@@ -19,8 +19,8 @@ Agent and CLI for operating the Reachy Mini expressive robot — device setup, a
 uv sync --extra daemon                # default: + the local reachy-mini-daemon
 # uv sync                             # remote profile: HTTP-only, no daemon deps
 uv run pytest -n auto                 # run the test suite
-uv run reachy-mini-cli whoami  # identity from culture.yaml
-uv run reachy-mini-cli learn   # self-teaching prompt (add --json)
+uv run reachy whoami                  # identity from culture.yaml
+uv run reachy learn                   # self-teaching prompt (add --json)
 uv run teken cli doctor . --strict    # the agent-first rubric gate CI runs
 ```
 

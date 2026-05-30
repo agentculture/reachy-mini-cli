@@ -21,6 +21,8 @@ from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
 from reachy.robot.transport import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
 
+_JSON_HELP = "Emit structured JSON."
+
 _VERBS = [
     "daemon start — start the local reachy-mini-daemon in the background",
     "daemon stop — stop the daemon this CLI started",
@@ -31,7 +33,7 @@ _VERBS = [
 
 def _add_health_args(parser: argparse.ArgumentParser) -> None:
     """Flags shared by verbs that talk to the daemon's health route."""
-    parser.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    parser.add_argument("--json", action="store_true", help=_JSON_HELP)
     parser.add_argument(
         "--base-url",
         default=os.environ.get("REACHY_BASE_URL", DEFAULT_BASE_URL),
@@ -110,12 +112,12 @@ def register(sub: argparse._SubParsersAction) -> None:
         "daemon",
         help="Local daemon process lifecycle (see 'reachy-mini-cli daemon overview').",
     )
-    p.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    p.add_argument("--json", action="store_true", help=_JSON_HELP)
     p.set_defaults(func=_no_verb, json=False)
     noun_sub = p.add_subparsers(dest="daemon_command", parser_class=type(p))
 
     ov = noun_sub.add_parser("overview", help="Describe the daemon noun group.")
-    ov.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    ov.add_argument("--json", action="store_true", help=_JSON_HELP)
     ov.set_defaults(func=cmd_daemon_overview)
 
     start = noun_sub.add_parser("start", help="Start the local reachy-mini-daemon.")
@@ -148,7 +150,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     start.set_defaults(func=cmd_daemon_start)
 
     stop = noun_sub.add_parser("stop", help="Stop the daemon this CLI started.")
-    stop.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    stop.add_argument("--json", action="store_true", help=_JSON_HELP)
     stop.add_argument(
         "--timeout",
         type=float,

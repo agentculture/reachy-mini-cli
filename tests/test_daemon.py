@@ -160,6 +160,47 @@ def test_start_reports_exit_on_startup_crash(monkeypatch, capsys) -> None:
     assert "exit_code: 1" in out
 
 
+def test_start_idempotent_path_honours_wait(monkeypatch, tmp_path, capsys) -> None:
+    # Tracked daemon is up but not answering yet; --wait should poll there too.
+    (tmp_path / "daemon.pid").write_text("4242")
+    monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: True)
+    calls = {"n": 0}
+
+    def _health(*a, **k):
+        calls["n"] += 1
+        return calls["n"] > 1  # first check not-ready, then healthy
+
+    monkeypatch.setattr("reachy.daemon.health_ok", _health)
+
+    def _no_spawn(cmd, **kwargs):  # noqa: ANN001 - test shim
+        raise AssertionError("must not spawn for an already-tracked daemon")
+
+    monkeypatch.setattr("subprocess.Popen", _no_spawn)
+
+    rc = main(["daemon", "start"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "already-running" in out
+    assert "healthy: True" in out
+
+
+def test_start_wraps_popen_oserror(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("REACHY_DAEMON_CMD", "fake-daemon")
+    monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: False)
+
+    def _boom(cmd, **kwargs):  # noqa: ANN001 - test shim
+        raise OSError("Exec format error")
+
+    monkeypatch.setattr("subprocess.Popen", _boom)
+
+    rc = main(["daemon", "start", "--no-wait"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "failed to launch the daemon" in err
+    assert "hint:" in err
+
+
 # --- stop -----------------------------------------------------------------
 
 
@@ -183,6 +224,7 @@ def test_stop_sigterm(monkeypatch, tmp_path, capsys) -> None:
     (tmp_path / "daemon.pid").write_text("4242")
     state = {"alive": True}
     monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: state["alive"])
+    monkeypatch.setattr("reachy.daemon._is_our_daemon", lambda pid: True)
     killed: list = []
 
     def _kill(pid, sig):
@@ -200,17 +242,59 @@ def test_stop_sigterm(monkeypatch, tmp_path, capsys) -> None:
     assert not (tmp_path / "daemon.pid").exists()
 
 
-def test_stop_escalates_to_sigkill(monkeypatch, tmp_path, capsys) -> None:
+def test_stop_escalates_to_sigkill_then_dies(monkeypatch, tmp_path, capsys) -> None:
     (tmp_path / "daemon.pid").write_text("4242")
-    monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: True)
-    monkeypatch.setattr("reachy.daemon._wait_gone", lambda pid, timeout: False)
+    state = {"alive": True}
+    monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: state["alive"])
+    monkeypatch.setattr("reachy.daemon._is_our_daemon", lambda pid: True)
     sigs: list = []
-    monkeypatch.setattr("os.kill", lambda pid, sig: sigs.append(sig))
+
+    def _kill(pid, sig):
+        sigs.append(sig)
+        if sig == signal.SIGKILL:
+            state["alive"] = False  # SIGTERM ignored; SIGKILL lands
+
+    monkeypatch.setattr("os.kill", _kill)
 
     rc = main(["daemon", "stop", "--timeout", "0"])
     assert rc == 0
-    assert "SIGKILL" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "stopped" in out
+    assert "SIGKILL" in out
     assert signal.SIGTERM in sigs and signal.SIGKILL in sigs
+    assert not (tmp_path / "daemon.pid").exists()
+
+
+def test_stop_refuses_reused_pid(monkeypatch, tmp_path, capsys) -> None:
+    # is_alive is True but the pid was recycled by an unrelated process.
+    (tmp_path / "daemon.pid").write_text("4242")
+    monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: True)
+    monkeypatch.setattr("reachy.daemon._is_our_daemon", lambda pid: False)
+    killed: list = []
+    monkeypatch.setattr("os.kill", lambda pid, sig: killed.append(sig))
+
+    rc = main(["daemon", "stop"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "not running" in out
+    assert "reused" in out
+    assert killed == []  # never signalled the recycled pid
+    assert not (tmp_path / "daemon.pid").exists()
+
+
+def test_stop_fails_when_unkillable(monkeypatch, tmp_path, capsys) -> None:
+    (tmp_path / "daemon.pid").write_text("4242")
+    monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: True)
+    monkeypatch.setattr("reachy.daemon._is_our_daemon", lambda pid: True)
+    monkeypatch.setattr("reachy.daemon._wait_gone", lambda pid, timeout: False)
+    monkeypatch.setattr("os.kill", lambda pid, sig: None)  # signals do nothing
+
+    rc = main(["daemon", "stop", "--timeout", "0"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "still alive after SIGKILL" in err
+    assert (tmp_path / "daemon.pid").exists()  # kept — process is still there
 
 
 # --- status ---------------------------------------------------------------
@@ -325,3 +409,12 @@ def test_resolve_daemon_cmd_empty_override_errors(monkeypatch) -> None:
 def test_read_pid_garbage_is_none(tmp_path) -> None:
     (tmp_path / "daemon.pid").write_text("not-a-number")
     assert daemon.read_pid() is None
+
+
+def test_is_our_daemon_false_for_dead_pid() -> None:
+    from pathlib import Path
+
+    if not Path("/proc").is_dir():
+        pytest.skip("no /proc on this platform")
+    # A pid that cannot exist -> /proc read fails -> not our daemon.
+    assert daemon._is_our_daemon(2_000_000_000) is False

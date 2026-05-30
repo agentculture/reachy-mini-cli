@@ -21,7 +21,6 @@ import shutil
 import signal
 import subprocess  # nosec B404 - only ever spawns the trusted reachy-mini-daemon binary
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -37,6 +36,8 @@ DEFAULT_STOP_TIMEOUT = 10.0
 # Seconds ``start`` polls the health endpoint before giving up the wait.
 DEFAULT_WAIT_TIMEOUT = 30.0
 _POLL_INTERVAL = 0.25
+# Shared status literal (one definition; avoids Sonar S1192 duplicate-string).
+_STATUS_NOT_RUNNING = "not running"
 
 
 def state_dir() -> Path:
@@ -122,6 +123,24 @@ def is_alive(pid: int) -> bool:
     return True
 
 
+def _is_our_daemon(pid: int) -> bool:
+    """Best-effort guard against PID reuse: is ``pid`` actually a reachy daemon?
+
+    Reads ``/proc/<pid>/cmdline`` on Linux. If ``/proc`` is unavailable (non-Linux)
+    we cannot verify, so we trust the pid file and return True. If ``/proc`` exists
+    but the process is gone or clearly isn't a reachy daemon, return False so
+    :func:`stop` never signals an unrelated process that recycled the pid.
+    """
+    if not Path("/proc").is_dir():
+        return True
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+    return DAEMON_BINARY in cmdline or "reachy_mini" in cmdline
+
+
 def health_ok(base_url: str, timeout: float) -> bool:
     """True if the daemon answers its health route with a 2xx. Never raises."""
     url = f"{base_url.rstrip('/')}{HEALTH_PATH}"
@@ -132,7 +151,8 @@ def health_ok(base_url: str, timeout: float) -> bool:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
             status = getattr(resp, "status", None) or resp.getcode()
             return 200 <= int(status) < 300
-    except (urllib.error.URLError, OSError, ValueError):
+    except (OSError, ValueError):
+        # urllib.error.URLError / HTTPError both subclass OSError.
         return False
 
 
@@ -143,18 +163,31 @@ def _clear_pid() -> None:
         pass
 
 
-def _wait_for_health(
-    proc: subprocess.Popen, base_url: str, poll_timeout: float, wait_timeout: float
+def _poll_until_healthy(
+    base_url: str, poll_timeout: float, wait_timeout: float, *, alive=None
 ) -> bool:
-    """Poll the health route until it answers, the deadline passes, or ``proc`` dies."""
+    """Poll the health route until it answers, the deadline passes, or ``alive()`` fails.
+
+    ``alive`` is an optional predicate (e.g. "is the process we spawned still
+    running?"); when it returns False the poll gives up early.
+    """
     deadline = time.monotonic() + wait_timeout
     while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return False  # process exited during startup; caller inspects returncode
+        if alive is not None and not alive():
+            return False
         if health_ok(base_url, poll_timeout):
             return True
         time.sleep(_POLL_INTERVAL)
     return health_ok(base_url, poll_timeout)
+
+
+def _wait_for_health(
+    proc: subprocess.Popen, base_url: str, poll_timeout: float, wait_timeout: float
+) -> bool:
+    """Poll the health route until it answers, the deadline passes, or ``proc`` dies."""
+    return _poll_until_healthy(
+        base_url, poll_timeout, wait_timeout, alive=lambda: proc.poll() is None
+    )
 
 
 def _wait_gone(pid: int, timeout: float) -> bool:
@@ -185,11 +218,17 @@ def start(
     """
     existing = read_pid()
     if existing is not None and is_alive(existing):
+        healthy = health_ok(base_url, poll_timeout)
+        if wait and not healthy:
+            # The tracked daemon is up but not answering yet — honour wait here too.
+            healthy = _poll_until_healthy(
+                base_url, poll_timeout, wait_timeout, alive=lambda: is_alive(existing)
+            )
         return {
             "status": "already-running",
             "pid": existing,
             "url": base_url,
-            "healthy": health_ok(base_url, poll_timeout),
+            "healthy": healthy,
             "log": str(log_file()),
         }
     if health_ok(base_url, poll_timeout):
@@ -209,14 +248,24 @@ def start(
     log_path = log_file()
     # Detach into its own session so the daemon outlives this CLI process, and
     # tee its stdout+stderr to the log file for ``daemon status`` to point at.
-    with open(log_path, "ab") as logf:
-        proc = subprocess.Popen(  # nosec B603 - trusted binary, arg list, no shell
-            cmd,
-            stdout=logf,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+    try:
+        with open(log_path, "ab") as logf:
+            proc = subprocess.Popen(  # nosec B603 - trusted binary, arg list, no shell
+                cmd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except OSError as err:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"failed to launch the daemon ({cmd[0]}): {err}",
+            remediation=(
+                "check the daemon binary is executable, or set --daemon-cmd / "
+                "REACHY_DAEMON_CMD to a working command"
+            ),
+        ) from err
     pid_file().write_text(str(proc.pid), encoding="utf-8")
 
     healthy = _wait_for_health(proc, base_url, poll_timeout, wait_timeout) if wait else False
@@ -242,18 +291,31 @@ def start(
 
 
 def stop(*, timeout: float = DEFAULT_STOP_TIMEOUT) -> dict[str, object]:
-    """Stop the daemon this CLI started: SIGTERM, then SIGKILL if it lingers."""
+    """Stop the daemon this CLI started: SIGTERM, then SIGKILL if it lingers.
+
+    Guards against PID reuse (never signals a process that isn't our daemon) and
+    never reports success it can't confirm — if the process survives SIGKILL it
+    raises a :class:`CliError` rather than claiming ``stopped``.
+    """
     pid = read_pid()
     if pid is None:
-        return {"status": "not running", "note": "no tracked daemon pid"}
+        return {"status": _STATUS_NOT_RUNNING, "note": "no tracked daemon pid"}
     if not is_alive(pid):
         _clear_pid()
-        return {"status": "not running", "pid": pid, "note": "stale pid cleared"}
+        return {"status": _STATUS_NOT_RUNNING, "pid": pid, "note": "stale pid cleared"}
+    if not _is_our_daemon(pid):
+        # The recorded pid was recycled by an unrelated process — do NOT signal it.
+        _clear_pid()
+        return {
+            "status": _STATUS_NOT_RUNNING,
+            "pid": pid,
+            "note": "tracked pid is no longer a reachy daemon (reused); left untouched",
+        }
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         _clear_pid()
-        return {"status": "not running", "pid": pid, "note": "process already gone"}
+        return {"status": _STATUS_NOT_RUNNING, "pid": pid, "note": "process already gone"}
     except PermissionError as err:
         raise CliError(
             code=EXIT_ENV_ERROR,
@@ -261,13 +323,21 @@ def stop(*, timeout: float = DEFAULT_STOP_TIMEOUT) -> dict[str, object]:
             remediation="stop it as the owning user, or via your service manager",
         ) from err
     signaled = "SIGTERM"
-    if not _wait_gone(pid, timeout):
+    gone = _wait_gone(pid, timeout)
+    if not gone:
         try:
             os.kill(pid, signal.SIGKILL)
             signaled = "SIGKILL"
         except ProcessLookupError:
-            pass
-        _wait_gone(pid, 2.0)
+            gone = True
+        if not gone:
+            gone = _wait_gone(pid, 2.0)
+    if not gone:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"failed to stop daemon pid {pid}: still alive after SIGKILL",
+            remediation="inspect and terminate the process manually",
+        )
     _clear_pid()
     return {"status": "stopped", "pid": pid, "signal": signaled}
 
