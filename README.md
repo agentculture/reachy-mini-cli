@@ -115,6 +115,60 @@ uv run reachy move wake
 uv run reachy daemon stop             # put it back down when you're done
 ```
 
+### Demo mode — make the robot feel alive
+
+`demo-mode` runs a continuous loop that streams gentle idle motion to the robot —
+a slow breathing oscillation, the occasional glance to a new gaze target, and a
+little antenna sway — so an idle robot looks present rather than frozen. It drives
+the robot through the same transport, so it needs a running daemon. It is built to
+run always-on and improve over time, so it has three layers.
+
+**Process** (tracked background loop; PID + log under `$REACHY_STATE_DIR` /
+`$XDG_STATE_HOME/reachy`):
+
+| Verb | What it does |
+|------|--------------|
+| `demo-mode start` | Spawn the feel-alive loop in the background (idempotent; preflights the daemon first). |
+| `demo-mode stop` | Stop the loop this CLI started (SIGTERM eases the robot back to neutral, then SIGKILL). |
+| `demo-mode restart` | Apply an update — restart the service if active, else relaunch the background loop. |
+| `demo-mode status` | Loop process state + systemd unit state + whether the daemon answers. |
+| `demo-mode run` | Run the loop in the foreground (what `start`/the service launch); Ctrl-C to stop. |
+
+**Config** — persisted tuning at `$XDG_CONFIG_HOME/reachy/demo-mode.json`, read by
+`run`/`start` (CLI flags override per-invocation):
+
+```bash
+uv run reachy demo-mode config                       # show resolved config
+uv run reachy demo-mode config --init                # write defaults
+uv run reachy demo-mode config --set energy=0.8 interval=3
+```
+
+Keys: `transport`, `base_url`, `timeout`, `interval` (tempo), `energy`
+(liveliness `0`–`n`), `interpolation`, `seed`, `wake`, `settle`.
+
+**Service** — run it always-on as a systemd `--user` unit (auto-restart on crash,
+start on boot):
+
+```bash
+uv run reachy demo-mode install      # write the reachy-demo-mode.service unit
+uv run reachy demo-mode enable       # enable --now + linger (survives reboot)
+uv run reachy demo-mode disable      # stop + disable
+uv run reachy demo-mode uninstall    # remove the unit
+```
+
+The full flow:
+
+```bash
+uv run reachy daemon start                    # something for the loop to drive
+uv run reachy demo-mode config --set energy=0.7
+uv run reachy demo-mode start                 # robot starts feeling alive
+uv run reachy demo-mode restart               # apply config/code updates
+uv run reachy demo-mode stop                  # eases back to neutral
+```
+
+As you make the motion richer over time, edit `reachy/alive.py` (or the config)
+and `demo-mode restart` to apply it.
+
 ## Make it your own
 
 1. Rename the package `reachy/` and the `reachy-mini-cli`

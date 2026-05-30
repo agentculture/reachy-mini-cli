@@ -65,6 +65,7 @@ def _build_parser() -> argparse.ArgumentParser:
     from reachy.cli._commands import app as _app_group
     from reachy.cli._commands import cli as _cli_group
     from reachy.cli._commands import daemon as _daemon_group
+    from reachy.cli._commands import demo_mode as _demo_group
     from reachy.cli._commands import device as _device_group
     from reachy.cli._commands import doctor as _doctor_cmd
     from reachy.cli._commands import explain as _explain_cmd
@@ -97,6 +98,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _device_group.register(sub)
     _app_group.register(sub)
     _move_group.register(sub)
+    # Higher-level behaviour built on the motion verbs.
+    _demo_group.register(sub)
 
     return parser
 

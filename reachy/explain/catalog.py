@@ -36,6 +36,8 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 - `reachy-mini-cli device <verb>` — daemon/robot status and live state.
 - `reachy-mini-cli app <verb>` — list/start/stop Reachy Mini apps.
 - `reachy-mini-cli move <verb>` — runtime motion (goto, wake, sleep).
+- `reachy-mini-cli demo-mode <verb>` — start/stop a background loop that makes
+  the robot feel alive (idle breathing, glances, antenna sway).
 
 The `device`/`app`/`move` verbs speak to the Reachy daemon over a transport
 flavor (`--transport http` by default, `sdk` optional); a missing daemon yields a
@@ -270,6 +272,90 @@ with a hint pointing at the `[daemon]` install.
 """
 
 
+_DEMO = """\
+# reachy-mini-cli demo-mode
+
+Make the robot *feel alive*. A continuously-running loop streams gentle idle
+motion to the robot — a slow breathing oscillation, the occasional glance to a
+new gaze target, and a little antenna sway — so an otherwise idle robot looks
+present rather than frozen. The motion is a stream of `move goto` calls over the
+transport, so it needs a running daemon (`reachy-mini-cli daemon start`).
+
+It is meant to run always-on and improve over time, so it has three layers:
+a tracked **process** (start/stop/restart), a persisted **config** file, and an
+optional systemd `--user` **service**.
+
+## Process verbs
+
+- `reachy-mini-cli demo-mode start` — spawn the loop in the background, recording
+  its PID + log under the state dir. For `--transport http` it first preflights
+  the daemon's health route so it never spawns a loop with nothing to drive.
+  Idempotent: reports `already-running` if a tracked loop is alive.
+- `reachy-mini-cli demo-mode stop` — SIGTERM the loop this CLI started (so it
+  eases the robot back to neutral before exiting), escalating to SIGKILL past
+  `--timeout`.
+- `reachy-mini-cli demo-mode restart` — apply an update. If the systemd service
+  is active it is restarted; otherwise the background loop is stopped and
+  relaunched. Either way the new process re-imports the latest motion code and
+  re-reads the config.
+- `reachy-mini-cli demo-mode status` — the loop's process state (running /
+  stopped / stale), the systemd unit state, and whether the daemon answers.
+- `reachy-mini-cli demo-mode run` — run the loop in the foreground (what `start`
+  and the service launch). Ctrl-C stops it. `--max-ticks N` runs a fixed number
+  of poses.
+- `reachy-mini-cli demo-mode overview` — this summary.
+
+## Config
+
+`demo-mode config` reads/writes the persisted tuning at
+`$XDG_CONFIG_HOME/reachy/demo-mode.json`. `run`/`start` read it; CLI flags
+override per-invocation (precedence: flag > config file > built-in default).
+
+- `reachy-mini-cli demo-mode config` — show the resolved config + its path.
+- `reachy-mini-cli demo-mode config --init` — write a default config file.
+- `reachy-mini-cli demo-mode config --set energy=0.8 interval=3` — set keys.
+
+Keys: `transport`, `base_url`, `timeout`, `interval`, `energy`, `interpolation`,
+`seed`, `wake`, `settle`. Tuning meaning:
+
+- `interval` — seconds between poses (tempo; default 2.5).
+- `energy` — liveliness multiplier scaling every amplitude (default 1.0;
+  `0` is nearly still, `>1` is bigger motion).
+- `interpolation` — `{minjerk,linear,ease,cartoon}` curve between poses.
+- `seed` — make the idle motion reproducible (`none` for random).
+- `wake` / `settle` — wake on start / ease to neutral on stop (override with
+  the `--no-wake` / `--no-settle` flags).
+
+## Service (systemd --user)
+
+Run it always-on, auto-restarting on crash and starting on boot:
+
+- `reachy-mini-cli demo-mode install` — write the `reachy-demo-mode.service` unit
+  (ExecStart re-invokes `demo-mode run --config <path>`).
+- `reachy-mini-cli demo-mode enable` — `systemctl --user enable --now` + enable
+  linger so it survives logout/reboot (`--no-linger` to skip).
+- `reachy-mini-cli demo-mode disable` — `systemctl --user disable --now`.
+- `reachy-mini-cli demo-mode uninstall` — remove the unit file.
+
+Without a systemd user session these exit `2` with a hint; use start/stop instead.
+
+{transports}
+
+## Notes
+
+- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`:
+  `demo-mode.pid` + `demo-mode.log`.
+
+## Usage
+
+    reachy-mini-cli daemon start                       # something for the loop to drive
+    reachy-mini-cli demo-mode config --set energy=0.7  # tune it
+    reachy-mini-cli demo-mode start                    # robot starts feeling alive
+    reachy-mini-cli demo-mode restart                  # apply config/code updates
+    reachy-mini-cli demo-mode install && reachy-mini-cli demo-mode enable  # always-on
+""".replace(_TRANSPORTS_SLOT, _TRANSPORTS)
+
+
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
     ("reachy",): _ROOT,
@@ -301,4 +387,16 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("move", "goto"): _MOVE,
     ("move", "wake"): _MOVE,
     ("move", "sleep"): _MOVE,
+    ("demo-mode",): _DEMO,
+    ("demo-mode", "overview"): _DEMO,
+    ("demo-mode", "start"): _DEMO,
+    ("demo-mode", "stop"): _DEMO,
+    ("demo-mode", "restart"): _DEMO,
+    ("demo-mode", "status"): _DEMO,
+    ("demo-mode", "run"): _DEMO,
+    ("demo-mode", "config"): _DEMO,
+    ("demo-mode", "install"): _DEMO,
+    ("demo-mode", "enable"): _DEMO,
+    ("demo-mode", "disable"): _DEMO,
+    ("demo-mode", "uninstall"): _DEMO,
 }

@@ -36,6 +36,9 @@ Robot commands (talk to the Reachy daemon; --transport http|sdk)
   reachy-mini-cli device state       Live robot state (pose, antennas).
   reachy-mini-cli app list           Available apps; also: status/start/stop.
   reachy-mini-cli move goto ...      Move head/antennas; also: wake/sleep.
+  reachy-mini-cli demo-mode start    Make the robot feel alive (continuous).
+                                     Also: stop/restart/status/run, config,
+                                     install/enable/disable (systemd --user).
 
 Machine-readable output
 -----------------------
@@ -74,6 +77,10 @@ def _as_json_payload() -> dict[str, object]:
             {"path": ["device", "state"], "summary": "Live robot state."},
             {"path": ["app", "list"], "summary": "List/start/stop Reachy Mini apps."},
             {"path": ["move", "goto"], "summary": "Move head/antennas; wake/sleep."},
+            {
+                "path": ["demo-mode", "start"],
+                "summary": "Start a background loop that makes the robot feel alive.",
+            },
         ],
         "exit_codes": {
             "0": "success",
