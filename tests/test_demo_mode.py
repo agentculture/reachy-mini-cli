@@ -135,6 +135,39 @@ def test_run_loop_preflight_propagates_when_robot_unreachable() -> None:
         alive.run_loop(_DeadOnWake(), alive.AliveConfig(interval=0), sleep=lambda *_: None)
 
 
+def test_run_loop_on_start_runs_after_preflight() -> None:
+    tr = _FakeTransport()
+    cfg = alive.AliveConfig(interval=0, seed=1)
+    order: list = []
+    tr_wake = tr.wake
+
+    def _wake():
+        order.append("preflight")
+        return tr_wake()
+
+    tr.wake = _wake  # type: ignore[method-assign]
+    alive.run_loop(
+        tr, cfg, sleep=lambda *_: None, max_ticks=1, on_start=lambda: order.append("on_start")
+    )
+    assert order[:2] == ["preflight", "on_start"]
+
+
+def test_run_loop_on_start_skipped_when_preflight_fails() -> None:
+    class _DeadOnWake(_FakeTransport):
+        def wake(self):
+            raise CliError(code=EXIT_ENV_ERROR, message="no daemon", remediation="start it")
+
+    started: list = []
+    with pytest.raises(CliError):
+        alive.run_loop(
+            _DeadOnWake(),
+            alive.AliveConfig(interval=0),
+            sleep=lambda *_: None,
+            on_start=lambda: started.append(1),
+        )
+    assert started == []  # never announced a start that didn't happen
+
+
 def test_run_loop_tolerates_transient_errors_then_recovers() -> None:
     tr = _FakeTransport(fail_times=2)  # first two gotos fail, then succeed
     cfg = alive.AliveConfig(interval=0, seed=1, max_errors=5)
@@ -181,10 +214,11 @@ def test_run_command_unreachable_exits_2(monkeypatch, capsys) -> None:
     rc = main(["demo-mode", "run", "--interval", "1", "--max-ticks", "1"])
     assert rc == 2
     err = capsys.readouterr().err
-    # The startup diagnostic precedes it on stderr, but the structured error pair
-    # must still be present.
-    assert "error:" in err
+    # The startup diagnostic is emitted only AFTER a successful preflight, so a
+    # failed preflight yields exactly the two-line error:/hint: contract.
+    assert err.startswith("error:")
     assert "hint:" in err
+    assert "feeling alive" not in err
 
 
 # --- CLI / supervisor: start ---------------------------------------------
@@ -514,6 +548,22 @@ def test_install_writes_unit(monkeypatch, capsys) -> None:
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "installed"
+
+
+def test_install_creates_missing_custom_config(monkeypatch, tmp_path, capsys) -> None:
+    # Qodo #4: a custom --config that doesn't exist must be created so the unit
+    # never points at a missing file.
+    seen: dict = {}
+    monkeypatch.setattr(
+        "reachy.demo_service.install",
+        lambda config_file=None: seen.update(cf=config_file) or {"status": "installed"},
+    )
+    custom = tmp_path / "nested" / "custom.json"
+    assert not custom.exists()
+    rc = main(["demo-mode", "install", "--config", str(custom), "--json"])
+    assert rc == 0
+    assert custom.is_file()  # ensure() created it
+    assert seen["cf"] == str(custom)  # unit points at the real file
 
 
 def test_enable_passes_linger_flag(monkeypatch, capsys) -> None:

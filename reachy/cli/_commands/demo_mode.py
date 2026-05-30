@@ -163,11 +163,14 @@ def cmd_demo_run(args: argparse.Namespace) -> int:
     transport = _transport_for(cfg)
     alive_cfg = cfg.to_alive_config()
 
-    if not json_mode:
-        emit_diagnostic(
-            f"[demo-mode] feeling alive: interval={alive_cfg.interval:g}s "
-            f"energy={alive_cfg.energy:g} via {transport.name}; Ctrl-C to stop"
-        )
+    def _on_start() -> None:
+        # Emitted only after the preflight succeeds, so a failed preflight yields
+        # exactly the two-line error:/hint: contract (no stray startup line).
+        if not json_mode:
+            emit_diagnostic(
+                f"[demo-mode] feeling alive: interval={alive_cfg.interval:g}s "
+                f"energy={alive_cfg.energy:g} via {transport.name}; Ctrl-C to stop"
+            )
 
     def _emit(event: dict) -> None:
         if json_mode:
@@ -178,6 +181,7 @@ def cmd_demo_run(args: argparse.Namespace) -> int:
     ticks = alive.run_loop(
         transport,
         alive_cfg,
+        on_start=_on_start,
         emit=_emit,
         max_ticks=args.max_ticks,
         wake=cfg.wake,
@@ -272,11 +276,9 @@ def cmd_demo_config(args: argparse.Namespace) -> int:
 
 
 def cmd_demo_install(args: argparse.Namespace) -> int:
-    # Ensure a config file exists so the unit's `run --config <path>` has one.
-    path = getattr(args, "config", None)
-    cfg_file = path or str(dconf.config_path())
-    if not dconf.config_path().is_file() and path is None:
-        dconf.save(dconf.load(path), path)
+    # Ensure the config file the unit will read actually exists — whether or not
+    # --config was given — so the service never points at a missing file.
+    cfg_file = str(dconf.ensure(getattr(args, "config", None)))
     data = dservice.install(config_file=cfg_file)
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0

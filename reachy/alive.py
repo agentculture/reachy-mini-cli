@@ -184,12 +184,48 @@ def _interruptible_sleep(seconds: float, stop: dict, sleep) -> None:
         slept += _SLEEP_SLICE
 
 
+def _preflight(transport: Transport, config: AliveConfig, wake: bool) -> None:
+    """First robot call — validates the transport. A dead daemon raises CliError."""
+    if wake:
+        transport.wake()
+    else:
+        _send_pose(transport, neutral_pose(config))
+
+
+def _settle(transport: Transport, config: AliveConfig) -> None:
+    """Best-effort ease back to neutral on stop (a dead daemon can't be settled)."""
+    try:
+        _send_pose(transport, neutral_pose(config))
+    except CliError:
+        pass
+
+
+def _send_tick(
+    transport: Transport, pose: dict, tick: int, elapsed: float, consecutive: int, max_errors: int
+) -> tuple[dict, int]:
+    """Send one pose; return ``(event, consecutive_errors)``.
+
+    Re-raises the :class:`CliError` once ``max_errors`` consecutive sends have
+    failed, so a sustained daemon outage ends the loop cleanly.
+    """
+    base = {"tick": tick, "elapsed": round(elapsed, 3)}
+    try:
+        _send_pose(transport, pose)
+    except CliError as exc:
+        consecutive += 1
+        if consecutive >= max_errors:
+            raise
+        return {**base, "ok": False, "error": exc.message}, consecutive
+    return {**base, "ok": True, "error": None}, 0
+
+
 def run_loop(
     transport: Transport,
     config: AliveConfig,
     *,
     sleep=time.sleep,
     now=time.monotonic,
+    on_start=None,
     emit=None,
     max_ticks: int | None = None,
     wake: bool = True,
@@ -200,54 +236,42 @@ def run_loop(
 
     Connectivity is validated up front (the opening ``wake`` — or, with
     ``wake=False``, a single neutral ``goto``); if the robot can't be reached the
-    underlying :class:`CliError` propagates so the caller exits cleanly. Once the
-    loop is running, transient send failures are tolerated up to
-    ``config.max_errors`` consecutive misses before giving up. On stop the robot
-    is eased back to a neutral pose (best effort).
+    underlying :class:`CliError` propagates so the caller exits cleanly. The
+    optional ``on_start`` callback runs *after* that preflight succeeds — so a
+    caller can emit a "starting" line only once the loop is truly live, never
+    polluting the error output of a failed preflight. Once running, transient send
+    failures are tolerated up to ``config.max_errors`` consecutive misses before
+    giving up. On stop the robot is eased back to neutral (best effort).
     """
     # nosec B311 - the RNG only shapes idle robot motion; not security-sensitive.
     rng = rng if rng is not None else random.Random(config.seed)  # nosec B311
     stop = {"flag": False}
     handlers = _install_stop_handlers(stop)
 
-    # Preflight: the first robot call validates the transport. A dead daemon
-    # raises CliError here, before the loop, so `demo-mode run` fails fast.
-    if wake:
-        transport.wake()
-    else:
-        _send_pose(transport, neutral_pose(config))
+    _preflight(transport, config, wake)
+    if on_start is not None:
+        on_start()
 
     start_t = now()
     ticks = 0
-    consecutive_errors = 0
+    consecutive = 0
     try:
         while not stop["flag"]:
             elapsed = now() - start_t
             pose = next_pose(elapsed, rng, config)
-            ok = True
-            err: str | None = None
-            try:
-                _send_pose(transport, pose)
-                consecutive_errors = 0
-            except CliError as exc:
-                ok = False
-                err = exc.message
-                consecutive_errors += 1
-                if consecutive_errors >= config.max_errors:
-                    raise
+            event, consecutive = _send_tick(
+                transport, pose, ticks + 1, elapsed, consecutive, config.max_errors
+            )
             ticks += 1
             if emit is not None:
-                emit({"tick": ticks, "ok": ok, "error": err, "elapsed": round(elapsed, 3)})
+                emit(event)
             if max_ticks is not None and ticks >= max_ticks:
                 break
             _interruptible_sleep(config.interval, stop, sleep)
     finally:
         _restore_stop_handlers(handlers)
         if settle:
-            try:
-                _send_pose(transport, neutral_pose(config))
-            except CliError:
-                pass  # shutting down; a dead daemon can't be settled
+            _settle(transport, config)
     return ticks
 
 

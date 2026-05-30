@@ -101,3 +101,17 @@ def test_load_tolerates_non_dict_json() -> None:
     dconf.config_path().parent.mkdir(parents=True, exist_ok=True)
     dconf.config_path().write_text(json.dumps([1, 2, 3]), encoding="utf-8")
     assert dconf.load().transport == "http"
+
+
+def test_ensure_creates_default_when_missing() -> None:
+    assert not dconf.config_path().exists()
+    path = dconf.ensure()
+    assert path == dconf.config_path()
+    assert path.is_file()
+
+
+def test_ensure_keeps_existing(tmp_path) -> None:
+    custom = tmp_path / "keep.json"
+    dconf.save(dconf.DemoConfig(energy=0.3), str(custom))
+    dconf.ensure(str(custom))
+    assert dconf.load(str(custom)).energy == 0.3  # not overwritten

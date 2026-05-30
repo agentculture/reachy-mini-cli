@@ -120,6 +120,18 @@ def save(cfg: DemoConfig, path: str | None = None) -> Path:
     return cfg_path
 
 
+def ensure(path: str | None = None) -> Path:
+    """Return the resolved config path, writing defaults first if it is missing.
+
+    Used before installing the systemd unit so its ``--config <path>`` always
+    points at a real file — whether the operator passed ``--config`` or not.
+    """
+    cfg_path = Path(path) if path else config_path()
+    if not cfg_path.is_file():
+        save(load(path), path)
+    return cfg_path
+
+
 def _coerce(key: str, raw: str) -> object:
     """Coerce a ``key=value`` string token to the field's type, validating enums."""
     if key in ("interval", "energy", "timeout"):
