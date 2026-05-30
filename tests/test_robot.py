@@ -158,7 +158,7 @@ def test_daemon_unreachable_exit_2(monkeypatch, capsys: pytest.CaptureFixture[st
     err = capsys.readouterr().err
     assert err.startswith("error:")
     assert "hint:" in err
-    assert "reachy-mini-daemon" in err
+    assert "reachy daemon start" in err
 
 
 def test_daemon_unreachable_json(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:

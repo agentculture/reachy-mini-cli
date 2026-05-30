@@ -32,13 +32,15 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 
 ## Robot nouns
 
+- `reachy-mini-cli daemon <verb>` — start/stop/check the local daemon process.
 - `reachy-mini-cli device <verb>` — daemon/robot status and live state.
 - `reachy-mini-cli app <verb>` — list/start/stop Reachy Mini apps.
 - `reachy-mini-cli move <verb>` — runtime motion (goto, wake, sleep).
 
-Robot verbs speak to the Reachy daemon over a transport flavor (`--transport
-http` by default, `sdk` optional). A missing daemon yields a clean exit-2 error,
-never a traceback.
+The `device`/`app`/`move` verbs speak to the Reachy daemon over a transport
+flavor (`--transport http` by default, `sdk` optional); a missing daemon yields a
+clean exit-2 error, never a traceback. `daemon` is the other half — it brings the
+local `reachy-mini-daemon` process up so those verbs have something to talk to.
 
 ## Exit-code policy
 
@@ -220,6 +222,54 @@ degrees for rotation — converted to the daemon's metres + radians.
 """.replace(_TRANSPORTS_SLOT, _TRANSPORTS)
 
 
+_DAEMON = """\
+# reachy-mini-cli daemon
+
+Local daemon process lifecycle. The `device`/`app`/`move` verbs are *clients* of
+a running daemon; this noun is the other half — it brings the local
+`reachy-mini-daemon` process up and down.
+
+## Verbs
+
+- `reachy-mini-cli daemon start` — spawn `reachy-mini-daemon` in the background,
+  record its PID + log under the state dir, and poll the health route
+  (`GET /api/daemon/status`) until it answers. Idempotent: if a daemon already
+  runs (tracked or foreign), it reports `already-running` instead of double-spawning.
+- `reachy-mini-cli daemon stop` — SIGTERM the daemon this CLI started, escalating
+  to SIGKILL if it lingers past `--timeout`.
+- `reachy-mini-cli daemon status` — reconcile the tracked process (running /
+  stopped / stale pid) with the HTTP health check.
+- `reachy-mini-cli daemon overview` — this summary.
+
+## Install
+
+The daemon binary ships in the `[daemon]` extra — the recommended default:
+
+    pip install 'reachy-cli[daemon]'
+
+The bare `pip install reachy-cli` is the HTTP-only *remote* profile (no daemon):
+use it on a control box that only talks to a daemon running elsewhere via
+`--base-url` / `REACHY_BASE_URL`. If the binary is missing, `daemon start` exits 2
+with a hint pointing at the `[daemon]` install.
+
+## Notes
+
+- `reachy-mini-daemon` defaults to `--wake-up-on-start`, so `daemon start` already
+  wakes the robot. Forward daemon args after `--`, e.g.
+  `reachy-mini-cli daemon start -- --sim --no-wake-up-on-start`.
+- Override the launch command with `--daemon-cmd` or `REACHY_DAEMON_CMD`.
+- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`
+  (`~/.local/state/reachy`): `daemon.pid` + `daemon.log`.
+
+## Usage
+
+    reachy-mini-cli daemon start
+    reachy-mini-cli daemon status --json
+    reachy-mini-cli daemon start --no-wait -- --sim
+    reachy-mini-cli daemon stop
+"""
+
+
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
     ("reachy",): _ROOT,
@@ -231,6 +281,11 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("doctor",): _DOCTOR,
     ("cli",): _CLI,
     ("cli", "overview"): _CLI,
+    ("daemon",): _DAEMON,
+    ("daemon", "overview"): _DAEMON,
+    ("daemon", "start"): _DAEMON,
+    ("daemon", "stop"): _DAEMON,
+    ("daemon", "status"): _DAEMON,
     ("device",): _DEVICE,
     ("device", "overview"): _DEVICE,
     ("device", "status"): _DEVICE,

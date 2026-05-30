@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-05-30
+
+### Added
+
+- `daemon` noun group (`start`/`stop`/`status`/`overview`): bring the local `reachy-mini-daemon` process up and down — background spawn + PID/log under `$XDG_STATE_HOME/reachy`, health-poll on `GET /api/daemon/status`, idempotent start, SIGTERM-then-SIGKILL stop.
+- `reachy/daemon.py` — stdlib-only daemon process-lifecycle module (no new runtime dependency).
+- `[daemon]` optional-dependencies extra (`reachy-mini>=1.0`) — the recommended default install, providing the `reachy-mini-daemon` binary.
+
+### Changed
+
+- Inverted the install model: `pip install 'reachy-cli[daemon]'` is now the default (bundles the daemon); the bare `pip install reachy-cli` is the HTTP-only *remote* profile. Base stays zero-runtime-deps.
+- The `http` transport's daemon-unreachable hint now points at `reachy daemon start` and the `[daemon]` install.
+- README + CLAUDE.md document the daemon noun, the install profiles, and the daemon-up wake-up flow.
+
 ## [0.2.0] - 2026-05-30
 
 ### Added

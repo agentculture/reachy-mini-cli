@@ -1,6 +1,6 @@
 [project]
 name = "reachy-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "Agent and CLI for operating the Reachy Mini expressive robot — device setup, app management, and runtime ops."
 readme = "README.md"
 license = "MIT"
@@ -15,12 +15,20 @@ classifiers = [
 ]
 dependencies = []
 
-# Optional "sdk" transport flavor. The default install stays dependency-free
-# (the http transport uses only the stdlib); installing the extra enables
-# `--transport sdk`, which drives the robot through the in-process client.
-# Sanctioned exception to the zero-runtime-dependency rule — see
+# Optional extras. The base install stays dependency-free (the http transport and
+# the `daemon` process verbs use only the stdlib), so the bare `pip install
+# reachy-cli` is the lightweight HTTP-only *remote* profile — for a control box
+# that only talks to a daemon running elsewhere via --base-url / REACHY_BASE_URL.
+#
+# The recommended *default* is `pip install 'reachy-cli[daemon]'`: it pulls in
+# `reachy-mini`, which provides the `reachy-mini-daemon` binary that `reachy
+# daemon start` launches. `[sdk]` enables the in-process `--transport sdk` client.
+# Both resolve to the same `reachy-mini` wheel today (it ships both the daemon
+# binary and the SDK client); they stay separately named for intent clarity.
+# Sanctioned exceptions to the zero-runtime-dependency rule — see
 # docs/adr-0001-sdk-transport-extra.md.
 [project.optional-dependencies]
+daemon = ["reachy-mini>=1.0"]
 sdk = ["reachy-mini>=1.0"]
 
 [project.urls]

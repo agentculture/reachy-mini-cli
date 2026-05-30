@@ -31,6 +31,7 @@ Commands
   reachy-mini-cli cli overview       Describe the CLI surface itself.
 
 Robot commands (talk to the Reachy daemon; --transport http|sdk)
+  reachy-mini-cli daemon start       Start the local daemon; also: stop/status.
   reachy-mini-cli device status      Daemon status / device info.
   reachy-mini-cli device state       Live robot state (pose, antennas).
   reachy-mini-cli app list           Available apps; also: status/start/stop.
@@ -66,6 +67,9 @@ def _as_json_payload() -> dict[str, object]:
             {"path": ["overview"], "summary": "Descriptive snapshot of the agent."},
             {"path": ["doctor"], "summary": "Check the agent-identity invariants."},
             {"path": ["cli", "overview"], "summary": "Describe the CLI surface."},
+            {"path": ["daemon", "start"], "summary": "Start the local reachy-mini-daemon."},
+            {"path": ["daemon", "stop"], "summary": "Stop the daemon this CLI started."},
+            {"path": ["daemon", "status"], "summary": "Daemon process + HTTP-health state."},
             {"path": ["device", "status"], "summary": "Daemon status / device info."},
             {"path": ["device", "state"], "summary": "Live robot state."},
             {"path": ["app", "list"], "summary": "List/start/stop Reachy Mini apps."},

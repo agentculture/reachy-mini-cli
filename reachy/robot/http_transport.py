@@ -89,7 +89,8 @@ class HttpTransport(Transport):
             code=EXIT_ENV_ERROR,
             message=f"cannot reach the Reachy daemon at {self.base_url} ({err})",
             remediation=(
-                "start it with 'reachy-mini-daemon', or set REACHY_BASE_URL / pass --base-url"
+                "start it with 'reachy daemon start' (install the daemon: "
+                "pip install 'reachy-cli[daemon]'), or set REACHY_BASE_URL / pass --base-url"
             ),
         )
 

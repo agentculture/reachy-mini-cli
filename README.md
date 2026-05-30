@@ -16,7 +16,8 @@ Agent and CLI for operating the Reachy Mini expressive robot — device setup, a
 ## Quickstart
 
 ```bash
-uv sync
+uv sync --extra daemon                # default: + the local reachy-mini-daemon
+# uv sync                             # remote profile: HTTP-only, no daemon deps
 uv run pytest -n auto                 # run the test suite
 uv run reachy-mini-cli whoami  # identity from culture.yaml
 uv run reachy-mini-cli learn   # self-teaching prompt (add --json)
@@ -40,8 +41,44 @@ error, `3+` reserved.
 
 ## Robot operations
 
-The `device`, `app`, and `move` noun groups operate the Reachy Mini. They talk
-to the robot through a selectable **transport flavor**:
+The `daemon`, `device`, `app`, and `move` noun groups operate the Reachy Mini.
+
+### Install profiles
+
+The Reachy daemon (`reachy-mini-daemon`) and the in-process SDK ship in
+`reachy-mini`. Choose your install by where the daemon runs:
+
+- **Default — with the daemon:** `pip install 'reachy-cli[daemon]'`. Bundles
+  `reachy-mini`, so `reachy daemon start` can bring the daemon up locally. This
+  is the profile for a machine with a robot attached.
+- **Remote — without the daemon:** `pip install reachy-cli` (bare). The base
+  install keeps **zero runtime dependencies** (the `http` transport and the
+  `daemon status`/`stop` verbs use only the stdlib). Use it on a control box that
+  only talks to a daemon running elsewhere via `--base-url` / `REACHY_BASE_URL`.
+  `daemon start` here exits `2` with a hint to install the `[daemon]` extra.
+
+`[sdk]` (also `reachy-mini`) adds the in-process `--transport sdk` client.
+
+### Bring the daemon up
+
+`device`/`app`/`move` are clients of a running daemon; `daemon` is the other
+half — it manages the local `reachy-mini-daemon` process.
+
+| Verb | What it does |
+|------|--------------|
+| `daemon start` | Spawn `reachy-mini-daemon` in the background, then poll its health route until ready. Idempotent. |
+| `daemon stop` | Stop the daemon this CLI started (SIGTERM, then SIGKILL). |
+| `daemon status` | Reconcile the tracked process (running/stopped/stale) with the HTTP health check. |
+
+`reachy-mini-daemon` defaults to `--wake-up-on-start`, so `daemon start` already
+wakes the robot. Forward daemon args after `--`, e.g.
+`reachy daemon start -- --sim --no-wake-up-on-start`. State (PID + log) lives
+under `$XDG_STATE_HOME/reachy` (`~/.local/state/reachy`).
+
+### Transports
+
+The `device`, `app`, and `move` verbs talk to a running daemon through a
+selectable **transport flavor**:
 
 - **`http`** (default) — the Reachy daemon's REST API. Uses only the Python
   standard library, so the default install keeps **zero runtime dependencies**.
@@ -70,11 +107,12 @@ with a clean `error:`/`hint:` pair — never a traceback.
 Each noun also exposes `overview` (e.g. `reachy move overview`).
 
 ```bash
-# Start the daemon (from the reachy_mini SDK), then:
-uv run reachy device status
+uv run reachy daemon start            # bring the local daemon up (and wake the robot)
+uv run reachy device status           # now answers instead of exit-2
 uv run reachy app list --json
 uv run reachy move goto --z 10 --pitch -5 --duration 2
 uv run reachy move wake
+uv run reachy daemon stop             # put it back down when you're done
 ```
 
 ## Make it your own

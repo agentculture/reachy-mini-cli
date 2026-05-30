@@ -1718,10 +1718,13 @@ wheels = [
 
 [[package]]
 name = "reachy-cli"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
+daemon = [
+    { name = "reachy-mini" },
+]
 sdk = [
     { name = "reachy-mini" },
 ]
@@ -1739,8 +1742,11 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "reachy-mini", marker = "extra == 'sdk'", specifier = ">=1.0" }]
-provides-extras = ["sdk"]
+requires-dist = [
+    { name = "reachy-mini", marker = "extra == 'daemon'", specifier = ">=1.0" },
+    { name = "reachy-mini", marker = "extra == 'sdk'", specifier = ">=1.0" },
+]
+provides-extras = ["daemon", "sdk"]
 
 [package.metadata.requires-dev]
 dev = [

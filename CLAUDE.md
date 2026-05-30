@@ -40,7 +40,9 @@ test assertions in one pass.
 
 ```bash
 uv sync                                              # create .venv, install (dev deps incl. teken)
+uv sync --extra daemon                               # + reachy-mini (the reachy-mini-daemon binary)
 uv run reachy whoami                                 # run the CLI (NOT `reachy-mini-cli`)
+uv run reachy daemon start                           # bring the local daemon up (needs [daemon] extra)
 uv run pytest -n auto                                # full suite (parallel)
 uv run pytest tests/test_cli.py::test_whoami_text    # a single test
 uv run pytest --cov=reachy --cov-report=term         # with coverage (CI gate: fail_under=60)
@@ -93,13 +95,29 @@ you touch the CLI.
   line scanner (no YAML library) and walks up from `__file__` to find it.
   `doctor` re-implements the steward invariants (prompt-file-present,
   backend-consistency `claude`→`CLAUDE.md`, skills-present).
+- **`daemon` noun & process module:** `device`/`app`/`move` are *clients* of a
+  running daemon; `reachy/cli/_commands/daemon.py` + `reachy/daemon.py` are the
+  other half — they start/stop/status the local `reachy-mini-daemon` OS process
+  (background spawn + PID/log under `$REACHY_STATE_DIR` / `$XDG_STATE_HOME/reachy`,
+  health-poll via `GET /api/daemon/status`). Pure stdlib (`subprocess`/`signal`/
+  `urllib`); the daemon *binary* comes from the `[daemon]` extra. Its `overview`
+  is hand-built (no `--transport sdk` line) — `daemon` does NOT use a transport,
+  so it does not call `_robot.noun_overview`/`get_transport`. A missing binary
+  raises a clean exit-2 `CliError` pointing at the `[daemon]` install.
 
 ## Hard constraints
 
-- **Zero runtime dependencies.** `pyproject.toml` has `dependencies = []` on
-  purpose; `teken` is dev-only. This is why `whoami` hand-rolls YAML parsing.
-  Do not add a third-party runtime import without an explicit decision to change
-  this — it would break the "self-contained runtime" property the README sells.
+- **Zero *base* runtime dependencies.** `pyproject.toml` keeps base
+  `dependencies = []` on purpose; `teken` is dev-only. This is why `whoami`
+  hand-rolls YAML parsing and `reachy/daemon.py` manages the daemon process with
+  stdlib `subprocess`/`urllib` only. The **recommended default install is `pip
+  install 'reachy-cli[daemon]'`** (pulls `reachy-mini` for the
+  `reachy-mini-daemon` binary); the bare `pip install reachy-cli` is the
+  HTTP-only *remote* profile. Keep the *base* dep-free — anything that needs
+  `reachy-mini` (the `sdk` transport, the daemon binary) goes behind the
+  `[daemon]`/`[sdk]` extras, never into base `dependencies`. Adding a base
+  runtime dep needs an explicit decision; it would break the dependency-free
+  remote profile the README sells.
 - **Python ≥ 3.12** (uses `X | None`, `tomllib`, etc.).
 - **Every PR bumps the version**, even docs/config/CI-only changes — the
   `version-check` CI job blocks the merge otherwise (it compares
