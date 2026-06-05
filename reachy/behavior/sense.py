@@ -95,9 +95,11 @@ class DoaPoller:
             t = self._now()
         if self._next_t is None or t >= self._next_t:
             self._next_t = t + self._period
+            # Any failure (no mic, a 500, an unsupported transport) means "no
+            # reading" — it must never crash the 50 Hz loop.
             try:
                 self._last = self._read()
-            except Exception:  # noqa: BLE001 - any failure => "no reading", never crash the loop
+            except Exception:  # noqa: BLE001
                 self._last = EMPTY_SENSE
         return self._last
 
