@@ -216,6 +216,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         data["active"] = published.get("active", [])
         data["ownership"] = published.get("ownership", {})
         data["compose_hz"] = published.get("compose_hz")
+        if "doa" in published:
+            data["doa"] = published["doa"]
     emit_payload(data, json_mode=json_mode)
     return 0
 

@@ -567,6 +567,7 @@ def test_status_reads_published_state(monkeypatch, capsys) -> None:
     main(["behavior", "status", "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert payload["ownership"]["head"].startswith("feel-alive")
+    assert payload["doa"] == {"angle": None, "speech_detected": False}  # surfaced from state
 
 
 class _FakePopen:
