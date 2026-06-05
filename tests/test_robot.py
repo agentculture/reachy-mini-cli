@@ -79,6 +79,42 @@ def test_device_state_uses_state_endpoint(monkeypatch) -> None:
     assert rec["url"].endswith("/api/state/full")
 
 
+# --- DoA (sound direction-of-arrival, read by the behavior engine) --------
+
+
+def test_doa_endpoint_and_per_call_timeout(monkeypatch) -> None:
+    from reachy.robot.http_transport import HttpTransport
+
+    rec: dict = {}
+    _patch_urlopen(monkeypatch, {"angle": 1.2, "speech_detected": True}, rec)
+    transport = HttpTransport(base_url="http://localhost:8000", timeout=10.0)
+    out = transport.doa(timeout=0.1)
+    assert out == {"angle": 1.2, "speech_detected": True}
+    assert rec["method"] == "GET"
+    assert rec["url"].endswith("/api/state/doa")
+    assert rec["timeout"] == 0.1  # per-call override, not the transport's 10s default
+
+
+def test_doa_null_body_is_none(monkeypatch) -> None:
+    from reachy.robot.http_transport import HttpTransport
+
+    _patch_urlopen(monkeypatch, None)  # a no-mic unit answers with a null/empty body
+    assert HttpTransport().doa() is None
+
+
+def test_doa_http_500_is_env_error(monkeypatch) -> None:
+    from reachy.cli._errors import EXIT_ENV_ERROR, CliError
+    from reachy.robot.http_transport import HttpTransport
+
+    def _boom(req, timeout=None):  # noqa: ANN001 - test shim
+        raise urllib.error.HTTPError(req.full_url, 500, "err", email.message.Message(), None)
+
+    monkeypatch.setattr("urllib.request.urlopen", _boom)
+    with pytest.raises(CliError) as exc:
+        HttpTransport().doa()
+    assert exc.value.code == EXIT_ENV_ERROR
+
+
 # --- app ------------------------------------------------------------------
 
 

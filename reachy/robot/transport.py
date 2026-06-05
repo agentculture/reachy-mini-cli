@@ -67,6 +67,14 @@ class Transport:
     def robot_state(self) -> object:
         raise self._unsupported("device state")
 
+    def doa(self, *, timeout: float | None = None) -> object:
+        """Read the sound Direction of Arrival (``{angle, speech_detected}`` or null).
+
+        Polled at a low rate by the behavior engine's sense source; ``timeout``
+        overrides the transport's default so a slow daemon can't stall the loop.
+        """
+        raise self._unsupported("state doa")
+
     # --- apps ------------------------------------------------------------
     def apps_list(self) -> object:
         raise self._unsupported("app list")

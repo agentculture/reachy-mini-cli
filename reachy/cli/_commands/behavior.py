@@ -7,6 +7,11 @@ per-channel contention model (``passive`` / ``stoppable`` / ``unstoppable`` /
 conflict. ``feel-alive`` runs as a passive base layer so the robot stays alive on
 any channel nothing else claims.
 
+Most behaviors are pure motion; ``listen`` is *sensor-driven* — it reads the sound
+Direction of Arrival from the daemon and orients the head (optionally the body)
+toward it (``behavior run listen``), yielding back to ``feel-alive`` when there is
+no sound (or no mic).
+
 * ``behavior list`` — the built-in behavior catalog (no robot needed).
 * ``behavior run`` / ``stop`` / ``status`` — drive the running engine (auto-starts
   it) through the command spool.
@@ -25,6 +30,7 @@ from reachy.behavior import control, library, supervisor
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.model import CHANNELS, StopClass
+from reachy.behavior.sense import DOA_TIMEOUT, DoaPoller, read_doa
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
@@ -287,6 +293,10 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     transport = get_transport(args)
     config = _engine_config(args)
     spool = control.CommandSpool()
+    # Sound Direction-of-Arrival source for sensor-driven behaviors (e.g. listen).
+    # Polled only while such a behavior is active, throttled, with a short timeout;
+    # any failure (no mic, unsupported transport) degrades to "no reading".
+    sense = DoaPoller(read=lambda: read_doa(transport, timeout=DOA_TIMEOUT))
 
     def _on_start() -> None:
         if not json_mode:
@@ -306,6 +316,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         emit=_emit,
         max_ticks=args.max_ticks,
         control=spool,
+        sense=sense,
     )
     if not json_mode:
         emit_diagnostic(f"[behavior] engine stopped after {ticks} tick(s)")

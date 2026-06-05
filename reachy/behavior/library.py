@@ -1,17 +1,23 @@
 """The built-in behavior library — named, parametric, pure motion generators.
 
 Each :class:`LibraryEntry` is data (which channels it claims, its default
-contention class, its natural lifetime, a typed parameter schema) plus a pure
-``fn(t_local, params) -> Contribution``. ``behavior list`` renders the registry
-without instantiating anything; the engine calls :func:`build` to turn a
+contention class, its natural lifetime, a typed parameter schema) plus a
+``fn(t_local, params, sense) -> Contribution``. ``behavior list`` renders the
+registry without instantiating anything; the engine calls :func:`build` to turn a
 resolved (name, params, class, lifetime) into a live :class:`Behavior`.
 
-Every generator is a *continuous* function of behavior-local time — smooth trig,
-no randomness — because the engine streams immediate ``set_target`` poses at
-50 Hz with no daemon-side interpolation. (This is why the idle ``feel-alive``
-layer here is a fresh continuous formulation rather than ``alive.next_pose``,
-which re-samples a random gaze target per call and is built for the slower,
-``goto``-interpolated demo-mode loop.)
+Almost every generator is a *pure, continuous* function of behavior-local time —
+smooth trig, no randomness, ignoring ``sense`` — because the engine streams
+immediate ``set_target`` poses at 50 Hz with no daemon-side interpolation. (This
+is why the idle ``feel-alive`` layer here is a fresh continuous formulation rather
+than ``alive.next_pose``, which re-samples a random gaze target per call and is
+built for the slower, ``goto``-interpolated demo-mode loop.)
+
+The one exception is ``listen``: a *sensor-driven* entry (``wants_sense=True``)
+whose ``make_fn`` builds a fresh stateful closure per behavior — it reads the
+sound Direction of Arrival from ``sense`` and slews the head toward it, abstaining
+(returning ``None`` channels, so ``feel-alive`` shows through) when there is no
+sound to react to.
 
 Units are the CLI's friendly ones: millimetres, degrees, seconds.
 """
@@ -23,9 +29,10 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass, neutral_head
+from reachy.behavior.sense import Sense, doa_angle_to_yaw
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 
-ContribFn = Callable[[float, dict], Contribution]
+ContribFn = Callable[[float, dict, Sense], Contribution]
 
 
 @dataclass(frozen=True)
@@ -39,7 +46,13 @@ class Param:
 
 @dataclass(frozen=True)
 class LibraryEntry:
-    """A named behavior template: metadata + a pure contribution function."""
+    """A named behavior template: metadata + a contribution function.
+
+    A pure entry supplies ``fn`` directly. A *sensor-driven* entry supplies
+    ``make_fn`` (a zero-arg factory) instead, so :func:`build` mints a fresh
+    stateful closure per behavior, and sets ``wants_sense`` so the engine feeds it
+    a live :class:`Sense` (pure entries always get :data:`EMPTY_SENSE`).
+    """
 
     name: str
     summary: str
@@ -48,10 +61,19 @@ class LibraryEntry:
     looping: bool
     default_duration: float | None
     params: dict[str, Param]
-    fn: ContribFn = field(compare=False, repr=False)
+    fn: ContribFn | None = field(default=None, compare=False, repr=False)
+    make_fn: Callable[[], ContribFn] | None = field(default=None, compare=False, repr=False)
+    wants_sense: bool = False
 
     def default_params(self) -> dict[str, float]:
         return {k: p.default for k, p in self.params.items()}
+
+    def build_fn(self) -> ContribFn:
+        """The contribution function for one behavior instance (fresh if stateful)."""
+        if self.make_fn is not None:
+            return self.make_fn()
+        assert self.fn is not None  # nosec B101 - an entry has exactly one of fn / make_fn
+        return self.fn
 
 
 # --------------------------------------------------------------------------- #
@@ -81,7 +103,7 @@ def _sin_at(t: float, period: float) -> float:
 # --------------------------------------------------------------------------- #
 
 
-def _feel_alive(t: float, p: dict) -> Contribution:
+def _feel_alive(t: float, p: dict, _sense: Sense) -> Contribution:
     """Continuous idle motion: breathing + slow organic gaze wander + antenna sway."""
     e = p["energy"]
     phase = 2.0 * math.pi * t / p["breathe_period"] if p["breathe_period"] else 0.0
@@ -99,20 +121,20 @@ def _feel_alive(t: float, p: dict) -> Contribution:
     )
 
 
-def _gaze_hold(t: float, p: dict) -> Contribution:
+def _gaze_hold(t: float, p: dict, _sense: Sense) -> Contribution:
     """Hold a fixed head offset (the 'look up-and-aside, hold N seconds' case)."""
     return Contribution(head=_head(yaw=p["yaw"], pitch=p["pitch"], roll=p["roll"], z=p["z"]))
 
 
-def _nod(t: float, p: dict) -> Contribution:
+def _nod(t: float, p: dict, _sense: Sense) -> Contribution:
     return Contribution(head=_head(pitch=p["amp"] * _sin_at(t, p["period"])))
 
 
-def _shake(t: float, p: dict) -> Contribution:
+def _shake(t: float, p: dict, _sense: Sense) -> Contribution:
     return Contribution(head=_head(yaw=p["amp"] * _sin_at(t, p["period"])))
 
 
-def _speak(t: float, p: dict) -> Contribution:
+def _speak(t: float, p: dict, _sense: Sense) -> Contribution:
     """Speech-like head bob: a quick pitch oscillation with a smaller offset yaw."""
     ph = 2.0 * math.pi * t / p["period"] if p["period"] else 0.0
     return Contribution(
@@ -120,20 +142,64 @@ def _speak(t: float, p: dict) -> Contribution:
     )
 
 
-def _thoughtful(t: float, p: dict) -> Contribution:
+def _thoughtful(t: float, p: dict, _sense: Sense) -> Contribution:
     """Ease into a tilted, gazing-aside hold (a 'thinking' gesture)."""
     k = _smoothstep(t / p["rise"]) if p["rise"] else 1.0
     return Contribution(head=_head(pitch=p["pitch"] * k, yaw=p["yaw"] * k, roll=p["roll"] * k))
 
 
-def _antenna_sway(t: float, p: dict) -> Contribution:
+def _antenna_sway(t: float, p: dict, _sense: Sense) -> Contribution:
     sway = p["amp"] * _sin_at(t, p["period"])
     return Contribution(antennas=(sway, -sway))
 
 
-def _body_turn_hold(t: float, p: dict) -> Contribution:
+def _body_turn_hold(t: float, p: dict, _sense: Sense) -> Contribution:
     k = _smoothstep(t / p["rise"]) if p["rise"] else 1.0
     return Contribution(body_yaw=p["yaw"] * k)
+
+
+def _clamp(value: float, limit: float) -> float:
+    """Clamp ``value`` to the symmetric range ``[-limit, limit]``."""
+    return max(-limit, min(limit, value))
+
+
+def _make_listen() -> ContribFn:
+    """Build a fresh sound-orienting closure: slew head (and optionally body) toward DoA.
+
+    Unlike the pure generators above this is *stateful* — it holds the current
+    head/body yaw and the last tick time so it can rate-limit (ease, not snap) the
+    slew toward the sound direction. When there is no usable reading — no mic,
+    daemon error, or (with ``speech_only``) no speech — it **abstains** by returning
+    ``None`` channels, so the passive ``feel-alive`` base layer keeps the head and
+    body alive rather than freezing them at the last orientation.
+    """
+    state = {"yaw_head": 0.0, "yaw_body": 0.0, "last_t": None}
+
+    def _listen(t: float, p: dict, sense: Sense) -> Contribution:
+        speech_only = p["speech_only"] >= 0.5
+        angle = sense.doa_angle
+        signal = angle is not None and (not speech_only or sense.speech_detected)
+        if not signal:
+            # Nothing to orient to: abstain so feel-alive shows through. Keep the
+            # slew state untouched so a re-acquired sound eases from where we were.
+            state["last_t"] = t
+            return Contribution(head=None, body_yaw=None)
+        last = state["last_t"]
+        dt = 0.0 if last is None else max(0.0, t - last)
+        state["last_t"] = t
+        # Exponential ease toward the target. dt==0 (first active tick) -> alpha 0,
+        # so it eases up from center rather than snapping; smooth<=0 -> snap.
+        alpha = 1.0 - math.exp(-dt / p["smooth"]) if p["smooth"] > 0 else 1.0
+        target_head = _clamp(doa_angle_to_yaw(angle, p["gain"]), p["max_yaw"])
+        state["yaw_head"] += (target_head - state["yaw_head"]) * alpha
+        body_yaw = None
+        if p["body_gain"] > 0:
+            target_body = _clamp(doa_angle_to_yaw(angle, p["body_gain"]), p["body_max"])
+            state["yaw_body"] += (target_body - state["yaw_body"]) * alpha
+            body_yaw = state["yaw_body"]
+        return Contribution(head=_head(yaw=state["yaw_head"]), body_yaw=body_yaw)
+
+    return _listen
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +327,24 @@ LIBRARY: dict[str, LibraryEntry] = {
         },
         fn=_body_turn_hold,
     ),
+    "listen": LibraryEntry(
+        name="listen",
+        summary="turn the head/body toward the direction of arrival of sound (DoA)",
+        channels=frozenset({"head", "body_yaw"}),
+        default_class=StopClass.STOPPABLE,
+        looping=True,
+        default_duration=None,
+        params={
+            "gain": Param(0.6, "x", "head-yaw gain per acoustic angle"),
+            "max_yaw": Param(35.0, "deg", "max head yaw toward sound"),
+            "smooth": Param(0.35, "s", "slew ease time constant (smaller = snappier)"),
+            "speech_only": Param(0.0, "", "react only to speech (1) vs any sound (0)"),
+            "body_gain": Param(0.0, "x", "body-yaw gain per acoustic angle (0 = head only)"),
+            "body_max": Param(45.0, "deg", "max body yaw toward sound"),
+        },
+        make_fn=_make_listen,
+        wants_sense=True,
+    ),
 }
 
 
@@ -371,5 +455,6 @@ def build(
         stop_class=stop_class,
         lifetime=lifetime,
         params=dict(params),
-        fn=entry.fn,
+        fn=entry.build_fn(),
+        wants_sense=entry.wants_sense,
     )

@@ -169,6 +169,27 @@ uv run reachy demo-mode stop                  # eases back to neutral
 As you make the motion richer over time, edit `reachy/alive.py` (or the config)
 and `demo-mode restart` to apply it.
 
+### Behaviors — compose motion, and orient toward sound
+
+`behavior` runs a 50 Hz engine that **composes** named behaviors on a per-channel
+contention model (`head` / `antennas` / `body_yaw`), with `feel-alive` as a passive
+base layer. Push behaviors onto the running engine from separate commands:
+
+```bash
+uv run reachy behavior engine start            # bring the 50 Hz loop up
+uv run reachy behavior run speak --duration 8  # head bobs like speech
+uv run reachy behavior run listen              # orient the head toward sound
+uv run reachy behavior status --json
+uv run reachy behavior stop all                # keeps the feel-alive base layer
+```
+
+`listen` is **sound-reactive**: it reads the mic array's Direction of Arrival from
+the daemon and slews the head (and, with `--set body_gain=0.5`, the body) toward
+where sound comes from — reacting to any sound by default (`--set speech_only=1`
+for speech only). With no sound, or on a unit whose mic is unavailable, it yields
+back to `feel-alive` rather than freezing. See `reachy explain behavior` for the
+full catalog, channels, and contention model.
+
 ## Make it your own
 
 1. Rename the package `reachy/` and the `reachy-mini-cli`

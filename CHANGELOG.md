@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-06
+
+### Added
+
+- behavior run listen — sound-reactive behavior that orients the head (and optionally the body, via --set body_gain) toward the sound Direction of Arrival read from the daemon; reacts to any sound by default (--set speech_only=1 for speech only), and degrades gracefully when the mic is unavailable
+- reachy/behavior/sense.py: Sense snapshot, DoaPoller (throttled, error-tolerant DoA reader), and HttpTransport.doa() over GET /api/state/doa
+
+### Changed
+
+- Behavior contribution signature is now fn(t, params, sense); the engine arbitration is abstention-aware — a behavior that returns None for a claimed channel yields it to the next-priority claimant, so listen falls back to feel-alive when there is no sound
+- behavior status now reports the live (resolved) per-channel ownership plus the latest DoA snapshot
+
 ## [0.5.0] - 2026-06-05
 
 ### Added

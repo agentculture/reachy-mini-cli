@@ -30,18 +30,31 @@ from dataclasses import dataclass, field
 from reachy.behavior.model import CHANNELS, Behavior, StopClass
 
 
-def arbitrate(behaviors: list[Behavior]) -> dict[str, Behavior | None]:
+def arbitrate(
+    behaviors: list[Behavior], contribs: dict | None = None
+) -> dict[str, Behavior | None]:
     """Assign each channel its owner. ``behaviors`` is oldest-first (recency = later).
 
     The owner of a channel is the candidate claiming it with the highest class
     priority, ties broken by most-recently-admitted. A channel no behavior claims
     maps to ``None``. A ``passive`` behavior (priority 0) therefore wins a channel
     only when nothing non-passive claims it.
+
+    With ``contribs`` (a ``{behavior_id: Contribution}`` for this tick) the result
+    is **abstention-aware**: a claimant whose contribution leaves a channel ``None``
+    is skipped for that channel, so it falls through to the next-priority claimant
+    (a sound-reactive behavior with no sound yields the head back to ``feel-alive``
+    rather than freezing it). Without ``contribs`` (the default, used by
+    :func:`admit` and as a fallback) selection is purely claim-based, as before.
     """
     owners: dict[str, Behavior | None] = dict.fromkeys(CHANNELS)
     indexed = list(enumerate(behaviors))
     for channel in CHANNELS:
         candidates = [(i, b) for i, b in indexed if channel in b.channels]
+        if contribs is not None:
+            candidates = [
+                (i, b) for i, b in candidates if contribs[b.id].channel(channel) is not None
+            ]
         if not candidates:
             continue
         _, best = max(candidates, key=lambda ib: (ib[1].stop_class.priority, ib[0]))

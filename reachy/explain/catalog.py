@@ -393,6 +393,17 @@ Same-channel conflicts resolve by class priority
 
 Each behavior has a natural default (e.g. `gaze-hold` is one-shot, `speak` loops).
 
+## Sensing — the `listen` behavior
+
+Most behaviors are pure motion. `listen` is **sensor-driven**: it reads the sound
+Direction of Arrival (DoA) from the daemon and slews the head toward where sound
+comes from. By default it reacts to **any** sound (`--set speech_only=1` to react
+only to speech); pass `--set body_gain=0.5` to also turn the body (it claims
+`body_yaw` too). When there is no sound — or the unit has no working mic (DoA
+unavailable) — it **abstains**, so `feel-alive` keeps the head and body gently
+alive rather than freezing them. Params: `gain`, `max_yaw`, `smooth` (slew ease),
+`speech_only`, `body_gain`, `body_max`.
+
 ## Verbs
 
 - `reachy-mini-cli behavior list` — the built-in catalog (names, channels,
@@ -423,6 +434,8 @@ Each behavior has a natural default (e.g. `gaze-hold` is one-shot, `speak` loops
     reachy-mini-cli daemon start                         # something to drive
     reachy-mini-cli behavior engine start                # bring the 50 Hz loop up
     reachy-mini-cli behavior run speak --duration 8      # head bobs like speech
+    reachy-mini-cli behavior run listen                  # orient head toward sound
+    reachy-mini-cli behavior run listen --set body_gain=0.5 speech_only=1
     reachy-mini-cli behavior run antenna-sway --loop --class stopping \\
         --channels antennas body_yaw                     # sway + seize the body yaw
     reachy-mini-cli behavior status --json

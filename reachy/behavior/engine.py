@@ -30,6 +30,7 @@ from reachy.behavior import control as control_mod
 from reachy.behavior import library
 from reachy.behavior.arbitration import admit, arbitrate
 from reachy.behavior.model import Behavior, Lifetime, StopClass, neutral_head
+from reachy.behavior.sense import EMPTY_SENSE, Sense
 from reachy.cli._errors import CliError
 from reachy.looputil import (
     DEFAULT_SLEEP_SLICE,
@@ -63,11 +64,16 @@ class ActiveBehavior:
 
 @dataclass
 class Engine:
-    """The active-behavior set and the pure per-tick composition."""
+    """The active-behavior set and the per-tick composition."""
 
     active: list[ActiveBehavior] = field(default_factory=list)
     _seq: int = 0
     _base_ids: set[str] = field(default_factory=set)
+    # The most recent tick's resolved (abstention-aware) ownership and sense
+    # snapshot, surfaced by ``state()`` so ``behavior status`` reports who *is*
+    # driving each channel (not just who nominally claims it) and the last DoA.
+    _last_ownership: dict | None = None
+    _last_sense: Sense = EMPTY_SENSE
 
     # --- mutation --------------------------------------------------------
     def _next_id(self, name: str) -> str:
@@ -175,9 +181,14 @@ class Engine:
         except Exception as err:  # noqa: BLE001 - defensive: isolate a bad command
             return {"ok": False, "op": op, "error": f"{type(err).__name__}: {err}"}
 
-    # --- pure composition ------------------------------------------------
-    def compose_tick(self, now: float) -> dict:
-        """Drop expired, arbitrate, and compose one complete pose. Mutates ``active``."""
+    # --- composition -----------------------------------------------------
+    def compose_tick(self, now: float, sense: Sense = EMPTY_SENSE) -> dict:
+        """Drop expired, arbitrate, and compose one complete pose. Mutates ``active``.
+
+        Every live behavior is asked for its contribution once (not just owners) so
+        abstention-aware :func:`arbitrate` can fall a channel through to the next
+        claimant when its nominal owner returns ``None`` for it.
+        """
         live: list[ActiveBehavior] = []
         expired: list[str] = []
         for ab in self.active:
@@ -187,20 +198,25 @@ class Engine:
                 live.append(ab)
         self.active = live
 
-        owners = arbitrate([ab.behavior for ab in live])
-        start_by_id = {ab.behavior.id: ab.start_t for ab in live}
-        contribs: dict[str, object] = {}
-        for owner in owners.values():
-            if owner is not None and owner.id not in contribs:
-                contribs[owner.id] = owner.contribution(now - start_by_id[owner.id])
+        behaviors = [ab.behavior for ab in live]
+        contribs: dict[str, object] = {
+            ab.behavior.id: ab.behavior.contribution(now - ab.start_t, sense) for ab in live
+        }
+        owners = arbitrate(behaviors, contribs)
         pose = _compose_pose(owners, contribs)
         ownership = {ch: (o.id if o is not None else None) for ch, o in owners.items()}
+        self._last_ownership = ownership
+        self._last_sense = sense
         return {"pose": pose, "ownership": ownership, "expired": expired}
 
     # --- snapshot --------------------------------------------------------
     def state(self, now: float, config: EngineConfig) -> dict:
-        """A JSON snapshot for ``behavior status`` (active set + channel ownership)."""
-        owners = arbitrate([ab.behavior for ab in self.active])
+        """A JSON snapshot for ``behavior status`` (active set + channel ownership + DoA)."""
+        if self._last_ownership is not None:
+            ownership = self._last_ownership
+        else:
+            owners = arbitrate([ab.behavior for ab in self.active])
+            ownership = {ch: (o.id if o is not None else None) for ch, o in owners.items()}
         active = []
         for ab in self.active:
             t_local = now - ab.start_t
@@ -221,7 +237,11 @@ class Engine:
             "updated": round(now, 3),
             "compose_hz": config.compose_hz,
             "active": active,
-            "ownership": {ch: (o.id if o is not None else None) for ch, o in owners.items()},
+            "ownership": ownership,
+            "doa": {
+                "angle": self._last_sense.doa_angle,
+                "speech_detected": self._last_sense.speech_detected,
+            },
         }
 
 
@@ -292,6 +312,17 @@ def _apply_commands(engine: Engine, control: "control_mod.CommandSpool | None", 
     return changed
 
 
+def _read_sense(engine: Engine, sense, t: float) -> Sense:
+    """Poll the sense source — but only while some behavior wants it (else EMPTY).
+
+    Gating on ``wants_sense`` keeps an idle engine from touching the mic endpoint
+    at all; the :class:`~reachy.behavior.sense.DoaPoller` itself throttles the rate.
+    """
+    if sense is None or not any(ab.behavior.wants_sense for ab in engine.active):
+        return EMPTY_SENSE
+    return sense(t)
+
+
 def _drive(
     engine: Engine,
     sink: TargetSink,
@@ -304,6 +335,7 @@ def _drive(
     sleep,
     max_ticks: int | None,
     timing: _Timing,
+    sense=None,
 ) -> int:
     """The 50 Hz body: drain → compose → stream → publish, until stopped. Returns ticks."""
     ticks = 0
@@ -312,7 +344,7 @@ def _drive(
     while not stop["flag"]:
         t = now()
         changed = _apply_commands(engine, control, t)
-        tick = engine.compose_tick(t)
+        tick = engine.compose_tick(t, _read_sense(engine, sense, t))
         changed = changed or bool(tick["expired"])
         consecutive = _stream_tick(sink, tick["pose"], consecutive, config.max_errors)
         ticks += 1
@@ -338,12 +370,18 @@ def run(
     max_ticks: int | None = None,
     control: control_mod.CommandSpool | None = None,
     engine: Engine | None = None,
+    sense=None,
 ) -> int:
     """Drive the robot from composed behaviors until stopped. Returns ticks run.
 
     Connectivity is validated by an opening neutral ``set_target`` (a dead daemon
     raises, so the loop exits cleanly before announcing a start). ``on_start`` runs
     only after that succeeds. The robot is eased to neutral on exit (best effort).
+
+    ``sense`` is an optional ``(t) -> Sense`` source (e.g. a
+    :class:`~reachy.behavior.sense.DoaPoller`); it is polled only while a
+    sensor-driven behavior is active, and every behavior otherwise gets
+    :data:`EMPTY_SENSE`.
     """
     engine = engine if engine is not None else Engine()
     if control is not None:
@@ -371,6 +409,7 @@ def run(
                     sleep=sleep,
                     max_ticks=max_ticks,
                     timing=timing,
+                    sense=sense,
                 )
             finally:
                 if config.settle:

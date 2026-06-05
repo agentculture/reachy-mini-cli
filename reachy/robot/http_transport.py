@@ -52,7 +52,14 @@ class HttpTransport(Transport):
         self.timeout = timeout
 
     # --- core request ----------------------------------------------------
-    def _request(self, method: str, path: str, body: dict | None = None) -> object:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> object:
         url = f"{self.base_url}{path}"
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(
@@ -61,8 +68,9 @@ class HttpTransport(Transport):
             method=method,
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
+        eff_timeout = timeout if timeout is not None else self.timeout
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # nosec B310
+            with urllib.request.urlopen(req, timeout=eff_timeout) as resp:  # nosec B310
                 raw = resp.read()
         except urllib.error.HTTPError as err:
             raise self._http_error(err) from err
@@ -114,6 +122,11 @@ class HttpTransport(Transport):
 
     def robot_state(self) -> object:
         return self._request("GET", "/api/state/full")
+
+    def doa(self, *, timeout: float | None = None) -> object:
+        # Returns {angle, speech_detected} (angle in radians, 0=left/π=right), or a
+        # JSON null on a unit with no working mic — read_doa maps both gracefully.
+        return self._request("GET", "/api/state/doa", timeout=timeout)
 
     # --- apps ------------------------------------------------------------
     def apps_list(self) -> object:

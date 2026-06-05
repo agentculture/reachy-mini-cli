@@ -3,8 +3,15 @@
 No I/O, no transport, no ``reachy_mini``: every type here is a plain value object
 so the arbitration core and the library are trivially unit-testable. A
 :class:`Behavior` pairs a small immutable spec (which channels it claims, how it
-contends, how long it lives) with a *pure* contribution function — its desired
-per-channel offsets as a function of behavior-local time.
+contends, how long it lives) with a contribution function — its desired
+per-channel offsets as a function of behavior-local time and the latest
+:class:`~reachy.behavior.sense.Sense`.
+
+Most behaviors are *pure* — given the same behavior-local time they return the
+same offsets, ignoring ``sense`` — so motion is smooth and reproducible. A
+sensor-driven behavior (one whose library entry sets ``wants_sense``) is the
+exception: it reads ``sense`` and may hold internal slew state, so it is *not*
+reproducible from time alone.
 
 Units match the rest of the CLI (``move goto`` / ``alive``): millimetres for head
 translation, degrees for rotation and antennas/body yaw. The engine converts to
@@ -16,6 +23,8 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from typing import Callable
+
+from reachy.behavior.sense import EMPTY_SENSE, Sense
 
 # The three arbitration units. A *channel* is a group of DOF claimed and resolved
 # atomically; they mirror the daemon's three independent target fields
@@ -107,12 +116,20 @@ class Contribution:
 
 @dataclass
 class Behavior:
-    """A live behavior: an immutable spec plus a pure contribution function.
+    """A live behavior: an immutable spec plus a contribution function.
 
-    ``fn`` maps ``(t_local, params) -> Contribution`` and must be pure — given the
-    same behavior-local time it returns the same offsets, so motion is smooth and
-    reproducible regardless of when the behavior was admitted. ``id`` is assigned
-    by the engine (e.g. ``"speak-3"``); ``name`` is the library entry it came from.
+    ``fn`` maps ``(t_local, params, sense) -> Contribution``. For a pure behavior
+    it ignores ``sense`` and returns the same offsets for the same behavior-local
+    time, so motion is smooth and reproducible regardless of when it was admitted.
+    A sensor-driven behavior (``wants_sense=True``) reads ``sense`` and may hold
+    internal state, so the engine only feeds it a live :class:`Sense` (otherwise
+    every behavior gets :data:`EMPTY_SENSE`). ``id`` is assigned by the engine
+    (e.g. ``"speak-3"``); ``name`` is the library entry it came from.
+
+    A contribution that leaves a *claimed* channel ``None`` **abstains** from it
+    this tick: the engine then resolves that channel to the next-priority claimant
+    (a sound-reactive behavior with no sound yields the head back to ``feel-alive``
+    rather than freezing it).
     """
 
     id: str
@@ -121,11 +138,12 @@ class Behavior:
     stop_class: StopClass
     lifetime: Lifetime
     params: dict[str, float]
-    fn: Callable[[float, dict], Contribution] = field(repr=False, compare=False)
+    fn: Callable[[float, dict, Sense], Contribution] = field(repr=False, compare=False)
+    wants_sense: bool = False
 
-    def contribution(self, t_local: float) -> Contribution:
+    def contribution(self, t_local: float, sense: Sense = EMPTY_SENSE) -> Contribution:
         """The behavior's desired offsets at ``t_local`` seconds since it started."""
-        return self.fn(t_local, self.params)
+        return self.fn(t_local, self.params, sense)
 
     def is_expired(self, t_local: float) -> bool:
         """True once a finite lifetime has elapsed (looping-forever never expires)."""

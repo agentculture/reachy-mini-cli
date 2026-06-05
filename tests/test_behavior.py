@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 
 import pytest
 
@@ -24,6 +25,7 @@ from reachy.behavior import library
 from reachy.behavior.arbitration import admit, arbitrate
 from reachy.behavior.engine import Engine, EngineConfig
 from reachy.behavior.model import CHANNELS, Behavior, Contribution, Lifetime, StopClass
+from reachy.behavior.sense import EMPTY_SENSE, DoaPoller, Sense, doa_angle_to_yaw, read_doa
 from reachy.cli import main
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 
@@ -43,7 +45,7 @@ def _beh(name, cls, channels, *, looping=True, duration=None, bid=None) -> Behav
         stop_class=cls,
         lifetime=Lifetime(looping=looping, duration=duration),
         params={},
-        fn=lambda t, p: Contribution(),
+        fn=lambda t, p, s: Contribution(),
     )
 
 
@@ -719,3 +721,206 @@ def test_run_forwards_engine_flags_to_autostart(monkeypatch) -> None:
     assert rc == 0
     assert seen["base_layer"] is False and seen["settle"] is False
     assert seen["compose_hz"] == 30.0
+
+
+# --------------------------------------------------------------------------- #
+# Sense: read_doa / DoaPoller / angle mapping                                 #
+# --------------------------------------------------------------------------- #
+
+
+class _SenseTransport:
+    """A transport stub exposing only ``doa`` (what read_doa duck-types)."""
+
+    def __init__(self, result):
+        self._result = result
+        self.timeout = None
+
+    def doa(self, *, timeout=None):
+        self.timeout = timeout
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+def test_read_doa_maps_dict_and_null() -> None:
+    s = read_doa(_SenseTransport({"angle": 1.5, "speech_detected": True}))
+    assert s.doa_angle == 1.5 and s.speech_detected is True
+    assert read_doa(_SenseTransport(None)).doa_angle is None  # daemon null body
+    assert read_doa(_SenseTransport({"angle": None})).doa_angle is None
+    # missing speech_detected defaults to False
+    assert read_doa(_SenseTransport({"angle": 0.3})).speech_detected is False
+
+
+def test_read_doa_passes_timeout() -> None:
+    t = _SenseTransport({"angle": 0.0})
+    read_doa(t, timeout=0.05)
+    assert t.timeout == 0.05
+
+
+def test_doa_poller_throttles_on_injected_clock() -> None:
+    reads = {"n": 0}
+
+    def _read():
+        reads["n"] += 1
+        return Sense(doa_angle=float(reads["n"]))
+
+    poller = DoaPoller(_read, period=0.2)
+    assert poller(0.0).doa_angle == 1.0  # first read
+    assert poller(0.1).doa_angle == 1.0  # within the period -> cached, no re-read
+    assert poller(0.2).doa_angle == 2.0  # period elapsed -> read again
+    assert reads["n"] == 2
+
+
+def test_doa_poller_swallows_every_error() -> None:
+    def _no_mic() -> Sense:
+        raise RuntimeError("audio device not available")
+
+    poller = DoaPoller(_no_mic, period=0.2)
+    assert poller(0.0) is EMPTY_SENSE  # an exception caches "no reading", never raises
+
+
+def test_doa_angle_to_yaw_sign() -> None:
+    assert doa_angle_to_yaw(0.0, 1.0) > 0  # sound on the left -> +yaw (turn left)
+    assert doa_angle_to_yaw(math.pi, 1.0) < 0  # right -> -yaw
+    assert abs(doa_angle_to_yaw(math.pi / 2.0, 1.0)) < 1e-9  # front -> 0
+
+
+# --------------------------------------------------------------------------- #
+# Abstention-aware arbitration                                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_arbitrate_abstention_falls_through_to_lower_priority() -> None:
+    base = _beh("feel-alive", StopClass.PASSIVE, ["head"], bid="base")
+    listener = _beh("listen", StopClass.STOPPABLE, ["head"], bid="listen")
+    behaviors = [base, listener]
+    # listener (higher priority) abstains on head -> base wins it this tick
+    abstaining = {"base": Contribution(head={"yaw": 1.0}), "listen": Contribution(head=None)}
+    assert arbitrate(behaviors, abstaining)["head"].id == "base"
+    # listener drives head -> it wins (its priority beats passive)
+    driving = {"base": Contribution(head={"yaw": 1.0}), "listen": Contribution(head={"yaw": 2.0})}
+    assert arbitrate(behaviors, driving)["head"].id == "listen"
+    # no contribs -> claim-based as before (stoppable beats passive)
+    assert arbitrate(behaviors)["head"].id == "listen"
+
+
+# --------------------------------------------------------------------------- #
+# listen behavior                                                             #
+# --------------------------------------------------------------------------- #
+
+
+def _listen(bid="listen-1", **overrides) -> Behavior:
+    params = library.get("listen").default_params()
+    params.update(overrides)
+    return library.build(
+        "listen", params, StopClass.STOPPABLE, Lifetime(looping=True, duration=None), bid
+    )
+
+
+def test_listen_orients_toward_sound_sign() -> None:
+    for angle, check in ((0.0, lambda y: y > 0), (math.pi, lambda y: y < 0)):
+        beh = _listen()
+        beh.contribution(0.0, Sense(doa_angle=angle))  # prime (dt=0, no move)
+        c = beh.contribution(1.0, Sense(doa_angle=angle))  # ease toward target
+        assert check(c.head["yaw"])
+    front = _listen()
+    front.contribution(0.0, Sense(doa_angle=math.pi / 2.0))
+    assert abs(front.contribution(1.0, Sense(doa_angle=math.pi / 2.0)).head["yaw"]) < 1e-6
+
+
+def test_listen_clamps_to_max_yaw() -> None:
+    beh = _listen(gain=5.0, max_yaw=35.0, smooth=0.0)  # smooth 0 -> snap to target
+    assert beh.contribution(0.0, Sense(doa_angle=0.0)).head["yaw"] == 35.0
+    assert beh.contribution(0.1, Sense(doa_angle=math.pi)).head["yaw"] == -35.0
+
+
+def test_listen_abstains_without_signal() -> None:
+    beh = _listen()
+    for sense in (Sense(doa_angle=None), EMPTY_SENSE):
+        c = beh.contribution(0.5, sense)
+        assert c.head is None and c.body_yaw is None  # yield head + body to feel-alive
+
+
+def test_listen_speech_only_gates() -> None:
+    beh = _listen(speech_only=1.0, smooth=0.0)
+    assert beh.contribution(0.0, Sense(doa_angle=0.0, speech_detected=False)).head is None
+    c = beh.contribution(0.1, Sense(doa_angle=0.0, speech_detected=True))
+    assert c.head is not None and c.head["yaw"] > 0
+
+
+def test_listen_body_gain_gates_body_channel() -> None:
+    assert _listen(smooth=0.0).contribution(0.0, Sense(doa_angle=0.0)).body_yaw is None
+    turner = _listen(smooth=0.0, body_gain=5.0, body_max=45.0)
+    assert turner.contribution(0.0, Sense(doa_angle=0.0)).body_yaw == 45.0  # clamped, + = left
+    assert turner.contribution(0.1, Sense(doa_angle=math.pi)).body_yaw == -45.0
+
+
+def test_listen_eases_not_snaps() -> None:
+    beh = _listen(gain=0.6, max_yaw=35.0, smooth=0.35)
+    sound = Sense(doa_angle=0.0)
+    assert beh.contribution(0.0, sound).head["yaw"] == 0.0  # first tick (dt=0): no jump
+    stepped = beh.contribution(0.02, sound).head["yaw"]  # one 50 Hz tick
+    assert 0.0 < stepped < 35.0  # eased a small step toward target, not snapped
+
+
+# --------------------------------------------------------------------------- #
+# Engine + sense integration                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _engine_with_listen(**overrides) -> Engine:
+    eng = Engine()
+    eng.seed_base_layer(now=0.0, energy=1.0)
+    params = library.get("listen").default_params()
+    params.update(overrides)
+    eng.add("listen", params, StopClass.STOPPABLE, Lifetime(looping=True, duration=None), now=0.0)
+    return eng
+
+
+def test_engine_listen_owns_head_with_sound_yields_when_silent() -> None:
+    eng = _engine_with_listen()
+    eng.compose_tick(0.0, Sense(doa_angle=0.0))  # prime the slew
+    loud = eng.compose_tick(1.0, Sense(doa_angle=0.0))
+    assert loud["ownership"]["head"].startswith("listen")
+    assert loud["ownership"]["antennas"].startswith("feel-alive")  # listen never claims antennas
+    assert loud["pose"]["head"]["yaw"] > 0
+    silent = eng.compose_tick(2.0, EMPTY_SENSE)  # no sound -> listen abstains
+    assert silent["ownership"]["head"].startswith("feel-alive")
+
+
+def test_state_includes_doa_snapshot() -> None:
+    eng = _engine_with_listen()
+    eng.compose_tick(0.5, Sense(doa_angle=1.2, speech_detected=True))
+    st = eng.state(0.5, EngineConfig())
+    assert st["doa"] == {"angle": 1.2, "speech_detected": True}
+
+
+def test_run_polls_sense_only_while_a_sensor_behavior_is_active() -> None:
+    calls = {"n": 0}
+
+    def _sense(t):
+        calls["n"] += 1
+        return Sense(doa_angle=0.0)
+
+    # no sensor-driven behavior -> the sense source is never touched
+    E.run(
+        _FakeTransport(),
+        EngineConfig(base_layer=True, settle=False),
+        sleep=lambda *_: None,
+        now=_Clock(),
+        max_ticks=3,
+        engine=Engine(),
+        sense=_sense,
+    )
+    assert calls["n"] == 0
+    # a live listen -> polled every tick
+    E.run(
+        _FakeTransport(),
+        EngineConfig(base_layer=False, settle=False),
+        sleep=lambda *_: None,
+        now=_Clock(),
+        max_ticks=3,
+        engine=_engine_with_listen(),
+        sense=_sense,
+    )
+    assert calls["n"] == 3
