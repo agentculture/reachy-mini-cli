@@ -10,14 +10,28 @@ Every failure is mapped to a :class:`CliError` so no traceback ever leaks:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Iterator
 
 from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
-from reachy.robot.transport import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, Transport
+from reachy.robot.transport import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, TargetSink, Transport
+
+
+def _head_to_si(head: dict[str, float]) -> dict[str, float]:
+    """Friendly head offset (mm + degrees) -> the daemon's metres + radians."""
+    return {
+        "x": head["x"] / 1000.0,
+        "y": head["y"] / 1000.0,
+        "z": head["z"] / 1000.0,
+        "roll": math.radians(head["roll"]),
+        "pitch": math.radians(head["pitch"]),
+        "yaw": math.radians(head["yaw"]),
+    }
 
 
 class HttpTransport(Transport):
@@ -127,14 +141,7 @@ class HttpTransport(Transport):
     ) -> object:
         body: dict[str, object] = {"duration": duration, "interpolation": interpolation}
         if head is not None:
-            body["head_pose"] = {
-                "x": head["x"] / 1000.0,
-                "y": head["y"] / 1000.0,
-                "z": head["z"] / 1000.0,
-                "roll": math.radians(head["roll"]),
-                "pitch": math.radians(head["pitch"]),
-                "yaw": math.radians(head["yaw"]),
-            }
+            body["head_pose"] = _head_to_si(head)
         if antennas is not None:
             body["antennas"] = [math.radians(antennas[0]), math.radians(antennas[1])]
         if body_yaw is not None:
@@ -146,3 +153,31 @@ class HttpTransport(Transport):
 
     def sleep(self) -> object:
         return self._request("POST", "/api/move/play/goto_sleep")
+
+    # --- streaming / immediate target ------------------------------------
+    def set_target(
+        self,
+        *,
+        head: dict[str, float] | None = None,
+        antennas: tuple[float, float] | None = None,
+        body_yaw: float | None = None,
+    ) -> object:
+        # Immediate target: POST /api/move/set_target. The daemon *ignores* this
+        # while an interpolated goto/play move is running, so a streaming loop must
+        # own motion exclusively (no concurrent 'move goto'/wake while it runs).
+        body: dict[str, object] = {}
+        if head is not None:
+            body["target_head_pose"] = _head_to_si(head)
+        if antennas is not None:
+            body["target_antennas"] = [math.radians(antennas[0]), math.radians(antennas[1])]
+        if body_yaw is not None:
+            body["target_body_yaw"] = math.radians(body_yaw)
+        return self._request("POST", "/api/move/set_target", body)
+
+    @contextlib.contextmanager
+    def streaming(self) -> Iterator[TargetSink]:
+        # HTTP is stateless, so there is no session to hold open — the transport is
+        # its own sink (it has ``set_target``) and POSTs each tick (one request per
+        # pose; fine on loopback). The context manager exists so the engine can use
+        # one uniform ``with transport.streaming() as sink`` for both flavors.
+        yield self

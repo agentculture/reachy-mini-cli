@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-05
+
+### Added
+
+- `behavior` noun group: compose robot behaviors on a persistent 50 Hz loop. Push one-shot ("look up-and-aside, hold 5s") or looping ("speak: bob the head for N seconds or until stopped") behaviors onto a running engine; a per-channel contention model decides who drives `head` / `antennas` / `body_yaw` when they conflict. Verbs: `list`, `run`, `stop`, `status`, `engine start|stop|status|run`, `overview` — each with `--json`.
+- Four-class contention model (`passive` / `stoppable` / `unstoppable` / `stopping`): a `stopping` behavior evicts the `stoppable` ones on its channels, an `unstoppable` holds its channels until it finishes, and the `passive` base layer only drives a channel nothing else claims. Same-channel conflicts resolve by class priority, then most-recent.
+- `feel-alive` runs as a **passive base layer** (default on; `--no-base-layer` to disable) — a continuous idle motion (breathing, slow gaze wander, antenna sway), so an idle robot stays alive on any channel no behavior has taken. This generalizes `demo-mode`; the existing `demo-mode` noun is unchanged (migration is future work).
+- `reachy.behavior` package: `model` (channels, classes, lifetimes, the pure `Behavior`), `arbitration` (the pure `arbitrate`/`admit` core), `library` (built-in parametric behaviors: gaze-hold, nod, shake, speak, thoughtful, antenna-sway, body-turn-hold, feel-alive), `engine` (the 50 Hz compose loop), `control` (a command-spool + state-file IPC under the state dir), and `supervisor` (a PID-file process manager). Stdlib only — no new base runtime dependency.
+- Immediate-target streaming on the transport: `Transport.set_target(...)` (`POST /api/move/set_target` for http; `ReachyMini.set_target` for sdk) and a `streaming()` session that holds one robot connection open for the whole loop — so the 50 Hz stream pays the open/close cost once, not per pose.
+
+### Changed
+
+- Extracted the signal-stoppable / interruptible-sleep loop helpers from `reachy.alive` into a shared `reachy.looputil` (used by both demo-mode and the behavior engine), with a configurable sleep slice for high-rate loops.
+
+### Notes
+
+- While the engine runs it streams immediate targets and **owns robot motion exclusively** — don't drive the robot with `move goto` / `demo-mode` at the same time (the daemon ignores `set_target` while an interpolated move is running).
+
 ## [0.4.0] - 2026-05-30
 
 ### Added

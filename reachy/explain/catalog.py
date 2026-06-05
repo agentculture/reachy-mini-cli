@@ -38,6 +38,8 @@ buildable/deployable package baseline. Clone it, rename the package, edit
 - `reachy-mini-cli move <verb>` — runtime motion (goto, wake, sleep).
 - `reachy-mini-cli demo-mode <verb>` — start/stop a background loop that makes
   the robot feel alive (idle breathing, glances, antenna sway).
+- `reachy-mini-cli behavior <verb>` — compose behaviors on a 50 Hz loop
+  (`list`, `run`, `stop`, `status`, `engine`).
 
 The `device`/`app`/`move` verbs speak to the Reachy daemon over a transport
 flavor (`--transport http` by default, `sdk` optional); a missing daemon yields a
@@ -356,6 +358,79 @@ Without a systemd user session these exit `2` with a hint; use start/stop instea
 """.replace(_TRANSPORTS_SLOT, _TRANSPORTS)
 
 
+_BEHAVIOR = """\
+# reachy-mini-cli behavior
+
+Compose robot behaviors on a 50 Hz control loop. A persistent **engine** holds a
+set of active behaviors; you push behaviors onto it from separate commands, and a
+per-channel contention model decides who drives each part of the robot when they
+conflict. `feel-alive` runs as a passive base layer, so an idle robot keeps
+breathing on any channel nothing else claims.
+
+The engine streams *immediate* `set_target` poses, so **it owns motion
+exclusively while running** — don't drive the robot with `move goto` / `demo-mode`
+at the same time. The http transport needs a running daemon
+(`reachy-mini-cli daemon start`).
+
+## Channels and contention
+
+Behaviors claim one or more **channels** — `head`, `antennas`, `body_yaw` — and
+carry a contention **class**:
+
+- `passive` — drives a channel only when nothing else claims it; yields instantly.
+- `stoppable` — drives, but a newly-started `stopping` behavior removes it.
+- `unstoppable` — holds its channels until it finishes on its own; never removed.
+- `stopping` — on start, stops the `stoppable` behaviors sharing its channels.
+
+Same-channel conflicts resolve by class priority
+(`unstoppable` > `stopping` > `stoppable` > `passive`), then by most-recent.
+
+## Lifetime
+
+- one-shot (`--once`) — runs once for `--duration` seconds, then expires;
+- looping (`--loop`) — repeats until `--duration` elapses, or forever (no
+  duration) until stopped.
+
+Each behavior has a natural default (e.g. `gaze-hold` is one-shot, `speak` loops).
+
+## Verbs
+
+- `reachy-mini-cli behavior list` — the built-in catalog (names, channels,
+  default class, parameters). No robot needed.
+- `reachy-mini-cli behavior run <name> [--set k=v ...] [--class CLASS]
+  [--channels ...] [--once|--loop] [--duration N]` — push a behavior onto the
+  engine (auto-starts it). Reports what it admitted / evicted / is blocked on.
+- `reachy-mini-cli behavior stop <id|name|all>` — stop a running behavior
+  (`all` keeps the passive base layer).
+- `reachy-mini-cli behavior status` — active behaviors, per-channel ownership,
+  and engine/daemon state.
+- `reachy-mini-cli behavior engine start|stop|status|run` — manage the 50 Hz
+  engine process (start/stop in the background, or `run` in the foreground).
+- `reachy-mini-cli behavior overview` — the verb summary.
+
+{transports}
+
+## Notes
+
+- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`:
+  `behavior/engine.pid`, `behavior/engine.log`, and a command spool +
+  `state.json` the CLI and engine talk through.
+- The engine tick rate is `--compose-hz` (default 50); the base layer's
+  liveliness is `--energy`; disable the base layer with `--no-base-layer`.
+
+## Usage
+
+    reachy-mini-cli daemon start                         # something to drive
+    reachy-mini-cli behavior engine start                # bring the 50 Hz loop up
+    reachy-mini-cli behavior run speak --duration 8      # head bobs like speech
+    reachy-mini-cli behavior run antenna-sway --loop --class stopping \\
+        --channels antennas body_yaw                     # sway + seize the body yaw
+    reachy-mini-cli behavior status --json
+    reachy-mini-cli behavior stop all
+    reachy-mini-cli behavior engine stop                 # eases robot to neutral
+""".replace(_TRANSPORTS_SLOT, _TRANSPORTS)
+
+
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
     ("reachy",): _ROOT,
@@ -399,4 +474,16 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("demo-mode", "enable"): _DEMO,
     ("demo-mode", "disable"): _DEMO,
     ("demo-mode", "uninstall"): _DEMO,
+    ("behavior",): _BEHAVIOR,
+    ("behavior", "overview"): _BEHAVIOR,
+    ("behavior", "list"): _BEHAVIOR,
+    ("behavior", "run"): _BEHAVIOR,
+    ("behavior", "stop"): _BEHAVIOR,
+    ("behavior", "status"): _BEHAVIOR,
+    ("behavior", "engine"): _BEHAVIOR,
+    ("behavior", "engine", "overview"): _BEHAVIOR,
+    ("behavior", "engine", "start"): _BEHAVIOR,
+    ("behavior", "engine", "stop"): _BEHAVIOR,
+    ("behavior", "engine", "status"): _BEHAVIOR,
+    ("behavior", "engine", "run"): _BEHAVIOR,
 }

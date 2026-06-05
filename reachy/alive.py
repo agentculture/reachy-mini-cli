@@ -38,6 +38,7 @@ from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 # Reuse the daemon's generic process primitives + state dir so demo-mode and the
 # daemon share one bookkeeping location and one definition of "is this pid alive".
 from reachy.daemon import health_ok, is_alive, state_dir
+from reachy.looputil import install_stop_handlers, interruptible_sleep, restore_stop_handlers
 from reachy.robot.transport import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, Transport
 
 # Grace window after spawning before we trust the loop came up (vs crashed).
@@ -149,41 +150,6 @@ def _send_pose(transport: Transport, pose: dict[str, object]) -> object:
     )
 
 
-def _install_stop_handlers(stop: dict):
-    """Install SIGTERM/SIGINT handlers that flip ``stop['flag']``; return the olds.
-
-    ``signal.signal`` only works in the main thread; under a test runner / worker
-    thread it raises ``ValueError`` — in that case we run without graceful stop.
-    """
-
-    def _handler(_signum, _frame):
-        stop["flag"] = True
-
-    try:
-        return (
-            signal.signal(signal.SIGTERM, _handler),
-            signal.signal(signal.SIGINT, _handler),
-        )
-    except ValueError:
-        return None
-
-
-def _restore_stop_handlers(handlers) -> None:
-    if handlers is not None:
-        signal.signal(signal.SIGTERM, handlers[0])
-        signal.signal(signal.SIGINT, handlers[1])
-
-
-def _interruptible_sleep(seconds: float, stop: dict, sleep) -> None:
-    """Sleep up to ``seconds`` in small slices, waking early if ``stop`` is set."""
-    if seconds <= 0:
-        return
-    slept = 0.0
-    while slept < seconds and not stop["flag"]:
-        sleep(_SLEEP_SLICE)
-        slept += _SLEEP_SLICE
-
-
 def _preflight(transport: Transport, config: AliveConfig, wake: bool) -> None:
     """First robot call — validates the transport. A dead daemon raises CliError."""
     if wake:
@@ -246,7 +212,7 @@ def run_loop(
     # nosec B311 - the RNG only shapes idle robot motion; not security-sensitive.
     rng = rng if rng is not None else random.Random(config.seed)  # nosec B311
     stop = {"flag": False}
-    handlers = _install_stop_handlers(stop)
+    handlers = install_stop_handlers(stop)
 
     _preflight(transport, config, wake)
     if on_start is not None:
@@ -267,9 +233,9 @@ def run_loop(
                 emit(event)
             if max_ticks is not None and ticks >= max_ticks:
                 break
-            _interruptible_sleep(config.interval, stop, sleep)
+            interruptible_sleep(config.interval, stop, sleep)
     finally:
-        _restore_stop_handlers(handlers)
+        restore_stop_handlers(handlers)
         if settle:
             _settle(transport, config)
     return ticks

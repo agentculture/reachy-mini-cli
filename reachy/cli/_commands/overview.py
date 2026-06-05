@@ -35,6 +35,7 @@ _VERBS = [
     "app <verb> — list/start/stop Reachy Mini apps",
     "move <verb> — runtime motion (goto, wake, sleep)",
     "demo-mode <verb> — background loop that makes the robot feel alive",
+    "behavior <verb> — compose behaviors on a 50Hz loop (list, run, stop, engine)",
 ]
 
 

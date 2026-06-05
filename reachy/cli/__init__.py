@@ -63,6 +63,7 @@ def _argv_has_json(argv: list[str] | None) -> bool:
 
 def _build_parser() -> argparse.ArgumentParser:
     from reachy.cli._commands import app as _app_group
+    from reachy.cli._commands import behavior as _behavior_group
     from reachy.cli._commands import cli as _cli_group
     from reachy.cli._commands import daemon as _daemon_group
     from reachy.cli._commands import demo_mode as _demo_group
@@ -100,6 +101,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _move_group.register(sub)
     # Higher-level behaviour built on the motion verbs.
     _demo_group.register(sub)
+    _behavior_group.register(sub)
 
     return parser
 

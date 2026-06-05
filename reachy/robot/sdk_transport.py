@@ -19,10 +19,12 @@ the zero-runtime-dependency rule in ``CLAUDE.md`` — see
 
 from __future__ import annotations
 
+import contextlib
 import math
+from typing import Iterator
 
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
-from reachy.robot.transport import Transport
+from reachy.robot.transport import TargetSink, Transport
 
 # CLI interpolation name -> SDK ``InterpolationTechnique`` value. The SDK calls
 # the eased curve ``ease_in_out``; the daemon (and our CLI) calls it ``ease``.
@@ -32,6 +34,45 @@ _INTERP_TO_SDK = {
     "ease": "ease_in_out",
     "cartoon": "cartoon",
 }
+
+
+class _SdkSink:
+    """Streaming sink over an *already-open* ``ReachyMini`` session.
+
+    Holds the session for the loop's lifetime so a 50 Hz stream pays the
+    open/close cost once, not per pose. Converts friendly units (mm / degrees) to
+    the SDK's metres / radians via ``create_head_pose``.
+    """
+
+    def __init__(self, mini, create_head_pose) -> None:  # type: ignore[no-untyped-def]
+        self._mini = mini
+        self._create_head_pose = create_head_pose
+
+    def set_target(
+        self,
+        *,
+        head: dict[str, float] | None = None,
+        antennas: tuple[float, float] | None = None,
+        body_yaw: float | None = None,
+    ) -> object:
+        kwargs: dict[str, object] = {}
+        if head is not None:
+            kwargs["head"] = self._create_head_pose(
+                x=head["x"],
+                y=head["y"],
+                z=head["z"],
+                roll=head["roll"],
+                pitch=head["pitch"],
+                yaw=head["yaw"],
+                mm=True,
+                degrees=True,
+            )
+        if antennas is not None:
+            kwargs["antennas"] = [math.radians(antennas[0]), math.radians(antennas[1])]
+        if body_yaw is not None:
+            kwargs["body_yaw"] = math.radians(body_yaw)
+        self._mini.set_target(**kwargs)
+        return {"status": "ok", "transport": "sdk", "action": "set_target"}
 
 
 class SdkTransport(Transport):
@@ -111,3 +152,22 @@ class SdkTransport(Transport):
         with reachy_mini_cls() as mini:
             mini.goto_sleep()
         return {"status": "ok", "transport": self.name, "action": "sleep"}
+
+    # --- streaming / immediate target ------------------------------------
+    def set_target(
+        self,
+        *,
+        head: dict[str, float] | None = None,
+        antennas: tuple[float, float] | None = None,
+        body_yaw: float | None = None,
+    ) -> object:
+        # One-off immediate target (opens a session per call). The engine never
+        # uses this path — it streams through ``streaming()`` to keep one session.
+        with self.streaming() as sink:
+            return sink.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
+
+    @contextlib.contextmanager
+    def streaming(self) -> Iterator[TargetSink]:
+        reachy_mini_cls, create_head_pose = self._import()
+        with reachy_mini_cls() as mini:  # opened ONCE for the loop's lifetime
+            yield _SdkSink(mini, create_head_pose)

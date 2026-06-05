@@ -21,7 +21,9 @@ degrees for rotation. Each transport converts to whatever its target expects
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
+from typing import Iterator, Protocol
 
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 
@@ -30,6 +32,24 @@ DEFAULT_TIMEOUT = 10.0
 TRANSPORTS = ("http", "sdk")
 # CLI-facing interpolation names (the daemon's ``InterpolationMode`` values).
 INTERPOLATIONS = ("minjerk", "linear", "ease", "cartoon")
+
+
+class TargetSink(Protocol):
+    """A streaming target sink: an open session a high-rate loop pushes poses to.
+
+    The behavior engine composes a complete pose every tick and calls
+    :meth:`set_target` on a sink obtained from :meth:`Transport.streaming`, so the
+    underlying robot session is opened once for the loop's lifetime rather than
+    per call. Units are the CLI's friendly ones (mm / degrees).
+    """
+
+    def set_target(
+        self,
+        *,
+        head: dict[str, float] | None = None,
+        antennas: tuple[float, float] | None = None,
+        body_yaw: float | None = None,
+    ) -> object: ...
 
 
 class Transport:
@@ -78,6 +98,27 @@ class Transport:
 
     def sleep(self) -> object:
         raise self._unsupported("move sleep")
+
+    # --- streaming / immediate target ------------------------------------
+    def set_target(
+        self,
+        *,
+        head: dict[str, float] | None = None,
+        antennas: tuple[float, float] | None = None,
+        body_yaw: float | None = None,
+    ) -> object:
+        """Set an immediate (non-interpolated) target. Friendly units in."""
+        raise self._unsupported("move set_target")
+
+    @contextlib.contextmanager
+    def streaming(self) -> Iterator[TargetSink]:
+        """Open one session for a high-rate loop, yielding a :class:`TargetSink`.
+
+        Flavors that support streaming override this. The base raises the standard
+        "not supported on this transport" error *when entered*.
+        """
+        raise self._unsupported("move streaming")
+        yield  # pragma: no cover - unreachable; makes this a generator for @contextmanager
 
     # --- helpers ---------------------------------------------------------
     def _unsupported(self, op: str) -> CliError:

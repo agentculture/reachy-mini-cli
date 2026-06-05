@@ -19,5 +19,7 @@ ignores:
   - ".local/**"
   - ".afi/**"
   - ".teken/**"
+  # The virtualenv carries third-party package docs we don't lint.
+  - ".venv/**"
   # Vendored skills are cited verbatim from guildmaster — do not reformat them.
   - ".claude/skills/**"
