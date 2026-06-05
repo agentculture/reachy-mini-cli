@@ -122,8 +122,10 @@ class CommandSpool:
 
     def reset(self) -> None:
         """Clear stale commands/results from a prior run (called on engine start)."""
+        # Unlinking each entry right after it is yielded is safe (scandir keeps its
+        # position past already-returned entries), so no need to materialise first.
         for d in (commands_dir(), results_dir()):
-            for p in list(d.iterdir()):
+            for p in d.iterdir():
                 _safe_unlink(p)
         _safe_unlink(state_file())
 

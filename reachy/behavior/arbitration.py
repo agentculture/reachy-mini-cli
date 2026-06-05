@@ -38,7 +38,7 @@ def arbitrate(behaviors: list[Behavior]) -> dict[str, Behavior | None]:
     maps to ``None``. A ``passive`` behavior (priority 0) therefore wins a channel
     only when nothing non-passive claims it.
     """
-    owners: dict[str, Behavior | None] = {c: None for c in CHANNELS}
+    owners: dict[str, Behavior | None] = dict.fromkeys(CHANNELS)
     indexed = list(enumerate(behaviors))
     for channel in CHANNELS:
         candidates = [(i, b) for i, b in indexed if channel in b.channels]

@@ -29,7 +29,7 @@ _HEAD_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
 
 def neutral_head() -> dict[str, float]:
     """A fresh centred head offset (all six axes zero)."""
-    return {k: 0.0 for k in _HEAD_KEYS}
+    return dict.fromkeys(_HEAD_KEYS, 0.0)
 
 
 class StopClass(enum.Enum):

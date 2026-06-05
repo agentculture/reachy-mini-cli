@@ -123,16 +123,22 @@ def cmd_list(args: argparse.Namespace) -> int:
         )
     if json_mode:
         emit_result({"behaviors": entries}, json_mode=True)
-        return 0
-    lines: list[str] = ["# behaviors", ""]
-    for e in entries:
-        dur = "until stopped" if e["default_duration"] is None else f"{e['default_duration']:g}s"
-        lines.append(f"- {e['name']} [{e['kind']}, {e['default_class']}, {dur}] — {e['summary']}")
-        lines.append(f"    channels: {', '.join(e['channels'])}")
-        if e["params"]:
-            params = ", ".join(f"{k}={p['default']:g}{p['unit']}" for k, p in e["params"].items())
-            lines.append(f"    params: {params}")
-    emit_result("\n".join(lines), json_mode=False)
+    else:
+        lines: list[str] = ["# behaviors", ""]
+        for e in entries:
+            dur = (
+                "until stopped" if e["default_duration"] is None else f"{e['default_duration']:g}s"
+            )
+            lines.append(
+                f"- {e['name']} [{e['kind']}, {e['default_class']}, {dur}] — {e['summary']}"
+            )
+            lines.append(f"    channels: {', '.join(e['channels'])}")
+            if e["params"]:
+                params = ", ".join(
+                    f"{k}={p['default']:g}{p['unit']}" for k, p in e["params"].items()
+                )
+                lines.append(f"    params: {params}")
+        emit_result("\n".join(lines), json_mode=False)
     return 0
 
 
@@ -196,7 +202,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     published = control.read_state()
     if published is None:
         data["active"] = []
-        data["ownership"] = {ch: None for ch in CHANNELS}
+        data["ownership"] = dict.fromkeys(CHANNELS)
         data["note"] = "engine has not published state (not running, or just started)"
     else:
         data["active"] = published.get("active", [])

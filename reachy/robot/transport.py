@@ -21,7 +21,6 @@ degrees for rotation. Each transport converts to whatever its target expects
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 from typing import Iterator, Protocol
 
@@ -110,15 +109,13 @@ class Transport:
         """Set an immediate (non-interpolated) target. Friendly units in."""
         raise self._unsupported("move set_target")
 
-    @contextlib.contextmanager
     def streaming(self) -> Iterator[TargetSink]:
         """Open one session for a high-rate loop, yielding a :class:`TargetSink`.
 
-        Flavors that support streaming override this. The base raises the standard
-        "not supported on this transport" error *when entered*.
+        Flavors that support streaming override this (as a context manager); the
+        base just raises the standard "not supported on this transport" error.
         """
         raise self._unsupported("move streaming")
-        yield  # pragma: no cover - unreachable; makes this a generator for @contextmanager
 
     # --- helpers ---------------------------------------------------------
     def _unsupported(self, op: str) -> CliError:

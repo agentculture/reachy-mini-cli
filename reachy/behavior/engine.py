@@ -265,6 +265,68 @@ def _stream_tick(sink: TargetSink, pose: dict, consecutive: int, max_errors: int
     return 0
 
 
+@dataclass
+class _Timing:
+    """Derived per-run cadence: loop period, sleep slice, and state-publish heartbeat."""
+
+    period: float
+    slice_seconds: float
+    heartbeat: int
+
+
+def _timing(config: EngineConfig) -> _Timing:
+    period = 1.0 / config.compose_hz if config.compose_hz > 0 else 0.0
+    slice_seconds = min(period, DEFAULT_SLEEP_SLICE) if period > 0 else DEFAULT_SLEEP_SLICE
+    heartbeat = max(1, int(round(config.compose_hz / 2.0)))
+    return _Timing(period, slice_seconds, heartbeat)
+
+
+def _apply_commands(engine: Engine, control: "control_mod.CommandSpool | None", now: float) -> bool:
+    """Drain + apply pending spool commands; return whether the active set changed."""
+    if control is None:
+        return False
+    changed = False
+    for cmd in control.drain():
+        control.write_result(cmd.get("cmd_id"), engine.apply(cmd, now))
+        changed = True
+    return changed
+
+
+def _drive(
+    engine: Engine,
+    sink: TargetSink,
+    config: EngineConfig,
+    *,
+    control,
+    emit,
+    stop: dict,
+    now,
+    sleep,
+    max_ticks: int | None,
+    timing: _Timing,
+) -> int:
+    """The 50 Hz body: drain → compose → stream → publish, until stopped. Returns ticks."""
+    ticks = 0
+    consecutive = 0
+    last_state_tick = -timing.heartbeat
+    while not stop["flag"]:
+        t = now()
+        changed = _apply_commands(engine, control, t)
+        tick = engine.compose_tick(t)
+        changed = changed or bool(tick["expired"])
+        consecutive = _stream_tick(sink, tick["pose"], consecutive, config.max_errors)
+        ticks += 1
+        if control is not None and (changed or ticks - last_state_tick >= timing.heartbeat):
+            control.write_state(engine.state(t, config))
+            last_state_tick = ticks
+        if emit is not None:
+            emit({"tick": ticks, "ownership": tick["ownership"]})
+        if max_ticks is not None and ticks >= max_ticks:
+            break
+        interruptible_sleep(timing.period, stop, sleep, timing.slice_seconds)
+    return ticks
+
+
 def run(
     transport,
     config: EngineConfig,
@@ -288,11 +350,7 @@ def run(
         control.reset()
     stop = {"flag": False}
     handlers = install_stop_handlers(stop)
-    period = 1.0 / config.compose_hz if config.compose_hz > 0 else 0.0
-    slice_seconds = min(period, DEFAULT_SLEEP_SLICE) if period > 0 else DEFAULT_SLEEP_SLICE
-    heartbeat = max(1, int(round(config.compose_hz / 2.0)))
-    ticks = 0
-    consecutive = 0
+    timing = _timing(config)
     try:
         with transport.streaming() as sink:
             try:
@@ -302,33 +360,23 @@ def run(
                     engine.seed_base_layer(start_t, config.energy)
                 if on_start is not None:
                     on_start()
-                last_state_tick = -heartbeat
-                while not stop["flag"]:
-                    t = now()
-                    changed = False
-                    if control is not None:
-                        for cmd in control.drain():
-                            outcome = engine.apply(cmd, t)
-                            control.write_result(cmd.get("cmd_id"), outcome)
-                            changed = True
-                    tick = engine.compose_tick(t)
-                    changed = changed or bool(tick["expired"])
-                    consecutive = _stream_tick(sink, tick["pose"], consecutive, config.max_errors)
-                    ticks += 1
-                    if control is not None and (changed or ticks - last_state_tick >= heartbeat):
-                        control.write_state(engine.state(t, config))
-                        last_state_tick = ticks
-                    if emit is not None:
-                        emit({"tick": ticks, "ownership": tick["ownership"]})
-                    if max_ticks is not None and ticks >= max_ticks:
-                        break
-                    interruptible_sleep(period, stop, sleep, slice_seconds)
+                return _drive(
+                    engine,
+                    sink,
+                    config,
+                    control=control,
+                    emit=emit,
+                    stop=stop,
+                    now=now,
+                    sleep=sleep,
+                    max_ticks=max_ticks,
+                    timing=timing,
+                )
             finally:
                 if config.settle:
                     _settle(sink)
     finally:
         restore_stop_handlers(handlers)
-    return ticks
 
 
 def _settle(sink: TargetSink) -> None:
