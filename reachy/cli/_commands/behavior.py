@@ -164,6 +164,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             compose_hz=args.compose_hz,
             energy=args.energy,
+            base_layer=not args.no_base_layer,
+            settle=not args.no_settle,
         )
 
     cmd_id = control.submit(

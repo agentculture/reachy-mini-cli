@@ -74,7 +74,10 @@ def _is_our_process(pid: int) -> bool:
     except OSError:
         return False
     cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
-    return "behavior" in cmdline
+    # The engine's spawn line is `... -m reachy behavior engine run`; require BOTH
+    # tokens so a bare `reachy behavior <verb>` CLI call — or any unrelated process
+    # that merely contains "behavior" — is never signalled under PID reuse.
+    return "behavior" in cmdline and "engine" in cmdline
 
 
 def build_run_command(

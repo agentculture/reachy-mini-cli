@@ -676,3 +676,46 @@ def test_engine_stop_refuses_reused_pid(monkeypatch, tmp_path, capsys) -> None:
 def test_engine_overview(capsys) -> None:
     assert main(["behavior", "engine", "overview", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["subject"] == "reachy-mini-cli behavior engine"
+
+
+# --------------------------------------------------------------------------- #
+# Qodo follow-ups                                                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_interruptible_sleep_never_overshoots() -> None:
+    # A 0.3 s gap with a 0.25 s slice must sleep 0.25 + 0.05, never 0.25 + 0.25.
+    from reachy.looputil import interruptible_sleep
+
+    slept: list[float] = []
+    interruptible_sleep(0.3, {"flag": False}, slept.append, slice_seconds=0.25)
+    assert sum(slept) == pytest.approx(0.3)
+    assert max(slept) <= 0.25 + 1e-9
+
+
+def test_run_forwards_engine_flags_to_autostart(monkeypatch) -> None:
+    seen: dict = {}
+    monkeypatch.setattr(
+        "reachy.cli._commands.behavior.supervisor.ensure_running",
+        lambda **k: seen.update(k) or {"status": "already-running"},
+    )
+    monkeypatch.setattr(
+        "reachy.cli._commands.behavior.control.await_result",
+        lambda cid, **k: {"ok": True, "id": "speak-1"},
+    )
+    rc = main(
+        [
+            "behavior",
+            "run",
+            "speak",
+            "--duration",
+            "5",
+            "--no-base-layer",
+            "--no-settle",
+            "--compose-hz",
+            "30",
+        ]
+    )
+    assert rc == 0
+    assert seen["base_layer"] is False and seen["settle"] is False
+    assert seen["compose_hz"] == 30.0

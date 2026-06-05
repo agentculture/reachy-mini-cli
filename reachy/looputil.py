@@ -51,14 +51,16 @@ def interruptible_sleep(
 ) -> None:
     """Sleep up to ``seconds`` in ``slice_seconds`` steps, waking early if stopped.
 
-    ``sleep`` is injected (``time.sleep`` in production, a no-op in tests). The
-    step is clamped to ``seconds`` so a sub-slice gap (e.g. a 50 Hz 0.02 s period)
-    sleeps exactly once rather than overshooting to a full slice.
+    ``sleep`` is injected (``time.sleep`` in production, a no-op in tests). Each
+    slice is clamped to the time still remaining, so the total never overshoots
+    ``seconds`` even when it is not an exact multiple of the slice (e.g. a 0.3 s
+    gap with a 0.25 s slice sleeps 0.25 + 0.05, not 0.5).
     """
     if seconds <= 0:
         return
-    step = min(slice_seconds, seconds) if slice_seconds > 0 else seconds
+    step = slice_seconds if slice_seconds > 0 else seconds
     slept = 0.0
     while slept < seconds and not stop["flag"]:
-        sleep(step)
-        slept += step
+        chunk = min(step, seconds - slept)  # clamp the last slice; never oversleep
+        sleep(chunk)
+        slept += chunk
