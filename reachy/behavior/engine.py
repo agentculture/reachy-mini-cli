@@ -199,8 +199,14 @@ class Engine:
         self.active = live
 
         behaviors = [ab.behavior for ab in live]
+        # Only sensor-driven behaviors are fed the live snapshot; everything else
+        # gets EMPTY_SENSE, so a behavior can't accidentally become sensor-
+        # dependent just because some other behavior is polling.
         contribs: dict[str, object] = {
-            ab.behavior.id: ab.behavior.contribution(now - ab.start_t, sense) for ab in live
+            ab.behavior.id: ab.behavior.contribution(
+                now - ab.start_t, sense if ab.behavior.wants_sense else EMPTY_SENSE
+            )
+            for ab in live
         }
         owners = arbitrate(behaviors, contribs)
         pose = _compose_pose(owners, contribs)

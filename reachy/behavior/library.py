@@ -64,6 +64,13 @@ class LibraryEntry:
     fn: ContribFn | None = field(default=None, compare=False, repr=False)
     make_fn: Callable[[], ContribFn] | None = field(default=None, compare=False, repr=False)
     wants_sense: bool = False
+    # Most entries claim a fixed ``channels`` set; an entry whose claim depends on
+    # its params (e.g. ``listen`` claims ``body_yaw`` only when ``body_gain>0``)
+    # supplies ``channels_fn`` so a channel it will never drive does not make it an
+    # eviction target on that channel.
+    channels_fn: Callable[[dict], frozenset[str]] | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def default_params(self) -> dict[str, float]:
         return {k: p.default for k, p in self.params.items()}
@@ -72,8 +79,19 @@ class LibraryEntry:
         """The contribution function for one behavior instance (fresh if stateful)."""
         if self.make_fn is not None:
             return self.make_fn()
-        assert self.fn is not None  # nosec B101 - an entry has exactly one of fn / make_fn
+        if self.fn is None:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"behavior {self.name!r} has neither fn nor make_fn",
+                remediation="this is a library bug — report it",
+            )
         return self.fn
+
+    def claimed_channels(self, params: dict[str, float]) -> frozenset[str]:
+        """The channels this instance claims (dynamic when ``channels_fn`` is set)."""
+        if self.channels_fn is not None:
+            return self.channels_fn(params)
+        return self.channels
 
 
 # --------------------------------------------------------------------------- #
@@ -179,17 +197,20 @@ def _make_listen() -> ContribFn:
         speech_only = p["speech_only"] >= 0.5
         angle = sense.doa_angle
         signal = angle is not None and (not speech_only or sense.speech_detected)
-        if not signal:
-            # Nothing to orient to: abstain so feel-alive shows through. Keep the
-            # slew state untouched so a re-acquired sound eases from where we were.
-            state["last_t"] = t
-            return Contribution(head=None, body_yaw=None)
         last = state["last_t"]
         dt = 0.0 if last is None else max(0.0, t - last)
         state["last_t"] = t
-        # Exponential ease toward the target. dt==0 (first active tick) -> alpha 0,
-        # so it eases up from center rather than snapping; smooth<=0 -> snap.
+        # Exponential ease. dt==0 (first active tick) -> alpha 0, so it eases up
+        # from where it is rather than snapping; smooth<=0 -> snap.
         alpha = 1.0 - math.exp(-dt / p["smooth"]) if p["smooth"] > 0 else 1.0
+        if not signal:
+            # Nothing to orient to: abstain (return None channels) so feel-alive
+            # shows through. Ease the internal slew state back toward center so a
+            # re-acquired sound starts near where the head actually is, not from a
+            # stale target -> no jump on takeover.
+            state["yaw_head"] += (0.0 - state["yaw_head"]) * alpha
+            state["yaw_body"] += (0.0 - state["yaw_body"]) * alpha
+            return Contribution(head=None, body_yaw=None)
         target_head = _clamp(doa_angle_to_yaw(angle, p["gain"]), p["max_yaw"])
         state["yaw_head"] += (target_head - state["yaw_head"]) * alpha
         body_yaw = None
@@ -344,6 +365,11 @@ LIBRARY: dict[str, LibraryEntry] = {
         },
         make_fn=_make_listen,
         wants_sense=True,
+        # Only contend for body_yaw when actually turning the body, so a head-only
+        # listen is not an eviction target for a body-yaw 'stopping' behavior.
+        channels_fn=lambda p: (
+            frozenset({"head", "body_yaw"}) if p["body_gain"] > 0 else frozenset({"head"})
+        ),
     ),
 }
 
@@ -451,7 +477,7 @@ def build(
     return Behavior(
         id=behavior_id,
         name=name,
-        channels=entry.channels,
+        channels=entry.claimed_channels(params),
         stop_class=stop_class,
         lifetime=lifetime,
         params=dict(params),

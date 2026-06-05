@@ -925,3 +925,85 @@ def test_run_polls_sense_only_while_a_sensor_behavior_is_active() -> None:
         sense=_sense,
     )
     assert calls["n"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes (Qodo, PR #20)                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_listen_claims_body_yaw_only_when_turning_body() -> None:
+    assert _listen(body_gain=0.0).channels == frozenset({"head"})  # head-only
+    assert _listen(body_gain=0.5).channels == frozenset({"head", "body_yaw"})
+
+
+def test_head_only_listen_survives_a_body_yaw_stopping_add() -> None:
+    eng = _engine_with_listen()  # body_gain=0 -> listen claims head only
+    eng.add(
+        "body-turn-hold",
+        library.get("body-turn-hold").default_params(),
+        StopClass.STOPPING,
+        Lifetime(looping=False, duration=5.0),
+        now=0.0,
+    )
+    # a body_yaw 'stopping' add must not evict head-only listening
+    assert "listen" in [ab.behavior.name for ab in eng.active]
+
+
+def test_listen_decays_toward_center_while_abstaining() -> None:
+    beh = _listen(gain=0.6, max_yaw=35.0, smooth=0.35)
+    left = Sense(doa_angle=0.0)
+    beh.contribution(0.0, left)
+    driven = beh.contribution(2.0, left).head["yaw"]  # eased out toward +max
+    for tt in (2.5, 3.0, 5.0, 9.0):  # long silence -> internal eases back to center
+        assert beh.contribution(tt, EMPTY_SENSE).head is None
+    reacquired = beh.contribution(9.02, left).head["yaw"]
+    assert 0.0 <= reacquired < driven  # no snap back to the stale held target
+
+
+def test_arbitrate_tolerates_missing_contrib() -> None:
+    b = _beh("x", StopClass.STOPPABLE, ["head"], bid="x")
+    assert arbitrate([b], {})["head"] is None  # missing id => abstains, no KeyError
+
+
+def test_library_entry_without_fn_or_make_fn_raises() -> None:
+    entry = library.LibraryEntry(
+        name="broken",
+        summary="",
+        channels=frozenset({"head"}),
+        default_class=StopClass.STOPPABLE,
+        looping=True,
+        default_duration=None,
+        params={},
+    )
+    with pytest.raises(CliError):
+        entry.build_fn()  # an assert would be stripped under python -O; must raise
+
+
+def test_compose_tick_feeds_sense_only_to_wants_sense_behaviors() -> None:
+    seen: dict[str, Sense] = {}
+
+    def _spy(name: str, wants: bool) -> Behavior:
+        def fn(t: float, p: dict, s: Sense) -> Contribution:
+            seen[name] = s
+            return Contribution(head={"yaw": 0.0})
+
+        return Behavior(
+            id=name,
+            name=name,
+            channels=frozenset({"head"}),
+            stop_class=StopClass.STOPPABLE,
+            lifetime=Lifetime(looping=True, duration=None),
+            params={},
+            fn=fn,
+            wants_sense=wants,
+        )
+
+    eng = Engine()
+    eng.active = [
+        E.ActiveBehavior(_spy("pure", False), 0.0),
+        E.ActiveBehavior(_spy("sensor", True), 0.0),
+    ]
+    eng.compose_tick(0.0, Sense(doa_angle=1.0, speech_detected=True))
+    assert seen["pure"] is EMPTY_SENSE  # non-sensor behavior never sees live sense
+    assert seen["sensor"].doa_angle == 1.0

@@ -52,8 +52,12 @@ def arbitrate(
     for channel in CHANNELS:
         candidates = [(i, b) for i, b in indexed if channel in b.channels]
         if contribs is not None:
+            # A candidate with no contribution this tick (missing id, or a None for
+            # this channel) abstains -> it is skipped and the channel falls through.
             candidates = [
-                (i, b) for i, b in candidates if contribs[b.id].channel(channel) is not None
+                (i, b)
+                for i, b in candidates
+                if (c := contribs.get(b.id)) is not None and c.channel(channel) is not None
             ]
         if not candidates:
             continue
