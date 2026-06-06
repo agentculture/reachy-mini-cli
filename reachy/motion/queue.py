@@ -57,6 +57,14 @@ class MotionQueue:
             self._pending = [a for a in self._pending if a.coalesce_key != action.coalesce_key]
         self._pending.append(action)
 
+    def peek(self) -> MotionAction | None:
+        """Return the next pending action without removing it (``None`` if empty).
+
+        The executor peeks, issues the move, and only :meth:`pop`\\ s once the daemon
+        accepts it — so a move that fails to send is retried, never silently dropped.
+        """
+        return self._pending[0] if self._pending else None
+
     def pop(self) -> MotionAction | None:
         """Remove and return the next pending action, or ``None`` if the queue is empty."""
         return self._pending.pop(0) if self._pending else None

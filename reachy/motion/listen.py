@@ -86,7 +86,7 @@ class ListenProducer:
         if not signal:
             # No usable sound: after a grace period, ease back to center once.
             if (
-                self.committed != 0.0
+                abs(self.committed) > 1e-9  # off-center (committed is set to exactly 0 at center)
                 and self._last_signal_t is not None
                 and (t - self._last_signal_t) >= p.recenter_after
             ):

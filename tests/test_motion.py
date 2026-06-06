@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 
 from reachy.behavior.sense import Sense
+from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.motion.listen import ListenParams, ListenProducer
 from reachy.motion.queue import LOOK_KEY, MotionAction, MotionQueue
 from reachy.motion.server import run
@@ -176,3 +177,56 @@ def test_server_runs_moves_serially_without_overlap() -> None:
         max_ticks=60,
     )
     assert 2 <= len(tr.gotos) <= 4  # NOT ~60 — no overlap, one move at a time
+
+
+def test_queue_peek_does_not_remove() -> None:
+    q = MotionQueue()
+    q.submit(MotionAction(label="nod"))
+    assert q.peek().label == "nod"
+    assert len(q) == 1  # still pending — peek doesn't consume
+    assert q.pop().label == "nod" and len(q) == 0
+    assert q.peek() is None  # empty
+
+
+class _OnceMove:
+    """A producer that emits exactly one (non-coalescing) move, then nothing."""
+
+    def __init__(self):
+        self.done = False
+
+    def update(self, t, sense):
+        if self.done:
+            return None
+        self.done = True
+        return MotionAction(label="once", head={"yaw": 10.0}, duration=1.0)
+
+
+class _FlakyTransport:
+    name = "flaky"
+
+    def __init__(self, fail_times: int):
+        self.gotos: list[float] = []
+        self._fail = fail_times
+
+    def move_goto(self, *, head=None, antennas=None, body_yaw=None, duration, interpolation):
+        if self._fail > 0:
+            self._fail -= 1
+            raise CliError(code=EXIT_ENV_ERROR, message="daemon hiccup", remediation="retry")
+        self.gotos.append(duration)
+        return {"uuid": "x"}
+
+
+def test_server_retries_a_failed_move_instead_of_dropping_it() -> None:
+    # The single queued move fails to send on its first attempt; the executor must
+    # keep it pending and land it on a later tick, not pop-and-lose it.
+    tr = _FlakyTransport(fail_times=1)
+    run(
+        tr,
+        _OnceMove(),
+        now=_Clock(0.05),
+        sleep=lambda *_: None,
+        tick=0.05,
+        settle=0.2,
+        max_ticks=5,
+    )
+    assert tr.gotos == [1.0]  # the move eventually landed (was not dropped on the failure)
