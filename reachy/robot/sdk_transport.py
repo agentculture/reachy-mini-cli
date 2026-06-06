@@ -21,10 +21,13 @@ from __future__ import annotations
 
 import contextlib
 import math
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.robot.transport import TargetSink, Transport
+
+if TYPE_CHECKING:  # pragma: no cover
+    import numpy as np
 
 # CLI interpolation name -> SDK ``InterpolationTechnique`` value. The SDK calls
 # the eased curve ``ease_in_out``; the daemon (and our CLI) calls it ``ease``.
@@ -34,6 +37,50 @@ _INTERP_TO_SDK = {
     "ease": "ease_in_out",
     "cartoon": "cartoon",
 }
+
+
+def _tuple_to_doa_dict(result: object) -> object:
+    """Map a ``(angle, speech_detected)`` tuple from ``get_DoA()`` to the canonical dict.
+
+    Returns ``None`` when the SDK returns ``None`` (no reading available).  The
+    dict shape ``{"angle": float, "speech_detected": bool}`` matches what the
+    HTTP transport returns from ``/api/state/doa`` so :func:`~reachy.behavior.sense.read_doa`
+    can consume both transports identically.
+    """
+    if result is None:
+        return None
+    angle, speech = result  # type: ignore[misc]
+    return {"angle": float(angle), "speech_detected": bool(speech)}
+
+
+class MediaSession:
+    """A live audio + DoA session open against the ``ReachyMini`` media subsystem.
+
+    Obtained exclusively through :meth:`SdkTransport.media_session` — do not
+    instantiate directly.  All audio reads happen through this object so the
+    loop pays the ``ReachyMini`` open/close cost once (not per tick).
+
+    The AEC (acoustic-echo-cancelled) channel is the recorder's default
+    (channel 0) — ``start_recording()`` activates it automatically.
+    """
+
+    def __init__(self, media) -> None:  # type: ignore[no-untyped-def]
+        self._media = media
+        self.samplerate: int = media.get_input_audio_samplerate()
+        self.channels: int = media.get_input_channels()
+
+    def doa(self) -> object:
+        """Read the sound Direction of Arrival.
+
+        Returns ``{"angle": float, "speech_detected": bool}`` (angle in radians,
+        ``0``=left, ``pi/2``=front, ``pi``=right), or ``None`` when the SDK has
+        no reading available.
+        """
+        return _tuple_to_doa_dict(self._media.get_DoA())
+
+    def get_audio_sample(self) -> "np.ndarray | None":
+        """Return one mic chunk (``np.float32`` ndarray) or ``None`` when unavailable."""
+        return self._media.get_audio_sample()  # type: ignore[return-value]
 
 
 class _SdkSink:
@@ -97,6 +144,24 @@ class SdkTransport(Transport):
         return ReachyMini, create_head_pose
 
     # --- device ----------------------------------------------------------
+    def doa(
+        self, *, timeout: float | None = None
+    ) -> object:  # noqa: ARG002 — timeout unused for SDK
+        """Read the sound Direction of Arrival via the SDK media subsystem.
+
+        Opens a short-lived ``ReachyMini`` session, calls
+        ``mini.media.get_DoA()``, and maps the ``(angle, speech_detected)``
+        tuple to ``{"angle": float, "speech_detected": bool}``.  Returns
+        ``None`` when the SDK has no reading available.
+
+        The ``timeout`` parameter is accepted for interface compatibility with
+        :meth:`~reachy.robot.http_transport.HttpTransport.doa` but is unused
+        here (the in-process SDK call is synchronous and does not block on I/O).
+        """
+        reachy_mini_cls, _ = self._import()
+        with reachy_mini_cls() as mini:
+            return _tuple_to_doa_dict(mini.media.get_DoA())
+
     def robot_state(self) -> object:
         reachy_mini_cls, _ = self._import()
         with reachy_mini_cls() as mini:
@@ -171,3 +236,26 @@ class SdkTransport(Transport):
         reachy_mini_cls, create_head_pose = self._import()
         with reachy_mini_cls() as mini:  # opened ONCE for the loop's lifetime
             yield _SdkSink(mini, create_head_pose)
+
+    @contextlib.contextmanager
+    def media_session(self) -> Iterator[MediaSession]:
+        """Open a persistent audio + DoA session for a streaming listen loop.
+
+        On enter: opens a ``ReachyMini`` context and calls
+        ``mini.media.start_recording()`` to activate the AEC mic recorder.
+        Yields a :class:`MediaSession` that exposes ``.doa()``,
+        ``.get_audio_sample()``, ``.samplerate``, and ``.channels``.
+        On exit: calls ``stop_recording()`` then closes the ``ReachyMini``
+        context — even if the loop body raises.
+
+        Use this instead of per-tick :meth:`doa` calls when the listen behavior
+        is running so the SDK session and the mic recorder are opened once for
+        the loop's lifetime rather than per read.
+        """
+        reachy_mini_cls, _ = self._import()
+        with reachy_mini_cls() as mini:
+            mini.media.start_recording()
+            try:
+                yield MediaSession(mini.media)
+            finally:
+                mini.media.stop_recording()
