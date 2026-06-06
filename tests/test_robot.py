@@ -164,6 +164,15 @@ def test_move_goto_converts_units(monkeypatch) -> None:
     assert "body_yaw" not in body
 
 
+def test_move_goto_maps_ease_to_daemon_name(monkeypatch) -> None:
+    # The CLI's friendly curve "ease" must reach the daemon as "ease_in_out"
+    # (its InterpolationTechnique name); the others pass through unchanged.
+    rec: dict = {}
+    _patch_urlopen(monkeypatch, {"uuid": "abc"}, rec)
+    assert main(["move", "goto", "--yaw", "10", "--duration", "1", "--interpolation", "ease"]) == 0
+    assert rec["data"]["interpolation"] == "ease_in_out"
+
+
 def test_move_goto_antennas_only(monkeypatch) -> None:
     rec: dict = {}
     _patch_urlopen(monkeypatch, {"uuid": "abc"}, rec)

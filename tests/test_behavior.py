@@ -24,7 +24,14 @@ from reachy.behavior import engine as E
 from reachy.behavior import library
 from reachy.behavior.arbitration import admit, arbitrate
 from reachy.behavior.engine import Engine, EngineConfig
-from reachy.behavior.model import CHANNELS, Behavior, Contribution, Lifetime, StopClass
+from reachy.behavior.model import (
+    CHANNELS,
+    Behavior,
+    Contribution,
+    Lifetime,
+    StopClass,
+    neutral_head,
+)
 from reachy.behavior.sense import EMPTY_SENSE, DoaPoller, Sense, doa_angle_to_yaw, read_doa
 from reachy.cli import main
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
@@ -793,151 +800,91 @@ def test_doa_angle_to_yaw_sign() -> None:
 
 def test_arbitrate_abstention_falls_through_to_lower_priority() -> None:
     base = _beh("feel-alive", StopClass.PASSIVE, ["head"], bid="base")
-    listener = _beh("listen", StopClass.STOPPABLE, ["head"], bid="listen")
-    behaviors = [base, listener]
-    # listener (higher priority) abstains on head -> base wins it this tick
-    abstaining = {"base": Contribution(head={"yaw": 1.0}), "listen": Contribution(head=None)}
+    sensor = _beh("sensor", StopClass.STOPPABLE, ["head"], bid="sensor")
+    behaviors = [base, sensor]
+    # sensor (higher priority) abstains on head -> base wins it this tick
+    abstaining = {"base": Contribution(head={"yaw": 1.0}), "sensor": Contribution(head=None)}
     assert arbitrate(behaviors, abstaining)["head"].id == "base"
-    # listener drives head -> it wins (its priority beats passive)
-    driving = {"base": Contribution(head={"yaw": 1.0}), "listen": Contribution(head={"yaw": 2.0})}
-    assert arbitrate(behaviors, driving)["head"].id == "listen"
+    # sensor drives head -> it wins (its priority beats passive)
+    driving = {"base": Contribution(head={"yaw": 1.0}), "sensor": Contribution(head={"yaw": 2.0})}
+    assert arbitrate(behaviors, driving)["head"].id == "sensor"
     # no contribs -> claim-based as before (stoppable beats passive)
-    assert arbitrate(behaviors)["head"].id == "listen"
+    assert arbitrate(behaviors)["head"].id == "sensor"
 
 
 # --------------------------------------------------------------------------- #
-# listen behavior                                                             #
+# Engine + sense integration (the sensor-driven behavior capability)          #
 # --------------------------------------------------------------------------- #
+#
+# No *built-in* behavior is sensor-driven any more — sound-orienting moved to the
+# standalone ``reachy listen`` motion loop (covered by tests/test_motion.py). The
+# engine keeps the general capability to feed a ``wants_sense`` behavior a live
+# ``Sense`` and to abstain a channel back to ``feel-alive``; these tests exercise it
+# with a synthetic sensor behavior registered into the library for the test only.
 
 
-def _listen(bid="listen-1", **overrides) -> Behavior:
-    params = library.get("listen").default_params()
-    # Isolate the output/mapping by default (continuous tracking); the deadband +
-    # dwell hold behavior is exercised by its own tests that set these explicitly.
-    params["deadband"] = 0.0
-    params["dwell"] = 0.0
-    params.update(overrides)
-    return library.build(
-        "listen", params, StopClass.STOPPABLE, Lifetime(looping=True, duration=None), bid
+@pytest.fixture
+def sensor_behavior(monkeypatch):
+    """A minimal sensor-driven library entry, removed after the test.
+
+    Claims ``head``, snaps to the DoA-derived yaw, and abstains (``head=None`` →
+    feel-alive shows through) when there is no reading.
+    """
+    name = "doa-look-test"
+
+    def _make():
+        def _fn(t, p, sense):
+            if sense.doa_angle is None:
+                return Contribution(head=None)
+            head = neutral_head()
+            head["yaw"] = doa_angle_to_yaw(sense.doa_angle, 1.0)
+            return Contribution(head=head)
+
+        return _fn
+
+    monkeypatch.setitem(
+        library.LIBRARY,
+        name,
+        library.LibraryEntry(
+            name=name,
+            summary="test sensor behavior",
+            channels=frozenset({"head"}),
+            default_class=StopClass.STOPPABLE,
+            looping=True,
+            default_duration=None,
+            params={},
+            make_fn=_make,
+            wants_sense=True,
+        ),
     )
+    return name
 
 
-def test_listen_orients_toward_sound_sign() -> None:
-    for angle, check in ((0.0, lambda y: y > 0), (math.pi, lambda y: y < 0)):
-        beh = _listen()
-        beh.contribution(0.0, Sense(doa_angle=angle))  # prime (dt=0, no move)
-        c = beh.contribution(1.0, Sense(doa_angle=angle))  # ease toward target
-        assert check(c.head["yaw"])
-    front = _listen()
-    front.contribution(0.0, Sense(doa_angle=math.pi / 2.0))
-    assert abs(front.contribution(1.0, Sense(doa_angle=math.pi / 2.0)).head["yaw"]) < 1e-6
-
-
-def test_listen_clamps_to_max_yaw() -> None:
-    beh = _listen(gain=5.0, max_yaw=35.0, smooth=0.0)  # smooth 0 -> snap to target
-    assert beh.contribution(0.0, Sense(doa_angle=0.0)).head["yaw"] == 35.0
-    assert beh.contribution(0.1, Sense(doa_angle=math.pi)).head["yaw"] == -35.0
-
-
-def test_listen_abstains_without_signal() -> None:
-    beh = _listen()
-    for sense in (Sense(doa_angle=None), EMPTY_SENSE):
-        c = beh.contribution(0.5, sense)
-        assert c.head is None and c.body_yaw is None  # yield head + body to feel-alive
-
-
-def test_listen_speech_only_gates() -> None:
-    beh = _listen(speech_only=1.0, smooth=0.0)
-    assert beh.contribution(0.0, Sense(doa_angle=0.0, speech_detected=False)).head is None
-    c = beh.contribution(0.1, Sense(doa_angle=0.0, speech_detected=True))
-    assert c.head is not None and c.head["yaw"] > 0
-
-
-def test_listen_body_gain_gates_body_channel() -> None:
-    assert _listen(smooth=0.0).contribution(0.0, Sense(doa_angle=0.0)).body_yaw is None
-    turner = _listen(smooth=0.0, body_gain=5.0, body_max=45.0)
-    assert turner.contribution(0.0, Sense(doa_angle=0.0)).body_yaw == 45.0  # clamped, + = left
-    assert turner.contribution(0.1, Sense(doa_angle=math.pi)).body_yaw == -45.0
-
-
-def test_listen_deadband_holds_against_small_changes() -> None:
-    # snap output isolates the commit logic; deadband 15deg, no dwell
-    beh = _listen(smooth=0.0, max_speed=0.0, deadband=15.0, dwell=0.0)
-    beh.contribution(0.0, Sense(doa_angle=math.pi / 2))  # front -> commit ~0
-    held = beh.contribution(0.1, Sense(doa_angle=math.pi / 2)).head["yaw"]
-    # a small shift (well under deadband in head-yaw terms) must not move the head
-    near = beh.contribution(0.2, Sense(doa_angle=math.pi / 2 - 0.15)).head["yaw"]
-    assert abs(near - held) < 1e-9
-    # a large, immediate shift (dwell=0) does re-commit and move
-    far = beh.contribution(0.3, Sense(doa_angle=0.0)).head["yaw"]  # hard left
-    assert far > held + 10.0
-
-
-def test_listen_dwell_requires_persistence() -> None:
-    # snap output; must HOLD a new direction for dwell seconds before turning
-    beh = _listen(smooth=0.0, max_speed=0.0, deadband=10.0, dwell=0.5)
-    beh.contribution(0.0, Sense(doa_angle=math.pi / 2))  # commit front (~0)
-    # a new far direction that appears only briefly must not commit
-    beh.contribution(0.1, Sense(doa_angle=0.0))  # left appears
-    flicker = beh.contribution(0.2, Sense(doa_angle=math.pi / 2)).head["yaw"]  # gone again
-    assert abs(flicker) < 1e-9  # never turned — flicker rejected
-    # the same direction sustained past dwell does commit
-    for i in range(1, 40):
-        y = beh.contribution(0.2 + 0.05 * i, Sense(doa_angle=0.0)).head["yaw"]
-    assert y > 10.0
-
-
-def test_listen_respects_max_speed_cap() -> None:
-    beh = _listen(gain=2.0, max_yaw=60.0, smooth=0.5, max_speed=10.0)
-    beh.contribution(0.0, Sense(doa_angle=0.0))  # prime; far target (angle=left)
-    prev = 0.0
-    for i in range(1, 8):  # each 20 ms tick may move at most max_speed*dt
-        y = beh.contribution(i * 0.02, Sense(doa_angle=0.0)).head["yaw"]
-        assert abs(y - prev) <= 10.0 * 0.02 + 1e-9
-        prev = y
-
-
-def test_listen_eases_not_snaps() -> None:
-    beh = _listen(gain=0.6, max_yaw=35.0, smooth=0.35)
-    sound = Sense(doa_angle=0.0)
-    assert beh.contribution(0.0, sound).head["yaw"] == 0.0  # first tick (dt=0): no jump
-    stepped = beh.contribution(0.02, sound).head["yaw"]  # one 50 Hz tick
-    assert 0.0 < stepped < 35.0  # eased a small step toward target, not snapped
-
-
-# --------------------------------------------------------------------------- #
-# Engine + sense integration                                                  #
-# --------------------------------------------------------------------------- #
-
-
-def _engine_with_listen(**overrides) -> Engine:
+def _engine_with_sensor(name: str) -> Engine:
     eng = Engine()
     eng.seed_base_layer(now=0.0, energy=1.0)
-    params = library.get("listen").default_params()
-    params.update(overrides)
-    eng.add("listen", params, StopClass.STOPPABLE, Lifetime(looping=True, duration=None), now=0.0)
+    eng.add(name, {}, StopClass.STOPPABLE, Lifetime(looping=True, duration=None), now=0.0)
     return eng
 
 
-def test_engine_listen_owns_head_with_sound_yields_when_silent() -> None:
-    eng = _engine_with_listen()
-    eng.compose_tick(0.0, Sense(doa_angle=0.0))  # prime the slew
-    loud = eng.compose_tick(1.0, Sense(doa_angle=0.0))
-    assert loud["ownership"]["head"].startswith("listen")
-    assert loud["ownership"]["antennas"].startswith("feel-alive")  # listen never claims antennas
+def test_engine_sensor_owns_head_with_sound_yields_when_silent(sensor_behavior) -> None:
+    eng = _engine_with_sensor(sensor_behavior)
+    loud = eng.compose_tick(1.0, Sense(doa_angle=0.0))  # sound on the left
+    assert loud["ownership"]["head"].startswith(sensor_behavior)
+    assert loud["ownership"]["antennas"].startswith("feel-alive")  # never claims antennas
     assert loud["pose"]["head"]["yaw"] > 0
-    silent = eng.compose_tick(2.0, EMPTY_SENSE)  # no sound -> listen abstains
+    silent = eng.compose_tick(2.0, EMPTY_SENSE)  # no sound -> abstains
     assert silent["ownership"]["head"].startswith("feel-alive")
 
 
-def test_state_includes_doa_snapshot() -> None:
-    eng = _engine_with_listen()
+def test_state_includes_doa_snapshot(sensor_behavior) -> None:
+    eng = _engine_with_sensor(sensor_behavior)
     eng.compose_tick(0.5, Sense(doa_angle=1.2, speech_detected=True))
     st = eng.state(0.5, EngineConfig())
     assert st["doa"] == {"angle": 1.2, "speech_detected": True}
 
 
-def test_run_polls_sense_only_while_a_sensor_behavior_is_active() -> None:
+def test_run_polls_sense_only_while_a_sensor_behavior_is_active(sensor_behavior) -> None:
     calls = {"n": 0}
 
     def _sense(t):
@@ -955,14 +902,14 @@ def test_run_polls_sense_only_while_a_sensor_behavior_is_active() -> None:
         sense=_sense,
     )
     assert calls["n"] == 0
-    # a live listen -> polled every tick
+    # a live sensor behavior -> polled every tick
     E.run(
         _FakeTransport(),
         EngineConfig(base_layer=False, settle=False),
         sleep=lambda *_: None,
         now=_Clock(),
         max_ticks=3,
-        engine=_engine_with_listen(),
+        engine=_engine_with_sensor(sensor_behavior),
         sense=_sense,
     )
     assert calls["n"] == 3
@@ -971,35 +918,6 @@ def test_run_polls_sense_only_while_a_sensor_behavior_is_active() -> None:
 # --------------------------------------------------------------------------- #
 # Review fixes (Qodo, PR #20)                                                  #
 # --------------------------------------------------------------------------- #
-
-
-def test_listen_claims_body_yaw_only_when_turning_body() -> None:
-    assert _listen(body_gain=0.0).channels == frozenset({"head"})  # head-only
-    assert _listen(body_gain=0.5).channels == frozenset({"head", "body_yaw"})
-
-
-def test_head_only_listen_survives_a_body_yaw_stopping_add() -> None:
-    eng = _engine_with_listen()  # body_gain=0 -> listen claims head only
-    eng.add(
-        "body-turn-hold",
-        library.get("body-turn-hold").default_params(),
-        StopClass.STOPPING,
-        Lifetime(looping=False, duration=5.0),
-        now=0.0,
-    )
-    # a body_yaw 'stopping' add must not evict head-only listening
-    assert "listen" in [ab.behavior.name for ab in eng.active]
-
-
-def test_listen_decays_toward_center_while_abstaining() -> None:
-    beh = _listen(gain=0.6, max_yaw=35.0, smooth=0.35)
-    left = Sense(doa_angle=0.0)
-    beh.contribution(0.0, left)
-    driven = beh.contribution(2.0, left).head["yaw"]  # eased out toward +max
-    for tt in (2.5, 3.0, 5.0, 9.0):  # long silence -> internal eases back to center
-        assert beh.contribution(tt, EMPTY_SENSE).head is None
-    reacquired = beh.contribution(9.02, left).head["yaw"]
-    assert 0.0 <= reacquired < driven  # no snap back to the stale held target
 
 
 def test_arbitrate_tolerates_missing_contrib() -> None:

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-06
+
+### Added
+
+- `listen` noun group — a standalone, smooth sound-orienting loop. Reads the mic array's Direction of Arrival (DoA) from the daemon and turns the head toward a *sustained, off-axis* sound (deadband + dwell), holds there briefly, then eases back to center after silence. Verbs: `run`, `start`, `stop`, `restart`, `status`, `overview` — each with `--json`; tune the feel with `--dwell` / `--hold` / `--speed` / `--deadband` / `--gain` / `--recenter-after` / `--speech-only`. Process-managed like `demo-mode` (PID + log under the state dir). Degrades gracefully: no mic / no daemon DoA ⇒ no reaction, no crash.
+- `reachy/motion/` — a serial motion subsystem: a coalescing `MotionQueue`, an executor that runs interpolated daemon `goto` moves strictly one at a time (never overlapping or resetting each other), and the `ListenProducer` (the DoA→look decision). The smooth trajectory is the daemon's minjerk planner.
+
+### Changed
+
+- Sound-orienting now drives the daemon's smooth minjerk `goto` planner via `reachy listen`, instead of the behavior engine's immediate `set_target` stream (jerky for big reorienting turns).
+- HTTP transport maps the CLI's `--interpolation ease` to the daemon's `ease_in_out` (the daemon rejected `ease` with HTTP 422), matching the SDK transport.
+
+### Removed
+
+- The `listen` **behavior** (the PR #20 `behavior run listen`, a 50 Hz `set_target` streamer) — superseded by the `reachy listen` loop above. The engine keeps its general sensor-input capability (`wants_sense`, abstention, DoA in `behavior status`), but ships no built-in sensor behavior.
+
 ## [0.6.0] - 2026-06-06
 
 ### Added

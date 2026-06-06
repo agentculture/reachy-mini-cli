@@ -21,6 +21,12 @@ from typing import Iterator
 from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from reachy.robot.transport import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, TargetSink, Transport
 
+# The CLI's friendly curve name -> the daemon's name. The daemon's
+# ``InterpolationTechnique`` spells the eased curve ``ease_in_out``; the CLI (like
+# the SDK transport) calls it ``ease``. The others match one-to-one and pass
+# through unchanged. Mirrors ``sdk_transport._INTERP_TO_SDK``.
+_INTERP_TO_DAEMON = {"ease": "ease_in_out"}
+
 
 def _head_to_si(head: dict[str, float]) -> dict[str, float]:
     """Friendly head offset (mm + degrees) -> the daemon's metres + radians."""
@@ -152,7 +158,8 @@ class HttpTransport(Transport):
         duration: float,
         interpolation: str,
     ) -> object:
-        body: dict[str, object] = {"duration": duration, "interpolation": interpolation}
+        daemon_interp = _INTERP_TO_DAEMON.get(interpolation, interpolation)
+        body: dict[str, object] = {"duration": duration, "interpolation": daemon_interp}
         if head is not None:
             body["head_pose"] = _head_to_si(head)
         if antennas is not None:

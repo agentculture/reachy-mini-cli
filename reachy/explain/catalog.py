@@ -393,16 +393,13 @@ Same-channel conflicts resolve by class priority
 
 Each behavior has a natural default (e.g. `gaze-hold` is one-shot, `speak` loops).
 
-## Sensing — the `listen` behavior
+## Sensing
 
-Most behaviors are pure motion. `listen` is **sensor-driven**: it reads the sound
-Direction of Arrival (DoA) from the daemon and slews the head toward where sound
-comes from. By default it reacts to **any** sound (`--set speech_only=1` to react
-only to speech); pass `--set body_gain=0.5` to also turn the body (it claims
-`body_yaw` too). When there is no sound — or the unit has no working mic (DoA
-unavailable) — it **abstains**, so `feel-alive` keeps the head and body gently
-alive rather than freezing them. Params: `gain`, `max_yaw`, `smooth` (slew ease),
-`speech_only`, `body_gain`, `body_max`.
+All built-in behaviors are pure motion. For **sound-orienting**, see the dedicated
+`reachy-mini-cli listen` noun (`reachy-mini-cli explain listen`): it drives the
+daemon's smooth minjerk `goto` planner instead of the engine's `set_target`
+stream, which is jerky for big reorienting turns. (The engine keeps a general
+capability to feed a sensor-driven behavior a live reading, but ships none today.)
 
 ## Verbs
 
@@ -434,13 +431,75 @@ alive rather than freezing them. Params: `gain`, `max_yaw`, `smooth` (slew ease)
     reachy-mini-cli daemon start                         # something to drive
     reachy-mini-cli behavior engine start                # bring the 50 Hz loop up
     reachy-mini-cli behavior run speak --duration 8      # head bobs like speech
-    reachy-mini-cli behavior run listen                  # orient head toward sound
-    reachy-mini-cli behavior run listen --set body_gain=0.5 speech_only=1
     reachy-mini-cli behavior run antenna-sway --loop --class stopping \\
         --channels antennas body_yaw                     # sway + seize the body yaw
     reachy-mini-cli behavior status --json
     reachy-mini-cli behavior stop all
     reachy-mini-cli behavior engine stop                 # eases robot to neutral
+""".replace(_TRANSPORTS_SLOT, _TRANSPORTS)
+
+
+_LISTEN = """\
+# reachy-mini-cli listen
+
+Orient the head toward sound. A loop reads the mic array's Direction of Arrival
+(DoA) from the daemon and turns the head toward a *sustained, off-axis* sound,
+holds there briefly, then eases back to center after silence.
+
+Unlike the behavior engine — which streams immediate `set_target` poses at 50 Hz
+(jerky for big reorienting turns) — this loop drives the daemon's smooth minjerk
+`goto` planner and runs moves strictly one at a time through a serial motion
+queue, so turns are soft and never conflict. It needs a running daemon
+(`reachy-mini-cli daemon start`) for the http transport.
+
+It degrades gracefully: no mic, a daemon DoA error, or (with `--speech-only`) no
+speech ⇒ no reaction, no crash.
+
+## Verbs
+
+- `reachy-mini-cli listen run` — run the loop in the foreground (what `start` and
+  the process launch run). Ctrl-C stops it; `--max-ticks N` runs a fixed number of
+  ticks. Eases to center on start (preflight) and on stop.
+- `reachy-mini-cli listen start` — spawn the loop in the background, recording its
+  PID + log under the state dir. For `--transport http` it first preflights the
+  daemon's health route. Idempotent: reports `already-running` if a tracked loop
+  is alive.
+- `reachy-mini-cli listen stop` — SIGTERM the loop this CLI started (so it eases
+  back to center before exiting), escalating to SIGKILL past `--timeout`.
+- `reachy-mini-cli listen restart` — stop the tracked loop and relaunch it, so the
+  new process re-reads the tuning and the latest code.
+- `reachy-mini-cli listen status` — the loop's process state (running / stopped /
+  stale) and whether the daemon answers.
+- `reachy-mini-cli listen overview` — the verb summary.
+
+## Tuning
+
+Feel knobs (each defaults to a tuned value; unset keeps it):
+
+- `--dwell SECONDS` — a new direction must persist this long before turning to it.
+- `--hold SECONDS` — after turning, stay there this long before reconsidering.
+- `--speed DEG_PER_S` — the slew speed for turns and for easing back to center.
+- `--deadband DEG` — ignore sound within this angle of the current heading.
+- `--gain X` / `--max-yaw DEG` — head-yaw per acoustic angle, and its cap.
+- `--recenter-after SECONDS` — ease back to center after this long with no sound.
+- `--speech-only` — react only to detected speech (default: any sound).
+
+{transports}
+
+## Notes
+
+- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`: `listen.pid`
+  and `listen.log`.
+- Only one thing should drive the robot at a time — don't run `listen` alongside
+  `demo-mode` or the behavior engine.
+
+## Usage
+
+    reachy-mini-cli daemon start                         # something to drive
+    reachy-mini-cli listen run                           # foreground, any sound
+    reachy-mini-cli listen start --dwell 1.5 --hold 3    # background, tuned
+    reachy-mini-cli listen status --json
+    reachy-mini-cli listen stop                          # eases back to center
 """.replace(_TRANSPORTS_SLOT, _TRANSPORTS)
 
 
@@ -499,4 +558,11 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("behavior", "engine", "stop"): _BEHAVIOR,
     ("behavior", "engine", "status"): _BEHAVIOR,
     ("behavior", "engine", "run"): _BEHAVIOR,
+    ("listen",): _LISTEN,
+    ("listen", "overview"): _LISTEN,
+    ("listen", "run"): _LISTEN,
+    ("listen", "start"): _LISTEN,
+    ("listen", "stop"): _LISTEN,
+    ("listen", "restart"): _LISTEN,
+    ("listen", "status"): _LISTEN,
 }

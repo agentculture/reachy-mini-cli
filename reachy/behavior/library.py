@@ -13,11 +13,11 @@ is why the idle ``feel-alive`` layer here is a fresh continuous formulation rath
 than ``alive.next_pose``, which re-samples a random gaze target per call and is
 built for the slower, ``goto``-interpolated demo-mode loop.)
 
-The one exception is ``listen``: a *sensor-driven* entry (``wants_sense=True``)
-whose ``make_fn`` builds a fresh stateful closure per behavior — it reads the
-sound Direction of Arrival from ``sense`` and slews the head toward it, abstaining
-(returning ``None`` channels, so ``feel-alive`` shows through) when there is no
-sound to react to.
+The engine can still feed a *sensor-driven* entry (one with ``wants_sense=True``,
+built per-instance via ``make_fn`` so it may hold state) a live :class:`Sense`
+reading, but no built-in behavior currently uses it — sound-orienting moved to the
+dedicated, smoother ``reachy listen`` loop (:mod:`reachy.motion`), which drives the
+daemon's minjerk ``goto`` planner instead of streaming ``set_target``.
 
 Units are the CLI's friendly ones: millimetres, degrees, seconds.
 """
@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass, neutral_head
-from reachy.behavior.sense import Sense, doa_angle_to_yaw
+from reachy.behavior.sense import Sense
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 
 ContribFn = Callable[[float, dict, Sense], Contribution]
@@ -64,13 +64,6 @@ class LibraryEntry:
     fn: ContribFn | None = field(default=None, compare=False, repr=False)
     make_fn: Callable[[], ContribFn] | None = field(default=None, compare=False, repr=False)
     wants_sense: bool = False
-    # Most entries claim a fixed ``channels`` set; an entry whose claim depends on
-    # its params (e.g. ``listen`` claims ``body_yaw`` only when ``body_gain>0``)
-    # supplies ``channels_fn`` so a channel it will never drive does not make it an
-    # eviction target on that channel.
-    channels_fn: Callable[[dict], frozenset[str]] | None = field(
-        default=None, compare=False, repr=False
-    )
 
     def default_params(self) -> dict[str, float]:
         return {k: p.default for k, p in self.params.items()}
@@ -86,12 +79,6 @@ class LibraryEntry:
                 remediation="this is a library bug — report it",
             )
         return self.fn
-
-    def claimed_channels(self, params: dict[str, float]) -> frozenset[str]:
-        """The channels this instance claims (dynamic when ``channels_fn`` is set)."""
-        if self.channels_fn is not None:
-            return self.channels_fn(params)
-        return self.channels
 
 
 # --------------------------------------------------------------------------- #
@@ -179,120 +166,6 @@ def _body_turn_hold(t: float, p: dict, _sense: Sense) -> Contribution:
 def _clamp(value: float, limit: float) -> float:
     """Clamp ``value`` to the symmetric range ``[-limit, limit]``."""
     return max(-limit, min(limit, value))
-
-
-def _smooth_damp(
-    current: float, target: float, vel: float, dt: float, smooth_time: float, max_speed: float
-) -> tuple[float, float]:
-    """Critically-damped approach toward ``target`` (Unity's ``SmoothDamp``).
-
-    Returns ``(new_value, new_velocity)``. Unlike a first-order exponential ease,
-    velocity is carried as state, so the motion is C1-continuous — it eases *in*
-    and *out* and never lurches when ``target`` jumps (which a noisy DoA does
-    constantly). ``smooth_time`` is roughly the time to reach the target; ``<=0``
-    snaps. ``max_speed`` caps the slew rate (``<=0`` = unlimited).
-    """
-    if smooth_time <= 0.0:
-        return target, 0.0
-    if dt <= 0.0:
-        return current, vel
-    omega = 2.0 / smooth_time
-    x = omega * dt
-    exp = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
-    change = current - target
-    temp = (vel + omega * change) * dt
-    new_vel = (vel - omega * temp) * exp
-    new_val = target + (change + temp) * exp
-    # Stop cleanly at the target instead of overshooting past it.
-    if (target - current > 0.0) == (new_val > target):
-        new_val, new_vel = target, 0.0
-    # Hard ceiling on the per-tick step so no jump ever exceeds max_speed deg/s,
-    # even when the (noisy) DoA target leaps to the far side.
-    if max_speed > 0.0:
-        max_step = max_speed * dt
-        step = new_val - current
-        if abs(step) > max_step:
-            new_val = current + math.copysign(max_step, step)
-            new_vel = math.copysign(max_speed, step)
-    return new_val, new_vel
-
-
-def _make_listen() -> ContribFn:
-    """Build a fresh sound-orienting closure: slew head (and optionally body) toward DoA.
-
-    Unlike the pure generators above this is *stateful* — it holds the current
-    head/body yaw and the last tick time so it can rate-limit (ease, not snap) the
-    slew toward the sound direction. When there is no usable reading — no mic,
-    daemon error, or (with ``speech_only``) no speech — it **abstains** by returning
-    ``None`` channels, so the passive ``feel-alive`` base layer keeps the head and
-    body alive rather than freezing them at the last orientation.
-    """
-    # ``committed`` is the heading the head currently holds; the head only re-commits
-    # (and then eases over) when a sound is both far enough (deadband) and sustained
-    # long enough (dwell). ``cand`` tracks the pending new direction and ``cand_since``
-    # when it first appeared, so transient/noisy DoA never accumulates enough dwell.
-    state = {
-        "yaw": 0.0,
-        "vel": 0.0,
-        "byaw": 0.0,
-        "bvel": 0.0,
-        "committed": 0.0,
-        "bcommitted": 0.0,
-        "cand": None,
-        "cand_since": None,
-        "last_t": None,
-    }
-
-    def _listen(t: float, p: dict, sense: Sense) -> Contribution:
-        speech_only = p["speech_only"] >= 0.5
-        angle = sense.doa_angle
-        signal = angle is not None and (not speech_only or sense.speech_detected)
-        last = state["last_t"]
-        dt = 0.0 if last is None else max(0.0, t - last)
-        state["last_t"] = t
-        smooth, max_speed = p["smooth"], p["max_speed"]
-        if not signal:
-            # No sound to orient to: abstain (None channels) so feel-alive shows
-            # through, release the committed heading, and ease the internal state to
-            # center so a re-acquired sound starts fresh without a jump.
-            state["committed"] = state["bcommitted"] = 0.0
-            state["cand"] = state["cand_since"] = None
-            state["yaw"], state["vel"] = _smooth_damp(
-                state["yaw"], 0.0, state["vel"], dt, smooth, max_speed
-            )
-            state["byaw"], state["bvel"] = _smooth_damp(
-                state["byaw"], 0.0, state["bvel"], dt, smooth, max_speed
-            )
-            return Contribution(head=None, body_yaw=None)
-        # Deadband + dwell: only re-commit to a new heading when it is more than
-        # ``deadband`` from the current one AND has persisted for ``dwell`` seconds.
-        desired = _clamp(doa_angle_to_yaw(angle, p["gain"]), p["max_yaw"])
-        if abs(desired - state["committed"]) > p["deadband"]:
-            if state["cand"] is None or abs(desired - state["cand"]) > p["deadband"]:
-                state["cand"], state["cand_since"] = desired, t
-            if (t - state["cand_since"]) >= p["dwell"]:
-                state["committed"] = desired
-                if p["body_gain"] > 0:
-                    state["bcommitted"] = _clamp(
-                        doa_angle_to_yaw(angle, p["body_gain"]), p["body_max"]
-                    )
-                state["cand"] = state["cand_since"] = None
-        else:
-            state["cand"] = state["cand_since"] = None
-        # Ease the head toward the committed heading (one soft move per commit; dead
-        # still between commits because ``committed`` does not change).
-        state["yaw"], state["vel"] = _smooth_damp(
-            state["yaw"], state["committed"], state["vel"], dt, smooth, max_speed
-        )
-        body_yaw = None
-        if p["body_gain"] > 0:
-            state["byaw"], state["bvel"] = _smooth_damp(
-                state["byaw"], state["bcommitted"], state["bvel"], dt, smooth, max_speed
-            )
-            body_yaw = state["byaw"]
-        return Contribution(head=_head(yaw=state["yaw"]), body_yaw=body_yaw)
-
-    return _listen
 
 
 # --------------------------------------------------------------------------- #
@@ -420,32 +293,6 @@ LIBRARY: dict[str, LibraryEntry] = {
         },
         fn=_body_turn_hold,
     ),
-    "listen": LibraryEntry(
-        name="listen",
-        summary="turn the head/body toward the direction of arrival of sound (DoA)",
-        channels=frozenset({"head", "body_yaw"}),
-        default_class=StopClass.STOPPABLE,
-        looping=True,
-        default_duration=None,
-        params={
-            "gain": Param(0.6, "x", "head-yaw gain per acoustic angle"),
-            "max_yaw": Param(35.0, "deg", "max head yaw toward sound"),
-            "deadband": Param(15.0, "deg", "ignore sound within this angle of current heading"),
-            "dwell": Param(1.0, "s", "hold a new direction this long before turning to it"),
-            "smooth": Param(1.0, "s", "ease time of each turn — larger is softer (0 = snap)"),
-            "max_speed": Param(20.0, "deg/s", "max slew speed cap (0 = unlimited)"),
-            "speech_only": Param(0.0, "", "react only to speech (1) vs any sound (0)"),
-            "body_gain": Param(0.0, "x", "body-yaw gain per acoustic angle (0 = head only)"),
-            "body_max": Param(45.0, "deg", "max body yaw toward sound"),
-        },
-        make_fn=_make_listen,
-        wants_sense=True,
-        # Only contend for body_yaw when actually turning the body, so a head-only
-        # listen is not an eviction target for a body-yaw 'stopping' behavior.
-        channels_fn=lambda p: (
-            frozenset({"head", "body_yaw"}) if p["body_gain"] > 0 else frozenset({"head"})
-        ),
-    ),
 }
 
 
@@ -552,7 +399,7 @@ def build(
     return Behavior(
         id=behavior_id,
         name=name,
-        channels=entry.claimed_channels(params),
+        channels=entry.channels,
         stop_class=stop_class,
         lifetime=lifetime,
         params=dict(params),
