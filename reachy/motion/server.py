@@ -15,6 +15,7 @@ transient transport errors like the behavior engine.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 from reachy.behavior.sense import EMPTY_SENSE
@@ -49,6 +50,28 @@ def _dispatch_next(transport, q: MotionQueue, t: float, settle: float, on_action
     return t + nxt.duration + settle
 
 
+@dataclass
+class _DriveState:
+    """Mutable per-run bookkeeping for the loop (kept out of :func:`_drive`'s body)."""
+
+    busy_until: float = 0.0
+    consecutive: int = 0
+    ticks: int = 0
+
+
+def _service_queue(transport, q, t, st: _DriveState, *, settle, on_action, max_errors) -> None:
+    """If idle and something is queued, run the next move; count/raise on errors."""
+    if t < st.busy_until or not len(q):
+        return
+    try:
+        st.busy_until = _dispatch_next(transport, q, t, settle, on_action)
+        st.consecutive = 0
+    except CliError:
+        st.consecutive += 1
+        if st.consecutive >= max_errors:
+            raise
+
+
 def _drive(
     transport,
     producer,
@@ -65,27 +88,20 @@ def _drive(
     stop,
 ) -> int:
     """The serial body: drain the producer into the queue, run one move at a time."""
-    busy_until = 0.0
-    ticks = 0
-    consecutive = 0
+    st = _DriveState()
     while not stop["flag"]:
         t = now()
         action = producer.update(t, sense(t) if sense is not None else EMPTY_SENSE)
         if action is not None:
             q.submit(action)
-        if t >= busy_until and len(q):
-            try:
-                busy_until = _dispatch_next(transport, q, t, settle, on_action)
-                consecutive = 0
-            except CliError:
-                consecutive += 1
-                if consecutive >= max_errors:
-                    raise
-        ticks += 1
-        if max_ticks is not None and ticks >= max_ticks:
+        _service_queue(
+            transport, q, t, st, settle=settle, on_action=on_action, max_errors=max_errors
+        )
+        st.ticks += 1
+        if max_ticks is not None and st.ticks >= max_ticks:
             break
         interruptible_sleep(tick, stop, sleep, tick)
-    return ticks
+    return st.ticks
 
 
 def run(
