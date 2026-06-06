@@ -1,0 +1,400 @@
+{
+  "slug": "reachy-listen-goes-sdk-first-it-uses-the-reachy-sd",
+  "title": "reachy listen goes SDK-first: it uses the Reachy SDK in-process for real DoA and real mic loudness, reacting in two tiers \u2014 a faint noise leans the near antenna toward the sound; speech or a loud sound (RMS snap) makes Reachy slowly turn head-then-body to face the source. reachy-mini becomes a base dependency, which also lets the CLI track daemon liveness across restarts more simply (issue #21).",
+  "frame_slug": "reachy-listen-goes-sdk-first-it-uses-the-reachy-sd",
+  "schema_version": 1,
+  "status": "exported",
+  "created": "2026-06-06T06:50:07Z",
+  "updated": "2026-06-06T06:50:37Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "reachy listen goes SDK-first: it uses the Reachy SDK in-process for real DoA and real mic loudness, reacting in two tiers \u2014 a faint noise leans the near antenna toward the sound; speech or a loud sound (RMS snap) makes Reachy slowly turn head-then-body to face the source. reachy-mini becomes a base dependency, which also lets the CLI track daemon liveness across restarts more simply (issue #21)."
+    },
+    {
+      "id": "h1",
+      "kind": "honesty",
+      "text": "On the live robot the two tiers are visibly distinct and loudness-driven: a faint tap \u2192 antenna lean only; a clap/loud sound \u2192 a snap turn toward it; speech \u2192 a slow head-then-body turn."
+    },
+    {
+      "id": "c2",
+      "kind": "audience",
+      "text": "A Reachy Mini owner running 'reachy listen', and the maintainer evolving motion/listen.py + the SDK transport + daemon-liveness."
+    },
+    {
+      "id": "h9",
+      "kind": "honesty",
+      "text": "The change is localized to motion/listen.py + the SDK transport + daemon-liveness; the observer is an owner running 'reachy listen'."
+    },
+    {
+      "id": "c3",
+      "kind": "before_state",
+      "text": "Today listen is HTTP-first: it reads the daemon's /api/state/doa {angle, speech_detected} only (NO loudness), turns head-yaw only, and the daemon is hand-managed as a background OS process (PID/log/health-poll in reachy/daemon.py) that is fragile across restarts (#21). reachy-mini is an optional [sdk]/[daemon] extra; base deps are []."
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "Verifiable against today's code: listen is HTTP-first (DoA {angle,speech} only, head-yaw only) and reachy/daemon.py hand-manages the daemon process; reachy-mini is an optional extra, base deps []."
+    },
+    {
+      "id": "c4",
+      "kind": "after_state",
+      "text": "listen is SDK-first by default: real DoA + real mic RMS loudness in-process (reachy_mini.media). Two graded tiers \u2014 TIER 1 faint noise: near-side antenna leans toward it; TIER 2 speech OR a loud RMS snap: a slow head-then-body turn to face the source. reachy-mini is a BASE dependency; the CLI checks daemon/robot liveness via the SDK, robust across restarts. HTTP stays as an optional remote profile."
+    },
+    {
+      "id": "h11",
+      "kind": "honesty",
+      "text": "Demonstrable: with the SDK default, a faint feed yields an antenna-only action and a loud/speech feed yields a head(/body) turn; pyproject base deps include reachy-mini."
+    },
+    {
+      "id": "c5",
+      "kind": "why_it_matters",
+      "text": "Real loudness delivers the true 'stronger noise' reaction (a clap/loud sound snaps attention), not a persistence-proxy approximation; SDK-first removes the dep-free contortions and the fragile daemon-process babysitting; it follows reachy_nova's proven in-process approach."
+    },
+    {
+      "id": "h12",
+      "kind": "honesty",
+      "text": "Observable: a real clap snaps attention (loudness-driven) where the proxy could not; daemon liveness stays correct across a restart without manual fiddling."
+    },
+    {
+      "id": "c6",
+      "kind": "boundary",
+      "text": "Not vision: no camera/ML; 'turn to see' is orienting only (a future camera frames the source; /api/camera/specs already exists). Not a full behavior-engine rewrite. HTTP/remote profile is kept, not removed. RMS is a plain energy scalar, not audio classification."
+    },
+    {
+      "id": "h13",
+      "kind": "honesty",
+      "text": "Greppable: no camera/ML dependency added; the HTTP transport remains selectable (--transport http); RMS is a scalar energy, not classification."
+    },
+    {
+      "id": "c7",
+      "kind": "success_signal",
+      "text": "On the live robot: a faint off-axis tap \u2192 antenna lean only; a clap/loud sound \u2192 a snap turn toward it; talking from the side \u2192 a slow head-then-body turn-to-see; and after a daemon restart the CLI reports liveness correctly without manual fiddling."
+    },
+    {
+      "id": "h14",
+      "kind": "honesty",
+      "text": "An on-robot/producer acceptance check: tap\u2192antenna-only; clap\u2192snap turn; talk\u2192slow head-then-body turn; daemon restart\u2192liveness reported correctly."
+    },
+    {
+      "id": "c16",
+      "kind": "requirement",
+      "text": "SDK default path: raw mic audio (media.get_audio_sample, AEC ch0) is RMS'd and a spike (>5x rolling avg, >floor, prev-quiet edge) escalates Tier-2 toward the current DoA direction."
+    },
+    {
+      "id": "h2",
+      "kind": "honesty",
+      "text": "Unit test on synthetic audio arrays: a quiet\u2192loud spike (>5x rolling avg, >floor) yields a snap escalation toward DoA; steady ambient yields none."
+    },
+    {
+      "id": "c17",
+      "kind": "requirement",
+      "text": "The producer commits/holds a direction only on speech_detected or a fresh snap and expires it after a hold timeout; a constant/latched angle with no speech and no snap commits no turn and recenters."
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "Unit test: a constant/latched angle with no speech and no snap commits zero turns and recenters after the hold; only a speech_detected transition or a snap commits."
+    },
+    {
+      "id": "c18",
+      "kind": "requirement",
+      "text": "Tier-1: only the near-side antenna leans toward a faint off-axis sound (ANTENNA_KEY coalescing in the motion queue, far antenna neutral, head held)."
+    },
+    {
+      "id": "h4",
+      "kind": "honesty",
+      "text": "tests/test_motion.py: a faint single-direction feed yields exactly a near-side-only antenna action (far ~neutral, head None); two ANTENNA_KEY actions coalesce independently of LOOK_KEY."
+    },
+    {
+      "id": "c19",
+      "kind": "requirement",
+      "text": "Tier-2 head->body escalation re-centers the head via a slow body turn when the source persists off-axis, folding the antenna pose into the committing turn action (no stale backlog)."
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "tests/test_motion.py: a persistent far-side feed produces a body-turn action with head re-centering and the antenna pose folded into the same action; no queued antenna action is left behind."
+    },
+    {
+      "id": "c20",
+      "kind": "requirement",
+      "text": "listen defaults to the SDK transport + tiered behavior; HTTP remains selectable as a remote profile; every existing tuning flag still parses and new tier/RMS knobs parse."
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "tests/test_listen_cli.py: 'reachy listen run' with no flags selects the SDK transport + tiered producer; --transport http still works; every pre-existing flag and each new knob parses."
+    },
+    {
+      "id": "c21",
+      "kind": "requirement",
+      "text": "Daemon/robot liveness is determined via the SDK and stays correct across a daemon restart (#21), reducing the hand-rolled PID/health-poll logic."
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "Unit test with a stubbed SDK: the liveness check reflects a simulated daemon restart correctly (down\u2192up), without the old PID/health-poll path."
+    },
+    {
+      "id": "c22",
+      "kind": "requirement",
+      "text": "reachy-mini is declared a base runtime dependency in pyproject; CLAUDE.md + README are updated to describe the SDK-first default (HTTP optional remote)."
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "A test/grep confirms pyproject lists reachy-mini in base [project.dependencies], and CLAUDE.md + README describe the SDK-first default with HTTP as an optional remote profile."
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "Make reachy-mini (+numpy) a BASE dependency in pyproject (decision c8)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "pyproject.toml moves reachy-mini into [project.dependencies] and adds numpy; the [sdk]/[daemon] extras still resolve; the HTTP/remote profile still imports with no robot hardware present."
+      ],
+      "deps": [],
+      "covers": [
+        "c22"
+      ]
+    },
+    {
+      "id": "t2",
+      "summary": "Add ANTENNA_KEY coalesce key to the motion queue",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "reachy/motion/queue.py defines ANTENNA_KEY (!= LOOK_KEY); tests/test_motion.py shows two ANTENNA_KEY actions coalesce while a pending LOOK_KEY action is untouched."
+      ],
+      "deps": [],
+      "covers": [
+        "c18"
+      ]
+    },
+    {
+      "id": "t3",
+      "summary": "SnapDetector: real RMS spike, cite reachy_nova detect_snap (c9/c15)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "new reachy/motion/snap.py SnapDetector.feed(audio)->bool: rolling energy deque, fires when rms=sqrt(mean(audio^2)) > 5x rolling_avg AND > ~0.02 floor AND prev chunk quiet (cite reachy_nova.tracking.detect_snap).",
+        "tests/test_motion.py: quiet->loud synthetic spike fires once; steady ambient never fires; sub-floor noise never fires."
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "c16",
+        "h2"
+      ]
+    },
+    {
+      "id": "t4",
+      "summary": "SDK transport: real DoA + audio sample, AEC ch0 (assumption c24)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "reachy/robot/sdk_transport.py exposes doa() via reachy_mini.media.audio.get_DoA() and get_audio_sample()/samplerate/channels (AEC ch0); HTTP transport keeps DoA, returns no audio.",
+        "a unit test with a stubbed reachy_mini verifies doa()->{angle,speech_detected} and audio passthrough; no hardware needed."
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "h11"
+      ]
+    },
+    {
+      "id": "t5",
+      "summary": "Tier-1 near-side antenna lean in ListenProducer (decision c11)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "ListenParams gains antenna knobs; for a usable DoA not (yet) turning, update() returns an ANTENNA_KEY MotionAction with ONLY the near-side antenna leaning (far ~neutral, head=None).",
+        "tests/test_motion.py: a faint single-direction feed yields exactly a near-side-only antenna action (near magnitude > far)."
+      ],
+      "deps": [
+        "t2"
+      ],
+      "covers": [
+        "c18",
+        "h4"
+      ]
+    },
+    {
+      "id": "t6",
+      "summary": "Tier-2 gate: speech OR snap, latched-DoA guard (decisions c9,c10)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "ListenProducer commits/holds a direction ONLY on speech_detected or a fresh snap, expiring it after a hold timeout (cite reachy_nova update_doa+speaker_hold); transient/latched angle never commits.",
+        "tests/test_motion.py: a constant/latched angle with no speech and no snap commits zero turns and recenters after the hold; a speech transition OR a snap commits exactly one turn."
+      ],
+      "deps": [
+        "t5",
+        "t3"
+      ],
+      "covers": [
+        "c17",
+        "h3"
+      ]
+    },
+    {
+      "id": "t7",
+      "summary": "Tier-2 escalate head->body, fold antenna into the turn (decision c12)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "when a committed source persists off-axis beyond the head-only band, update() emits a slow body_yaw turn re-centering the head, with the antenna pose folded into the committing action (no stale backlog).",
+        "tests/test_motion.py: a persistent far-side feed produces a body-turn with head re-centering and no leftover queued antenna action."
+      ],
+      "deps": [
+        "t6"
+      ],
+      "covers": [
+        "c19",
+        "h5"
+      ]
+    },
+    {
+      "id": "t8",
+      "summary": "Wire RMS snap into the listen loop (SDK audio -> SnapDetector -> producer)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "the listen run loop pulls get_audio_sample() each tick (SDK profile), feeds SnapDetector, and a snap escalates Tier-2 toward the current DoA; HTTP profile (no audio) skips the snap path.",
+        "an integration test (stubbed SDK feeding audio,DoA): faint->antenna-only; loud spike->snap turn; speech->turn; the two tiers are distinct MotionAction shapes."
+      ],
+      "deps": [
+        "t4",
+        "t7"
+      ],
+      "covers": [
+        "c1",
+        "h1",
+        "c4"
+      ]
+    },
+    {
+      "id": "t9",
+      "summary": "CLI: SDK default transport + tiered default + tuning flags (decision c8)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "reachy/cli/_commands/listen.py + robot default make 'reachy listen run' (no flags) select SDK transport + tiered producer; --transport http remains selectable; overview describes the two tiers + loudness.",
+        "tests/test_listen_cli.py: default run uses SDK+tiered; --transport http parses; every pre-existing flag and each new tier/RMS knob parses into ListenParams."
+      ],
+      "deps": [
+        "t8",
+        "t4"
+      ],
+      "covers": [
+        "c20",
+        "h6",
+        "c2",
+        "h9"
+      ]
+    },
+    {
+      "id": "t10",
+      "summary": "Daemon/robot liveness via the SDK across restart (issue #21, decision c13)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "liveness is determined via the SDK transport (not only PID/health-poll); a restart (down->up) is reflected correctly, bounded to liveness (no full daemon-mgmt rewrite).",
+        "a unit test with a stubbed SDK simulates a restart and asserts the liveness check transitions down->up correctly."
+      ],
+      "deps": [
+        "t4"
+      ],
+      "covers": [
+        "c21",
+        "h7"
+      ]
+    },
+    {
+      "id": "t11",
+      "summary": "Docs: SDK-first README + CLAUDE.md + explain catalog (decision c8, boundary c6)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "README + CLAUDE.md describe the SDK-first default (reachy-mini base dep, HTTP optional remote) and relax the zero-base-dep rule; explain/catalog.py describes the two tiers + loudness; no-vision/no-ML boundary + HTTP-still-selectable stated.",
+        "a test/grep confirms pyproject lists reachy-mini in base [project.dependencies]; the explain catalog entry for listen resolves (test_every_catalog_path_resolves stays green)."
+      ],
+      "deps": [
+        "t9",
+        "t10"
+      ],
+      "covers": [
+        "c22",
+        "h8",
+        "c3",
+        "h10",
+        "c5",
+        "h12",
+        "c6",
+        "h13"
+      ]
+    },
+    {
+      "id": "t12",
+      "summary": "Acceptance: end-to-end two-tier behavior + success signals (success_signal c7)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "an acceptance/integration test (stubbed SDK) asserts the documented success signals: tap->antenna-only, clap/loud->snap turn, talk->slow head-then-body turn; documented as the on-robot acceptance script.",
+        "reflects real defaults and would pass on the live unit (mic confirmed working at localhost:8000)."
+      ],
+      "deps": [
+        "t8",
+        "t9"
+      ],
+      "covers": [
+        "c7",
+        "h14"
+      ]
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "text": "SDK API shapes (media.audio.get_DoA, media.get_audio_sample, samplerate/channels) assumed from reachy_nova (c24) \u2014 verify against the installed reachy-mini.",
+      "kind": "unknown_nonblocking",
+      "task_id": "t4"
+    },
+    {
+      "id": "r2",
+      "text": "Antenna near-side sign/axis is hardware-dependent (c23) \u2014 confirm on the live unit (mic verified at localhost:8000).",
+      "kind": "unknown_nonblocking",
+      "task_id": "t5"
+    },
+    {
+      "id": "r3",
+      "text": "Feel/thresholds (snap 5x + 0.02 floor, dwell, hold, head-only band, body speed) are tuning \u2014 ship defaults, tune live.",
+      "kind": "unknown_nonblocking",
+      "task_id": "t6"
+    },
+    {
+      "id": "r4",
+      "text": "Base-dep migration changes the README dep-free pitch; keep the HTTP/remote profile importable with no robot/SDK hardware present.",
+      "kind": "unknown_nonblocking",
+      "task_id": "t1"
+    },
+    {
+      "id": "r5",
+      "text": "Issue #21 scope is BOUNDED to SDK-based liveness; watch for regressions in existing daemon start/stop/status.",
+      "kind": "unknown_nonblocking",
+      "task_id": "t10"
+    },
+    {
+      "id": "r6",
+      "text": "numpy as a base dep adds weight + softens the pure-stdlib ethos \u2014 accepted per the SDK-first decision (c8).",
+      "kind": "follow_up",
+      "task_id": null
+    }
+  ]
+}
