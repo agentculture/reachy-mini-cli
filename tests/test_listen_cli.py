@@ -62,11 +62,15 @@ def test_run_centers_then_settles_when_silent(monkeypatch, capsys) -> None:
 def test_run_orients_toward_sound_json(monkeypatch, capsys) -> None:
     tr = _FakeTransport(doa={"angle": 0.0, "speech_detected": False})  # sound on the left
     monkeypatch.setattr("reachy.cli._commands.listen.get_transport", lambda args: tr)
-    rc = main(["listen", "run", "--json", "--dwell", "0", "--deadband", "0", "--max-ticks", "5"])
+    # Two-tier listen: a Tier-1 antenna lean precedes the Tier-2 head turn, and each
+    # move runs serially through the queue — so allow enough ticks for the head turn to
+    # *dispatch* after the lean's interpolation completes.
+    rc = main(["listen", "run", "--json", "--dwell", "0", "--deadband", "0", "--max-ticks", "20"])
     assert rc == 0
     events = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.strip()]
-    assert any(e.get("action") for e in events)  # turned toward the sound
-    assert any((e.get("yaw") or 0.0) > 0 for e in events)  # left -> +yaw
+    assert any(e.get("action") for e in events)  # reacted to the sound
+    assert any("antenna" in (e.get("action") or "") for e in events)  # Tier-1 lean
+    assert any((e.get("yaw") or 0.0) > 0 for e in events)  # Tier-2 turn: left -> +yaw
 
 
 def test_run_unreachable_exits_2(monkeypatch, capsys) -> None:
