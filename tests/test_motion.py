@@ -12,12 +12,16 @@ import math
 from reachy.behavior.sense import Sense
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.motion.listen import ListenParams, ListenProducer
-from reachy.motion.queue import LOOK_KEY, MotionAction, MotionQueue
+from reachy.motion.queue import ANTENNA_KEY, LOOK_KEY, MotionAction, MotionQueue
 from reachy.motion.server import run
 
 
 def _look(label: str, yaw: float) -> MotionAction:
     return MotionAction(label=label, head={"yaw": yaw}, duration=1.0, coalesce_key=LOOK_KEY)
+
+
+def _antenna(label: str, right: float, left: float) -> MotionAction:
+    return MotionAction(label=label, antennas=(right, left), duration=1.0, coalesce_key=ANTENNA_KEY)
 
 
 # --------------------------------------------------------------------------- #
@@ -60,6 +64,27 @@ def test_queue_recoalesces_after_pop() -> None:
     q.submit(_look("look-2", 30))
     assert started.label == "look-1"
     assert [a.label for a in q.pending()] == ["look-2"]
+
+
+def test_antenna_key_coalesces_independently() -> None:
+    # antenna actions coalesce with each other
+    q = MotionQueue()
+    q.submit(_antenna("antenna-up", 10, 10))
+    q.submit(_antenna("antenna-down", 0, 0))  # replaces the pending antenna
+    assert len(q) == 1
+    only = q.pop()
+    assert only.label == "antenna-down"
+
+
+def test_antenna_and_look_do_not_evict_each_other() -> None:
+    # antenna and look are independent coalesce keys — a look doesn't evict an antenna
+    # and vice-versa
+    q = MotionQueue()
+    q.submit(_look("look-left", 20))
+    q.submit(_antenna("antenna-up", 10, 10))
+    q.submit(_look("look-right", -20))  # replaces the pending look only
+    pending_labels = [a.label for a in q.pending()]
+    assert pending_labels == ["antenna-up", "look-right"]
 
 
 # --------------------------------------------------------------------------- #

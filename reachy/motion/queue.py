@@ -19,6 +19,9 @@ from dataclasses import dataclass, field
 # A reactive producer re-targeting the head shares this key so only the latest look
 # survives in the queue; one-shot gestures pass coalesce_key=None to queue in order.
 LOOK_KEY = "look"
+# A reactive producer re-targeting the antennas shares this key so only the latest antenna
+# action survives in the queue, independently of LOOK_KEY.
+ANTENNA_KEY = "antenna"
 
 
 @dataclass(frozen=True)
