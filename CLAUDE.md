@@ -129,17 +129,20 @@ you touch the CLI.
 
 ## Hard constraints
 
-- **Base runtime dependencies — SDK-first (deliberate trade-off).** `reachy-mini`
-  and `numpy` are now **base** `dependencies` in `pyproject.toml`. This was a
-  deliberate decision: `listen` needs real in-process DoA + RMS loudness from the
-  mic array, and shipping that as an optional extra would mean the default install
-  silently falls back to HTTP polling. The trade-off is that the bare `pip install
-  reachy-cli` no longer carries zero dependencies — the remote-only control-box
-  profile now also pulls the SDK. The HTTP transport remains available via
-  `--transport http` / `REACHY_TRANSPORT=http` for any command. The
-  `reachy-mini-daemon` binary still lives behind the `[daemon]` extra (recommended
-  default: `pip install 'reachy-cli[daemon]'`). `teken` remains dev-only.
-  `whoami` still hand-rolls YAML; `reachy/daemon.py` still uses stdlib only.
+- **Base runtime dependencies — SDK-first, but installable.** `numpy` is the only
+  **base** runtime dependency (`pyproject.toml`) — it powers the RMS loudness
+  detector and is a pure wheel that installs everywhere. The SDK transport is
+  `listen`'s **default**, but `reachy-mini` stays an **extra** (`[sdk]` / `[daemon]`),
+  not a base dep, because its transitive stack (pycairo / gstreamer / pyaudio) needs
+  system libraries absent on a bare box and in CI — a hard base dep breaks `uv sync`
+  on the cairo build (learned the hard way on PR #24). So the **recommended default
+  install is `pip install 'reachy-cli[daemon]'`** (pulls `reachy-mini`); a bare
+  `pip install reachy-cli` is the HTTP remote profile, and running the `sdk`
+  transport without the extra raises a clean exit-2 `CliError` pointing at `[sdk]`.
+  The HTTP transport stays available via `--transport http` / `REACHY_TRANSPORT=http`.
+  Adding a *new* base runtime dep beyond `numpy` needs an explicit decision (keep the
+  base light enough for the remote profile). `teken` remains dev-only; `whoami` still
+  hand-rolls YAML; `reachy/daemon.py` still uses stdlib only.
 - **Python ≥ 3.12** (uses `X | None`, `tomllib`, etc.).
 - **Every PR bumps the version**, even docs/config/CI-only changes — the
   `version-check` CI job blocks the merge otherwise (it compares

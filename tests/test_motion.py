@@ -79,15 +79,22 @@ def test_antenna_key_coalesces_independently() -> None:
     assert only.label == "antenna-down"
 
 
-def test_antenna_and_look_do_not_evict_each_other() -> None:
-    # antenna and look are independent coalesce keys — a look doesn't evict an antenna
-    # and vice-versa
+def test_antenna_does_not_evict_a_pending_look() -> None:
+    # A Tier-1 antenna lean must never drop a queued Tier-2 turn (one-way supersede).
     q = MotionQueue()
     q.submit(_look("look-left", 20))
+    q.submit(_antenna("antenna-up", 10, 10))  # coexists — does not evict the look
+    assert [a.label for a in q.pending()] == ["look-left", "antenna-up"]
+
+
+def test_look_supersedes_a_pending_antenna_lean() -> None:
+    # A committed head/body turn supersedes a pending subtle antenna lean so the
+    # "turn to see" is never delayed behind one (Qodo PR #24, comment 4).
+    q = MotionQueue()
     q.submit(_antenna("antenna-up", 10, 10))
-    q.submit(_look("look-right", -20))  # replaces the pending look only
+    q.submit(_look("look-right", -20))  # evicts the pending antenna lean
     pending_labels = [a.label for a in q.pending()]
-    assert pending_labels == ["antenna-up", "look-right"]
+    assert pending_labels == ["look-right"]
 
 
 # --------------------------------------------------------------------------- #

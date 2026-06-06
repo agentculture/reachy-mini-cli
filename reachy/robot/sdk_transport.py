@@ -69,12 +69,14 @@ class MediaSession:
         self.samplerate: int = media.get_input_audio_samplerate()
         self.channels: int = media.get_input_channels()
 
-    def doa(self) -> object:
+    def doa(self, *, timeout: float | None = None) -> object:
         """Read the sound Direction of Arrival.
 
         Returns ``{"angle": float, "speech_detected": bool}`` (angle in radians,
         ``0``=left, ``pi/2``=front, ``pi``=right), or ``None`` when the SDK has
-        no reading available.
+        no reading available. Accepts (and ignores) ``timeout`` so this is
+        duck-compatible with ``Transport.doa`` — ``read_doa`` always passes it,
+        and the SDK read is non-blocking, so there is nothing to time out.
         """
         return _tuple_to_doa_dict(self._media.get_DoA())
 

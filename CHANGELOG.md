@@ -17,7 +17,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- `listen` is now SDK-first: `reachy-mini` + `numpy` are base dependencies and the SDK transport is listen's default (real DoA + mic loudness in-process); the HTTP transport remains an optional remote profile via --transport http. Relaxes the prior zero-base-dependency rule (deliberate decision).
+- `listen` is now SDK-first: the SDK transport is listen's default (real DoA + mic loudness in-process), with `numpy` as a base dependency for the RMS detector. `reachy-mini` stays a `[sdk]`/`[daemon]` extra (its cairo/gstreamer stack can't be a base dep without breaking bare/CI installs); running the `sdk` transport without it gives a clean exit-2 hint. The HTTP transport remains an optional remote profile via `--transport http`.
 - Latched-DoA guard: a head turn fires only on live speech/snap, never on a frozen DoA angle (the daemon latches the last direction at rest).
 
 ## [0.7.0] - 2026-06-06

@@ -13,20 +13,20 @@ classifiers = [
     "Topic :: Software Development",
     "Intended Audience :: Developers",
 ]
-dependencies = ["reachy-mini>=1.0", "numpy>=1.24"]
+dependencies = ["numpy>=1.24"]
 
-# SDK-first design: `reachy-mini` (SDK + daemon binary) and `numpy` (RMS detector)
-# are now base dependencies — the SDK transport and numpy-based audio processing are
-# the default path. The bare `pip install reachy-cli` therefore includes the full SDK.
+# SDK-first design, installability-aware: `numpy` (the RMS loudness detector) is a base
+# dependency — it is a pure wheel that installs everywhere. `reachy-mini` (the SDK + daemon
+# binary) is the DEFAULT `listen` transport but stays an *extra*, because its transitive
+# stack (pycairo / gstreamer / pyaudio) needs system libraries that aren't present on a bare
+# box or in CI. So the recommended install is `pip install 'reachy-cli[daemon]'` (or
+# `[sdk]`), which the README documents; a bare `pip install reachy-cli` gives the HTTP remote
+# profile, and running the SDK transport without the extra raises a clean CliError pointing
+# at `[sdk]`. (See the `version-check`/CI note: a hard reachy-mini base dep breaks `uv sync`
+# on the cairo build.)
 #
-# The HTTP-only *remote* profile (controlling a daemon running elsewhere via
-# --base-url / REACHY_BASE_URL, without local SDK usage) remains valid as a usage
-# pattern — no code change needed, just omit the sdk transport flag. It is no longer
-# a lighter install profile, however, since reachy-mini ships in base deps.
-#
-# Optional extras below keep their entries for intent clarity and backward compat:
-# `[daemon]` signals "I need the reachy-mini-daemon binary" and `[sdk]` signals
-# "I need the in-process SDK client" — both resolve to the same reachy-mini wheel.
+# `[daemon]` signals "I need the reachy-mini-daemon binary" and `[sdk]` signals "I need the
+# in-process SDK client" — both resolve to the same reachy-mini wheel.
 [project.optional-dependencies]
 daemon = ["reachy-mini>=1.0"]
 sdk = ["reachy-mini>=1.0"]

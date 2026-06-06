@@ -23,6 +23,12 @@ LOOK_KEY = "look"
 # action survives in the queue, independently of LOOK_KEY.
 ANTENNA_KEY = "antenna"
 
+# A committed head/body move (LOOK_KEY) also supersedes any pending subtle antenna lean
+# (ANTENNA_KEY) — a deliberate "turn to see" must never wait behind a Tier-1 lean. The
+# relation is one-way: a lean never evicts a queued turn. (The turn already folds the
+# antenna pose into its own action, so the antenna still moves with the head.)
+_SUPERSEDES: dict[str, frozenset[str]] = {LOOK_KEY: frozenset({ANTENNA_KEY})}
+
 
 @dataclass(frozen=True)
 class MotionAction:
@@ -51,13 +57,17 @@ class MotionQueue:
     _pending: list[MotionAction] = field(default_factory=list)
 
     def submit(self, action: MotionAction) -> None:
-        """Enqueue ``action``; if it coalesces, drop any pending action sharing its key.
+        """Enqueue ``action``; if it coalesces, drop any pending action it replaces.
 
-        The currently-executing action is owned by the executor (not here), so it always
+        A keyed action evicts pending actions sharing its key, plus any keys it
+        *supersedes* (see :data:`_SUPERSEDES` — a turn evicts a pending lean). The
+        currently-executing action is owned by the executor (not here), so it always
         finishes — coalescing only ever replaces moves that have not started yet.
         """
-        if action.coalesce_key is not None:
-            self._pending = [a for a in self._pending if a.coalesce_key != action.coalesce_key]
+        key = action.coalesce_key
+        if key is not None:
+            evict = {key} | _SUPERSEDES.get(key, frozenset())
+            self._pending = [a for a in self._pending if a.coalesce_key not in evict]
         self._pending.append(action)
 
     def peek(self) -> MotionAction | None:

@@ -16,8 +16,8 @@ Agent and CLI for operating the Reachy Mini expressive robot — device setup, a
 ## Quickstart
 
 ```bash
-uv sync                               # base install — includes reachy-mini + numpy (SDK-first)
-uv sync --extra daemon                # + the local reachy-mini-daemon binary
+uv sync --extra daemon                # recommended — SDK + the reachy-mini-daemon binary
+uv sync                               # bare — numpy only; HTTP remote profile (--transport http)
 uv run pytest -n auto                 # run the test suite
 uv run reachy whoami                  # identity from culture.yaml
 uv run reachy learn                   # self-teaching prompt (add --json)
@@ -45,21 +45,20 @@ The `daemon`, `device`, `app`, and `move` noun groups operate the Reachy Mini.
 
 ### Install profiles
 
-The base install is **SDK-first**: `pip install reachy-cli` pulls `reachy-mini` and
-`numpy` as base runtime dependencies. This gives `listen` direct in-process access
-to the mic array (real DoA + RMS loudness via `reachy_mini`), making the `sdk`
-transport the default for `listen`.
+`listen` is **SDK-first** — the `sdk` transport is its default, giving direct
+in-process access to the mic array (real DoA + RMS loudness via `reachy_mini`).
+`numpy` is a base dependency (the RMS detector; a pure wheel). `reachy-mini` itself
+stays an **extra**, not a base dep, because its transitive stack (pycairo /
+gstreamer / pyaudio) needs system libraries a bare box / CI lack — so the
+recommended install bundles it via an extra.
 
-- **Default — SDK profile:** `pip install reachy-cli`. Includes `reachy-mini` +
-  `numpy`. The `sdk` transport works out of the box; `listen` uses it by default.
-  The bare `pip install reachy-cli` does **not** include the daemon binary.
-- **With the daemon:** `pip install 'reachy-cli[daemon]'`. Recommended for a machine
-  with a robot attached. Adds the `reachy-mini-daemon` binary so `reachy daemon
-  start` can bring the daemon up locally.
-- **HTTP remote profile:** pass `--transport http` (or set `REACHY_TRANSPORT=http`)
-  on any command to talk to a remote daemon via its REST API instead of the
-  in-process SDK. Use this on a control box that only connects to a daemon running
-  elsewhere via `--base-url` / `REACHY_BASE_URL`.
+- **Recommended — with the SDK + daemon:** `pip install 'reachy-cli[daemon]'` (or
+  `[sdk]`). Pulls `reachy-mini`, so the `sdk` transport `listen` defaults to works
+  out of the box and `reachy daemon start` can bring the daemon up locally.
+- **Bare — HTTP remote profile:** `pip install reachy-cli` (no extra). `numpy`-only;
+  use `--transport http` (or `REACHY_TRANSPORT=http`) with `--base-url` /
+  `REACHY_BASE_URL` to talk to a daemon running elsewhere via its REST API. Running
+  the `sdk` transport here exits `2` with a hint to install the `[sdk]` extra.
 
 ### Bring the daemon up
 

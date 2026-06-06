@@ -151,6 +151,27 @@ def test_media_session_doa_passthrough(monkeypatch) -> None:  # type: ignore[no-
     assert result == {"angle": 1.05, "speech_detected": True}
 
 
+def test_read_doa_passes_timeout_to_session(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """read_doa(session, timeout=...) must work — MediaSession.doa accepts (ignores) timeout.
+
+    Regression for Qodo PR #24 comment 3: the SDK listen loop polls DoA via
+    ``read_doa(session, timeout=DOA_TIMEOUT)``, which calls ``session.doa(timeout=...)``.
+    A missing ``timeout`` kwarg raised TypeError (swallowed by DoaPoller), so the SDK
+    listen path never received any reading.
+    """
+    from reachy.behavior.sense import read_doa
+
+    fake_cls = _FakeMiniCls(doa_return=(1.05, True))
+    _patch_import(monkeypatch, fake_cls)
+
+    with SdkTransport().media_session() as session:
+        # The exact call read_doa makes — must not raise.
+        sense = read_doa(session, timeout=0.1)
+        assert session.doa(timeout=0.1) == {"angle": 1.05, "speech_detected": True}
+
+    assert sense.doa_angle == 1.05 and sense.speech_detected is True
+
+
 def test_media_session_doa_none(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """media_session().doa() returns None when SDK returns None."""
     fake_cls = _FakeMiniCls(doa_return=None)

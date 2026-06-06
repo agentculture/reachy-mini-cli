@@ -1722,7 +1722,6 @@ version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
-    { name = "reachy-mini" },
 ]
 
 [package.optional-dependencies]
@@ -1748,7 +1747,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
-    { name = "reachy-mini", specifier = ">=1.0" },
     { name = "reachy-mini", marker = "extra == 'daemon'", specifier = ">=1.0" },
     { name = "reachy-mini", marker = "extra == 'sdk'", specifier = ">=1.0" },
 ]

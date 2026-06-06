@@ -1,8 +1,11 @@
 """
-Verify that reachy-mini and numpy are base (non-optional) runtime dependencies.
+Verify the SDK-first-but-installable dependency split.
 
-These must live in [project.dependencies], not only in [project.optional-dependencies],
-because the SDK transport and the numpy-based RMS detector are now the default path.
+`numpy` (the RMS loudness detector) is a base dependency — a pure wheel that
+installs everywhere. `reachy-mini` (the SDK) is the default ``listen`` transport
+but stays an *extra* (``[sdk]`` / ``[daemon]``), because its transitive stack
+(pycairo / gstreamer) needs system libraries absent on a bare box / in CI, so a
+hard base dep would break ``uv sync``.
 """
 
 import tomllib
@@ -11,21 +14,33 @@ from pathlib import Path
 PYPROJECT = Path(__file__).parent.parent / "pyproject.toml"
 
 
-def _load_base_deps() -> list[str]:
+def _project() -> dict:
     with PYPROJECT.open("rb") as fh:
-        data = tomllib.load(fh)
-    return data["project"]["dependencies"]
+        return tomllib.load(fh)["project"]
 
 
-def test_reachy_mini_is_base_dep():
-    """reachy-mini must appear in [project.dependencies]."""
-    deps = _load_base_deps()
-    assert any(
-        d.startswith("reachy-mini") for d in deps
-    ), f"reachy-mini not found in base dependencies: {deps}"
+def _base_deps() -> list[str]:
+    return _project()["dependencies"]
 
 
 def test_numpy_is_base_dep():
-    """numpy must appear in [project.dependencies]."""
-    deps = _load_base_deps()
-    assert any(d.startswith("numpy") for d in deps), f"numpy not found in base dependencies: {deps}"
+    """numpy must appear in [project.dependencies] (pure wheel, installs everywhere)."""
+    deps = _base_deps()
+    assert any(d.startswith("numpy") for d in deps), f"numpy not in base dependencies: {deps}"
+
+
+def test_reachy_mini_is_not_a_base_dep():
+    """reachy-mini must NOT be a base dep — its cairo/gstreamer stack breaks bare installs/CI."""
+    deps = _base_deps()
+    assert not any(
+        d.startswith("reachy-mini") for d in deps
+    ), f"reachy-mini must stay an extra, not base: {deps}"
+
+
+def test_reachy_mini_is_in_sdk_and_daemon_extras():
+    """reachy-mini must remain available via the [sdk] and [daemon] extras."""
+    extras = _project()["optional-dependencies"]
+    for name in ("sdk", "daemon"):
+        assert any(
+            d.startswith("reachy-mini") for d in extras.get(name, [])
+        ), f"reachy-mini not found in the [{name}] extra: {extras.get(name)}"

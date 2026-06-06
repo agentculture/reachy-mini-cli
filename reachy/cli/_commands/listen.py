@@ -121,7 +121,7 @@ def _add_tuning_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=None,
         dest="body_yaw_max",
-        help=f"maximum body yaw for Tier-2 head→body escalation (deg, default {d.body_yaw_max:g}).",
+        help=f"max body yaw for Tier-2 head/body escalation (deg, default {d.body_yaw_max:g}).",
     )
     parser.add_argument(
         "--body-speed",
