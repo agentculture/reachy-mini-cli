@@ -9,7 +9,7 @@ with the daemon's HTTP health endpoint.
 Pure standard library (``subprocess`` / ``signal`` / ``os`` / ``urllib``):
 managing a local process adds **no** third-party runtime dependency, so the slim
 base install keeps its zero-runtime-deps property. The daemon binary itself
-ships in the ``[daemon]`` extra (``pip install 'reachy-cli[daemon]'``); a missing
+ships in the ``[daemon]`` extra (``pip install 'reachy-mini-cli[daemon]'``); a missing
 binary is reported as a clean environment error pointing at that install.
 """
 
@@ -90,7 +90,7 @@ def resolve_daemon_cmd(override: str | None = None) -> list[str]:
         code=EXIT_ENV_ERROR,
         message=f"{DAEMON_BINARY!r} not found on PATH",
         remediation=(
-            "install the daemon build: pip install 'reachy-cli[daemon]' (the bare/remote "
+            "install the daemon build: pip install 'reachy-mini-cli[daemon]' (the bare/remote "
             "install is HTTP-only). Or point --daemon-cmd / REACHY_DAEMON_CMD at the binary, "
             "or run the daemon elsewhere and target it with --base-url / REACHY_BASE_URL."
         ),

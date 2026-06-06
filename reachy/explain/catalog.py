@@ -143,7 +143,7 @@ Robot verbs reach the robot through a selectable flavor:
   `http://localhost:8000`, override with `--base-url` or `REACHY_BASE_URL`).
   Uses only the standard library, so the CLI stays dependency-free.
 - `sdk` — the in-process `reachy_mini` client; needs the optional `[sdk]` extra
-  (`pip install 'reachy-cli[sdk]'`). Covers motion/state; daemon and app verbs
+  (`pip install 'reachy-mini-cli[sdk]'`). Covers motion/state; daemon and app verbs
   require `http`.
 
 Select with `--transport {http,sdk}` (or `REACHY_TRANSPORT`). If the daemon is
@@ -249,9 +249,9 @@ a running daemon; this noun is the other half — it brings the local
 
 The daemon binary ships in the `[daemon]` extra — the recommended default:
 
-    pip install 'reachy-cli[daemon]'
+    pip install 'reachy-mini-cli[daemon]'
 
-The bare `pip install reachy-cli` is the HTTP-only *remote* profile (no daemon):
+The bare `pip install reachy-mini-cli` is the HTTP-only *remote* profile (no daemon):
 use it on a control box that only talks to a daemon running elsewhere via
 `--base-url` / `REACHY_BASE_URL`. If the binary is missing, `daemon start` exits 2
 with a hint pointing at the `[daemon]` install.

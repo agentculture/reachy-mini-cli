@@ -52,13 +52,17 @@ stays an **extra**, not a base dep, because its transitive stack (pycairo /
 gstreamer / pyaudio) needs system libraries a bare box / CI lack — so the
 recommended install bundles it via an extra.
 
-- **Recommended — with the SDK + daemon:** `pip install 'reachy-cli[daemon]'` (or
+- **Recommended — with the SDK + daemon:** `pip install 'reachy-mini-cli[daemon]'` (or
   `[sdk]`). Pulls `reachy-mini`, so the `sdk` transport `listen` defaults to works
   out of the box and `reachy daemon start` can bring the daemon up locally.
-- **Bare — HTTP remote profile:** `pip install reachy-cli` (no extra). `numpy`-only;
+- **Bare — HTTP remote profile:** `pip install reachy-mini-cli` (no extra). `numpy`-only;
   use `--transport http` (or `REACHY_TRANSPORT=http`) with `--base-url` /
   `REACHY_BASE_URL` to talk to a daemon running elsewhere via its REST API. Running
   the `sdk` transport here exits `2` with a hint to install the `[sdk]` extra.
+
+> `reachy-cli` still works as a transitional alias (`pip install reachy-cli`) — it
+> just pulls in `reachy-mini-cli`. Either package installs the same tool, and the
+> command is `reachy` (or `reachy-mini-cli`).
 
 ### Bring the daemon up
 

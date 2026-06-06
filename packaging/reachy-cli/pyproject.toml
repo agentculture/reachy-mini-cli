@@ -1,0 +1,42 @@
+# Transitional alias distribution: `reachy-cli` -> `reachy-mini-cli`.
+#
+# This is a metadata-only wheel (no Python modules of its own) whose single job
+# is to make `pip install reachy-cli` pull in the canonical `reachy-mini-cli`
+# distribution. The `version` field and the `reachy-mini-cli` dependency pins
+# below are kept in lock-step with the root pyproject.toml by the publish
+# workflow (it rewrites them from the root version at build time), so the alias
+# always resolves to the exact same release.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reachy-cli"
+version = "0.9.0"
+description = "Transitional alias for reachy-mini-cli — installs the renamed distribution."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{name = "AgentCulture"}]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development",
+    "Intended Audience :: Developers",
+]
+dependencies = ["reachy-mini-cli==0.9.0"]
+
+# Forward the extras so `pip install 'reachy-cli[daemon]'` keeps working exactly
+# like `pip install 'reachy-mini-cli[daemon]'`.
+[project.optional-dependencies]
+daemon = ["reachy-mini-cli[daemon]==0.9.0"]
+sdk = ["reachy-mini-cli[sdk]==0.9.0"]
+
+[project.urls]
+Homepage = "https://github.com/agentculture/reachy-mini-cli"
+Issues = "https://github.com/agentculture/reachy-mini-cli/issues"
+
+# Build a wheel with no package payload — metadata (and its dependency) only.
+[tool.hatch.build.targets.wheel]
+bypass-selection = true

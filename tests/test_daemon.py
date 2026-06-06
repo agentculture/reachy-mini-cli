@@ -134,7 +134,7 @@ def test_start_missing_binary_exit_2(monkeypatch, capsys) -> None:
     err = capsys.readouterr().err
     assert err.startswith("error:")
     assert "hint:" in err
-    assert "reachy-cli[daemon]" in err
+    assert "reachy-mini-cli[daemon]" in err
 
 
 def test_start_forwards_extra_args_after_dashdash(monkeypatch) -> None:

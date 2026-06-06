@@ -1,6 +1,6 @@
 [project]
-name = "reachy-cli"
-version = "0.8.0"
+name = "reachy-mini-cli"
+version = "0.9.0"
 description = "Agent and CLI for operating the Reachy Mini expressive robot — device setup, app management, and runtime ops."
 readme = "README.md"
 license = "MIT"
@@ -19,8 +19,8 @@ dependencies = ["numpy>=1.24"]
 # dependency — it is a pure wheel that installs everywhere. `reachy-mini` (the SDK + daemon
 # binary) is the DEFAULT `listen` transport but stays an *extra*, because its transitive
 # stack (pycairo / gstreamer / pyaudio) needs system libraries that aren't present on a bare
-# box or in CI. So the recommended install is `pip install 'reachy-cli[daemon]'` (or
-# `[sdk]`), which the README documents; a bare `pip install reachy-cli` gives the HTTP remote
+# box or in CI. So the recommended install is `pip install 'reachy-mini-cli[daemon]'` (or
+# `[sdk]`), which the README documents; a bare `pip install reachy-mini-cli` gives the HTTP remote
 # profile, and running the SDK transport without the extra raises a clean CliError pointing
 # at `[sdk]`. (See the `version-check`/CI note: a hard reachy-mini base dep breaks `uv sync`
 # on the cairo build.)
@@ -37,6 +37,7 @@ Issues = "https://github.com/agentculture/reachy-mini-cli/issues"
 
 [project.scripts]
 reachy = "reachy.cli:main"
+reachy-mini-cli = "reachy.cli:main"
 
 [build-system]
 requires = ["hatchling"]

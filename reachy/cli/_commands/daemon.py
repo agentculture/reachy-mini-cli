@@ -63,7 +63,7 @@ def cmd_daemon_overview(args: argparse.Namespace) -> int:
             "items": [
                 "every command supports --json",
                 "start spawns reachy-mini-daemon detached, then polls the health route",
-                "the daemon ships in the [daemon] extra: pip install 'reachy-cli[daemon]'",
+                "the daemon ships in the [daemon] extra: pip install 'reachy-mini-cli[daemon]'",
                 "override the binary with --daemon-cmd or REACHY_DAEMON_CMD",
                 "forward daemon args after '--' (e.g. -- --sim --fastapi-port 9000)",
                 "exit codes: 0 ok, 1 user error, 2 environment (binary/daemon missing)",

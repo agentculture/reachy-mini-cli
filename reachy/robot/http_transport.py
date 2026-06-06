@@ -118,7 +118,7 @@ class HttpTransport(Transport):
             message=f"cannot reach the Reachy daemon at {self.base_url} ({err})",
             remediation=(
                 "start it with 'reachy daemon start' (install the daemon: "
-                "pip install 'reachy-cli[daemon]'), or set REACHY_BASE_URL / pass --base-url"
+                "pip install 'reachy-mini-cli[daemon]'), or set REACHY_BASE_URL / pass --base-url"
             ),
         )
 

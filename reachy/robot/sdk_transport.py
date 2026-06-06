@@ -139,7 +139,7 @@ class SdkTransport(Transport):
                 code=EXIT_ENV_ERROR,
                 message="the reachy_mini SDK is not installed",
                 remediation=(
-                    "install the sdk extra: pip install 'reachy-cli[sdk]', "
+                    "install the sdk extra: pip install 'reachy-mini-cli[sdk]', "
                     "or use --transport http"
                 ),
             ) from err

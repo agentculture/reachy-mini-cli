@@ -1717,8 +1717,50 @@ wheels = [
 ]
 
 [[package]]
-name = "reachy-cli"
-version = "0.8.0"
+name = "reachy-mini"
+version = "1.7.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "asgiref" },
+    { name = "fastapi" },
+    { name = "gstreamer-bundle", marker = "sys_platform != 'linux'" },
+    { name = "huggingface-hub" },
+    { name = "jinja2" },
+    { name = "libusb-package" },
+    { name = "log-throttling" },
+    { name = "numpy" },
+    { name = "pip" },
+    { name = "psutil" },
+    { name = "pulsectl", marker = "sys_platform == 'linux'" },
+    { name = "pycaw", marker = "sys_platform == 'win32'" },
+    { name = "pygobject", marker = "sys_platform == 'linux'" },
+    { name = "pyserial" },
+    { name = "python-multipart" },
+    { name = "pyusb" },
+    { name = "pyyaml" },
+    { name = "questionary" },
+    { name = "reachy-mini-motor-controller" },
+    { name = "reachy-mini-rust-kinematics" },
+    { name = "requests" },
+    { name = "rich" },
+    { name = "rustypot" },
+    { name = "scipy" },
+    { name = "starlette" },
+    { name = "toml" },
+    { name = "tornado" },
+    { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
+    { name = "zeroconf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a5/6e/13c306ae5f8e596fef397dafe26fdb3519812eacb3c6eb6e32fc5149cfd8/reachy_mini-1.7.3.tar.gz", hash = "sha256:adc0b0b2febfe6224919069d6080f93fb88d0af0dd0411e776471d1441f81e45", size = 24737633, upload-time = "2026-05-13T14:30:32.09Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ee/fc/e464236bde6e25a3dde4655973076962c756a2da46c37f2adb25c8363ce1/reachy_mini-1.7.3-py3-none-any.whl", hash = "sha256:209c712b31ccf77b8ff7d861c4598a1e0f4596656a161b12d1e4068bc76fe006", size = 24834307, upload-time = "2026-05-13T14:30:28.406Z" },
+]
+
+[[package]]
+name = "reachy-mini-cli"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
@@ -1762,48 +1804,6 @@ dev = [
     { name = "pytest-cov", specifier = ">=4.1" },
     { name = "pytest-xdist", specifier = ">=3.0" },
     { name = "teken", specifier = ">=0.8" },
-]
-
-[[package]]
-name = "reachy-mini"
-version = "1.7.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "aiohttp" },
-    { name = "asgiref" },
-    { name = "fastapi" },
-    { name = "gstreamer-bundle", marker = "sys_platform != 'linux'" },
-    { name = "huggingface-hub" },
-    { name = "jinja2" },
-    { name = "libusb-package" },
-    { name = "log-throttling" },
-    { name = "numpy" },
-    { name = "pip" },
-    { name = "psutil" },
-    { name = "pulsectl", marker = "sys_platform == 'linux'" },
-    { name = "pycaw", marker = "sys_platform == 'win32'" },
-    { name = "pygobject", marker = "sys_platform == 'linux'" },
-    { name = "pyserial" },
-    { name = "python-multipart" },
-    { name = "pyusb" },
-    { name = "pyyaml" },
-    { name = "questionary" },
-    { name = "reachy-mini-motor-controller" },
-    { name = "reachy-mini-rust-kinematics" },
-    { name = "requests" },
-    { name = "rich" },
-    { name = "rustypot" },
-    { name = "scipy" },
-    { name = "starlette" },
-    { name = "toml" },
-    { name = "tornado" },
-    { name = "uvicorn", extra = ["standard"] },
-    { name = "websockets" },
-    { name = "zeroconf" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a5/6e/13c306ae5f8e596fef397dafe26fdb3519812eacb3c6eb6e32fc5149cfd8/reachy_mini-1.7.3.tar.gz", hash = "sha256:adc0b0b2febfe6224919069d6080f93fb88d0af0dd0411e776471d1441f81e45", size = 24737633, upload-time = "2026-05-13T14:30:32.09Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ee/fc/e464236bde6e25a3dde4655973076962c756a2da46c37f2adb25c8363ce1/reachy_mini-1.7.3-py3-none-any.whl", hash = "sha256:209c712b31ccf77b8ff7d861c4598a1e0f4596656a161b12d1e4068bc76fe006", size = 24834307, upload-time = "2026-05-13T14:30:28.406Z" },
 ]
 
 [[package]]

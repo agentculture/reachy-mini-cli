@@ -18,23 +18,23 @@ copy*, not the *feature set*.
 
 ## Critical naming gotcha
 
-The clone was only half-renamed. The names do **not** all agree:
+The half-rename has been resolved — the names now agree on `reachy-mini-cli`:
 
 | Thing | Value |
 |-------|-------|
-| Installed console script (what you actually run) | **`reachy`** |
-| Import package | `reachy` |
-| Distribution / PyPI name | `reachy-cli` (`__version__` reads this) |
+| Installed console scripts (what you actually run) | **`reachy`** and **`reachy-mini-cli`** (both → `reachy.cli:main`) |
+| Import package | `reachy` (unchanged — short and ergonomic) |
+| Distribution / PyPI name | `reachy-mini-cli` (`__version__` reads this) |
+| Transitional alias dist | `reachy-cli` — a metadata-only wheel that just depends on `reachy-mini-cli` (`packaging/reachy-cli/`) |
 | `prog=` and every help/`learn`/`explain`/README string | `reachy-mini-cli` |
 
-So `uv run reachy whoami` **works**; `uv run reachy-mini-cli whoami` **fails**
-(no such binary) — the README's quickstart and `explain`/`learn` text are wrong
-about the invocation name. When you run or document the CLI, use `reachy`.
-Test assertions and catalog text hard-code the literal `"reachy-mini-cli"`, so
-do not "fix" the display name piecemeal; either leave it or do a complete,
-deliberate rename across `pyproject.toml` (`name`, `[project.scripts]`),
-`prog=`, all `_commands/` + `explain/catalog.py` strings, the README, and the
-test assertions in one pass.
+So `uv run reachy whoami` and `uv run reachy-mini-cli whoami` **both work**, and
+`pip install reachy-mini-cli` / `pip install reachy-cli` install the same tool
+(the alias pulls in the canonical dist). The import package stays `reachy` on
+purpose. If you ever rename again, do it as one deliberate pass across
+`pyproject.toml` (`name`, `[project.scripts]`), `prog=`, all `_commands/` +
+`explain/catalog.py` strings, the README, the alias package, and the test
+assertions — never piecemeal.
 
 ## Commands
 
@@ -136,8 +136,8 @@ you touch the CLI.
   not a base dep, because its transitive stack (pycairo / gstreamer / pyaudio) needs
   system libraries absent on a bare box and in CI — a hard base dep breaks `uv sync`
   on the cairo build (learned the hard way on PR #24). So the **recommended default
-  install is `pip install 'reachy-cli[daemon]'`** (pulls `reachy-mini`); a bare
-  `pip install reachy-cli` is the HTTP remote profile, and running the `sdk`
+  install is `pip install 'reachy-mini-cli[daemon]'`** (pulls `reachy-mini`); a bare
+  `pip install reachy-mini-cli` is the HTTP remote profile, and running the `sdk`
   transport without the extra raises a clean exit-2 `CliError` pointing at `[sdk]`.
   The HTTP transport stays available via `--transport http` / `REACHY_TRANSPORT=http`.
   Adding a *new* base runtime dep beyond `numpy` needs an explicit decision (keep the
@@ -159,8 +159,11 @@ you touch the CLI.
   when `SONAR_TOKEN` is set; token-less repos and fork PRs skip the scan and
   stay green.
 - `publish.yml`: TestPyPI dev build on internal PRs, real PyPI publish on push
-  to `main`, both via Trusted Publishing (no stored credentials). Dist name is
-  `reachy-cli`.
+  to `main`, both via Trusted Publishing (no stored credentials). It publishes
+  **two** dists: the canonical `reachy-mini-cli` (the real package) and the
+  transitional `reachy-cli` alias (metadata-only, `packaging/reachy-cli/`, pinned
+  to the same version). Both names need a Trusted Publisher configured on PyPI /
+  TestPyPI for this repo + workflow + environment.
 
 ## Skills (`.claude/skills/`)
 
