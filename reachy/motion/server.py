@@ -78,6 +78,7 @@ def _drive(
     q,
     *,
     sense,
+    audio,
     now,
     sleep,
     tick,
@@ -91,7 +92,9 @@ def _drive(
     st = _DriveState()
     while not stop["flag"]:
         t = now()
-        action = producer.update(t, sense(t) if sense is not None else EMPTY_SENSE)
+        snap, sp = audio(t) if audio is not None else (False, None)
+        sense_val = sense(t) if sense is not None else EMPTY_SENSE
+        action = producer.update(t, sense_val, snap=snap, sound_present=sp)
         if action is not None:
             q.submit(action)
         _service_queue(
@@ -109,6 +112,7 @@ def run(
     producer,
     *,
     sense: Callable | None = None,
+    audio: Callable | None = None,
     queue: MotionQueue | None = None,
     now=time.monotonic,
     sleep=time.sleep,
@@ -121,9 +125,12 @@ def run(
 ) -> int:
     """Drive the robot from ``producer`` actions until stopped. Returns ticks run.
 
-    ``producer.update(t, sense) -> MotionAction | None`` decides what to do each tick;
-    ``sense`` is an optional ``(t) -> Sense`` source (e.g. a ``DoaPoller``). Moves are run
-    one at a time via ``transport.move_goto`` — never overlapping.
+    ``producer.update(t, sense, snap=..., sound_present=...) -> MotionAction | None`` decides
+    what to do each tick; ``sense`` is an optional ``(t) -> Sense`` source (e.g. a
+    ``DoaPoller``); ``audio`` is an optional ``(t) -> (snap: bool, sound_present: bool | None)``
+    source — when provided, its values are forwarded to the producer each tick so it can use
+    real mic loudness rather than the degraded ``sound_present=None`` fallback.
+    Moves are run one at a time via ``transport.move_goto`` — never overlapping.
     """
     q = queue if queue is not None else MotionQueue()
     own_stop = stop is None
@@ -135,6 +142,7 @@ def run(
             producer,
             q,
             sense=sense,
+            audio=audio,
             now=now,
             sleep=sleep,
             tick=tick,

@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 
+import numpy as np
+
 from reachy.behavior.sense import DOA_TIMEOUT, DoaPoller, read_doa
 from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
@@ -32,6 +34,7 @@ from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.motion import supervisor
 from reachy.motion.listen import ListenParams, ListenProducer
 from reachy.motion.server import run as run_loop
+from reachy.motion.snap import SnapDetector
 from reachy.robot import add_robot_args, get_transport
 
 _JSON_HELP = "Emit structured JSON."
@@ -170,7 +173,6 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
     transport = get_transport(args)
     params = _params_from_args(args)
-    poller = DoaPoller(read=lambda: read_doa(transport, timeout=DOA_TIMEOUT))
     producer = ListenProducer(params)
 
     # Preflight: ease to center. Validates the transport (a dead daemon raises a
@@ -193,9 +195,33 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
         else:
             emit_diagnostic(f"[listen] {action.label} ({action.duration:.1f}s)")
 
-    ticks = run_loop(
-        transport, producer, sense=poller, on_action=_on_action, max_ticks=args.max_ticks
-    )
+    if hasattr(transport, "media_session"):
+        # SDK profile: open a persistent audio+DoA session for the loop's lifetime.
+        with transport.media_session() as session:
+            poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
+            detector = SnapDetector()
+
+            def _audio(_t):
+                sample = session.get_audio_sample()
+                if sample is None:
+                    return (False, None)
+                rms = float(np.sqrt(np.mean(sample**2)))
+                return (detector.feed(sample), rms > detector.min_rms)
+
+            ticks = run_loop(
+                transport,
+                producer,
+                sense=poller,
+                audio=_audio,
+                on_action=_on_action,
+                max_ticks=args.max_ticks,
+            )
+    else:
+        # Non-SDK (HTTP/remote) profile: DoA via transport.doa(), no audio source.
+        poller = DoaPoller(read=lambda: read_doa(transport, timeout=DOA_TIMEOUT))
+        ticks = run_loop(
+            transport, producer, sense=poller, on_action=_on_action, max_ticks=args.max_ticks
+        )
 
     # Settle: ease back to center (best effort — a dead daemon can't be settled).
     try:

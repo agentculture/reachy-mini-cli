@@ -47,6 +47,11 @@ class SnapDetector:
         self._history: deque[float] = deque(maxlen=history)
         self._prev_chunk_low: bool = True  # edge-trigger gate
 
+    @property
+    def min_rms(self) -> float:
+        """Absolute RMS floor below which a chunk is treated as ambient noise."""
+        return self._min_rms
+
     def feed(self, audio: np.ndarray) -> bool:
         """Feed one mic chunk (float32 ndarray). Return True only on a fresh loud spike.
 
