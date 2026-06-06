@@ -39,7 +39,7 @@ _INTERP_TO_SDK = {
 }
 
 
-def _tuple_to_doa_dict(result: object) -> object:
+def _tuple_to_doa_dict(result: tuple[float, bool] | None) -> dict[str, object] | None:
     """Map a ``(angle, speech_detected)`` tuple from ``get_DoA()`` to the canonical dict.
 
     Returns ``None`` when the SDK returns ``None`` (no reading available).  The
@@ -49,7 +49,7 @@ def _tuple_to_doa_dict(result: object) -> object:
     """
     if result is None:
         return None
-    angle, speech = result  # type: ignore[misc]
+    angle, speech = result
     return {"angle": float(angle), "speech_detected": bool(speech)}
 
 
@@ -69,14 +69,14 @@ class MediaSession:
         self.samplerate: int = media.get_input_audio_samplerate()
         self.channels: int = media.get_input_channels()
 
-    def doa(self, *, timeout: float | None = None) -> object:
+    def doa(self, **_kwargs: object) -> object:
         """Read the sound Direction of Arrival.
 
         Returns ``{"angle": float, "speech_detected": bool}`` (angle in radians,
         ``0``=left, ``pi/2``=front, ``pi``=right), or ``None`` when the SDK has
-        no reading available. Accepts (and ignores) ``timeout`` so this is
-        duck-compatible with ``Transport.doa`` — ``read_doa`` always passes it,
-        and the SDK read is non-blocking, so there is nothing to time out.
+        no reading available. Accepts and ignores transport-style keyword args
+        (notably ``timeout``) so it is duck-compatible with ``Transport.doa`` —
+        ``read_doa`` always passes ``timeout`` and the SDK read is non-blocking.
         """
         return _tuple_to_doa_dict(self._media.get_DoA())
 
@@ -146,10 +146,11 @@ class SdkTransport(Transport):
         return ReachyMini, create_head_pose
 
     # --- device ----------------------------------------------------------
-    def doa(
-        self, *, timeout: float | None = None
-    ) -> object:  # noqa: ARG002 — timeout unused for SDK
+    def doa(self, **_kwargs: object) -> object:
         """Read the sound Direction of Arrival via the SDK media subsystem.
+
+        Accepts and ignores transport-style keyword args (notably ``timeout``)
+        for duck-compatibility with ``Transport.doa``.
 
         Opens a short-lived ``ReachyMini`` session, calls
         ``mini.media.get_DoA()``, and maps the ``(angle, speech_detected)``

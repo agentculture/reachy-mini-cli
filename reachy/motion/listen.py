@@ -126,12 +126,13 @@ class ListenProducer:
     _last_live_t: float | None = None
     _hold_until: float = 0.0
 
-    def _move_to(self, target: float, t: float) -> MotionAction:
-        """Commit a head-only turn to *target* (no body change).
+    def _move_to(self, target: float, t: float, *, body_yaw: float | None = None) -> MotionAction:
+        """Commit a head turn to *target*; optionally drive ``body_yaw`` in the same move.
 
         The near-side antenna pose is folded into the same action so the head
         and antenna move together.  On recentering to 0 the antennas return to
-        neutral ``(0.0, 0.0)``.
+        neutral ``(0.0, 0.0)``.  ``body_yaw`` is left ``None`` (body not driven)
+        except on a recenter, where it is ``0.0`` to bring the body home too.
         """
         p = self.params
         toward_center = abs(target) < abs(self.committed)
@@ -149,6 +150,7 @@ class ListenProducer:
             label=f"{kind} {target:+.0f}",
             head=_head(target),
             antennas=antennas,
+            body_yaw=body_yaw,
             duration=dur,
             interpolation="minjerk",
             coalesce_key=LOOK_KEY,
@@ -190,6 +192,34 @@ class ListenProducer:
             coalesce_key=LOOK_KEY,
         )
 
+    def _react_to_angle(
+        self, angle: float, t: float, *, triggered: bool, live: bool
+    ) -> MotionAction | None:
+        """A Tier-2 turn (on a speech/snap trigger) or a Tier-1 antenna lean, or ``None``."""
+        p = self.params
+        raw_desired = doa_angle_to_yaw(angle, p.gain)  # unclamped — drives escalation
+        desired = max(-p.max_yaw, min(p.max_yaw, raw_desired))  # clamped head-only target
+        if triggered and abs(desired - self.committed) > p.deadband:
+            if abs(raw_desired) > p.head_only_band:
+                return self._escalate_to_body(raw_desired, t)
+            return self._move_to(desired, t)
+        if live:
+            return _antenna_lean(desired, p)
+        return None
+
+    def _recenter(self, t: float, live: bool) -> MotionAction | None:
+        """Ease head AND body back to center once, after a grace period of no live sound."""
+        p = self.params
+        if (
+            not live
+            and abs(self.committed) > 1e-9  # off-center (committed is exactly 0 at center)
+            and self._last_live_t is not None
+            and (t - self._last_live_t) >= p.recenter_after
+        ):
+            self.body = 0.0
+            return self._move_to(0.0, t, body_yaw=0.0)
+        return None
+
     def update(
         self,
         t: float,
@@ -219,12 +249,11 @@ class ListenProducer:
         **Recenter:** once sound has been non-live for ``recenter_after`` seconds and
         the head is off-center, ease back to center once (head AND body both return).
         """
-        p = self.params
         angle = sense.doa_angle
         # Effective liveness: prefer the live mic floor; fall back to the (latched)
         # angle only when there is no audio path at all (HTTP/remote profile).
         live = sound_present if sound_present is not None else (angle is not None)
-        if p.speech_only:
+        if self.params.speech_only:
             live = live and sense.speech_detected
         if live:
             self._last_live_t = t
@@ -233,38 +262,11 @@ class ListenProducer:
             # Holding at the just-committed direction — ignore everything else.
             return None
 
-        # A turn is a deliberate event: detected speech or a loud snap. Without one,
-        # the head never moves (the latched angle alone must not commit a turn).
+        # A turn is a deliberate event: detected speech or a loud snap. A bare latched
+        # angle (no speech, no snap) must never commit a turn.
         triggered = sense.speech_detected or snap
-
         if angle is not None:
-            # Raw unclamped desired — used for escalation decision.
-            raw_desired = doa_angle_to_yaw(angle, p.gain)
-            # Clamped desired for head-only path.
-            desired = max(-p.max_yaw, min(p.max_yaw, raw_desired))
-
-            if triggered and abs(desired - self.committed) > p.deadband:
-                # Tier 2: off-axis speech/snap — decide head-only vs. body escalation.
-                if abs(raw_desired) > p.head_only_band:
-                    return self._escalate_to_body(raw_desired, t)
-                return self._move_to(desired, t)
-            if live:
-                # Tier 1: live sound, no turn this tick — acknowledge with a near-side
-                # lean (only when off-front; front-facing sound yields no lean).
-                return _antenna_lean(desired, p)
-
-        # No live sound this tick. After a grace period off-center, ease to center once.
-        if (
-            not live
-            and abs(self.committed) > 1e-9  # off-center (committed is exactly 0 at center)
-            and self._last_live_t is not None
-            and (t - self._last_live_t) >= p.recenter_after
-        ):
-            # Return the body toward 0 as well: include body_yaw=0 alongside the head recenter.
-            self.body = 0.0
-            action = self._move_to(0.0, t)
-            # Rebuild with body_yaw=0 (frozen dataclass — reconstruct with replace).
-            from dataclasses import replace  # local import keeps the top of module clean
-
-            return replace(action, body_yaw=0.0)
-        return None
+            reaction = self._react_to_angle(angle, t, triggered=triggered, live=live)
+            if reaction is not None:
+                return reaction
+        return self._recenter(t, live)

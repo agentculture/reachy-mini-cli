@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import Callable
 
 import numpy as np
 
@@ -241,6 +242,52 @@ def cmd_listen_overview(args: argparse.Namespace) -> int:
 # --- run (foreground loop) ------------------------------------------------
 
 
+def _run_sdk_loop(
+    transport: object,
+    producer: ListenProducer,
+    args: argparse.Namespace,
+    on_action: Callable[[object], None],
+) -> int:
+    """Drive the loop over an open SDK media session (real DoA + mic-audio loudness)."""
+    snap_kwargs: dict[str, float] = {}
+    if getattr(args, "snap_ratio", None) is not None:
+        snap_kwargs["ratio"] = args.snap_ratio
+    if getattr(args, "snap_floor", None) is not None:
+        snap_kwargs["min_rms"] = args.snap_floor
+    with transport.media_session() as session:  # type: ignore[attr-defined]
+        poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
+        detector = SnapDetector(**snap_kwargs)
+
+        def _audio(_t: float) -> tuple[bool, bool | None]:
+            sample = session.get_audio_sample()
+            if sample is None:
+                return (False, None)
+            rms = float(np.sqrt(np.mean(sample**2)))
+            return (detector.feed(sample), rms > detector.min_rms)
+
+        return run_loop(
+            transport,
+            producer,
+            sense=poller,
+            audio=_audio,
+            on_action=on_action,
+            max_ticks=args.max_ticks,
+        )
+
+
+def _run_http_loop(
+    transport: object,
+    producer: ListenProducer,
+    args: argparse.Namespace,
+    on_action: Callable[[object], None],
+) -> int:
+    """Drive the loop over the HTTP transport's DoA (no audio source / loudness)."""
+    poller = DoaPoller(read=lambda: read_doa(transport, timeout=DOA_TIMEOUT))
+    return run_loop(
+        transport, producer, sense=poller, on_action=on_action, max_ticks=args.max_ticks
+    )
+
+
 def cmd_listen_run(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
     transport = get_transport(args)
@@ -267,38 +314,12 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
         else:
             emit_diagnostic(f"[listen] {action.label} ({action.duration:.1f}s)")
 
+    # SDK profile streams real DoA + mic loudness through a media session; the HTTP/remote
+    # profile polls transport.doa() with no audio source.
     if hasattr(transport, "media_session"):
-        # SDK profile: open a persistent audio+DoA session for the loop's lifetime.
-        _snap_kwargs: dict[str, float] = {}
-        if getattr(args, "snap_ratio", None) is not None:
-            _snap_kwargs["ratio"] = args.snap_ratio
-        if getattr(args, "snap_floor", None) is not None:
-            _snap_kwargs["min_rms"] = args.snap_floor
-        with transport.media_session() as session:
-            poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
-            detector = SnapDetector(**_snap_kwargs)
-
-            def _audio(_t):
-                sample = session.get_audio_sample()
-                if sample is None:
-                    return (False, None)
-                rms = float(np.sqrt(np.mean(sample**2)))
-                return (detector.feed(sample), rms > detector.min_rms)
-
-            ticks = run_loop(
-                transport,
-                producer,
-                sense=poller,
-                audio=_audio,
-                on_action=_on_action,
-                max_ticks=args.max_ticks,
-            )
+        ticks = _run_sdk_loop(transport, producer, args, _on_action)
     else:
-        # Non-SDK (HTTP/remote) profile: DoA via transport.doa(), no audio source.
-        poller = DoaPoller(read=lambda: read_doa(transport, timeout=DOA_TIMEOUT))
-        ticks = run_loop(
-            transport, producer, sense=poller, on_action=_on_action, max_ticks=args.max_ticks
-        )
+        ticks = _run_http_loop(transport, producer, args, _on_action)
 
     # Settle: ease back to center (best effort — a dead daemon can't be settled).
     try:
