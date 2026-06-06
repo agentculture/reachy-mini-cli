@@ -92,27 +92,53 @@ def test_antenna_and_look_do_not_evict_each_other() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_producer_commits_only_after_dwell() -> None:
-    prod = ListenProducer(ListenParams(deadband=10, dwell=0.5, gain=0.6, max_yaw=35))
-    left = Sense(doa_angle=0.0)
-    # Tier-1: while dwell is accumulating the producer now emits near-side antenna leans
-    # instead of None — the head is not driven, only the left (near-side) antenna deflects.
-    a0 = prod.update(0.0, left)  # candidate noted + first antenna lean
-    assert a0 is not None and a0.head is None and a0.coalesce_key == ANTENNA_KEY
-    assert a0.antennas is not None and a0.antennas[1] > 0 and a0.antennas[0] == 0.0  # left only
-    a1 = prod.update(0.3, left)  # still under dwell — another antenna lean, no head turn
-    assert a1 is not None and a1.head is None and a1.coalesce_key == ANTENNA_KEY
-    a = prod.update(0.6, left)  # dwell elapsed -> head turn committed
+def test_producer_commits_on_speech_off_axis() -> None:
+    # Speech off-axis commits exactly one head turn, then holds (no second commit).
+    prod = ListenProducer(ListenParams(deadband=10, hold=3.0, gain=0.6, max_yaw=35))
+    spoke = Sense(doa_angle=0.0, speech_detected=True)  # doa=0 → desired +35°, off-axis
+    a = prod.update(0.0, spoke, sound_present=True)  # speech off-axis -> head turn
     assert a is not None and a.head["yaw"] > 0 and a.coalesce_key == LOOK_KEY
+    # During the hold window a second speech event does not re-commit.
+    assert prod.update(0.5, spoke, sound_present=True) is None
+    assert prod.update(1.0, spoke, sound_present=True) is None
 
 
-def test_producer_holds_within_deadband() -> None:
-    prod = ListenProducer(ListenParams(deadband=20, dwell=0.0, gain=0.6, max_yaw=35))
+def test_producer_commits_on_snap_off_axis() -> None:
+    # A loud snap off-axis commits exactly one head turn, even with no speech.
+    prod = ListenProducer(ListenParams(deadband=10, hold=3.0, gain=0.6, max_yaw=35))
+    s = Sense(doa_angle=0.0, speech_detected=False)
+    a = prod.update(0.0, s, snap=True, sound_present=True)  # snap off-axis -> head turn
+    assert a is not None and a.head["yaw"] > 0 and a.coalesce_key == LOOK_KEY
+    # Hold window suppresses a second commit even on another snap.
+    assert prod.update(0.5, s, snap=True, sound_present=True) is None
+
+
+def test_latched_angle_never_turns_head() -> None:
+    # A constant/latched angle with no speech, no snap, no live sound must NOT turn the
+    # head at all (the latched-DoA guard) — and it must recenter after silence.
+    prod = ListenProducer(
+        ListenParams(deadband=10, hold=0.0, recenter_after=1.0, gain=0.6, max_yaw=35)
+    )
+    latched = Sense(doa_angle=0.0, speech_detected=False)  # off-axis but frozen/silent
+    turns = 0
+    for i in range(30):  # 30 ticks of a bare latched angle, no liveness
+        a = prod.update(i * 0.1, latched, snap=False, sound_present=False)
+        if a is not None and a.head is not None:
+            # the only head action permitted is the eventual recenter to 0°
+            assert a.head["yaw"] == 0.0
+        elif a is not None and a.head is None:
+            turns += 1  # would be an antenna lean — also not allowed on silence
+    assert turns == 0, "no antenna lean and no off-axis head turn on a silent latched angle"
+    assert prod.committed == 0.0, "head recentered after recenter_after of silence"
+
+
+def test_producer_no_head_turn_within_deadband() -> None:
+    # Speech within the deadband leans (Tier-1) but does not turn the head.
+    prod = ListenProducer(ListenParams(deadband=20, gain=0.6, max_yaw=35))
     # Front sound (doa=pi/2) maps to desired≈0° — lean magnitude is 0, so None still.
-    assert prod.update(0.0, Sense(doa_angle=math.pi / 2)) is None  # front -> ~0, no lean
-    # doa=1.28 maps to ~10° head yaw, within the 20° deadband — no head turn.
-    # Tier-1: a non-zero desired yaw now produces a near-side antenna lean instead of None.
-    a = prod.update(0.1, Sense(doa_angle=1.28))
+    assert prod.update(0.0, Sense(doa_angle=math.pi / 2), sound_present=True) is None
+    # doa=1.28 maps to ~10° head yaw, within the 20° deadband — no head turn even on speech.
+    a = prod.update(0.1, Sense(doa_angle=1.28, speech_detected=True), sound_present=True)
     assert a is not None and a.head is None and a.coalesce_key == ANTENNA_KEY
     assert a.antennas is not None and a.antennas[1] > 0 and a.antennas[0] == 0.0  # left near
 
@@ -129,7 +155,6 @@ def test_producer_recenters_after_silence() -> None:
     prod = ListenProducer(
         ListenParams(
             deadband=10,
-            dwell=0.0,
             hold=0.0,
             recenter_after=1.0,
             gain=0.6,
@@ -137,30 +162,28 @@ def test_producer_recenters_after_silence() -> None:
             alert_speed=1000.0,
         )  # near-instant move so hold clears
     )
-    prod.update(0.0, Sense(doa_angle=0.0))
-    prod.update(0.02, Sense(doa_angle=0.0))  # commit off-center
+    # Speech off-axis commits the turn (latched angle alone never would).
+    prod.update(0.0, Sense(doa_angle=0.0, speech_detected=True), sound_present=True)
     assert prod.committed != 0.0
     from reachy.behavior.sense import EMPTY_SENSE
 
-    assert prod.update(0.5, EMPTY_SENSE) is None  # within grace, holds
-    back = prod.update(1.1, EMPTY_SENSE)  # silence past recenter_after -> ease to center
+    # Silence clock is keyed on liveness, not on the (still-latched) angle.
+    assert prod.update(0.5, EMPTY_SENSE, sound_present=False) is None  # within grace, holds
+    back = prod.update(1.1, EMPTY_SENSE, sound_present=False)  # past recenter_after -> center
     assert back is not None and back.head["yaw"] == 0.0
 
 
 def test_producer_holds_at_target_after_turn() -> None:
-    # turn readily (dwell 0), but stay committed for `hold` seconds before reconsidering
-    p = ListenParams(
-        deadband=10, dwell=0.0, hold=3.0, gain=0.6, max_yaw=35, alert_speed=30, min_dur=0.5
-    )
+    # turn readily on speech, but stay committed for `hold` seconds before reconsidering
+    p = ListenParams(deadband=10, hold=3.0, gain=0.6, max_yaw=35, alert_speed=30, min_dur=0.5)
     prod = ListenProducer(p)
-    prod.update(0.0, Sense(doa_angle=0.0))
-    assert prod.update(0.1, Sense(doa_angle=0.0)) is not None  # commit left
+    left = Sense(doa_angle=0.0, speech_detected=True)
+    right = Sense(doa_angle=math.pi, speech_detected=True)
+    assert prod.update(0.1, left, sound_present=True) is not None  # commit left on speech
     # a strong opposite sound during the hold window is ignored
-    prod.update(0.2, Sense(doa_angle=math.pi))
-    assert prod.update(2.0, Sense(doa_angle=math.pi)) is None  # still holding left
-    # once the hold elapses it may turn again
-    prod.update(5.0, Sense(doa_angle=math.pi))
-    b = prod.update(5.2, Sense(doa_angle=math.pi))
+    assert prod.update(2.0, right, sound_present=True) is None  # still holding left
+    # once the hold elapses a fresh speech event may turn again
+    b = prod.update(5.2, right, sound_present=True)
     assert b is not None and b.head["yaw"] < 0  # now turns to the right
 
 
@@ -170,14 +193,12 @@ def test_producer_holds_at_target_after_turn() -> None:
 
 
 def test_tier1_antenna_lean_left() -> None:
-    """Sound on the left (within deadband) → near-side (left) antenna leans; head is not driven."""
-    # Large deadband so the sound never triggers a head turn; dwell>0 for extra safety.
-    p = ListenParams(deadband=30, dwell=2.0, gain=0.6, max_yaw=35, antenna_max=18.0)
+    """Live sound on the left (within deadband) → near-side (left) antenna leans; head unmoved."""
+    # Large deadband so the sound never triggers a head turn even if it were speech.
+    p = ListenParams(deadband=30, gain=0.6, max_yaw=35, antenna_max=18.0)
     prod = ListenProducer(p)
-    # doa=0.0 → desired ≈ +35° (left), within deadband=30 is False here — so this is
-    # actually the "outside deadband, dwell not met" branch.  Use a softer angle instead.
     # doa≈1.0 rad → desired ≈ degrees(pi/2-1.0)*0.6 ≈ 17.2*0.6 ≈ 10.3° — within 30° deadband.
-    a = prod.update(0.0, Sense(doa_angle=1.0))
+    a = prod.update(0.0, Sense(doa_angle=1.0), sound_present=True)
     assert a is not None, "expected antenna lean, got None"
     assert a.head is None, "Tier-1 must not drive the head"
     assert a.coalesce_key == ANTENNA_KEY
@@ -189,12 +210,12 @@ def test_tier1_antenna_lean_left() -> None:
 
 
 def test_tier1_antenna_lean_right() -> None:
-    """Sound on the right (within deadband) → near-side (right) antenna leans; head not driven."""
-    p = ListenParams(deadband=30, dwell=2.0, gain=0.6, max_yaw=35, antenna_max=18.0)
+    """Live sound on the right (within deadband) → near-side (right) antenna leans; head unmoved."""
+    p = ListenParams(deadband=30, gain=0.6, max_yaw=35, antenna_max=18.0)
     prod = ListenProducer(p)
     # doa≈2.14 rad → desired ≈ degrees(pi/2-2.14)*0.6 ≈ -37.7*0.6 ≈ -10.3° (right side),
     # within 30° deadband, so no head turn.
-    a = prod.update(0.0, Sense(doa_angle=2.14))
+    a = prod.update(0.0, Sense(doa_angle=2.14), sound_present=True)
     assert a is not None, "expected antenna lean, got None"
     assert a.head is None, "Tier-1 must not drive the head"
     assert a.coalesce_key == ANTENNA_KEY
@@ -205,24 +226,53 @@ def test_tier1_antenna_lean_right() -> None:
     assert right_a > left_a, "near magnitude must exceed far magnitude"
 
 
-def test_tier1_antenna_lean_during_dwell_accumulation() -> None:
-    """Sound outside deadband but dwell not yet met → antenna lean each tick, no head turn."""
-    p = ListenParams(deadband=10, dwell=1.0, gain=0.6, max_yaw=35, antenna_max=18.0)
+def test_tier1_lean_on_sound_present_without_speech_or_snap() -> None:
+    """Live sound (sound_present) off-axis, but no speech/snap → antenna lean only, no head turn."""
+    p = ListenParams(deadband=10, gain=0.6, max_yaw=35, antenna_max=18.0)
     prod = ListenProducer(p)
-    # doa=0.0 → desired=35° (clamped), outside 10° deadband — dwell clock starts.
-    a0 = prod.update(0.0, Sense(doa_angle=0.0))
-    a1 = prod.update(0.5, Sense(doa_angle=0.0))  # still under 1.0s dwell
-    for tick_result in (a0, a1):
-        assert tick_result is not None, "expected antenna lean during dwell wait"
-        assert tick_result.head is None
-        assert tick_result.coalesce_key == ANTENNA_KEY
-        assert tick_result.antennas is not None
-        right_a, left_a = tick_result.antennas
+    # doa=0.0 → desired=35° (clamped), well outside 10° deadband — but with no speech and
+    # no snap the head must NOT turn; only the near-side antenna leans.
+    for ti in (0.0, 0.5, 1.5):
+        a = prod.update(ti, Sense(doa_angle=0.0, speech_detected=False), sound_present=True)
+        assert a is not None and a.head is None, "live sound w/o speech/snap → lean only"
+        assert a.coalesce_key == ANTENNA_KEY
+        assert a.antennas is not None
+        right_a, left_a = a.antennas
         assert left_a > 0 and right_a == 0.0  # left near-side for positive desired yaw
-    # After dwell elapses, the head-turn action is returned (not an antenna lean).
-    head_action = prod.update(1.1, Sense(doa_angle=0.0))
-    assert head_action is not None and head_action.head is not None
-    assert head_action.coalesce_key == LOOK_KEY
+    assert prod.committed == 0.0, "no head turn was committed"
+
+
+def test_tier1_no_lean_without_live_sound_then_recenters() -> None:
+    """No live sound → no antenna lean (even on a latched angle); head eventually recenters."""
+    p = ListenParams(
+        deadband=10,
+        hold=0.0,
+        recenter_after=1.0,
+        gain=0.6,
+        max_yaw=35,
+        min_dur=0.0,
+        alert_speed=1000.0,  # near-instant move so the hold window clears immediately
+    )
+    prod = ListenProducer(p)
+    # First commit a turn via speech so there is something to recenter from.
+    prod.update(0.0, Sense(doa_angle=0.0, speech_detected=True), sound_present=True)
+    assert prod.committed != 0.0
+    # Now the angle latches but sound goes silent — no lean while waiting to recenter.
+    latched = Sense(doa_angle=0.0, speech_detected=False)
+    assert prod.update(0.5, latched, sound_present=False) is None  # within grace, no lean
+    back = prod.update(1.6, latched, sound_present=False)  # past recenter_after -> center once
+    assert back is not None and back.head["yaw"] == 0.0
+
+
+def test_remote_profile_falls_back_to_latched_angle_for_liveness() -> None:
+    """sound_present=None (HTTP/remote) → ``live`` falls back to ``doa_angle is not None``."""
+    p = ListenParams(deadband=10, gain=0.6, max_yaw=35, antenna_max=18.0)
+    prod = ListenProducer(p)
+    # No audio path: a present angle is the best-effort liveness signal, so Tier-1 leans.
+    a = prod.update(0.0, Sense(doa_angle=0.0), sound_present=None)
+    assert a is not None and a.head is None and a.coalesce_key == ANTENNA_KEY
+    # But still no head turn without speech/snap.
+    assert prod.committed == 0.0
 
 
 # --------------------------------------------------------------------------- #
