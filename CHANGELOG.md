@@ -9,11 +9,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `reachy-cli` is published as a transitional alias distribution (`packaging/reachy-cli/`, metadata-only) that depends on `reachy-mini-cli` at the matching version and forwards the `[daemon]`/`[sdk]` extras — `pip install reachy-cli` keeps working. The publish workflow now builds and publishes both names via Trusted Publishing.
+- `reachy-cli` is published as a transitional alias distribution
+  (`packaging/reachy-cli/`, metadata-only) that depends on `reachy-mini-cli` at the
+  matching version and forwards the `[daemon]`/`[sdk]` extras — `pip install
+  reachy-cli` keeps working. The publish workflow now builds and publishes both
+  names via Trusted Publishing.
 
 ### Changed
 
-- Renamed the distribution to `reachy-mini-cli` (canonical PyPI name); the console command is now installed as both `reachy` and `reachy-mini-cli`. The import package stays `reachy`. `__version__` now reads the `reachy-mini-cli` metadata, and all install hints/docs point at the new name.
+- Renamed the distribution to `reachy-mini-cli` (canonical PyPI name); the console
+  command is now installed as both `reachy` and `reachy-mini-cli`. The import
+  package stays `reachy`. `__version__` now reads the `reachy-mini-cli` metadata,
+  and all install hints/docs point at the new name.
 
 ## [0.8.0] - 2026-06-06
 
