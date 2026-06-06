@@ -342,6 +342,29 @@ def stop(*, timeout: float = DEFAULT_STOP_TIMEOUT) -> dict[str, object]:
     return {"status": "stopped", "pid": pid, "signal": signaled}
 
 
+def is_robot_live(*, base_url: str = DEFAULT_BASE_URL, timeout: float = DEFAULT_TIMEOUT) -> bool:
+    """Return True if the robot/daemon is actually reachable *right now*.
+
+    This is an **always-fresh** liveness probe: it re-checks the HTTP health
+    endpoint on every call and deliberately ignores any PID file state. The PID
+    file can be stale across a restart (a new process may have already claimed the
+    port while the old PID file still exists), so trusting it would produce false
+    negatives immediately after a restart and false positives when the daemon
+    crashed without cleaning up its PID file.
+
+    Correct restart semantics: call this function twice in succession — the first
+    call correctly reports ``False`` while the daemon is down; the second call
+    correctly reports ``True`` once the new process is listening, without any
+    in-process caching in the way.
+
+    The function is **additive**: it does not replace the existing ``health_ok``
+    helper (which the start/stop/status machinery uses internally) but provides a
+    stable, named, restart-safe public surface for callers that only need to know
+    "can I talk to the robot right now?".
+    """
+    return health_ok(base_url, timeout)
+
+
 def status(
     *, base_url: str = DEFAULT_BASE_URL, timeout: float = DEFAULT_TIMEOUT
 ) -> dict[str, object]:
@@ -353,10 +376,12 @@ def status(
         process = "running"
     else:
         process = "stale"  # pid file points at a dead process
+    live = is_robot_live(base_url=base_url, timeout=timeout)
     return {
         "process": process,
         "pid": pid,
-        "http": "healthy" if health_ok(base_url, timeout) else "unreachable",
+        "http": "healthy" if live else "unreachable",
+        "live": live,
         "url": base_url,
         "log": str(log_file()),
     }
