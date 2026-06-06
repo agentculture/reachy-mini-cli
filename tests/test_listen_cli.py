@@ -60,7 +60,10 @@ def test_run_centers_then_settles_when_silent(monkeypatch, capsys) -> None:
 
 
 def test_run_orients_toward_sound_json(monkeypatch, capsys) -> None:
-    tr = _FakeTransport(doa={"angle": 0.0, "speech_detected": False})  # sound on the left
+    # t6: the head turn (Tier-2) is triggered by SPEECH or a loud snap — a bare latched
+    # DoA angle never turns the head. So the live source here is a *speech* reading on the
+    # left; the producer leans (Tier-1) then orients toward it (Tier-2).
+    tr = _FakeTransport(doa={"angle": 0.0, "speech_detected": True})  # speech on the left
     monkeypatch.setattr("reachy.cli._commands.listen.get_transport", lambda args: tr)
     # Two-tier listen: a Tier-1 antenna lean precedes the Tier-2 head turn, and each
     # move runs serially through the queue — so allow enough ticks for the head turn to
@@ -69,7 +72,9 @@ def test_run_orients_toward_sound_json(monkeypatch, capsys) -> None:
     assert rc == 0
     events = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.strip()]
     assert any(e.get("action") for e in events)  # reacted to the sound
-    assert any("antenna" in (e.get("action") or "") for e in events)  # Tier-1 lean
+    # t6 triggers the head turn immediately on speech (no dwell wait), so with deadband 0
+    # the off-axis speech orients the head (Tier-2: left -> +yaw). The Tier-1 antenna lean
+    # is exercised in tests/test_motion.py, where a within-deadband / no-trigger sound leans.
     assert any((e.get("yaw") or 0.0) > 0 for e in events)  # Tier-2 turn: left -> +yaw
 
 
