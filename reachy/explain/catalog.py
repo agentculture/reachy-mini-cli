@@ -442,18 +442,42 @@ capability to feed a sensor-driven behavior a live reading, but ships none today
 _LISTEN = """\
 # reachy-mini-cli listen
 
-Orient the head toward sound. A loop reads the mic array's Direction of Arrival
-(DoA) from the daemon and turns the head toward a *sustained, off-axis* sound,
-holds there briefly, then eases back to center after silence.
+Orient the robot toward sound in real time. `listen` is **SDK-first**: it streams
+live audio from the mic array via the `reachy_mini` SDK (the `sdk` transport is the
+default), so DoA and loudness are computed in-process — no round-trip to the daemon.
+The HTTP transport remains available via `--transport http` / `REACHY_TRANSPORT=http`
+for a control box talking to a remote daemon.
+
+## Two-tier reaction
+
+The loop runs two tiers simultaneously:
+
+**Tier 1 — antenna lean (always on):** A lightweight, near-continuous lean of the
+*antennas* (and head holds position) toward the incoming DoA on every tick. This gives
+the robot a subtle "perked ear" reaction to any live sound, even faint ambient noise,
+without moving the body.
+
+**Tier 2 — head→body turn (speech or loud snap):** On detected *speech* or a loud
+RMS transient ("snap") — a sudden noise spike above a ratio × floor threshold — the
+robot executes a slow, smooth head→body turn:
+
+1. The head turns toward the source first.
+2. If the source is beyond `--head-only-band` degrees from center, the body rotates
+   to face the source and the head re-centers, so the whole robot is re-oriented.
+
+A **latched-DoA guard** prevents stale angles from triggering a spurious turn: the
+daemon's DoA angle freezes at rest, so Tier-2 fires only on live speech/snap, never
+on the last angle left over from a previous sound.
+
+The `SnapDetector` (`reachy/motion/snap.py`) implements the RMS spike detection,
+algorithm cited from `reachy_nova`'s `TrackingManager.detect_snap`.
 
 Unlike the behavior engine — which streams immediate `set_target` poses at 50 Hz
-(jerky for big reorienting turns) — this loop drives the daemon's smooth minjerk
-`goto` planner and runs moves strictly one at a time through a serial motion
-queue, so turns are soft and never conflict. It needs a running daemon
-(`reachy-mini-cli daemon start`) for the http transport.
+(jerky for big reorienting turns) — this loop drives the smooth minjerk `goto`
+planner and runs moves strictly one at a time through a serial motion queue.
 
-It degrades gracefully: no mic, a daemon DoA error, or (with `--speech-only`) no
-speech ⇒ no reaction, no crash.
+It degrades gracefully: no mic, a DoA error, or (with `--speech-only`) no speech ⇒
+no reaction, no crash.
 
 ## Verbs
 
@@ -476,15 +500,25 @@ speech ⇒ no reaction, no crash.
 
 Feel knobs (each defaults to a tuned value; unset keeps it):
 
-- `--dwell SECONDS` — a new direction must persist this long before turning to it.
-- `--hold SECONDS` — after turning, stay there this long before reconsidering.
-- `--speed DEG_PER_S` — the slew speed for turns and for easing back to center.
+- `--gain X` — DoA-to-head-yaw scaling factor.
 - `--deadband DEG` — ignore sound within this angle of the current heading.
-- `--gain X` / `--max-yaw DEG` — head-yaw per acoustic angle, and its cap.
+- `--hold SECONDS` — after a Tier-2 turn, stay there this long before reconsidering.
+- `--speed DEG_PER_S` — slew speed for Tier-2 turns and for easing back to center.
 - `--recenter-after SECONDS` — ease back to center after this long with no sound.
-- `--speech-only` — react only to detected speech (default: any sound).
+- `--speech-only` — Tier-2 reacts only to detected speech (Tier-1 still runs).
+- `--antenna-max DEG` — maximum antenna lean angle for Tier-1.
+- `--body-yaw-max DEG` — maximum body yaw for Tier-2 body rotation.
+- `--head-only-band DEG` — source angles within this band stay head-only (no body
+  rotation); outside it the body turns and the head re-centers.
+- `--snap-ratio X` — RMS spike must be this many times the floor to count as a snap.
+- `--snap-floor RMS` — minimum floor RMS below which snap detection is suppressed.
 
-{transports}
+## Transport
+
+The `sdk` transport (default) streams mic audio via `reachy_mini` in-process —
+`reachy-mini` and `numpy` are base runtime dependencies. The `http` transport polls
+the daemon's DoA endpoint instead; use it with `--transport http` or
+`REACHY_TRANSPORT=http` on a control box that talks to a remote daemon.
 
 ## Notes
 
@@ -495,12 +529,14 @@ Feel knobs (each defaults to a tuned value; unset keeps it):
 
 ## Usage
 
-    reachy-mini-cli daemon start                         # something to drive
-    reachy-mini-cli listen run                           # foreground, any sound
-    reachy-mini-cli listen start --dwell 1.5 --hold 3    # background, tuned
+    reachy-mini-cli daemon start                              # bring the daemon up
+    reachy-mini-cli listen run                                # foreground, SDK transport (default)
+    reachy-mini-cli listen run --transport http               # foreground, HTTP transport
+    reachy-mini-cli listen start --hold 3 --speech-only       # background, speech only
+    reachy-mini-cli listen start --antenna-max 25 --snap-ratio 4
     reachy-mini-cli listen status --json
-    reachy-mini-cli listen stop                          # eases back to center
-""".replace(_TRANSPORTS_SLOT, _TRANSPORTS)
+    reachy-mini-cli listen stop                               # eases back to center
+"""
 
 
 ENTRIES: dict[tuple[str, ...], str] = {
