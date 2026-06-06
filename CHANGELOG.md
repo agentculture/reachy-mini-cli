@@ -9,15 +9,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `listen` is now always-alive: between sounds the robot keeps gently breathing, gaze-wandering, and swaying its antennas around its *current* heading instead of freezing. New `--idle-energy` (0 disables, restoring hold-still) and `--drift-speed` knobs, threaded through the background supervisor.
+- `listen` is now always-alive: between sounds the robot keeps gently breathing,
+  gaze-wandering, and swaying its antennas around its *current* heading instead of
+  freezing. New `--idle-energy` (0 disables, restoring hold-still) and `--drift-speed`
+  knobs, threaded through the background supervisor.
 
 ### Changed
 
-- After turning toward a sound, `listen` now *stays rotated* and keeps the idle motion around that heading, then drifts the head+body slowly home over `--recenter-after` seconds rather than hard-snapping back to front. The shared idle-pose generator (`AliveConfig`/`next_pose`) moved to `reachy/motion/idle.py` (re-exported from `reachy.alive` for back-compat).
+- After turning toward a sound, `listen` now *stays rotated* and keeps the idle motion
+  around that heading, then drifts the head+body slowly home over `--recenter-after`
+  seconds rather than hard-snapping back to front. The hold window no longer freezes the
+  robot — the idle layer keeps it alive even right after a turn. The shared idle-pose
+  generator (`AliveConfig`/`next_pose`) moved to `reachy/motion/idle.py` (re-exported
+  from `reachy.alive` for back-compat).
 
 ### Fixed
 
-- `listen` right-antenna lean direction: the right antenna now perks toward a right-side sound instead of leaning the wrong way (its joint sign is mirrored from the left).
+- `listen` right-antenna lean direction: the right antenna now perks toward a right-side
+  sound instead of leaning the wrong way (its joint sign is mirrored from the left).
 
 ## [0.9.0] - 2026-06-06
 

@@ -243,6 +243,23 @@ class ListenProducer:
             return _antenna_lean(desired, p)
         return None
 
+    def _recenter(self, t: float, live: bool) -> MotionAction | None:
+        """Hard ease head AND body back to center once, after a grace of no live sound.
+
+        Used only when the always-alive idle layer is disabled (``idle_energy <= 0``):
+        with idle on, :meth:`_idle` brings the heading home as a gradual drift instead.
+        """
+        p = self.params
+        if (
+            not live
+            and abs(self.committed) > 1e-9  # off-center (committed is exactly 0 at center)
+            and self._last_live_t is not None
+            and (t - self._last_live_t) >= p.recenter_after
+        ):
+            self.body = 0.0
+            return self._move_to(0.0, t, body_yaw=0.0)
+        return None
+
     def _idle(self, t: float, live: bool) -> MotionAction | None:
         """Always-alive idle motion around the current heading, with a slow drift home.
 
@@ -268,12 +285,14 @@ class ListenProducer:
 
         # Slow drift home: ease the committed head + body toward centre a little each
         # idle pose, but only after the silence grace and never while sound is live.
+        # ``drift_speed`` is clamped to >= 0 so a stray negative value can never push the
+        # heading *away* from centre (which would diverge instead of homing).
         if (
             not live
             and self._last_live_t is not None
             and (t - self._last_live_t) >= p.recenter_after
         ):
-            step = p.drift_speed * self._alive.interval
+            step = max(0.0, p.drift_speed) * self._alive.interval
             self.committed = _toward_zero(self.committed, step)
             self.body = _toward_zero(self.body, step)
 
@@ -306,7 +325,7 @@ class ListenProducer:
         ``sense.speech_detected`` or a loud ``snap`` — and only when that direction is
         more than ``deadband`` off the current heading. A bare latched ``angle`` (no
         speech, no snap) never turns the head. After a commit, the ``hold`` window
-        suppresses re-commits.
+        suppresses *re-commits and leans* (but not the idle layer — see below).
 
         **Tier 2 escalation (head+body):** when the raw *desired* direction exceeds
         ``head_only_band``, the body rotates toward the source while the head
@@ -318,12 +337,13 @@ class ListenProducer:
         ``sense.doa_angle is not None`` as a degraded best-effort — never a stale
         latched angle during true silence.
 
-        **Idle (always-alive):** when no reaction fires, emit a gentle idle pose
-        (breathing / gaze wander / antenna sway) around the *current* heading, so
-        the robot is never frozen. After ``recenter_after`` seconds of silence the
-        committed head + body drift slowly back toward front (``drift_speed``) while
-        the idle motion continues. Set ``idle_energy=0`` to restore the old
-        hold-still-then-snap-home behaviour.
+        **Idle (always-alive):** whenever no reaction fires — *including during the
+        hold window*, so the robot is never frozen — emit a gentle idle pose
+        (breathing / gaze wander / antenna sway) around the *current* heading. After
+        ``recenter_after`` seconds of silence the committed head + body drift slowly
+        back toward front (``drift_speed``) while the idle motion continues. Set
+        ``idle_energy=0`` to restore the old behaviour: hold still, then hard-snap
+        back to center after ``recenter_after`` of silence (:meth:`_recenter`).
         """
         angle = sense.doa_angle
         # Effective liveness: prefer the live mic floor; fall back to the (latched)
@@ -334,15 +354,19 @@ class ListenProducer:
         if live:
             self._last_live_t = t
 
-        if t < self._hold_until:
-            # Holding at the just-committed direction — ignore everything else.
-            return None
+        # The hold window after a turn suppresses *reactive* actions (re-commits and
+        # leans) so the head doesn't whip around — but the idle layer below still runs,
+        # so the robot keeps breathing instead of freezing. Drift-home stays gated on
+        # silence inside the idle/recenter paths, so it won't start during the hold.
+        if t >= self._hold_until:
+            triggered = sense.speech_detected or snap  # deliberate event: speech / snap
+            if angle is not None:
+                reaction = self._react_to_angle(angle, t, triggered=triggered, live=live)
+                if reaction is not None:
+                    return reaction
 
-        # A turn is a deliberate event: detected speech or a loud snap. A bare latched
-        # angle (no speech, no snap) must never commit a turn.
-        triggered = sense.speech_detected or snap
-        if angle is not None:
-            reaction = self._react_to_angle(angle, t, triggered=triggered, live=live)
-            if reaction is not None:
-                return reaction
+        # Fallback: keep the robot alive around the current heading. With idle disabled,
+        # fall back to the old hard recenter-to-front after the silence grace.
+        if self.params.idle_energy <= 0.0:
+            return self._recenter(t, live)
         return self._idle(t, live)

@@ -135,7 +135,8 @@ def test_idle_coalesces_with_itself_but_never_evicts_a_turn() -> None:
 
 def test_producer_commits_on_speech_off_axis() -> None:
     # Speech off-axis commits exactly one head turn, then holds (no second commit).
-    prod = ListenProducer(ListenParams(deadband=10, hold=3.0, gain=0.6, max_yaw=35))
+    # idle_energy=0 isolates the reactive path (else idle motion fires during the hold).
+    prod = ListenProducer(ListenParams(deadband=10, hold=3.0, gain=0.6, max_yaw=35, idle_energy=0))
     spoke = Sense(doa_angle=0.0, speech_detected=True)  # doa=0 → desired +35°, off-axis
     a = prod.update(0.0, spoke, sound_present=True)  # speech off-axis -> head turn
     assert a is not None and a.head["yaw"] > 0 and a.coalesce_key == LOOK_KEY
@@ -146,7 +147,8 @@ def test_producer_commits_on_speech_off_axis() -> None:
 
 def test_producer_commits_on_snap_off_axis() -> None:
     # A loud snap off-axis commits exactly one head turn, even with no speech.
-    prod = ListenProducer(ListenParams(deadband=10, hold=3.0, gain=0.6, max_yaw=35))
+    # idle_energy=0 isolates the reactive path (else idle motion fires during the hold).
+    prod = ListenProducer(ListenParams(deadband=10, hold=3.0, gain=0.6, max_yaw=35, idle_energy=0))
     s = Sense(doa_angle=0.0, speech_detected=False)
     a = prod.update(0.0, s, snap=True, sound_present=True)  # snap off-axis -> head turn
     assert a is not None and a.head["yaw"] > 0 and a.coalesce_key == LOOK_KEY
@@ -224,7 +226,8 @@ def test_producer_drifts_home_after_silence() -> None:
 
 
 def test_producer_holds_at_target_after_turn() -> None:
-    # turn readily on speech, but stay committed for `hold` seconds before reconsidering
+    # turn readily on speech, but stay committed for `hold` seconds before reconsidering.
+    # idle_energy=0 isolates the reactive path (else idle motion fires during the hold).
     p = ListenParams(
         deadband=10,
         hold=3.0,
@@ -233,6 +236,7 @@ def test_producer_holds_at_target_after_turn() -> None:
         alert_speed=30,
         min_dur=0.5,
         body_speed=1000.0,  # near-instant escalation so hold duration is driven by alert_speed
+        idle_energy=0,
     )
     prod = ListenProducer(p)
     left = Sense(doa_angle=0.0, speech_detected=True)
@@ -403,8 +407,12 @@ def test_far_off_axis_speech_body_escalation() -> None:
     assert prod.committed == a.head["yaw"]
 
 
-def test_hold_window_returns_none_no_stale_antenna() -> None:
-    """During the post-turn hold window, update() returns None (no stray antenna action)."""
+def test_hold_window_suppresses_reactive_but_keeps_idle_alive() -> None:
+    """During the post-turn hold window: no reactive re-commit/lean, but idle keeps alive.
+
+    The hold must stop the head whipping to a new sound, yet the always-alive idle layer
+    keeps running so the robot never freezes — and the committed heading stays fixed.
+    """
     p = ListenParams(
         deadband=10,
         hold=3.0,
@@ -415,11 +423,14 @@ def test_hold_window_returns_none_no_stale_antenna() -> None:
     prod = ListenProducer(p)
     s = Sense(doa_angle=1.0, speech_detected=True)
     a = prod.update(0.0, s, sound_present=True)
-    assert a is not None  # committed the turn
-    # During hold, even with live sound, no further action is returned.
+    assert a is not None and a.coalesce_key == LOOK_KEY  # committed the turn
+    committed = prod.committed
+    # During hold, even with live sound, no reactive turn/lean fires — only idle may.
     for ti in (0.5, 1.0, 1.5, 2.0, 2.5):
         result = prod.update(ti, s, sound_present=True)
-        assert result is None, f"expected None during hold at t={ti}, got {result}"
+        if result is not None:
+            assert result.coalesce_key == IDLE_KEY, f"only idle may fire during hold at t={ti}"
+        assert prod.committed == committed, "the committed heading stays fixed during hold"
 
 
 def test_drift_home_returns_head_and_body_to_center() -> None:
@@ -524,6 +535,51 @@ def test_idle_head_yaw_clamped_to_max_yaw() -> None:
         a = prod.update(0.5 + i * 2.6, EMPTY_SENSE, sound_present=False)
         if a is not None and a.head is not None:
             assert -35.0 - 1e-9 <= a.head["yaw"] <= 35.0 + 1e-9
+
+
+def test_idle_disabled_still_recenters_after_turn() -> None:
+    """idle_energy=0 keeps the old hard recenter: a committed turn snaps home after silence.
+
+    Regression guard: disabling the idle layer must NOT also disable homing — otherwise the
+    robot would stay rotated forever once it had turned.
+    """
+    p = ListenParams(
+        deadband=10,
+        hold=0.0,
+        recenter_after=1.0,
+        gain=0.6,
+        min_dur=0.0,
+        alert_speed=1000.0,
+        body_speed=1000.0,
+        idle_energy=0,
+    )
+    prod = ListenProducer(p)
+    prod.update(0.0, Sense(doa_angle=0.0, speech_detected=True), sound_present=True)
+    assert prod.committed != 0.0 or prod.body != 0.0
+    # Within the silence grace it holds; past it, a single hard recenter to front fires.
+    assert prod.update(0.5, EMPTY_SENSE, sound_present=False) is None
+    back = prod.update(1.1, EMPTY_SENSE, sound_present=False)
+    assert back is not None and back.head["yaw"] == 0.0 and back.body_yaw == 0.0
+
+
+def test_negative_drift_speed_does_not_diverge() -> None:
+    """A negative --drift-speed must never push the heading away from 0 (step clamped to >=0)."""
+    p = ListenParams(
+        deadband=10,
+        hold=0.0,
+        recenter_after=1.0,
+        gain=0.6,
+        min_dur=0.0,
+        alert_speed=1000.0,
+        body_speed=1000.0,
+        drift_speed=-10.0,
+    )
+    prod = ListenProducer(p)
+    prod.update(0.0, Sense(doa_angle=0.0, speech_detected=True), sound_present=True)
+    start = abs(prod.committed) + abs(prod.body)
+    for t in (3.1, 5.7, 8.3, 10.9):
+        prod.update(t, EMPTY_SENSE, sound_present=False)
+    assert abs(prod.committed) + abs(prod.body) <= start + 1e-9, "negative drift must not diverge"
 
 
 # --------------------------------------------------------------------------- #
