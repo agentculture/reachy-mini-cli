@@ -812,6 +812,10 @@ def test_arbitrate_abstention_falls_through_to_lower_priority() -> None:
 
 def _listen(bid="listen-1", **overrides) -> Behavior:
     params = library.get("listen").default_params()
+    # Isolate the output/mapping by default (continuous tracking); the deadband +
+    # dwell hold behavior is exercised by its own tests that set these explicitly.
+    params["deadband"] = 0.0
+    params["dwell"] = 0.0
     params.update(overrides)
     return library.build(
         "listen", params, StopClass.STOPPABLE, Lifetime(looping=True, duration=None), bid
@@ -854,6 +858,43 @@ def test_listen_body_gain_gates_body_channel() -> None:
     turner = _listen(smooth=0.0, body_gain=5.0, body_max=45.0)
     assert turner.contribution(0.0, Sense(doa_angle=0.0)).body_yaw == 45.0  # clamped, + = left
     assert turner.contribution(0.1, Sense(doa_angle=math.pi)).body_yaw == -45.0
+
+
+def test_listen_deadband_holds_against_small_changes() -> None:
+    # snap output isolates the commit logic; deadband 15deg, no dwell
+    beh = _listen(smooth=0.0, max_speed=0.0, deadband=15.0, dwell=0.0)
+    beh.contribution(0.0, Sense(doa_angle=math.pi / 2))  # front -> commit ~0
+    held = beh.contribution(0.1, Sense(doa_angle=math.pi / 2)).head["yaw"]
+    # a small shift (well under deadband in head-yaw terms) must not move the head
+    near = beh.contribution(0.2, Sense(doa_angle=math.pi / 2 - 0.15)).head["yaw"]
+    assert abs(near - held) < 1e-9
+    # a large, immediate shift (dwell=0) does re-commit and move
+    far = beh.contribution(0.3, Sense(doa_angle=0.0)).head["yaw"]  # hard left
+    assert far > held + 10.0
+
+
+def test_listen_dwell_requires_persistence() -> None:
+    # snap output; must HOLD a new direction for dwell seconds before turning
+    beh = _listen(smooth=0.0, max_speed=0.0, deadband=10.0, dwell=0.5)
+    beh.contribution(0.0, Sense(doa_angle=math.pi / 2))  # commit front (~0)
+    # a new far direction that appears only briefly must not commit
+    beh.contribution(0.1, Sense(doa_angle=0.0))  # left appears
+    flicker = beh.contribution(0.2, Sense(doa_angle=math.pi / 2)).head["yaw"]  # gone again
+    assert abs(flicker) < 1e-9  # never turned — flicker rejected
+    # the same direction sustained past dwell does commit
+    for i in range(1, 40):
+        y = beh.contribution(0.2 + 0.05 * i, Sense(doa_angle=0.0)).head["yaw"]
+    assert y > 10.0
+
+
+def test_listen_respects_max_speed_cap() -> None:
+    beh = _listen(gain=2.0, max_yaw=60.0, smooth=0.5, max_speed=10.0)
+    beh.contribution(0.0, Sense(doa_angle=0.0))  # prime; far target (angle=left)
+    prev = 0.0
+    for i in range(1, 8):  # each 20 ms tick may move at most max_speed*dt
+        y = beh.contribution(i * 0.02, Sense(doa_angle=0.0)).head["yaw"]
+        assert abs(y - prev) <= 10.0 * 0.02 + 1e-9
+        prev = y
 
 
 def test_listen_eases_not_snaps() -> None:

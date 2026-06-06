@@ -181,6 +181,42 @@ def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
 
 
+def _smooth_damp(
+    current: float, target: float, vel: float, dt: float, smooth_time: float, max_speed: float
+) -> tuple[float, float]:
+    """Critically-damped approach toward ``target`` (Unity's ``SmoothDamp``).
+
+    Returns ``(new_value, new_velocity)``. Unlike a first-order exponential ease,
+    velocity is carried as state, so the motion is C1-continuous — it eases *in*
+    and *out* and never lurches when ``target`` jumps (which a noisy DoA does
+    constantly). ``smooth_time`` is roughly the time to reach the target; ``<=0``
+    snaps. ``max_speed`` caps the slew rate (``<=0`` = unlimited).
+    """
+    if smooth_time <= 0.0:
+        return target, 0.0
+    if dt <= 0.0:
+        return current, vel
+    omega = 2.0 / smooth_time
+    x = omega * dt
+    exp = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
+    change = current - target
+    temp = (vel + omega * change) * dt
+    new_vel = (vel - omega * temp) * exp
+    new_val = target + (change + temp) * exp
+    # Stop cleanly at the target instead of overshooting past it.
+    if (target - current > 0.0) == (new_val > target):
+        new_val, new_vel = target, 0.0
+    # Hard ceiling on the per-tick step so no jump ever exceeds max_speed deg/s,
+    # even when the (noisy) DoA target leaps to the far side.
+    if max_speed > 0.0:
+        max_step = max_speed * dt
+        step = new_val - current
+        if abs(step) > max_step:
+            new_val = current + math.copysign(max_step, step)
+            new_vel = math.copysign(max_speed, step)
+    return new_val, new_vel
+
+
 def _make_listen() -> ContribFn:
     """Build a fresh sound-orienting closure: slew head (and optionally body) toward DoA.
 
@@ -191,7 +227,21 @@ def _make_listen() -> ContribFn:
     ``None`` channels, so the passive ``feel-alive`` base layer keeps the head and
     body alive rather than freezing them at the last orientation.
     """
-    state = {"yaw_head": 0.0, "yaw_body": 0.0, "last_t": None}
+    # ``committed`` is the heading the head currently holds; the head only re-commits
+    # (and then eases over) when a sound is both far enough (deadband) and sustained
+    # long enough (dwell). ``cand`` tracks the pending new direction and ``cand_since``
+    # when it first appeared, so transient/noisy DoA never accumulates enough dwell.
+    state = {
+        "yaw": 0.0,
+        "vel": 0.0,
+        "byaw": 0.0,
+        "bvel": 0.0,
+        "committed": 0.0,
+        "bcommitted": 0.0,
+        "cand": None,
+        "cand_since": None,
+        "last_t": None,
+    }
 
     def _listen(t: float, p: dict, sense: Sense) -> Contribution:
         speech_only = p["speech_only"] >= 0.5
@@ -200,25 +250,47 @@ def _make_listen() -> ContribFn:
         last = state["last_t"]
         dt = 0.0 if last is None else max(0.0, t - last)
         state["last_t"] = t
-        # Exponential ease. dt==0 (first active tick) -> alpha 0, so it eases up
-        # from where it is rather than snapping; smooth<=0 -> snap.
-        alpha = 1.0 - math.exp(-dt / p["smooth"]) if p["smooth"] > 0 else 1.0
+        smooth, max_speed = p["smooth"], p["max_speed"]
         if not signal:
-            # Nothing to orient to: abstain (return None channels) so feel-alive
-            # shows through. Ease the internal slew state back toward center so a
-            # re-acquired sound starts near where the head actually is, not from a
-            # stale target -> no jump on takeover.
-            state["yaw_head"] += (0.0 - state["yaw_head"]) * alpha
-            state["yaw_body"] += (0.0 - state["yaw_body"]) * alpha
+            # No sound to orient to: abstain (None channels) so feel-alive shows
+            # through, release the committed heading, and ease the internal state to
+            # center so a re-acquired sound starts fresh without a jump.
+            state["committed"] = state["bcommitted"] = 0.0
+            state["cand"] = state["cand_since"] = None
+            state["yaw"], state["vel"] = _smooth_damp(
+                state["yaw"], 0.0, state["vel"], dt, smooth, max_speed
+            )
+            state["byaw"], state["bvel"] = _smooth_damp(
+                state["byaw"], 0.0, state["bvel"], dt, smooth, max_speed
+            )
             return Contribution(head=None, body_yaw=None)
-        target_head = _clamp(doa_angle_to_yaw(angle, p["gain"]), p["max_yaw"])
-        state["yaw_head"] += (target_head - state["yaw_head"]) * alpha
+        # Deadband + dwell: only re-commit to a new heading when it is more than
+        # ``deadband`` from the current one AND has persisted for ``dwell`` seconds.
+        desired = _clamp(doa_angle_to_yaw(angle, p["gain"]), p["max_yaw"])
+        if abs(desired - state["committed"]) > p["deadband"]:
+            if state["cand"] is None or abs(desired - state["cand"]) > p["deadband"]:
+                state["cand"], state["cand_since"] = desired, t
+            if (t - state["cand_since"]) >= p["dwell"]:
+                state["committed"] = desired
+                if p["body_gain"] > 0:
+                    state["bcommitted"] = _clamp(
+                        doa_angle_to_yaw(angle, p["body_gain"]), p["body_max"]
+                    )
+                state["cand"] = state["cand_since"] = None
+        else:
+            state["cand"] = state["cand_since"] = None
+        # Ease the head toward the committed heading (one soft move per commit; dead
+        # still between commits because ``committed`` does not change).
+        state["yaw"], state["vel"] = _smooth_damp(
+            state["yaw"], state["committed"], state["vel"], dt, smooth, max_speed
+        )
         body_yaw = None
         if p["body_gain"] > 0:
-            target_body = _clamp(doa_angle_to_yaw(angle, p["body_gain"]), p["body_max"])
-            state["yaw_body"] += (target_body - state["yaw_body"]) * alpha
-            body_yaw = state["yaw_body"]
-        return Contribution(head=_head(yaw=state["yaw_head"]), body_yaw=body_yaw)
+            state["byaw"], state["bvel"] = _smooth_damp(
+                state["byaw"], state["bcommitted"], state["bvel"], dt, smooth, max_speed
+            )
+            body_yaw = state["byaw"]
+        return Contribution(head=_head(yaw=state["yaw"]), body_yaw=body_yaw)
 
     return _listen
 
@@ -358,7 +430,10 @@ LIBRARY: dict[str, LibraryEntry] = {
         params={
             "gain": Param(0.6, "x", "head-yaw gain per acoustic angle"),
             "max_yaw": Param(35.0, "deg", "max head yaw toward sound"),
-            "smooth": Param(0.35, "s", "slew ease time constant (smaller = snappier)"),
+            "deadband": Param(15.0, "deg", "ignore sound within this angle of current heading"),
+            "dwell": Param(1.0, "s", "hold a new direction this long before turning to it"),
+            "smooth": Param(1.0, "s", "ease time of each turn — larger is softer (0 = snap)"),
+            "max_speed": Param(20.0, "deg/s", "max slew speed cap (0 = unlimited)"),
             "speech_only": Param(0.0, "", "react only to speech (1) vs any sound (0)"),
             "body_gain": Param(0.0, "x", "body-yaw gain per acoustic angle (0 = head only)"),
             "body_max": Param(45.0, "deg", "max body yaw toward sound"),
