@@ -9,6 +9,13 @@ head holds still and only turns deliberately. Turns *toward* a more off-axis sou
 gentle relax). After ``recenter_after`` seconds with no usable sound it eases back to
 centre. The smooth motor trajectory itself is the daemon's job (the action is a minjerk
 ``goto``); this object only decides *when* and *where*.
+
+**Tier-1 antenna lean:** on every tick where there is a usable DoA signal but no head
+turn is being committed this tick (sound within deadband, or dwell not yet met), the
+*near-side* antenna deflects gently toward the sound instead.  The head is never driven
+by this path — only the antenna that faces the sound moves; the far antenna returns to
+neutral (0°).  Repeated leans coalesce via ``ANTENNA_KEY`` so only the latest intent
+queues.
 """
 
 from __future__ import annotations
@@ -16,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from reachy.behavior.sense import Sense, doa_angle_to_yaw
-from reachy.motion.queue import LOOK_KEY, MotionAction
+from reachy.motion.queue import ANTENNA_KEY, LOOK_KEY, MotionAction
 
 
 @dataclass
@@ -34,10 +41,43 @@ class ListenParams:
     max_dur: float = 4.0
     speech_only: bool = False
     recenter_after: float = 4.0  # ease to center after this long with no usable sound
+    antenna_gain: float = 1.0  # scales the lean magnitude (1.0 = full proportion of max_yaw)
+    antenna_max: float = 18.0  # maximum near-side antenna deflection in degrees
 
 
 def _head(yaw: float) -> dict[str, float]:
     return {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": yaw}
+
+
+def _antenna_lean(desired: float, params: ListenParams) -> MotionAction | None:
+    """Build a Tier-1 near-side antenna lean for *desired* yaw (degrees).
+
+    Only the antenna on the near side (toward the sound) deflects; the far
+    antenna returns to neutral (0°).  Returns ``None`` when ``desired`` is
+    effectively zero (front-facing sound → no lean needed).
+
+    ``antennas`` tuple is ``(right, left)``.  Positive yaw = sound on the left,
+    so left antenna leans; negative yaw = sound on the right, so right antenna
+    leans.
+    """
+    if abs(desired) < 1e-9:
+        return None
+    p = params
+    lean = min(1.0, abs(desired) / p.max_yaw) * p.antenna_max * p.antenna_gain
+    if desired > 0:
+        # Sound on the left — left antenna leans toward it.
+        right_a, left_a = 0.0, lean
+    else:
+        # Sound on the right — right antenna leans toward it.
+        right_a, left_a = lean, 0.0
+    return MotionAction(
+        label=f"antenna lean {desired:+.0f}",
+        head=None,
+        antennas=(right_a, left_a),
+        duration=0.3,
+        interpolation="minjerk",
+        coalesce_key=ANTENNA_KEY,
+    )
 
 
 @dataclass
@@ -73,7 +113,13 @@ class ListenProducer:
         )
 
     def update(self, t: float, sense: Sense) -> MotionAction | None:
-        """Return a look-at action to submit this tick, or ``None`` to hold."""
+        """Return a look-at (or antenna-lean) action to submit this tick, or ``None``.
+
+        Head turns are committed only when a sound clears the deadband *and* has dwelt
+        long enough.  On every tick where a usable DoA signal exists but no head turn is
+        issued (within deadband, or dwell not yet met), a Tier-1 antenna lean is emitted
+        instead so the robot shows subtle near-side attention without moving its head.
+        """
         p = self.params
         angle = sense.doa_angle
         signal = angle is not None and (not p.speech_only or sense.speech_detected)
@@ -95,9 +141,17 @@ class ListenProducer:
         desired = max(-p.max_yaw, min(p.max_yaw, doa_angle_to_yaw(angle, p.gain)))
         if abs(desired - self.committed) > p.deadband:
             if self._cand is None or abs(desired - self._cand) > p.deadband:
+                # New candidate noted — dwell clock starts.  Emit an antenna lean while
+                # we wait: near-side attention without committing the head.
                 self._cand, self._cand_since = desired, t
+                return _antenna_lean(desired, p)
             elif (t - self._cand_since) >= p.dwell:
                 return self._move_to(desired, t)
+            else:
+                # Candidate is accumulating dwell — keep leaning near-side.
+                return _antenna_lean(desired, p)
         else:
+            # Within deadband — sound is near the current heading.  Lean gently
+            # near-side to acknowledge, but don't turn.
             self._cand = self._cand_since = None
-        return None
+            return _antenna_lean(desired, p)

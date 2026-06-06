@@ -95,17 +95,26 @@ def test_antenna_and_look_do_not_evict_each_other() -> None:
 def test_producer_commits_only_after_dwell() -> None:
     prod = ListenProducer(ListenParams(deadband=10, dwell=0.5, gain=0.6, max_yaw=35))
     left = Sense(doa_angle=0.0)
-    assert prod.update(0.0, left) is None  # candidate noted
-    assert prod.update(0.3, left) is None  # still under dwell
-    a = prod.update(0.6, left)  # dwell elapsed -> turn
+    # Tier-1: while dwell is accumulating the producer now emits near-side antenna leans
+    # instead of None — the head is not driven, only the left (near-side) antenna deflects.
+    a0 = prod.update(0.0, left)  # candidate noted + first antenna lean
+    assert a0 is not None and a0.head is None and a0.coalesce_key == ANTENNA_KEY
+    assert a0.antennas is not None and a0.antennas[1] > 0 and a0.antennas[0] == 0.0  # left only
+    a1 = prod.update(0.3, left)  # still under dwell — another antenna lean, no head turn
+    assert a1 is not None and a1.head is None and a1.coalesce_key == ANTENNA_KEY
+    a = prod.update(0.6, left)  # dwell elapsed -> head turn committed
     assert a is not None and a.head["yaw"] > 0 and a.coalesce_key == LOOK_KEY
 
 
 def test_producer_holds_within_deadband() -> None:
     prod = ListenProducer(ListenParams(deadband=20, dwell=0.0, gain=0.6, max_yaw=35))
-    assert prod.update(0.0, Sense(doa_angle=math.pi / 2)) is None  # front -> ~0, held
-    # a sound mapping to ~10deg head-yaw is within the 20deg deadband -> no turn
-    assert prod.update(0.1, Sense(doa_angle=1.28)) is None
+    # Front sound (doa=pi/2) maps to desired≈0° — lean magnitude is 0, so None still.
+    assert prod.update(0.0, Sense(doa_angle=math.pi / 2)) is None  # front -> ~0, no lean
+    # doa=1.28 maps to ~10° head yaw, within the 20° deadband — no head turn.
+    # Tier-1: a non-zero desired yaw now produces a near-side antenna lean instead of None.
+    a = prod.update(0.1, Sense(doa_angle=1.28))
+    assert a is not None and a.head is None and a.coalesce_key == ANTENNA_KEY
+    assert a.antennas is not None and a.antennas[1] > 0 and a.antennas[0] == 0.0  # left near
 
 
 def test_producer_relax_is_gentler_than_alert() -> None:
@@ -153,6 +162,67 @@ def test_producer_holds_at_target_after_turn() -> None:
     prod.update(5.0, Sense(doa_angle=math.pi))
     b = prod.update(5.2, Sense(doa_angle=math.pi))
     assert b is not None and b.head["yaw"] < 0  # now turns to the right
+
+
+# --------------------------------------------------------------------------- #
+# Tier-1 antenna lean                                                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_tier1_antenna_lean_left() -> None:
+    """Sound on the left (within deadband) → near-side (left) antenna leans; head is not driven."""
+    # Large deadband so the sound never triggers a head turn; dwell>0 for extra safety.
+    p = ListenParams(deadband=30, dwell=2.0, gain=0.6, max_yaw=35, antenna_max=18.0)
+    prod = ListenProducer(p)
+    # doa=0.0 → desired ≈ +35° (left), within deadband=30 is False here — so this is
+    # actually the "outside deadband, dwell not met" branch.  Use a softer angle instead.
+    # doa≈1.0 rad → desired ≈ degrees(pi/2-1.0)*0.6 ≈ 17.2*0.6 ≈ 10.3° — within 30° deadband.
+    a = prod.update(0.0, Sense(doa_angle=1.0))
+    assert a is not None, "expected antenna lean, got None"
+    assert a.head is None, "Tier-1 must not drive the head"
+    assert a.coalesce_key == ANTENNA_KEY
+    assert a.antennas is not None
+    right_a, left_a = a.antennas
+    assert left_a > 0, "near-side (left) antenna must deflect toward the sound"
+    assert right_a == 0.0, "far-side (right) antenna must stay neutral"
+    assert left_a > right_a, "near magnitude must exceed far magnitude"
+
+
+def test_tier1_antenna_lean_right() -> None:
+    """Sound on the right (within deadband) → near-side (right) antenna leans; head not driven."""
+    p = ListenParams(deadband=30, dwell=2.0, gain=0.6, max_yaw=35, antenna_max=18.0)
+    prod = ListenProducer(p)
+    # doa≈2.14 rad → desired ≈ degrees(pi/2-2.14)*0.6 ≈ -37.7*0.6 ≈ -10.3° (right side),
+    # within 30° deadband, so no head turn.
+    a = prod.update(0.0, Sense(doa_angle=2.14))
+    assert a is not None, "expected antenna lean, got None"
+    assert a.head is None, "Tier-1 must not drive the head"
+    assert a.coalesce_key == ANTENNA_KEY
+    assert a.antennas is not None
+    right_a, left_a = a.antennas
+    assert right_a > 0, "near-side (right) antenna must deflect toward the sound"
+    assert left_a == 0.0, "far-side (left) antenna must stay neutral"
+    assert right_a > left_a, "near magnitude must exceed far magnitude"
+
+
+def test_tier1_antenna_lean_during_dwell_accumulation() -> None:
+    """Sound outside deadband but dwell not yet met → antenna lean each tick, no head turn."""
+    p = ListenParams(deadband=10, dwell=1.0, gain=0.6, max_yaw=35, antenna_max=18.0)
+    prod = ListenProducer(p)
+    # doa=0.0 → desired=35° (clamped), outside 10° deadband — dwell clock starts.
+    a0 = prod.update(0.0, Sense(doa_angle=0.0))
+    a1 = prod.update(0.5, Sense(doa_angle=0.0))  # still under 1.0s dwell
+    for tick_result in (a0, a1):
+        assert tick_result is not None, "expected antenna lean during dwell wait"
+        assert tick_result.head is None
+        assert tick_result.coalesce_key == ANTENNA_KEY
+        assert tick_result.antennas is not None
+        right_a, left_a = tick_result.antennas
+        assert left_a > 0 and right_a == 0.0  # left near-side for positive desired yaw
+    # After dwell elapses, the head-turn action is returned (not an antenna lean).
+    head_action = prod.update(1.1, Sense(doa_angle=0.0))
+    assert head_action is not None and head_action.head is not None
+    assert head_action.coalesce_key == LOOK_KEY
 
 
 # --------------------------------------------------------------------------- #
