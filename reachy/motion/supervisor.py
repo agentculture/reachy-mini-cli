@@ -130,6 +130,10 @@ def build_run_command(
         str(params.alert_speed),
         "--recenter-after",
         str(params.recenter_after),
+        "--idle-energy",
+        str(params.idle_energy),
+        "--drift-speed",
+        str(params.drift_speed),
     ]
     if params.speech_only:
         cmd.append("--speech-only")

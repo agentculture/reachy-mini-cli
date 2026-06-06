@@ -9,17 +9,24 @@ never commits a turn on its own, because the daemon **latches** the angle: it
 holds the last direction through silence, so ``angle is not None`` is not a
 "sound is happening now" signal. Turns *toward* a more off-axis sound are
 ``alert_speed`` (a touch quick); moves back *toward* center are ``relax_speed``
-(a slow, gentle relax). After ``recenter_after`` seconds with no *live* sound it
-eases back to centre. The smooth motor trajectory itself is the daemon's job
+(a slow, gentle relax). The smooth motor trajectory itself is the daemon's job
 (the action is a minjerk ``goto``); this object only decides *when* and *where*.
+
+**Always-alive idle.** When nothing reactive fires, the producer keeps the robot
+gently moving — a breathing / gaze-wander / antenna-sway pose around its *current*
+heading — so it is never frozen between sounds. A robot that turned toward a sound
+stays rotated and keeps wandering around that heading; after ``recenter_after``
+seconds of silence the committed head + body drift slowly back toward front
+(``drift_speed`` deg/s) rather than snapping home. ``idle_energy=0`` restores the
+old hold-still-then-snap-home behaviour.
 
 **Liveness vs. latched angle.** The honest "sound now" signals are
 ``sense.speech_detected``, the ``snap`` transient, and ``sound_present`` (live
 mic energy above the ambient floor). ``sound_present is None`` means there is no
 audio path (the HTTP/remote profile) — we then fall back to
 ``sense.doa_angle is not None`` as a degraded best-effort. The effective boolean
-``live`` drives both the Tier-1 lean gate and the recenter silence clock, so a
-frozen/latched angle during true silence neither leans nor blocks recentering.
+``live`` drives both the Tier-1 lean gate and the idle drift-home silence clock, so
+a frozen/latched angle during true silence neither leans nor drifts the heading home.
 
 **Tier-1 antenna lean:** on every tick where sound is *live* but no head turn is
 committed or held this tick, the *near-side* antenna deflects gently toward the
@@ -37,10 +44,12 @@ with head close to centre. The near-side antenna is folded into the same action.
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 
 from reachy.behavior.sense import Sense, doa_angle_to_yaw
-from reachy.motion.queue import ANTENNA_KEY, LOOK_KEY, MotionAction
+from reachy.motion.idle import AliveConfig, next_pose
+from reachy.motion.queue import ANTENNA_KEY, IDLE_KEY, LOOK_KEY, MotionAction
 
 
 @dataclass
@@ -57,7 +66,11 @@ class ListenParams:
     min_dur: float = 1.5  # floor so even small turns are deliberate, never snappy
     max_dur: float = 4.0
     speech_only: bool = False
-    recenter_after: float = 4.0  # ease to center after this long with no live sound
+    recenter_after: float = 4.0  # silence grace before the head/body start drifting home
+    # Always-alive idle layer: gentle breathing/gaze/antenna motion around the current
+    # heading so the robot is never frozen between sounds (0 disables → old hold-still).
+    idle_energy: float = 1.0  # liveliness of the idle layer (scales demo amplitudes)
+    drift_speed: float = 4.0  # deg/s the committed head+body ease home during silence
     antenna_gain: float = 1.0  # scales the lean magnitude (1.0 = full proportion of max_yaw)
     antenna_max: float = 18.0  # maximum near-side antenna deflection in degrees
     # Tier-2 head→body escalation
@@ -78,8 +91,10 @@ def _antenna_lean(desired: float, params: ListenParams) -> MotionAction | None:
     effectively zero (front-facing sound → no lean needed).
 
     ``antennas`` tuple is ``(right, left)``.  Positive yaw = sound on the left,
-    so left antenna leans; negative yaw = sound on the right, so right antenna
-    leans.
+    so the left antenna leans with a **positive** value; negative yaw = sound on
+    the right, so the right antenna leans with a **negative** value — the right
+    joint's sign is mirrored from the left, so a positive right value would tilt
+    it the wrong way (toward the centre instead of toward the sound).
     """
     if abs(desired) < 1e-9:
         return None
@@ -89,8 +104,8 @@ def _antenna_lean(desired: float, params: ListenParams) -> MotionAction | None:
         # Sound on the left — left antenna leans toward it.
         right_a, left_a = 0.0, lean
     else:
-        # Sound on the right — right antenna leans toward it.
-        right_a, left_a = lean, 0.0
+        # Sound on the right — right antenna leans toward it (mirrored sign).
+        right_a, left_a = -lean, 0.0
     return MotionAction(
         label=f"antenna lean {desired:+.0f}",
         head=None,
@@ -106,6 +121,8 @@ def _antenna_tuple(desired: float, params: ListenParams) -> tuple[float, float]:
 
     Used to fold the antenna pose into a committing head-turn action.  When
     *desired* is effectively zero (recentering) both sides return to neutral.
+    The right antenna leans with a **negative** value (its joint sign is
+    mirrored from the left) so it deflects toward a right-side sound, not away.
     """
     if abs(desired) < 1e-9:
         return (0.0, 0.0)
@@ -113,7 +130,16 @@ def _antenna_tuple(desired: float, params: ListenParams) -> tuple[float, float]:
     lean = min(1.0, abs(desired) / p.max_yaw) * p.antenna_max * p.antenna_gain
     if desired > 0:
         return (0.0, lean)
-    return (lean, 0.0)
+    return (-lean, 0.0)
+
+
+def _toward_zero(value: float, step: float) -> float:
+    """Ease *value* toward 0 by at most *step*, never crossing past 0."""
+    if value > 0.0:
+        return max(0.0, value - step)
+    if value < 0.0:
+        return min(0.0, value + step)
+    return 0.0
 
 
 @dataclass
@@ -125,6 +151,16 @@ class ListenProducer:
     body: float = field(default=0.0)  # current body yaw
     _last_live_t: float | None = None
     _hold_until: float = 0.0
+    # Always-alive idle layer state (built in __post_init__; paced to AliveConfig.interval).
+    _t0: float | None = field(default=None, init=False)
+    _last_idle_t: float | None = field(default=None, init=False)
+    _rng: random.Random = field(init=False, repr=False)
+    _alive: AliveConfig = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Cosmetic idle wander only — not security-sensitive.
+        self._rng = random.Random()  # nosec B311
+        self._alive = AliveConfig(energy=self.params.idle_energy)
 
     def _move_to(self, target: float, t: float, *, body_yaw: float | None = None) -> MotionAction:
         """Commit a head turn to *target*; optionally drive ``body_yaw`` in the same move.
@@ -207,18 +243,54 @@ class ListenProducer:
             return _antenna_lean(desired, p)
         return None
 
-    def _recenter(self, t: float, live: bool) -> MotionAction | None:
-        """Ease head AND body back to center once, after a grace period of no live sound."""
+    def _idle(self, t: float, live: bool) -> MotionAction | None:
+        """Always-alive idle motion around the current heading, with a slow drift home.
+
+        On silence the robot keeps breathing / gaze-wandering / antenna-swaying
+        around its *current* committed heading — a robot that turned toward a
+        sound stays rotated and keeps moving, never freezing. Meanwhile, once
+        sound has been non-live for ``recenter_after`` seconds, the committed
+        head + body ease slowly back toward front (``drift_speed`` deg/s) so it
+        eventually faces forward again without a hard snap.
+
+        Paced to ``AliveConfig.interval`` (one pose per interval; the serial
+        queue + coalescing throttle execution). Returns ``None`` when the idle
+        layer is disabled (``idle_energy <= 0``) or before the next paced pose.
+        """
         p = self.params
+        if p.idle_energy <= 0.0:
+            return None
+        if self._t0 is None:
+            self._t0 = t
+        if self._last_idle_t is not None and (t - self._last_idle_t) < self._alive.interval:
+            return None
+        self._last_idle_t = t
+
+        # Slow drift home: ease the committed head + body toward centre a little each
+        # idle pose, but only after the silence grace and never while sound is live.
         if (
             not live
-            and abs(self.committed) > 1e-9  # off-center (committed is exactly 0 at center)
             and self._last_live_t is not None
             and (t - self._last_live_t) >= p.recenter_after
         ):
-            self.body = 0.0
-            return self._move_to(0.0, t, body_yaw=0.0)
-        return None
+            step = p.drift_speed * self._alive.interval
+            self.committed = _toward_zero(self.committed, step)
+            self.body = _toward_zero(self.body, step)
+
+        pose = next_pose(t - self._t0, self._rng, self._alive)
+        head = dict(pose["head"])  # type: ignore[arg-type]
+        head["yaw"] = max(-p.max_yaw, min(p.max_yaw, head["yaw"] + self.committed))
+        raw_body = float(pose["body_yaw"]) + self.body  # type: ignore[arg-type]
+        body_yaw = max(-p.body_yaw_max, min(p.body_yaw_max, raw_body))
+        return MotionAction(
+            label=f"idle {self.committed:+.0f}",
+            head=head,
+            antennas=pose["antennas"],  # type: ignore[arg-type]
+            body_yaw=body_yaw,
+            duration=float(pose["duration"]),  # type: ignore[arg-type]
+            interpolation=str(pose["interpolation"]),
+            coalesce_key=IDLE_KEY,
+        )
 
     def update(
         self,
@@ -246,8 +318,12 @@ class ListenProducer:
         ``sense.doa_angle is not None`` as a degraded best-effort — never a stale
         latched angle during true silence.
 
-        **Recenter:** once sound has been non-live for ``recenter_after`` seconds and
-        the head is off-center, ease back to center once (head AND body both return).
+        **Idle (always-alive):** when no reaction fires, emit a gentle idle pose
+        (breathing / gaze wander / antenna sway) around the *current* heading, so
+        the robot is never frozen. After ``recenter_after`` seconds of silence the
+        committed head + body drift slowly back toward front (``drift_speed``) while
+        the idle motion continues. Set ``idle_energy=0`` to restore the old
+        hold-still-then-snap-home behaviour.
         """
         angle = sense.doa_angle
         # Effective liveness: prefer the live mic floor; fall back to the (latched)
@@ -269,4 +345,4 @@ class ListenProducer:
             reaction = self._react_to_angle(angle, t, triggered=triggered, live=live)
             if reaction is not None:
                 return reaction
-        return self._recenter(t, live)
+        return self._idle(t, live)

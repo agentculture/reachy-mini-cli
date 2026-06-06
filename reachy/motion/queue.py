@@ -22,12 +22,21 @@ LOOK_KEY = "look"
 # A reactive producer re-targeting the antennas shares this key so only the latest antenna
 # action survives in the queue, independently of LOOK_KEY.
 ANTENNA_KEY = "antenna"
+# The always-alive idle layer re-targets a gentle breathing/gaze pose under this key so only
+# the latest idle pose survives; any real reaction (turn or lean) supersedes it, so live
+# sound always wins over background idle motion.
+IDLE_KEY = "idle"
 
-# A committed head/body move (LOOK_KEY) also supersedes any pending subtle antenna lean
-# (ANTENNA_KEY) — a deliberate "turn to see" must never wait behind a Tier-1 lean. The
-# relation is one-way: a lean never evicts a queued turn. (The turn already folds the
+# A committed head/body move (LOOK_KEY) supersedes any pending subtle antenna lean
+# (ANTENNA_KEY) *and* any pending idle pose (IDLE_KEY) — a deliberate "turn to see" must
+# never wait behind background motion. A Tier-1 lean (ANTENNA_KEY) likewise supersedes a
+# pending idle pose so live sound preempts idle. The relations are one-way: a lean never
+# evicts a queued turn, and idle never evicts a turn or a lean. (A turn already folds the
 # antenna pose into its own action, so the antenna still moves with the head.)
-_SUPERSEDES: dict[str, frozenset[str]] = {LOOK_KEY: frozenset({ANTENNA_KEY})}
+_SUPERSEDES: dict[str, frozenset[str]] = {
+    LOOK_KEY: frozenset({ANTENNA_KEY, IDLE_KEY}),
+    ANTENNA_KEY: frozenset({IDLE_KEY}),
+}
 
 
 @dataclass(frozen=True)

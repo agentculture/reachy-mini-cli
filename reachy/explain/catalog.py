@@ -469,6 +469,13 @@ A **latched-DoA guard** prevents stale angles from triggering a spurious turn: t
 daemon's DoA angle freezes at rest, so Tier-2 fires only on live speech/snap, never
 on the last angle left over from a previous sound.
 
+**Always-alive idle (between sounds):** when nothing reactive fires, the robot
+keeps gently moving — breathing, a slow gaze wander, and antenna sway — *around its
+current heading*, so it is never frozen. A robot that turned toward a sound stays
+rotated and keeps wandering there; after `--recenter-after` seconds of silence the
+head and body drift slowly back toward front (`--drift-speed` deg/s) rather than
+hard-snapping home. `--idle-energy 0` restores the old hold-still behaviour.
+
 The `SnapDetector` (`reachy/motion/snap.py`) implements the RMS spike detection,
 algorithm cited from `reachy_nova`'s `TrackingManager.detect_snap`.
 
@@ -504,7 +511,9 @@ Feel knobs (each defaults to a tuned value; unset keeps it):
 - `--deadband DEG` — ignore sound within this angle of the current heading.
 - `--hold SECONDS` — after a Tier-2 turn, stay there this long before reconsidering.
 - `--speed DEG_PER_S` — slew speed for Tier-2 turns and for easing back to center.
-- `--recenter-after SECONDS` — ease back to center after this long with no sound.
+- `--recenter-after SECONDS` — silence grace before the head/body start drifting home.
+- `--idle-energy X` — liveliness of the always-alive idle motion (0 = hold still).
+- `--drift-speed DEG_PER_S` — how fast the head/body drift home after silence.
 - `--speech-only` — Tier-2 reacts only to detected speech (Tier-1 still runs).
 - `--antenna-max DEG` — maximum antenna lean angle for Tier-1.
 - `--body-yaw-max DEG` — maximum body yaw for Tier-2 body rotation.

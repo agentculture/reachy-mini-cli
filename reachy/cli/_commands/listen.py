@@ -95,7 +95,23 @@ def _add_tuning_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=None,
         dest="recenter_after",
-        help=f"ease to center after this long with no sound (s, default {d.recenter_after:g}).",
+        help="silence grace before the head/body start drifting home "
+        f"(s, default {d.recenter_after:g}).",
+    )
+    parser.add_argument(
+        "--idle-energy",
+        type=float,
+        default=None,
+        dest="idle_energy",
+        help="liveliness of the always-alive idle motion; 0 holds still between sounds "
+        f"(default {d.idle_energy:g}).",
+    )
+    parser.add_argument(
+        "--drift-speed",
+        type=float,
+        default=None,
+        dest="drift_speed",
+        help="speed the head/body drift home after silence (deg/s, " f"default {d.drift_speed:g}).",
     )
     parser.add_argument(
         "--speech-only",
@@ -172,6 +188,10 @@ def _params_from_args(args: argparse.Namespace) -> ListenParams:
         p.alert_speed = p.relax_speed = args.speed
     if args.recenter_after is not None:
         p.recenter_after = args.recenter_after
+    if getattr(args, "idle_energy", None) is not None:
+        p.idle_energy = args.idle_energy
+    if getattr(args, "drift_speed", None) is not None:
+        p.drift_speed = args.drift_speed
     if getattr(args, "speech_only", False):
         p.speech_only = True
     if getattr(args, "antenna_gain", None) is not None:
@@ -204,6 +224,12 @@ def cmd_listen_overview(args: argparse.Namespace) -> int:
                 "transient, the head turns toward the source; when the angle exceeds "
                 "head-only-band the body rotates too (head re-centres on the residual) "
                 "so the whole robot faces the sound.",
+                "Always-alive idle: between sounds the robot keeps gently moving "
+                "(breathing, slow gaze wander, antenna sway) around its current heading — "
+                "if it turned toward a sound it stays rotated and keeps moving there, "
+                "then drifts slowly back to front after silence (never frozen, never a "
+                "hard snap). Tune with --idle-energy / --drift-speed (--idle-energy 0 "
+                "restores hold-still).",
                 "Smooth by construction — drives the daemon's minjerk 'goto' planner, "
                 "one move at a time through a serial motion queue (no jerky streaming).",
                 "Graceful: no mic / no daemon DoA ⇒ no reaction, no crash.",
@@ -225,7 +251,8 @@ def cmd_listen_overview(args: argparse.Namespace) -> int:
                 "use --transport http for the remote/daemon profile",
                 "Tier-1 knobs: --antenna-gain / --antenna-max",
                 "Tier-2 knobs: --head-only-band / --body-yaw-max / --body-speed",
-                "feel knobs: --dwell / --hold / --speed / --deadband / --gain / --recenter-after",
+                "idle knobs: --idle-energy / --drift-speed / --recenter-after",
+                "feel knobs: --dwell / --hold / --speed / --deadband / --gain",
                 "snap detector: --snap-ratio / --snap-floor (SDK profile only)",
                 "exit codes: 0 ok, 1 user error, 2 environment (daemon unreachable)",
             ],

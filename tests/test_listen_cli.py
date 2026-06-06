@@ -247,6 +247,9 @@ def test_build_run_command_serializes_params() -> None:
     assert cmd[cmd.index("--hold") + 1] == "4.0"
     assert cmd[cmd.index("--speed") + 1] == "12.0"
     assert "--speech-only" in cmd
+    # The always-alive idle knobs must reach the background process too.
+    assert cmd[cmd.index("--idle-energy") + 1] == "1.0"
+    assert cmd[cmd.index("--drift-speed") + 1] == "4.0"
 
 
 def test_build_run_command_omits_speech_only_by_default() -> None:
@@ -364,6 +367,18 @@ def test_body_speed_flag() -> None:
     assert params.body_speed == 8.0
 
 
+def test_idle_energy_flag() -> None:
+    args = _parse_tuning(["--idle-energy", "0"])
+    params = _params_from_args(args)
+    assert params.idle_energy == 0.0
+
+
+def test_drift_speed_flag() -> None:
+    args = _parse_tuning(["--drift-speed", "6"])
+    params = _params_from_args(args)
+    assert params.drift_speed == 6.0
+
+
 def test_new_tuning_defaults_unchanged_when_unset() -> None:
     """Unset new flags keep the ListenParams dataclass defaults."""
     d = ListenParams()
@@ -374,6 +389,8 @@ def test_new_tuning_defaults_unchanged_when_unset() -> None:
     assert params.body_yaw_max == d.body_yaw_max
     assert params.body_speed == d.body_speed
     assert params.head_only_band == d.head_only_band
+    assert params.idle_energy == d.idle_energy
+    assert params.drift_speed == d.drift_speed
 
 
 def test_combined_new_tuning_flags() -> None:

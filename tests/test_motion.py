@@ -12,10 +12,10 @@ import math
 
 import numpy as np
 
-from reachy.behavior.sense import Sense
+from reachy.behavior.sense import EMPTY_SENSE, Sense
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.motion.listen import ListenParams, ListenProducer
-from reachy.motion.queue import ANTENNA_KEY, LOOK_KEY, MotionAction, MotionQueue
+from reachy.motion.queue import ANTENNA_KEY, IDLE_KEY, LOOK_KEY, MotionAction, MotionQueue
 from reachy.motion.server import run
 
 
@@ -25,6 +25,12 @@ def _look(label: str, yaw: float) -> MotionAction:
 
 def _antenna(label: str, right: float, left: float) -> MotionAction:
     return MotionAction(label=label, antennas=(right, left), duration=1.0, coalesce_key=ANTENNA_KEY)
+
+
+def _idle_action(label: str) -> MotionAction:
+    return MotionAction(
+        label=label, head={"yaw": 0.0}, antennas=(1.0, -1.0), duration=2.0, coalesce_key=IDLE_KEY
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -97,6 +103,31 @@ def test_look_supersedes_a_pending_antenna_lean() -> None:
     assert pending_labels == ["look-right"]
 
 
+def test_look_supersedes_a_pending_idle_pose() -> None:
+    # A real "turn to see" must never wait behind a background idle pose.
+    q = MotionQueue()
+    q.submit(_idle_action("idle-1"))
+    q.submit(_look("look-left", 20))  # evicts the pending idle pose
+    assert [a.label for a in q.pending()] == ["look-left"]
+
+
+def test_antenna_lean_supersedes_a_pending_idle_pose() -> None:
+    # A live-sound Tier-1 lean preempts background idle motion (sound wins over idle).
+    q = MotionQueue()
+    q.submit(_idle_action("idle-1"))
+    q.submit(_antenna("antenna-up", 10, 0))  # evicts the pending idle pose
+    assert [a.label for a in q.pending()] == ["antenna-up"]
+
+
+def test_idle_coalesces_with_itself_but_never_evicts_a_turn() -> None:
+    # Idle replaces only a previous idle pose; it never evicts a queued turn or lean.
+    q = MotionQueue()
+    q.submit(_look("look-left", 20))
+    q.submit(_idle_action("idle-1"))  # coexists — idle never evicts a turn
+    q.submit(_idle_action("idle-2"))  # latest idle replaces the previous idle only
+    assert [a.label for a in q.pending()] == ["look-left", "idle-2"]
+
+
 # --------------------------------------------------------------------------- #
 # listen producer                                                             #
 # --------------------------------------------------------------------------- #
@@ -125,26 +156,22 @@ def test_producer_commits_on_snap_off_axis() -> None:
 
 def test_latched_angle_never_turns_head() -> None:
     # A constant/latched angle with no speech, no snap, no live sound must NOT turn the
-    # head at all (the latched-DoA guard) — and it must recenter after silence.
+    # head toward it (the latched-DoA guard). idle_energy=0 isolates the reaction logic
+    # from the always-alive idle layer (which would otherwise wander the head on silence).
     prod = ListenProducer(
-        ListenParams(deadband=10, hold=0.0, recenter_after=1.0, gain=0.6, max_yaw=35)
+        ListenParams(deadband=10, hold=0.0, recenter_after=1.0, gain=0.6, max_yaw=35, idle_energy=0)
     )
     latched = Sense(doa_angle=0.0, speech_detected=False)  # off-axis but frozen/silent
-    turns = 0
     for i in range(30):  # 30 ticks of a bare latched angle, no liveness
         a = prod.update(i * 0.1, latched, snap=False, sound_present=False)
-        if a is not None and a.head is not None:
-            # the only head action permitted is the eventual recenter to 0°
-            assert a.head["yaw"] == 0.0
-        elif a is not None and a.head is None:
-            turns += 1  # would be an antenna lean — also not allowed on silence
-    assert turns == 0, "no antenna lean and no off-axis head turn on a silent latched angle"
-    assert prod.committed == 0.0, "head recentered after recenter_after of silence"
+        assert a is None, "a silent latched angle must produce no action with idle disabled"
+    assert prod.committed == 0.0, "head never turned toward the latched angle"
 
 
 def test_producer_no_head_turn_within_deadband() -> None:
     # Speech within the deadband leans (Tier-1) but does not turn the head.
-    prod = ListenProducer(ListenParams(deadband=20, gain=0.6, max_yaw=35))
+    # idle_energy=0 isolates the reaction logic from the always-alive idle layer.
+    prod = ListenProducer(ListenParams(deadband=20, gain=0.6, max_yaw=35, idle_energy=0))
     # Front sound (doa=pi/2) maps to desired≈0° — lean magnitude is 0, so None still.
     assert prod.update(0.0, Sense(doa_angle=math.pi / 2), sound_present=True) is None
     # doa=1.28 maps to ~10° head yaw, within the 20° deadband — no head turn even on speech.
@@ -161,7 +188,9 @@ def test_producer_relax_is_gentler_than_alert() -> None:
     assert relax.duration > alert.duration  # easing back is slower than turning toward
 
 
-def test_producer_recenters_after_silence() -> None:
+def test_producer_drifts_home_after_silence() -> None:
+    # After a turn, the always-alive idle layer slowly drifts the committed heading back
+    # toward front during silence (a gentle drift, not the old hard snap).
     prod = ListenProducer(
         ListenParams(
             deadband=10,
@@ -169,19 +198,29 @@ def test_producer_recenters_after_silence() -> None:
             recenter_after=1.0,
             gain=0.6,
             min_dur=0.0,
+            drift_speed=4.0,
             alert_speed=1000.0,
             body_speed=1000.0,  # near-instant escalation so hold clears immediately
-        )  # near-instant move so hold clears
+        )
     )
     # Speech off-axis commits the turn (latched angle alone never would).
     prod.update(0.0, Sense(doa_angle=0.0, speech_detected=True), sound_present=True)
-    assert prod.committed != 0.0
-    from reachy.behavior.sense import EMPTY_SENSE
+    assert prod.committed != 0.0 or prod.body != 0.0
 
-    # Silence clock is keyed on liveness, not on the (still-latched) angle.
-    assert prod.update(0.5, EMPTY_SENSE, sound_present=False) is None  # within grace, holds
-    back = prod.update(1.1, EMPTY_SENSE, sound_present=False)  # past recenter_after -> center
-    assert back is not None and back.head["yaw"] == 0.0
+    # Within the silence grace, idle keeps the heading where it is (stays rotated).
+    first = prod.update(0.5, EMPTY_SENSE, sound_present=False)
+    assert first is not None and first.coalesce_key == IDLE_KEY
+    offset_before = abs(prod.committed) + abs(prod.body)
+
+    # Past the grace, successive idle poses (paced ≥ interval apart) ease the head + body
+    # toward 0 monotonically, without overshoot, eventually reaching center.
+    seen = []
+    for t in (3.1, 5.7, 8.3, 10.9, 13.5, 16.1):
+        prod.update(t, EMPTY_SENSE, sound_present=False)
+        seen.append(abs(prod.committed) + abs(prod.body))
+    assert seen[0] < offset_before, "drift should reduce the offset"
+    assert all(b <= a + 1e-9 for a, b in zip(seen, seen[1:])), "drift is monotone toward 0"
+    assert prod.committed == 0.0 and prod.body == 0.0, "eventually fully home"
 
 
 def test_producer_holds_at_target_after_turn() -> None:
@@ -240,9 +279,11 @@ def test_tier1_antenna_lean_right() -> None:
     assert a.coalesce_key == ANTENNA_KEY
     assert a.antennas is not None
     right_a, left_a = a.antennas
-    assert right_a > 0, "near-side (right) antenna must deflect toward the sound"
+    # The right antenna's joint sign is mirrored from the left, so leaning it toward a
+    # right-side sound uses a NEGATIVE value (a positive value would tilt it the wrong way).
+    assert right_a < 0, "near-side (right) antenna must deflect toward the sound (mirrored sign)"
     assert left_a == 0.0, "far-side (left) antenna must stay neutral"
-    assert right_a > left_a, "near magnitude must exceed far magnitude"
+    assert abs(right_a) > abs(left_a), "near magnitude must exceed far magnitude"
 
 
 def test_tier1_lean_on_sound_present_without_speech_or_snap() -> None:
@@ -261,8 +302,8 @@ def test_tier1_lean_on_sound_present_without_speech_or_snap() -> None:
     assert prod.committed == 0.0, "no head turn was committed"
 
 
-def test_tier1_no_lean_without_live_sound_then_recenters() -> None:
-    """No live sound → no antenna lean (even on a latched angle); head eventually recenters."""
+def test_no_antenna_lean_without_live_sound() -> None:
+    """No live sound → never a Tier-1 antenna lean (ANTENNA_KEY); only idle motion may fire."""
     p = ListenParams(
         deadband=10,
         hold=0.0,
@@ -274,14 +315,16 @@ def test_tier1_no_lean_without_live_sound_then_recenters() -> None:
         body_speed=1000.0,  # near-instant escalation so hold clears immediately
     )
     prod = ListenProducer(p)
-    # First commit a turn via speech so there is something to recenter from.
+    # First commit a turn via speech so there is a non-zero heading to drift from.
     prod.update(0.0, Sense(doa_angle=0.0, speech_detected=True), sound_present=True)
-    assert prod.committed != 0.0
-    # Now the angle latches but sound goes silent — no lean while waiting to recenter.
+    assert prod.committed != 0.0 or prod.body != 0.0
+    # Now the angle latches but sound goes silent: the near-side LEAN must never fire on
+    # silence (the latched-DoA guard). Background idle poses (IDLE_KEY) are allowed.
     latched = Sense(doa_angle=0.0, speech_detected=False)
-    assert prod.update(0.5, latched, sound_present=False) is None  # within grace, no lean
-    back = prod.update(1.6, latched, sound_present=False)  # past recenter_after -> center once
-    assert back is not None and back.head["yaw"] == 0.0
+    for t in (0.5, 3.1, 5.7, 8.3):
+        a = prod.update(t, latched, sound_present=False)
+        if a is not None:
+            assert a.coalesce_key != ANTENNA_KEY, "silence must not produce an antenna lean"
 
 
 def test_remote_profile_falls_back_to_latched_angle_for_liveness() -> None:
@@ -379,8 +422,8 @@ def test_hold_window_returns_none_no_stale_antenna() -> None:
         assert result is None, f"expected None during hold at t={ti}, got {result}"
 
 
-def test_recenter_returns_head_and_body_to_center() -> None:
-    """After silence, both head and body return to center (body_yaw=0 in recenter action)."""
+def test_drift_home_returns_head_and_body_to_center() -> None:
+    """After silence, the slow drift eventually eases BOTH head and body back to center."""
     p = ListenParams(
         deadband=10,
         hold=0.0,
@@ -392,18 +435,95 @@ def test_recenter_returns_head_and_body_to_center() -> None:
         body_yaw_max=45.0,
         body_speed=1000.0,  # near-instant
         alert_speed=1000.0,
+        drift_speed=4.0,
     )
     prod = ListenProducer(p)
     # Speech off-axis → escalate so both head and body are off-center.
     s = Sense(doa_angle=0.0, speech_detected=True)
     prod.update(0.0, s, sound_present=True)
     assert prod.body != 0.0, "body should be non-zero after escalation"
-    from reachy.behavior.sense import EMPTY_SENSE
 
-    # After silence, recenter action should bring both head and body to 0.
-    back = prod.update(1.1, EMPTY_SENSE, sound_present=False)
-    assert back is not None and back.head["yaw"] == 0.0, "head must recenter"
-    assert back.body_yaw == 0.0, "body must also be returned to center in the recenter action"
+    # Drive enough silent idle emissions (paced ≥ interval apart, past the grace).
+    last = None
+    for i in range(12):
+        last = prod.update(3.0 + i * 2.6, EMPTY_SENSE, sound_present=False)
+    assert prod.committed == 0.0, "head fully drifted home"
+    assert prod.body == 0.0, "body fully drifted home"
+    # The final idle pose wanders around the now-centred heading (an IDLE_KEY action).
+    assert last is not None and last.coalesce_key == IDLE_KEY
+
+
+# --------------------------------------------------------------------------- #
+# always-alive idle layer                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_idle_disabled_holds_still_on_silence() -> None:
+    """idle_energy=0 restores the old behaviour: silence produces no action."""
+    prod = ListenProducer(ListenParams(idle_energy=0))
+    assert prod.update(0.0, EMPTY_SENSE, sound_present=False) is None
+    assert prod.update(10.0, EMPTY_SENSE, sound_present=False) is None
+
+
+def test_idle_emits_alive_pose_around_committed_heading() -> None:
+    """With a committed heading, idle wanders AROUND it (stays rotated) under IDLE_KEY."""
+    p = ListenParams(
+        idle_energy=1.0,
+        hold=0.0,
+        recenter_after=100.0,  # long grace → no drift within the test window
+        gain=0.6,
+        max_yaw=35,
+        min_dur=0.0,
+        alert_speed=1000.0,
+        head_only_band=90.0,  # head-only turn (no body)
+    )
+    prod = ListenProducer(p)
+    # Commit a head-only turn to the left.
+    prod.update(0.0, Sense(doa_angle=1.0, speech_detected=True), sound_present=True)
+    committed = prod.committed
+    assert committed > 0.0
+    # The first idle pose (within the long grace → no drift) wanders near the committed yaw.
+    a = prod.update(0.5, EMPTY_SENSE, sound_present=False)
+    assert a is not None and a.coalesce_key == IDLE_KEY
+    assert a.head is not None
+    # Head yaw is offset by the committed heading (not centred on 0); wander stays bounded.
+    assert abs(a.head["yaw"] - committed) <= 20.0
+    # committed is unchanged (no drift within the grace) — the robot stays rotated.
+    assert prod.committed == committed
+
+
+def test_idle_is_paced_to_interval() -> None:
+    """Idle emits at most one pose per AliveConfig.interval; intermediate ticks return None."""
+    prod = ListenProducer(ListenParams(idle_energy=1.0))
+    first = prod.update(0.0, EMPTY_SENSE, sound_present=False)
+    assert first is not None and first.coalesce_key == IDLE_KEY
+    # Within the interval (2.5 s) the next ticks are paced out.
+    assert prod.update(0.5, EMPTY_SENSE, sound_present=False) is None
+    assert prod.update(1.0, EMPTY_SENSE, sound_present=False) is None
+    # Past the interval, another idle pose emits.
+    assert prod.update(2.6, EMPTY_SENSE, sound_present=False) is not None
+
+
+def test_idle_head_yaw_clamped_to_max_yaw() -> None:
+    """The composed idle head yaw never exceeds the head's safe range even around a max turn."""
+    p = ListenParams(
+        idle_energy=1.0,
+        hold=0.0,
+        recenter_after=100.0,
+        gain=0.6,
+        max_yaw=35,
+        min_dur=0.0,
+        alert_speed=1000.0,
+        head_only_band=90.0,
+    )
+    prod = ListenProducer(p)
+    # Turn to the head-only max so wander could otherwise push past the limit.
+    prod.update(0.0, Sense(doa_angle=0.0, speech_detected=True), sound_present=True)
+    assert prod.committed == 35.0
+    for i in range(8):
+        a = prod.update(0.5 + i * 2.6, EMPTY_SENSE, sound_present=False)
+        if a is not None and a.head is not None:
+            assert -35.0 - 1e-9 <= a.head["yaw"] <= 35.0 + 1e-9
 
 
 # --------------------------------------------------------------------------- #
