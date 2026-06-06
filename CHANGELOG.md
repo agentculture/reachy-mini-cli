@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-06-06
+
+### Added
+
+- Two-tier `reachy listen`: Tier-1 near-side antenna lean toward faint sound; Tier-2 head->body "turn to see" on detected speech or a loud RMS snap transient.
+- Real mic loudness via a `SnapDetector` (RMS spike, algorithm cited from reachy_nova `detect_snap`), fed from the SDK `media_session()` audio stream.
+- SDK-based daemon/robot liveness (`is_robot_live`) that stays correct across a daemon restart (#21).
+- New `listen` tuning flags: --antenna-gain/--antenna-max/--body-yaw-max/--body-speed/--head-only-band/--snap-ratio/--snap-floor.
+- `ANTENNA_KEY` coalesce key in the motion queue so antenna leans coalesce independently of head moves.
+
+### Changed
+
+- `listen` is now SDK-first: `reachy-mini` + `numpy` are base dependencies and the SDK transport is listen's default (real DoA + mic loudness in-process); the HTTP transport remains an optional remote profile via --transport http. Relaxes the prior zero-base-dependency rule (deliberate decision).
+- Latched-DoA guard: a head turn fires only on live speech/snap, never on a frozen DoA angle (the daemon latches the last direction at rest).
+
 ## [0.7.0] - 2026-06-06
 
 ### Added
