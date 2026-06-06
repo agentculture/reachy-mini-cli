@@ -7,7 +7,10 @@ and a fake transport, and the listen producer is a pure decision function fed sy
 
 from __future__ import annotations
 
+import contextlib
 import math
+
+import numpy as np
 
 from reachy.behavior.sense import Sense
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
@@ -425,7 +428,7 @@ class _RecTransport:
 class _AlwaysLook:
     """A producer that wants to look somewhere every single tick."""
 
-    def update(self, t, sense):
+    def update(self, t, sense, **_kwargs):
         return MotionAction(label="look", head={"yaw": 20.0}, duration=1.0, coalesce_key=LOOK_KEY)
 
 
@@ -460,7 +463,7 @@ class _OnceMove:
     def __init__(self):
         self.done = False
 
-    def update(self, t, sense):
+    def update(self, t, sense, **_kwargs):
         if self.done:
             return None
         self.done = True
@@ -496,3 +499,158 @@ def test_server_retries_a_failed_move_instead_of_dropping_it() -> None:
         max_ticks=5,
     )
     assert tr.gotos == [1.0]  # the move eventually landed (was not dropped on the failure)
+
+
+# --------------------------------------------------------------------------- #
+# t8: audio= kwarg wired into producer.update()                               #
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingProducer:
+    """Records every (snap, sound_present) pair it is called with; never produces a move."""
+
+    def __init__(self):
+        self.calls: list[tuple[bool, object]] = []
+
+    def update(self, t, sense, *, snap: bool = False, sound_present=None, **_):
+        self.calls.append((snap, sound_present))
+        return None
+
+
+def test_run_forwards_audio_kwargs_to_producer() -> None:
+    """run(audio=...) must pass snap+sound_present from the audio source to producer.update()."""
+    # Script: first call returns (False, False), second (True, True), rest (False, False).
+    script = [(False, False), (True, True)]
+    call_count = [0]
+
+    def _audio(_t):
+        i = call_count[0]
+        call_count[0] += 1
+        return script[i] if i < len(script) else (False, False)
+
+    tr = _RecTransport()
+    prod = _RecordingProducer()
+    run(
+        tr,
+        prod,
+        audio=_audio,
+        now=_Clock(0.05),
+        sleep=lambda *_: None,
+        tick=0.05,
+        max_ticks=3,
+    )
+    assert len(prod.calls) == 3
+    assert prod.calls[0] == (False, False)
+    assert prod.calls[1] == (True, True)
+    assert prod.calls[2] == (False, False)  # past script → default
+
+
+def test_run_no_audio_passes_false_none_to_producer() -> None:
+    """When audio=None (HTTP profile), producer.update() receives snap=False, sound_present=None."""
+    tr = _RecTransport()
+    prod = _RecordingProducer()
+    run(
+        tr,
+        prod,
+        audio=None,
+        now=_Clock(0.05),
+        sleep=lambda *_: None,
+        tick=0.05,
+        max_ticks=4,
+    )
+    assert len(prod.calls) == 4
+    assert all(c == (False, None) for c in prod.calls)
+
+
+# --------------------------------------------------------------------------- #
+# t8: fake-SDK-transport end-to-end                                           #
+# --------------------------------------------------------------------------- #
+
+
+class _FakeMediaSession:
+    """Mimics sdk_transport.MediaSession: loud audio + off-axis speech DoA."""
+
+    def __init__(self, loud_rms: float = 0.5):
+        self._loud_rms = loud_rms
+        # Build a history of quiet samples first so the SnapDetector has a baseline,
+        # then a loud spike is a genuine snap (ratio-5 gate fires once baseline exists).
+        self._call_count = 0
+
+    def doa(self, *, timeout=None):  # noqa: ARG002 — timeout unused in fake
+        # Speech off-axis to the left (angle=0 rad → left, speech=True).
+        return {"angle": 0.0, "speech_detected": True}
+
+    def get_audio_sample(self):
+        self._call_count += 1
+        # First 10 calls: quiet baseline (rms ≈ 0.001); thereafter: loud spike.
+        if self._call_count <= 10:
+            return np.full(512, 0.001, dtype=np.float32)
+        return np.full(512, self._loud_rms, dtype=np.float32)
+
+
+class _FakeSdkTransport:
+    """A transport that exposes media_session() (SDK profile) and records gotos."""
+
+    name = "sdk-fake"
+
+    def __init__(self):
+        self.gotos: list[dict] = []
+        self._session = _FakeMediaSession()
+
+    def move_goto(self, *, head=None, antennas=None, body_yaw=None, duration, interpolation):
+        self.gotos.append(
+            {"head": head, "antennas": antennas, "body_yaw": body_yaw, "duration": duration}
+        )
+        return {"uuid": "x"}
+
+    @contextlib.contextmanager
+    def media_session(self):
+        yield self._session
+
+
+def test_sdk_transport_audio_drives_snap_turn(monkeypatch) -> None:
+    """Fake-SDK transport: loud audio + off-axis speech → Tier-2 head (or body) turn dispatched.
+
+    Drive via cmd_listen_run with an injected fake SDK transport.  To avoid
+    real-clock timing issues the test patches time.sleep to a no-op and uses
+    a fast enough move duration (speed=1000 deg/s, min_dur via speed) so that
+    busy_until clears within the first handful of ticks.
+    """
+    import argparse
+
+    from reachy.cli._commands.listen import cmd_listen_run
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    tr = _FakeSdkTransport()
+
+    # Build a minimal args namespace (same fields as the real CLI).
+    args = argparse.Namespace(
+        json=False,
+        gain=0.6,
+        max_yaw=35.0,
+        deadband=0.0,  # zero deadband so even small off-axis angles trigger
+        dwell=0.0,
+        hold=0.0,
+        speed=1000.0,  # very fast so move duration is tiny; busy_until clears quickly
+        recenter_after=60.0,
+        speech_only=False,
+        max_ticks=30,  # enough ticks for at least one Tier-2 dispatch
+    )
+
+    monkeypatch.setattr("reachy.cli._commands.listen.get_transport", lambda _: tr)
+
+    rc = cmd_listen_run(args)
+
+    assert rc == 0
+    # The first goto is the preflight center; subsequent ones should include a
+    # head turn driven by the speech+snap path (Tier-2: yaw != 0 or body_yaw != None).
+    non_center = [
+        g
+        for g in tr.gotos
+        if (g.get("head") or {}).get("yaw", 0.0) != 0.0 or g.get("body_yaw") is not None
+    ]
+    assert non_center, (
+        f"expected at least one off-center head/body move from snap/speech path; "
+        f"gotos={tr.gotos}"
+    )
