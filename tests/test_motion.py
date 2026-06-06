@@ -160,6 +160,7 @@ def test_producer_recenters_after_silence() -> None:
             gain=0.6,
             min_dur=0.0,
             alert_speed=1000.0,
+            body_speed=1000.0,  # near-instant escalation so hold clears immediately
         )  # near-instant move so hold clears
     )
     # Speech off-axis commits the turn (latched angle alone never would).
@@ -175,7 +176,15 @@ def test_producer_recenters_after_silence() -> None:
 
 def test_producer_holds_at_target_after_turn() -> None:
     # turn readily on speech, but stay committed for `hold` seconds before reconsidering
-    p = ListenParams(deadband=10, hold=3.0, gain=0.6, max_yaw=35, alert_speed=30, min_dur=0.5)
+    p = ListenParams(
+        deadband=10,
+        hold=3.0,
+        gain=0.6,
+        max_yaw=35,
+        alert_speed=30,
+        min_dur=0.5,
+        body_speed=1000.0,  # near-instant escalation so hold duration is driven by alert_speed
+    )
     prod = ListenProducer(p)
     left = Sense(doa_angle=0.0, speech_detected=True)
     right = Sense(doa_angle=math.pi, speech_detected=True)
@@ -252,6 +261,7 @@ def test_tier1_no_lean_without_live_sound_then_recenters() -> None:
         max_yaw=35,
         min_dur=0.0,
         alert_speed=1000.0,  # near-instant move so the hold window clears immediately
+        body_speed=1000.0,  # near-instant escalation so hold clears immediately
     )
     prod = ListenProducer(p)
     # First commit a turn via speech so there is something to recenter from.
@@ -273,6 +283,117 @@ def test_remote_profile_falls_back_to_latched_angle_for_liveness() -> None:
     assert a is not None and a.head is None and a.coalesce_key == ANTENNA_KEY
     # But still no head turn without speech/snap.
     assert prod.committed == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# t7: antenna fold + head→body escalation                                    #
+# --------------------------------------------------------------------------- #
+
+
+def test_near_off_axis_speech_head_only_antennas_folded() -> None:
+    """Near off-axis (within head_only_band) → head-only turn; antenna folded into the action."""
+    # head_only_band=60 ensures raw_desired stays below band for a moderate doa angle.
+    p = ListenParams(
+        deadband=10,
+        gain=0.6,
+        max_yaw=35,
+        antenna_max=18.0,
+        head_only_band=60.0,  # wide band → head-only path
+    )
+    prod = ListenProducer(p)
+    # doa=1.0 → raw ~17.2°, within head_only_band=60 → head-only turn.
+    s = Sense(doa_angle=1.0, speech_detected=True)
+    a = prod.update(0.0, s, sound_present=True)
+    assert a is not None, "expected a head turn"
+    assert a.coalesce_key == LOOK_KEY
+    assert a.head is not None and a.head["yaw"] > 0, "head should turn toward the sound"
+    # body_yaw should be absent (None) — no body movement for head-only path.
+    assert a.body_yaw is None, "head-only turn must not move the body"
+    # Antenna should be folded into this same action (near-side non-zero).
+    assert a.antennas is not None, "antenna pose must be folded into the committing turn"
+    right_a, left_a = a.antennas
+    # Sound on the left (positive yaw) → left antenna near-side.
+    assert left_a > 0, "near-side (left) antenna must deflect toward the sound"
+    assert right_a == 0.0, "far-side (right) antenna must stay neutral"
+    # Body yaw state is unchanged.
+    assert prod.body == 0.0
+
+
+def test_far_off_axis_speech_body_escalation() -> None:
+    """Far off-axis (beyond head_only_band) → combined body+head action with antennas folded."""
+    # Use narrow head_only_band so doa=0.0 (raw=54° at gain=0.6) triggers escalation.
+    p = ListenParams(
+        deadband=10,
+        gain=0.6,
+        max_yaw=35,
+        antenna_max=18.0,
+        head_only_band=30.0,  # raw=54 > 30 → escalate
+        body_yaw_max=45.0,
+        body_speed=1000.0,  # fast so test is not about timing
+        min_dur=0.0,
+    )
+    prod = ListenProducer(p)
+    s = Sense(doa_angle=0.0, speech_detected=True)
+    a = prod.update(0.0, s, snap=False, sound_present=True)
+    assert a is not None, "expected an escalation action"
+    assert a.coalesce_key == LOOK_KEY
+    # body_yaw must be non-zero toward the source (positive for left-side source).
+    assert a.body_yaw is not None and a.body_yaw > 0, "body must rotate toward the source"
+    # head yaw must be less extreme than the raw desired angle (54°), re-centered.
+    assert a.head is not None
+    raw_desired = 54.0  # doa_angle_to_yaw(0.0, 0.6)
+    assert abs(a.head["yaw"]) < abs(raw_desired), "head should be more centred than raw desired"
+    # Antennas must be folded in.
+    assert a.antennas is not None, "antenna must be folded into escalation action"
+    # body and committed state updated.
+    assert prod.body > 0
+    assert prod.committed == a.head["yaw"]
+
+
+def test_hold_window_returns_none_no_stale_antenna() -> None:
+    """During the post-turn hold window, update() returns None (no stray antenna action)."""
+    p = ListenParams(
+        deadband=10,
+        hold=3.0,
+        gain=0.6,
+        max_yaw=35,
+        head_only_band=60.0,  # head-only path
+    )
+    prod = ListenProducer(p)
+    s = Sense(doa_angle=1.0, speech_detected=True)
+    a = prod.update(0.0, s, sound_present=True)
+    assert a is not None  # committed the turn
+    # During hold, even with live sound, no further action is returned.
+    for ti in (0.5, 1.0, 1.5, 2.0, 2.5):
+        result = prod.update(ti, s, sound_present=True)
+        assert result is None, f"expected None during hold at t={ti}, got {result}"
+
+
+def test_recenter_returns_head_and_body_to_center() -> None:
+    """After silence, both head and body return to center (body_yaw=0 in recenter action)."""
+    p = ListenParams(
+        deadband=10,
+        hold=0.0,
+        recenter_after=1.0,
+        gain=0.6,
+        max_yaw=35,
+        min_dur=0.0,
+        head_only_band=30.0,  # escalation path
+        body_yaw_max=45.0,
+        body_speed=1000.0,  # near-instant
+        alert_speed=1000.0,
+    )
+    prod = ListenProducer(p)
+    # Speech off-axis → escalate so both head and body are off-center.
+    s = Sense(doa_angle=0.0, speech_detected=True)
+    prod.update(0.0, s, sound_present=True)
+    assert prod.body != 0.0, "body should be non-zero after escalation"
+    from reachy.behavior.sense import EMPTY_SENSE
+
+    # After silence, recenter action should bring both head and body to 0.
+    back = prod.update(1.1, EMPTY_SENSE, sound_present=False)
+    assert back is not None and back.head["yaw"] == 0.0, "head must recenter"
+    assert back.body_yaw == 0.0, "body must also be returned to center in the recenter action"
 
 
 # --------------------------------------------------------------------------- #
