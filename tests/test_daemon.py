@@ -418,3 +418,109 @@ def test_is_our_daemon_false_for_dead_pid() -> None:
         pytest.skip("no /proc on this platform")
     # A pid that cannot exist -> /proc read fails -> not our daemon.
     assert daemon._is_our_daemon(2_000_000_000) is False
+
+
+# --- is_robot_live liveness probe ------------------------------------------
+
+
+def test_is_robot_live_true_when_http_healthy(monkeypatch) -> None:
+    """is_robot_live returns True immediately when the HTTP health endpoint answers."""
+    monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: True)
+    assert daemon.is_robot_live() is True
+
+
+def test_is_robot_live_false_when_http_unreachable(monkeypatch) -> None:
+    """is_robot_live returns False when the health endpoint does not answer."""
+    monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: False)
+    assert daemon.is_robot_live() is False
+
+
+def test_is_robot_live_reflects_restart(monkeypatch, tmp_path) -> None:
+    """Simulate a daemon restart: down then up.
+
+    A stale PID file is present throughout.  The probe must NOT trust the cached
+    PID state — each call re-checks the HTTP health endpoint independently.
+    """
+    # Write a stale PID file (daemon is down, but file still exists).
+    (tmp_path / "daemon.pid").write_text("4242")
+    # is_alive claims the pid is gone (restart tore down the old process).
+    monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: False)
+
+    call_count = {"n": 0}
+
+    def _health(*a, **k):
+        call_count["n"] += 1
+        # First call: daemon is still down (just restarting).
+        # Second call: daemon is back up.
+        return call_count["n"] > 1
+
+    monkeypatch.setattr("reachy.daemon.health_ok", _health)
+
+    # First probe: must report down even though PID file exists.
+    assert daemon.is_robot_live() is False
+
+    # Second probe: must report live — fresh HTTP check, not a cached/PID result.
+    assert daemon.is_robot_live() is True
+
+    # Exactly two health probes were made (one per is_robot_live call).
+    assert call_count["n"] == 2
+
+
+def test_is_robot_live_no_stale_cache(monkeypatch) -> None:
+    """is_robot_live never caches: alternating up/down is reflected correctly."""
+    states = [True, False, True]
+    monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: states.pop(0))
+    assert daemon.is_robot_live() is True
+    assert daemon.is_robot_live() is False
+    assert daemon.is_robot_live() is True
+
+
+def test_is_robot_live_ignores_pid_file(monkeypatch, tmp_path) -> None:
+    """A stale PID file must not cause is_robot_live to report True when HTTP is down."""
+    (tmp_path / "daemon.pid").write_text("9999")
+    monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: True)  # pid "alive"
+    monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: False)  # but HTTP down
+
+    # The robot is NOT actually reachable — HTTP says no.
+    assert daemon.is_robot_live() is False
+
+
+def test_is_robot_live_custom_url_and_timeout(monkeypatch) -> None:
+    """is_robot_live forwards base_url and timeout to health_ok."""
+    captured: dict = {}
+
+    def _health(base_url, timeout):
+        captured["base_url"] = base_url
+        captured["timeout"] = timeout
+        return True
+
+    monkeypatch.setattr("reachy.daemon.health_ok", _health)
+    result = daemon.is_robot_live(base_url="http://robot.local:8080", timeout=2.5)
+    assert result is True
+    assert captured["base_url"] == "http://robot.local:8080"
+    assert captured["timeout"] == 2.5
+
+
+def test_status_includes_live_field(monkeypatch, tmp_path, capsys) -> None:
+    """daemon.status result now includes a 'live' key from is_robot_live."""
+    (tmp_path / "daemon.pid").write_text("4242")
+    monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: True)
+    monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: True)
+
+    rc = main(["daemon", "status", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "live" in payload
+    assert payload["live"] is True
+
+
+def test_status_live_false_when_http_down(monkeypatch, tmp_path, capsys) -> None:
+    """live=False in status when HTTP health is not reachable."""
+    (tmp_path / "daemon.pid").write_text("4242")
+    monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: True)
+    monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: False)
+
+    rc = main(["daemon", "status", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["live"] is False
