@@ -13,20 +13,20 @@ classifiers = [
     "Topic :: Software Development",
     "Intended Audience :: Developers",
 ]
-dependencies = []
+dependencies = ["reachy-mini>=1.0", "numpy>=1.24"]
 
-# Optional extras. The base install stays dependency-free (the http transport and
-# the `daemon` process verbs use only the stdlib), so the bare `pip install
-# reachy-cli` is the lightweight HTTP-only *remote* profile — for a control box
-# that only talks to a daemon running elsewhere via --base-url / REACHY_BASE_URL.
+# SDK-first design: `reachy-mini` (SDK + daemon binary) and `numpy` (RMS detector)
+# are now base dependencies — the SDK transport and numpy-based audio processing are
+# the default path. The bare `pip install reachy-cli` therefore includes the full SDK.
 #
-# The recommended *default* is `pip install 'reachy-cli[daemon]'`: it pulls in
-# `reachy-mini`, which provides the `reachy-mini-daemon` binary that `reachy
-# daemon start` launches. `[sdk]` enables the in-process `--transport sdk` client.
-# Both resolve to the same `reachy-mini` wheel today (it ships both the daemon
-# binary and the SDK client); they stay separately named for intent clarity.
-# Sanctioned exceptions to the zero-runtime-dependency rule — see
-# docs/adr-0001-sdk-transport-extra.md.
+# The HTTP-only *remote* profile (controlling a daemon running elsewhere via
+# --base-url / REACHY_BASE_URL, without local SDK usage) remains valid as a usage
+# pattern — no code change needed, just omit the sdk transport flag. It is no longer
+# a lighter install profile, however, since reachy-mini ships in base deps.
+#
+# Optional extras below keep their entries for intent clarity and backward compat:
+# `[daemon]` signals "I need the reachy-mini-daemon binary" and `[sdk]` signals
+# "I need the in-process SDK client" — both resolve to the same reachy-mini wheel.
 [project.optional-dependencies]
 daemon = ["reachy-mini>=1.0"]
 sdk = ["reachy-mini>=1.0"]
