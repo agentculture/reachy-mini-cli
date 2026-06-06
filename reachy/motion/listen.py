@@ -26,11 +26,18 @@ committed or held this tick, the *near-side* antenna deflects gently toward the
 sound instead. The head is never driven by this path — only the antenna that
 faces the sound moves; the far antenna returns to neutral (0°). Repeated leans
 coalesce via ``ANTENNA_KEY`` so only the latest intent queues.
+
+**Tier-2 head→body escalation:** when a committing speech/snap event points
+beyond ``head_only_band`` degrees, the head alone cannot reach the source. In
+that case a single combined action turns the body toward the source (clamped to
+±``body_yaw_max``) *and* re-centres the head to the residual angle
+(``desired - body_yaw``, clamped to ±``max_yaw``) so the robot faces the sound
+with head close to centre. The near-side antenna is folded into the same action.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from reachy.behavior.sense import Sense, doa_angle_to_yaw
 from reachy.motion.queue import ANTENNA_KEY, LOOK_KEY, MotionAction
@@ -53,6 +60,10 @@ class ListenParams:
     recenter_after: float = 4.0  # ease to center after this long with no live sound
     antenna_gain: float = 1.0  # scales the lean magnitude (1.0 = full proportion of max_yaw)
     antenna_max: float = 18.0  # maximum near-side antenna deflection in degrees
+    # Tier-2 head→body escalation
+    body_yaw_max: float = 45.0  # maximum body yaw rotation in degrees
+    body_speed: float = 12.0  # deg/s (slow — body turn is deliberate, not snappy)
+    head_only_band: float = 30.0  # |desired| <= this → head-only; beyond → body escalation
 
 
 def _head(yaw: float) -> dict[str, float]:
@@ -90,16 +101,38 @@ def _antenna_lean(desired: float, params: ListenParams) -> MotionAction | None:
     )
 
 
+def _antenna_tuple(desired: float, params: ListenParams) -> tuple[float, float]:
+    """Return the ``(right, left)`` antenna pair for a given head *desired* yaw.
+
+    Used to fold the antenna pose into a committing head-turn action.  When
+    *desired* is effectively zero (recentering) both sides return to neutral.
+    """
+    if abs(desired) < 1e-9:
+        return (0.0, 0.0)
+    p = params
+    lean = min(1.0, abs(desired) / p.max_yaw) * p.antenna_max * p.antenna_gain
+    if desired > 0:
+        return (0.0, lean)
+    return (lean, 0.0)
+
+
 @dataclass
 class ListenProducer:
     """Stateful DoA→look decision. Call :meth:`update` each tick."""
 
     params: ListenParams
-    committed: float = 0.0
+    committed: float = 0.0  # current head yaw
+    body: float = field(default=0.0)  # current body yaw
     _last_live_t: float | None = None
     _hold_until: float = 0.0
 
     def _move_to(self, target: float, t: float) -> MotionAction:
+        """Commit a head-only turn to *target* (no body change).
+
+        The near-side antenna pose is folded into the same action so the head
+        and antenna move together.  On recentering to 0 the antennas return to
+        neutral ``(0.0, 0.0)``.
+        """
         p = self.params
         toward_center = abs(target) < abs(self.committed)
         speed = p.relax_speed if toward_center else p.alert_speed
@@ -111,9 +144,47 @@ class ListenProducer:
         # dwelt `hold` seconds there, so the head doesn't whip back and forth.
         self._hold_until = t + dur + p.hold
         kind = "relax" if toward_center else "look"
+        antennas = _antenna_tuple(target, p)
         return MotionAction(
             label=f"{kind} {target:+.0f}",
             head=_head(target),
+            antennas=antennas,
+            duration=dur,
+            interpolation="minjerk",
+            coalesce_key=LOOK_KEY,
+        )
+
+    def _escalate_to_body(self, desired: float, t: float) -> MotionAction:
+        """Emit a combined head+body action that brings the robot to face *desired*.
+
+        The body rotates toward the source (clamped to ±``body_yaw_max``); the
+        head takes the residual ``desired - new_body_yaw`` (clamped to
+        ±``max_yaw``) so head + body together point at the source and the head
+        sits closer to centre.  The near-side antenna (relative to the final head
+        yaw) is folded into the same action.
+        """
+        p = self.params
+        sign = 1.0 if desired >= 0 else -1.0
+        new_body = sign * min(abs(desired), p.body_yaw_max)
+        residual = desired - new_body
+        new_head = max(-p.max_yaw, min(p.max_yaw, residual))
+
+        body_delta = abs(new_body - self.body)
+        dur = max(
+            p.min_dur,
+            min(p.max_dur, body_delta / p.body_speed if p.body_speed else p.max_dur),
+        )
+
+        self.committed = new_head
+        self.body = new_body
+        self._hold_until = t + dur + p.hold
+
+        antennas = _antenna_tuple(new_head, p)
+        return MotionAction(
+            label=f"escalate body {new_body:+.0f} head {new_head:+.0f}",
+            head=_head(new_head),
+            antennas=antennas,
+            body_yaw=new_body,
             duration=dur,
             interpolation="minjerk",
             coalesce_key=LOOK_KEY,
@@ -135,6 +206,10 @@ class ListenProducer:
         speech, no snap) never turns the head. After a commit, the ``hold`` window
         suppresses re-commits.
 
+        **Tier 2 escalation (head+body):** when the raw *desired* direction exceeds
+        ``head_only_band``, the body rotates toward the source while the head
+        re-centres on the residual — head and body together face the source.
+
         **Tier 1 (antenna lean)** fires on any *live* tick with no head turn committed
         or held: the near-side antenna deflects toward the sound. ``live`` is
         ``sound_present`` when an audio path exists, else (HTTP/remote)
@@ -142,7 +217,7 @@ class ListenProducer:
         latched angle during true silence.
 
         **Recenter:** once sound has been non-live for ``recenter_after`` seconds and
-        the head is off-center, ease back to center once.
+        the head is off-center, ease back to center once (head AND body both return).
         """
         p = self.params
         angle = sense.doa_angle
@@ -163,9 +238,15 @@ class ListenProducer:
         triggered = sense.speech_detected or snap
 
         if angle is not None:
-            desired = max(-p.max_yaw, min(p.max_yaw, doa_angle_to_yaw(angle, p.gain)))
+            # Raw unclamped desired — used for escalation decision.
+            raw_desired = doa_angle_to_yaw(angle, p.gain)
+            # Clamped desired for head-only path.
+            desired = max(-p.max_yaw, min(p.max_yaw, raw_desired))
+
             if triggered and abs(desired - self.committed) > p.deadband:
-                # Tier 2: off-axis speech/snap — commit the head turn.
+                # Tier 2: off-axis speech/snap — decide head-only vs. body escalation.
+                if abs(raw_desired) > p.head_only_band:
+                    return self._escalate_to_body(raw_desired, t)
                 return self._move_to(desired, t)
             if live:
                 # Tier 1: live sound, no turn this tick — acknowledge with a near-side
@@ -179,5 +260,11 @@ class ListenProducer:
             and self._last_live_t is not None
             and (t - self._last_live_t) >= p.recenter_after
         ):
-            return self._move_to(0.0, t)
+            # Return the body toward 0 as well: include body_yaw=0 alongside the head recenter.
+            self.body = 0.0
+            action = self._move_to(0.0, t)
+            # Rebuild with body_yaw=0 (frozen dataclass — reconstruct with replace).
+            from dataclasses import replace  # local import keeps the top of module clean
+
+            return replace(action, body_yaw=0.0)
         return None
