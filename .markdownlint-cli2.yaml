@@ -23,3 +23,9 @@ ignores:
   - ".venv/**"
   # Vendored skills are cited verbatim from guildmaster — do not reformat them.
   - ".claude/skills/**"
+  # Generated devague artifacts (spec/plan exports + working state). The exporter
+  # owns their formatting; their long announcement headings end in a period by
+  # design (MD026), so don't lint them.
+  - "docs/specs/**"
+  - "docs/plans/**"
+  - ".devague/**"
