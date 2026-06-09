@@ -165,6 +165,59 @@ class SdkTransport(Transport):
         with reachy_mini_cls() as mini:
             return _tuple_to_doa_dict(mini.media.get_DoA())
 
+    # --- camera ----------------------------------------------------------
+    @staticmethod
+    def _import_camera():  # type: ignore[no-untyped-def]
+        """Lazily resolve the local camera handle: ``(available, camera)``.
+
+        Kept tiny and ``@staticmethod`` so a test can inject a FAKE via
+        ``monkeypatch.setattr(SdkTransport, "_import_camera", ...)`` — exactly the
+        seam ``_import`` uses for the rest of the SDK surface — without installing
+        ``reachy_mini``.
+
+        PARKED ASSUMPTION about the SDK camera API (mirrors the audio path's
+        ``mini.media.get_DoA()`` style): a local camera is exposed through the
+        media manager — ``is_local_camera_available()`` gates it, and the handle
+        lives at ``media_manager.camera`` (frames via ``camera.get_frame()``,
+        connection_mode == 'localhost_only'). Isolated here so a wrong guess is a
+        one-line fix, not a scatter across methods.
+        """
+        try:
+            from reachy_mini import ReachyMini
+        except ImportError as err:
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message="the reachy_mini SDK is not installed",
+                remediation=(
+                    "install the sdk extra: pip install 'reachy-mini-cli[sdk]', "
+                    "or use --transport http"
+                ),
+            ) from err
+        mini = ReachyMini()
+        available = bool(mini.is_local_camera_available())
+        camera = mini.media_manager.camera if available else None
+        return available, camera
+
+    def get_frame(self) -> "np.ndarray":
+        """Capture one frame from the local camera as a ``numpy.ndarray`` (H x W x 3).
+
+        Frames are a *local-profile* capability (issue #22): the daemon HTTP API
+        serves camera metadata only, so this exists on the ``sdk`` flavor alone.
+        Raises :class:`CliError` (exit 2) when the SDK is missing or the local
+        camera is unavailable — never a traceback.
+        """
+        available, camera = self._import_camera()
+        if not available or camera is None:
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message="no local camera is available on this Reachy Mini",
+                remediation=(
+                    "check the camera is connected and run on the robot itself "
+                    "(local camera frames need connection_mode 'localhost_only')"
+                ),
+            )
+        return camera.get_frame()
+
     def robot_state(self) -> object:
         reachy_mini_cls, _ = self._import()
         with reachy_mini_cls() as mini:

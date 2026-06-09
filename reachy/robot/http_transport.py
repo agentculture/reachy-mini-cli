@@ -134,6 +134,26 @@ class HttpTransport(Transport):
         # JSON null on a unit with no working mic — read_doa maps both gracefully.
         return self._request("GET", "/api/state/doa", timeout=timeout)
 
+    # --- camera ----------------------------------------------------------
+    def camera_specs(self) -> object:
+        # Camera *metadata* (resolution, name, intrinsics) — the daemon's REST API
+        # serves this much remotely. It does NOT serve frames (see get_frame).
+        return self._request("GET", "/api/camera/specs")
+
+    def get_frame(self) -> object:
+        # The daemon HTTP API serves camera metadata only, never frames (issue #22):
+        # frames travel solely over the local SDK/IPC path, which is a local-profile
+        # capability. So over HTTP this is an environment error, not a user error.
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message="camera frames are not available over the http transport",
+            remediation=(
+                "frames come only via the local SDK path: install the sdk extra "
+                "(pip install 'reachy-mini-cli[sdk]', or '[daemon]') and run on the "
+                "robot with --transport sdk"
+            ),
+        )
+
     # --- apps ------------------------------------------------------------
     def apps_list(self) -> object:
         return self._request("GET", "/api/apps/list-available")
