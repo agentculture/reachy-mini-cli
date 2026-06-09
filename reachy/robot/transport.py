@@ -75,6 +75,26 @@ class Transport:
         """
         raise self._unsupported("state doa")
 
+    # --- camera ----------------------------------------------------------
+    def camera_specs(self) -> object:
+        """Read camera metadata (resolution, name, intrinsics) — no pixels.
+
+        This is the *remote-safe* half of camera access: the daemon's REST API
+        serves specs but never frames. Flavors that can reach the daemon
+        override it; others fall through to "not supported on this transport".
+        """
+        raise self._unsupported("camera specs")
+
+    def get_frame(self) -> object:
+        """Capture one camera frame as a ``numpy.ndarray`` (H x W x 3).
+
+        Frames travel *only* over the local SDK/IPC path (issue #22), so this is
+        a local-profile (``sdk``) capability. The ``http`` flavor overrides it to
+        raise a structured "use the local SDK profile" error; the base raises the
+        standard "not supported on this transport" error.
+        """
+        raise self._unsupported("camera frame")
+
     # --- apps ------------------------------------------------------------
     def apps_list(self) -> object:
         raise self._unsupported("app list")
