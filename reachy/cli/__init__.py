@@ -74,11 +74,20 @@ def _build_parser() -> argparse.ArgumentParser:
     from reachy.cli._commands import listen as _listen_group
     from reachy.cli._commands import move as _move_group
     from reachy.cli._commands import overview as _overview_cmd
+    from reachy.cli._commands import quickstart as _quickstart_cmd
     from reachy.cli._commands import whoami as _whoami_cmd
 
     parser = _CliArgumentParser(
         prog="reachy-mini-cli",
-        description="reachy-mini-cli — a clonable template for AgentCulture mesh agents.",
+        description=(
+            "reachy-mini-cli — CLI for operating the Reachy Mini expressive robot: "
+            "device setup, app management, motion, behaviors, and sound orienting."
+        ),
+        epilog=(
+            "Getting started: run 'reachy quickstart' to install and start real mode, "
+            "or 'reachy learn' for the full command map. "
+            "Docs for any command: 'reachy explain <path>'."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -90,6 +99,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", parser_class=_CliArgumentParser)
 
     _whoami_cmd.register(sub)
+    _quickstart_cmd.register(sub)
     _learn_cmd.register(sub)
     _explain_cmd.register(sub)
     _overview_cmd.register(sub)

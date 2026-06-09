@@ -77,6 +77,26 @@ def test_learn_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert payload["json_support"] is True
 
 
+# --- quickstart -----------------------------------------------------------
+
+
+def test_quickstart_text(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = main(["quickstart"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "uv tool install" in out
+    assert "reachy-mini-cli[daemon]" in out
+    assert "daemon start" in out
+
+
+def test_quickstart_json(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = main(["quickstart", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload["profiles"], list)
+    assert payload["profiles"]
+
+
 # --- explain --------------------------------------------------------------
 
 

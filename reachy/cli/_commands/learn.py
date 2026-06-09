@@ -12,17 +12,26 @@ from reachy import __version__
 from reachy.cli._output import emit_result
 
 _TEXT = """\
-reachy-mini-cli — a clonable template for AgentCulture mesh agents.
+reachy-mini-cli — CLI and agent for operating the Reachy Mini expressive robot.
 
 Purpose
 -------
-Scaffold for a new Culture mesh agent: an agent-first CLI (cited from the teken
-`python-cli` reference), an identity (culture.yaml + CLAUDE.md), the canonical
-guildmaster skill kit under .claude/skills/, and a deploy/CI baseline. Clone it,
-rename the package, and edit culture.yaml to mint a new agent.
+Operate the Reachy Mini robot from one agent-first CLI: bring the local daemon
+up, set up the device, manage apps, drive runtime motion (goto/wake/sleep), run
+demo mode and the 50 Hz behavior engine, and orient the head toward sound
+(SDK-first listen). Commands talk to the reachy-mini-daemon over HTTP (default)
+or the in-process reachy_mini SDK.
+
+Install
+-------
+  Real mode (robot + daemon):    uv tool install 'reachy-mini-cli[daemon]'
+                                 (or: pip install 'reachy-mini-cli[daemon]')
+  HTTP remote (no local robot):  uv tool install reachy-mini-cli
+  Start real mode:               reachy-mini-cli quickstart
 
 Commands
 --------
+  reachy-mini-cli quickstart         Copy-paste install + start-real-mode steps.
   reachy-mini-cli whoami             Identity from culture.yaml.
   reachy-mini-cli learn              This self-teaching prompt.
   reachy-mini-cli explain <path>...  Markdown docs for any noun/verb path.
@@ -62,8 +71,18 @@ def _as_json_payload() -> dict[str, object]:
     return {
         "tool": "reachy-mini-cli",
         "version": __version__,
-        "purpose": "Clonable scaffold for a new AgentCulture mesh agent.",
+        "purpose": (
+            "CLI and agent for operating the Reachy Mini expressive robot: "
+            "device setup, apps, motion, behaviors, and sound orienting."
+        ),
+        "install": {
+            "real_mode": "uv tool install 'reachy-mini-cli[daemon]'",
+            "pip": "pip install 'reachy-mini-cli[daemon]'",
+            "http_remote": "uv tool install reachy-mini-cli",
+            "start": "reachy-mini-cli quickstart",
+        },
         "commands": [
+            {"path": ["quickstart"], "summary": "Install + start-real-mode steps."},
             {"path": ["whoami"], "summary": "Identity probe from culture.yaml."},
             {"path": ["learn"], "summary": "Self-teaching prompt."},
             {"path": ["explain"], "summary": "Markdown docs by path."},

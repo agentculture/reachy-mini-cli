@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-06-10
+
+### Added
+
+- `quickstart` verb — prints the copy-paste install + start-real-mode sequence in text or `--json`, available on any install profile (no daemon needed); resolvable via `explain quickstart`.
+
+### Changed
+
+- Front-door text now describes the Reachy Mini robot CLI instead of the cloned agent template: the `--help` description + a getting-started epilog pointing at `quickstart`/`learn`, the `learn` purpose paragraph + an Install block, and the `explain` root entry.
+- README now leads with `uv tool install 'reachy-mini-cli[daemon]'` as the primary install path and relabels the old Quickstart as the Developer quickstart.
+
+### Fixed
+
+- `explain` root listed the robot nouns but omitted `listen` — added it.
+
 ## [0.10.0] - 2026-06-06
 
 ### Added

@@ -15,14 +15,16 @@ from __future__ import annotations
 _ROOT = """\
 # reachy-mini-cli
 
-A clonable template for AgentCulture mesh agents. It carries an agent-first CLI
-(cited from the teken `python-cli` reference), a mesh identity (`culture.yaml` +
-`CLAUDE.md`), the canonical guildmaster skill kit under `.claude/skills/`, and a
-buildable/deployable package baseline. Clone it, rename the package, edit
-`culture.yaml`, and you have a new agent.
+CLI and agent for operating the Reachy Mini expressive robot — device setup, app
+management, runtime motion, higher-level behaviors, and sound orienting. Commands
+talk to the `reachy-mini-daemon` over an HTTP transport (default) or the
+in-process `reachy_mini` SDK. Install the daemon binary with the `[daemon]` extra
+(`uv tool install 'reachy-mini-cli[daemon]'`), then run `reachy-mini-cli
+quickstart` for the install-and-start-real-mode sequence.
 
 ## Verbs
 
+- `reachy-mini-cli quickstart` — copy-paste install + start-real-mode steps.
 - `reachy-mini-cli whoami` — identity probe from `culture.yaml`.
 - `reachy-mini-cli learn` — structured self-teaching prompt.
 - `reachy-mini-cli explain <path>` — markdown docs for any noun/verb.
@@ -40,6 +42,8 @@ buildable/deployable package baseline. Clone it, rename the package, edit
   the robot feel alive (idle breathing, glances, antenna sway).
 - `reachy-mini-cli behavior <verb>` — compose behaviors on a 50 Hz loop
   (`list`, `run`, `stop`, `status`, `engine`).
+- `reachy-mini-cli listen <verb>` — orient the head toward sound on a two-tier
+  SDK-first loop (`run`, `start`, `stop`, `restart`, `status`).
 
 The `device`/`app`/`move` verbs speak to the Reachy daemon over a transport
 flavor (`--transport http` by default, `sdk` optional); a missing daemon yields a
@@ -81,6 +85,37 @@ exit-code policy, `--json` support, and the `explain` pointer.
 
     reachy-mini-cli learn
     reachy-mini-cli learn --json
+"""
+
+_QUICKSTART = """\
+# reachy-mini-cli quickstart
+
+Prints the copy-paste sequence to install the CLI and start "real mode" (a live
+Reachy Mini with its daemon up), the HTTP-remote profile, and the agent-first
+commands that work with no robot attached. Read-only; supports `--json`.
+
+## Real mode — local robot (recommended)
+
+    uv tool install 'reachy-mini-cli[daemon]'   # CLI + daemon binary + SDK
+    reachy-mini-cli daemon start                # wakes the robot
+    reachy-mini-cli device status               # verify it answers
+    reachy-mini-cli listen run                  # orient to sound (Ctrl-C to stop)
+    reachy-mini-cli daemon stop                 # when you are done
+
+## Remote / HTTP-only — no local robot
+
+    uv tool install reachy-mini-cli             # numpy-only, no daemon binary
+    export REACHY_BASE_URL=http://reachy.local:8000
+    reachy-mini-cli device status --transport http
+
+The bare install omits `reachy-mini` (its pycairo/gstreamer/pyaudio stack needs
+system libraries a bare box lacks); the `[daemon]` extra adds the daemon binary
+and SDK. See `reachy-mini-cli explain daemon` and `reachy-mini-cli explain listen`.
+
+## Usage
+
+    reachy-mini-cli quickstart
+    reachy-mini-cli quickstart --json
 """
 
 _EXPLAIN = """\
@@ -553,6 +588,7 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("reachy",): _ROOT,
     ("reachy-mini-cli",): _ROOT,
     ("whoami",): _WHOAMI,
+    ("quickstart",): _QUICKSTART,
     ("learn",): _LEARN,
     ("explain",): _EXPLAIN,
     ("overview",): _OVERVIEW,
