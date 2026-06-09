@@ -474,6 +474,87 @@ capability to feed a sensor-driven behavior a live reading, but ships none today
 """.replace(_TRANSPORTS_SLOT, _TRANSPORTS)
 
 
+_VISION = """\
+# reachy-mini-cli vision
+
+Orient the robot toward what it *sees* in real time. `vision` is **SDK-first** and
+**local-profile only**: frames come from the camera via the in-process `reachy_mini`
+SDK (the `sdk` transport is the default). No frames are streamed over HTTP — running
+with `--transport http` gives camera-metadata-only access (`vision specs`); `vision run`
+and the background process (`start`/`stop`/`restart`) require the local `sdk` transport.
+
+**Pixel-based; no ML and no GPU.** Detection is pure pixel math that runs on any
+hardware without a GPU:
+
+- **Motion (primary cue) — frame differencing:** consecutive frames are subtracted
+  and thresholded; the centroid of the motion-heavy region is mapped to a yaw offset
+  and drives a head turn toward the moving object.
+- **Light (fallback cue) — brightness/centroid:** when no motion fires, the weighted
+  brightness centroid of the frame is computed; a significant shift in the centroid
+  triggers a softer look toward the bright region.
+
+Like `listen`, `vision` mirrors the serial-motion-queue design: both tiers drive the
+daemon's smooth minjerk `goto` planner strictly one move at a time, so turns are soft
+and never conflict. The loop runs only when the daemon is reachable and a camera frame
+is available; if either is absent it exits cleanly (exit 2) rather than crashing.
+
+## Verbs
+
+- `reachy-mini-cli vision run` — run the loop in the foreground; Ctrl-C stops it.
+  `--max-ticks N` runs a fixed number of ticks. Eases to center on start and on stop.
+- `reachy-mini-cli vision start` — spawn the loop in the background, recording its
+  PID + log under the state dir. Idempotent: reports `already-running` if a tracked
+  loop is alive.
+- `reachy-mini-cli vision stop` — SIGTERM the loop this CLI started (so it eases
+  back to center before exiting), escalating to SIGKILL past `--timeout`.
+- `reachy-mini-cli vision restart` — stop the tracked loop and relaunch it, so the
+  new process re-reads the tuning and the latest code.
+- `reachy-mini-cli vision status` — the loop's process state (running / stopped /
+  stale) and whether the daemon answers.
+- `reachy-mini-cli vision specs` — report camera metadata (resolution, name,
+  intrinsics). This verb is remote-safe: it works with `--transport http` because
+  the daemon REST API serves camera metadata without streaming frames.
+- `reachy-mini-cli vision overview` — the verb summary.
+
+## Tuning
+
+Feel knobs (each defaults to a tuned value; unset keeps it):
+
+- `--gain X` — direction-to-head-yaw scaling factor.
+- `--max-yaw DEG` — maximum head yaw toward a visual target.
+- `--deadband DEG` — ignore targets within this angle of the current heading.
+- `--hold SECONDS` — after a turn, stay there this long before reconsidering.
+- `--speed DEG_PER_S` — slew speed for turns and for easing back to center.
+- `--motion-threshold X` — minimum motion magnitude to trigger a head turn; lower =
+  more sensitive; higher = only large moves fire.
+
+## Transport
+
+The `sdk` transport (default) reads camera frames via `reachy_mini` in-process —
+requires the `[sdk]` / `[daemon]` extra. The `http` transport polls the daemon's
+camera-metadata endpoint; use it with `--transport http` or `REACHY_TRANSPORT=http`
+for a remote control box or to run `vision specs` without the SDK installed.
+
+## Notes
+
+- Camera was previously unused by the CLI — this is a net-new perception channel.
+- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`: `vision.pid`
+  and `vision.log`.
+- Only one thing should drive the robot at a time — don't run `vision` alongside
+  `listen`, `demo-mode`, or the behavior engine.
+
+## Usage
+
+    reachy-mini-cli vision specs                               # check camera metadata
+    reachy-mini-cli daemon start                              # bring the daemon up
+    reachy-mini-cli vision run                                # foreground, SDK transport (default)
+    reachy-mini-cli vision run --motion-threshold 0.02        # more sensitive
+    reachy-mini-cli vision start --hold 2 --speed 30          # background
+    reachy-mini-cli vision status --json
+    reachy-mini-cli vision stop                               # eases back to center
+"""
+
+
 _LISTEN = """\
 # reachy-mini-cli listen
 
@@ -646,4 +727,12 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("listen", "stop"): _LISTEN,
     ("listen", "restart"): _LISTEN,
     ("listen", "status"): _LISTEN,
+    ("vision",): _VISION,
+    ("vision", "overview"): _VISION,
+    ("vision", "run"): _VISION,
+    ("vision", "start"): _VISION,
+    ("vision", "stop"): _VISION,
+    ("vision", "restart"): _VISION,
+    ("vision", "status"): _VISION,
+    ("vision", "specs"): _VISION,
 }
