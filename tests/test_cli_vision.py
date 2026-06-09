@@ -115,6 +115,30 @@ def test_run_centers_then_settles(monkeypatch, capsys) -> None:
     assert tr.gotos[-1]["head"]["yaw"] == 0.0
 
 
+def test_run_installs_stop_handlers_and_settles_on_interrupt(monkeypatch) -> None:
+    """`vision run` installs SIGTERM/SIGINT handlers and still eases the head back
+    to center if the loop is interrupted — so `vision stop`/Ctrl-C never leave the
+    head off-center (the supervisor's "eases back to center" contract)."""
+    tr = _FakeTransport()
+    monkeypatch.setattr("reachy.cli._commands.vision.get_transport", lambda args: tr)
+    seen: dict = {}
+    monkeypatch.setattr(
+        "reachy.cli._commands.vision.install_stop_handlers",
+        lambda stop: seen.__setitem__("stop", stop),  # returns None -> restore is a no-op
+    )
+
+    def _boom(self, **kwargs):  # noqa: ANN003 - test shim
+        raise RuntimeError("interrupted mid-loop")
+
+    monkeypatch.setattr("reachy.vision.producer.VisionProducer.run", _boom)
+    main(["vision", "run", "--max-ticks", "1"])
+    # handlers were installed against a real stop flag ...
+    assert isinstance(seen.get("stop"), dict) and "flag" in seen["stop"]
+    # ... and the settle-to-center still ran despite the interruption (preflight + settle).
+    assert len(tr.gotos) >= 2
+    assert tr.gotos[-1]["head"]["yaw"] == 0.0
+
+
 def test_run_json_exits_zero_with_blank_frames(monkeypatch, capsys) -> None:
     # A blank (all-zero) frame stream produces no actions (motion centred, deadband holds),
     # but the loop must exit 0 and emit valid JSON for each event (if any).

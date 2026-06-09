@@ -26,6 +26,7 @@ from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import CliError
 from reachy.cli._output import emit_diagnostic, emit_result
+from reachy.looputil import install_stop_handlers, restore_stop_handlers
 from reachy.robot import add_robot_args, get_transport
 from reachy.vision import supervisor
 from reachy.vision.producer import VisionParams
@@ -182,13 +183,22 @@ def cmd_vision_run(args: argparse.Namespace) -> int:
         else:
             emit_diagnostic(f"[vision] {action.label} ({action.duration:.1f}s)")
 
-    ticks = producer.run(max_ticks=args.max_ticks, on_action=_on_action)
-
-    # Settle: ease back to center (best effort — a dead daemon can't be settled).
+    # Install SIGTERM/SIGINT handlers so `vision stop` and Ctrl-C flip the stop
+    # flag and let the loop exit cleanly — otherwise the signal kills the process
+    # mid-loop and the settle-to-center below never runs, leaving the head off
+    # center despite the supervisor's "eases back to center" contract.
+    stop = {"flag": False}
+    handlers = install_stop_handlers(stop)
+    ticks = 0
     try:
-        transport.move_goto(head=dict(_CENTER), duration=0.8, interpolation="minjerk")
-    except CliError:
-        pass
+        ticks = producer.run(max_ticks=args.max_ticks, on_action=_on_action, stop=stop)
+    finally:
+        restore_stop_handlers(handlers)
+        # Settle: ease back to center (best effort — a dead daemon can't be settled).
+        try:
+            transport.move_goto(head=dict(_CENTER), duration=0.8, interpolation="minjerk")
+        except CliError:
+            pass
     if not json_mode:
         emit_diagnostic(f"[vision] stopped after {ticks} tick(s)")
     return 0

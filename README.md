@@ -272,12 +272,12 @@ transport is the default); the `http` transport gives camera-metadata-only acces
 background process.
 
 ```bash
-reachy vision specs                       # check camera metadata (remote-safe)
-reachy daemon start                       # bring the daemon up
-reachy vision run                         # foreground, SDK transport (default)
-reachy vision start                       # background, tracked process
-reachy vision status --json
-reachy vision stop                        # eases back to center
+reachy-mini-cli vision specs         # check camera metadata (remote-safe)
+reachy-mini-cli daemon start         # bring the daemon up
+reachy-mini-cli vision run           # foreground, SDK transport (default)
+reachy-mini-cli vision start         # background, tracked process
+reachy-mini-cli vision status --json
+reachy-mini-cli vision stop          # eases back to center
 ```
 
 Key tuning flags: `--gain`, `--max-yaw`, `--deadband`, `--hold`, `--speed`,
