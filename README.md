@@ -247,6 +247,43 @@ Key tuning flags: `--gain`, `--deadband`, `--hold`, `--speed`, `--recenter-after
 `--body-yaw-max`, `--head-only-band`, `--snap-ratio`, `--snap-floor`.
 See `reachy explain listen` for the full reference.
 
+### Vision — pixel-based motion + light orienting
+
+`vision` is the camera counterpart to `listen`: it reads frames from the robot's
+camera and orients the head toward the strongest visual event. The camera was
+previously unused by the CLI — this is a **net-new perception channel**.
+
+**Pixel-based; no ML and no GPU.** Two detectors run in pure pixel math on every
+frame:
+
+- **Motion (primary cue) — frame differencing:** the centroid of pixel change
+  between consecutive frames maps to a head-yaw offset.
+- **Light (fallback cue) — brightness/centroid:** when no motion fires, the
+  weighted brightness centroid of the frame drives a softer look toward the bright
+  region.
+
+Like `listen`, `vision` **mirrors the serial motion queue**: both detectors drive the
+daemon's smooth minjerk `goto` planner one move at a time, so turns are soft and
+never conflict.
+
+**Local-profile only.** Frames come via the in-process `reachy_mini` SDK (the `sdk`
+transport is the default); the `http` transport gives camera-metadata-only access
+(`vision specs`). The `[sdk]` / `[daemon]` extra is required for `vision run` and the
+background process.
+
+```bash
+reachy vision specs                       # check camera metadata (remote-safe)
+reachy daemon start                       # bring the daemon up
+reachy vision run                         # foreground, SDK transport (default)
+reachy vision start                       # background, tracked process
+reachy vision status --json
+reachy vision stop                        # eases back to center
+```
+
+Key tuning flags: `--gain`, `--max-yaw`, `--deadband`, `--hold`, `--speed`,
+`--motion-threshold`.
+See `reachy explain vision` for the full reference.
+
 ## Make it your own
 
 1. Rename the package `reachy/` and the `reachy-mini-cli`

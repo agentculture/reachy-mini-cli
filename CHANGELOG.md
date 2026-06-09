@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-06-10
+
+### Added
+
+- `vision` noun — a pixel-based, low-compute visual sense (motion via frame differencing + light via brightness/centroid) that orients the head toward the strongest visual event, mirroring `listen` on the serial motion queue. Local-profile only (frames via the SDK/IPC camera path); no ML/GPU. Verbs: run/start/stop/restart/status/specs/overview, each with --json. Camera frame access added to the transport layer (SdkTransport.get_frame / HttpTransport.camera_specs).
+
 ## [0.11.0] - 2026-06-10
 
 ### Added
