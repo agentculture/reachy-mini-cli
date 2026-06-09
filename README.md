@@ -16,10 +16,10 @@ uv tool install reachy-mini-cli
 The installed command is `reachy-mini-cli` (short alias: `reachy`). Then:
 
 ```bash
-reachy quickstart       # copy-paste install + start-real-mode sequence
-reachy daemon start     # bring the local daemon up (wakes the robot)
-reachy device status    # verify it answers
-reachy listen run       # orient the head toward sound (Ctrl-C to stop)
+reachy-mini-cli quickstart     # copy-paste install + start-real-mode sequence
+reachy-mini-cli daemon start   # bring the local daemon up (wakes the robot)
+reachy-mini-cli device status  # verify it answers
+reachy-mini-cli listen run     # orient the head toward sound (Ctrl-C to stop)
 ```
 
 See [Install profiles](#install-profiles) below for why `reachy-mini` is an extra.

@@ -84,9 +84,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "device setup, app management, motion, behaviors, and sound orienting."
         ),
         epilog=(
-            "Getting started: run 'reachy quickstart' to install and start real mode, "
-            "or 'reachy learn' for the full command map. "
-            "Docs for any command: 'reachy explain <path>'."
+            "Getting started: run 'reachy-mini-cli quickstart' to install and start "
+            "real mode, or 'reachy-mini-cli learn' for the full command map. "
+            "Docs for any command: 'reachy-mini-cli explain <path>'."
         ),
     )
     parser.add_argument(
