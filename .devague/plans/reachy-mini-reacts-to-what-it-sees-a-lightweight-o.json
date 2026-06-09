@@ -1,0 +1,264 @@
+{
+  "slug": "reachy-mini-reacts-to-what-it-sees-a-lightweight-o",
+  "title": "Reachy Mini reacts to what it sees: a lightweight on-board vision sense detects motion, light, and nearby objects from the camera in realtime on a Raspberry Pi 4 \u2014 simple pixel math, no ML \u2014 and feeds those events into the behavior/motion system so the robot orients toward what it sees.",
+  "frame_slug": "reachy-mini-reacts-to-what-it-sees-a-lightweight-o",
+  "schema_version": 1,
+  "status": "exported",
+  "created": "2026-06-09T22:49:45Z",
+  "updated": "2026-06-09T22:52:08Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "Reachy Mini reacts to what it sees: a lightweight on-board vision sense detects motion, light, and nearby objects from the camera in realtime on a Raspberry Pi 4 \u2014 simple pixel math, no ML \u2014 and feeds those events into the behavior/motion system so the robot orients toward what it sees."
+    },
+    {
+      "id": "h1",
+      "kind": "honesty",
+      "text": "On a Raspberry Pi 4 the full capture->downsample->detect->emit loop sustains >=10 FPS with CPU headroom left for the motion loop."
+    },
+    {
+      "id": "c2",
+      "kind": "audience",
+      "text": "Reachy Mini operators running the on-board CLI, plus the behavior/listen subsystems that consume sense events to drive motion."
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "The on-board operator and the listen/motion subsystems are the real consumers \u2014 vision events matter to a robot reacting in place, not to a remote dashboard."
+    },
+    {
+      "id": "c4",
+      "kind": "before_state",
+      "text": "Today the CLI is sightless \u2014 it hears (listen/DoA) and moves, but the on-board camera is unused; perception is audio-only."
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "The camera is genuinely unused by the current CLI (no existing vision verb), so this is net-new perception, not a duplicate of something present."
+    },
+    {
+      "id": "c5",
+      "kind": "why_it_matters",
+      "text": "Visual reactivity makes the robot feel present and alive, complements audio DoA, and enables gaze-following \u2014 without heavy compute, ML, or a GPU."
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "A robot that visibly reacts to motion/light reads as more present than one reacting only to sound \u2014 the added liveliness is perceptible to a bystander."
+    },
+    {
+      "id": "c6",
+      "kind": "boundary",
+      "text": "Not ML: no object recognition, face ID, classification, tracking-by-detection, SLAM or depth mapping; no neural models, no cloud, no GPU. Rudimentary pixel math only."
+    },
+    {
+      "id": "h9",
+      "kind": "honesty",
+      "text": "Motion and light can be detected usefully with pixel math alone, so dropping ML/GPU does not gut the feature."
+    },
+    {
+      "id": "c7",
+      "kind": "boundary",
+      "text": "Local-profile only: frames come from the SDK/IPC local camera path; the pure-HTTP remote profile (camera metadata only, per issue #22) cannot run detection."
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "The local SDK/IPC camera path is present whenever the [sdk]/[daemon] extra is installed, so 'local-profile only' still covers the normal on-robot deployment."
+    },
+    {
+      "id": "c8",
+      "kind": "success_signal",
+      "text": "Runs realtime on a Raspberry Pi 4 (target ~10-15 FPS) within a modest CPU budget on downsampled frames, and a detected motion/light event drives a smooth head orient through the existing serial motion queue (like listen)."
+    },
+    {
+      "id": "h11",
+      "kind": "honesty",
+      "text": "On a Pi 4 the loop holds the target frame rate and a motion/light event yields a visibly smooth head orient within a fraction of a second \u2014 measurable on hardware."
+    },
+    {
+      "id": "c9",
+      "kind": "requirement",
+      "text": "Detect motion via frame differencing on downsampled grayscale frames (numpy abs-diff + threshold + blob centroid for direction)."
+    },
+    {
+      "id": "h2",
+      "kind": "honesty",
+      "text": "Frame differencing on downsampled grayscale reliably flags real motion (a hand wave at ~1-2 m) while rejecting sensor noise and lighting flicker via a tunable threshold."
+    },
+    {
+      "id": "c10",
+      "kind": "requirement",
+      "text": "Detect light via per-frame brightness and bright-region centroid (mean luma + thresholded max region), reacting to changes rather than absolute level."
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "A brightness/centroid pass locates the dominant bright region and its direction, distinguishing a real light change from a uniform exposure shift."
+    },
+    {
+      "id": "c14",
+      "kind": "after_state",
+      "text": "The robot has a realtime visual sense: it detects motion and brightness/light changes from the local camera and emits events that orient the head/body toward what it sees. Object proximity is a parked stretch follow-up."
+    },
+    {
+      "id": "h12",
+      "kind": "honesty",
+      "text": "Once shipped, waving a hand or moving a light in view turns the head toward it, with no ML model loaded and CPU to spare."
+    },
+    {
+      "id": "c15",
+      "kind": "requirement",
+      "text": "Expose a 'vision' noun (run/start/stop/restart/status + overview, --json) that mirrors 'listen': its own loop drives the head/body through the existing serial motion queue. Behavior-engine Sense-channel integration is a follow-up."
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "The vision loop drives the same serial motion queue as listen, so visual orients are serialized with (do not fight) listen and demo-mode moves."
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "Camera frame access in the transport layer",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "SdkTransport.get_frame() returns a numpy frame from the local SDK/IPC camera path (is_local_camera_available); a fake SDK in tests yields a frame of the expected shape.",
+        "HttpTransport exposes camera_specs() via GET /api/camera/specs and raises a clean exit-2 CliError (pointing at the [sdk]/[daemon] extra) when asked for frames.",
+        "No new base runtime dependency; camera/SDK access stays behind the [sdk]/[daemon] extra; black/isort/flake8/bandit green."
+      ],
+      "deps": [],
+      "covers": [
+        "c7",
+        "h10"
+      ]
+    },
+    {
+      "id": "t2",
+      "summary": "Pixel-based motion detector (frame differencing)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "MotionDetector.feed(frame) downsamples to grayscale, abs-diffs vs the previous frame, thresholds, and returns a normalized horizontal direction + magnitude (or None below threshold).",
+        "A synthetic blob moving left-to-right yields centroids on the correct side; uniform noise below threshold yields no event (tunable threshold).",
+        "Pure numpy, no ML; tests/test_vision_motion.py passes."
+      ],
+      "deps": [],
+      "covers": [
+        "c9",
+        "h2"
+      ]
+    },
+    {
+      "id": "t3",
+      "summary": "Pixel-based light detector (brightness/centroid)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "LightDetector.feed(frame) computes mean luma and the centroid of the brightest thresholded region, returning bright-region direction + a change flag driven by change, not absolute level.",
+        "A synthetic bright-spot fixture yields its centroid/direction; a uniform exposure shift does NOT fire a change event.",
+        "Pure numpy; tests/test_vision_light.py passes."
+      ],
+      "deps": [],
+      "covers": [
+        "c10",
+        "h3"
+      ]
+    },
+    {
+      "id": "t4",
+      "summary": "VisionProducer loop: detectors -> serial-motion-queue head orient",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "VisionProducer consumes a frame stream and per tick emits at most one head-orient goto toward the strongest motion/light event via the existing serial motion-queue planner (no concurrent moves), mirroring ListenProducer.",
+        "A hand-wave fixture orients toward the correct side; with no event + deadband it holds; turns are smooth minjerk gotos serialized with listen/demo-mode.",
+        "A bounded offline test (fake transport, --max-ticks) runs within a per-tick compute budget consistent with >=10 FPS on a Pi 4; tests/test_vision_producer.py passes."
+      ],
+      "deps": [
+        "t1",
+        "t2",
+        "t3"
+      ],
+      "covers": [
+        "c1",
+        "c8",
+        "c14",
+        "h1",
+        "h5",
+        "h11",
+        "h12"
+      ]
+    },
+    {
+      "id": "t5",
+      "summary": "'vision' CLI noun mirroring 'listen' (run/start/stop/restart/status/specs/overview)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "reachy/cli/_commands/vision.py exposes register(sub) wired in reachy/cli/__init__.py; 'vision run' runs the loop foreground (eases head to center), 'vision start/stop/restart/status' manage a tracked background process like listen, 'vision specs' reports camera specs; every verb takes --json.",
+        "Running the sdk path without a local camera raises a clean exit-2 CliError; 'vision overview' exists so the noun satisfies teken cli doctor --strict; results->stdout, errors->stderr.",
+        "tests/test_cli_vision.py covers overview/status/specs (exit 0 + --json) and the missing-camera exit-2 path."
+      ],
+      "deps": [
+        "t1",
+        "t4"
+      ],
+      "covers": [
+        "c2",
+        "c15",
+        "h6"
+      ]
+    },
+    {
+      "id": "t6",
+      "summary": "explain catalog, docs, and release for the vision noun",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "reachy/explain/catalog.py gains a _VISION entry + ('vision',...) ENTRIES keys; 'reachy explain vision' resolves and test_every_catalog_path_resolves passes; the text states the no-ML/no-GPU and local-profile-only boundaries and the listen-mirroring design.",
+        "README documents the vision noun (net-new perception, not a duplicate) under Robot operations; CHANGELOG entry added and pyproject version bumped (minor) per version-check CI.",
+        "Full suite green: pytest -n auto, teken cli doctor . --strict, black/isort/flake8/bandit, markdownlint."
+      ],
+      "deps": [
+        "t5"
+      ],
+      "covers": [
+        "c4",
+        "c5",
+        "c6",
+        "h7",
+        "h8",
+        "h9"
+      ]
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "text": "Pi 4 realtime feasibility (the c13 assumption) is unverified until measured on real hardware; the loop must hold >=10 FPS with CPU headroom for motion.",
+      "kind": "unknown_nonblocking",
+      "task_id": "t4"
+    },
+    {
+      "id": "r2",
+      "text": "Exact reachy_mini SDK local-camera frame API (is_local_camera_available / media_manager.camera shape) not yet verified in code; t1 must confirm against the installed SDK.",
+      "kind": "unknown_nonblocking",
+      "task_id": "t1"
+    },
+    {
+      "id": "r3",
+      "text": "Proximity / 'close objects' detection deferred to a follow-up (apparent-size/optic-flow); not in v1.",
+      "kind": "follow_up",
+      "task_id": null
+    },
+    {
+      "id": "r4",
+      "text": "Behavior-engine Sense-channel integration deferred; v1 vision drives the serial motion queue directly like listen.",
+      "kind": "follow_up",
+      "task_id": null
+    }
+  ]
+}
