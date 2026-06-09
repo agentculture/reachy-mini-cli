@@ -158,7 +158,7 @@ class MotionDetector:
         If the mask is entirely empty (shouldn't happen after the magnitude
         check, but guarded for safety) returns ``0.0``.
         """
-        cols = np.where(mask)[1]
+        cols = np.nonzero(mask)[1]
         if cols.size == 0:
             return 0.0
         centroid_col = float(cols.mean())

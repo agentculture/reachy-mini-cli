@@ -106,9 +106,8 @@ class LightDetector:
         f = frame.astype(np.float32)
         if f.ndim == 2:
             return f
-        if f.ndim == 3:
-            if f.shape[2] >= 3:
-                return 0.299 * f[:, :, 0] + 0.587 * f[:, :, 1] + 0.114 * f[:, :, 2]
+        if f.ndim == 3 and f.shape[2] >= 3:
+            return 0.299 * f[:, :, 0] + 0.587 * f[:, :, 1] + 0.114 * f[:, :, 2]
         raise ValueError(f"Unsupported frame shape: {frame.shape}")
 
     def _downsample_frame(self, luma: np.ndarray) -> np.ndarray:
