@@ -26,6 +26,14 @@ ANTENNA_KEY = "antenna"
 # the latest idle pose survives; any real reaction (turn or lean) supersedes it, so live
 # sound always wins over background idle motion.
 IDLE_KEY = "idle"
+# A deliberate expression gesture (think's ExpressionProducer, fired on an LLM expression
+# marker) shares this key. It supersedes a pending IDLE pose so a marked expression always
+# wins over background idle motion (the gesture is the thinking robot's deliberate "tell"),
+# and successive markers queued before either executes coalesce to the latest — keeping the
+# motion sparse (≤ one expression move per marker). It is independent of LOOK_KEY /
+# ANTENNA_KEY: expression gestures are not reactive look-at turns, so a committed turn or
+# lean does not evict a pending expression and vice-versa — they queue alongside in order.
+EXPRESSION_KEY = "expression"
 
 # A committed head/body move (LOOK_KEY) supersedes any pending subtle antenna lean
 # (ANTENNA_KEY) *and* any pending idle pose (IDLE_KEY) — a deliberate "turn to see" must
@@ -36,6 +44,7 @@ IDLE_KEY = "idle"
 _SUPERSEDES: dict[str, frozenset[str]] = {
     LOOK_KEY: frozenset({ANTENNA_KEY, IDLE_KEY}),
     ANTENNA_KEY: frozenset({IDLE_KEY}),
+    EXPRESSION_KEY: frozenset({IDLE_KEY}),
 }
 
 
