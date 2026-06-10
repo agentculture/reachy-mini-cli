@@ -136,7 +136,9 @@ you touch the CLI.
   pipelines.
 - **`think` noun — continuous cognition loop (SDK-first):** `reachy/cli/_commands/think.py`
   exposes `run` (foreground) + `start`/`stop`/`restart`/`status` (background
-  process) + `overview`. The `reachy/speech/` package provides the engine:
+  process) + `demo` (drive a fixed scripted `*emoji*` / `"speech"` stream through
+  the real marker→expression+TTS path, no LLM — for on-robot verification) +
+  `overview`. The `reachy/speech/` package provides the engine:
   - `reachy/speech/llm.py` — pure `urllib` streaming LLM client
     (`REACHY_LLM_BASE_URL` / `REACHY_LLM_API_KEY` / `REACHY_LLM_MODEL`; no
     OpenAI SDK, no new base dep).

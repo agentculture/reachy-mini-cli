@@ -341,7 +341,13 @@ reachy-mini-cli think run --max-turns 3                   # stop after 3 spoken 
 reachy-mini-cli think start --llm-model mistral-small     # background process
 reachy-mini-cli think status --json
 reachy-mini-cli think stop
+reachy-mini-cli think demo                                # drive a scripted *emoji* "speech" stream (no LLM)
 ```
+
+`think demo` runs a fixed `*emoji* "speech"` script through the same path the
+cognition loop uses (marker parser → expression moves + spoken quoted text) so
+you can watch the body language on a live robot without an LLM. See
+`docs/verification/think-body-expression.md` for the manual observer checklist.
 
 **Catalog tooling:**
 
