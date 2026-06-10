@@ -1,0 +1,312 @@
+{
+  "slug": "reachy-mini-cli-can-think-and-speak-a-say-pipeline",
+  "title": "reachy-mini-cli can think and speak: a 'say' pipeline streams an OpenAI-compatible LLM's thought sentence-by-sentence into text-to-speech and plays it aloud through the robot, so Reachy Mini reasons about a prompt and voices the answer in its own voice.",
+  "frame_slug": "reachy-mini-cli-can-think-and-speak-a-say-pipeline",
+  "schema_version": 1,
+  "status": "exported",
+  "created": "2026-06-10T12:03:41Z",
+  "updated": "2026-06-10T12:09:04Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "reachy-mini-cli can think and speak: a 'say' pipeline streams an OpenAI-compatible LLM's thought sentence-by-sentence into text-to-speech and plays it aloud through the robot, so Reachy Mini reasons about a prompt and voices the answer in its own voice."
+    },
+    {
+      "id": "h4",
+      "kind": "honesty",
+      "text": "End-to-end LLM->TTS->robot-speaker produces coherent spoken output from a prompt/sense-context in Ori's setup (vLLM/Nemotron + Magpie reachable)."
+    },
+    {
+      "id": "c2",
+      "kind": "audience",
+      "text": "Ori operating Reachy Mini from the CLI, plus the mesh agent itself \u2014 anyone who wants the robot to answer a prompt out loud instead of just on screen."
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "The operator (and the mesh agent) can invoke say/think from the CLI and hear output with no extra GUI tooling."
+    },
+    {
+      "id": "c4",
+      "kind": "why_it_matters",
+      "text": "Listen/vision/motion already let Reachy sense and move; a voice closes the loop so the robot can actually respond \u2014 the difference between a reactive ornament and something you can talk with."
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "Spoken output is qualitatively more useful to the operator than on-screen text \u2014 the robot actually 'responds'."
+    },
+    {
+      "id": "c5",
+      "kind": "before_state",
+      "text": "Today the CLI can orient to sound (listen) and react to motion (vision) but has no language or audio-out path at all \u2014 the robot cannot form or voice a single sentence."
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "Today's CLI has no language or audio-out verb (verifiable: no say/think/tts in reachy/cli/_commands)."
+    },
+    {
+      "id": "c6",
+      "kind": "success_signal",
+      "text": "From a bare prompt, the robot speaks a coherent spoken answer through its own speaker, sentence-streamed (talking begins before the LLM finishes), and degrades to a clean exit-2 CliError when the LLM or TTS endpoint is unreachable \u2014 never a traceback."
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "On an unreachable LLM or TTS endpoint the verb exits 2 with a CliError (hint line, no traceback); on success speech is sentence-streamed (first audio before generation completes)."
+    },
+    {
+      "id": "c9",
+      "kind": "requirement",
+      "text": "Thinking uses an OpenAI-compatible chat-completions endpoint configured by env + flags (REACHY_LLM_BASE_URL / _API_KEY / _MODEL, --base-url/--model), streamed and split into sentences exactly like realtime-api's stream_sentences, so first speech starts early."
+    },
+    {
+      "id": "h1",
+      "kind": "honesty",
+      "text": "An OpenAI-compatible /v1/chat/completions with stream=true is reachable in Ori's setup (the realtime-api vLLM/Nemotron or any OpenAI endpoint), and sentence-splitting yields first speakable text within ~1-2 sentences of generation."
+    },
+    {
+      "id": "c10",
+      "kind": "requirement",
+      "text": "Speech uses a configurable TTS endpoint (default the Magpie-style HTTP synth from realtime-api: REACHY_TTS_URL / _VOICE), each streamed sentence synthesized as it arrives and the PCM played back through the robot."
+    },
+    {
+      "id": "h2",
+      "kind": "honesty",
+      "text": "A TTS HTTP endpoint that returns playable PCM/WAV for a sentence is available (Magpie NIM or equivalent), and per-sentence synth latency is low enough that speech keeps up with the LLM stream."
+    },
+    {
+      "id": "c11",
+      "kind": "requirement",
+      "text": "Audio plays out through the robot's own speaker via the reachy-mini SDK media session (consistent with listen's sdk transport), NOT the host's aplay; SDK stays an extra so a bare install still parses."
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "The reachy-mini SDK media session can PLAY audio out to the robot speaker (not only capture mic in); if it cannot, speech-out needs another path (host aplay / daemon endpoint)."
+    },
+    {
+      "id": "c13",
+      "kind": "after_state",
+      "text": "Two nouns: 'reachy say \"<text>\"' is pure text-to-speech (no LLM) that voices given text through the robot; 'reachy think' is a continuous mode (like listen/vision) that accumulates live sense EVENTS, reasons over them with an OpenAI-compatible LLM, and speaks the result by reusing say's synth+playback."
+    },
+    {
+      "id": "h9",
+      "kind": "honesty",
+      "text": "say works with no LLM and no senses; think runs the full sense->reason->speak loop; each is independently invokable."
+    },
+    {
+      "id": "c15",
+      "kind": "boundary",
+      "text": "v1 think fuses EVENT-level cues only (built from listen/vision state: 'speech from the left', 'loud sound', 'motion right', 'brightening') \u2014 NOT transcribed words (STT is a follow-up), NOT a full-duplex barge-in conversation, NOT a tool-using agent. say stays a dumb TTS pipe with no senses and no LLM."
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "v1 delivers value from event-cue reasoning alone \u2014 shipping without STT, barge-in, or tool-use is still worth using."
+    },
+    {
+      "id": "c17",
+      "kind": "requirement",
+      "text": "think sources sense EVENTS by polling the same primitives listen/vision already use (behavior.sense DoA/RMS + vision motion/light), turning them into timestamped cues in a rolling buffer \u2014 no new sensor code, reuse existing senses."
+    },
+    {
+      "id": "h11",
+      "kind": "honesty",
+      "text": "The listen/vision sense primitives are readable by think concurrently (no exclusive hardware lock that the existing loops hold) so think can poll DoA/motion while idle."
+    },
+    {
+      "id": "c19",
+      "kind": "requirement",
+      "text": "Parallel think+speak: the LLM response streams sentence-by-sentence into TTS (reusing say) so early sentences play through the speaker while later sentences are still being generated \u2014 the realtime-api stream_sentences pattern."
+    },
+    {
+      "id": "h12",
+      "kind": "honesty",
+      "text": "Per-sentence synth+playback keeps up with LLM generation closely enough that speech is continuous/gap-tolerant (proven by realtime-api at 125% rate)."
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "TTS synth client: reachy/speech/tts.py \u2014 POST cleaned text to a Magpie-style HTTP /v1/audio/synthesize over stdlib urllib, return PCM16; text cleaning + sentence-split cited from realtime-api",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "given a stub HTTP synth, synthesize() returns non-empty PCM bytes for a sentence",
+        "markdown/emoji are stripped and a multi-sentence paragraph splits into ordered sentences",
+        "an unreachable TTS URL raises CliError exit 2 with a hint line (no traceback)"
+      ],
+      "deps": [],
+      "covers": [
+        "c10",
+        "h2"
+      ]
+    },
+    {
+      "id": "t2",
+      "summary": "LLM streaming client: reachy/speech/llm.py \u2014 stream OpenAI-compatible /v1/chat/completions (stream=true) over stdlib urllib, parse SSE deltas, yield complete sentences early (stream_sentences port)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "given a stubbed SSE byte stream, stream_sentences() yields complete sentences before the stream ends",
+        "config reads REACHY_LLM_BASE_URL/_API_KEY/_MODEL with --base-url/--model overrides",
+        "an unreachable LLM URL raises CliError exit 2 with a hint (no traceback)"
+      ],
+      "deps": [],
+      "covers": [
+        "c9",
+        "h1"
+      ]
+    },
+    {
+      "id": "t3",
+      "summary": "Audio playback: reachy/speech/playback.py \u2014 sdk path streams PCM via reachy_mini media push_audio_sample()/start_playing(); http path uploads WAV to daemon /media/sounds/upload then POSTs /media/play_sound",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "sdk playback feeds PCM to a fake media session via push_audio_sample",
+        "http playback uploads a WAV and calls /media/play_sound against a stub daemon",
+        "selecting the sdk path without the [sdk] extra raises CliError exit 2 pointing at the [sdk] install"
+      ],
+      "deps": [],
+      "covers": [
+        "c11",
+        "h3"
+      ]
+    },
+    {
+      "id": "t4",
+      "summary": "Sense-event buffer: reachy/speech/events.py \u2014 poll existing behavior.sense DoA/RMS + vision motion/light into a rolling timestamped cue buffer ('speech from the left', 'motion right', 'brightening'); thread-safe snapshot-and-clear",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "feeding DoA/RMS + vision samples yields human-readable directional cue strings",
+        "snapshot() returns buffered cues and atomically clears them; concurrent producer/consumer loses no cues",
+        "reads the listen/vision sense primitives without holding an exclusive lock (no new sensor code)"
+      ],
+      "deps": [],
+      "covers": [
+        "c17",
+        "h11"
+      ]
+    },
+    {
+      "id": "t5",
+      "summary": "say noun: reachy/cli/_commands/say.py \u2014 'reachy say \"<text>\"' (+ stdin '-'), --voice/--speed/--json, run+overview; pipes text -> tts -> playback; never touches the LLM or senses",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "'reachy say' with text synthesizes and plays it via the tts+playback modules",
+        "'-' reads text from stdin; --voice/--speed are forwarded to synth; --json emits a structured result",
+        "say imports neither the llm nor events modules (a test asserts the dumb-pipe boundary)"
+      ],
+      "deps": [
+        "t1",
+        "t3"
+      ],
+      "covers": [
+        "c13",
+        "h9"
+      ]
+    },
+    {
+      "id": "t6",
+      "summary": "think engine: reachy/speech/cognition.py \u2014 event-buffer -> serialized single LLM turn -> sentence-stream into TTS+playback with speech overlapping generation; mid-turn events buffer for the next turn",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "only one LLM turn runs at a time; cues arriving during a turn are consumed only by the next turn",
+        "early sentences reach playback while later sentences are still being generated (parallel pipeline)",
+        "the engine consumes only event cues \u2014 no STT/transcription, tool-use, or barge-in path exists"
+      ],
+      "deps": [
+        "t1",
+        "t2",
+        "t3",
+        "t4"
+      ],
+      "covers": [
+        "c15",
+        "c19",
+        "h10",
+        "h12"
+      ]
+    },
+    {
+      "id": "t7",
+      "summary": "think noun: reachy/cli/_commands/think.py \u2014 managed-loop verbs mirroring listen (run + start/stop/restart/status + overview), --json, CliError contract; drives the cognition engine over a live sense feed",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "think exposes run + start/stop/restart/status + overview as a tracked background process (pid/log under the state dir), like listen",
+        "from a sense context the loop produces a sentence-streamed spoken answer (first audio before generation completes)",
+        "an unreachable LLM or TTS endpoint exits 2 with a CliError hint line and no traceback"
+      ],
+      "deps": [
+        "t6"
+      ],
+      "covers": [
+        "c6",
+        "h8"
+      ]
+    },
+    {
+      "id": "t8",
+      "summary": "Wire + document: register say & think in reachy/cli/__init__._build_parser, add explain/catalog ENTRIES for both, document REACHY_LLM_*/REACHY_TTS_* env + verbs in README/CLAUDE.md, bump version",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "'reachy say' and 'reachy think' resolve through reachy.cli.main; teken cli doctor . --strict stays green",
+        "explain/catalog has resolving ENTRIES for the say and think command paths",
+        "README/CLAUDE.md document the two nouns + env vars; pyproject version is bumped (version-check passes)"
+      ],
+      "deps": [
+        "t5",
+        "t7"
+      ],
+      "covers": [
+        "c1",
+        "c2",
+        "c4",
+        "c5",
+        "h5",
+        "h7"
+      ]
+    },
+    {
+      "id": "t9",
+      "summary": "Integration + E2E tests: tests/test_say_think.py \u2014 end-to-end say and think against stubbed LLM/TTS/media, proving the spoken-response loop and say/think independence",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "an E2E test drives 'think' with stubbed LLM+TTS+media and asserts coherent ordered audio reaches playback",
+        "a test proves say works with no LLM/senses and think runs the full loop, each independently invokable",
+        "the suite runs under pytest -n auto and keeps coverage >= the CI gate (60%)"
+      ],
+      "deps": [
+        "t8"
+      ],
+      "covers": [
+        "h4",
+        "h6"
+      ]
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "text": "think's background process mgmt may require generalizing the listen-bound reachy/motion/supervisor.py + server.py (shared files) \u2014 refactor/merge-overlap risk between t7 and listen",
+      "kind": "unknown_nonblocking",
+      "task_id": "t7"
+    },
+    {
+      "id": "r2",
+      "text": "porting realtime-api's async httpx SSE streaming to stdlib urllib sync chunked reads (LLM stream + per-sentence TTS) is non-trivial and may need careful incremental buffering",
+      "kind": "unknown_nonblocking",
+      "task_id": "t2"
+    }
+  ]
+}
