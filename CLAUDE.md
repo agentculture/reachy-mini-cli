@@ -154,6 +154,49 @@ you touch the CLI.
     `media_session()` and reads DoA + mic RMS per tick; `http` transport polls
     the daemon's DoA route (no audio source, RMS = 0). Two-noun split: `say` =
     dumb TTS pipe; `think` = cognition loop that reuses `say`'s speech leg.
+  - **`*emoji*` / `"quoted"` output convention:** the cognition LLM interleaves
+    expression markers and speech. `reachy/speech/markers.py` — streaming
+    `MarkerParser` state machine: `*…*` → `MarkerEvent(emoji=…)` (drives a body
+    expression); `"…"` → `SpeechEvent(text=…)` (spoken aloud). Text outside
+    these delimiters is silently discarded. The parser is incremental (char-by-char)
+    so split LLM token chunks are assembled correctly; unclosed spans at flush-time
+    are silently dropped.
+  - **Expression catalog** — `reachy/speech/expressions.toml`: emoji-keyed TOML
+    tables, each mapping to a 9-axis `ExpressionPose` (head mm/deg, antenna deg,
+    body_yaw deg). Loaded via stdlib `tomllib` (no new dep). `NEUTRAL_KEY =
+    "neutral"` is the all-zeros fallback for unknown emoji. `Catalog` (thin
+    wrapper), `load_catalog`, and `get_pose` in `reachy/speech/expressions.py`.
+    Starter set: 🤔 😮 🙂 👂 😐 🎉 😔 and neutral. Edit this file to tune poses
+    without any code change.
+  - **`ExpressionProducer`** (`reachy/motion/expression.py`) — enqueues calm
+    one-shot expression moves onto the shared serial `MotionQueue` from the
+    cognition thread. `think`'s `_MotionExecutor` runs a dedicated background
+    thread that drains the queue to the robot; motion errors degrade silently so
+    a transport drop never kills the cognition loop.
+  - **`reachy/speech/distinctness.py`** — `find_too_similar(catalog, threshold)`
+    computes weighted Euclidean pose distances (normalised by per-axis amplitude
+    σ) and returns pairs below the threshold. The neutral entry is excluded from
+    pairwise comparison. Default threshold `0.5`; starter catalog passes cleanly.
+  - **`think expressions` sub-noun** (registered in `_register_expressions`):
+    - `think expressions` / `think expressions list` — emit each catalog emoji
+      with a generated pose descriptor (non-zero axes and signed magnitudes).
+    - `think expressions check` — run `find_too_similar`; exit 0 always
+      (flagged pairs are warnings); `--json` `ok` is the machine-readable signal.
+    - `think expressions overview` — describe the sub-noun (rubric-required).
+    Both verbs support `--json`.
+  - **Cognition signal** (`reachy/speech/cognition_signal.py`) — `cognition_active()`
+    context manager writes `think_active.flag` (under `state_dir()`) on enter and
+    removes it on exit (including on exception). `is_active()` is a pure
+    `Path.exists()` check with no I/O cost. The `listen` motion producer
+    (`reachy/motion/listen.py`) calls `cognition_signal.is_active()` on every
+    idle tick and swaps in a low-energy `_focused` `AliveConfig` while the flag
+    is present — so the idle wander drops to a quiet "focused breathe" while
+    `think` runs, making stillness the thinking posture.
+  - **Self-mute guard** — `think run` wraps `play_audio` so after each clip it
+    stamps `mute["until"] = monotonic() + mute_after` (default 2.5 s). The
+    `before_turn` sense feed checks this window and discards any sample captured
+    inside it, preventing the robot from reacting to its own voice through the
+    shared USB audio device.
 
 ## Hard constraints
 
