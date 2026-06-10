@@ -603,6 +603,42 @@ assert this. Keep `say` as a pure TTS → playback pipe.
 """
 
 
+_THINK_DEMO = """\
+# reachy-mini-cli think demo
+
+Run a scripted `*emoji* "speech"` stream through the real expression + TTS
+pipeline, so a human can verify the body-expression wiring on a live robot
+without a running LLM.
+
+The built-in script is:
+
+    *🤔* "I wonder what that sound was."
+    *👂* "There it is again, to my left."
+    *🙂* "Ah — it's just the fan."
+
+Each `*emoji*` marker enqueues exactly one calm gesture via
+`ExpressionProducer`; each quoted phrase is synthesized via TTS and played
+through the robot speaker. The cognition-active signal is raised for the
+duration of the demo so a co-running `listen` backs off its idle motion.
+
+## Usage
+
+    reachy-mini-cli think demo                            # built-in script, sdk transport
+    reachy-mini-cli think demo --transport http           # use HTTP playback
+    reachy-mini-cli think demo --script '*😮* "Oh!"'     # custom script
+    reachy-mini-cli think demo --json                     # machine-readable result
+
+## Manual verification
+
+See `docs/verification/think-body-expression.md` for the full on-robot checklist.
+
+## Exit codes
+
+- `0` — demo ran to completion
+- `1` — user error (bad script / args)
+- `2` — environment error (TTS unreachable, missing SDK extra, etc.)
+"""
+
 _THINK = """\
 # reachy-mini-cli think
 
@@ -896,4 +932,5 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("think", "expressions", "overview"): _THINK,
     ("think", "expressions", "list"): _THINK,
     ("think", "expressions", "check"): _THINK,
+    ("think", "demo"): _THINK_DEMO,
 }

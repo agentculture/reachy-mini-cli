@@ -50,6 +50,8 @@ from reachy.speech.distinctness import find_too_similar as _find_too_similar
 from reachy.speech.events import EventBuffer
 from reachy.speech.expressions import NEUTRAL_KEY, Catalog
 from reachy.speech.llm import stream_sentences as _stream_sentences
+from reachy.speech.markers import MarkerEvent, SpeechEvent
+from reachy.speech.markers import parse as _parse_marker_script
 from reachy.speech.playback import play_audio as _play_audio
 from reachy.speech.tts import synthesize as _synthesize
 
@@ -71,6 +73,7 @@ _VERBS = [
     "think restart — restart the background loop (re-reads flags + code)",
     "think status — loop process state",
     "think expressions — list the expression catalog (and 'expressions check')",
+    "think demo — run a scripted expression stream for hardware verification",
     "think overview — this summary",
 ]
 
@@ -617,6 +620,106 @@ def _no_verb(args: argparse.Namespace) -> int:
     return cmd_think_overview(args)
 
 
+# --- demo (scripted expression stream) ------------------------------------
+
+#: The scripted stream used by ``think demo`` — a short *emoji* / "speech" sequence
+#: that exercises the full marker→ExpressionProducer + TTS path so a human can
+#: observe the wiring on a live robot without an LLM.
+DEMO_SCRIPT: str = (
+    '*🤔* "I wonder what that sound was." '
+    '*👂* "There it is again, to my left." '
+    '*🙂* "Ah — it\'s just the fan."'
+)
+
+
+def cmd_think_demo(args: argparse.Namespace) -> int:
+    """Run a scripted ``*emoji* "speech"`` stream through the real pipeline.
+
+    Drives :data:`DEMO_SCRIPT` (or ``--script TEXT``) through
+    :class:`~reachy.speech.markers.MarkerParser` →
+    :class:`~reachy.motion.expression.ExpressionProducer` (enqueue moves) +
+    TTS (speak quoted text), with the cognition signal active, so a co-running
+    ``listen`` idles while the demo plays.  Exits when the scripted stream is
+    exhausted.
+
+    Use this to verify ``think``'s body-expression wiring on a live robot
+    without a running LLM.  See
+    ``docs/verification/think-body-expression.md`` for the manual checklist.
+    """
+    json_mode = bool(getattr(args, "json", False))
+    script = getattr(args, "script", None) or DEMO_SCRIPT
+
+    events = _parse_marker_script(script)
+    motion = _make_motion_executor(args)
+
+    expressed: list[str] = []
+    spoken: list[str] = []
+
+    with cognition_signal.cognition_active():
+        motion.start()
+        try:
+            for event in events:
+                if isinstance(event, MarkerEvent):
+                    motion.express(event.emoji)
+                    expressed.append(event.emoji)
+                elif isinstance(event, SpeechEvent):
+                    tts_kw: dict = {}
+                    if getattr(args, "tts_url", None) is not None:
+                        tts_kw["tts_url"] = args.tts_url
+                    if getattr(args, "voice", None) is not None:
+                        tts_kw["voice"] = args.voice
+                    pb_kw = _playback_kwargs(args)
+                    pcm = _synthesize(event.text, **tts_kw)
+                    if pcm:
+                        _play_audio(pcm, **pb_kw)
+                    spoken.append(event.text)
+        finally:
+            motion.stop()
+
+    if json_mode:
+        emit_result(
+            {"status": "ok", "expressed": expressed, "spoken": spoken},
+            json_mode=True,
+        )
+    else:
+        emit_diagnostic(
+            f"[think demo] done — expressed {len(expressed)} gesture(s), "
+            f"spoke {len(spoken)} phrase(s)"
+        )
+    return 0
+
+
+def _register_demo(noun_sub: argparse._SubParsersAction) -> None:
+    demo = noun_sub.add_parser(
+        "demo",
+        help="Run a scripted expression stream on the robot (hardware verification).",
+    )
+    # add_robot_args provides --json, --transport, --base-url, --timeout.
+    add_robot_args(demo)
+    # Override the transport default to sdk (think's default transport).
+    demo.set_defaults(transport=os.environ.get("REACHY_TRANSPORT", "sdk"))
+    demo.add_argument(
+        "--script",
+        default=None,
+        help=(
+            "Override the built-in scripted stream with custom text "
+            '(same *emoji* / "speech" format).  Default: built-in 3-marker sequence.'
+        ),
+    )
+    demo.add_argument(
+        "--tts-url",
+        default=None,
+        dest="tts_url",
+        help="TTS base URL (overrides REACHY_TTS_URL).",
+    )
+    demo.add_argument(
+        "--voice",
+        default=None,
+        help="TTS voice identifier (overrides REACHY_TTS_VOICE).",
+    )
+    demo.set_defaults(func=cmd_think_demo)
+
+
 # --- shared cognition args ------------------------------------------------
 
 
@@ -758,3 +861,4 @@ def register(sub: argparse._SubParsersAction) -> None:
     _register_run(noun_sub)
     _register_process_verbs(noun_sub)
     _register_expressions(noun_sub)
+    _register_demo(noun_sub)
