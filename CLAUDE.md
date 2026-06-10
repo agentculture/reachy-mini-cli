@@ -126,6 +126,34 @@ you touch the CLI.
     deployments.
   - Both tiers drive the smooth minjerk `goto` planner one move at a time (serial
     motion queue), so turns are soft and never conflict.
+- **`say` noun — dumb TTS pipe:** `reachy/cli/_commands/say.py` exposes `run`
+  (text → TTS → playback) and `overview`. It MUST NOT import `reachy.speech.llm`
+  or `reachy.speech.events` — tests assert this boundary. TTS is via
+  `reachy.speech.tts.synthesize` (Magpie-style HTTP: `REACHY_TTS_URL` /
+  `REACHY_TTS_VOICE`). Playback is via `reachy.speech.playback.play_audio` —
+  `sdk` (default, pushes PCM via `reachy_mini.media`) or `http` (daemon
+  `/media/play` route). No LLM, no event bus, no senses; safe to compose in
+  pipelines.
+- **`think` noun — continuous cognition loop (SDK-first):** `reachy/cli/_commands/think.py`
+  exposes `run` (foreground) + `start`/`stop`/`restart`/`status` (background
+  process) + `overview`. The `reachy/speech/` package provides the engine:
+  - `reachy/speech/llm.py` — pure `urllib` streaming LLM client
+    (`REACHY_LLM_BASE_URL` / `REACHY_LLM_API_KEY` / `REACHY_LLM_MODEL`; no
+    OpenAI SDK, no new base dep).
+  - `reachy/speech/tts.py` + `reachy/speech/playback.py` — shared with `say`;
+    `think` reuses the same TTS + playback leg.
+  - `reachy/speech/events.py` — `EventBuffer` accumulates per-tick DoA / RMS /
+    speech cues; `CognitionEngine.run()` consumes them.
+  - `reachy/speech/cognition.py` — `CognitionEngine`: calls the LLM with the
+    buffer snapshot, streams sentences, synthesizes + plays each sentence while
+    the LLM streams the next (sentence-streamed overlap).
+  - `reachy/speech/supervisor.py` — manages `think`'s background process (PID +
+    log under `$REACHY_STATE_DIR`). **Distinct** from `listen`'s
+    `reachy/motion/supervisor.py` — they track separate processes.
+  - Sense feed mirrors `listen`: `sdk` transport opens a `ReachyMini`
+    `media_session()` and reads DoA + mic RMS per tick; `http` transport polls
+    the daemon's DoA route (no audio source, RMS = 0). Two-noun split: `say` =
+    dumb TTS pipe; `think` = cognition loop that reuses `say`'s speech leg.
 
 ## Hard constraints
 

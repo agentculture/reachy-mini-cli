@@ -284,6 +284,54 @@ Key tuning flags: `--gain`, `--max-yaw`, `--deadband`, `--hold`, `--speed`,
 `--motion-threshold`.
 See `reachy explain vision` for the full reference.
 
+### Say — text-to-speech pipe
+
+`say` is a **dumb pipe**: text → TTS synthesis → robot speaker playback. No LLM,
+no senses — deliberately boundary-clean so agents can compose it into pipelines.
+Pass `"-"` as the text argument to read from stdin.
+
+```bash
+reachy-mini-cli say run "Hello from Reachy"
+echo "Hello from stdin" | reachy-mini-cli say run -
+reachy-mini-cli say run "Remote" --transport http --base-url http://reachy.local:8000
+```
+
+**TTS endpoint** — Magpie-style HTTP server: `REACHY_TTS_URL` (default
+`http://localhost:9000`), `REACHY_TTS_VOICE` (voice identifier), `--speed`
+(forwarded, a no-op if the server ignores it). **Playback transport** —
+`REACHY_TRANSPORT` (`sdk` default; `http` for remote) via the same
+`--transport` flag as `listen`/`vision`. See `reachy explain say`.
+
+### Think — continuous cognition loop
+
+`think` runs a **sentence-streamed cognition loop**: on each turn it snapshots
+live senses (DoA + mic loudness) into an event buffer, sends the buffer to an
+LLM (streamed), and plays each synthesized sentence through the speaker while
+the LLM is still generating the next — so speech starts before the turn completes.
+An empty buffer (no notable events) is a silent no-op turn (no LLM call, no audio).
+
+Like `listen`, `think` is **SDK-first**: the `sdk` transport (default) streams
+real DoA + mic RMS in-process; `--transport http` polls the daemon's DoA route.
+Like `daemon`, it has a foreground loop (`run`) and a tracked background process
+(`start`/`stop`/`restart`/`status`) managed by its own supervisor
+(`reachy/speech/supervisor.py`).
+
+```bash
+reachy-mini-cli daemon start                              # bring the daemon up
+reachy-mini-cli think run                                 # foreground loop (Ctrl-C to stop)
+reachy-mini-cli think run --max-turns 3                   # stop after 3 spoken turns
+reachy-mini-cli think start --llm-model mistral-small     # background process
+reachy-mini-cli think status --json
+reachy-mini-cli think stop
+```
+
+**LLM endpoint** — `REACHY_LLM_BASE_URL`, `REACHY_LLM_API_KEY`,
+`REACHY_LLM_MODEL`; pure `urllib` streaming (no OpenAI SDK, no new base dep).
+**TTS endpoint** — `REACHY_TTS_URL`, `REACHY_TTS_VOICE` (same as `say`).
+**Playback** — `REACHY_TRANSPORT` (`sdk`/`http`); same transport flag as `say`.
+Key pacing flag: `--turn-interval` (seconds between turns).
+See `reachy explain think` for the full reference.
+
 ## Make it your own
 
 1. Rename the package `reachy/` and the `reachy-mini-cli`

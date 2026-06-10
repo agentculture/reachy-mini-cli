@@ -12,7 +12,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "reachy-cli"
-version = "0.9.0"
+version = "0.13.0"
 description = "Transitional alias for reachy-mini-cli — installs the renamed distribution."
 readme = "README.md"
 license = "MIT"
@@ -25,13 +25,13 @@ classifiers = [
     "Topic :: Software Development",
     "Intended Audience :: Developers",
 ]
-dependencies = ["reachy-mini-cli==0.9.0"]
+dependencies = ["reachy-mini-cli==0.13.0"]
 
 # Forward the extras so `pip install 'reachy-cli[daemon]'` keeps working exactly
 # like `pip install 'reachy-mini-cli[daemon]'`.
 [project.optional-dependencies]
-daemon = ["reachy-mini-cli[daemon]==0.9.0"]
-sdk = ["reachy-mini-cli[sdk]==0.9.0"]
+daemon = ["reachy-mini-cli[daemon]==0.13.0"]
+sdk = ["reachy-mini-cli[sdk]==0.13.0"]
 
 [project.urls]
 Homepage = "https://github.com/agentculture/reachy-mini-cli"
