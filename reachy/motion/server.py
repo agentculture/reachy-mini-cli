@@ -31,12 +31,17 @@ DEFAULT_TICK = 0.05  # 20 Hz producer/poll cadence (the DoA itself updates slowl
 def _dispatch_next(transport, q: MotionQueue, t: float, settle: float, on_action) -> float:
     """Issue the next queued move; return the new ``busy_until``.
 
-    Peeks the queue and only :meth:`~MotionQueue.pop`\\ s after ``move_goto`` is
-    accepted, so a move that fails to send is left pending and retried next tick
-    rather than silently dropped (a :class:`CliError` propagates to the caller,
-    which counts it toward the error ceiling).
+    Peeks the queue and only removes the action via :meth:`~MotionQueue.pop_if`
+    after ``move_goto`` is accepted, so a move that fails to send is left pending
+    and retried next tick rather than silently dropped (a :class:`CliError`
+    propagates to the caller, which counts it toward the error ceiling).
+    ``pop_if`` (not a bare ``pop``) removes the action only if it is still the
+    head — so a gesture a concurrent producer thread coalesced in mid-dispatch is
+    never popped in its place (see :meth:`MotionQueue.pop_if`).
     """
     nxt = q.peek()
+    if nxt is None:  # emptied by another thread between the len() check and here
+        return t
     transport.move_goto(
         head=nxt.head,
         antennas=nxt.antennas,
@@ -44,7 +49,7 @@ def _dispatch_next(transport, q: MotionQueue, t: float, settle: float, on_action
         duration=nxt.duration,
         interpolation=nxt.interpolation,
     )
-    q.pop()  # accepted — now safe to remove it
+    q.pop_if(nxt)  # accepted — remove it, unless a newer gesture took the head
     if on_action is not None:
         on_action(nxt)
     return t + nxt.duration + settle

@@ -121,11 +121,14 @@ def _build_system_prompt(*, emojis: list[str], base: str = DEFAULT_SYSTEM_PROMPT
     """
     vocab = " ".join(emojis)
     convention = (
-        " You may express body language by emitting one of the available emojis "
-        "wrapped in asterisks (e.g. *<emoji>*); wrap everything you want spoken "
-        'aloud in double quotes (e.g. "like this"). Only quoted text is spoken; '
-        "only an asterisk-wrapped emoji moves the body. "
-        f"Available expressions: {vocab}."
+        " Output format: write NOTHING except asterisk-wrapped emojis and "
+        "double-quoted speech. Express body language by emitting one of the "
+        "available emojis wrapped in asterisks (e.g. *<emoji>*); put every word "
+        'you want spoken aloud inside double quotes (e.g. "like this"). Begin your '
+        "reply with a quote or an emoji marker. Any text outside quotes and emoji "
+        "markers is discarded, not spoken — so never write unquoted narration or a "
+        "lead-in. Only quoted text is spoken; only an asterisk-wrapped emoji moves "
+        f"the body. Available expressions: {vocab}."
     )
     return base + convention
 

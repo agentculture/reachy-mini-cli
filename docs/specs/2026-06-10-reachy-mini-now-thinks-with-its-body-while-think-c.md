@@ -4,7 +4,7 @@
 
 ## Audience
 
-- Someone running `reachy think` on a live Reachy Mini who wants the robot to look like it's thinking, not just talking — plus the developer tuning the expression vocabulary.
+- Someone running `reachy-mini-cli think` on a live Reachy Mini who wants the robot to look like it's thinking, not just talking — plus the developer tuning the expression vocabulary.
 
 ## Before → After
 
@@ -33,7 +33,7 @@
 
 ## Honesty conditions
 
-- Demoing `reachy think` on a live robot, an observer sees expressive movement timed to the spoken thoughts, a visibly calmer body than full idle, and can name distinct expressions.
+- Demoing `reachy-mini-cli think` on a live robot, an observer sees expressive movement timed to the spoken thoughts, a visibly calmer body than full idle, and can name distinct expressions.
 - Both personas are served without a code change for the developer one: a runtime user just runs think; a developer tunes expressions by editing the catalog data file.
 - Verifiable in-repo: think.py issues no transport.move_* calls today and all ambient motion lives in listen/demo-mode/idle.
 - While think runs, the serial motion queue receives expression moves sourced from think, and the idle baseline is measurably lower-energy than standalone listen idle.

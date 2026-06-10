@@ -1,6 +1,6 @@
 # Manual Verification Checklist — think body-expression
 
-**Feature:** `reachy think` gestures while speaking — expression markers in the
+**Feature:** `reachy-mini-cli think` gestures while speaking — expression markers in the
 LLM stream drive calm body poses that arrive timed to the robot's spoken thoughts.
 
 **How to run the demo:**

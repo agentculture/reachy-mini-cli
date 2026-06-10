@@ -68,7 +68,7 @@ slug: `reachy-mini-now-thinks-with-its-body-while-think-c` · status: `exported`
 - covers: c3, h3, c6, h6
 - acceptance:
   - think run writes the cognition signal on start and clears it on exit; the LLM prompt advertises the available emoji vocabulary from the catalog
-  - adds 'reachy think expressions' (list) and 'reachy think expressions check' (distinctness) verbs with --json, following the existing error/output contract
+  - adds 'reachy-mini-cli think expressions' (list) and 'reachy-mini-cli think expressions check' (distinctness) verbs with --json, following the existing error/output contract
   - boundary preserved by an import/behaviour test: think drives motion only via the queue/producer (no direct transport.move_* in the cognition path), adds no vision-driven expression and no cross-session mood store, and say stays a dumb TTS pipe
 
 ### t9 — Live observer verification + demo entrypoint (manual, on robot)

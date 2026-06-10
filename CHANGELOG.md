@@ -25,9 +25,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `reachy/speech/distinctness.py` — weighted Euclidean pose-distance scorer that
   detects catalog entries too similar to be meaningfully distinct.
 - `think expressions` sub-noun — two catalog tooling verbs (both `--json`-ready):
-  - `reachy think expressions` / `reachy think expressions list` — list every
-    catalog emoji with a generated pose descriptor.
-  - `reachy think expressions check` — flag expression pairs whose poses are too
+  - `reachy-mini-cli think expressions` / `reachy-mini-cli think expressions list`
+    — list every catalog emoji with a generated pose descriptor.
+  - `reachy-mini-cli think expressions check` — flag expression pairs whose poses are too
     similar to tell apart (exit 0; `ok` field is the machine-readable signal).
 - **Focused idle while thinking:** while `think run` is active it writes a
   `think_active.flag` file under `$REACHY_STATE_DIR` via `cognition_signal`
@@ -37,6 +37,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Self-mute guard:** `think run` mutes the sense feed for `--mute-after-speak`
   seconds (default 2.5 s) after each playback clip to prevent the robot from
   reacting to its own voice through the shared USB audio device.
+
+### Fixed
+
+- `MotionQueue` is now thread-safe: an internal lock guards the pending list and
+  a new atomic `pop_if` removes the head only when it is still the dispatched
+  action. This closes a race `think` introduced by draining the queue on the
+  motion-executor thread while the cognition thread submits gestures — a blind
+  `pop` could otherwise drop a gesture that coalesced in mid-dispatch.
+- Hardened the cognition system prompt to instruct the LLM to emit nothing
+  outside `*emoji*` markers and `"quoted"` speech (unquoted text is discarded,
+  not spoken), reducing the chance of an unquoted lead-in being voiced.
 
 ## [0.13.0] - 2026-06-10
 
