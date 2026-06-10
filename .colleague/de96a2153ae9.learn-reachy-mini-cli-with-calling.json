@@ -1,0 +1,210 @@
+{
+  "task_id": "de96a2153ae9",
+  "status": "ok",
+  "summary": "Learned reachy-mini-cli comprehensively by running `reachy-mini-cli learn` and exploring all nouns (daemon, device, app, move, demo-mode, behavior, listen) and meta commands (whoami, explain, overview, doctor). Real mode operation: start the daemon, check device status, control motion with `move goto`, bring the robot to life with `demo-mode start`, compose behaviors via the 50 Hz engine, and react to sound with `listen run`. Key rule: only one subsystem drives the robot at a time.",
+  "changed_files": [],
+  "steps": [
+    {
+      "index": 0,
+      "tool": "list_dir",
+      "arguments": {
+        "path": "."
+      },
+      "result": ".agex/\n.claude/\n.colleague/\n.coverage\n.devague/\n.flake8\n.git/\n.github/\n.gitignore\n.markdownlint-cli2.yaml\n.pytest_cache/\n.venv/\nCHANGELOG.md\nCLAUDE.md\nLICENSE\nREADME.md\nculture.yaml\ndocs/\npackaging/\npyproject.toml\nreachy/\nsonar-project.properties\ntests/\nuv.lock",
+      "ok": true
+    },
+    {
+      "index": 1,
+      "tool": "run_command",
+      "arguments": {
+        "command": "which reachy-mini-cli 2>/dev/null || echo \"not on PATH\""
+      },
+      "result": "exit=0\n/home/spark/.local/bin/reachy-mini-cli\n",
+      "ok": true
+    },
+    {
+      "index": 2,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli learn"
+      },
+      "result": "exit=0\nreachy-mini-cli — a clonable template for AgentCulture mesh agents.\n\nPurpose\n-------\nScaffold for a new Culture mesh agent: an agent-first CLI (cited from the teken\n`python-cli` reference), an identity (culture.yaml + CLAUDE.md), the canonical\nguildmaster skill kit under .claude/skills/, and a deploy/CI baseline. Clone it,\nrename the package, and edit culture.yaml to mint a new agent.\n\nCommands\n--------\n  reachy-mini-cli whoami             Identity from culture.yaml.\n  reachy-mini-cli learn              This self-teaching prompt.\n  reachy-mini-cli explain <path>...  Markdown docs for any noun/verb path.\n  reachy-mini-cli overview           Descriptive snapshot of the agent.\n  reachy-mini-cli doctor             Check the agent-identity invariants.\n  reachy-mini-cli cli overview       Describe the CLI surface itself.\n\nRobot commands (talk to the Reachy daemon; --transport http|sdk)\n  reachy-mini-cli daemon start       Start the local daemon; also: stop/status.\n  reachy-mini-cli device status      Daemon status / device info.\n  reachy-mini-cli device state       Live robot state (pose, antennas).\n  reachy-mini-cli app list           Available apps; also: status/start/stop.\n  reachy-mini-cli move goto ...      Move head/antennas; also: wake/sleep.\n  reachy-mini-cli demo-mode start    Make the robot feel alive (continuous).\n                                     Also: stop/restart/status/run, config,\n                                     install/enable/disable (systemd --user).\n\nMachine-readable output\n-----------------------\nEvery command supports --json. Errors in JSON mode emit\n{\"code\", \"message\", \"remediation\"} to stderr. Stdout and stderr never mix.\n\nExit-code policy\n----------------\n  0 success\n  1 user-input error (bad flag, bad path, missing arg)\n  2 environment / setup error\n  3+ reserved\n\nMore detail\n-----------\n  reachy-mini-cli explain reachy-mini-cli\n",
+      "ok": true
+    },
+    {
+      "index": 3,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain reachy-mini-cli"
+      },
+      "result": "exit=0\n# reachy-mini-cli\n\nA clonable template for AgentCulture mesh agents. It carries an agent-first CLI\n(cited from the teken `python-cli` reference), a mesh identity (`culture.yaml` +\n`CLAUDE.md`), the canonical guildmaster skill kit under `.claude/skills/`, and a\nbuildable/deployable package baseline. Clone it, rename the package, edit\n`culture.yaml`, and you have a new agent.\n\n## Verbs\n\n- `reachy-mini-cli whoami` — identity probe from `culture.yaml`.\n- `reachy-mini-cli learn` — structured self-teaching prompt.\n- `reachy-mini-cli explain <path>` — markdown docs for any noun/verb.\n- `reachy-mini-cli overview` — descriptive snapshot of the agent.\n- `reachy-mini-cli doctor` — check the agent-identity invariants.\n- `reachy-mini-cli cli overview` — describe the CLI surface.\n\n## Robot nouns\n\n- `reachy-mini-cli daemon <verb>` — start/stop/check the local daemon process.\n- `reachy-mini-cli device <verb>` — daemon/robot status and live state.\n- `reachy-mini-cli app <verb>` — list/start/stop Reachy Mini apps.\n- `reachy-mini-cli move <verb>` — runtime motion (goto, wake, sleep).\n- `reachy-mini-cli demo-mode <verb>` — start/stop a background loop that makes\n  the robot feel alive (idle breathing, glances, antenna sway).\n- `reachy-mini-cli behavior <verb>` — compose behaviors on a 50 Hz loop\n  (`list`, `run`, `stop`, `status`, `engine`).\n\nThe `device`/`app`/`move` verbs speak to the Reachy daemon over a transport\nflavor (`--transport http` by default, `sdk` optional); a missing daemon yields a\nclean exit-2 error, never a traceback. `daemon` is the other half — it brings the\nlocal `reachy-mini-daemon` process up so those verbs have something to talk to.\n\n## Exit-code policy\n\n- `0` success\n- `1` user-input error\n- `2` environment / setup error\n- `3+` reserved\n\n## See also\n\n- `reachy-mini-cli explain whoami`\n- `reachy-mini-cli explain doctor`\n",
+      "ok": true
+    },
+    {
+      "index": 4,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain daemon"
+      },
+      "result": "exit=0\n# reachy-mini-cli daemon\n\nLocal daemon process lifecycle. The `device`/`app`/`move` verbs are *clients* of\na running daemon; this noun is the other half — it brings the local\n`reachy-mini-daemon` process up and down.\n\n## Verbs\n\n- `reachy-mini-cli daemon start` — spawn `reachy-mini-daemon` in the background,\n  record its PID + log under the state dir, and poll the health route\n  (`GET /api/daemon/status`) until it answers. Idempotent: if a daemon already\n  runs (tracked or foreign), it reports `already-running` instead of double-spawning.\n- `reachy-mini-cli daemon stop` — SIGTERM the daemon this CLI started, escalating\n  to SIGKILL if it lingers past `--timeout`.\n- `reachy-mini-cli daemon status` — reconcile the tracked process (running /\n  stopped / stale pid) with the HTTP health check.\n- `reachy-mini-cli daemon overview` — this summary.\n\n## Install\n\nThe daemon binary ships in the `[daemon]` extra — the recommended default:\n\n    pip install 'reachy-mini-cli[daemon]'\n\nThe bare `pip install reachy-mini-cli` is the HTTP-only *remote* profile (no daemon):\nuse it on a control box that only talks to a daemon running elsewhere via\n`--base-url` / `REACHY_BASE_URL`. If the binary is missing, `daemon start` exits 2\nwith a hint pointing at the `[daemon]` install.\n\n## Notes\n\n- `reachy-mini-daemon` defaults to `--wake-up-on-start`, so `daemon start` already\n  wakes the robot. Forward daemon args after `--`, e.g.\n  `reachy-mini-cli daemon start -- --sim --no-wake-up-on-start`.\n- Override the launch command with `--daemon-cmd` or `REACHY_DAEMON_CMD`.\n- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`\n  (`~/.local/state/reachy`): `daemon.pid` + `daemon.log`.\n\n## Usage\n\n    reachy-mini-cli daemon start\n    reachy-mini-cli daemon status --json\n    reachy-mini-cli daemon start --no-wait -- --sim\n    reachy-mini-cli daemon stop\n",
+      "ok": true
+    },
+    {
+      "index": 5,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain device"
+      },
+      "result": "exit=0\n# reachy-mini-cli device\n\nDevice setup and status for the Reachy Mini.\n\n## Verbs\n\n- `reachy-mini-cli device status` — daemon status (state, version,\n  wireless/lite, simulation, IP). Calls `GET /api/daemon/status`.\n- `reachy-mini-cli device state` — live robot state: head pose, antenna\n  positions, body yaw, direction-of-arrival. Calls `GET /api/state/full`.\n- `reachy-mini-cli device overview` — this summary.\n\n## Transports\n\nRobot verbs reach the robot through a selectable flavor:\n\n- `http` (default) — the Reachy daemon's REST API (default\n  `http://localhost:8000`, override with `--base-url` or `REACHY_BASE_URL`).\n  Uses only the standard library, so the CLI stays dependency-free.\n- `sdk` — the in-process `reachy_mini` client; needs the optional `[sdk]` extra\n  (`pip install 'reachy-mini-cli[sdk]'`). Covers motion/state; daemon and app verbs\n  require `http`.\n\nSelect with `--transport {http,sdk}` (or `REACHY_TRANSPORT`). If the daemon is\nunreachable, the command exits 2 with an `error:`/`hint:` pair — no traceback.\n\n\n## Usage\n\n    reachy-mini-cli device status\n    reachy-mini-cli device state --json\n    reachy-mini-cli device status --base-url http://reachy.local:8000\n",
+      "ok": true
+    },
+    {
+      "index": 6,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain move"
+      },
+      "result": "exit=0\n# reachy-mini-cli move\n\nRuntime motion. `goto` takes friendly units — millimetres for translation,\ndegrees for rotation — converted to the daemon's metres + radians.\n\n## Verbs\n\n- `reachy-mini-cli move goto` — move head/antennas to a target. Flags:\n  `--x/--y/--z` (mm), `--roll/--pitch/--yaw` (deg), `--antennas RIGHT LEFT`\n  (deg), `--body-yaw` (deg), `--duration` (s, default 2.0),\n  `--interpolation {minjerk,linear,ease,cartoon}`. Calls `POST /api/move/goto`.\n- `reachy-mini-cli move wake` — play the wake-up animation.\n- `reachy-mini-cli move sleep` — play the go-to-sleep animation.\n- `reachy-mini-cli move overview` — this summary.\n\n## Transports\n\nRobot verbs reach the robot through a selectable flavor:\n\n- `http` (default) — the Reachy daemon's REST API (default\n  `http://localhost:8000`, override with `--base-url` or `REACHY_BASE_URL`).\n  Uses only the standard library, so the CLI stays dependency-free.\n- `sdk` — the in-process `reachy_mini` client; needs the optional `[sdk]` extra\n  (`pip install 'reachy-mini-cli[sdk]'`). Covers motion/state; daemon and app verbs\n  require `http`.\n\nSelect with `--transport {http,sdk}` (or `REACHY_TRANSPORT`). If the daemon is\nunreachable, the command exits 2 with an `error:`/`hint:` pair — no traceback.\n\n\n## Usage\n\n    reachy-mini-cli move goto --z 10 --pitch -5 --duration 2\n    reachy-mini-cli move goto --antennas 30 -30 --duration 1\n    reachy-mini-cli move wake\n    reachy-mini-cli move sleep --json\n",
+      "ok": true
+    },
+    {
+      "index": 7,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain demo-mode"
+      },
+      "result": "exit=0\n# reachy-mini-cli demo-mode\n\nMake the robot *feel alive*. A continuously-running loop streams gentle idle\nmotion to the robot — a slow breathing oscillation, the occasional glance to a\nnew gaze target, and a little antenna sway — so an otherwise idle robot looks\npresent rather than frozen. The motion is a stream of `move goto` calls over the\ntransport, so it needs a running daemon (`reachy-mini-cli daemon start`).\n\nIt is meant to run always-on and improve over time, so it has three layers:\na tracked **process** (start/stop/restart), a persisted **config** file, and an\noptional systemd `--user` **service**.\n\n## Process verbs\n\n- `reachy-mini-cli demo-mode start` — spawn the loop in the background, recording\n  its PID + log under the state dir. For `--transport http` it first preflights\n  the daemon's health route so it never spawns a loop with nothing to drive.\n  Idempotent: reports `already-running` if a tracked loop is alive.\n- `reachy-mini-cli demo-mode stop` — SIGTERM the loop this CLI started (so it\n  eases the robot back to neutral before exiting), escalating to SIGKILL past\n  `--timeout`.\n- `reachy-mini-cli demo-mode restart` — apply an update. If the systemd service\n  is active it is restarted; otherwise the background loop is stopped and\n  relaunched. Either way the new process re-imports the latest motion code and\n  re-reads the config.\n- `reachy-mini-cli demo-mode status` — the loop's process state (running /\n  stopped / stale), the systemd unit state, and whether the daemon answers.\n- `reachy-mini-cli demo-mode run` — run the loop in the foreground (what `start`\n  and the service launch). Ctrl-C stops it. `--max-ticks N` runs a fixed number\n  of poses.\n- `reachy-mini-cli demo-mode overview` — this summary.\n\n## Config\n\n`demo-mode config` reads/writes the persisted tuning at\n`$XDG_CONFIG_HOME/reachy/demo-mode.json`. `run`/`start` read it; CLI flags\noverride per-invocation (precedence: flag > config file > built-in default).\n\n- `reachy-mini-cli demo-mode config` — show the resolved config + its path.\n- `reachy-mini-cli demo-mode config --init` — write a default config file.\n- `reachy-mini-cli demo-mode config --set energy=0.8 interval=3` — set keys.\n\nKeys: `transport`, `base_url`, `timeout`, `interval`, `energy`, `interpolation`,\n`seed`, `wake`, `settle`. Tuning meaning:\n\n- `interval` — seconds between poses (tempo; default 2.5).\n- `energy` — liveliness multiplier scaling every amplitude (default 1.0;\n  `0` is nearly still, `>1` is bigger motion).\n- `interpolation` — `{minjerk,linear,ease,cartoon}` curve between poses.\n- `seed` — make the idle motion reproducible (`none` for random).\n- `wake` / `settle` — wake on start / ease to neutral on stop (override with\n  the `--no-wake` / `--no-settle` flags).\n\n## Service (systemd --user)\n\nRun it always-on, auto-restarting on crash and starting on boot:\n\n- `reachy-mini-cli demo-mode install` — write the `reachy-demo-mode.service` unit\n  (ExecStart re-invokes `demo-mode run --config <path>`).\n- `reachy-mini-cli demo-mode enable` — `systemctl --user enable --now` + enable\n  linger so it survives logout/reboot (`--no-linger` to skip).\n- `reachy-mini-cli demo-mode disable` — `systemctl --user disable --now`.\n- `reachy-mini-cli demo-mode uninstall` — remove the unit file.\n\nWithout a systemd user session these exit `2` with a hint; use start/stop instead.\n\n## Transports\n\nRobot verbs reach the robot through a selectable flavor:\n\n- `http` (default) — the Reachy daemon's REST API (default\n  `http://localhost:8000`, override with `--base-url` or `REACHY_BASE_URL`).\n  Uses only the standard library, so the CLI stays dependency-free.\n- `sdk` — the in-process `reachy_mini` client; needs the optional `[sdk]` extra\n  (`pip install 'reachy-mini-cli[sdk]'`). Covers motion/state; daemon and app verbs\n  require `http`.\n\nSelect with `--transport {http,sdk}` (or `REACHY_TRANSPORT`). If the daemon is\nunreachable, the command exits 2 with an `error:`/`hint:` pair — no traceback.\n\n\n## Notes\n\n- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`:\n  `demo-mode.pid` + `demo-mode.log`.\n\n## Usage\n\n    reachy-mini-cli daemon start                       # something for the loop to drive\n    reachy-mini-cli demo-mode config --set energy=0.7  # tune it\n    reachy-mini-cli demo-mode start                    # robot starts feeling alive\n    reachy-mini-cli demo-mode restart                  # apply config/code updates\n    reachy-mini-cli demo-mode install && reachy-mini-cli demo-mode enable  # always-on\n",
+      "ok": true
+    },
+    {
+      "index": 8,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain behavior"
+      },
+      "result": "exit=0\n# reachy-mini-cli behavior\n\nCompose robot behaviors on a 50 Hz control loop. A persistent **engine** holds a\nset of active behaviors; you push behaviors onto it from separate commands, and a\nper-channel contention model decides who drives each part of the robot when they\nconflict. `feel-alive` runs as a passive base layer, so an idle robot keeps\nbreathing on any channel nothing else claims.\n\nThe engine streams *immediate* `set_target` poses, so **it owns motion\nexclusively while running** — don't drive the robot with `move goto` / `demo-mode`\nat the same time. The http transport needs a running daemon\n(`reachy-mini-cli daemon start`).\n\n## Channels and contention\n\nBehaviors claim one or more **channels** — `head`, `antennas`, `body_yaw` — and\ncarry a contention **class**:\n\n- `passive` — drives a channel only when nothing else claims it; yields instantly.\n- `stoppable` — drives, but a newly-started `stopping` behavior removes it.\n- `unstoppable` — holds its channels until it finishes on its own; never removed.\n- `stopping` — on start, stops the `stoppable` behaviors sharing its channels.\n\nSame-channel conflicts resolve by class priority\n(`unstoppable` > `stopping` > `stoppable` > `passive`), then by most-recent.\n\n## Lifetime\n\n- one-shot (`--once`) — runs once for `--duration` seconds, then expires;\n- looping (`--loop`) — repeats until `--duration` elapses, or forever (no\n  duration) until stopped.\n\nEach behavior has a natural default (e.g. `gaze-hold` is one-shot, `speak` loops).\n\n## Sensing\n\nAll built-in behaviors are pure motion. For **sound-orienting**, see the dedicated\n`reachy-mini-cli listen` noun (`reachy-mini-cli explain listen`): it drives the\ndaemon's smooth minjerk `goto` planner instead of the engine's `set_target`\nstream, which is jerky for big reorienting turns. (The engine keeps a general\ncapability to feed a sensor-driven behavior a live reading, but ships none today.)\n\n## Verbs\n\n- `reachy-mini-cli behavior list` — the built-in catalog (names, channels,\n  default class, parameters). No robot needed.\n- `reachy-mini-cli behavior run <name> [--set k=v ...] [--class CLASS]\n  [--channels ...] [--once|--loop] [--duration N]` — push a behavior onto the\n  engine (auto-starts it). Reports what it admitted / evicted / is blocked on.\n- `reachy-mini-cli behavior stop <id|name|all>` — stop a running behavior\n  (`all` keeps the passive base layer).\n- `reachy-mini-cli behavior status` — active behaviors, per-channel ownership,\n  and engine/daemon state.\n- `reachy-mini-cli behavior engine start|stop|status|run` — manage the 50 Hz\n  engine process (start/stop in the background, or `run` in the foreground).\n- `reachy-mini-cli behavior overview` — the verb summary.\n\n## Transports\n\nRobot verbs reach the robot through a selectable flavor:\n\n- `http` (default) — the Reachy daemon's REST API (default\n  `http://localhost:8000`, override with `--base-url` or `REACHY_BASE_URL`).\n  Uses only the standard library, so the CLI stays dependency-free.\n- `sdk` — the in-process `reachy_mini` client; needs the optional `[sdk]` extra\n  (`pip install 'reachy-mini-cli[sdk]'`). Covers motion/state; daemon and app verbs\n  require `http`.\n\nSelect with `--transport {http,sdk}` (or `REACHY_TRANSPORT`). If the daemon is\nunreachable, the command exits 2 with an `error:`/`hint:` pair — no traceback.\n\n\n## Notes\n\n- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`:\n  `behavior/engine.pid`, `behavior/engine.log`, and a command spool +\n  `state.json` the CLI and engine talk through.\n- The engine tick rate is `--compose-hz` (default 50); the base layer's\n  liveliness is `--energy`; disable the base layer with `--no-base-layer`.\n\n## Usage\n\n    reachy-mini-cli daemon start                         # something to drive\n    reachy-mini-cli behavior engine start                # bring the 50 Hz loop up\n    reachy-mini-cli behavior run speak --duration 8      # head bobs like speech\n    reachy-mini-cli behavior run antenna-sway --loop --class stopping \\\n        --channels antennas body_yaw                     # sway + seize the body yaw\n    reachy-mini-cli behavior status --json\n    reachy-mini-cli behavior stop all\n    reachy-mini-cli behavior engine stop                 # eases robot to neutral\n",
+      "ok": true
+    },
+    {
+      "index": 9,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain app"
+      },
+      "result": "exit=0\n# reachy-mini-cli app\n\nManage Reachy Mini apps (daemon-side; requires `--transport http`).\n\n## Verbs\n\n- `reachy-mini-cli app list` — available apps, installed and installable.\n  Calls `GET /api/apps/list-available`.\n- `reachy-mini-cli app status` — the currently running app, if any.\n- `reachy-mini-cli app start <name>` — start an installed app by name.\n- `reachy-mini-cli app stop` — stop the currently running app.\n- `reachy-mini-cli app overview` — this summary.\n\n## Transports\n\nRobot verbs reach the robot through a selectable flavor:\n\n- `http` (default) — the Reachy daemon's REST API (default\n  `http://localhost:8000`, override with `--base-url` or `REACHY_BASE_URL`).\n  Uses only the standard library, so the CLI stays dependency-free.\n- `sdk` — the in-process `reachy_mini` client; needs the optional `[sdk]` extra\n  (`pip install 'reachy-mini-cli[sdk]'`). Covers motion/state; daemon and app verbs\n  require `http`.\n\nSelect with `--transport {http,sdk}` (or `REACHY_TRANSPORT`). If the daemon is\nunreachable, the command exits 2 with an `error:`/`hint:` pair — no traceback.\n\n\n## Usage\n\n    reachy-mini-cli app list\n    reachy-mini-cli app start my-app\n    reachy-mini-cli app stop --json\n",
+      "ok": true
+    },
+    {
+      "index": 10,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain whoami"
+      },
+      "result": "exit=0\n# reachy-mini-cli whoami\n\nReports the agent's identity from `culture.yaml`: nick (`suffix`), backend,\nserved model, and the package version. Read-only.\n\n## Usage\n\n    reachy-mini-cli whoami\n    reachy-mini-cli whoami --json\n",
+      "ok": true
+    },
+    {
+      "index": 11,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain doctor"
+      },
+      "result": "exit=0\n# reachy-mini-cli doctor\n\nChecks the agent-identity invariants `steward doctor` verifies:\nprompt-file-present and backend-consistency (`claude` → `CLAUDE.md`), plus a\nskills-present check. Exits 1 when unhealthy.\n\n## Usage\n\n    reachy-mini-cli doctor\n    reachy-mini-cli doctor --json\n",
+      "ok": true
+    },
+    {
+      "index": 12,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli whoami"
+      },
+      "result": "exit=0\nnick: reachy-mini-cli\nversion: 0.10.0\nbackend: unknown\nmodel: unknown\n",
+      "ok": true
+    },
+    {
+      "index": 13,
+      "tool": "list_dir",
+      "arguments": {
+        "path": "reachy"
+      },
+      "result": "__init__.py\n__main__.py\n__pycache__/\nalive.py\nbehavior/\ncli/\ndaemon.py\ndemo_config.py\ndemo_service.py\nexplain/\nlooputil.py\nmotion/\nrobot/",
+      "ok": true
+    },
+    {
+      "index": 14,
+      "tool": "list_dir",
+      "arguments": {
+        "path": "reachy/cli"
+      },
+      "result": "__init__.py\n__pycache__/\n_commands/\n_errors.py\n_output.py",
+      "ok": true
+    },
+    {
+      "index": 15,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli explain listen 2>/dev/null || echo \"no listen noun\""
+      },
+      "result": "exit=0\n# reachy-mini-cli listen\n\nOrient the robot toward sound in real time. `listen` is **SDK-first**: it streams\nlive audio from the mic array via the `reachy_mini` SDK (the `sdk` transport is the\ndefault), so DoA and loudness are computed in-process — no round-trip to the daemon.\nThe HTTP transport remains available via `--transport http` / `REACHY_TRANSPORT=http`\nfor a control box talking to a remote daemon.\n\n## Two-tier reaction\n\nThe loop runs two tiers simultaneously:\n\n**Tier 1 — antenna lean (always on):** A lightweight, near-continuous lean of the\n*antennas* (and head holds position) toward the incoming DoA on every tick. This gives\nthe robot a subtle \"perked ear\" reaction to any live sound, even faint ambient noise,\nwithout moving the body.\n\n**Tier 2 — head→body turn (speech or loud snap):** On detected *speech* or a loud\nRMS transient (\"snap\") — a sudden noise spike above a ratio × floor threshold — the\nrobot executes a slow, smooth head→body turn:\n\n1. The head turns toward the source first.\n2. If the source is beyond `--head-only-band` degrees from center, the body rotates\n   to face the source and the head re-centers, so the whole robot is re-oriented.\n\nA **latched-DoA guard** prevents stale angles from triggering a spurious turn: the\ndaemon's DoA angle freezes at rest, so Tier-2 fires only on live speech/snap, never\non the last angle left over from a previous sound.\n\n**Always-alive idle (between sounds):** when nothing reactive fires, the robot\nkeeps gently moving — breathing, a slow gaze wander, and antenna sway — *around its\ncurrent heading*, so it is never frozen. A robot that turned toward a sound stays\nrotated and keeps wandering there; after `--recenter-after` seconds of silence the\nhead and body drift slowly back toward front (`--drift-speed` deg/s) rather than\nhard-snapping home. `--idle-energy 0` restores the old hold-still behaviour.\n\nThe `SnapDetector` (`reachy/motion/snap.py`) implements the RMS spike detection,\nalgorithm cited from `reachy_nova`'s `TrackingManager.detect_snap`.\n\nUnlike the behavior engine — which streams immediate `set_target` poses at 50 Hz\n(jerky for big reorienting turns) — this loop drives the smooth minjerk `goto`\nplanner and runs moves strictly one at a time through a serial motion queue.\n\nIt degrades gracefully: no mic, a DoA error, or (with `--speech-only`) no speech ⇒\nno reaction, no crash.\n\n## Verbs\n\n- `reachy-mini-cli listen run` — run the loop in the foreground (what `start` and\n  the process launch run). Ctrl-C stops it; `--max-ticks N` runs a fixed number of\n  ticks. Eases to center on start (preflight) and on stop.\n- `reachy-mini-cli listen start` — spawn the loop in the background, recording its\n  PID + log under the state dir. For `--transport http` it first preflights the\n  daemon's health route. Idempotent: reports `already-running` if a tracked loop\n  is alive.\n- `reachy-mini-cli listen stop` — SIGTERM the loop this CLI started (so it eases\n  back to center before exiting), escalating to SIGKILL past `--timeout`.\n- `reachy-mini-cli listen restart` — stop the tracked loop and relaunch it, so the\n  new process re-reads the tuning and the latest code.\n- `reachy-mini-cli listen status` — the loop's process state (running / stopped /\n  stale) and whether the daemon answers.\n- `reachy-mini-cli listen overview` — the verb summary.\n\n## Tuning\n\nFeel knobs (each defaults to a tuned value; unset keeps it):\n\n- `--gain X` — DoA-to-head-yaw scaling factor.\n- `--deadband DEG` — ignore sound within this angle of the current heading.\n- `--hold SECONDS` — after a Tier-2 turn, stay there this long before reconsidering.\n- `--speed DEG_PER_S` — slew speed for Tier-2 turns and for easing back to center.\n- `--recenter-after SECONDS` — silence grace before the head/body start drifting home.\n- `--idle-energy X` — liveliness of the always-alive idle motion (0 = hold still).\n- `--drift-speed DEG_PER_S` — how fast the head/body drift home after silence.\n- `--speech-only` — Tier-2 reacts only to detected speech (Tier-1 still runs).\n- `--antenna-max DEG` — maximum antenna lean angle for Tier-1.\n- `--body-yaw-max DEG` — maximum body yaw for Tier-2 body rotation.\n- `--head-only-band DEG` — source angles within this band stay head-only (no body\n  rotation); outside it the body turns and the head re-centers.\n- `--snap-ratio X` — RMS spike must be this many times the floor to count as a snap.\n- `--snap-floor RMS` — minimum floor RMS below which snap detection is suppressed.\n\n## Transport\n\nThe `sdk` transport (default) streams mic audio via `reachy_mini` in-process —\n`reachy-mini` and `numpy` are base runtime dependencies. The `http` transport polls\nthe daemon's DoA endpoint instead; use it with `--transport http` or\n`REACHY_TRANSPORT=http` on a control box that talks to a remote daemon.\n\n## Notes\n\n- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`: `listen.pid`\n  and `listen.log`.\n- Only one thing should drive the robot at a time — don't run `listen` alongside\n  `demo-mode` or the behavior engine.\n\n## Usage\n\n    reachy-mini-cli daemon start                              # bring the daemon up\n    reachy-mini-cli listen run                                # foreground, SDK transport (default)\n    reachy-mini-cli listen run --transport http               # foreground, HTTP transport\n    reachy-mini-cli listen start --hold 3 --speech-only       # background, speech only\n    reachy-mini-cli listen start --antenna-max 25 --snap-ratio 4\n    reachy-mini-cli listen status --json\n    reachy-mini-cli listen stop                               # eases back to center\n",
+      "ok": true
+    },
+    {
+      "index": 16,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli daemon start --help 2>&1 | head -40"
+      },
+      "result": "exit=0\nusage: reachy-mini-cli daemon start [-h] [--json] [--base-url BASE_URL]\n                                    [--timeout TIMEOUT]\n                                    [--daemon-cmd DAEMON_CMD] [--no-wait]\n                                    [--wait-timeout WAIT_TIMEOUT]\n                                    [-- ARGS ...]\n\npositional arguments:\n  -- ARGS               Args after '--' are forwarded to reachy-mini-daemon\n                        (e.g. -- --sim --fastapi-port 9000).\n\noptions:\n  -h, --help            show this help message and exit\n  --json                Emit structured JSON.\n  --base-url BASE_URL   Daemon base URL for the health check (env\n                        REACHY_BASE_URL).\n  --timeout TIMEOUT     Health-check request timeout in seconds (default:\n                        10.0).\n  --daemon-cmd DAEMON_CMD\n                        Override the daemon launch command (env\n                        REACHY_DAEMON_CMD).\n  --no-wait             Return immediately after spawning, without polling the\n                        health route.\n  --wait-timeout WAIT_TIMEOUT\n                        Seconds to wait for the daemon to become healthy\n                        (default: 30).\n",
+      "ok": true
+    },
+    {
+      "index": 17,
+      "tool": "run_command",
+      "arguments": {
+        "command": "reachy-mini-cli --help 2>&1"
+      },
+      "result": "exit=0\nusage: reachy-mini-cli [-h] [--version]\n                       {whoami,learn,explain,overview,doctor,cli,daemon,device,app,move,demo-mode,behavior,listen}\n                       ...\n\nreachy-mini-cli — a clonable template for AgentCulture mesh agents.\n\npositional arguments:\n  {whoami,learn,explain,overview,doctor,cli,daemon,device,app,move,demo-mode,behavior,listen}\n    whoami              Report this agent's nick, version, backend, and served\n                        model.\n    learn               Print a structured self-teaching prompt for agent\n                        consumers.\n    explain             Print markdown docs for a noun/verb path. Supports\n                        --json.\n    overview            Read-only descriptive snapshot of the agent (identity,\n                        verbs, artifacts).\n    doctor              Check the agent-identity invariants (prompt-file-\n                        present, backend-consistency).\n    cli                 CLI-surface introspection (see 'reachy-mini-cli cli\n                        overview').\n    daemon              Local daemon process lifecycle (see 'reachy-mini-cli\n                        daemon overview').\n    device              Device setup and status (see 'reachy-mini-cli device\n                        overview').\n    app                 App management (see 'reachy-mini-cli app overview').\n    move                Runtime motion (see 'reachy-mini-cli move overview').\n    demo-mode           Make the robot feel alive (see 'reachy-mini-cli demo-\n                        mode overview').\n    behavior            Compose robot behaviors on a 50 Hz loop (see 'reachy-\n                        mini-cli behavior overview').\n    listen              Orient the head toward sound (see 'reachy-mini-cli\n                        listen overview').\n\noptions:\n  -h, --help            show this help message and exit\n  --version             show program's version number and exit\n",
+      "ok": true
+    },
+    {
+      "index": 18,
+      "tool": "finish",
+      "arguments": {
+        "summary": "Learned reachy-mini-cli comprehensively by running `reachy-mini-cli learn` and exploring all nouns (daemon, device, app, move, demo-mode, behavior, listen) and meta commands (whoami, explain, overview, doctor). Real mode operation: start the daemon, check device status, control motion with `move goto`, bring the robot to life with `demo-mode start`, compose behaviors via the 50 Hz engine, and react to sound with `listen run`. Key rule: only one subsystem drives the robot at a time."
+      },
+      "result": "finished",
+      "ok": true
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 74437,
+    "completion_tokens": 2038,
+    "total_tokens": 76475
+  },
+  "stats": {
+    "request": "Learn 'reachy-mini-cli' with calling 'reachy-mini-cli learn' to learn how to operate reachy-mini and run it in real mode",
+    "started_at": "2026-06-08T11:31:34.433614+00:00",
+    "duration_seconds": 110.252151,
+    "model_turns": 10,
+    "step_count": 19,
+    "tool_counts": {
+      "list_dir": 3,
+      "run_command": 15,
+      "finish": 1
+    },
+    "files_changed": 0,
+    "bytes_written": 0,
+    "reasoning_chars": 2708,
+    "reasoning_bytes": 2708,
+    "answer_chars": 2659,
+    "answer_bytes": 2675
+  },
+  "artifacts_path": ".colleague/de96a2153ae9.learn-reachy-mini-cli-with-calling.json",
+  "error": null,
+  "branch": null,
+  "pr_url": null,
+  "hook_firings": [],
+  "command": null,
+  "not_finished": false,
+  "stopped_without_finish": false
+}

@@ -114,7 +114,7 @@ def cmd_say_run(args: argparse.Namespace) -> int:
                 code=EXIT_USER_ERROR,
                 message="no text received from stdin",
                 remediation=(
-                    "pipe non-empty text into the command, " "e.g. echo 'hello' | reachy say run -"
+                    "pipe non-empty text into the command, e.g. echo 'hello' | reachy say run -"
                 ),
             )
     else:

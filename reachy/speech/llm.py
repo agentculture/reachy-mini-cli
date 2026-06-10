@@ -84,6 +84,62 @@ class LlmConfig:
 # ---------------------------------------------------------------------------
 
 
+def _update_nesting(ch: str, paren_depth: int, quote_open: bool) -> tuple[int, bool]:
+    """Fold one character into the quote / paren nesting state."""
+    if ch == "“":  # left "
+        quote_open = True
+    elif ch == "”":  # right "
+        quote_open = False
+    elif ch == '"':  # ASCII — toggle
+        quote_open = not quote_open
+
+    if ch == "(":
+        paren_depth += 1
+    elif ch == ")":
+        paren_depth = max(0, paren_depth - 1)
+
+    return paren_depth, quote_open
+
+
+def _ends_sentence(text: str, i: int) -> bool:
+    """Whether index *i* is sentence-terminal: ``.!?`` directly, or a closing
+    quote / paren that immediately follows terminal punctuation (``."`` ``!)``)."""
+    ch = text[i]
+    if ch in ".!?":
+        return True
+    if ch in '"”)':
+        k = i - 1
+        while k >= 0 and text[k] in "\"”)’'":
+            k -= 1
+        return k >= 0 and text[k] in ".!?"
+    return False
+
+
+def _next_sentence_start(text: str, i: int) -> int | None:
+    """After a terminal at *i*, return the raw index where the next sentence
+    starts — skipping closing markdown then requiring whitespace — but only when
+    the following character (through opening markdown) is uppercase. Else None.
+    """
+    # Skip closing markdown after terminal punct (e.g. !** or ."*)
+    j = i + 1
+    while j < len(text) and text[j] in _MARKDOWN_CHARS:
+        j += 1
+    # Must find at least one whitespace character
+    ws_start = j
+    while j < len(text) and text[j] in " \t\n\r":
+        j += 1
+    if j == ws_start:
+        return None
+    # Start of the next sentence in raw text (may include opening markdown)
+    sentence_start = j
+    # Peek past opening markdown to find the actual first letter
+    while j < len(text) and text[j] in _MARKDOWN_CHARS:
+        j += 1
+    if j < len(text) and text[j].isupper():
+        return sentence_start
+    return None
+
+
 def _find_sentence_breaks(text: str) -> list[int]:
     """Return character indices where new sentences start.
 
@@ -103,55 +159,15 @@ def _find_sentence_breaks(text: str) -> list[int]:
     quote_open = False
 
     for i, ch in enumerate(text):
-        # --- track nesting depth ---
-        if ch == "“":  # left "
-            quote_open = True
-        elif ch == "”":  # right "
-            quote_open = False
-        elif ch == '"':  # ASCII — toggle
-            quote_open = not quote_open
-
-        if ch == "(":
-            paren_depth += 1
-        elif ch == ")":
-            paren_depth = max(0, paren_depth - 1)
-
+        paren_depth, quote_open = _update_nesting(ch, paren_depth, quote_open)
         # While nested inside quotes or parens, no boundary is possible.
         if paren_depth > 0 or quote_open:
             continue
-
-        # --- detect sentence-ending position ---
-        is_terminal = ch in ".!?"
-
-        # A closing quote/paren right after terminal punct also ends the
-        # sentence:  ."  !)  ?")  etc.
-        if not is_terminal and ch in '"”)':
-            k = i - 1
-            while k >= 0 and text[k] in "\"”)’'":
-                k -= 1
-            is_terminal = k >= 0 and text[k] in ".!?"
-
-        if not is_terminal:
+        if not _ends_sentence(text, i):
             continue
-
-        # --- look ahead: closing-markdown*, whitespace+, opening-markdown*, uppercase ---
-        j = i + 1
-        # Skip closing markdown after terminal punct  (e.g. !** or ."*)
-        while j < len(text) and text[j] in _MARKDOWN_CHARS:
-            j += 1
-        # Must find at least one whitespace character
-        ws_start = j
-        while j < len(text) and text[j] in " \t\n\r":
-            j += 1
-        if j == ws_start:
-            continue
-        # Start of the next sentence in raw text (may include opening markdown)
-        sentence_start = j
-        # Peek past opening markdown to find the actual first letter
-        while j < len(text) and text[j] in _MARKDOWN_CHARS:
-            j += 1
-        if j < len(text) and text[j].isupper():
-            breaks.append(sentence_start)
+        start = _next_sentence_start(text, i)
+        if start is not None:
+            breaks.append(start)
 
     return breaks
 
@@ -249,7 +265,7 @@ def stream_chat_completion(
                 "REACHY_LLM_API_KEY is valid"
             ),
         ) from err
-    except (urllib.error.URLError, OSError) as err:
+    except OSError as err:  # URLError is an OSError subclass — this covers both
         raise CliError(
             code=EXIT_ENV_ERROR,
             message=f"cannot reach LLM at {cfg.base_url}: {err}",

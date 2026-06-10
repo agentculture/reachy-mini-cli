@@ -276,7 +276,7 @@ class CognitionEngine:
                 pcm = self._synthesize(item, **self._tts_kwargs)
                 if pcm:
                     self._play_audio(pcm, **self._playback_kwargs)
-        except BaseException as exc:  # noqa: BLE001 — re-raised on the turn thread
+        except Exception as exc:  # noqa: BLE001 — re-raised on the turn thread
             error_out.append(exc)
             # Drain any remaining items so a blocked producer's put() unblocks and
             # the sentinel is consumed; we are abandoning playback for this turn.

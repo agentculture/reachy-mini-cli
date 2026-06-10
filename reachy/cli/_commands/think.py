@@ -140,9 +140,9 @@ def _make_sdk_feed(transport: object, buffer: EventBuffer) -> Callable[[], None]
         sample = session.get_audio_sample()
         rms = float(np.sqrt(np.mean(sample**2))) if sample is not None else 0.0
         _feed_doa(buffer, sense, rms)
-        # TODO(t-vision): also feed camera motion + light via buffer.feed_vision()
-        # once a vision media path is wired here (the engine already consumes any
-        # cues the buffer holds — see reachy.vision.* + EventBuffer.feed_vision).
+        # Vision cues (camera motion + light) are not fed here yet — tracked in
+        # issue #32. The engine already consumes any cues the buffer holds, so
+        # wiring buffer.feed_vision() later is additive (see reachy.vision.*).
 
     return _feed
 
