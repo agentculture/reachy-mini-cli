@@ -51,8 +51,9 @@ _CHUNK_FRAMES = 512
 _INT16_BYTES = 2
 
 DEFAULT_BASE_URL = "http://localhost:8000"
-_UPLOAD_PATH = "/media/sounds/upload"
-_PLAY_PATH = "/media/play_sound"
+# The daemon mounts its routers under /api (health is /api/daemon/status).
+_UPLOAD_PATH = "/api/media/sounds/upload"
+_PLAY_PATH = "/api/media/play_sound"
 
 # Default filename used when uploading a synthesized WAV to the daemon.
 _UPLOAD_FILENAME = "tts_synth.wav"

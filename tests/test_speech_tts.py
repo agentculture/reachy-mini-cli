@@ -103,7 +103,8 @@ def test_synthesize_sends_correct_form_fields(monkeypatch: pytest.MonkeyPatch) -
 
     def _capture(req, timeout=None):
         captured.append(req)
-        return _FakeResponse(_fake_pcm())
+        # Full-length clip so the truncation guard doesn't retry (1 call expected).
+        return _FakeResponse(_fake_pcm(40_000))
 
     monkeypatch.setattr("urllib.request.urlopen", _capture)
 
@@ -321,3 +322,66 @@ def test_voice_arg_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
     synthesize("Test.", tts_url="http://stub:9000", voice="explicit-voice")
     assert b"explicit-voice" in captured[0]
     assert b"env-voice" not in captured[0]
+
+
+# ---------------------------------------------------------------------------
+# Live-test regressions — the Magpie server returns a WAV container and
+# intermittently truncates; synthesize must unwrap to bare PCM and retry.
+# ---------------------------------------------------------------------------
+
+
+def _wav_bytes(pcm: bytes, *, rate: int = 22050) -> bytes:
+    """Wrap raw PCM16 mono in a RIFF/WAVE container (what the Magpie server returns)."""
+    import wave as _wave
+
+    buf = io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def test_synthesize_unwraps_wav_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A RIFF/WAVE response is unwrapped to its bare PCM data chunk (no RIFF header)."""
+    pcm = _fake_pcm(4096)
+    wav = _wav_bytes(pcm)
+    assert wav[:4] == b"RIFF"  # the server returns a container
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _FakeResponse(wav))
+
+    result = synthesize("Speak this please.", tts_url="http://stub:9000")
+    assert result[:4] != b"RIFF", "WAV header leaked into the PCM stream"
+    assert result == pcm
+
+
+def test_synthesize_retries_truncated_then_returns_full(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A truncated first response triggers a retry; the full clip is returned."""
+    text = "Hello there friend, this is a longer sentence for synthesis."
+    truncated = _fake_pcm(800)  # << 15ms/char floor -> flagged truncated
+    full = _fake_pcm(80_000)  # plausible full clip
+    responses = iter([truncated, full])
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=None: _FakeResponse(next(responses)),
+    )
+
+    result = synthesize(text, tts_url="http://stub:9000")
+    assert result == full, "should retry past the truncated clip and return the full one"
+
+
+def test_synthesize_keeps_longest_when_all_truncated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If every attempt is truncated, the longest clip is returned (not empty)."""
+    text = "Another long-enough sentence to exceed the truncation floor here."
+    clips = [_fake_pcm(400), _fake_pcm(1200), _fake_pcm(600)]
+    responses = iter(clips)
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=None: _FakeResponse(next(responses)),
+    )
+
+    result = synthesize(text, tts_url="http://stub:9000")
+    assert result == clips[1], "should keep the longest of the truncated attempts"

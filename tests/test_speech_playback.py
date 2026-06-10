@@ -190,15 +190,15 @@ def test_http_upload_and_play(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     upload_call, play_call = fake_handler.calls
 
-    # First call: multipart upload
+    # First call: multipart upload (daemon mounts media under /api)
     assert upload_call["url"].endswith(
-        "/media/sounds/upload"
+        "/api/media/sounds/upload"
     ), f"Upload URL mismatch: {upload_call['url']}"
     assert upload_call["method"] == "POST"
 
     # Second call: play_sound with the returned path
     assert play_call["url"].endswith(
-        "/media/play_sound"
+        "/api/media/play_sound"
     ), f"play_sound URL mismatch: {play_call['url']}"
     assert play_call["method"] == "POST"
     assert "file" in play_call.get("json_body", {}), f"play_sound body missing 'file': {play_call}"

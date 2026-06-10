@@ -5,7 +5,7 @@ only — no httpx / requests) and returns raw PCM16 bytes.
 
 Configuration (environment variables):
     ``REACHY_TTS_URL``   — base URL of the TTS server (default ``http://localhost:9000``).
-    ``REACHY_TTS_VOICE`` — voice identifier sent in the POST form (default ``en-US-female``).
+    ``REACHY_TTS_VOICE`` — voice id sent in the POST form (default a Magpie voice).
 
 Function-argument overrides take precedence over env vars.
 
@@ -15,12 +15,14 @@ Cited from: autonomous-intelligence/realtime-api/src/realtime_api/tts_client.py
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
 
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 
@@ -31,7 +33,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_TTS_URL = "http://localhost:9000"
-DEFAULT_VOICE = "en-US-female"
+# Magpie multilingual default (matches the reference TTS in ../model-gear). Override
+# with --voice / REACHY_TTS_VOICE; list valid ids at GET {TTS_URL}/v1/audio/list_voices.
+DEFAULT_VOICE = "Magpie-Multilingual.EN-US.Mia.Calm"
 DEFAULT_LANGUAGE = "en-US"
 DEFAULT_ENCODING = "LINEAR_PCM"
 DEFAULT_SAMPLE_RATE = 22050
@@ -155,13 +159,78 @@ def _resolve_voice(override: str | None) -> str:
     return override or os.environ.get("REACHY_TTS_VOICE") or DEFAULT_VOICE
 
 
+def _extract_pcm(raw: bytes) -> bytes:
+    """Return bare PCM16 samples from *raw*.
+
+    The Magpie TTS returns a full RIFF/WAVE container even for ``LINEAR_PCM``,
+    but the rest of the pipeline (playback / cognition) expects raw PCM16 @
+    22050 Hz — feeding it a WAV would double-wrap the header and play noise.
+    Unwrap the ``data`` chunk when *raw* is a WAV; pass it through unchanged for
+    a server that already returns bare PCM.
+    """
+    if raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        return raw
+    try:
+        with wave.open(io.BytesIO(raw), "rb") as wav:
+            return wav.readframes(wav.getnframes())
+    except (wave.Error, EOFError):
+        return raw
+
+
+# Minimum plausible audio: ~15 ms per cleaned char (real speech at this voice is
+# ~60-80 ms/char, so 15 ms is a conservative floor). The Magpie server
+# intermittently returns a truncated clip; anything below this is a bad response
+# we retry. Cited from realtime-api's tts_client truncation guard.
+_MIN_SECONDS_PER_CHAR = 0.015
+_BYTES_PER_SAMPLE = 2  # PCM16
+_SYNTH_ATTEMPTS = 3
+
+
+def _is_truncated(clean: str, pcm: bytes) -> bool:
+    """True when *pcm* is implausibly short for *clean* (a truncated response)."""
+    if len(clean) <= 10:
+        return False
+    duration = len(pcm) / _BYTES_PER_SAMPLE / DEFAULT_SAMPLE_RATE
+    return duration < max(0.5, len(clean) * _MIN_SECONDS_PER_CHAR)
+
+
 def _post_synth(
     clean: str,
     endpoint_url: str,
     voice: str,
     timeout: float,
 ) -> bytes:
-    """POST *clean* text to *endpoint_url* and return raw PCM bytes.
+    """Synthesize *clean*, retrying when the server returns truncated audio.
+
+    The Magpie endpoint occasionally returns a short/truncated clip for valid
+    input; we re-request up to ``_SYNTH_ATTEMPTS`` times and keep the longest
+    result rather than play a clipped fragment. Raises
+    :class:`~reachy.cli._errors.CliError` (code 2) on network/HTTP failure.
+    """
+    best = b""
+    for attempt in range(_SYNTH_ATTEMPTS):
+        pcm = _synth_once(clean, endpoint_url, voice, timeout)
+        if len(pcm) > len(best):
+            best = pcm
+        if not _is_truncated(clean, pcm):
+            return pcm
+        log.warning(
+            "[tts] truncated audio (%d bytes for %d chars), attempt %d/%d",
+            len(pcm),
+            len(clean),
+            attempt + 1,
+            _SYNTH_ATTEMPTS,
+        )
+    return best
+
+
+def _synth_once(
+    clean: str,
+    endpoint_url: str,
+    voice: str,
+    timeout: float,
+) -> bytes:
+    """POST *clean* text to *endpoint_url* and return raw PCM bytes (one attempt).
 
     Raises :class:`~reachy.cli._errors.CliError` (code 2) on any network or
     HTTP-level failure — no raw exception ever escapes this function.
@@ -195,7 +264,7 @@ def _post_synth(
                         "set REACHY_TTS_URL to the correct base URL"
                     ),
                 )
-            return resp.read()
+            return _extract_pcm(resp.read())
     except CliError:
         raise
     except urllib.error.HTTPError as exc:
