@@ -417,7 +417,11 @@ class _MotionExecutor:
                 stop=self._stop,
                 max_errors=10**9,
             )
-        except BaseException as exc:  # noqa: BLE001 — degrade, never crash cognition
+        # Degrade, never crash cognition: capture any transport error from this
+        # background thread; the cognition loop owns SIGINT/SIGTERM, so letting
+        # KeyboardInterrupt/SystemExit propagate (by catching Exception, not
+        # BaseException) is correct here.
+        except Exception as exc:  # noqa: BLE001
             self._error.append(exc)
 
     def start(self) -> None:
@@ -632,6 +636,18 @@ DEMO_SCRIPT: str = (
 )
 
 
+def _demo_speak(args: argparse.Namespace, text: str) -> None:
+    """Synthesize ``text`` and play it, honoring the demo's TTS/playback flags."""
+    tts_kw: dict = {}
+    if getattr(args, "tts_url", None) is not None:
+        tts_kw["tts_url"] = args.tts_url
+    if getattr(args, "voice", None) is not None:
+        tts_kw["voice"] = args.voice
+    pcm = _synthesize(text, **tts_kw)
+    if pcm:
+        _play_audio(pcm, **_playback_kwargs(args))
+
+
 def cmd_think_demo(args: argparse.Namespace) -> int:
     """Run a scripted ``*emoji* "speech"`` stream through the real pipeline.
 
@@ -663,15 +679,7 @@ def cmd_think_demo(args: argparse.Namespace) -> int:
                     motion.express(event.emoji)
                     expressed.append(event.emoji)
                 elif isinstance(event, SpeechEvent):
-                    tts_kw: dict = {}
-                    if getattr(args, "tts_url", None) is not None:
-                        tts_kw["tts_url"] = args.tts_url
-                    if getattr(args, "voice", None) is not None:
-                        tts_kw["voice"] = args.voice
-                    pb_kw = _playback_kwargs(args)
-                    pcm = _synthesize(event.text, **tts_kw)
-                    if pcm:
-                        _play_audio(pcm, **pb_kw)
+                    _demo_speak(args, event.text)
                     spoken.append(event.text)
         finally:
             motion.stop()

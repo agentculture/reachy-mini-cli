@@ -184,46 +184,44 @@ class MarkerParser:
 
     def _step(self, ch: str) -> Event | None:
         """Process one character and return a completed event or None."""
-        if self._state == _STATE_IDLE:
-            if ch == "*":
-                self._state = _STATE_MARKER
-                self._buf.clear()
-            elif ch == '"':
-                self._state = _STATE_SPEECH
-                self._buf.clear()
-            # Everything else outside spans is silently ignored.
-            return None
-
+        # Inside a span: a matching delimiter closes it, anything else is literal
+        # content.  Both spans are symmetric, so they share one handler.
         if self._state == _STATE_MARKER:
-            if ch == "*":
-                # Closing asterisk — close the span and emit (if non-empty).
-                content = "".join(self._buf).strip()
-                self._state = _STATE_IDLE
-                self._buf.clear()
-                if content:
-                    return MarkerEvent(emoji=content)
-                return None
-            # Inside a marker span asterisks-as-content cannot occur; every
-            # ``*`` closes the current marker.  Quotes inside a marker are
-            # accumulated as literal content.
-            self._buf.append(ch)
-            return None
-
+            return self._step_span(ch, "*", MarkerEvent, "emoji")
         if self._state == _STATE_SPEECH:
-            if ch == '"':
-                # Closing double-quote — close the span and emit (if non-empty).
-                content = "".join(self._buf).strip()
-                self._state = _STATE_IDLE
-                self._buf.clear()
-                if content:
-                    return SpeechEvent(text=content)
-                return None
-            # Inside a speech span any character (including ``*``) is literal.
+            return self._step_span(ch, '"', SpeechEvent, "text")
+
+        # Idle: a delimiter opens a span; everything else is silently ignored.
+        if ch == "*":
+            self._state = _STATE_MARKER
+            self._buf.clear()
+        elif ch == '"':
+            self._state = _STATE_SPEECH
+            self._buf.clear()
+        return None
+
+    def _step_span(
+        self,
+        ch: str,
+        delimiter: str,
+        event_cls: type[MarkerEvent] | type[SpeechEvent],
+        field: str,
+    ) -> Event | None:
+        """Handle one character inside an open span.
+
+        A ``delimiter`` closes the span and emits ``event_cls(**{field: content})``
+        when the stripped content is non-empty; any other character is
+        accumulated as literal content.
+        """
+        if ch != delimiter:
             self._buf.append(ch)
             return None
-
-        # Should be unreachable; treat as idle to recover gracefully.
-        return None  # pragma: no cover
+        content = "".join(self._buf).strip()
+        self._state = _STATE_IDLE
+        self._buf.clear()
+        if content:
+            return event_cls(**{field: content})
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -46,7 +46,6 @@ re-calibrated.
 from __future__ import annotations
 
 import math
-from typing import Union
 
 from reachy.speech.expressions import NEUTRAL_KEY, Catalog, ExpressionPose
 
@@ -124,7 +123,7 @@ def distance(a: ExpressionPose, b: ExpressionPose) -> float:
 
 
 def find_too_similar(
-    catalog: Union[dict[str, ExpressionPose], Catalog],
+    catalog: dict[str, ExpressionPose] | Catalog,
     threshold: float | None = None,
 ) -> list[tuple[str, str, float]]:
     """Scan a catalog and return expression pairs that are too similar.
