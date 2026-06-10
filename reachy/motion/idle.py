@@ -42,6 +42,43 @@ class AliveConfig:
     # Give up the loop after this many consecutive failed gotos (daemon gone).
     max_errors: int = 5
 
+    def focused(self) -> "AliveConfig":
+        """Return a low-energy "focused" variant of this config.
+
+        Stillness is the thinking posture: while the ``think`` cognition loop is
+        running, the always-alive idle motion should QUIET DOWN rather than stop.
+        The robot keeps *breathing* — vertical/pitch oscillation stays present,
+        just smaller — but the ambient gaze / antenna / body wander backs off so
+        the body looks calm and focused rather than restlessly looking around.
+
+        Relative to the base config this:
+
+        * keeps a (reduced) breathe — ``breathe_z_mm`` / ``breathe_pitch_deg``
+          are scaled down, never zeroed, so it still visibly breathes;
+        * sharply cuts the wander amplitudes (gaze yaw/pitch/roll, antenna sway,
+          body yaw);
+        * lowers the overall ``energy`` multiplier and ``glance_probability`` so
+          large reorienting glances become rare.
+
+        All other tunables (``interval``, ``breathe_period``, ``interpolation``,
+        ``seed``, ``max_errors``) are preserved so pacing and bookkeeping are
+        unchanged — only the *amount* of motion drops.
+        """
+        from dataclasses import replace
+
+        return replace(
+            self,
+            energy=self.energy * 0.35,
+            breathe_z_mm=self.breathe_z_mm * 0.5,
+            breathe_pitch_deg=self.breathe_pitch_deg * 0.5,
+            gaze_yaw_deg=self.gaze_yaw_deg * 0.15,
+            gaze_pitch_deg=self.gaze_pitch_deg * 0.15,
+            gaze_roll_deg=self.gaze_roll_deg * 0.15,
+            antenna_deg=self.antenna_deg * 0.2,
+            body_yaw_deg=self.body_yaw_deg * 0.15,
+            glance_probability=self.glance_probability * 0.2,
+        )
+
 
 def neutral_pose(config: AliveConfig) -> dict[str, object]:
     """The centred rest pose demo-mode settles to when it stops."""
