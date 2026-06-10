@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 import time
 from typing import Callable
 
@@ -37,11 +38,17 @@ import numpy as np
 from reachy.behavior.sense import DOA_TIMEOUT, DoaPoller, read_doa
 from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
+from reachy.cli._errors import CliError
 from reachy.cli._output import emit_diagnostic, emit_result
+from reachy.motion.expression import ExpressionProducer
+from reachy.motion.queue import MotionQueue
+from reachy.motion.server import run as run_motion
 from reachy.robot import add_robot_args, get_transport
-from reachy.speech import supervisor
-from reachy.speech.cognition import DEFAULT_TURN_INTERVAL, CognitionEngine
+from reachy.speech import cognition_signal, supervisor
+from reachy.speech.cognition import DEFAULT_SYSTEM_PROMPT, DEFAULT_TURN_INTERVAL, CognitionEngine
+from reachy.speech.distinctness import find_too_similar as _find_too_similar
 from reachy.speech.events import EventBuffer
+from reachy.speech.expressions import NEUTRAL_KEY, Catalog
 from reachy.speech.llm import stream_sentences as _stream_sentences
 from reachy.speech.playback import play_audio as _play_audio
 from reachy.speech.tts import synthesize as _synthesize
@@ -63,8 +70,61 @@ _VERBS = [
     "think stop — stop the loop this CLI started",
     "think restart — restart the background loop (re-reads flags + code)",
     "think status — loop process state",
+    "think expressions — list the expression catalog (and 'expressions check')",
     "think overview — this summary",
 ]
+
+
+# --- expression vocabulary (catalog → prompt + listing) -------------------
+
+
+def _expression_emojis(catalog: Catalog | None = None) -> list[str]:
+    """The catalog's expression emojis (every key except the neutral fallback)."""
+    cat = catalog if catalog is not None else Catalog()
+    return [key for key in cat.keys() if key != NEUTRAL_KEY]
+
+
+def _pose_descriptor(catalog: Catalog, emoji: str) -> str:
+    """A short, generated descriptor of an emoji's pose (its non-zero axes).
+
+    The catalog is pose values only (the TOML's prose lives in comments, which
+    ``tomllib`` drops), so we summarise the pose itself — the non-zero axes and
+    their signed magnitudes — giving an agent a machine-stable, catalog-derived
+    descriptor without duplicating the TOML comments in code.
+    """
+    pose = catalog.get(emoji)
+    axes = [
+        ("head_x", pose.head_x),
+        ("head_y", pose.head_y),
+        ("head_z", pose.head_z),
+        ("head_roll", pose.head_roll),
+        ("head_pitch", pose.head_pitch),
+        ("head_yaw", pose.head_yaw),
+        ("antenna_right", pose.antenna_right),
+        ("antenna_left", pose.antenna_left),
+        ("body_yaw", pose.body_yaw),
+    ]
+    moved = [f"{name}{value:+g}" for name, value in axes if value]
+    return ", ".join(moved) if moved else "neutral (no offset)"
+
+
+def _build_system_prompt(*, emojis: list[str], base: str = DEFAULT_SYSTEM_PROMPT) -> str:
+    """Append the available emoji vocabulary + the marker convention to *base*.
+
+    The vocabulary is pulled from the live catalog (never hardcoded), so editing
+    ``expressions.toml`` re-shapes what the LLM is told it may express. The
+    convention line teaches the ``*emoji*`` (expression) / ``"quoted"`` (speech)
+    output contract the cognition loop parses.
+    """
+    vocab = " ".join(emojis)
+    convention = (
+        " You may express body language by emitting one of the available emojis "
+        "wrapped in asterisks (e.g. *<emoji>*); wrap everything you want spoken "
+        'aloud in double quotes (e.g. "like this"). Only quoted text is spoken; '
+        "only an asterisk-wrapped emoji moves the body. "
+        f"Available expressions: {vocab}."
+    )
+    return base + convention
 
 
 # --- overview -------------------------------------------------------------
@@ -114,6 +174,90 @@ def cmd_think_overview(args: argparse.Namespace) -> int:
         json_mode=bool(getattr(args, "json", False)),
     )
     return 0
+
+
+# --- expressions sub-noun (catalog tooling) -------------------------------
+
+_EXPR_VERBS = [
+    "expressions list — list the expression catalog (emoji + pose descriptor)",
+    "expressions check — flag catalog poses too similar to be distinct",
+    "expressions overview — this summary",
+]
+
+
+def cmd_expressions_list(args: argparse.Namespace) -> int:
+    """List the expression catalog: each emoji + a short pose descriptor."""
+    catalog = Catalog()
+    rows = [
+        {"emoji": emoji, "descriptor": _pose_descriptor(catalog, emoji)}
+        for emoji in _expression_emojis(catalog)
+    ]
+    if bool(getattr(args, "json", False)):
+        emit_result({"expressions": rows}, json_mode=True)
+    else:
+        lines = [f"{row['emoji']}  {row['descriptor']}" for row in rows]
+        emit_result("\n".join(lines), json_mode=False)
+    return 0
+
+
+def cmd_expressions_check(args: argparse.Namespace) -> int:
+    """Run the distinctness check; report flagged pairs (clean check exits 0).
+
+    A flagged pair is a *warning*, not an error — the catalog still works — so the
+    exit code stays 0; the ``--json`` ``ok`` field is the machine-readable signal.
+    """
+    catalog = Catalog()
+    flagged = _find_too_similar(catalog)
+    ok = not flagged
+    if bool(getattr(args, "json", False)):
+        emit_result(
+            {"ok": ok, "flagged": [[a, b, score] for a, b, score in flagged]},
+            json_mode=True,
+        )
+    else:
+        if ok:
+            emit_result("clean — all expressions are sufficiently distinct", json_mode=False)
+        else:
+            lines = [f"{a} ~ {b} (distance {score:.3f})" for a, b, score in flagged]
+            emit_result(
+                "too similar (" + str(len(flagged)) + " pair(s)):\n" + "\n".join(lines),
+                json_mode=False,
+            )
+    return 0
+
+
+def cmd_expressions_overview(args: argparse.Namespace) -> int:
+    sections: list[dict[str, object]] = [
+        {
+            "title": "What",
+            "items": [
+                "The emoji-keyed expression catalog think uses to gesture while "
+                "thinking (loaded from expressions.toml).",
+                "list — every catalog emoji + a generated pose descriptor.",
+                "check — flags catalog poses too similar to be meaningfully distinct.",
+            ],
+        },
+        {"title": "Verbs", "items": list(_EXPR_VERBS)},
+        {
+            "title": "Conventions",
+            "items": [
+                "every command supports --json",
+                "results to stdout, diagnostics to stderr (never mixed)",
+                "a flagged 'check' is a warning, not an error — exit stays 0",
+            ],
+        },
+    ]
+    emit_overview(
+        "reachy-mini-cli think expressions",
+        sections,
+        json_mode=bool(getattr(args, "json", False)),
+    )
+    return 0
+
+
+def _expressions_no_verb(args: argparse.Namespace) -> int:
+    # Bare `think expressions` lists the catalog.
+    return cmd_expressions_list(args)
 
 
 # --- sense feed (DoA/RMS/speech → EventBuffer) ----------------------------
@@ -218,10 +362,111 @@ def _playback_kwargs(args: argparse.Namespace) -> dict:
     }
 
 
+class _NullProducer:
+    """A producer that never originates a move — the queue is filled externally.
+
+    ``think``'s expression moves are submitted onto the :class:`MotionQueue` from
+    the cognition thread via :meth:`ExpressionProducer.express`. The motion
+    executor (:func:`reachy.motion.server.run`) still owns *draining* that queue
+    to the robot one move at a time, but it should originate nothing itself — so
+    we hand it this no-op producer whose :meth:`update` always returns ``None``.
+    The executor's serial-drain guarantee (never two moves at once) is what keeps
+    the rare expression gestures soft and non-overlapping.
+    """
+
+    def update(self, *_a: object, **_kw: object) -> None:
+        return None
+
+
+class _MotionExecutor:
+    """Background thread draining an expression queue to the robot, degrade-safe.
+
+    Wraps :func:`reachy.motion.server.run` on its own thread, draining the shared
+    :class:`MotionQueue` (which :attr:`producer` fills) to ``transport.move_goto``.
+    A :class:`~reachy.cli._errors.CliError` inside the executor (e.g. the daemon
+    went away mid-run) is captured, **not** raised on the cognition thread — motion
+    degrades to silent while the cognition loop keeps thinking/speaking. The clean
+    exit-2 for a missing ``[sdk]``/``[daemon]`` extra is raised *eagerly* at
+    :meth:`start` (before the loop), so a missing extra is still a tidy CliError,
+    not a traceback.
+    """
+
+    def __init__(self, transport: object) -> None:
+        self.transport = transport
+        self.queue = MotionQueue()
+        self.producer = ExpressionProducer(queue=self.queue)
+        self._stop = {"flag": False}
+        self._thread: threading.Thread | None = None
+        self._error: list[BaseException] = []
+
+    def express(self, emoji: str) -> None:
+        """Enqueue one calm gesture for *emoji* (drained by the executor thread)."""
+        self.producer.express(emoji)
+
+    def _drive(self) -> None:
+        try:
+            # No own stop handlers: the cognition loop owns SIGINT/SIGTERM. We
+            # tolerate transient transport errors and only stop on the flag.
+            run_motion(
+                self.transport,
+                _NullProducer(),
+                queue=self.queue,
+                stop=self._stop,
+                max_errors=10**9,
+            )
+        except BaseException as exc:  # noqa: BLE001 — degrade, never crash cognition
+            self._error.append(exc)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._drive, name="reachy-think-motion", daemon=True)
+        self._thread.start()
+
+    def drain(self) -> None:
+        """Flush any pending moves the executor hasn't issued yet (best effort).
+
+        On a bounded/clean stop the executor thread may not have serviced the last
+        enqueued gesture before the stop flag flips, so we issue whatever remains
+        synchronously here. A transport error is swallowed — draining is best
+        effort, and motion is degrade-safe by contract.
+        """
+        try:
+            while True:
+                action = self.queue.pop()
+                if action is None:
+                    return
+                self.transport.move_goto(  # type: ignore[attr-defined]
+                    head=action.head,
+                    antennas=action.antennas,
+                    body_yaw=action.body_yaw,
+                    duration=action.duration,
+                    interpolation=action.interpolation,
+                )
+        except CliError:
+            return
+
+    def stop(self) -> None:
+        self._stop["flag"] = True
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        self.drain()
+
+
+def _make_motion_executor(args: argparse.Namespace) -> _MotionExecutor:
+    """Build the expression motion executor for the selected transport.
+
+    Reuses :func:`get_transport` (the same transport flavor the sense feed uses):
+    a missing ``[sdk]``/``[daemon]`` extra raises its clean exit-2 CliError here,
+    before any loop work, mirroring the rest of ``think``.
+    """
+    transport = get_transport(args)
+    return _MotionExecutor(transport)
+
+
 def cmd_think_run(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
     buffer = EventBuffer(maxlen=_DEFAULT_MAXLEN)
     feed = _make_sense_feed(args, buffer)
+    motion = _make_motion_executor(args)
     turn_interval = _resolve_turn_interval(args)
     mute_after = _resolve_mute_after(args)
 
@@ -244,11 +489,14 @@ def cmd_think_run(args: argparse.Namespace) -> int:
 
     _guarded_feed.close = getattr(feed, "close", None)  # type: ignore[attr-defined]
 
+    system_prompt = _build_system_prompt(emojis=_expression_emojis())
     engine = CognitionEngine(
         buffer=buffer,
         stream_sentences=_stream_sentences,
         synthesize=_synthesize,
         play_audio=_guarded_play,
+        express=motion.express,
+        system_prompt=system_prompt,
         llm_kwargs=_llm_kwargs(args),
         tts_kwargs=_tts_kwargs(args),
         playback_kwargs=_playback_kwargs(args),
@@ -266,15 +514,21 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     max_turns = getattr(args, "max_turns", None)
     stop = _tick_stop(getattr(args, "max_ticks", None))
 
-    try:
-        turns = engine.run(max_turns=max_turns, stop=stop, before_turn=_guarded_feed)
-    finally:
-        # Close the SDK media session (stops the mic recorder) on every exit path
-        # — normal stop, max-ticks/turns, Ctrl-C, or error. Fakes/http feeds carry
-        # no closer.
-        close = getattr(_guarded_feed, "close", None)
-        if close is not None:
-            close()
+    # cognition_active() publishes the file flag on enter and clears it on exit —
+    # on a clean stop, max-ticks/turns, Ctrl-C, OR an exception (its finally runs).
+    # The motion executor drains the expression queue to the robot in parallel.
+    with cognition_signal.cognition_active():
+        motion.start()
+        try:
+            turns = engine.run(max_turns=max_turns, stop=stop, before_turn=_guarded_feed)
+        finally:
+            # Stop the motion executor thread, then close the SDK media session
+            # (stops the mic recorder) on every exit path. Fakes/http feeds carry
+            # no closer.
+            motion.stop()
+            close = getattr(_guarded_feed, "close", None)
+            if close is not None:
+                close()
 
     if json_mode:
         emit_result({"status": "ok", "turns": turns}, json_mode=True)
@@ -459,6 +713,34 @@ def _register_process_verbs(noun_sub: argparse._SubParsersAction) -> None:
     st.set_defaults(func=cmd_think_status)
 
 
+def _register_expressions(noun_sub: argparse._SubParsersAction) -> None:
+    """The ``think expressions`` sub-noun: list + check the expression catalog.
+
+    A noun with action-verbs must also expose ``overview`` (rubric requirement),
+    so ``expressions`` carries one alongside ``list`` / ``check``. ``parser_class``
+    propagates so nested parse errors keep the structured error contract.
+    """
+    ex = noun_sub.add_parser(
+        "expressions",
+        help="List/check the expression catalog (see 'think expressions overview').",
+    )
+    ex.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ex.set_defaults(func=_expressions_no_verb, json=False)
+    ex_sub = ex.add_subparsers(dest="expressions_command", parser_class=type(ex))
+
+    ov = ex_sub.add_parser("overview", help="Describe the expressions sub-noun.")
+    ov.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ov.set_defaults(func=cmd_expressions_overview)
+
+    ls = ex_sub.add_parser("list", help="List the expression catalog.")
+    ls.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ls.set_defaults(func=cmd_expressions_list)
+
+    ck = ex_sub.add_parser("check", help="Flag catalog poses too similar to be distinct.")
+    ck.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ck.set_defaults(func=cmd_expressions_check)
+
+
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "think",
@@ -475,3 +757,4 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     _register_run(noun_sub)
     _register_process_verbs(noun_sub)
+    _register_expressions(noun_sub)
