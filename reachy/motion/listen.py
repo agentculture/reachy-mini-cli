@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from reachy.behavior.sense import Sense, doa_angle_to_yaw
 from reachy.motion.idle import AliveConfig, next_pose
 from reachy.motion.queue import ANTENNA_KEY, IDLE_KEY, LOOK_KEY, MotionAction
+from reachy.speech import cognition_signal
 
 
 @dataclass
@@ -156,11 +157,16 @@ class ListenProducer:
     _last_idle_t: float | None = field(default=None, init=False)
     _rng: random.Random = field(init=False, repr=False)
     _alive: AliveConfig = field(init=False, repr=False)
+    _focused: AliveConfig = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Cosmetic idle wander only — not security-sensitive.
         self._rng = random.Random()  # nosec B311
         self._alive = AliveConfig(energy=self.params.idle_energy)
+        # Low-energy "focused" idle used while the think cognition loop is active:
+        # stillness is the thinking posture, so the wander quiets down (it still
+        # breathes — see AliveConfig.focused).
+        self._focused = self._alive.focused()
 
     def _move_to(self, target: float, t: float, *, body_yaw: float | None = None) -> MotionAction:
         """Commit a head turn to *target*; optionally drive ``body_yaw`` in the same move.
@@ -296,7 +302,13 @@ class ListenProducer:
             self.committed = _toward_zero(self.committed, step)
             self.body = _toward_zero(self.body, step)
 
-        pose = next_pose(t - self._t0, self._rng, self._alive)
+        # Stillness is the thinking posture: while the ``think`` cognition loop is
+        # active (a cheap file-exists check via the cognition signal), drop to the
+        # low-energy focused idle so the wander quiets down while the robot thinks.
+        # ``interval`` / ``breathe_period`` are preserved across the swap so pacing
+        # is unchanged — only the motion amplitude drops.
+        config = self._focused if cognition_signal.is_active() else self._alive
+        pose = next_pose(t - self._t0, self._rng, config)
         head = dict(pose["head"])  # type: ignore[arg-type]
         head["yaw"] = max(-p.max_yaw, min(p.max_yaw, head["yaw"] + self.committed))
         raw_body = float(pose["body_yaw"]) + self.body  # type: ignore[arg-type]
