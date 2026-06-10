@@ -302,17 +302,35 @@ reachy-mini-cli say run "Remote" --transport http --base-url http://reachy.local
 `REACHY_TRANSPORT` (`sdk` default; `http` for remote) via the same
 `--transport` flag as `listen`/`vision`. See `reachy explain say`.
 
-### Think — continuous cognition loop
+### Think — continuous cognition loop with body expression
 
-`think` runs a **sentence-streamed cognition loop**: on each turn it snapshots
-live senses (DoA + mic loudness) into an event buffer, sends the buffer to an
-LLM (streamed), and plays each synthesized sentence through the speaker while
-the LLM is still generating the next — so speech starts before the turn completes.
-An empty buffer (no notable events) is a silent no-op turn (no LLM call, no audio).
+`think` runs a **sentence-streamed cognition loop** that also **moves the robot's
+body in step with its thoughts**. On each turn it snapshots live senses (DoA + mic
+loudness) into an event buffer, sends the buffer to an LLM (streamed), and plays
+each synthesized sentence through the speaker while the LLM is still generating
+the next — so speech starts before the turn completes. An empty buffer (no notable
+events) is a silent no-op turn (no LLM call, no audio).
 
-Like `listen`, `think` is **SDK-first**: the `sdk` transport (default) streams
-real DoA + mic RMS in-process; `--transport http` polls the daemon's DoA route.
-Like `daemon`, it has a foreground loop (`run`) and a tracked background process
+**Convention — `*emoji*` / `"quoted"` output format:** the LLM interleaves
+expression markers and speech in its output stream. Only `"quoted"` text is spoken
+aloud; each `*emoji*` marker (e.g. `*🤔*`) drives one calm expression move on the
+robot. Text outside these delimiters is silently discarded.
+
+**Expression catalog** — `reachy/speech/expressions.toml` is an editable,
+emoji-keyed data file mapping each emoji to a target head/antenna/body pose. Tune
+expressions by editing this file directly; no code change is needed. Starter set:
+🤔 😮 🙂 👂 😐 🎉 😔 (+ neutral fallback for unknown emoji). Unknown emoji fall
+back to neutral silently.
+
+**Focused idle:** while `think run` is active it writes a file flag
+(`think_active.flag` under `$REACHY_STATE_DIR`). A co-running `listen`/idle loop
+reads this flag and drops to a low-energy "focused breathe" — so the body quiets
+and stillness becomes the thinking posture even if both `listen` and `think` run
+together.
+
+Like `listen`, `think` is **SDK-first**: the `sdk` transport (default) streams real
+DoA + mic RMS in-process; `--transport http` polls the daemon's DoA route. Like
+`daemon`, it has a foreground loop (`run`) and a tracked background process
 (`start`/`stop`/`restart`/`status`) managed by its own supervisor
 (`reachy/speech/supervisor.py`).
 
@@ -325,11 +343,24 @@ reachy-mini-cli think status --json
 reachy-mini-cli think stop
 ```
 
+**Catalog tooling:**
+
+```bash
+reachy-mini-cli think expressions           # list catalog emojis + pose descriptors
+reachy-mini-cli think expressions list      # same (explicit verb)
+reachy-mini-cli think expressions check     # flag poses too similar to tell apart
+reachy-mini-cli think expressions check --json
+```
+
+`expressions check` exits `0` always — a flagged pair is a warning, not an error.
+The `--json` `ok` field is the machine-readable signal.
+
 **LLM endpoint** — `REACHY_LLM_BASE_URL`, `REACHY_LLM_API_KEY`,
 `REACHY_LLM_MODEL`; pure `urllib` streaming (no OpenAI SDK, no new base dep).
 **TTS endpoint** — `REACHY_TTS_URL`, `REACHY_TTS_VOICE` (same as `say`).
 **Playback** — `REACHY_TRANSPORT` (`sdk`/`http`); same transport flag as `say`.
-Key pacing flag: `--turn-interval` (seconds between turns).
+Key pacing flags: `--turn-interval` (seconds between turns), `--mute-after-speak`
+(self-mute window after speaking, default 2.5 s).
 See `reachy explain think` for the full reference.
 
 ## Make it your own

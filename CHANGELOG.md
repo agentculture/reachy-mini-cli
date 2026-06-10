@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-06-10
+
+### Added
+
+- `think` now **thinks with its body**: the cognition LLM interleaves `*emoji*`
+  expression markers and `"quoted"` speech in its output. Only quoted text is
+  spoken aloud; each `*emoji*` drives one calm expression move on the robot.
+  Parsing is handled by a streaming `MarkerParser` (`reachy/speech/markers.py`)
+  that feeds `MarkerEvent` / `SpeechEvent` values into the cognition pipeline.
+- `reachy/speech/expressions.toml` — an emoji-keyed, editable data file mapping
+  each emoji to a target head/antenna/body pose. Loaded via stdlib `tomllib`
+  (no new dependency). Starter set: 🤔 😮 🙂 👂 😐 🎉 😔 + neutral fallback.
+  Tune expressions by editing this file; no code change needed.
+- `reachy/speech/expressions.py` — `Catalog` / `ExpressionPose` / `load_catalog`
+  / `get_pose` API wrapping the TOML file. `ExpressionProducer`
+  (`reachy/motion/expression.py`) enqueues calm one-shot expression moves onto
+  the serial `MotionQueue` from the cognition thread.
+- `reachy/speech/distinctness.py` — weighted Euclidean pose-distance scorer that
+  detects catalog entries too similar to be meaningfully distinct.
+- `think expressions` sub-noun — two catalog tooling verbs (both `--json`-ready):
+  - `reachy think expressions` / `reachy think expressions list` — list every
+    catalog emoji with a generated pose descriptor.
+  - `reachy think expressions check` — flag expression pairs whose poses are too
+    similar to tell apart (exit 0; `ok` field is the machine-readable signal).
+- **Focused idle while thinking:** while `think run` is active it writes a
+  `think_active.flag` file under `$REACHY_STATE_DIR` via `cognition_signal`
+  (`reachy/speech/cognition_signal.py`). A co-running `listen`/idle loop reads
+  this flag on each tick and drops to a low-energy "focused breathe" — the body
+  quiets, reducing wander amplitude so stillness becomes the thinking posture.
+- **Self-mute guard:** `think run` mutes the sense feed for `--mute-after-speak`
+  seconds (default 2.5 s) after each playback clip to prevent the robot from
+  reacting to its own voice through the shared USB audio device.
+
 ## [0.13.0] - 2026-06-10
 
 ### Added
