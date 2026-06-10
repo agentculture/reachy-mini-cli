@@ -634,7 +634,25 @@ supervisor (`reachy/speech/supervisor.py`, distinct from `listen`'s).
   (re-reads flags and latest code).
 - `reachy-mini-cli think status` — the loop's process state (running / stopped
   / stale pid).
+- `reachy-mini-cli think expressions` — list the expression catalog (emoji +
+  pose descriptor); `expressions check` flags poses too similar to be distinct.
 - `reachy-mini-cli think overview` — this summary.
+
+## Expressions
+
+While thinking, the robot gestures: the LLM may emit `*emoji*` expression
+markers (and wraps spoken text in `"quotes"`). Each marker enqueues one calm
+gesture from the expression catalog onto a serial motion queue, drained one move
+at a time to the robot — `think` never streams `set_target` poses. The available
+emoji vocabulary is advertised to the LLM in its system prompt, pulled live from
+the catalog. Inspect the catalog with `think expressions` / `think expressions
+check`.
+
+## Cognition signal
+
+While `run` is active it publishes a file flag (`think_active.flag` under the
+state dir) so other subsystems (e.g. idle motion) can back off; the flag is
+cleared on every exit path, including Ctrl-C and errors.
 
 ## LLM endpoint
 
@@ -874,4 +892,8 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("think", "stop"): _THINK,
     ("think", "restart"): _THINK,
     ("think", "status"): _THINK,
+    ("think", "expressions"): _THINK,
+    ("think", "expressions", "overview"): _THINK,
+    ("think", "expressions", "list"): _THINK,
+    ("think", "expressions", "check"): _THINK,
 }
