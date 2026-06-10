@@ -1,0 +1,134 @@
+# reachy/speech/expressions.toml
+#
+# Emoji-keyed expression catalog for Reachy Mini.
+#
+# Each entry maps one emoji to a target pose the robot can move to, letting
+# the cognition engine express reactions through body language.  Edit this
+# file directly to tune values on the robot — no code change needed.
+#
+# Format (all fields required per entry):
+#
+#   [emoji]          # the emoji string used as the lookup key (quote if needed)
+#   head_x       = 0.0   # head forward/back offset    (mm, + = forward)
+#   head_y       = 0.0   # head left/right offset       (mm, + = right)
+#   head_z       = 0.0   # head up/down offset          (mm, + = up)
+#   head_roll    = 0.0   # head tilt (ear-to-shoulder)  (deg, + = right lean)
+#   head_pitch   = 0.0   # head nod                     (deg, + = chin-down)
+#   head_yaw     = 0.0   # head turn left/right         (deg, + = right)
+#   antenna_right = 0.0  # right antenna angle          (deg, + = forward)
+#   antenna_left  = 0.0  # left antenna angle           (deg, + = forward)
+#   body_yaw     = 0.0   # body rotation                (deg, + = right)
+#
+# AMPLITUDE GUIDE  Keep values LOW — the robot is small and expressive poses
+#   need only gentle offsets to read as intentional.  Typical safe ranges:
+#     head_x / head_y: ±5 mm       head_z:  ±8 mm
+#     head_roll:  ±10 deg          head_pitch: ±12 deg    head_yaw: ±20 deg
+#     antennas: ±45 deg            body_yaw: ±15 deg
+#   Exact values are deliberately left as rough starting points; tune them
+#   on the real robot and commit the results back here.
+#
+# NEUTRAL  The "neutral" key is the fallback pose returned for any unknown
+#   emoji.  It must always be all-zeros (centred, at rest).
+
+# ---------------------------------------------------------------------------
+# Fallback — centred rest pose.  Do NOT change these to non-zero values.
+# ---------------------------------------------------------------------------
+
+[neutral]
+head_x        = 0.0
+head_y        = 0.0
+head_z        = 0.0
+head_roll     = 0.0
+head_pitch    = 0.0
+head_yaw      = 0.0
+antenna_right = 0.0
+antenna_left  = 0.0
+body_yaw      = 0.0
+
+# ---------------------------------------------------------------------------
+# Starter expression set — tune values on the robot as needed.
+# ---------------------------------------------------------------------------
+
+# 🤔  Thoughtful head tilt — slight right roll + chin down, antennas droop gently.
+["🤔"]
+head_x        =  0.0
+head_y        =  0.0
+head_z        =  2.0
+head_roll     =  8.0
+head_pitch    =  6.0
+head_yaw      = -5.0
+antenna_right = -10.0
+antenna_left  = -10.0
+body_yaw      =  0.0
+
+# 😮  Surprised recoil — head lifts and pulls back slightly, antennas perk up.
+["😮"]
+head_x        = -3.0
+head_y        =  0.0
+head_z        =  5.0
+head_roll     =  0.0
+head_pitch    = -8.0
+head_yaw      =  0.0
+antenna_right =  30.0
+antenna_left  =  30.0
+body_yaw      =  0.0
+
+# 🙂  Gentle welcoming nod — chin slightly down, antennas forward-friendly.
+["🙂"]
+head_x        =  0.0
+head_y        =  0.0
+head_z        =  0.0
+head_roll     =  0.0
+head_pitch    =  5.0
+head_yaw      =  0.0
+antenna_right =  12.0
+antenna_left  =  12.0
+body_yaw      =  0.0
+
+# 👂  Lean toward — turn head to the right, body follows slightly.
+["👂"]
+head_x        =  0.0
+head_y        =  2.0
+head_z        =  0.0
+head_roll     = -5.0
+head_pitch    =  3.0
+head_yaw      = 15.0
+antenna_right =  20.0
+antenna_left  =  -5.0
+body_yaw      =  8.0
+
+# 😐  Neutral-but-attentive — almost zero, head just slightly raised.
+["😐"]
+head_x        =  0.0
+head_y        =  0.0
+head_z        =  3.0
+head_roll     =  0.0
+head_pitch    = -3.0
+head_yaw      =  0.0
+antenna_right =  5.0
+antenna_left  =  5.0
+body_yaw      =  0.0
+
+# 🎉  Excited — head up, body turn, antennas spread wide.
+["🎉"]
+head_x        =  0.0
+head_y        =  0.0
+head_z        =  6.0
+head_roll     =  0.0
+head_pitch    = -10.0
+head_yaw      =  0.0
+antenna_right =  40.0
+antenna_left  = -40.0
+body_yaw      = 10.0
+
+# 😔  Subdued / sad — head droops forward, antennas droop down.
+["😔"]
+head_x        =  2.0
+head_y        =  0.0
+head_z        = -3.0
+head_roll     =  0.0
+head_pitch    = 12.0
+head_yaw      =  0.0
+antenna_right = -25.0
+antenna_left  = -25.0
+body_yaw      =  0.0
