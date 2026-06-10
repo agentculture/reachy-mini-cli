@@ -75,6 +75,8 @@ def _build_parser() -> argparse.ArgumentParser:
     from reachy.cli._commands import move as _move_group
     from reachy.cli._commands import overview as _overview_cmd
     from reachy.cli._commands import quickstart as _quickstart_cmd
+    from reachy.cli._commands import say as _say_group
+    from reachy.cli._commands import think as _think_group
     from reachy.cli._commands import vision as _vision_group
     from reachy.cli._commands import whoami as _whoami_cmd
 
@@ -116,6 +118,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _behavior_group.register(sub)
     _listen_group.register(sub)
     _vision_group.register(sub)
+    _say_group.register(sub)
+    _think_group.register(sub)
 
     return parser
 

@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-06-10
+
+### Added
+
+- `say` noun — dumb TTS pipe: text → Magpie-style TTS synthesis → robot speaker
+  playback. No LLM, no senses. Verbs: `run` (text or stdin `-`) and `overview`,
+  each with `--json`. TTS via `REACHY_TTS_URL` / `REACHY_TTS_VOICE`; playback via
+  SDK (default) or HTTP daemon transport (`REACHY_TRANSPORT`).
+- `think` noun — sentence-streamed continuous cognition loop: snapshots live senses
+  (DoA + mic loudness) into an event buffer, streams a short spoken thought from the
+  LLM, and plays each sentence while the LLM generates the next. SDK-first (same
+  two-transport model as `listen`). Verbs: `run` / `start` / `stop` / `restart` /
+  `status` / `overview`, each with `--json`. LLM via `REACHY_LLM_BASE_URL` /
+  `REACHY_LLM_API_KEY` / `REACHY_LLM_MODEL` (pure `urllib` streaming, no new base
+  dep); TTS/playback reuses `say`'s speech leg. Managed by its own supervisor
+  (`reachy/speech/supervisor.py`).
+- `explain` catalog entries for `say` and `think` (noun roots + all verbs).
+- README and CLAUDE.md architecture docs for `say` and `think` with env-var reference.
+
 ## [0.12.0] - 2026-06-10
 
 ### Added

@@ -555,6 +555,135 @@ for a remote control box or to run `vision specs` without the SDK installed.
 """
 
 
+_SAY = """\
+# reachy-mini-cli say
+
+Synthesize text and play it through the robot speaker. A *dumb pipe*: text →
+TTS synthesis → playback. No LLM, no senses, no event bus — `say` is
+deliberately boundary-clean so agents can compose it into pipelines without
+pulling in the heavier speech stack.
+
+Pass `"-"` as the text argument to read from stdin (e.g.
+`echo "hello" | reachy-mini-cli say run -`).
+
+## Verbs
+
+- `reachy-mini-cli say run <text>` — synthesize the given text (or stdin with
+  `"-"`) and play it through the robot speaker.
+- `reachy-mini-cli say overview` — this summary.
+
+## TTS
+
+The TTS step calls a Magpie-style HTTP endpoint (default `http://localhost:9000`,
+override with `--tts-url` / `REACHY_TTS_URL`). The voice identifier can be set
+with `--voice` / `REACHY_TTS_VOICE`. The `--speed` flag is accepted (forwarded
+to the server) for forward compatibility.
+
+## Playback transport
+
+- `sdk` (default) — pushes PCM audio frames to the robot speaker via the
+  in-process `reachy_mini` SDK. Requires the `[sdk]` / `[daemon]` extra.
+- `http` — sends a single POST to the daemon's `/media/play` route. Use with
+  `--transport http` / `REACHY_TRANSPORT=http` for a remote control box.
+
+`--base-url` / `REACHY_BASE_URL` sets the daemon URL for `http` playback.
+
+## Boundary invariant
+
+`say` MUST NOT import `reachy.speech.llm` or `reachy.speech.events`. Tests
+assert this. Keep `say` as a pure TTS → playback pipe.
+
+## Usage
+
+    reachy-mini-cli say run "Hello from Reachy"
+    echo "Hello from stdin" | reachy-mini-cli say run -
+    reachy-mini-cli say run "Test" --voice en_US --tts-url http://localhost:9000
+    reachy-mini-cli say run "Remote" --transport http --base-url http://reachy.local:8000
+    reachy-mini-cli say run "JSON check" --json
+"""
+
+
+_THINK = """\
+# reachy-mini-cli think
+
+Think out loud about what the robot perceives. A continuous cognition loop: on
+each turn the robot's live senses are snapshotted into an event buffer, the LLM
+produces one or two first-person sentences, each sentence is synthesized via TTS
+and played through the speaker while the LLM is still generating the next one
+(sentence-streamed), so speech starts before the turn is complete.
+
+The sense feed mirrors `listen`: DoA (direction of arrival) and mic loudness
+are read per tick via the SDK transport (default) or the daemon's DoA HTTP route
+(`--transport http`). Both feed the `EventBuffer` through a `before_turn` hook.
+An empty buffer (no notable sounds since the last turn) is a no-op — no LLM call,
+no audio.
+
+Like `daemon`, `think` has both a foreground loop (`run`) and a tracked
+background process (`start`/`stop`/`restart`/`status`) managed by its own
+supervisor (`reachy/speech/supervisor.py`, distinct from `listen`'s).
+
+## Verbs
+
+- `reachy-mini-cli think run` — run the cognition loop in the foreground; Ctrl-C
+  stops it. `--max-turns N` stops after N spoken turns; `--max-ticks N` stops
+  after N loop iterations (idle turns included).
+- `reachy-mini-cli think start` — spawn the loop in the background, recording
+  its PID + log under the state dir.
+- `reachy-mini-cli think stop` — stop the loop this CLI started.
+- `reachy-mini-cli think restart` — stop and relaunch the background loop
+  (re-reads flags and latest code).
+- `reachy-mini-cli think status` — the loop's process state (running / stopped
+  / stale pid).
+- `reachy-mini-cli think overview` — this summary.
+
+## LLM endpoint
+
+Configure with `--llm-base-url` / `REACHY_LLM_BASE_URL` (base URL) and
+`--llm-model` / `REACHY_LLM_MODEL` (model name). The client is a pure
+`urllib`-based streaming HTTP client (no new base dep; no `openai` SDK required).
+
+## TTS endpoint
+
+Same as `say`: `--tts-url` / `REACHY_TTS_URL`, `--voice` / `REACHY_TTS_VOICE`.
+`think` reuses `say`'s speech leg (`reachy.speech.tts.synthesize` +
+`reachy.speech.playback.play_audio`).
+
+## Playback transport
+
+- `sdk` (default) — pushes PCM via `reachy_mini`; requires `[sdk]` / `[daemon]`.
+- `http` — sends PCM to the daemon's `/media/play` HTTP route.
+
+## Pacing
+
+`--turn-interval` (seconds between turns; default from `CognitionEngine`).
+`--max-turns` bounds a run to N spoken turns. `--max-ticks` bounds by loop
+iterations (useful for testing: idle ticks count, spoken turns don't).
+
+## Transport (sense feed)
+
+- `sdk` (default) — opens a `ReachyMini` media session in-process; reads real
+  DoA + mic RMS per tick.
+- `http` — polls the daemon's DoA route; no audio source (RMS treated as 0).
+
+## Notes
+
+- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`: `think.pid`
+  and `think.log`.
+- `think` has its own supervisor (`reachy/speech/supervisor.py`), separate from
+  `listen`'s `reachy/motion/supervisor.py` — they track different processes.
+
+## Usage
+
+    reachy-mini-cli daemon start                             # bring the daemon up
+    reachy-mini-cli think run                                # foreground loop (Ctrl-C to stop)
+    reachy-mini-cli think run --max-turns 3                  # stop after 3 spoken turns
+    reachy-mini-cli think start --llm-model mistral-small    # background process
+    reachy-mini-cli think status --json
+    reachy-mini-cli think stop
+    reachy-mini-cli think restart                            # apply code/config updates
+"""
+
+
 _LISTEN = """\
 # reachy-mini-cli listen
 
@@ -735,4 +864,14 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("vision", "restart"): _VISION,
     ("vision", "status"): _VISION,
     ("vision", "specs"): _VISION,
+    ("say",): _SAY,
+    ("say", "overview"): _SAY,
+    ("say", "run"): _SAY,
+    ("think",): _THINK,
+    ("think", "overview"): _THINK,
+    ("think", "run"): _THINK,
+    ("think", "start"): _THINK,
+    ("think", "stop"): _THINK,
+    ("think", "restart"): _THINK,
+    ("think", "status"): _THINK,
 }
