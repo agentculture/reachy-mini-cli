@@ -63,6 +63,7 @@ from reachy.speech import llm as _llm
 from reachy.speech import playback as _playback
 from reachy.speech import tts as _tts
 from reachy.speech.events import SenseCue
+from reachy.speech.markers import MarkerEvent, MarkerParser, SpeechEvent
 
 # Default system prompt — terse, first-person, present-tense, spoken aloud.
 DEFAULT_SYSTEM_PROMPT = (
@@ -93,6 +94,10 @@ class _Synthesize(Protocol):
 
 class _PlayAudio(Protocol):
     def __call__(self, pcm_bytes: bytes, **kwargs) -> None: ...
+
+
+class _Express(Protocol):
+    def __call__(self, emoji: str) -> None: ...
 
 
 class _BufferLike(Protocol):
@@ -144,6 +149,15 @@ class CognitionEngine:
     play_audio:
         Callable ``(pcm_bytes, **kw) -> None`` playing PCM. Defaults to
         :func:`reachy.speech.playback.play_audio`.
+    express:
+        Optional callable ``(emoji: str) -> None`` invoked **once per expression
+        marker** the LLM emits (``*🤔*``), in stream order relative to the spoken
+        text. Defaults to ``None`` (a no-op — markers are parsed and the emoji is
+        simply not driven). This is the motion seam: ``think``'s CLI passes
+        ``lambda emoji: expression_producer.express(emoji)`` so each marker enqueues
+        one calm gesture on the serial motion queue. The engine deliberately does
+        **not** import :mod:`reachy.motion` — the producer is injected through this
+        callback, preserving the say/think and speech/motion boundaries.
     system_prompt:
         The system message prepended to every turn's prompt.
     llm_kwargs / tts_kwargs / playback_kwargs:
@@ -166,6 +180,7 @@ class CognitionEngine:
         stream_sentences: _StreamSentences | None = None,
         synthesize: _Synthesize | None = None,
         play_audio: _PlayAudio | None = None,
+        express: _Express | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         llm_kwargs: dict | None = None,
         tts_kwargs: dict | None = None,
@@ -177,6 +192,9 @@ class CognitionEngine:
         self._stream_sentences = stream_sentences or _llm.stream_sentences
         self._synthesize = synthesize or _tts.synthesize
         self._play_audio = play_audio or _playback.play_audio
+        # Optional motion seam: fired once per expression marker, in stream order.
+        # None → a no-op (markers parsed out of the speech, emoji simply not driven).
+        self._express = express
         self._system_prompt = system_prompt
         self._llm_kwargs = dict(llm_kwargs or {})
         self._tts_kwargs = dict(tts_kwargs or {})
@@ -228,17 +246,29 @@ class CognitionEngine:
             return True
 
     def _stream_and_speak(self, messages: list[dict]) -> None:
-        """Producer/consumer pipeline: stream sentences while speaking earlier ones.
+        """Producer/consumer pipeline: parse markers, speak quoted text, drive expressions.
 
-        The main thread is the *producer*: it pulls complete sentences off the LLM
-        stream and enqueues them. A dedicated *speak worker* thread is the
-        *consumer*: it synthesizes and plays each queued sentence. Because synth +
-        playback happen on the worker, they overlap generation of later sentences
-        — the first sentence reaches the speaker before the turn's stream ends.
+        The main thread is the *producer*: it pulls chunks off the LLM stream,
+        feeds each through a streaming :class:`~reachy.speech.markers.MarkerParser`
+        (so a marker / quoted span split across chunks is assembled correctly), and
+        enqueues one ordered *work item* per parsed event — ``("speak", text)`` for a
+        :class:`SpeechEvent`, ``("express", emoji)`` for a :class:`MarkerEvent`. A
+        dedicated *speak worker* thread is the *consumer*: it synthesizes + plays each
+        spoken item and fires :attr:`_express` for each expression item, in queue
+        (i.e. stream) order. Because the worker runs concurrently with the producer,
+        the first quoted sentence reaches the speaker before the turn's stream ends —
+        the think↔speak overlap is preserved for the spoken text.
 
-        Any exception from the worker (synth/playback ``CliError``) is captured
-        and re-raised on this thread after the worker is joined, so it propagates
-        out of :meth:`run_turn` under the error contract.
+        Only the **quoted** text is ever synthesized; the emoji / markers are never
+        spoken. Markers fire in the exact position they appear relative to speech.
+
+        Legacy / un-marked prose (a stream with no ``*…*`` or ``"…"`` spans, e.g. the
+        plain-sentence fakes in the older tests) is spoken verbatim — see
+        :func:`_iter_work_items`.
+
+        Any exception from the worker (synth/playback ``CliError``) is captured and
+        re-raised on this thread after the worker is joined, so it propagates out of
+        :meth:`run_turn` under the error contract.
         """
         speak_q: queue.Queue = queue.Queue()
         worker_error: list[BaseException] = []
@@ -250,8 +280,9 @@ class CognitionEngine:
         )
         worker.start()
         try:
-            for sentence in self._stream_sentences(messages, **self._llm_kwargs):
-                speak_q.put(sentence)
+            chunks = self._stream_sentences(messages, **self._llm_kwargs)
+            for item in _iter_work_items(chunks):
+                speak_q.put(item)
         finally:
             # Always signal end-of-stream and join, so the worker terminates even
             # if the producer raised (e.g. LLM CliError mid-stream).
@@ -261,19 +292,27 @@ class CognitionEngine:
             raise worker_error[0]
 
     def _speak_worker(self, speak_q: queue.Queue, error_out: list) -> None:
-        """Drain the speak queue, synthesizing + playing each sentence in order.
+        """Drain the work queue in order: speak quoted text, fire expressions.
 
-        Runs on its own thread so synth + playback of sentence N overlap the
-        producer's generation of sentence N+1. Stops on the :data:`_DONE`
-        sentinel. A raised exception is stashed in ``error_out`` for the turn
-        thread to re-raise (it cannot escape a worker thread on its own).
+        Runs on its own thread so synth + playback of spoken item N overlap the
+        producer's generation of item N+1. Each item is a ``(kind, payload)`` pair:
+        ``("speak", text)`` is synthesized + played (empty synth output is skipped);
+        ``("express", emoji)`` invokes :attr:`_express` (a no-op when it is ``None``).
+        Stops on the :data:`_DONE` sentinel. A raised exception is stashed in
+        ``error_out`` for the turn thread to re-raise (it cannot escape a worker
+        thread on its own).
         """
         try:
             while True:
                 item = speak_q.get()
                 if item is _DONE:
                     return
-                pcm = self._synthesize(item, **self._tts_kwargs)
+                kind, payload = item
+                if kind == "express":
+                    if self._express is not None:
+                        self._express(payload)
+                    continue
+                pcm = self._synthesize(payload, **self._tts_kwargs)
                 if pcm:
                     self._play_audio(pcm, **self._playback_kwargs)
         except Exception as exc:  # noqa: BLE001 — re-raised on the turn thread
@@ -340,6 +379,50 @@ class CognitionEngine:
                 # controls termination.)
                 break
         return spoken
+
+
+def _event_to_item(event) -> tuple[str, str]:
+    """Map a parsed marker/speech event onto a worker work item."""
+    if isinstance(event, MarkerEvent):
+        return ("express", event.emoji)
+    assert isinstance(event, SpeechEvent)  # nosec B101 — exhaustive over the Event union
+    return ("speak", event.text)
+
+
+def _iter_work_items(chunks: Iterator[str]):
+    """Turn the raw LLM chunk stream into an ordered stream of worker work items.
+
+    Each yielded item is ``("speak", text)`` (quoted speech to synthesize + play) or
+    ``("express", emoji)`` (an expression marker to drive), in the order the spans
+    close in the stream. Chunks are fed **incrementally** through a single
+    :class:`~reachy.speech.markers.MarkerParser`, so a marker / quoted span split
+    across chunks is assembled correctly and the item is yielded the moment the span
+    closes — this preserves the producer/consumer overlap for the spoken text.
+
+    Backward compatibility: a stream that uses **no** marker convention at all (no
+    ``*`` / ``"`` — the plain-sentence fakes in the older cognition tests, and any
+    LLM that ignores the convention) is spoken verbatim. A chunk is treated as such
+    legacy prose only while the parser is idle (not mid-span) and the chunk carries
+    no delimiter, so a real marked stream is never mis-spoken.
+    """
+    parser = MarkerParser()
+    marked = False  # latches True on the first marker/quote delimiter of the turn
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if not marked and "*" not in chunk and '"' not in chunk:
+            # Legacy fast-path: no delimiter has appeared yet this turn and this
+            # chunk carries none either → it is plain prose; speak it verbatim. This
+            # preserves the pre-marker contract (and its streaming overlap) for any
+            # stream that ignores the marker convention. A marked stream's first
+            # relevant chunk *does* carry a delimiter, so it never lands here.
+            yield ("speak", chunk)
+            continue
+        marked = True  # from the first delimiter on, the parser owns the stream
+        for event in parser.feed(chunk):
+            yield _event_to_item(event)
+    for event in parser.flush():  # always [] today (unclosed spans dropped)
+        yield _event_to_item(event)
 
 
 def _drain(q: queue.Queue) -> None:
