@@ -113,6 +113,7 @@ def build_run_command(
     tts_url: str | None = None,
     voice: str | None = None,
     turn_interval: float | None = None,
+    mute_after_speak: float | None = None,
 ) -> list[str]:
     """The argv the background process runs: ``python -m reachy think run``.
 
@@ -142,6 +143,8 @@ def build_run_command(
         cmd += ["--voice", voice]
     if turn_interval is not None:
         cmd += ["--turn-interval", str(turn_interval)]
+    if mute_after_speak is not None:
+        cmd += ["--mute-after-speak", str(mute_after_speak)]
     return cmd
 
 
@@ -155,6 +158,7 @@ def start(
     tts_url: str | None = None,
     voice: str | None = None,
     turn_interval: float | None = None,
+    mute_after_speak: float | None = None,
     max_turns: int | None = None,
 ) -> dict[str, object]:
     """Start the think loop in the background (idempotent).
@@ -187,6 +191,7 @@ def start(
         tts_url=tts_url,
         voice=voice,
         turn_interval=turn_interval,
+        mute_after_speak=mute_after_speak,
     )
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]

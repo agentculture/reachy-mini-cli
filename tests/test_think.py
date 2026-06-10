@@ -421,3 +421,70 @@ def test_sense_feed_pumps_doa_into_buffer(monkeypatch) -> None:
     feed()
     cues = buffer.snapshot()
     assert any("speech from the left" in c.text for c in cues)
+
+
+# ---------------------------------------------------------------------------
+# Self-mute guard — no audio feedback loop (mic + speaker share one device)
+# ---------------------------------------------------------------------------
+
+
+def test_mute_after_speak_breaks_the_feedback_loop(monkeypatch) -> None:
+    """With a cue available every tick, the robot speaks only ONCE while the
+    self-mute window holds — proving it doesn't react to its own voice."""
+    rec = _Recorder()
+
+    def fake_stream(messages, **_kw):
+        yield "I hear something."
+
+    # The feed would produce a fresh speech cue on EVERY call (simulates the mic
+    # hearing the robot's own voice) — the guard must suppress it after speaking.
+    def always_feed(buffer) -> None:
+        buffer.feed_doa(angle_rad=0.0, rms=0.3, is_speech=True)
+
+    monkeypatch.setattr(
+        think_mod, "_make_sense_feed", lambda args, buffer: lambda: always_feed(buffer)
+    )
+    monkeypatch.setattr(think_mod, "_stream_sentences", fake_stream)
+    monkeypatch.setattr(think_mod, "_synthesize", rec.synth)
+    monkeypatch.setattr(think_mod, "_play_audio", rec.play)
+
+    # Large mute window + 5 ticks: after the first spoken turn, every later tick is
+    # muted, so the cue never re-fires.
+    rc = _run(
+        ["think", "run", "--max-ticks", "5", "--turn-interval", "0", "--mute-after-speak", "100"]
+    )
+    assert rc == 0
+    assert rec.played_texts == ["I hear something."], "spoke more than once → feedback loop"
+
+
+def test_mute_after_speak_zero_disables_the_guard(monkeypatch) -> None:
+    """--mute-after-speak 0 disables the guard: a cue every tick → speaks every tick."""
+    rec = _Recorder()
+
+    def fake_stream(messages, **_kw):
+        yield "Tick."
+
+    def always_feed(buffer) -> None:
+        buffer.feed_doa(angle_rad=0.0, rms=0.3, is_speech=True)
+
+    monkeypatch.setattr(
+        think_mod, "_make_sense_feed", lambda args, buffer: lambda: always_feed(buffer)
+    )
+    monkeypatch.setattr(think_mod, "_stream_sentences", fake_stream)
+    monkeypatch.setattr(think_mod, "_synthesize", rec.synth)
+    monkeypatch.setattr(think_mod, "_play_audio", rec.play)
+
+    rc = _run(
+        ["think", "run", "--max-ticks", "3", "--turn-interval", "0", "--mute-after-speak", "0"]
+    )
+    assert rc == 0
+    assert len(rec.played_texts) == 3, "guard disabled should speak on every cued tick"
+
+
+def test_supervisor_forwards_mute_after_speak() -> None:
+    """build_run_command forwards --mute-after-speak to the spawned think run."""
+    cmd = supervisor.build_run_command(
+        transport="http", base_url="http://localhost:8000", timeout=5.0, mute_after_speak=3.0
+    )
+    assert "--mute-after-speak" in cmd
+    assert cmd[cmd.index("--mute-after-speak") + 1] == "3.0"

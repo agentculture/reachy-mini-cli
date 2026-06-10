@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from typing import Callable
 
 import numpy as np
@@ -49,6 +50,12 @@ _JSON_HELP = "Emit structured JSON."
 
 # Rolling sense-event window size (matches EventBuffer's own default).
 _DEFAULT_MAXLEN = 256
+
+# Self-mute window (seconds) after the robot finishes speaking. Playback and
+# capture share the one Reachy Mini USB audio device, so the mic hears the robot's
+# own voice — without this guard think reacts to itself in a runaway feedback loop.
+# v1 has no AEC/barge-in (intentional boundary); this is the minimal guard. 0 disables.
+_DEFAULT_MUTE_AFTER_SPEAK = 2.5
 
 _VERBS = [
     "think run — run the cognition loop in the foreground",
@@ -216,12 +223,32 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     buffer = EventBuffer(maxlen=_DEFAULT_MAXLEN)
     feed = _make_sense_feed(args, buffer)
     turn_interval = _resolve_turn_interval(args)
+    mute_after = _resolve_mute_after(args)
+
+    # Self-mute guard against the audio feedback loop: while the robot is speaking
+    # and for `mute_after` seconds after, suppress sense cues so think never reacts
+    # to its own voice (mic + speaker share one device). `play_audio` stamps the
+    # window forward on every clip; the feed drops anything captured inside it.
+    mute = {"until": 0.0}
+
+    def _guarded_play(pcm: bytes, **kwargs: object) -> None:
+        _play_audio(pcm, **kwargs)
+        if mute_after > 0:
+            mute["until"] = time.monotonic() + mute_after
+
+    def _guarded_feed() -> None:
+        if time.monotonic() < mute["until"]:
+            buffer.snapshot()  # discard the robot's own speech the mic just caught
+            return
+        feed()
+
+    _guarded_feed.close = getattr(feed, "close", None)  # type: ignore[attr-defined]
 
     engine = CognitionEngine(
         buffer=buffer,
         stream_sentences=_stream_sentences,
         synthesize=_synthesize,
-        play_audio=_play_audio,
+        play_audio=_guarded_play,
         llm_kwargs=_llm_kwargs(args),
         tts_kwargs=_tts_kwargs(args),
         playback_kwargs=_playback_kwargs(args),
@@ -231,7 +258,7 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     if not json_mode:
         emit_diagnostic(
             f"[think] thinking out loud via {getattr(args, 'transport', 'sdk')}; "
-            f"turn-interval={turn_interval:g}s; Ctrl-C to stop"
+            f"turn-interval={turn_interval:g}s mute-after-speak={mute_after:g}s; Ctrl-C to stop"
         )
 
     # --max-ticks bounds the loop by *iterations* (idle turns included); --max-turns
@@ -240,12 +267,12 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     stop = _tick_stop(getattr(args, "max_ticks", None))
 
     try:
-        turns = engine.run(max_turns=max_turns, stop=stop, before_turn=feed)
+        turns = engine.run(max_turns=max_turns, stop=stop, before_turn=_guarded_feed)
     finally:
         # Close the SDK media session (stops the mic recorder) on every exit path
         # — normal stop, max-ticks/turns, Ctrl-C, or error. Fakes/http feeds carry
         # no closer.
-        close = getattr(feed, "close", None)
+        close = getattr(_guarded_feed, "close", None)
         if close is not None:
             close()
 
@@ -254,6 +281,12 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     else:
         emit_diagnostic(f"[think] stopped after {turns} spoken turn(s)")
     return 0
+
+
+def _resolve_mute_after(args: argparse.Namespace) -> float:
+    """Self-mute window after speaking: the flag value, or the built-in default."""
+    value = getattr(args, "mute_after_speak", None)
+    return _DEFAULT_MUTE_AFTER_SPEAK if value is None else max(0.0, float(value))
 
 
 def _resolve_turn_interval(args: argparse.Namespace) -> float:
@@ -290,6 +323,7 @@ def cmd_think_start(args: argparse.Namespace) -> int:
         tts_url=getattr(args, "tts_url", None),
         voice=getattr(args, "voice", None),
         turn_interval=getattr(args, "turn_interval", None),
+        mute_after_speak=getattr(args, "mute_after_speak", None),
         max_turns=getattr(args, "max_turns", None),
     )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
@@ -312,6 +346,7 @@ def cmd_think_restart(args: argparse.Namespace) -> int:
         tts_url=getattr(args, "tts_url", None),
         voice=getattr(args, "voice", None),
         turn_interval=getattr(args, "turn_interval", None),
+        mute_after_speak=getattr(args, "mute_after_speak", None),
         max_turns=getattr(args, "max_turns", None),
     )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
@@ -362,6 +397,14 @@ def _add_cognition_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         dest="turn_interval",
         help=f"Seconds between cognition turns (default {DEFAULT_TURN_INTERVAL:g}).",
+    )
+    parser.add_argument(
+        "--mute-after-speak",
+        type=float,
+        default=None,
+        dest="mute_after_speak",
+        help="Seconds to ignore the mic after speaking, to avoid hearing itself "
+        f"(default {_DEFAULT_MUTE_AFTER_SPEAK:g}; 0 disables).",
     )
     parser.add_argument(
         "--max-turns",
