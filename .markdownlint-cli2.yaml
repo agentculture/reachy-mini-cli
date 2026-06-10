@@ -29,3 +29,6 @@ ignores:
   - "docs/specs/**"
   - "docs/plans/**"
   - ".devague/**"
+  # Colleague local tooling state (traces + vendored skill-description mirrors).
+  # Not committed; the mirrors are cited verbatim, like .claude/skills.
+  - ".colleague/**"

@@ -226,3 +226,6 @@ skills.local.yaml
 
 # devague working state (local only — never committed; specs/plans live in docs/)
 .devague/
+
+# colleague local tooling state (traces, stat dumps, skill mirrors) — never committed
+.colleague/
