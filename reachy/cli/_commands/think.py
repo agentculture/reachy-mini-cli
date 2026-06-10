@@ -131,8 +131,13 @@ def _make_sdk_feed(transport: object, buffer: EventBuffer) -> Callable[[], None]
     """
     session = transport.media_session()  # type: ignore[attr-defined]
     # Support both context-manager sessions (real SDK) and plain objects (fakes).
-    if hasattr(session, "__enter__"):
-        session = session.__enter__()
+    # When it is a context manager, enter it now (so a missing SDK / dead daemon
+    # raises its clean CliError before the loop starts) and remember it so the
+    # caller can close it — skipping __exit__ would leave the mic recorder running
+    # for the rest of the process (the SDK finalizes recording in __exit__).
+    cm = session if (hasattr(session, "__enter__") and hasattr(session, "__exit__")) else None
+    if cm is not None:
+        session = cm.__enter__()
     poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
 
     def _feed() -> None:
@@ -144,6 +149,11 @@ def _make_sdk_feed(transport: object, buffer: EventBuffer) -> Callable[[], None]
         # issue #32. The engine already consumes any cues the buffer holds, so
         # wiring buffer.feed_vision() later is additive (see reachy.vision.*).
 
+    def _close() -> None:
+        if cm is not None:
+            cm.__exit__(None, None, None)
+
+    _feed.close = _close  # type: ignore[attr-defined]
     return _feed
 
 
@@ -229,7 +239,15 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     max_turns = getattr(args, "max_turns", None)
     stop = _tick_stop(getattr(args, "max_ticks", None))
 
-    turns = engine.run(max_turns=max_turns, stop=stop, before_turn=feed)
+    try:
+        turns = engine.run(max_turns=max_turns, stop=stop, before_turn=feed)
+    finally:
+        # Close the SDK media session (stops the mic recorder) on every exit path
+        # — normal stop, max-ticks/turns, Ctrl-C, or error. Fakes/http feeds carry
+        # no closer.
+        close = getattr(feed, "close", None)
+        if close is not None:
+            close()
 
     if json_mode:
         emit_result({"status": "ok", "turns": turns}, json_mode=True)

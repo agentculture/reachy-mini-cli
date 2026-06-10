@@ -130,6 +130,30 @@ def _multipart_encode(filename: str, wav_bytes: bytes) -> tuple[bytes, str]:
     return b"".join(parts), ctype
 
 
+def _post_for_json(req: urllib.request.Request, timeout: float) -> dict:
+    """Send *req* and parse the JSON response, translating network/HTTP failures
+    into a clean ``CliError`` (exit 2) — mirrors ``tts``/``llm`` so an unreachable
+    or erroring daemon never leaks a traceback."""
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as err:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"daemon returned HTTP {err.code} for {req.full_url}",
+            remediation="check the daemon is healthy (reachy-mini-cli daemon status)",
+        ) from err
+    except OSError as err:  # URLError is an OSError subclass — covers both
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"cannot reach the daemon at {req.full_url}: {err}",
+            remediation=(
+                "start the daemon (reachy-mini-cli daemon start), set --base-url, "
+                "or use --transport sdk"
+            ),
+        ) from err
+
+
 def _http_post_json(url: str, body: dict, timeout: float = 10.0) -> dict:
     """POST a JSON body to ``url`` and return the parsed JSON response."""
     data = json.dumps(body).encode("utf-8")
@@ -139,8 +163,7 @@ def _http_post_json(url: str, body: dict, timeout: float = 10.0) -> dict:
         method="POST",
         headers={"Content-Type": "application/json", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
-        return json.loads(resp.read())
+    return _post_for_json(req, timeout)
 
 
 def _http_post_multipart(url: str, body: bytes, content_type: str, timeout: float = 10.0) -> dict:
@@ -151,8 +174,7 @@ def _http_post_multipart(url: str, body: bytes, content_type: str, timeout: floa
         method="POST",
         headers={"Content-Type": content_type},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
-        return json.loads(resp.read())
+    return _post_for_json(req, timeout)
 
 
 # ---------------------------------------------------------------------------

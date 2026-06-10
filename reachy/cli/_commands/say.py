@@ -113,9 +113,7 @@ def cmd_say_run(args: argparse.Namespace) -> int:
             raise CliError(
                 code=EXIT_USER_ERROR,
                 message="no text received from stdin",
-                remediation=(
-                    "pipe non-empty text into the command, e.g. echo 'hello' | reachy say run -"
-                ),
+                remediation=("provide text, e.g. echo 'hello' | reachy-mini-cli say run -"),
             )
     else:
         text = raw_text
@@ -129,11 +127,10 @@ def cmd_say_run(args: argparse.Namespace) -> int:
         emit_diagnostic(f"[say] synthesizing {len(text)} char(s) …")
 
     # Synthesize — forward TTS-specific args.
-    # NOTE: tts.synthesize does not currently expose a ``speed`` parameter.
-    # The ``--speed`` flag is accepted at the CLI level as a forward-compatible
-    # placeholder; it is stored on the Namespace but not forwarded to the
-    # synthesizer until tts.py adds speed/SSML prosody support.  TODO: wire
-    # speed through once tts.synthesize gains a speed= kwarg.
+    # NOTE: tts.synthesize does not currently expose a ``speed`` parameter, so
+    # ``--speed`` is accepted as a forward-compatible placeholder — stored on the
+    # Namespace but intentionally not forwarded (a no-op, not silently dropped)
+    # until tts.py gains speed/SSML prosody support. Tracked for a follow-up.
     pcm = _synthesize(
         text,
         tts_url=getattr(args, "tts_url", None),
