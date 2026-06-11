@@ -38,6 +38,7 @@ from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import CliError
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.looputil import install_stop_handlers, interruptible_sleep, restore_stop_handlers
+from reachy.motion import pat_signal
 from reachy.motion.pat import PatDetector
 from reachy.motion.pat_reaction import PatReaction
 from reachy.motion.queue import MotionQueue
@@ -284,7 +285,12 @@ def _proprioceptive_loop(
             event = detector.update(commanded_pitch, actual_pitch, commanded_yaw, actual_yaw)
             if event is not None:
                 level, touch_type = event
-                reaction.react(touch_type, level)
+                # A scratch breaks stillness: signal the pat-active flag only
+                # while the lean is enqueued, so the listen idle wander pauses
+                # and never fights the reaction. The context manager always
+                # clears the flag, including on error.
+                with pat_signal.pat_active():
+                    reaction.react(touch_type, level)
                 events += 1
                 emit_diagnostic(f"[pat] {level} {touch_type} — leaning in")
             ticks += 1
@@ -315,7 +321,11 @@ def cmd_pat_demo(args: argparse.Namespace) -> int:
     reactions: list[dict[str, object]] = []
     for level, touch_type in events:
         queue = MotionQueue()
-        PatReaction(queue=queue).react(touch_type, level)
+        # Mirror the live loop: signal the pat-active flag while the reaction is
+        # enqueued (cleared afterward, including on error) so demo exercises the
+        # same idle-suppression wiring as `run`.
+        with pat_signal.pat_active():
+            PatReaction(queue=queue).react(touch_type, level)
         actions = [a.label for a in queue.pending()]
         reactions.append({"touch_type": touch_type, "level": level, "actions": actions})
 
