@@ -87,6 +87,19 @@ _VALID_TOUCH_TYPES = frozenset({"scratch", "side_pat"})
 _VALID_LEVELS = frozenset({"level1", "level2"})
 
 
+def reaction_duration(level: str = "level1") -> float:
+    """Total wall-clock seconds a :meth:`PatReaction.react` sequence takes to play.
+
+    The sum of the lean, nuzzle, and settle phase durations — the lean phase is
+    longer for a ``"level2"`` (sustained) pat. A caller driving the reaction (the
+    ``pat`` run loop) uses this to hold the pat-active signal — and pause its own
+    sensing — for exactly as long as the robot is executing its own lean, so the
+    deliberate motion is never mistaken for a fresh pat (no self-trigger).
+    """
+    lean_dur = LEAN_DURATION_L2 if level == "level2" else LEAN_DURATION_L1
+    return lean_dur + NUZZLE_DURATION + SETTLE_DURATION
+
+
 def _head_dict(*, pitch: float = 0.0, yaw: float = 0.0) -> dict[str, float]:
     """Build a six-axis head dict with only ``pitch`` and/or ``yaw`` non-zero.
 

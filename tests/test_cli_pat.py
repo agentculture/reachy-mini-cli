@@ -15,6 +15,7 @@ real robot / ``[sdk]`` extra is required.
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import pytest
@@ -172,3 +173,82 @@ def test_pat_run_bounded_exits_zero(
     payload = json.loads(last)
     assert payload["status"] == "ok"
     assert payload["ticks"] == 5
+
+
+class _AlternatingTransport:
+    """A fake transport that presses then releases on alternating ``head_pose``
+    reads, so two press edges accumulate and the detector fires a pat."""
+
+    name = "sdk"
+
+    def __init__(self) -> None:
+        self.gotos: list[dict] = []
+        self.pose_calls = 0
+
+    def head_pose(self) -> tuple[float, float]:
+        self.pose_calls += 1
+        pressed = (self.pose_calls % 2) == 1  # press on the 1st, 3rd, … read
+        return (-20.0 if pressed else 0.0, 0.0)
+
+    def move_goto(self, **kwargs: object) -> None:
+        self.gotos.append(kwargs)
+
+
+def test_pat_run_reaction_window_holds_flag_and_pauses_sensing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Regression for PR #34 qodo bugs 6 & 7: once a pat fires, the pat-active
+    signal stays up for the WHOLE reaction (not just the instantaneous enqueue),
+    and the loop stops sensing while the robot executes its own lean — so the
+    deliberate motion can never self-trigger a second pat."""
+    import reachy.cli._commands.pat as pat_mod
+    from reachy.motion import pat_signal
+    from reachy.motion.pat import PatDetector
+    from reachy.motion.pat_reaction import PatReaction
+    from reachy.motion.queue import MotionQueue
+
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pat_mod.time, "sleep", lambda *_a, **_k: None)  # no real waits
+
+    fake = _AlternatingTransport()
+    # Fire on two presses with no inter-pat cooldown so the event lands early and
+    # the reaction window (~3.5 s) is observed across the remaining ticks.
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0)
+    reaction = PatReaction(queue=MotionQueue())
+
+    # A clock advancing 0.5 s/tick: the reaction window spans several ticks.
+    # Record the pat-active flag at the top of each tick.
+    state = {"i": 0, "active": []}
+
+    def clock() -> float:
+        state["active"].append(pat_signal.is_active())
+        t = 0.5 * state["i"]
+        state["i"] += 1
+        return t
+
+    ticks, events = pat_mod._proprioceptive_loop(
+        transport=fake,
+        detector=detector,
+        reaction=reaction,
+        commanded_pitch=0.0,
+        commanded_yaw=0.0,
+        max_ticks=9,
+        clock=clock,
+    )
+
+    active = state["active"]
+    # Exactly one pat despite presses continuing — the window suppresses re-fire.
+    assert events == 1
+    # The flag is held up across a contiguous run of >= 2 in-window ticks
+    # (bug 6: not cleared the instant react() enqueues).
+    longest_run = max(
+        (len(list(g)) for k, g in itertools.groupby(active) if k),
+        default=0,
+    )
+    assert longest_run >= 2
+    assert active[0] is False
+    # Sensing is paused during the window: head_pose is NOT read every tick
+    # (bug 7: the robot's own lean is never fed back to the detector).
+    assert fake.pose_calls < ticks
+    # The flag never leaks past the loop.
+    assert pat_signal.is_active() is False

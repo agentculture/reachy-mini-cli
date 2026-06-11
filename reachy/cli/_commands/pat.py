@@ -1,9 +1,10 @@
 """``reachy-mini-cli pat`` — feel a head pat and lean into it.
 
 A proprioceptive reactive loop, the same shape as the ``listen`` / ``think``
-nouns: a foreground loop holds the head at a baseline pose, reads the *actual*
-head pose back from the robot via :meth:`~reachy.robot.transport.Transport.head_pose`,
-and feeds the commanded-vs-actual deviation to a
+nouns: a foreground loop eases the head to a baseline pose once (through the
+serial motion executor) and then reads the *actual* head pose back from the robot
+via :meth:`~reachy.robot.transport.Transport.head_pose`, feeding the
+commanded-vs-actual deviation to a
 :class:`~reachy.motion.pat.PatDetector`. When the detector recognises a pat
 (``"scratch"`` head-press or ``"side_pat"`` side-nudge) it fires an event, and
 :class:`~reachy.motion.pat_reaction.PatReaction` enqueues a calm lean→nuzzle→settle
@@ -33,6 +34,7 @@ import argparse
 import os
 import threading
 import time
+from typing import Callable
 
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import CliError
@@ -40,16 +42,16 @@ from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.looputil import install_stop_handlers, interruptible_sleep, restore_stop_handlers
 from reachy.motion import pat_signal
 from reachy.motion.pat import PatDetector
-from reachy.motion.pat_reaction import PatReaction
-from reachy.motion.queue import MotionQueue
+from reachy.motion.pat_reaction import PatReaction, reaction_duration
+from reachy.motion.queue import MotionAction, MotionQueue
 from reachy.motion.server import run as run_motion
 from reachy.robot import add_robot_args, get_transport
 
 _JSON_HELP = "Emit structured JSON."
 
-#: The baseline head pose the loop commands and holds each tick (neutral). The
-#: detector compares the actual pose read-back against the commanded pitch/yaw, so
-#: a deviation (someone pressing the head) is what triggers a pat.
+#: The baseline (neutral) head pose. The loop eases the head here once at start
+#: (through the serial executor), then compares the actual pose read-back against
+#: this commanded pitch/yaw — a deviation (someone pressing the head) triggers a pat.
 _BASELINE = {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}
 
 #: Seconds between proprioceptive samples in the foreground loop.
@@ -214,9 +216,17 @@ def cmd_pat_run(args: argparse.Namespace) -> int:
     motion = _MotionExecutor(transport)
     reaction = PatReaction(queue=motion.queue)
 
-    # We always pass the live commanded head pose to the detector (nova does the
-    # same). The loop holds the baseline; a future live-tuning task may track the
-    # commanded lean pose here. Start neutral.
+    # All robot motion flows through the single serial executor (which drains the
+    # queue one move at a time) — the loop never calls ``move_goto`` itself, so the
+    # executor's non-overlap guarantee holds. Ease the head to neutral once at the
+    # start by submitting one baseline move onto that same queue; thereafter the
+    # loop only *reads* the pose.
+    motion.queue.submit(MotionAction(label="pat baseline", head=dict(_BASELINE), duration=1.0))
+
+    # The robot rests at the commanded baseline whenever the loop is sensing (the
+    # loop pauses sensing while a reaction plays — see ``_proprioceptive_loop``), so
+    # the commanded pose stays at neutral and the detector never sees the robot's
+    # own deliberate lean as a press.
     commanded_pitch = _BASELINE["pitch"]
     commanded_yaw = _BASELINE["yaw"]
 
@@ -256,48 +266,68 @@ def _proprioceptive_loop(
     commanded_pitch: float,
     commanded_yaw: float,
     max_ticks: int | None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> tuple[int, int]:
     """Run the sense→detect→react loop until ``max_ticks`` (or signalled).
 
-    Each tick commands the baseline head pose, reads the actual pose back, and
-    feeds the commanded-vs-actual deviation to the detector. On a detection event
-    it enqueues a lean via :class:`PatReaction`. Errors degrade silently so a
-    transient transport drop never kills the loop. Returns ``(ticks, events)``.
+    Each tick reads the actual head pose back and feeds the commanded-vs-actual
+    deviation to the detector; on a detection event it enqueues a lean via
+    :class:`PatReaction`. The loop itself never commands motion — the executor
+    owns the robot (one move at a time), so the lean is never fought.
+
+    **Reaction window.** A pat moves the head deliberately (the lean→nuzzle→settle
+    gesture), which the detector would otherwise read as fresh presses. So on a
+    pat the loop opens a window of :func:`reaction_duration` seconds during which
+    it (a) holds the ``pat_active`` signal up — so a co-running ``listen`` idle
+    wander yields for the *whole* reaction, not just the instant of enqueue — and
+    (b) pauses its own sensing, so the robot's own motion can't self-trigger.
+    ``clock`` is injectable for deterministic tests. Returns ``(ticks, events)``.
     """
     stop = {"flag": False}
     handlers = install_stop_handlers(stop)
     ticks = 0
     events = 0
+    reacting_until = 0.0
+    flag_up = False
     try:
         while not stop["flag"]:
-            # Command/hold the baseline pose (best effort — a drop degrades to silent).
-            try:
-                transport.move_goto(  # type: ignore[attr-defined]
-                    head=dict(_BASELINE), duration=_DEFAULT_TICK, interpolation="minjerk"
-                )
-            except CliError:
+            now = clock()
+            if now < reacting_until:
+                # Mid-reaction: the robot is executing its own lean. Keep the
+                # pat-active flag up and do NOT sense (avoid self-trigger).
                 pass
-            # Read the actual pose and feed the deviation to the detector.
-            try:
-                actual_pitch, actual_yaw = transport.head_pose()  # type: ignore[attr-defined]
-            except CliError:
-                actual_pitch, actual_yaw = commanded_pitch, commanded_yaw
-            event = detector.update(commanded_pitch, actual_pitch, commanded_yaw, actual_yaw)
-            if event is not None:
-                level, touch_type = event
-                # A scratch breaks stillness: signal the pat-active flag only
-                # while the lean is enqueued, so the listen idle wander pauses
-                # and never fights the reaction. The context manager always
-                # clears the flag, including on error.
-                with pat_signal.pat_active():
+            else:
+                if flag_up:
+                    pat_signal.clear()
+                    flag_up = False
+                # Read the actual pose and feed the deviation to the detector.
+                try:
+                    actual_pitch, actual_yaw = transport.head_pose()  # type: ignore[attr-defined]
+                except CliError:
+                    actual_pitch, actual_yaw = commanded_pitch, commanded_yaw
+                event = detector.update(
+                    commanded_pitch, actual_pitch, commanded_yaw, actual_yaw, now=now
+                )
+                if event is not None:
+                    level, touch_type = event
                     reaction.react(touch_type, level)
-                events += 1
-                emit_diagnostic(f"[pat] {level} {touch_type} — leaning in")
+                    # Clear the detector's accumulated press history and open the
+                    # reaction window: hold pat_active up and stop sensing until the
+                    # lean→nuzzle→settle gesture has finished playing.
+                    detector.reset()
+                    pat_signal.write()
+                    flag_up = True
+                    reacting_until = now + reaction_duration(level)
+                    events += 1
+                    emit_diagnostic(f"[pat] {level} {touch_type} — leaning in")
             ticks += 1
             if max_ticks is not None and ticks >= max_ticks:
                 break
             interruptible_sleep(_DEFAULT_TICK, stop, time.sleep)
     finally:
+        # Never leak the flag (e.g. Ctrl-C mid-reaction): always clear on exit.
+        if flag_up or pat_signal.is_active():
+            pat_signal.clear()
         restore_stop_handlers(handlers)
     return ticks, events
 
