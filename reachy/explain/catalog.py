@@ -916,6 +916,78 @@ degrades motion to silent — the pat sensing loop keeps running. The queue is f
 """
 
 
+_SLEEP = """\
+# reachy-mini-cli sleep
+
+Drift off when undisturbed, wake on a stimulus. A graduated-wakefulness loop: an
+idle timer walks the robot ALERT → DROWSY → ASLEEP the longer it goes
+undisturbed. Any qualifying stimulus — detected speech, a sound-direction (DoA)
+shift, a loud snap transient, or a pat — snaps it back to ALERT with a single
+re-engagement gesture.
+
+Each wakefulness state maps to motion through the `SleepProducer`: full-energy
+alive idle when ALERT, a low-energy idle when DROWSY, and a near-still
+"sleep breathe" (slow body rock + gentle antenna breathing + a slight head
+droop) when ASLEEP. Moves are submitted onto the shared serial `MotionQueue` and
+drained one move at a time by a background motion executor — the same
+architecture as `listen`, `think`, and `pat`.
+
+While the robot is ASLEEP the noun keeps the `sleep_active.flag` written (under
+the state dir) so other subsystems can quiet themselves; it is cleared the moment
+the robot is no longer asleep, and on every exit path.
+
+## Verbs
+
+- `reachy-mini-cli sleep run` — run the decay→sleep→wake loop in the foreground
+  (SDK-first by default); Ctrl-C stops it. `--ticks N` stops after N loop ticks
+  (useful for ops/testing). `--idle-timeout SECONDS` sets the quiet time before
+  sleep (the drowsy threshold is half of it).
+- `reachy-mini-cli sleep start` — spawn the loop in the background, recording its
+  PID + log under the state dir. Idempotent: reports `already-running` if a
+  tracked loop is alive.
+- `reachy-mini-cli sleep stop` — SIGTERM the loop this CLI started, escalating to
+  SIGKILL past `--timeout`.
+- `reachy-mini-cli sleep restart` — stop the tracked loop and relaunch it, so the
+  new process re-reads the tuning and the latest code.
+- `reachy-mini-cli sleep status` — the current sleep state + idle seconds and the
+  loop's process state (running / stopped / stale).
+- `reachy-mini-cli sleep demo` — walk the full ALERT→DROWSY→ASLEEP→wake arc
+  against a synthetic sense sequence + a fake clock, with **no robot and no
+  `[sdk]` extra**; the observed state sequence is reported (use `--json`).
+- `reachy-mini-cli sleep overview` — this summary.
+
+## Transport
+
+`sleep` is **SDK-first**: the `sdk` transport (default) opens a `reachy_mini`
+media session in-process and reads real DoA + mic loudness per tick — requires
+the `[sdk]` / `[daemon]` extra. The `http` transport polls the daemon's DoA route
+(no audio source, so the snap cue is inert); use it with `--transport http` /
+`REACHY_TRANSPORT=http` for a remote control box. A missing `[sdk]` extra raises a
+clean exit-2 `CliError` pointing at the extra — never a traceback. `demo` needs no
+transport at all.
+
+## Notes
+
+- `demo` requires no robot and no `[sdk]` extra — safe to run in CI and on a
+  plain dev machine to exercise the full state arc end-to-end.
+- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`: `sleep.pid`,
+  `sleep.log`, and the `sleep_active.flag`.
+- Only one thing should drive the robot at a time — don't run `sleep` alongside
+  `listen`, `demo-mode`, or another motion source.
+
+## Usage
+
+    reachy-mini-cli sleep run                          # foreground loop, SDK transport
+    reachy-mini-cli sleep run --idle-timeout 60        # nod off after 60s of quiet
+    reachy-mini-cli sleep run --ticks 100              # stop after 100 ticks
+    reachy-mini-cli sleep demo                         # walk the arc, no robot
+    reachy-mini-cli sleep demo --json                  # machine-readable arc
+    reachy-mini-cli sleep start                        # background process
+    reachy-mini-cli sleep status --json                # state + idle + process
+    reachy-mini-cli sleep stop
+"""
+
+
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
     ("reachy",): _ROOT,
@@ -1006,4 +1078,12 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("pat", "overview"): _PAT,
     ("pat", "run"): _PAT,
     ("pat", "demo"): _PAT,
+    ("sleep",): _SLEEP,
+    ("sleep", "overview"): _SLEEP,
+    ("sleep", "run"): _SLEEP,
+    ("sleep", "start"): _SLEEP,
+    ("sleep", "stop"): _SLEEP,
+    ("sleep", "restart"): _SLEEP,
+    ("sleep", "status"): _SLEEP,
+    ("sleep", "demo"): _SLEEP,
 }
