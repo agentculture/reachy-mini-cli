@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -27,6 +28,24 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).parent.parent
+
+
+def _module_pulls_in(dotted: str, forbidden: str) -> bool:
+    """True if importing *dotted* pulls *forbidden* into sys.modules.
+
+    Run in a fresh SUBPROCESS so the probe has ZERO effect on this
+    interpreter's sys.modules — evicting/re-importing in-process splits module
+    identity and breaks unrelated suites (e.g. the supervisor monkeypatch tests).
+    """
+    code = f"import sys; import {dotted}; print({forbidden!r} in sys.modules)"
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        check=True,
+    )
+    return proc.stdout.strip() == "True"
 
 
 def _imported_modules(module) -> set[str]:
@@ -73,76 +92,40 @@ _SLEEP_MODULE_NAMES = [
 class TestNoSdkImportAtModuleLoad:
     """Importing the base sleep modules must not pull in ``reachy_mini``."""
 
-    def _evict_sleep_modules(self) -> None:
-        """Remove all sleep-related modules from sys.modules for a clean slate."""
-        for key in list(sys.modules):
-            if key.startswith(("reachy.motion.sleep", "reachy.sleep")):
-                del sys.modules[key]
-
     def test_sleep_signal_does_not_import_reachy_mini(self) -> None:
         """reachy.motion.sleep_signal must not pull in reachy_mini at import time."""
-        sys.modules.pop("reachy.motion.sleep_signal", None)
-        sys.modules.pop("reachy_mini", None)
-
-        importlib.import_module("reachy.motion.sleep_signal")
-
-        assert "reachy_mini" not in sys.modules, (
+        assert not _module_pulls_in("reachy.motion.sleep_signal", "reachy_mini"), (
             "reachy.motion.sleep_signal pulled in reachy_mini — "
             "it must be SDK-free on the base profile"
         )
 
     def test_sleep_state_does_not_import_reachy_mini(self) -> None:
         """reachy.sleep.state is pure stdlib — must not import reachy_mini."""
-        sys.modules.pop("reachy.sleep.state", None)
-        sys.modules.pop("reachy_mini", None)
-
-        importlib.import_module("reachy.sleep.state")
-
-        assert (
-            "reachy_mini" not in sys.modules
+        assert not _module_pulls_in(
+            "reachy.sleep.state", "reachy_mini"
         ), "reachy.sleep.state pulled in reachy_mini at import time"
 
     def test_sleep_stimulus_does_not_import_reachy_mini(self) -> None:
         """reachy.sleep.stimulus is stdlib-only — must not import reachy_mini."""
-        sys.modules.pop("reachy.sleep.stimulus", None)
-        sys.modules.pop("reachy_mini", None)
-
-        importlib.import_module("reachy.sleep.stimulus")
-
-        assert (
-            "reachy_mini" not in sys.modules
+        assert not _module_pulls_in(
+            "reachy.sleep.stimulus", "reachy_mini"
         ), "reachy.sleep.stimulus pulled in reachy_mini at import time"
 
     def test_sleep_wake_does_not_import_reachy_mini(self) -> None:
         """reachy.sleep.wake must not pull in reachy_mini at module load."""
-        sys.modules.pop("reachy.sleep.wake", None)
-        sys.modules.pop("reachy_mini", None)
-
-        importlib.import_module("reachy.sleep.wake")
-
-        assert (
-            "reachy_mini" not in sys.modules
+        assert not _module_pulls_in(
+            "reachy.sleep.wake", "reachy_mini"
         ), "reachy.sleep.wake pulled in reachy_mini — wake-word engine must stay lazy"
 
     def test_sleep_supervisor_does_not_import_reachy_mini(self) -> None:
         """reachy.sleep.supervisor is pure stdlib — must not import reachy_mini."""
-        sys.modules.pop("reachy.sleep.supervisor", None)
-        sys.modules.pop("reachy_mini", None)
-
-        importlib.import_module("reachy.sleep.supervisor")
-
-        assert (
-            "reachy_mini" not in sys.modules
+        assert not _module_pulls_in(
+            "reachy.sleep.supervisor", "reachy_mini"
         ), "reachy.sleep.supervisor pulled in reachy_mini at import time"
 
     def test_sleep_producer_does_not_import_reachy_mini(self) -> None:
         """reachy.motion.sleep (SleepProducer) must not pull in reachy_mini."""
-        sys.modules.pop("reachy.motion.sleep", None)
-        sys.modules.pop("reachy_mini", None)
-
-        importlib.import_module("reachy.motion.sleep")
-
-        assert "reachy_mini" not in sys.modules, (
+        assert not _module_pulls_in("reachy.motion.sleep", "reachy_mini"), (
             "reachy.motion.sleep pulled in reachy_mini at import time — "
             "it must be a pure planner with no SDK dependency"
         )
@@ -310,13 +293,7 @@ class TestWakeWordLazyImport:
 
     def test_importing_wake_module_does_not_import_openwakeword(self) -> None:
         """openwakeword must NOT appear in sys.modules after importing reachy.sleep.wake."""
-        # Ensure a clean slate: evict both modules.
-        sys.modules.pop("reachy.sleep.wake", None)
-        sys.modules.pop("openwakeword", None)
-
-        importlib.import_module("reachy.sleep.wake")
-
-        assert "openwakeword" not in sys.modules, (
+        assert not _module_pulls_in("reachy.sleep.wake", "openwakeword"), (
             "Importing reachy.sleep.wake pulled in openwakeword at module load time — "
             "the engine import must be guarded inside a function/method so it only "
             "fires when wake_word_enabled=True AND the package is installed."
@@ -342,16 +319,10 @@ class TestWakeWordLazyImport:
 
     def test_importing_wake_module_does_not_import_asr_libs(self) -> None:
         """No ASR / speech-recognition library is pulled in by importing wake.py."""
-        asr_libs = {"nemo", "nemo_toolkit", "speechbrain", "whisper", "faster_whisper"}
-
-        sys.modules.pop("reachy.sleep.wake", None)
-        for lib in asr_libs:
-            sys.modules.pop(lib, None)
-
-        importlib.import_module("reachy.sleep.wake")
+        asr_libs = ["nemo", "nemo_toolkit", "speechbrain", "whisper", "faster_whisper"]
 
         for lib in asr_libs:
-            assert lib not in sys.modules, (
+            assert not _module_pulls_in("reachy.sleep.wake", lib), (
                 f"Importing reachy.sleep.wake pulled in ASR library {lib!r} — "
                 "ASR/wake-word deps must stay behind the [cpu]/[gpu] optional extra"
             )

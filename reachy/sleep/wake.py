@@ -30,6 +30,7 @@ Cited pattern for Tier-2 ASR phrase matching:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -178,10 +179,9 @@ class WakeDetector:
         # Delegate to the engine's own reset if it has one
         engine = self._engine
         if engine is not None and hasattr(engine, "reset"):
-            try:
+            # Degrade silently: a flaky engine reset must never crash wake handling.
+            with contextlib.suppress(Exception):
                 engine.reset()
-            except Exception:  # noqa: BLE001
-                pass
 
     # ------------------------------------------------------------------
     # Internal helpers
