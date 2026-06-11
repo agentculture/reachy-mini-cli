@@ -1760,7 +1760,7 @@ wheels = [
 
 [[package]]
 name = "reachy-mini-cli"
-version = "0.15.0"
+version = "0.16.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
@@ -1792,7 +1792,7 @@ requires-dist = [
     { name = "reachy-mini", marker = "extra == 'daemon'", specifier = ">=1.0" },
     { name = "reachy-mini", marker = "extra == 'sdk'", specifier = ">=1.0" },
 ]
-provides-extras = ["daemon", "sdk"]
+provides-extras = ["daemon", "sdk", "cpu", "gpu"]
 
 [package.metadata.requires-dev]
 dev = [

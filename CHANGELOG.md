@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-06-12
+
+### Added
+
+- sleep noun: graduated alert->drowsy->asleep idle-decay state machine with injected-clock seam (reachy/sleep/state.py)
+- sleep mode wakes on speech/snap (Tier-1, zero new base dep) plus an optional wake-word phrase behind generic [cpu]/[gpu] compute-class extras (Tier-2, lazy + graceful degrade)
+- sleep run/start/stop/restart/status/demo/overview verbs (reachy/cli/_commands/sleep.py); demo walks the full arc headless with no robot
+- SleepProducer drives a drowsy energy-fade then a near-still sleep-breathe (slow rock + antenna breathe) and a wake re-engagement gesture onto the shared MotionQueue (reachy/motion/sleep.py)
+- cross-noun sleep_active.flag (reachy/motion/sleep_signal.py): the listen idle layer fully yields to it as the strongest interrupt, above pat and think-focused
+- qualifying-stimulation classifier with self-mute exclusion so the robot cannot keep itself awake by speaking (reachy/sleep/stimulus.py)
+
+### Changed
+
+- listen idle producer now treats sleep as the top-priority interrupt (full wander suppression while asleep)
+
 ## [0.15.0] - 2026-06-11
 
 ### Added
