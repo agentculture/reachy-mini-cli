@@ -369,6 +369,39 @@ Key pacing flags: `--turn-interval` (seconds between turns), `--mute-after-speak
 (self-mute window after speaking, default 2.5 s).
 See `reachy explain think` for the full reference.
 
+### Pat — proprioceptive touch + snuggle
+
+`pat` makes the robot **feel a head pat and lean into it** — with no touch sensor.
+It holds a baseline head pose, reads the *actual* head pose back from the robot,
+and detects a pat from the **commanded-vs-actual deviation**: a downward pitch
+press is a **scratch** (head/neck pat) and a sideways yaw nudge is a **side-nudge**
+(`side_pat`). On a detected pat it leans in — a calm lean→nuzzle→settle snuggle
+(a pitch-down dip for a scratch; a yaw-toward + soft body-yaw for a side_pat) —
+enqueued onto the same shared serial `MotionQueue` the executor drains one move at
+a time, so the reaction is smooth and never fights other motion.
+
+Like `listen`/`think`, `pat` is **SDK-first**: the `head_pose` read-back is an
+SDK-only capability, so the `sdk` transport (default) is required to feel a pat;
+`--transport http` is available for non-pose ops but cannot read `head_pose`. The
+`demo` verb needs **no robot and no `[sdk]` extra** — it synthesizes pat events
+and runs them through the real lean planner so you can verify the wiring in CI or
+by eye.
+
+```bash
+reachy-mini-cli pat run                                   # foreground loop (Ctrl-C to stop)
+reachy-mini-cli pat run --ticks 200                       # bounded run (testing/ops)
+reachy-mini-cli pat run --press-threshold 1.5 --min-presses 3   # retune sensitivity
+reachy-mini-cli pat demo                                  # synthesize pats, no robot
+reachy-mini-cli pat demo --json --count 1                 # one scripted reaction, JSON
+```
+
+**Breaks idle stillness:** while a pat reaction is enqueued, `pat` writes a file
+flag (`pat_active.flag` under `$REACHY_STATE_DIR`, the counterpart to think's
+`think_active.flag`). A co-running `listen`/idle loop reads this flag and **pauses
+its idle wander entirely** so the lean/snuggle owns the motion — a scratch fully
+breaks stillness, where a `think` turn only quiets it to a focused breathe. See
+`reachy explain pat` for the full reference.
+
 ## Make it your own
 
 1. Rename the package `reachy/` and the `reachy-mini-cli`
