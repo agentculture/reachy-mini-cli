@@ -258,6 +258,40 @@ def cmd_pat_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sense_and_maybe_react(
+    *,
+    transport: object,
+    detector: PatDetector,
+    reaction: PatReaction,
+    commanded_pitch: float,
+    commanded_yaw: float,
+    now: float,
+) -> tuple[float, str] | None:
+    """One sensing pass: read the actual head pose, feed the deviation to the
+    detector, and on a detection enqueue the lean and open the reaction window.
+
+    Returns ``(reacting_until, level)`` when a pat fired this tick (the caller
+    raises the ``pat_active`` flag and stops sensing until ``reacting_until``),
+    or ``None`` when nothing fired.
+    """
+    try:
+        actual_pitch, actual_yaw = transport.head_pose()  # type: ignore[attr-defined]
+    except CliError:
+        actual_pitch, actual_yaw = commanded_pitch, commanded_yaw
+    event = detector.update(commanded_pitch, actual_pitch, commanded_yaw, actual_yaw, now=now)
+    if event is None:
+        return None
+    level, touch_type = event
+    reaction.react(touch_type, level)
+    # Clear the detector's accumulated press history and open the reaction
+    # window: the caller holds pat_active up and stops sensing until the
+    # lean→nuzzle→settle gesture has finished playing.
+    detector.reset()
+    pat_signal.write()
+    emit_diagnostic(f"[pat] {level} {touch_type} — leaning in")
+    return now + reaction_duration(level), level
+
+
 def _proprioceptive_loop(
     *,
     transport: object,
@@ -292,34 +326,24 @@ def _proprioceptive_loop(
     try:
         while not stop["flag"]:
             now = clock()
-            if now < reacting_until:
-                # Mid-reaction: the robot is executing its own lean. Keep the
-                # pat-active flag up and do NOT sense (avoid self-trigger).
-                pass
-            else:
+            # Mid-reaction: the robot is executing its own lean. Keep the
+            # pat-active flag up and do NOT sense (avoid self-trigger).
+            if now >= reacting_until:
                 if flag_up:
                     pat_signal.clear()
                     flag_up = False
-                # Read the actual pose and feed the deviation to the detector.
-                try:
-                    actual_pitch, actual_yaw = transport.head_pose()  # type: ignore[attr-defined]
-                except CliError:
-                    actual_pitch, actual_yaw = commanded_pitch, commanded_yaw
-                event = detector.update(
-                    commanded_pitch, actual_pitch, commanded_yaw, actual_yaw, now=now
+                fired = _sense_and_maybe_react(
+                    transport=transport,
+                    detector=detector,
+                    reaction=reaction,
+                    commanded_pitch=commanded_pitch,
+                    commanded_yaw=commanded_yaw,
+                    now=now,
                 )
-                if event is not None:
-                    level, touch_type = event
-                    reaction.react(touch_type, level)
-                    # Clear the detector's accumulated press history and open the
-                    # reaction window: hold pat_active up and stop sensing until the
-                    # lean→nuzzle→settle gesture has finished playing.
-                    detector.reset()
-                    pat_signal.write()
+                if fired is not None:
+                    reacting_until, _level = fired
                     flag_up = True
-                    reacting_until = now + reaction_duration(level)
                     events += 1
-                    emit_diagnostic(f"[pat] {level} {touch_type} — leaning in")
             ticks += 1
             if max_ticks is not None and ticks >= max_ticks:
                 break

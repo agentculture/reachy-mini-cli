@@ -33,6 +33,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The `run` loop routes all motion through the single serial executor and pauses
   sensing while the lean plays, so the robot's own motion never self-triggers.
 
+### Changed
+
+- Reduced cognitive complexity of `PatDetector.update` and the `pat run` loop
+  (SonarCloud `S3776`): the detector's per-axis press tracking and two-level
+  state machine are split into `_track_pitch` / `_track_yaw` / `_advance_state`
+  helpers, and the run loop's sense→detect→react step into
+  `_sense_and_maybe_react`. Pure refactor — no behavior change.
+
 ## [0.14.0] - 2026-06-10
 
 ### Added

@@ -196,7 +196,17 @@ class PatDetector:
         if now is None:
             now = time.monotonic()
 
-        # --- Pitch deviation ---
+        self._track_pitch(commanded_pitch, actual_pitch, now)
+        self._track_yaw(commanded_yaw, actual_yaw, now)
+        return self._advance_state(now)
+
+    # ------------------------------------------------------------------
+    # Per-axis press tracking + state machine (split out of update for clarity
+    # and to keep each unit's cognitive complexity low)
+    # ------------------------------------------------------------------
+
+    def _track_pitch(self, commanded_pitch: float, actual_pitch: float, now: float) -> None:
+        """Update the EMA-baselined pitch deviation and its press edge state."""
         raw_deviation: float = actual_pitch - commanded_pitch
         self._baseline_offset += self._baseline_alpha * (raw_deviation - self._baseline_offset)
         deviation: float = raw_deviation - self._baseline_offset
@@ -210,7 +220,8 @@ class PatDetector:
         elif deviation > -self.release_threshold:
             self._in_press = False
 
-        # --- Yaw deviation ---
+    def _track_yaw(self, commanded_yaw: float, actual_yaw: float, now: float) -> None:
+        """Update the EMA-baselined yaw deviation and its press edge state."""
         raw_yaw_dev: float = actual_yaw - commanded_yaw
         self._yaw_baseline_offset += self._baseline_alpha * (
             raw_yaw_dev - self._yaw_baseline_offset
@@ -226,51 +237,61 @@ class PatDetector:
         elif abs(yaw_dev) < self.yaw_release_threshold:
             self._yaw_in_press = False
 
-        # --- State machine ---
+    def _advance_state(self, now: float) -> tuple[str, str] | None:
+        """Run the two-level state machine for one tick; return any event."""
         if self._state == "idle":
-            cutoff = now - self.pat_window
-            recent_presses = sum(1 for t, _ in self.press_times if t > cutoff)
-
-            if recent_presses >= self.min_presses and now - self.last_pat_time > self.pat_cooldown:
-                touch_type = self._classify_touch(now)
-                self._current_touch_type = touch_type
-                self.last_pat_time = now
-                self.press_times.clear()
-                self._state = "level1"
-                self._level1_time = now
-                self._level2_threshold = self._level2_threshold_fn()
-                logger.info(
-                    "Pat level1! type=%s (%d presses, level2 threshold=%.1f s)",
-                    touch_type,
-                    recent_presses,
-                    self._level2_threshold,
-                )
-                return ("level1", touch_type)
-
-        elif self._state == "level1":
-            if (
-                self._last_press_time > 0
-                and now - self._last_press_time > self._interaction_gap_timeout
-            ):
-                logger.info("Pat interaction gap — resetting to idle")
-                self._state = "idle"
-                return None
-
-            elapsed = now - self._level1_time
-            if elapsed > self._level2_threshold:
-                touch_type = self._current_touch_type
-                self.last_pat_time = now
-                self.press_times.clear()
-                self._state = "level2_cooldown"
-                logger.info("Pat level2! type=%s (sustained %.1f s)", touch_type, elapsed)
-                return ("level2", touch_type)
-
-        elif self._state == "level2_cooldown":
+            return self._advance_idle(now)
+        if self._state == "level1":
+            return self._advance_level1(now)
+        if self._state == "level2_cooldown":
             if now - self.last_pat_time > self._level2_cooldown:
                 logger.info("Pat cooldown expired — ready for new detection")
                 self._state = "idle"
                 self.press_times.clear()
+        return None
 
+    def _advance_idle(self, now: float) -> tuple[str, str] | None:
+        """Idle → level1 once enough recent presses land outside the cooldown."""
+        cutoff = now - self.pat_window
+        recent_presses = sum(1 for t, _ in self.press_times if t > cutoff)
+        if not (
+            recent_presses >= self.min_presses and now - self.last_pat_time > self.pat_cooldown
+        ):
+            return None
+
+        touch_type = self._classify_touch(now)
+        self._current_touch_type = touch_type
+        self.last_pat_time = now
+        self.press_times.clear()
+        self._state = "level1"
+        self._level1_time = now
+        self._level2_threshold = self._level2_threshold_fn()
+        logger.info(
+            "Pat level1! type=%s (%d presses, level2 threshold=%.1f s)",
+            touch_type,
+            recent_presses,
+            self._level2_threshold,
+        )
+        return ("level1", touch_type)
+
+    def _advance_level1(self, now: float) -> tuple[str, str] | None:
+        """level1 → level2 on a sustained hold, or → idle on an interaction gap."""
+        if (
+            self._last_press_time > 0
+            and now - self._last_press_time > self._interaction_gap_timeout
+        ):
+            logger.info("Pat interaction gap — resetting to idle")
+            self._state = "idle"
+            return None
+
+        elapsed = now - self._level1_time
+        if elapsed > self._level2_threshold:
+            touch_type = self._current_touch_type
+            self.last_pat_time = now
+            self.press_times.clear()
+            self._state = "level2_cooldown"
+            logger.info("Pat level2! type=%s (sustained %.1f s)", touch_type, elapsed)
+            return ("level2", touch_type)
         return None
 
     def reset(self) -> None:
