@@ -847,6 +847,75 @@ the daemon's DoA endpoint instead; use it with `--transport http` or
 """
 
 
+_PAT = """\
+# reachy-mini-cli pat
+
+Feel a head pat and lean into it. A proprioceptive reactive loop: the robot holds
+a neutral baseline head pose, reads the *actual* head pose back each tick, and feeds
+the commanded-vs-actual deviation to a `PatDetector`. When the detector recognises a
+pat it fires an event and `PatReaction` enqueues a calm lean→nuzzle→settle gesture
+onto the shared serial `MotionQueue`, drained one move at a time to the robot by a
+background motion executor — the same architecture as `listen` and `think`.
+
+Two **touch types**:
+
+- `scratch` — a head-press (pitch deviation): the robot dips its head into the touch.
+- `side_pat` — a sideways nudge (yaw deviation): the robot turns toward the hand.
+
+Two **intensities**: `level1` (light touch) and `level2` (sustained/firmer touch).
+Each combination produces a distinct lean gesture — the reaction is scaled by level.
+
+Detection is **proprioceptive**: there is no physical touch sensor. The detector
+infers a pat from the difference between the commanded pose and the actual pose
+reported by the SDK (`head_pose` read-back). A transient pose deviation that matches
+the scratch or side-nudge pattern — enough presses within a sliding window above the
+press threshold — fires a detection event.
+
+## Verbs
+
+- `reachy-mini-cli pat run` — run the foreground proprioceptive loop (SDK-first by
+  default); Ctrl-C stops it. `--ticks N` stops after N loop ticks (useful for
+  ops/testing). `--press-threshold DEG` and `--min-presses N` tune the detector.
+- `reachy-mini-cli pat demo` — synthesize the scripted pat events through
+  `PatReaction` with **no robot and no `[sdk]` extra**; emits the enqueued action
+  labels so the lean wiring can be verified in CI or on any machine. `--count N`
+  limits the number of scripted events played. `--json` for machine-readable output.
+- `reachy-mini-cli pat overview` — this summary.
+
+## Transport
+
+`pat` is **SDK-first**: `head_pose` read-back is an SDK-only capability. The `http`
+transport is accepted via `--transport http` / `REACHY_TRANSPORT=http` for non-pose
+operations, but attempting a `run` over `http` raises a clean exit-2 `CliError`
+("not supported on this transport") — never a traceback. A missing `[sdk]` extra also
+raises a clean exit-2 `CliError` pointing at the extra before the loop starts.
+
+## Motion
+
+Lean gestures are enqueued onto a serial `MotionQueue` and drained one move at a
+time by a background `_MotionExecutor` thread. A transport drop inside the executor
+degrades motion to silent — the pat sensing loop keeps running. The queue is flushed
+(best effort) on shutdown so any in-flight lean completes before exit.
+
+## Notes
+
+- `demo` requires no robot and no `[sdk]` extra — safe to run in CI and on a
+  plain dev machine to exercise the lean planner end-to-end.
+- `--ticks N` is handy for bounded ops runs or automated tests.
+- Only one thing should drive the robot at a time — don't run `pat` alongside
+  `demo-mode`, `listen`, or another motion source.
+
+## Usage
+
+    reachy-mini-cli pat run                          # foreground loop, SDK transport
+    reachy-mini-cli pat run --ticks 100              # stop after 100 ticks
+    reachy-mini-cli pat run --press-threshold 1.5    # stiffer detection threshold
+    reachy-mini-cli pat demo                         # verify lean wiring, no robot
+    reachy-mini-cli pat demo --count 2 --json        # first 2 events, JSON output
+    reachy-mini-cli pat overview                     # this summary
+"""
+
+
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
     ("reachy",): _ROOT,
@@ -933,4 +1002,8 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("think", "expressions", "list"): _THINK,
     ("think", "expressions", "check"): _THINK,
     ("think", "demo"): _THINK_DEMO,
+    ("pat",): _PAT,
+    ("pat", "overview"): _PAT,
+    ("pat", "run"): _PAT,
+    ("pat", "demo"): _PAT,
 }
