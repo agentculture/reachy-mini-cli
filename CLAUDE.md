@@ -199,6 +199,27 @@ you touch the CLI.
     `before_turn` sense feed checks this window and discards any sample captured
     inside it, preventing the robot from reacting to its own voice through the
     shared USB audio device.
+- **`pat` noun — proprioceptive touch + snuggle (SDK-first):**
+  `reachy/cli/_commands/pat.py` exposes `run` (foreground proprioceptive loop) +
+  `demo` (synthesize pat events, NO robot / NO `[sdk]` extra) + `overview`. There
+  is no touch sensor: the loop holds a baseline head pose, reads the *actual* pose
+  back via `reachy/robot` `head_pose()` (an SDK-only read-back), and feeds the
+  commanded-vs-actual deviation to a `PatDetector` (`reachy/motion/pat.py`, cited
+  from `reachy_nova` — numpy + stdlib only). A downward **pitch** press → `scratch`;
+  a sideways **yaw** nudge → `side_pat`; two intensities (`level1`/`level2`). On a
+  detection `PatReaction` (`reachy/motion/pat_reaction.py`) — a pure planner —
+  enqueues a calm lean→nuzzle→settle gesture (pitch-down for scratch; yaw-toward +
+  body_yaw for side_pat) onto the shared serial `MotionQueue`, drained by the same
+  `_MotionExecutor`/`reachy.motion.server.run` background-thread pattern as
+  `listen`/`think` (motion errors degrade silently). SDK-first by default; the
+  `http` transport cannot read `head_pose`. A missing `[sdk]` extra raises a clean
+  exit-2 `CliError`; `demo` works with no robot. While a reaction is enqueued, `pat`
+  writes `pat_active.flag` via `reachy/motion/pat_signal.py` (the counterpart to
+  think's `think_active.flag`) — the `listen` idle producer reads it and **pauses
+  the idle wander entirely** so the snuggle owns the motion (full suppression,
+  vs. think's focused-breathe). Determinism seams for tests: `PatDetector.update`
+  takes `now=` and the constructor takes `level2_threshold_fn`; `pat run` takes a
+  bounded `--ticks N` and injects the transport via `get_transport`.
 
 ## Hard constraints
 
