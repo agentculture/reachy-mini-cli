@@ -48,7 +48,7 @@ import random
 from dataclasses import dataclass, field
 
 from reachy.behavior.sense import Sense, doa_angle_to_yaw
-from reachy.motion import pat_signal
+from reachy.motion import pat_signal, sleep_signal
 from reachy.motion.idle import AliveConfig, next_pose
 from reachy.motion.queue import ANTENNA_KEY, IDLE_KEY, LOOK_KEY, MotionAction
 from reachy.speech import cognition_signal
@@ -289,6 +289,16 @@ class ListenProducer:
         if self._last_idle_t is not None and (t - self._last_idle_t) < self._alive.interval:
             return None
         self._last_idle_t = t
+
+        # Sleep is the strongest interrupt: while the robot is asleep/resting
+        # (a cheap file-exists check via the sleep signal), suppress the idle
+        # wander ENTIRELY — emit no pose this tick so stillness is total. This
+        # check is placed ABOVE the pat and ``think`` checks below, so sleep
+        # outranks both: if several flags are active, sleep wins and we return
+        # None. Placed after the paced-tick guard so pacing state stays
+        # consistent.
+        if sleep_signal.is_active():
+            return None
 
         # A scratch breaks stillness: while a ``pat`` reaction is in progress
         # (a cheap file-exists check via the pat signal), suppress the idle
