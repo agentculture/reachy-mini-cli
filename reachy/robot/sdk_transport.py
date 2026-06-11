@@ -21,13 +21,12 @@ from __future__ import annotations
 
 import contextlib
 import math
-from typing import TYPE_CHECKING, Iterator
+from typing import Iterator
+
+import numpy as np
 
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.robot.transport import TargetSink, Transport
-
-if TYPE_CHECKING:  # pragma: no cover
-    import numpy as np
 
 # CLI interpolation name -> SDK ``InterpolationTechnique`` value. The SDK calls
 # the eased curve ``ease_in_out``; the daemon (and our CLI) calls it ``ease``.
@@ -51,6 +50,32 @@ def _tuple_to_doa_dict(result: tuple[float, bool] | None) -> dict[str, object] |
         return None
     angle, speech = result
     return {"angle": float(angle), "speech_detected": bool(speech)}
+
+
+def _euler_pitch_yaw(pose: "np.ndarray") -> tuple[float, float]:
+    """Extract ``(pitch_deg, yaw_deg)`` from a head-pose rotation, in pure numpy.
+
+    ``pose`` is the SDK's head pose as either a 4×4 homogeneous transform (what
+    ``ReachyMini.get_current_head_pose()`` returns) or a bare 3×3 rotation; only
+    the upper-left 3×3 rotation block is used.
+
+    The convention matches reachy_nova's ``detect_pat``, which reads pitch and
+    yaw from ``scipy``'s ``Rotation.from_matrix(R).as_euler("xyz", degrees=True)``
+    (intrinsic XYZ → ``[roll, pitch, yaw]``; pitch is index 1, yaw is index 2).
+    scipy is deliberately NOT a dependency here, so we close-form the same
+    decomposition. For intrinsic ``R = Rx(roll) @ Ry(pitch) @ Rz(yaw)``::
+
+        pitch = asin(R[0, 2])
+        yaw   = atan2(-R[0, 1], R[0, 0])
+
+    ``R[0, 2]`` is clamped to ``[-1, 1]`` so floating-point drift past the unit
+    range can't make ``asin`` return NaN.
+    """
+    rot = np.asarray(pose, dtype=float)[:3, :3]
+    sin_pitch = float(np.clip(rot[0, 2], -1.0, 1.0))
+    pitch = math.degrees(math.asin(sin_pitch))
+    yaw = math.degrees(math.atan2(-rot[0, 1], rot[0, 0]))
+    return float(pitch), float(yaw)
 
 
 class MediaSession:
@@ -227,6 +252,20 @@ class SdkTransport(Transport):
             "head_pose": pose.tolist() if hasattr(pose, "tolist") else pose,
             "antennas_position": list(antennas) if antennas is not None else None,
         }
+
+    def head_pose(self) -> tuple[float, float]:
+        """Read the ACTUAL current head pose as ``(pitch_deg, yaw_deg)``.
+
+        Opens a short-lived ``ReachyMini`` session, calls
+        ``get_current_head_pose()`` (a 4×4 homogeneous transform matrix), and
+        normalizes its rotation block to degrees via :func:`_euler_pitch_yaw`.
+        Raises a clean :class:`CliError` (exit 2) when the SDK extra is missing —
+        never a traceback.
+        """
+        reachy_mini_cls, _ = self._import()
+        with reachy_mini_cls() as mini:
+            pose = mini.get_current_head_pose()
+        return _euler_pitch_yaw(pose)
 
     # --- move ------------------------------------------------------------
     def move_goto(

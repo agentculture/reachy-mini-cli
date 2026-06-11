@@ -67,6 +67,17 @@ class Transport:
     def robot_state(self) -> object:
         raise self._unsupported("device state")
 
+    def head_pose(self) -> tuple[float, float]:
+        """Read the robot's ACTUAL current head pose as ``(pitch_deg, yaw_deg)``.
+
+        This is the proprioceptive read-back — the head's *measured* pose, for
+        comparing against a commanded pose (e.g. pat detection). It travels only
+        over the local SDK path (the daemon REST API has no read-back route), so
+        it is an ``sdk``-flavor capability; the ``http`` flavor and the base
+        raise the standard "not supported on this transport" error.
+        """
+        raise self._unsupported("state head_pose")
+
     def doa(self, *, timeout: float | None = None) -> object:
         """Read the sound Direction of Arrival (``{angle, speech_detected}`` or null).
 
