@@ -402,6 +402,56 @@ its idle wander entirely** so the lean/snuggle owns the motion — a scratch ful
 breaks stillness, where a `think` turn only quiets it to a focused breathe. See
 `reachy explain pat` for the full reference.
 
+### Sleep — decay-to-sleep + wake
+
+`sleep` makes the robot **fall asleep when left alone and wake up when addressed**.
+It tracks idle time against configurable thresholds and decays through three states —
+**ALERT** → **DROWSY** → **ASLEEP** — using a purely injected-clock idle timer (no
+wall-clock dependency). Motion follows the state: a drowsy fade on the way down, a
+quiet sleep-breathe cycle while asleep, and a wake gesture on resumption.
+
+**Idle timer and state machine** — `reachy/sleep/state.py` holds `SleepState`
+(ALERT/DROWSY/ASLEEP) and the injected-clock timer. Any qualifying stimulus
+resets the timer; without one, the robot decays through the thresholds automatically.
+`reachy/sleep/stimulus.py` classifies incoming sense events as qualifying
+stimulation, including a self-mute exclusion so the robot does not wake itself
+from its own speaker output.
+
+**Two-tier wake** — `reachy/sleep/wake.py`: Tier 1 (default) wakes on detected
+speech or a loud RMS snap transient (same signals as `listen` Tier 2). Tier 2
+adds optional wake-word detection, available behind generic `[cpu]` / `[gpu]`
+extras that pin the appropriate compute-class backend; the wake-word path is
+lazy-loaded and degrades gracefully if the extra is absent.
+
+**Idle interrupt — strongest suppressor:** `sleep` writes `sleep_active.flag`
+(via `reachy/motion/sleep_signal.py`) while the robot is in DROWSY or ASLEEP
+state. A co-running `listen`/idle loop reads this flag as the **highest-priority
+idle interrupt** — above `pat_active.flag` and `think_active.flag` — and yields
+the motion channel entirely to `sleep`'s `SleepProducer`
+(`reachy/motion/sleep.py`).
+
+Like `pat`/`think`, `sleep` is **SDK-first**: the `sdk` transport (default) is
+the full path; `--transport http` is available for non-pose ops. A missing `[sdk]`
+extra raises a clean exit-2 `CliError`. `sleep` has its own supervisor
+(`reachy/sleep/supervisor.py`, tracking `sleep.pid`/`sleep.log` under
+`$REACHY_STATE_DIR`) separate from the `listen` and `think` supervisors.
+
+```bash
+reachy-mini-cli sleep run                                 # foreground decay loop (Ctrl-C to stop)
+reachy-mini-cli sleep run --ticks 300                     # bounded run (testing/ops)
+reachy-mini-cli sleep run --idle-timeout 30               # fall asleep after 30 s of quiet
+reachy-mini-cli sleep start                               # background tracked process
+reachy-mini-cli sleep status --json                       # state + idle timer + health
+reachy-mini-cli sleep stop
+reachy-mini-cli sleep restart
+reachy-mini-cli sleep demo                                # walk ALERT→DROWSY→ASLEEP→wake, no robot
+reachy-mini-cli sleep demo --json                         # machine-readable event trace
+```
+
+`sleep demo` uses injected senses and a fake clock to walk the full state
+machine deterministically — no robot and no `[sdk]` extra needed. See
+`reachy explain sleep` for the full flag reference.
+
 ## Make it your own
 
 1. Rename the package `reachy/` and the `reachy-mini-cli`

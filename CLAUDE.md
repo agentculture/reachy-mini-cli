@@ -221,6 +221,43 @@ you touch the CLI.
   takes `now=` and the constructor takes `level2_threshold_fn`; `pat run` takes a
   bounded `--ticks N` and injects the transport via `get_transport`.
 
+- **`sleep` noun — decay-to-sleep + wake (SDK-first):**
+  `reachy/cli/_commands/sleep.py` exposes `run` (foreground decay loop) +
+  `start`/`stop`/`restart`/`status` (background process; `status --json` reports
+  state + idle timer + health) + `demo` (injected sense + fake clock, walks
+  ALERT→DROWSY→ASLEEP→wake in `--json`, NO robot / NO `[sdk]` extra) + `overview`.
+  The sleep subsystem lives in `reachy/sleep/`:
+  - `reachy/sleep/state.py` — `SleepState` enum (ALERT/DROWSY/ASLEEP) + an
+    injected-clock idle timer; wall-clock dependency is fully factored out for
+    determinism in tests.
+  - `reachy/sleep/stimulus.py` — qualifying-stimulation classifier: decides which
+    incoming sense events reset the idle timer; includes a self-mute exclusion so
+    the robot cannot wake itself from its own speaker output.
+  - `reachy/sleep/wake.py` — two-tier wake: Tier 1 (default) wakes on detected
+    speech or a loud RMS snap transient (same signals as `listen` Tier 2).
+    Tier 2 adds optional wake-word detection behind generic `[cpu]` / `[gpu]`
+    extras (compute-class pins for the wake-word backend); the path is lazy-loaded
+    and degrades gracefully when the extra is absent — a missing extra never raises
+    at import time.
+  - `reachy/sleep/supervisor.py` — manages `sleep`'s background process (PID +
+    log as `sleep.pid`/`sleep.log` under `$REACHY_STATE_DIR`). **Distinct** from
+    `listen`'s `reachy/motion/supervisor.py` and `think`'s
+    `reachy/speech/supervisor.py` — each noun tracks its own process.
+  - `reachy/motion/sleep.py` — `SleepProducer`: drowsy fade on the way down,
+    quiet sleep-breathe cycle while ASLEEP, wake gesture on resumption; enqueued
+    onto the same shared serial `MotionQueue` as `pat`/`listen`/`think`.
+  - `reachy/motion/sleep_signal.py` — `sleep_active.flag` counterpart to
+    `pat_active.flag`/`think_active.flag`. Written while the robot is in DROWSY or
+    ASLEEP state. The `listen` idle layer reads this flag as the **strongest idle
+    interrupt** — higher priority than `pat_active.flag` (which pauses idle) and
+    `think_active.flag` (which drops to focused-breathe) — and yields the motion
+    channel entirely to `sleep`'s `SleepProducer`.
+  SDK-first by default; the `http` transport is available for non-pose ops. A
+  missing `[sdk]` extra raises a clean exit-2 `CliError`. Determinism seams for
+  tests: `SleepState` timer takes an injected clock; `sleep run` takes a bounded
+  `--ticks N` and injects the transport via `get_transport`; `demo` needs no
+  robot.
+
 ## Hard constraints
 
 - **Base runtime dependencies — SDK-first, but installable.** `numpy` is the only
@@ -236,7 +273,11 @@ you touch the CLI.
   The HTTP transport stays available via `--transport http` / `REACHY_TRANSPORT=http`.
   Adding a *new* base runtime dep beyond `numpy` needs an explicit decision (keep the
   base light enough for the remote profile). `teken` remains dev-only; `whoami` still
-  hand-rolls YAML; `reachy/daemon.py` still uses stdlib only.
+  hand-rolls YAML; `reachy/daemon.py` still uses stdlib only. The `[cpu]` / `[gpu]`
+  extras (introduced for `sleep`'s optional wake-word path) are generic compute-class
+  extras that pin the appropriate backend wheel; they are lazy-loaded and the Tier 1
+  wake (speech/snap) never requires them — a bare `pip install reachy-mini-cli` still
+  gets full Tier 1 wake functionality.
 - **Python ≥ 3.12** (uses `X | None`, `tomllib`, etc.).
 - **Every PR bumps the version**, even docs/config/CI-only changes — the
   `version-check` CI job blocks the merge otherwise (it compares
