@@ -117,7 +117,7 @@ class PatDetector:
         self._level2_threshold_fn: Callable[[], float] = (
             level2_threshold_fn
             if level2_threshold_fn is not None
-            else lambda: random.uniform(4.0, 8.0)
+            else lambda: random.uniform(4.0, 8.0)  # nosec B311 — jitter, not crypto
         )
 
         # --- Rolling history (timestamp, corrected_deviation) ---
