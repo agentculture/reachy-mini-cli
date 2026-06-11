@@ -74,6 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
     from reachy.cli._commands import listen as _listen_group
     from reachy.cli._commands import move as _move_group
     from reachy.cli._commands import overview as _overview_cmd
+    from reachy.cli._commands import pat as _pat_group
     from reachy.cli._commands import quickstart as _quickstart_cmd
     from reachy.cli._commands import say as _say_group
     from reachy.cli._commands import think as _think_group
@@ -120,6 +121,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _vision_group.register(sub)
     _say_group.register(sub)
     _think_group.register(sub)
+    _pat_group.register(sub)
 
     return parser
 
