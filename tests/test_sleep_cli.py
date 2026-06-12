@@ -307,3 +307,298 @@ def test_sleep_arc_alert_drowsy_asleep_wake_no_wallclock() -> None:
     # The final tick had a speech stimulus → wake → back to ALERT.
     assert states[-1] == SleepState.ALERT.name
     assert result["woke"] is True
+
+
+# --- t4: audio-wake toggle (pat-only / quiet-room) ------------------------
+
+
+def _idle_then(events, *, ticks):
+    """Build a (now, sense, advance) seam: silent until the last tick, then the
+    provided final ``Sense``.  The clock jumps 10s/tick so a small idle-timeout
+    walks the machine to ASLEEP within a handful of ticks."""
+    from reachy.behavior.sense import EMPTY_SENSE
+
+    clock = {"t": 0.0}
+    feed = {"i": 0}
+
+    def now() -> float:
+        return clock["t"]
+
+    def sense():
+        return events[min(feed["i"], len(events) - 1)]
+
+    def advance() -> None:
+        feed["i"] += 1
+        clock["t"] += 10.0
+
+    _ = ticks  # documentation only — caller passes ticks to run_sleep_arc
+    _ = EMPTY_SENSE
+    return now, sense, advance
+
+
+def test_sleep_arc_pat_only_ignores_speech_and_snap() -> None:
+    """``run_sleep_arc(audio_wake=False)`` is pat-only: an injected speech flag
+    AND an injected snap both stay ASLEEP (audio ignored) — only a pat wakes."""
+    from reachy.behavior.sense import EMPTY_SENSE, Sense
+    from reachy.cli._commands.sleep import run_sleep_arc
+    from reachy.motion.queue import MotionQueue
+
+    # Every tick carries an active speech flag; a snap source fires every tick too.
+    senses = [Sense(speech_detected=True)] * 5
+    now, sense, advance = _idle_then(senses, ticks=5)
+    _ = EMPTY_SENSE
+
+    result = run_sleep_arc(
+        queue=MotionQueue(),
+        now=now,
+        sense=sense,
+        snap=lambda: True,  # loud transient every tick
+        pat=lambda: False,  # no touch
+        audio_wake=False,
+        on_tick=advance,
+        ticks=5,
+        idle_timeout=15.0,
+    )
+    # Audio is ignored: speech + snap never wake it; it decays to ASLEEP and stays.
+    assert SleepState.ASLEEP.name in result["states"]
+    assert result["states"][-1] != SleepState.ALERT.name
+    assert result["woke"] is False
+
+
+def test_sleep_arc_pat_only_wakes_on_pat() -> None:
+    """``run_sleep_arc(audio_wake=False)`` wakes when the injected ``pat`` source
+    fires on the final tick — pat is the only path."""
+    from reachy.behavior.sense import EMPTY_SENSE
+    from reachy.cli._commands.sleep import run_sleep_arc
+    from reachy.motion.queue import MotionQueue
+
+    senses = [EMPTY_SENSE] * 5
+    now, sense, advance = _idle_then(senses, ticks=5)
+    pat_state = {"i": 0}
+
+    def pat_source() -> bool:
+        pat_state["i"] += 1
+        return pat_state["i"] >= 5  # fire on the 5th poll (the last tick)
+
+    result = run_sleep_arc(
+        queue=MotionQueue(),
+        now=now,
+        sense=sense,
+        snap=lambda: False,
+        pat=pat_source,
+        audio_wake=False,
+        on_tick=advance,
+        ticks=5,
+        idle_timeout=15.0,
+    )
+    assert SleepState.ASLEEP.name in result["states"]
+    assert result["states"][-1] == SleepState.ALERT.name
+    assert result["woke"] is True
+
+
+def test_sleep_arc_default_keeps_audio_wake() -> None:
+    """The default (``audio_wake`` omitted) keeps audio wake: a speech flag on the
+    final tick wakes it."""
+    from reachy.behavior.sense import EMPTY_SENSE, Sense
+    from reachy.cli._commands.sleep import run_sleep_arc
+    from reachy.motion.queue import MotionQueue
+
+    senses = [EMPTY_SENSE, EMPTY_SENSE, EMPTY_SENSE, EMPTY_SENSE, Sense(speech_detected=True)]
+    now, sense, advance = _idle_then(senses, ticks=5)
+
+    result = run_sleep_arc(
+        queue=MotionQueue(),
+        now=now,
+        sense=sense,
+        on_tick=advance,
+        ticks=5,
+        idle_timeout=15.0,
+    )
+    assert SleepState.ASLEEP.name in result["states"]
+    assert result["states"][-1] == SleepState.ALERT.name
+    assert result["woke"] is True
+
+
+def test_sleep_arc_wake_word_wakes_when_audio_on() -> None:
+    """With ``audio_wake=True`` a detected wake-WORD (via the injected wake_detector
+    factory) wakes it even with no speech flag / snap."""
+    from reachy.behavior.sense import EMPTY_SENSE
+    from reachy.cli._commands.sleep import run_sleep_arc
+    from reachy.motion.queue import MotionQueue
+
+    senses = [EMPTY_SENSE] * 5
+    now, sense, advance = _idle_then(senses, ticks=5)
+
+    fired = {"i": 0}
+
+    class _WakeWordDetector:
+        def update(self, sense, audio) -> bool:  # noqa: ANN001
+            fired["i"] += 1
+            return fired["i"] >= 5
+
+        def reset(self) -> None:
+            return None
+
+    result = run_sleep_arc(
+        queue=MotionQueue(),
+        now=now,
+        sense=sense,
+        audio_wake=True,
+        wake_detector_factory=lambda: _WakeWordDetector(),
+        on_tick=advance,
+        ticks=5,
+        idle_timeout=15.0,
+    )
+    assert SleepState.ASLEEP.name in result["states"]
+    assert result["states"][-1] == SleepState.ALERT.name
+    assert result["woke"] is True
+
+
+def test_sleep_arc_pat_only_does_not_consult_wake_word() -> None:
+    """With ``audio_wake=False`` the audio wake-word backend is never consulted —
+    its ``update`` must not be called."""
+    from reachy.behavior.sense import EMPTY_SENSE
+    from reachy.cli._commands.sleep import run_sleep_arc
+    from reachy.motion.queue import MotionQueue
+
+    senses = [EMPTY_SENSE] * 3
+    now, sense, advance = _idle_then(senses, ticks=3)
+    calls = {"n": 0}
+
+    class _SpyDetector:
+        def update(self, sense, audio) -> bool:  # noqa: ANN001
+            calls["n"] += 1
+            return False
+
+        def reset(self) -> None:
+            return None
+
+    run_sleep_arc(
+        queue=MotionQueue(),
+        now=now,
+        sense=sense,
+        audio_wake=False,
+        wake_detector_factory=lambda: _SpyDetector(),
+        on_tick=advance,
+        ticks=3,
+        idle_timeout=15.0,
+    )
+    assert calls["n"] == 0
+
+
+# --- t4: CLI surface for --no-audio-wake / --wake pat ----------------------
+
+
+def test_sleep_run_wake_pat_on_http_exits_2_text(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path
+) -> None:
+    """``sleep run --wake pat`` on the http transport (no head_pose read-back)
+    raises a clean exit-2 CliError — two lines, no traceback."""
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    import reachy.cli._commands.sleep as sleep_mod
+
+    class _HttpTransport:
+        name = "http"
+
+        def move_goto(self, **kwargs: object) -> None:
+            return None
+
+    monkeypatch.setattr(sleep_mod, "get_transport", lambda args: _HttpTransport())
+    rc = main(["sleep", "run", "--transport", "http", "--wake", "pat", "--ticks", "1"])
+    assert rc == EXIT_ENV_ERROR
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "hint:" in err
+    assert "Traceback" not in err
+
+
+def test_sleep_run_no_audio_wake_on_http_exits_2_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path
+) -> None:
+    """``sleep run --no-audio-wake --json`` on http raises a structured exit-2."""
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    import reachy.cli._commands.sleep as sleep_mod
+
+    class _HttpTransport:
+        name = "http"
+
+        def move_goto(self, **kwargs: object) -> None:
+            return None
+
+    monkeypatch.setattr(sleep_mod, "get_transport", lambda args: _HttpTransport())
+    rc = main(["sleep", "run", "--transport", "http", "--no-audio-wake", "--ticks", "1", "--json"])
+    assert rc == EXIT_ENV_ERROR
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["code"] == EXIT_ENV_ERROR
+    assert "message" in payload and "remediation" in payload
+
+
+def test_sleep_run_no_audio_wake_sdk_pat_only_bounded(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path
+) -> None:
+    """``sleep run --no-audio-wake`` on the sdk transport wires a pat source from
+    ``head_pose`` and runs the bounded loop to completion (no robot, no wake)."""
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    import reachy.cli._commands.sleep as sleep_mod
+
+    class _PatSdkTransport(_FakeSdkTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.head_pose_reads = 0
+
+        def head_pose(self) -> tuple[float, float]:
+            self.head_pose_reads += 1
+            return (0.0, 0.0)
+
+    fake = _PatSdkTransport()
+
+    # Stub the pat-wake SOURCE so the test exercises the pat-only WIRING (the
+    # source is constructed with the SDK head-pose read-back and polled each tick)
+    # without coupling to the PatDetector's press dynamics — a quiet run, no pat.
+    polled = {"n": 0}
+
+    class _QuietPatWake:
+        def __init__(
+            self, *, read_head_pose, commanded_pose, detector=None
+        ) -> None:  # noqa: ANN001
+            # Prove the wiring: the SDK head-pose read-back is the source.
+            assert getattr(read_head_pose, "__self__", None) is fake
+            self._commanded = commanded_pose
+
+        def poll(self, *, now=None) -> bool:  # noqa: ANN001
+            polled["n"] += 1
+            self._commanded()  # reads the moving commanded pose (must not raise)
+            return False
+
+    monkeypatch.setattr(sleep_mod, "get_transport", lambda args: fake)
+    monkeypatch.setattr(sleep_mod, "PatWakeSource", _QuietPatWake)
+    monkeypatch.setattr(sleep_mod.time, "sleep", lambda *_a, **_k: None)
+    rc = main(["sleep", "run", "--transport", "sdk", "--no-audio-wake", "--ticks", "4", "--json"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    last = [line for line in out.splitlines() if line.strip()][-1]
+    payload = json.loads(last)
+    assert payload["status"] == "ok"
+    assert payload["ticks"] == 4
+    assert payload["woke"] is False
+    # The pat source was actually polled (pat-only path executed).
+    assert polled["n"] >= 1
+
+
+def test_sleep_run_help_names_audio_off_use(capsys: pytest.CaptureFixture[str]) -> None:
+    """The run help text names the pat-only / quiet-room / audio-off deployment."""
+    with pytest.raises(SystemExit) as exc:
+        main(["sleep", "run", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out.lower()
+    assert "--no-audio-wake" in out or "no-audio-wake" in out
+    assert "--wake" in out
+    assert "pat" in out
+
+
+def test_sleep_overview_names_audio_off_use(capsys: pytest.CaptureFixture[str]) -> None:
+    """The overview names the quiet-room / audio-off / pat-only deployment."""
+    rc = main(["sleep", "overview"])
+    assert rc == 0
+    out = capsys.readouterr().out.lower()
+    assert "quiet" in out or "audio-off" in out or "pat-only" in out

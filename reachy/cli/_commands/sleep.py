@@ -55,6 +55,7 @@ from reachy.motion.sleep import SleepProducer
 from reachy.motion.snap import SnapDetector
 from reachy.robot import add_robot_args, get_transport
 from reachy.sleep import supervisor
+from reachy.sleep.patwake import PatWakeSource
 from reachy.sleep.state import SleepState, SleepStateMachine
 from reachy.sleep.stimulus import is_stimulus
 from reachy.sleep.wake import WakeDetector
@@ -94,6 +95,9 @@ def cmd_sleep_overview(args: argparse.Namespace) -> int:
                 "ALERT → DROWSY → ASLEEP the longer it goes undisturbed.",
                 "Any stimulus — detected speech, a DoA shift, a loud snap, or a pat — "
                 "snaps it back to ALERT with a single re-engagement gesture.",
+                "Quiet-room / audio-off deployment: --no-audio-wake (alias --wake pat) makes "
+                "it pat-only — speech/DoA/snap are ignored and only a head pat wakes it "
+                "(needs the sdk head-pose read-back; not available on --transport http).",
                 "Each state maps to motion: full alive idle (ALERT), low-energy idle "
                 "(DROWSY), a near-still sleep-breathe (ASLEEP).",
                 "While ASLEEP it writes the sleep-active flag so other subsystems can "
@@ -118,6 +122,8 @@ def cmd_sleep_overview(args: argparse.Namespace) -> int:
             "items": [
                 "every command supports --json",
                 "SDK-first by default; the sdk sense feed requires the [sdk] extra",
+                "wake: --no-audio-wake / --wake pat → pat-only (quiet-room / audio-off); "
+                "default --wake audio keeps sound wake; --wake-word adds phrase wake",
                 "pacing: --idle-timeout (seconds of quiet before sleep)",
                 "bound a run for testing/ops with --ticks N",
                 "demo needs NO robot and NO [sdk] extra (synthetic sense + fake clock)",
@@ -219,21 +225,39 @@ def _doa_shifted(curr: float | None, prev: float | None) -> bool:
     return curr is not None and prev is not None and abs(curr - prev) > _DOA_DEADBAND
 
 
+def _commanded_head_pose(producer: SleepProducer) -> tuple[float, float]:
+    """Best-effort read of the producer's CURRENT commanded head ``(pitch, yaw)``.
+
+    The :class:`SleepProducer` submits its sleep-breathe / idle pose onto the
+    shared queue under :data:`~reachy.motion.sleep.SLEEP_COALESCE_KEY` (and idle
+    moves under ``IDLE_KEY``); the latest pending action with a ``head`` dict is
+    the pose the robot was just told to hold this tick.  Inspect the queue's
+    public snapshot — newest-last — and return its head pitch/yaw, defaulting to
+    neutral ``(0.0, 0.0)`` when no head pose is pending yet.
+    """
+    for action in reversed(producer.queue.pending()):
+        head = action.head
+        if head is not None:
+            return float(head.get("pitch", 0.0)), float(head.get("yaw", 0.0))
+    return 0.0, 0.0
+
+
 def _advance(
     machine: SleepStateMachine,
     producer: SleepProducer,
     wake_detector: WakeDetector,
-    snapshot: Sense,
-    silent_audio: np.ndarray,
     t: float,
     *,
     stimulated: bool,
 ) -> bool:
-    """Advance the FSM + producer for one tick; return ``True`` if a wake fired."""
+    """Advance the FSM + producer for one tick; return ``True`` if a wake fired.
+
+    The acoustic wake-word leg is consulted in :func:`run_sleep_arc` before this
+    call; here ``wake_detector`` is only reset on a wake so its snap history does
+    not carry stale state across a re-engagement.
+    """
     if stimulated:
         machine.reset(now=t)
-        # Tier-1/2 wake detector keeps internal history consistent.
-        wake_detector.update(snapshot, silent_audio)
         producer.wake()
         wake_detector.reset()
         woke = True
@@ -256,6 +280,16 @@ def _sync_sleep_flag(*, asleep: bool, flag_up: bool) -> bool:
     return flag_up
 
 
+def _default_wake_detector() -> WakeDetector:
+    """The arc's default wake-word detector: Tier-2 wake-word disabled.
+
+    Tier-1 (speech flag / snap) is already handled by ``is_stimulus``; this
+    detector only adds the optional wake-*word* leg, which is off by default.
+    Callers wire a wake-word-enabled detector via ``wake_detector_factory``.
+    """
+    return WakeDetector(wake_word_enabled=False)
+
+
 def run_sleep_arc(
     *,
     queue: MotionQueue,
@@ -267,6 +301,9 @@ def run_sleep_arc(
     snap: Callable[[], bool] | None = None,
     pat: Callable[[], bool] | None = None,
     mute_until: Callable[[], float] | None = None,
+    audio_wake: bool = True,
+    wake_detector_factory: Callable[[], WakeDetector] | None = None,
+    commanded_pose_sink: Callable[[tuple[float, float]], None] | None = None,
     stop: dict | None = None,
 ) -> dict[str, object]:
     """Drive the decay→sleep→wake state arc for ``ticks`` iterations.
@@ -282,6 +319,19 @@ def run_sleep_arc(
     ``producer.state`` and call ``producer.update(...)`` to enqueue motion.  While
     ASLEEP keep the ``sleep_active.flag`` written; clear it otherwise.
 
+    ``audio_wake`` gates the acoustic wake paths.  When ``True`` (default) the
+    three acoustic stimuli (DoA shift, speech flag, snap) all qualify *and* a
+    wake-*word* backend (from ``wake_detector_factory``) is consulted on the
+    audio each tick — a detected phrase also wakes it.  When ``False`` the loop is
+    **pat-only**: ``is_stimulus(audio_wake=False)`` ignores all acoustic cues and
+    the wake-word backend is never consulted, so only an injected ``pat`` wakes it
+    — the quiet-room / mic-off deployment.
+
+    ``commanded_pose_sink``, when supplied, is called once per tick with the
+    producer's current commanded head ``(pitch_deg, yaw_deg)`` *after*
+    ``producer.update`` — so a pat-wake source can compare the read-back against
+    the MOVING sleep-breathe target.
+
     Returns ``{"states": [...], "woke": bool, "idle_seconds": float}`` — the
     observed :class:`SleepState` name per tick, whether a wake fired, and the
     final idle seconds.
@@ -289,7 +339,8 @@ def run_sleep_arc(
     # asleep_after == idle_timeout; drowsy_after is half of it (75/150 ratio).
     machine = SleepStateMachine(drowsy_after=idle_timeout / 2.0, asleep_after=idle_timeout)
     producer = SleepProducer(queue=queue, state=SleepState.ALERT)
-    wake_detector = WakeDetector(wake_word_enabled=False)
+    factory = wake_detector_factory if wake_detector_factory is not None else _default_wake_detector
+    wake_detector = factory()
 
     states: list[str] = []
     woke = False
@@ -315,20 +366,26 @@ def run_sleep_arc(
                 pat=_call_bool(pat),
                 now=t,
                 mute_until=_call_float(mute_until),
+                audio_wake=audio_wake,
             )
+            # Tier-2 wake-WORD: only when audio is on (pat-only never listens).
+            if audio_wake and not stimulated:
+                stimulated = wake_detector.update(snapshot, silent_audio)
 
             woke = (
                 _advance(
                     machine,
                     producer,
                     wake_detector,
-                    snapshot,
-                    silent_audio,
                     t,
                     stimulated=stimulated,
                 )
                 or woke
             )
+            # Publish the commanded sleep pose so a pat-wake source can compare the
+            # read-back against the MOVING target (not a static baseline).
+            if commanded_pose_sink is not None:
+                commanded_pose_sink(_commanded_head_pose(producer))
             flag_up = _sync_sleep_flag(asleep=machine.state is SleepState.ASLEEP, flag_up=flag_up)
             states.append(machine.state.name)
 
@@ -406,11 +463,104 @@ def _resolve_idle_timeout(args: argparse.Namespace) -> float:
     return _DEFAULT_IDLE_TIMEOUT if value is None else max(0.001, float(value))
 
 
+def _resolve_audio_wake(args: argparse.Namespace) -> bool:
+    """Fold ``--no-audio-wake`` / ``--wake {audio,pat}`` into a single bool.
+
+    ``--no-audio-wake`` and ``--wake pat`` mean the same thing (pat-only); either
+    yields ``False``.  ``--wake audio`` (the default) yields ``True``.  When both
+    forms are supplied they must agree on "audio off" — ``--no-audio-wake`` is the
+    floor, so any audio-off request wins.
+    """
+    no_audio = bool(getattr(args, "no_audio_wake", False))
+    wake = getattr(args, "wake", None)  # None | "audio" | "pat"
+    if wake == "pat":
+        no_audio = True
+    return not no_audio
+
+
+def _make_wake_detector_factory(args: argparse.Namespace) -> Callable[[], WakeDetector]:
+    """Build the arc's wake-WORD detector factory from the run flags.
+
+    Tier-2 wake-word is opt-in via ``--wake-word``; the resolved backend kind
+    (``http`` STT default, or ``openwakeword`` on the ``[cpu]``/``[gpu]`` extra)
+    and an optional phrase override are threaded to :class:`WakeDetector`, which
+    resolves the t2 backend.  Disabled by default → a null backend that never
+    fires (Tier-1 speech/snap still works via ``is_stimulus``).
+    """
+    enabled = bool(getattr(args, "wake_word", False))
+    kind = getattr(args, "wake_word_kind", None) or "http"
+    phrase = getattr(args, "wake_phrase", None)
+
+    def _factory() -> WakeDetector:
+        kw: dict[str, object] = {"wake_word_enabled": enabled, "wake_word_kind": kind}
+        if phrase:
+            kw["phrase"] = phrase
+        return WakeDetector(**kw)  # type: ignore[arg-type]
+
+    return _factory
+
+
+def _require_pat_capable(transport: object) -> None:
+    """Guard: pat-only wake needs the SDK ``head_pose`` read-back.
+
+    The ``http`` transport (no ``media_session``) cannot read the head pose back,
+    so a pat-only request there can never detect a touch.  Raise a clean exit-2
+    :class:`CliError` (two lines, no traceback) pointing at the SDK requirement.
+    """
+    if not hasattr(transport, "media_session"):
+        raise CliError(
+            code=2,
+            message="pat-only wake (--no-audio-wake / --wake pat) needs the SDK head-pose "
+            "read-back, which the http transport cannot provide",
+            remediation="run on the sdk transport (the default): drop --transport http, "
+            "and install the extra with: pip install 'reachy-mini-cli[sdk]'",
+        )
+
+
+def _build_pat_wake(
+    transport: object,
+) -> tuple[Callable[[], bool], Callable[[tuple[float, float]], None]]:
+    """Wire a :class:`PatWakeSource` against the MOVING commanded sleep pose.
+
+    Returns ``(pat, commanded_pose_sink)``:
+
+    * ``commanded_pose_sink`` — passed to :func:`run_sleep_arc`; called each tick
+      with the producer's current commanded head ``(pitch, yaw)`` and stashed.
+    * ``pat`` — polled by the arc; the :class:`PatWakeSource` reads the actual head
+      pose via ``transport.head_pose`` and compares it to the stashed commanded
+      pose, so the robot's own sleep-breathe motion is not read as a press.
+    """
+    commanded: dict[str, tuple[float, float]] = {"pose": (0.0, 0.0)}
+
+    def _sink(pose: tuple[float, float]) -> None:
+        commanded["pose"] = pose
+
+    source = PatWakeSource(
+        read_head_pose=transport.head_pose,  # type: ignore[attr-defined]
+        commanded_pose=lambda: commanded["pose"],
+    )
+
+    def _pat() -> bool:
+        try:
+            return source.poll()
+        except CliError:
+            # head_pose unavailable mid-run (transport dropped) → no pat this tick.
+            return False
+
+    return _pat, _sink
+
+
 def cmd_sleep_run(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
     transport = get_transport(args)
     idle_timeout = _resolve_idle_timeout(args)
     max_ticks = getattr(args, "ticks", None)
+    audio_wake = _resolve_audio_wake(args)
+
+    # Pat-only wake needs the SDK head-pose read-back: reject the http transport
+    # up front with a clean exit-2 CliError (never a traceback) before any session.
+    if not audio_wake:
+        _require_pat_capable(transport)
 
     # Build the sense feed for the selected transport.  The sdk feed opens the
     # media session eagerly, so a missing [sdk] extra raises a clean exit-2
@@ -420,13 +570,14 @@ def cmd_sleep_run(args: argparse.Namespace) -> int:
     else:
         sense, snap, close = _make_http_feed(transport)
 
+    # Pat-only mode wires a PatWakeSource off the SDK head-pose read-back; audio
+    # mode leaves it absent (None → the arc's pat source defaults to "no pat").
+    pat, pose_sink = _build_pat_wake(transport) if not audio_wake else (None, None)
+
     motion = _MotionExecutor(transport)
 
     if not json_mode:
-        emit_diagnostic(
-            f"[sleep] drifting off when undisturbed via {getattr(transport, 'name', 'sdk')}; "
-            f"idle-timeout={idle_timeout:g}s; a sound/touch wakes it; Ctrl-C to stop"
-        )
+        emit_diagnostic(_run_banner(transport, idle_timeout=idle_timeout, audio_wake=audio_wake))
 
     stop = {"flag": False}
     handlers = install_stop_handlers(stop)
@@ -439,6 +590,10 @@ def cmd_sleep_run(args: argparse.Namespace) -> int:
             idle_timeout=idle_timeout,
             max_ticks=max_ticks,
             stop=stop,
+            audio_wake=audio_wake,
+            wake_detector_factory=_make_wake_detector_factory(args),
+            pat=pat,
+            commanded_pose_sink=pose_sink,
         )
     finally:
         motion.stop()
@@ -461,6 +616,15 @@ def cmd_sleep_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_banner(transport: object, *, idle_timeout: float, audio_wake: bool) -> str:
+    """The one-line text diagnostic shown when a foreground run starts."""
+    wake_by = "a sound or touch wakes it" if audio_wake else "pat-only (mic off); a touch wakes it"
+    return (
+        f"[sleep] drifting off when undisturbed via {getattr(transport, 'name', 'sdk')}; "
+        f"idle-timeout={idle_timeout:g}s; {wake_by}; Ctrl-C to stop"
+    )
+
+
 def _run_foreground(
     *,
     queue: MotionQueue,
@@ -469,6 +633,10 @@ def _run_foreground(
     idle_timeout: float,
     max_ticks: int | None,
     stop: dict,
+    audio_wake: bool = True,
+    wake_detector_factory: Callable[[], WakeDetector] | None = None,
+    pat: Callable[[], bool] | None = None,
+    commanded_pose_sink: Callable[[tuple[float, float]], None] | None = None,
 ) -> dict[str, object]:
     """The live foreground loop: an unbounded (or ``max_ticks``-bounded) arc.
 
@@ -477,6 +645,10 @@ def _run_foreground(
     sleep-breathe makes no sound today, so nothing stamps it yet, but the seam
     exists.  Reuses :func:`run_sleep_arc` with a real monotonic clock and a real
     sleep between ticks; an unbounded run loops until ``stop['flag']``.
+
+    ``audio_wake`` gates the acoustic wake paths (see :func:`run_sleep_arc`); in
+    pat-only mode the caller supplies a ``pat`` source + ``commanded_pose_sink``
+    so the pat detector compares the read-back against the moving sleep pose.
     """
     mute = {"until": 0.0}
     ticks = max_ticks if max_ticks is not None else 10**12
@@ -489,7 +661,11 @@ def _run_foreground(
         now=time.monotonic,
         sense=sense,
         snap=snap,
+        pat=pat,
         mute_until=lambda: mute["until"],
+        audio_wake=audio_wake,
+        wake_detector_factory=wake_detector_factory,
+        commanded_pose_sink=commanded_pose_sink,
         on_tick=_between_ticks,
         ticks=ticks,
         idle_timeout=idle_timeout,
@@ -633,12 +809,64 @@ def _add_idle_timeout(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_wake_flags(parser: argparse.ArgumentParser) -> None:
+    """Add the audio-wake toggle + optional wake-word backend flags.
+
+    ``--no-audio-wake`` and ``--wake pat`` are aliases meaning the same thing:
+    pat-only / quiet-room — the mic is off, so speech/snap/DoA are ignored and
+    only a physical head pat wakes it (needs the SDK head-pose read-back).
+    ``--wake audio`` (the default) keeps the acoustic wake paths on.
+    """
+    parser.add_argument(
+        "--no-audio-wake",
+        action="store_true",
+        dest="no_audio_wake",
+        help="Pat-only / quiet-room mode (audio-off): ignore speech, DoA shifts and "
+        "snaps — only a physical head pat wakes it (needs the sdk head-pose read-back). "
+        "Same as --wake pat.",
+    )
+    parser.add_argument(
+        "--wake",
+        choices=("audio", "pat"),
+        default=None,
+        dest="wake",
+        help="Which stimulus wakes the robot: 'audio' (default — sound or touch) or "
+        "'pat' (quiet-room / audio-off, touch only; alias for --no-audio-wake).",
+    )
+    parser.add_argument(
+        "--wake-word",
+        action="store_true",
+        dest="wake_word",
+        help="Also wake on a spoken wake-WORD phrase (Tier-2; audio mode only). "
+        "Resolves the STT backend; off by default.",
+    )
+    parser.add_argument(
+        "--wake-word-kind",
+        choices=("http", "openwakeword"),
+        default=None,
+        dest="wake_word_kind",
+        help="Wake-word backend when --wake-word is set: 'http' STT (default) or "
+        "'openwakeword' (the [cpu]/[gpu] extra).",
+    )
+    parser.add_argument(
+        "--wake-phrase",
+        default=None,
+        dest="wake_phrase",
+        help="Wake-word phrase override (default 'hey reachy' / REACHY_STT_PHRASE).",
+    )
+
+
 def _register_run(noun_sub: argparse._SubParsersAction) -> None:
-    run = noun_sub.add_parser("run", help="Run the decay→sleep→wake loop in the foreground.")
+    run = noun_sub.add_parser(
+        "run",
+        help="Run the decay→sleep→wake loop in the foreground "
+        "(--no-audio-wake / --wake pat for the quiet-room / audio-off deployment).",
+    )
     add_robot_args(run)
     # sleep is SDK-first (real DoA + mic RMS) — default to sdk.
     run.set_defaults(transport=os.environ.get("REACHY_TRANSPORT", "sdk"))
     _add_idle_timeout(run)
+    _add_wake_flags(run)
     run.add_argument(
         "--ticks",
         type=int,
