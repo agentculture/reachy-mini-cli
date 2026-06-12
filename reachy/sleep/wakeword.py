@@ -100,7 +100,7 @@ def _resolve_stt_timeout(override: float | None) -> float:
 class _NullBackend:
     """A wake-word backend that never fires (Tier-2 disabled)."""
 
-    def update(self, sense: Sense, audio: np.ndarray) -> bool:  # noqa: ARG002
+    def update(self, _sense: Sense, _audio: np.ndarray) -> bool:
         return False
 
     def reset(self) -> None:
@@ -152,14 +152,15 @@ class HttpSttBackend:
     # Public API
     # ------------------------------------------------------------------
 
-    def update(self, sense: Sense, audio: np.ndarray) -> bool:  # noqa: ARG002
+    def update(self, _sense: Sense, audio: np.ndarray) -> bool:
         """Send the audio window for transcription; return True on a phrase match.
 
         Never raises — any network / parse failure degrades to ``False``.
         """
         try:
             payload = self._post(audio)
-        except Exception as exc:  # noqa: BLE001 — degrade cleanly, never crash the loop
+        # Degrade cleanly: a network/parse failure must never crash the loop.
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[wakeword] STT request failed (%s); no wake-word this tick", exc)
             return False
         return self._matches(payload)
@@ -218,7 +219,7 @@ class HttpSttBackend:
             return None
         try:
             decoded = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+        except ValueError:  # UnicodeDecodeError is a ValueError subclass
             logger.debug("[wakeword] STT response was not JSON; no wake-word")
             return None
         return decoded if isinstance(decoded, dict) else None
@@ -250,14 +251,15 @@ class OpenWakeWordBackend:
         self._engine = None
         self._engine_loaded = False
 
-    def update(self, sense: Sense, audio: np.ndarray) -> bool:  # noqa: ARG002
+    def update(self, _sense: Sense, audio: np.ndarray) -> bool:
         engine = self._get_engine()
         if engine is None:
             return False
         try:
             result = engine.detect(audio) if hasattr(engine, "detect") else False
             return bool(result)
-        except Exception as exc:  # noqa: BLE001 — an engine crash must not kill the loop
+        # An engine crash must not kill the loop.
+        except Exception as exc:  # noqa: BLE001
             logger.warning("[wakeword] openwakeword error: %s; ignoring this tick", exc)
             return False
 

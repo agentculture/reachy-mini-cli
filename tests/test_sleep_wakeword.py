@@ -227,3 +227,182 @@ class TestImportBoundary:
         assert not _module_pulls_in(
             "reachy.sleep.wakeword", "reachy_mini"
         ), "reachy.sleep.wakeword pulled in reachy_mini — it must be SDK-free."
+
+
+# ---------------------------------------------------------------------------
+# Timeout resolution (env precedence + bad value)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSttTimeout:
+    """_resolve_stt_timeout: explicit arg > REACHY_STT_TIMEOUT > default; bad env → default."""
+
+    def test_explicit_override_wins(self):
+        from reachy.sleep import wakeword
+
+        assert wakeword._resolve_stt_timeout(2.5) == 2.5
+
+    def test_env_var_parsed(self, monkeypatch):
+        from reachy.sleep import wakeword
+
+        monkeypatch.setenv("REACHY_STT_TIMEOUT", "0.4")
+        assert wakeword._resolve_stt_timeout(None) == 0.4
+
+    def test_bad_env_falls_back_to_default(self, monkeypatch):
+        from reachy.sleep import wakeword
+
+        monkeypatch.setenv("REACHY_STT_TIMEOUT", "not-a-number")
+        assert wakeword._resolve_stt_timeout(None) == wakeword.DEFAULT_STT_TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# HTTP _post leg + _encode_audio (stubbed urlopen, no real network)
+# ---------------------------------------------------------------------------
+
+
+class _FakeResp:
+    def __init__(self, *, status=200, body=b""):
+        self._status = status
+        self._body = body
+
+    status = property(lambda self: self._status)
+
+    def getcode(self):
+        return self._status
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _http_backend():
+    from reachy.sleep.wakeword import HttpSttBackend
+
+    return HttpSttBackend(stt_url="http://stt.local", phrase="hey reachy")
+
+
+class TestHttpPostLeg:
+    """Drive _post through a stubbed urllib.request.urlopen."""
+
+    def _patch_urlopen(self, monkeypatch, resp):
+        import urllib.request
+
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: resp)
+
+    def test_post_success_returns_dict(self, monkeypatch):
+        import json as _json
+
+        self._patch_urlopen(monkeypatch, _FakeResp(body=_json.dumps({"detected": True}).encode()))
+        backend = _http_backend()
+        assert backend.update(_make_sense(), _chunk()) is True
+
+    def test_post_http_error_returns_false(self, monkeypatch):
+        self._patch_urlopen(monkeypatch, _FakeResp(status=503, body=b"oops"))
+        backend = _http_backend()
+        assert backend.update(_make_sense(), _chunk()) is False
+
+    def test_post_empty_body_returns_false(self, monkeypatch):
+        self._patch_urlopen(monkeypatch, _FakeResp(body=b""))
+        assert _http_backend().update(_make_sense(), _chunk()) is False
+
+    def test_post_non_json_returns_false(self, monkeypatch):
+        self._patch_urlopen(monkeypatch, _FakeResp(body=b"\xff\xfe not json"))
+        assert _http_backend().update(_make_sense(), _chunk()) is False
+
+    def test_post_non_dict_json_returns_false(self, monkeypatch):
+        self._patch_urlopen(monkeypatch, _FakeResp(body=b"[1, 2, 3]"))
+        assert _http_backend().update(_make_sense(), _chunk()) is False
+
+    def test_post_transcript_substring_matches(self, monkeypatch):
+        import json as _json
+
+        body = _json.dumps({"transcript": "well HEY REACHY there"}).encode()
+        self._patch_urlopen(monkeypatch, _FakeResp(body=body))
+        assert _http_backend().update(_make_sense(), _chunk()) is True
+
+    def test_post_unreachable_raises_swallowed(self, monkeypatch):
+        import urllib.request
+
+        def _boom(*a, **k):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _boom)
+        assert _http_backend().update(_make_sense(), _chunk()) is False
+
+
+class TestEncodeAudio:
+    def test_empty_audio_encodes_to_empty_bytes(self):
+        from reachy.sleep.wakeword import HttpSttBackend
+
+        assert HttpSttBackend._encode_audio(np.zeros(0, dtype=np.float32)) == b""
+
+    def test_none_audio_encodes_to_empty_bytes(self):
+        from reachy.sleep.wakeword import HttpSttBackend
+
+        assert HttpSttBackend._encode_audio(None) == b""
+
+    def test_normal_audio_encodes_to_pcm16(self):
+        from reachy.sleep.wakeword import HttpSttBackend
+
+        out = HttpSttBackend._encode_audio(np.array([0.0, 1.0, -1.0], dtype=np.float32))
+        assert isinstance(out, bytes) and len(out) == 6  # 3 samples * 2 bytes
+
+
+# ---------------------------------------------------------------------------
+# openwakeword backend — fake engine injected (no openwakeword package needed)
+# ---------------------------------------------------------------------------
+
+
+class _FakeEngine:
+    def __init__(self, *, result=True, raises=False, has_reset=True):
+        self._result = result
+        self._raises = raises
+        self.reset_called = False
+        if not has_reset:
+            del self.reset
+
+    def detect(self, audio):
+        if self._raises:
+            raise RuntimeError("engine boom")
+        return self._result
+
+    def reset(self):
+        self.reset_called = True
+
+
+def _oww_backend_with(engine):
+    from reachy.sleep.wakeword import OpenWakeWordBackend
+
+    b = OpenWakeWordBackend(phrase="hey reachy")
+    b._engine = engine
+    b._engine_loaded = True  # skip the lazy import
+    return b
+
+
+class TestOpenWakeWordBackend:
+    def test_detect_true_fires(self):
+        assert _oww_backend_with(_FakeEngine(result=True)).update(_make_sense(), _chunk()) is True
+
+    def test_detect_false_no_fire(self):
+        assert _oww_backend_with(_FakeEngine(result=False)).update(_make_sense(), _chunk()) is False
+
+    def test_engine_crash_degrades_to_false(self):
+        b = _oww_backend_with(_FakeEngine(raises=True))
+        assert b.update(_make_sense(), _chunk()) is False
+
+    def test_absent_engine_returns_false(self):
+        b = _oww_backend_with(None)
+        assert b.update(_make_sense(), _chunk()) is False
+
+    def test_reset_delegates_to_engine(self):
+        eng = _FakeEngine()
+        _oww_backend_with(eng).reset()
+        assert eng.reset_called is True
+
+    def test_reset_safe_when_engine_absent(self):
+        _oww_backend_with(None).reset()  # must not raise

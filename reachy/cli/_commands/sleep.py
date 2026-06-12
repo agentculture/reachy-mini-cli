@@ -290,6 +290,53 @@ def _default_wake_detector() -> WakeDetector:
     return WakeDetector(wake_word_enabled=False)
 
 
+#: A one-sample silent buffer fed to the wake-word backend each tick (the real
+#: mic audio is the snap detector's concern; the wake-word leg only needs a
+#: non-None array here).
+_SILENT_AUDIO = np.zeros(1, dtype=np.float32)
+
+
+def _process_tick(
+    *,
+    t: float,
+    snapshot: Sense,
+    prev_doa: float | None,
+    machine: SleepStateMachine,
+    producer: SleepProducer,
+    wake_detector: WakeDetector,
+    snap: Callable[[], bool] | None,
+    pat: Callable[[], bool] | None,
+    mute_until: Callable[[], float] | None,
+    audio_wake: bool,
+    commanded_pose_sink: Callable[[tuple[float, float]], None] | None,
+    flag_up: bool,
+) -> tuple[float | None, bool, bool]:
+    """Run one arc tick. Returns ``(new_prev_doa, woke_this_tick, new_flag_up)``."""
+    doa_shift = _doa_shifted(snapshot.doa_angle, prev_doa)
+    new_prev = snapshot.doa_angle if snapshot.doa_angle is not None else prev_doa
+
+    stimulated = is_stimulus(
+        snapshot,
+        doa_shift=doa_shift,
+        snap=_call_bool(snap),
+        pat=_call_bool(pat),
+        now=t,
+        mute_until=_call_float(mute_until),
+        audio_wake=audio_wake,
+    )
+    # Tier-2 wake-WORD: only when audio is on (pat-only never listens).
+    if audio_wake and not stimulated:
+        stimulated = wake_detector.update(snapshot, _SILENT_AUDIO)
+
+    woke = _advance(machine, producer, wake_detector, t, stimulated=stimulated)
+    # Publish the commanded sleep pose so a pat-wake source can compare the
+    # read-back against the MOVING target (not a static baseline).
+    if commanded_pose_sink is not None:
+        commanded_pose_sink(_commanded_head_pose(producer))
+    new_flag_up = _sync_sleep_flag(asleep=machine.state is SleepState.ASLEEP, flag_up=flag_up)
+    return new_prev, woke, new_flag_up
+
+
 def run_sleep_arc(
     *,
     queue: MotionQueue,
@@ -346,7 +393,6 @@ def run_sleep_arc(
     woke = False
     flag_up = False
     prev_doa: float | None = None
-    silent_audio = np.zeros(1, dtype=np.float32)
 
     try:
         for _ in range(ticks):
@@ -354,41 +400,22 @@ def run_sleep_arc(
                 break
             t = now()
             snapshot = sense()
-
-            doa_shift = _doa_shifted(snapshot.doa_angle, prev_doa)
-            if snapshot.doa_angle is not None:
-                prev_doa = snapshot.doa_angle
-
-            stimulated = is_stimulus(
-                snapshot,
-                doa_shift=doa_shift,
-                snap=_call_bool(snap),
-                pat=_call_bool(pat),
-                now=t,
-                mute_until=_call_float(mute_until),
+            prev_doa, tick_woke, flag_up = _process_tick(
+                t=t,
+                snapshot=snapshot,
+                prev_doa=prev_doa,
+                machine=machine,
+                producer=producer,
+                wake_detector=wake_detector,
+                snap=snap,
+                pat=pat,
+                mute_until=mute_until,
                 audio_wake=audio_wake,
+                commanded_pose_sink=commanded_pose_sink,
+                flag_up=flag_up,
             )
-            # Tier-2 wake-WORD: only when audio is on (pat-only never listens).
-            if audio_wake and not stimulated:
-                stimulated = wake_detector.update(snapshot, silent_audio)
-
-            woke = (
-                _advance(
-                    machine,
-                    producer,
-                    wake_detector,
-                    t,
-                    stimulated=stimulated,
-                )
-                or woke
-            )
-            # Publish the commanded sleep pose so a pat-wake source can compare the
-            # read-back against the MOVING target (not a static baseline).
-            if commanded_pose_sink is not None:
-                commanded_pose_sink(_commanded_head_pose(producer))
-            flag_up = _sync_sleep_flag(asleep=machine.state is SleepState.ASLEEP, flag_up=flag_up)
+            woke = woke or tick_woke
             states.append(machine.state.name)
-
             if on_tick is not None:
                 on_tick()
     finally:
