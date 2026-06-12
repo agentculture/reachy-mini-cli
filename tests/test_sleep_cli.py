@@ -602,3 +602,95 @@ def test_sleep_overview_names_audio_off_use(capsys: pytest.CaptureFixture[str]) 
     assert rc == 0
     out = capsys.readouterr().out.lower()
     assert "quiet" in out or "audio-off" in out or "pat-only" in out
+
+
+# --- t5: sleep start/restart forward --no-audio-wake ----------------------
+
+
+def test_sleep_start_no_audio_wake_spawns_flag(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """``sleep start --no-audio-wake`` builds a spawned command containing
+    ``--no-audio-wake`` — verifying the plumb from subparser → cmd_sleep_start
+    → supervisor.start → build_run_command."""
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    from reachy.sleep import supervisor as sup
+
+    captured: list[list[str]] = []
+
+    class _SpyPopen:
+        returncode = None
+        pid = 5555
+
+        def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001
+            captured.append(list(cmd))
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr("subprocess.Popen", _SpyPopen)
+    monkeypatch.setattr(sup, "is_alive", lambda pid: False)
+
+    rc = main(["sleep", "start", "--no-audio-wake"])
+    assert rc == 0
+    assert len(captured) == 1
+    assert "--no-audio-wake" in captured[0]
+
+
+def test_sleep_start_no_audio_wake_absent_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """``sleep start`` (no flag) spawns a command WITHOUT ``--no-audio-wake``."""
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    from reachy.sleep import supervisor as sup
+
+    captured: list[list[str]] = []
+
+    class _SpyPopen:
+        returncode = None
+        pid = 5556
+
+        def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001
+            captured.append(list(cmd))
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr("subprocess.Popen", _SpyPopen)
+    monkeypatch.setattr(sup, "is_alive", lambda pid: False)
+
+    rc = main(["sleep", "start"])
+    assert rc == 0
+    assert len(captured) == 1
+    assert "--no-audio-wake" not in captured[0]
+
+
+def test_sleep_restart_no_audio_wake_spawns_flag(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """``sleep restart --no-audio-wake`` plumbs through cmd_sleep_restart →
+    supervisor.restart → build_run_command: spawned argv carries the flag."""
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    from reachy.sleep import supervisor as sup
+
+    captured: list[list[str]] = []
+
+    class _SpyPopen:
+        returncode = None
+        pid = 5557
+
+        def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001
+            captured.append(list(cmd))
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr("subprocess.Popen", _SpyPopen)
+    monkeypatch.setattr(sup, "is_alive", lambda pid: False)
+
+    rc = main(["sleep", "restart", "--no-audio-wake"])
+    assert rc == 0
+    assert len(captured) == 1
+    assert "--no-audio-wake" in captured[0]

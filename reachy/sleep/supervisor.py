@@ -110,6 +110,7 @@ def build_run_command(
     timeout: float,
     ticks: int | None = None,
     idle_timeout: float | None = None,
+    no_audio_wake: bool = False,
 ) -> list[str]:
     """The argv the background process runs: ``python -m reachy sleep run``.
 
@@ -118,6 +119,9 @@ def build_run_command(
     task (t8) will finalize which additional flags are accepted; placeholders for
     ``--ticks`` and ``--idle-timeout`` are included here for passthrough
     consistency with the motion supervisor's approach.
+
+    ``no_audio_wake`` forwards ``--no-audio-wake`` when ``True`` — pat-only /
+    quiet-room mode where speech/snap/DoA stimuli are ignored.
     """
     cmd = [
         sys.executable,
@@ -136,6 +140,8 @@ def build_run_command(
         cmd += ["--ticks", str(ticks)]
     if idle_timeout is not None:
         cmd += ["--idle-timeout", str(idle_timeout)]
+    if no_audio_wake:
+        cmd += ["--no-audio-wake"]
     return cmd
 
 
@@ -146,6 +152,7 @@ def start(
     timeout: float = DEFAULT_TIMEOUT,
     ticks: int | None = None,
     idle_timeout: float | None = None,
+    no_audio_wake: bool = False,
 ) -> dict[str, object]:
     """Start the sleep loop in the background (idempotent).
 
@@ -157,6 +164,9 @@ def start(
     the sleep loop surfaces its own clean exit-2 ``CliError`` if unreachable —
     so a spawned loop that can't reach the robot exits during the grace window and
     is reported as ``exited``.
+
+    ``no_audio_wake`` forwards ``--no-audio-wake`` into the spawned ``sleep run``
+    command — pat-only / quiet-room mode where speech/snap/DoA stimuli are ignored.
     """
     existing = read_pid()
     if existing is not None and is_alive(existing):
@@ -173,6 +183,7 @@ def start(
         timeout=timeout,
         ticks=ticks,
         idle_timeout=idle_timeout,
+        no_audio_wake=no_audio_wake,
     )
     log_path = log_file()
     try:
