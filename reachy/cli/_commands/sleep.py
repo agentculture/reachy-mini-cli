@@ -682,6 +682,7 @@ def cmd_sleep_start(args: argparse.Namespace) -> int:
         base_url=args.base_url,
         timeout=args.timeout,
         idle_timeout=getattr(args, "idle_timeout", None),
+        no_audio_wake=getattr(args, "no_audio_wake", False),
     )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
@@ -699,6 +700,7 @@ def cmd_sleep_restart(args: argparse.Namespace) -> int:
         base_url=args.base_url,
         timeout=args.timeout,
         idle_timeout=getattr(args, "idle_timeout", None),
+        no_audio_wake=getattr(args, "no_audio_wake", False),
     )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
@@ -881,12 +883,28 @@ def _register_process_verbs(noun_sub: argparse._SubParsersAction) -> None:
     add_robot_args(start)
     start.set_defaults(transport=os.environ.get("REACHY_TRANSPORT", "sdk"))
     _add_idle_timeout(start)
+    start.add_argument(
+        "--no-audio-wake",
+        action="store_true",
+        dest="no_audio_wake",
+        help="Pat-only / quiet-room mode: ignore speech, DoA shifts and snaps — "
+        "only a physical head pat wakes the robot. Forwarded to the background "
+        "sleep run process. Same as --wake pat on the run verb.",
+    )
     start.set_defaults(func=cmd_sleep_start)
 
     restart = noun_sub.add_parser("restart", help="Restart the background loop (re-reads flags).")
     add_robot_args(restart)
     restart.set_defaults(transport=os.environ.get("REACHY_TRANSPORT", "sdk"))
     _add_idle_timeout(restart)
+    restart.add_argument(
+        "--no-audio-wake",
+        action="store_true",
+        dest="no_audio_wake",
+        help="Pat-only / quiet-room mode: ignore speech, DoA shifts and snaps — "
+        "only a physical head pat wakes the robot. Forwarded to the background "
+        "sleep run process. Same as --wake pat on the run verb.",
+    )
     restart.set_defaults(func=cmd_sleep_restart)
 
     stop = noun_sub.add_parser("stop", help="Stop the loop this CLI started.")

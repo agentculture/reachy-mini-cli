@@ -124,6 +124,38 @@ def test_build_run_command_idle_timeout() -> None:
     assert cmd[cmd.index("--idle-timeout") + 1] == "30.0"
 
 
+def test_build_run_command_no_audio_wake_forwarded() -> None:
+    """``--no-audio-wake`` appears in argv when ``no_audio_wake=True``."""
+    cmd = supervisor.build_run_command(
+        transport="sdk",
+        base_url="http://localhost:8000",
+        timeout=5.0,
+        no_audio_wake=True,
+    )
+    assert "--no-audio-wake" in cmd
+
+
+def test_build_run_command_no_audio_wake_absent_by_default() -> None:
+    """``--no-audio-wake`` must NOT appear when not set (default ``False``)."""
+    cmd = supervisor.build_run_command(
+        transport="sdk",
+        base_url="http://localhost:8000",
+        timeout=5.0,
+    )
+    assert "--no-audio-wake" not in cmd
+
+
+def test_build_run_command_no_audio_wake_false_also_absent() -> None:
+    """Explicit ``no_audio_wake=False`` produces the same clean argv as omitting it."""
+    cmd = supervisor.build_run_command(
+        transport="sdk",
+        base_url="http://localhost:8000",
+        timeout=5.0,
+        no_audio_wake=False,
+    )
+    assert "--no-audio-wake" not in cmd
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
@@ -171,6 +203,37 @@ def test_start_spawns_sleep_run(monkeypatch, tmp_path) -> None:
     cmd = procs[0].cmd
     assert cmd[1:5] == ["-m", "reachy", "sleep", "run"]
     assert procs[0].kwargs.get("start_new_session") is True
+
+
+def test_start_forwards_no_audio_wake(monkeypatch, tmp_path) -> None:
+    """``start(no_audio_wake=True)`` spawns a command that contains ``--no-audio-wake``."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    procs: list = []
+    monkeypatch.setattr("subprocess.Popen", _popen_factory(procs))
+
+    supervisor.start(transport="sdk", no_audio_wake=True)
+    assert "--no-audio-wake" in procs[0].cmd
+
+
+def test_start_omits_no_audio_wake_by_default(monkeypatch, tmp_path) -> None:
+    """``start()`` without ``no_audio_wake`` produces a command without the flag."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    procs: list = []
+    monkeypatch.setattr("subprocess.Popen", _popen_factory(procs))
+
+    supervisor.start(transport="sdk")
+    assert "--no-audio-wake" not in procs[0].cmd
+
+
+def test_restart_forwards_no_audio_wake(monkeypatch, tmp_path) -> None:
+    """``restart(no_audio_wake=True)`` passes the flag through to the spawned command."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    procs: list = []
+    monkeypatch.setattr("subprocess.Popen", _popen_factory(procs))
+
+    result = supervisor.restart(transport="sdk", no_audio_wake=True)
+    assert result["status"] == "started"
+    assert "--no-audio-wake" in procs[0].cmd
 
 
 def test_start_idempotent_when_already_running(monkeypatch, tmp_path) -> None:
