@@ -396,6 +396,47 @@ def test_sleep_arc_pat_only_wakes_on_pat() -> None:
     assert result["woke"] is True
 
 
+def test_sleep_arc_feeds_real_audio_to_wake_word() -> None:
+    """run_sleep_arc forwards the audio() chunk (not a silent buffer) to the
+    wake-word backend — regression for the silent-audio bug (Qodo #1, PR #37)."""
+    import numpy as np
+
+    from reachy.behavior.sense import EMPTY_SENSE
+    from reachy.cli._commands.sleep import run_sleep_arc
+    from reachy.motion.queue import MotionQueue
+
+    received: list = []
+
+    class _RecordingDetector:
+        def update(self, sense, audio):
+            received.append(audio)
+            return False
+
+        def reset(self) -> None:
+            return None
+
+    real_chunk = np.full(64, 0.5, dtype=np.float32)
+    senses = [EMPTY_SENSE] * 3
+    now, sense, advance = _idle_then(senses, ticks=3)
+
+    run_sleep_arc(
+        queue=MotionQueue(),
+        now=now,
+        sense=sense,
+        snap=lambda: False,
+        audio=lambda: real_chunk,
+        audio_wake=True,
+        wake_detector_factory=lambda: _RecordingDetector(),
+        on_tick=advance,
+        ticks=3,
+        idle_timeout=15.0,
+    )
+    assert received, "wake-word backend must be consulted when audio_wake is on"
+    # It got the REAL chunk, not a zero/silent buffer.
+    assert any(np.array_equal(a, real_chunk) for a in received)
+    assert all(float(np.max(np.abs(a))) > 0.0 for a in received)
+
+
 def test_sleep_arc_default_keeps_audio_wake() -> None:
     """The default (``audio_wake`` omitted) keeps audio wake: a speech flag on the
     final tick wakes it."""

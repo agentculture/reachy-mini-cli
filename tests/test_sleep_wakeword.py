@@ -406,3 +406,28 @@ class TestOpenWakeWordBackend:
 
     def test_reset_safe_when_engine_absent(self):
         _oww_backend_with(None).reset()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _matches: a `phrase` echo only fires when it EQUALS the configured phrase
+# (regression: any truthy phrase used to wake — Qodo bug #3 on PR #37)
+# ---------------------------------------------------------------------------
+
+
+class TestPhraseMatching:
+    def test_phrase_echo_of_other_phrase_does_not_fire(self):
+        backend = _http_backend()  # configured phrase = "hey reachy"
+        assert backend._matches({"phrase": "good morning"}) is False
+
+    def test_phrase_equal_to_configured_fires(self):
+        backend = _http_backend()
+        assert backend._matches({"phrase": "Hey Reachy"}) is True  # case-insensitive
+
+    def test_empty_phrase_does_not_fire(self):
+        assert _http_backend()._matches({"phrase": ""}) is False
+
+    def test_detected_true_still_fires(self):
+        assert _http_backend()._matches({"detected": True}) is True
+
+    def test_transcript_substring_still_fires(self):
+        assert _http_backend()._matches({"transcript": "oh HEY REACHY hi"}) is True

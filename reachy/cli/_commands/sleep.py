@@ -305,6 +305,7 @@ def _process_tick(
     producer: SleepProducer,
     wake_detector: WakeDetector,
     snap: Callable[[], bool] | None,
+    audio: Callable[[], np.ndarray] | None,
     pat: Callable[[], bool] | None,
     mute_until: Callable[[], float] | None,
     audio_wake: bool,
@@ -324,9 +325,11 @@ def _process_tick(
         mute_until=_call_float(mute_until),
         audio_wake=audio_wake,
     )
-    # Tier-2 wake-WORD: only when audio is on (pat-only never listens).
+    # Tier-2 wake-WORD: only when audio is on (pat-only never listens).  Feed the
+    # real mic chunk (the sdk feed's latest sample); a silent buffer when absent.
     if audio_wake and not stimulated:
-        stimulated = wake_detector.update(snapshot, _SILENT_AUDIO)
+        chunk = audio() if audio is not None else _SILENT_AUDIO
+        stimulated = wake_detector.update(snapshot, chunk)
 
     woke = _advance(machine, producer, wake_detector, t, stimulated=stimulated)
     # Publish the commanded sleep pose so a pat-wake source can compare the
@@ -346,6 +349,7 @@ def run_sleep_arc(
     ticks: int,
     idle_timeout: float,
     snap: Callable[[], bool] | None = None,
+    audio: Callable[[], np.ndarray] | None = None,
     pat: Callable[[], bool] | None = None,
     mute_until: Callable[[], float] | None = None,
     audio_wake: bool = True,
@@ -408,6 +412,7 @@ def run_sleep_arc(
                 producer=producer,
                 wake_detector=wake_detector,
                 snap=snap,
+                audio=audio,
                 pat=pat,
                 mute_until=mute_until,
                 audio_wake=audio_wake,
@@ -430,12 +435,14 @@ def run_sleep_arc(
 
 def _make_sdk_feed(
     transport: object,
-) -> tuple[Callable[[], Sense], Callable[[], bool], Callable[[], None]]:
-    """Open the SDK media session and return ``(sense, snap, close)`` callables.
+) -> tuple[Callable[[], Sense], Callable[[], bool], Callable[[], np.ndarray], Callable[[], None]]:
+    """Open the SDK media session and return ``(sense, snap, audio, close)``.
 
     The session is entered eagerly so a missing ``[sdk]`` / dead daemon raises its
     clean CliError before the loop starts.  ``sense()`` returns the latest DoA
-    snapshot; ``snap()`` returns whether the latest mic chunk was a loud transient.
+    snapshot; ``snap()`` returns whether the latest mic chunk was a loud transient;
+    ``audio()`` returns that same latest mic chunk (so the wake-WORD backend sees
+    real audio, not silence).
     """
     session = transport.media_session()  # type: ignore[attr-defined]
     cm = session if (hasattr(session, "__enter__") and hasattr(session, "__exit__")) else None
@@ -444,30 +451,37 @@ def _make_sdk_feed(
     poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
     detector = SnapDetector()
     last_snap = {"v": False}
+    last_audio: dict[str, np.ndarray] = {"v": _SILENT_AUDIO}
 
     def _sense() -> Sense:
         snapshot = poller()
         sample = session.get_audio_sample()
         if sample is not None:
             last_snap["v"] = detector.feed(sample)
+            last_audio["v"] = np.asarray(sample, dtype=np.float32)
         else:
             last_snap["v"] = False
+            last_audio["v"] = _SILENT_AUDIO
         return snapshot
 
     def _snap() -> bool:
         return last_snap["v"]
 
+    def _audio() -> np.ndarray:
+        return last_audio["v"]
+
     def _close() -> None:
         if cm is not None:
             cm.__exit__(None, None, None)
 
-    return _sense, _snap, _close
+    return _sense, _snap, _audio, _close
 
 
 def _make_http_feed(
     transport: object,
-) -> tuple[Callable[[], Sense], Callable[[], bool], Callable[[], None]]:
-    """Poll the daemon's DoA route — no audio source, so ``snap`` is always False."""
+) -> tuple[Callable[[], Sense], Callable[[], bool], Callable[[], np.ndarray], Callable[[], None]]:
+    """Poll the daemon's DoA route — no audio source, so ``snap`` is always False
+    and ``audio`` is always a silent buffer (no mic on the http transport)."""
     poller = DoaPoller(read=lambda: read_doa(transport, timeout=DOA_TIMEOUT))
 
     def _sense() -> Sense:
@@ -476,10 +490,13 @@ def _make_http_feed(
     def _snap() -> bool:
         return False
 
+    def _audio() -> np.ndarray:
+        return _SILENT_AUDIO
+
     def _close() -> None:
         return None
 
-    return _sense, _snap, _close
+    return _sense, _snap, _audio, _close
 
 
 # --- run (foreground loop) ------------------------------------------------
@@ -593,9 +610,9 @@ def cmd_sleep_run(args: argparse.Namespace) -> int:
     # media session eagerly, so a missing [sdk] extra raises a clean exit-2
     # CliError here — never a traceback.
     if hasattr(transport, "media_session"):
-        sense, snap, close = _make_sdk_feed(transport)
+        sense, snap, audio, close = _make_sdk_feed(transport)
     else:
-        sense, snap, close = _make_http_feed(transport)
+        sense, snap, audio, close = _make_http_feed(transport)
 
     # Pat-only mode wires a PatWakeSource off the SDK head-pose read-back; audio
     # mode leaves it absent (None → the arc's pat source defaults to "no pat").
@@ -614,6 +631,7 @@ def cmd_sleep_run(args: argparse.Namespace) -> int:
             queue=motion.queue,
             sense=sense,
             snap=snap,
+            audio=audio,
             idle_timeout=idle_timeout,
             max_ticks=max_ticks,
             stop=stop,
@@ -657,6 +675,7 @@ def _run_foreground(
     queue: MotionQueue,
     sense: Callable[[], Sense],
     snap: Callable[[], bool],
+    audio: Callable[[], np.ndarray] | None = None,
     idle_timeout: float,
     max_ticks: int | None,
     stop: dict,
@@ -688,6 +707,7 @@ def _run_foreground(
         now=time.monotonic,
         sense=sense,
         snap=snap,
+        audio=audio,
         pat=pat,
         mute_until=lambda: mute["until"],
         audio_wake=audio_wake,

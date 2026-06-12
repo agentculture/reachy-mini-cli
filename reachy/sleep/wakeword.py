@@ -176,15 +176,17 @@ class HttpSttBackend:
     def _matches(self, payload: dict | None) -> bool:
         """Decide whether *payload* (a parsed JSON response) signals a wake-word.
 
-        Honours, in order: an explicit ``detected`` boolean, a ``phrase`` echo,
-        then a case-insensitive substring match of ``self.phrase`` in
-        ``transcript``. Anything else (incl. ``None``) → ``False``.
+        Honours, in order: an explicit ``detected`` boolean, a ``phrase`` field
+        that *equals* the configured wake phrase (case-insensitive — a bare echo
+        of some other phrase must NOT fire), then a case-insensitive substring
+        match of ``self.phrase`` in ``transcript``. Anything else → ``False``.
         """
         if not isinstance(payload, dict):
             return False
         if bool(payload.get("detected")):
             return True
-        if payload.get("phrase"):
+        phrase = payload.get("phrase")
+        if isinstance(phrase, str) and phrase.strip().lower() == self.phrase.lower():
             return True
         transcript = payload.get("transcript")
         if isinstance(transcript, str) and transcript:
