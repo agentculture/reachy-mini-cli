@@ -402,7 +402,7 @@ def test_sleep_arc_feeds_real_audio_to_wake_word() -> None:
     import numpy as np
 
     from reachy.behavior.sense import EMPTY_SENSE
-    from reachy.cli._commands.sleep import run_sleep_arc
+    from reachy.cli._commands.sleep import WakeWord, run_sleep_arc
     from reachy.motion.queue import MotionQueue
 
     received: list = []
@@ -424,9 +424,8 @@ def test_sleep_arc_feeds_real_audio_to_wake_word() -> None:
         now=now,
         sense=sense,
         snap=lambda: False,
-        audio=lambda: real_chunk,
         audio_wake=True,
-        wake_detector_factory=lambda: _RecordingDetector(),
+        wake_word=WakeWord(factory=lambda: _RecordingDetector(), audio=lambda: real_chunk),
         on_tick=advance,
         ticks=3,
         idle_timeout=15.0,
@@ -464,7 +463,7 @@ def test_sleep_arc_wake_word_wakes_when_audio_on() -> None:
     """With ``audio_wake=True`` a detected wake-WORD (via the injected wake_detector
     factory) wakes it even with no speech flag / snap."""
     from reachy.behavior.sense import EMPTY_SENSE
-    from reachy.cli._commands.sleep import run_sleep_arc
+    from reachy.cli._commands.sleep import WakeWord, run_sleep_arc
     from reachy.motion.queue import MotionQueue
 
     senses = [EMPTY_SENSE] * 5
@@ -485,7 +484,7 @@ def test_sleep_arc_wake_word_wakes_when_audio_on() -> None:
         now=now,
         sense=sense,
         audio_wake=True,
-        wake_detector_factory=lambda: _WakeWordDetector(),
+        wake_word=WakeWord(factory=lambda: _WakeWordDetector()),
         on_tick=advance,
         ticks=5,
         idle_timeout=15.0,
@@ -499,7 +498,7 @@ def test_sleep_arc_pat_only_does_not_consult_wake_word() -> None:
     """With ``audio_wake=False`` the audio wake-word backend is never consulted —
     its ``update`` must not be called."""
     from reachy.behavior.sense import EMPTY_SENSE
-    from reachy.cli._commands.sleep import run_sleep_arc
+    from reachy.cli._commands.sleep import WakeWord, run_sleep_arc
     from reachy.motion.queue import MotionQueue
 
     senses = [EMPTY_SENSE] * 3
@@ -519,7 +518,7 @@ def test_sleep_arc_pat_only_does_not_consult_wake_word() -> None:
         now=now,
         sense=sense,
         audio_wake=False,
-        wake_detector_factory=lambda: _SpyDetector(),
+        wake_word=WakeWord(factory=lambda: _SpyDetector()),
         on_tick=advance,
         ticks=3,
         idle_timeout=15.0,

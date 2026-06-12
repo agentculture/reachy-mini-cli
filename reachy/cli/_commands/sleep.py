@@ -38,6 +38,7 @@ import argparse
 import os
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
@@ -296,6 +297,20 @@ def _default_wake_detector() -> WakeDetector:
 _SILENT_AUDIO = np.zeros(1, dtype=np.float32)
 
 
+@dataclass(frozen=True)
+class WakeWord:
+    """Tier-2 wake-WORD wiring for the arc: the detector factory + its audio feed.
+
+    Bundled because both pieces serve *only* the wake-word leg — ``audio`` is
+    consumed nowhere else — and to keep :func:`run_sleep_arc`'s parameter list
+    within bounds. Both default to ``None`` (Tier-2 off; a silent buffer feeds a
+    null detector).
+    """
+
+    factory: Callable[[], WakeDetector] | None = None
+    audio: Callable[[], np.ndarray] | None = None
+
+
 def _process_tick(
     *,
     t: float,
@@ -349,11 +364,10 @@ def run_sleep_arc(
     ticks: int,
     idle_timeout: float,
     snap: Callable[[], bool] | None = None,
-    audio: Callable[[], np.ndarray] | None = None,
     pat: Callable[[], bool] | None = None,
     mute_until: Callable[[], float] | None = None,
     audio_wake: bool = True,
-    wake_detector_factory: Callable[[], WakeDetector] | None = None,
+    wake_word: WakeWord | None = None,
     commanded_pose_sink: Callable[[tuple[float, float]], None] | None = None,
     stop: dict | None = None,
 ) -> dict[str, object]:
@@ -390,7 +404,8 @@ def run_sleep_arc(
     # asleep_after == idle_timeout; drowsy_after is half of it (75/150 ratio).
     machine = SleepStateMachine(drowsy_after=idle_timeout / 2.0, asleep_after=idle_timeout)
     producer = SleepProducer(queue=queue, state=SleepState.ALERT)
-    factory = wake_detector_factory if wake_detector_factory is not None else _default_wake_detector
+    ww = wake_word if wake_word is not None else WakeWord()
+    factory = ww.factory if ww.factory is not None else _default_wake_detector
     wake_detector = factory()
 
     states: list[str] = []
@@ -412,7 +427,7 @@ def run_sleep_arc(
                 producer=producer,
                 wake_detector=wake_detector,
                 snap=snap,
-                audio=audio,
+                audio=ww.audio,
                 pat=pat,
                 mute_until=mute_until,
                 audio_wake=audio_wake,
@@ -707,11 +722,10 @@ def _run_foreground(
         now=time.monotonic,
         sense=sense,
         snap=snap,
-        audio=audio,
         pat=pat,
         mute_until=lambda: mute["until"],
         audio_wake=audio_wake,
-        wake_detector_factory=wake_detector_factory,
+        wake_word=WakeWord(factory=wake_detector_factory, audio=audio),
         commanded_pose_sink=commanded_pose_sink,
         on_tick=_between_ticks,
         ticks=ticks,
