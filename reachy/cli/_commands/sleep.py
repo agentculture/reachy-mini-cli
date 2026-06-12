@@ -204,6 +204,58 @@ class _MotionExecutor:
 # --- the pure arc driver (shared by run + demo + the arc unit test) -------
 
 
+def _call_bool(fn: Callable[[], bool] | None) -> bool:
+    """Invoke an optional bool source, defaulting to ``False`` when absent."""
+    return bool(fn()) if fn is not None else False
+
+
+def _call_float(fn: Callable[[], float] | None) -> float:
+    """Invoke an optional float source, defaulting to ``0.0`` when absent."""
+    return float(fn()) if fn is not None else 0.0
+
+
+def _doa_shifted(curr: float | None, prev: float | None) -> bool:
+    """True when the DoA angle moved past the deadband since the last reading."""
+    return curr is not None and prev is not None and abs(curr - prev) > _DOA_DEADBAND
+
+
+def _advance(
+    machine: SleepStateMachine,
+    producer: SleepProducer,
+    wake_detector: WakeDetector,
+    snapshot: Sense,
+    silent_audio: np.ndarray,
+    t: float,
+    *,
+    stimulated: bool,
+) -> bool:
+    """Advance the FSM + producer for one tick; return ``True`` if a wake fired."""
+    if stimulated:
+        machine.reset(now=t)
+        # Tier-1/2 wake detector keeps internal history consistent.
+        wake_detector.update(snapshot, silent_audio)
+        producer.wake()
+        wake_detector.reset()
+        woke = True
+    else:
+        machine.update(now=t)
+        woke = False
+    producer.state = machine.state
+    producer.update(t)
+    return woke
+
+
+def _sync_sleep_flag(*, asleep: bool, flag_up: bool) -> bool:
+    """Write/clear the ASLEEP flag so it matches state; return the new flag_up."""
+    if asleep and not flag_up:
+        sleep_signal.write()
+        return True
+    if flag_up and not asleep:
+        sleep_signal.clear()
+        return False
+    return flag_up
+
+
 def run_sleep_arc(
     *,
     queue: MotionQueue,
@@ -252,47 +304,32 @@ def run_sleep_arc(
             t = now()
             snapshot = sense()
 
-            # A DoA shift = the angle moved more than the deadband since last tick.
-            doa_shift = False
+            doa_shift = _doa_shifted(snapshot.doa_angle, prev_doa)
             if snapshot.doa_angle is not None:
-                if prev_doa is not None and abs(snapshot.doa_angle - prev_doa) > _DOA_DEADBAND:
-                    doa_shift = True
                 prev_doa = snapshot.doa_angle
-
-            snap_fired = bool(snap()) if snap is not None else False
-            pat_fired = bool(pat()) if pat is not None else False
-            mu = float(mute_until()) if mute_until is not None else 0.0
 
             stimulated = is_stimulus(
                 snapshot,
                 doa_shift=doa_shift,
-                snap=snap_fired,
-                pat=pat_fired,
+                snap=_call_bool(snap),
+                pat=_call_bool(pat),
                 now=t,
-                mute_until=mu,
+                mute_until=_call_float(mute_until),
             )
 
-            if stimulated:
-                machine.reset(now=t)
-                # Tier-1/2 wake detector keeps internal history consistent.
-                wake_detector.update(snapshot, silent_audio)
-                producer.wake()
-                wake_detector.reset()
-                woke = True
-            else:
-                machine.update(now=t)
-
-            producer.state = machine.state
-            producer.update(t, snapshot)
-
-            if machine.state is SleepState.ASLEEP:
-                if not flag_up:
-                    sleep_signal.write()
-                    flag_up = True
-            elif flag_up:
-                sleep_signal.clear()
-                flag_up = False
-
+            woke = (
+                _advance(
+                    machine,
+                    producer,
+                    wake_detector,
+                    snapshot,
+                    silent_audio,
+                    t,
+                    stimulated=stimulated,
+                )
+                or woke
+            )
+            flag_up = _sync_sleep_flag(asleep=machine.state is SleepState.ASLEEP, flag_up=flag_up)
             states.append(machine.state.name)
 
             if on_tick is not None:

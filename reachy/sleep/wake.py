@@ -167,10 +167,9 @@ class WakeDetector:
         # Tier-2: wake word (only if enabled + engine available)
         if self._wake_word_enabled:
             engine = self._get_engine()
-            if engine is not None:
-                if self._engine_check(engine, audio):
-                    logger.info("[WakeDetector] Tier-2 fired (wake word)")
-                    return True
+            if engine is not None and self._engine_check(engine, audio):
+                logger.info("[WakeDetector] Tier-2 fired (wake word)")
+                return True
 
         return False
 

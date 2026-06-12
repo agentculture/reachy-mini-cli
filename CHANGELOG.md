@@ -27,6 +27,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - sleep status reports idle_seconds as null instead of a fabricated 0.0 — the live idle timer lives in the loop process and is not observable across processes (reachy/cli/_commands/sleep.py)
 - SleepStateMachine.reset() clamps backwards ticks, matching update() and the documented contract (reachy/sleep/state.py)
 - WakeDetector.reset() rebuilds the SnapDetector from its own retained config instead of SnapDetector private attributes (reachy/sleep/wake.py)
+- refactor run_sleep_arc into small helpers (_doa_shifted/_advance/_sync_sleep_flag/_call_bool/_call_float) to cut cognitive complexity below the gate; dropped the unused sense/snap/sound_present params from SleepProducer.update; merged the Tier-2 wake nested-if (SonarCloud)
 
 ## [0.15.0] - 2026-06-11
 

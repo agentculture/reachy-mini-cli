@@ -42,10 +42,9 @@ def _make(state: SleepState = SleepState.ALERT) -> tuple[MotionQueue, SleepProdu
 
 def _call_update(prod: SleepProducer, t: float = 0.0) -> MotionAction | None:
     """Drive one tick; returns the action submitted (if any) by inspecting the queue."""
-    from reachy.behavior.sense import EMPTY_SENSE
 
     before = len(prod.queue)
-    action = prod.update(t, EMPTY_SENSE)
+    action = prod.update(t)
     after = len(prod.queue)
     # The producer may submit directly to the queue OR return an action for the server
     # to submit; handle both conventions.
@@ -69,13 +68,12 @@ class TestDrowsyLowerEnergy:
         q, prod = _make(SleepState.ALERT)
         prod.state = SleepState.ALERT
         # ALERT should produce an idle-like action under IDLE_KEY
-        from reachy.behavior.sense import EMPTY_SENSE
 
-        action = prod.update(0.0, EMPTY_SENSE)
+        action = prod.update(0.0)
         if action is not None:
             q.submit(action)
         # Queue may be empty at t=0 (pacing); advance by the interval
-        action2 = prod.update(100.0, EMPTY_SENSE)
+        action2 = prod.update(100.0)
         if action2 is not None:
             q.submit(action2)
         # Either immediate or after advance — at least one tick should produce motion
@@ -83,10 +81,9 @@ class TestDrowsyLowerEnergy:
 
     def test_drowsy_action_uses_drowsy_coalesce_key(self) -> None:
         q, prod = _make(SleepState.DROWSY)
-        from reachy.behavior.sense import EMPTY_SENSE
 
         # Advance past pacing interval
-        action = prod.update(100.0, EMPTY_SENSE)
+        action = prod.update(100.0)
         if action is not None:
             q.submit(action)
         pending = q.pending()
@@ -141,18 +138,16 @@ class TestAsleepBreath:
     def test_asleep_enqueues_a_sleep_action(self) -> None:
         """ASLEEP state produces at least one action on the queue."""
         q, prod = _make(SleepState.ASLEEP)
-        from reachy.behavior.sense import EMPTY_SENSE
 
-        action = prod.update(100.0, EMPTY_SENSE)
+        action = prod.update(100.0)
         if action is not None:
             q.submit(action)
         assert len(q) >= 1, "ASLEEP must produce at least one motion action"
 
     def test_asleep_action_uses_sleep_coalesce_key(self) -> None:
         q, prod = _make(SleepState.ASLEEP)
-        from reachy.behavior.sense import EMPTY_SENSE
 
-        action = prod.update(100.0, EMPTY_SENSE)
+        action = prod.update(100.0)
         if action is not None:
             q.submit(action)
         pending = q.pending()
@@ -162,13 +157,12 @@ class TestAsleepBreath:
     def test_asleep_body_rocking_present(self) -> None:
         """ASLEEP action drives body_yaw (slow rock, from reachy_nova SLEEP_ROCK_BODY)."""
         q, prod = _make(SleepState.ASLEEP)
-        from reachy.behavior.sense import EMPTY_SENSE
 
         actions: list[MotionAction] = []
         # Run several ticks at different phases so body rock appears
         for i in range(1, 20):
             t = float(i) * 2.0
-            action = prod.update(t, EMPTY_SENSE)
+            action = prod.update(t)
             if action is not None:
                 q.submit(action)
         actions = q.pending()
@@ -187,17 +181,16 @@ class TestAsleepBreath:
         process had run longer than the ramp window it saturated to 1.0 and the
         soft entry was skipped on every later sleep cycle.
         """
-        from reachy.behavior.sense import EMPTY_SENSE
 
         q, prod = _make(SleepState.ALERT)
-        prod.update(0.0, EMPTY_SENSE)  # anchors producer _t0 at 0
+        prod.update(0.0)  # anchors producer _t0 at 0
 
         # Enter ASLEEP only after long uptime (well past the ramp window from _t0).
         prod.state = SleepState.ASLEEP
-        entry = prod.update(1000.0, EMPTY_SENSE)
+        entry = prod.update(1000.0)
         if entry is None and q.pending():
             entry = q.pending()[-1]
-        settled = prod.update(1000.0 + 20.0, EMPTY_SENSE)
+        settled = prod.update(1000.0 + 20.0)
         if settled is None and q.pending():
             settled = q.pending()[-1]
 
@@ -212,9 +205,8 @@ class TestAsleepBreath:
     def test_asleep_action_has_near_still_head(self) -> None:
         """The sleep-breathe head is near-neutral — minimal yaw, minimal roll."""
         q, prod = _make(SleepState.ASLEEP)
-        from reachy.behavior.sense import EMPTY_SENSE
 
-        action = prod.update(100.0, EMPTY_SENSE)
+        action = prod.update(100.0)
         if action is not None:
             q.submit(action)
         pending = q.pending()
@@ -226,9 +218,8 @@ class TestAsleepBreath:
 
     def test_asleep_minjerk_interpolation(self) -> None:
         q, prod = _make(SleepState.ASLEEP)
-        from reachy.behavior.sense import EMPTY_SENSE
 
-        action = prod.update(100.0, EMPTY_SENSE)
+        action = prod.update(100.0)
         if action is not None:
             q.submit(action)
         for a in q.pending():
@@ -245,33 +236,30 @@ class TestTransportErrorResilience:
 
     def test_update_does_not_raise_on_call_without_transport(self) -> None:
         """SleepProducer.update() is pure — no transport call inside it."""
-        from reachy.behavior.sense import EMPTY_SENSE
 
         q, prod = _make(SleepState.ASLEEP)
         # update() must not call any transport — it only submits to the queue.
         # This verifies the producer is a pure planner (no transport calls).
         try:
-            prod.update(100.0, EMPTY_SENSE)
+            prod.update(100.0)
         except Exception as exc:
             pytest.fail(f"update() must not raise without a transport: {exc}")
 
     def test_multiple_updates_survive_state_changes(self) -> None:
         """Cycling through states does not raise."""
-        from reachy.behavior.sense import EMPTY_SENSE
 
         q, prod = _make(SleepState.ALERT)
         for state in (SleepState.DROWSY, SleepState.ASLEEP, SleepState.ALERT):
             prod.state = state
-            prod.update(float(state.value) * 100.0, EMPTY_SENSE)
+            prod.update(float(state.value) * 100.0)
 
     def test_prior_asleep_then_alert_does_not_raise(self) -> None:
         """Transitioning from ASLEEP → ALERT via state attribute is safe."""
-        from reachy.behavior.sense import EMPTY_SENSE
 
         q, prod = _make(SleepState.ASLEEP)
-        prod.update(50.0, EMPTY_SENSE)
+        prod.update(50.0)
         prod.state = SleepState.ALERT
-        prod.update(51.0, EMPTY_SENSE)  # should not raise
+        prod.update(51.0)  # should not raise
 
 
 # ---------------------------------------------------------------------------
@@ -284,14 +272,13 @@ class TestAsleepDistinctFromIdle:
 
     def _get_asleep_action(self) -> MotionAction:
         """Return the ASLEEP action at a mid-phase tick (not zero)."""
-        from reachy.behavior.sense import EMPTY_SENSE
 
         q, prod = _make(SleepState.ASLEEP)
         # Use a non-zero time so the rocking phase is past zero
-        action = prod.update(7.0, EMPTY_SENSE)
+        action = prod.update(7.0)
         if action is None:
             # May need a second tick past pacing
-            action = prod.update(100.0, EMPTY_SENSE)
+            action = prod.update(100.0)
         if action is None and q.pending():
             action = q.pending()[-1]
         assert action is not None, "ASLEEP must produce an action"
@@ -299,10 +286,9 @@ class TestAsleepDistinctFromIdle:
 
     def _get_alert_idle_action(self) -> MotionAction:
         """Return the ALERT idle action (alive wander)."""
-        from reachy.behavior.sense import EMPTY_SENSE
 
         q, prod = _make(SleepState.ALERT)
-        action = prod.update(100.0, EMPTY_SENSE)
+        action = prod.update(100.0)
         if action is None and q.pending():
             action = q.pending()[-1]
         assert action is not None, "ALERT must produce an idle action"
@@ -392,9 +378,8 @@ class TestWakeGesture:
     def test_wake_gesture_distinct_from_sleep_breathe(self) -> None:
         """Wake action is visually distinct from the sleep-breathe action."""
         q_sleep, prod_sleep = _make(SleepState.ASLEEP)
-        from reachy.behavior.sense import EMPTY_SENSE
 
-        sleep_action = prod_sleep.update(100.0, EMPTY_SENSE)
+        sleep_action = prod_sleep.update(100.0)
         if sleep_action is None and q_sleep.pending():
             sleep_action = q_sleep.pending()[-1]
 

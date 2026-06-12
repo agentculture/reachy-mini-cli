@@ -56,7 +56,6 @@ import math
 import random
 from dataclasses import dataclass, field
 
-from reachy.behavior.sense import Sense
 from reachy.motion.idle import AliveConfig, next_pose
 from reachy.motion.queue import IDLE_KEY, MotionAction, MotionQueue
 from reachy.sleep.state import SleepState
@@ -197,31 +196,19 @@ class SleepProducer:
     # Public API
     # ------------------------------------------------------------------
 
-    def update(
-        self,
-        t: float,
-        sense: Sense,
-        *,
-        snap: bool = False,
-        sound_present: bool | None = None,
-    ) -> MotionAction | None:
+    def update(self, t: float) -> None:
         """Submit the appropriate motion action for the current :attr:`state`.
 
-        Called each tick by :func:`reachy.motion.server.run`.  Submits directly to
-        :attr:`queue` and returns ``None`` (the server's submit branch stays inert).
-        Paced to the idle interval so the queue never builds up faster than the
-        executor can drain it.
+        Driven directly by the sleep arc (``run_sleep_arc``), which owns the
+        :class:`~reachy.sleep.state.SleepStateMachine` and mirrors its state onto
+        :attr:`state` before each call.  Submits actions directly onto
+        :attr:`queue` (the caller drains it).  Paced to the idle interval so the
+        queue never builds up faster than the executor can drain it.
 
         Parameters
         ----------
         t:
-            Current monotonic time (seconds, injected by the server).
-        sense:
-            Current sensor snapshot (not used directly — reserved for future
-            stimulation integration; the SleepStateMachine is owned by the caller).
-        snap, sound_present:
-            Forwarded from the server's audio path (ignored here — stimulation
-            resets the FSM via the caller, not this producer).
+            Current monotonic time (seconds, injected by the caller).
         """
         if self._t0 is None:
             self._t0 = t
@@ -231,7 +218,7 @@ class SleepProducer:
             _SLEEP_INTERVAL if self.state is SleepState.ASLEEP else self._alert_config.interval
         )
         if self._last_pose_t is not None and (t - self._last_pose_t) < interval:
-            return None
+            return
         self._last_pose_t = t
 
         elapsed = t - self._t0
@@ -248,8 +235,6 @@ class SleepProducer:
                 self._submit_drowsy_idle(elapsed)
             else:
                 self._submit_alert_idle(elapsed)
-
-        return None
 
     def wake(self) -> None:
         """Emit the wake re-engagement gesture and snap state to ALERT.
