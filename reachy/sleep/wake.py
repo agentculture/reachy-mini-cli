@@ -64,6 +64,9 @@ class WakeDetector:
     wake_word_kind:
         Which Tier-2 backend to build (``"http"`` default, or ``"openwakeword"``).
         Forwarded to :func:`reachy.sleep.wakeword.resolve_backend`.
+    wake_word_sample_rate:
+        Mic sample rate forwarded to the HTTP STT backend's WAV header (the real
+        rate from the SDK transport; default 16000). Ignored by openwakeword.
     snap_ratio:
         Loudness ratio threshold forwarded to :class:`~reachy.motion.snap.SnapDetector`.
     snap_min_rms:
@@ -78,6 +81,7 @@ class WakeDetector:
         wake_word_enabled: bool = False,
         phrase: str = _DEFAULT_PHRASE,
         wake_word_kind: str = wakeword.DEFAULT_KIND,
+        wake_word_sample_rate: int = wakeword.DEFAULT_SAMPLE_RATE,
         snap_ratio: float = 5.0,
         snap_min_rms: float = 0.02,
         snap_history: int = 30,
@@ -103,6 +107,7 @@ class WakeDetector:
             enabled=wake_word_enabled,
             kind=wake_word_kind,
             phrase=phrase,
+            sample_rate=wake_word_sample_rate,
         )
 
     # ------------------------------------------------------------------

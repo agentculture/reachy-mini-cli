@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-06-12
+
+### Changed
+
+- sleep wake-word HTTP STT backend now speaks the real model-gear / NVIDIA Parakeet contract: `POST /v1/audio/transcriptions` as a multipart WAV upload (was a guessed `/v1/audio/transcribe` raw-PCM POST). Matches the wake phrase against the OpenAI/Parakeet response `text` field (legacy `transcript`/`detected`/`phrase` still honoured). Default `REACHY_STT_URL` is now `http://localhost:9002` (Parakeet on the same box); new `REACHY_STT_LANGUAGE` env var.
+- `HttpSttBackend` now accumulates a rolling ~1.5 s audio window and throttles POSTs (one tick mic chunk is too short to transcribe a phrase); the real mic sample rate from the SDK transport is carried into the WAV header. `window_seconds`/`min_interval`/`clock` are injectable seams for tests.
+
 ## [0.17.0] - 2026-06-12
 
 ### Added

@@ -431,9 +431,13 @@ wakes. Requires the `sdk` transport (pat detection reads live `head_pose`); on
 **Pluggable wake-word backend** — opt in with `--wake-word` (+ optional
 `--wake-word-kind {http,openwakeword}` and `--wake-phrase`). Two backends:
 
-- **`http` (default)** — an external HTTP STT service (stdlib `urllib`; mirrors
-  the Magpie TTS pattern). Configure with `REACHY_STT_URL`, `REACHY_STT_PHRASE`,
-  `REACHY_STT_TIMEOUT`. No extra required; the service is externally managed.
+- **`http` (default)** — an external **OpenAI-compatible** STT service, targeting
+  the model-gear / NVIDIA **Parakeet** endpoint (`POST /v1/audio/transcriptions`,
+  a multipart WAV upload; stdlib `urllib`, no extra required). It buffers a
+  rolling ~1.5 s audio window (one tick's mic chunk is too short to transcribe a
+  phrase) and matches the wake phrase against the response `text`. Configure with
+  `REACHY_STT_URL` (default `http://localhost:9002`), `REACHY_STT_PHRASE`,
+  `REACHY_STT_LANGUAGE`, `REACHY_STT_TIMEOUT`. The service is externally managed.
 - **`openwakeword`** — on-box wake-word engine under the `[cpu]` extra
   (lazy-loaded; the dep list is empty until `openwakeword` gains a cp312 wheel).
 

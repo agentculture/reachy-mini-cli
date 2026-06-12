@@ -239,19 +239,31 @@ you touch the CLI.
     in that mode only a physical head pat rouses the robot; requires the `sdk`
     transport (`http` raises a clean exit-2). Tier 2 adds optional wake-word
     detection (`--wake-word`) via a pluggable backend (`reachy/sleep/wakeword.py`
-    `resolve_backend`): `http` (default — external HTTP STT service, stdlib
-    `urllib`; `REACHY_STT_URL` / `REACHY_STT_PHRASE` / `REACHY_STT_TIMEOUT`,
-    mirrors the Magpie TTS pattern; no extra required) or `openwakeword` (on-box,
-    `[cpu]` extra, lazy-loaded). The `[gpu]` extra is a generic compute-class pin
-    for future GPU features — it does NOT carry an on-box STT model.
+    `resolve_backend`): `http` (default — external **OpenAI-compatible** STT,
+    stdlib `urllib`, targets the model-gear / NVIDIA **Parakeet** service
+    `POST /v1/audio/transcriptions` as a multipart WAV upload; `REACHY_STT_URL`
+    default `http://localhost:9002` / `REACHY_STT_PHRASE` / `REACHY_STT_LANGUAGE`
+    / `REACHY_STT_TIMEOUT`; no extra required) or `openwakeword` (on-box, `[cpu]`
+    extra, lazy-loaded). The `[gpu]` extra is a generic compute-class pin for
+    future GPU features — it does NOT carry an on-box STT model. The HTTP backend
+    accumulates a rolling ~1.5 s audio window (a single tick's mic chunk is far
+    too short to transcribe a phrase) and POSTs at most once per `min_interval`;
+    the real mic sample rate (from the SDK transport) is carried in the WAV
+    header. Server-side serving is tracked in model-gear#39 (Parakeet GPU) /
+    model-gear#40 (realtime facade route).
   - `reachy/sleep/patwake.py` — `PatWakeDetector`: pat-based wake detector that
     measures head-pose deviation against the **moving** sleep-breathe commanded
     pose (not a fixed baseline), reusing `reachy/motion/pat.py` `PatDetector`
     (numpy + stdlib only). Used when `--no-audio-wake` is active.
   - `reachy/sleep/wakeword.py` — `resolve_backend(kind)`: factory for the
-    pluggable wake-word backend (`http` / `openwakeword`). The `http` backend
-    calls an external STT HTTP service (pure stdlib); `openwakeword` is
-    lazy-imported from the `[cpu]` extra and degrades gracefully when absent.
+    pluggable wake-word backend (`http` / `openwakeword`). The `http`
+    `HttpSttBackend` calls the external OpenAI-compatible STT (Parakeet)
+    `/v1/audio/transcriptions` as a multipart WAV upload (pure stdlib), matching
+    the wake phrase against the response `text` (OpenAI/Parakeet shape; legacy
+    `transcript`/`detected`/`phrase` also honoured). It buffers a rolling audio
+    window + throttles POSTs (`window_seconds` / `min_interval`, both injectable);
+    `openwakeword` is lazy-imported from the `[cpu]` extra and degrades gracefully
+    when absent.
   - `reachy/sleep/supervisor.py` — manages `sleep`'s background process (PID +
     log as `sleep.pid`/`sleep.log` under `$REACHY_STATE_DIR`). **Distinct** from
     `listen`'s `reachy/motion/supervisor.py` and `think`'s

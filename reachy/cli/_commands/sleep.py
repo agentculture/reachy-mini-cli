@@ -537,7 +537,9 @@ def _resolve_audio_wake(args: argparse.Namespace) -> bool:
     return not no_audio
 
 
-def _make_wake_detector_factory(args: argparse.Namespace) -> Callable[[], WakeDetector]:
+def _make_wake_detector_factory(
+    args: argparse.Namespace, sample_rate: int | None = None
+) -> Callable[[], WakeDetector]:
     """Build the arc's wake-WORD detector factory from the run flags.
 
     Tier-2 wake-word is opt-in via ``--wake-word``; the resolved backend kind
@@ -545,6 +547,9 @@ def _make_wake_detector_factory(args: argparse.Namespace) -> Callable[[], WakeDe
     and an optional phrase override are threaded to :class:`WakeDetector`, which
     resolves the t2 backend.  Disabled by default → a null backend that never
     fires (Tier-1 speech/snap still works via ``is_stimulus``).
+
+    ``sample_rate`` is the real mic rate from the SDK transport, carried into the
+    HTTP STT backend's WAV header so Parakeet interprets the audio correctly.
     """
     enabled = bool(getattr(args, "wake_word", False))
     kind = getattr(args, "wake_word_kind", None) or "http"
@@ -554,6 +559,8 @@ def _make_wake_detector_factory(args: argparse.Namespace) -> Callable[[], WakeDe
         kw: dict[str, object] = {"wake_word_enabled": enabled, "wake_word_kind": kind}
         if phrase:
             kw["phrase"] = phrase
+        if sample_rate:
+            kw["wake_word_sample_rate"] = int(sample_rate)
         return WakeDetector(**kw)  # type: ignore[arg-type]
 
     return _factory
@@ -651,7 +658,9 @@ def cmd_sleep_run(args: argparse.Namespace) -> int:
             max_ticks=max_ticks,
             stop=stop,
             audio_wake=audio_wake,
-            wake_detector_factory=_make_wake_detector_factory(args),
+            wake_detector_factory=_make_wake_detector_factory(
+                args, sample_rate=getattr(transport, "samplerate", None)
+            ),
             pat=pat,
             commanded_pose_sink=pose_sink,
         )
