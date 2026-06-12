@@ -127,6 +127,20 @@ class TestReset:
         m.update(now=11.0)
         assert pytest.approx(m.idle_seconds) == 3.0
 
+    def test_reset_clamps_backwards_now(self) -> None:
+        """reset() clamps a stale backwards ``now`` just like update() does, so the
+        idle clock never lands in the past (consistency with the class contract)."""
+        m = make_machine(drowsy_after=5.0, asleep_after=10.0)
+        m.update(now=10.0)
+        # A stale reset arriving with now < last seen time must not anchor the
+        # idle clock ahead of real time.
+        m.reset(now=4.0)
+        # idle_seconds is measured from the clamped anchor (10.0), so at a later
+        # forward tick it reflects only the real elapsed time.
+        m.update(now=13.0)
+        assert pytest.approx(m.idle_seconds) == 3.0
+        assert m.idle_seconds >= 0.0
+
 
 # ---------------------------------------------------------------------------
 # Test 3 — snapshot fields and default thresholds

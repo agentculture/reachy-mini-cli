@@ -115,18 +115,20 @@ def test_sleep_demo_does_not_need_reachy_mini(monkeypatch: pytest.MonkeyPatch) -
 def test_sleep_status_json_shape(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path
 ) -> None:
-    """``sleep status --json`` reports a process state + a current sleep state +
-    idle seconds (machine-readable)."""
+    """``sleep status --json`` reports a process state + the cross-process sleep
+    state; ``idle_seconds`` is ``null`` (the live timer is not readable across
+    processes)."""
     monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
     rc = main(["sleep", "status", "--json"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     # Process health (delegated to the supervisor).
     assert payload["process"] in {"running", "stopped", "stale"}
-    # Current sleep state + idle seconds reported.
+    # Cross-process sleep state (from the flag) is reported.
     assert payload["state"] in {"ALERT", "DROWSY", "ASLEEP"}
+    # idle_seconds is present but null — the live timer lives in the loop process.
     assert "idle_seconds" in payload
-    assert isinstance(payload["idle_seconds"], (int, float))
+    assert payload["idle_seconds"] is None
 
 
 def test_sleep_status_reports_asleep_when_flag_set(

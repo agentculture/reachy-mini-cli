@@ -115,6 +115,11 @@ class WakeDetector:
         snap_min_rms: float = 0.02,
         snap_history: int = 30,
     ) -> None:
+        # Retain the snap configuration so reset() can rebuild the detector
+        # without reaching into SnapDetector's private attributes.
+        self._snap_ratio = snap_ratio
+        self._snap_min_rms = snap_min_rms
+        self._snap_history = snap_history
         self._snap = SnapDetector(
             ratio=snap_ratio,
             min_rms=snap_min_rms,
@@ -172,9 +177,9 @@ class WakeDetector:
     def reset(self) -> None:
         """Reset internal state (call when the robot wakes to avoid re-triggering)."""
         self._snap = SnapDetector(
-            ratio=self._snap._ratio,
-            min_rms=self._snap._min_rms,
-            history=self._snap._history.maxlen or 30,
+            ratio=self._snap_ratio,
+            min_rms=self._snap_min_rms,
+            history=self._snap_history,
         )
         # Delegate to the engine's own reset if it has one
         engine = self._engine

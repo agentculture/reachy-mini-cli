@@ -208,6 +208,10 @@ def test_start_reports_exited_when_process_dies_in_grace_window(monkeypatch, tmp
     result = supervisor.start(transport="http")
     assert result["status"] == "exited"
     assert result["exit_code"] == 1
+    # The pid file must NOT linger after a failed start — otherwise status/stop
+    # would report a stale pid (regression: pid was written unconditionally).
+    assert not (tmp_path / "sleep.pid").exists()
+    assert supervisor.read_pid() is None
 
 
 # ---------------------------------------------------------------------------

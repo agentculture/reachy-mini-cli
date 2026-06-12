@@ -20,6 +20,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - listen idle producer now treats sleep as the top-priority interrupt (full wander suppression while asleep)
 
+### Fixed
+
+- sleep-breathe ramp now measures from ASLEEP entry (not producer lifetime), so every sleep cycle eases in softly even after long uptime (reachy/motion/sleep.py)
+- sleep supervisor clears the pid file when a spawned loop exits during the startup grace window, so status/stop no longer report a stale pid (reachy/sleep/supervisor.py)
+- sleep status reports idle_seconds as null instead of a fabricated 0.0 — the live idle timer lives in the loop process and is not observable across processes (reachy/cli/_commands/sleep.py)
+- SleepStateMachine.reset() clamps backwards ticks, matching update() and the documented contract (reachy/sleep/state.py)
+- WakeDetector.reset() rebuilds the SnapDetector from its own retained config instead of SnapDetector private attributes (reachy/sleep/wake.py)
+
 ## [0.15.0] - 2026-06-11
 
 ### Added

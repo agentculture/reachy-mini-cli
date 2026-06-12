@@ -201,6 +201,8 @@ def start(
     }
     if proc.poll() is not None:
         # Exited within the grace window — startup failed (e.g. robot unreachable).
+        # Clear the pid file we just wrote so `status`/`stop` don't report a stale pid.
+        _clear_pid()
         result["status"] = "exited"
         result["exit_code"] = proc.returncode
         result["note"] = f"sleep exited during startup; see {log_path}"

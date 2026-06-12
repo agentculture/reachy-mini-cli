@@ -112,6 +112,28 @@ class TestTier1Snap:
             result = det.update(sense, _snap_chunk())
         assert result is False
 
+    def test_reset_rebuilds_snap_without_private_access(self):
+        """reset() reconstructs the SnapDetector from WakeDetector's own retained
+        config — not by reaching into SnapDetector private attributes (regression:
+        coupled to ``_ratio`` / ``_min_rms`` / ``_history`` internals)."""
+        from reachy.sleep.wake import WakeDetector
+
+        det = WakeDetector(
+            wake_word_enabled=False, snap_ratio=4.0, snap_min_rms=0.03, snap_history=17
+        )
+        # Config is retained on the detector itself, so reset() needs no SnapDetector internals.
+        assert det._snap_ratio == 4.0
+        assert det._snap_min_rms == 0.03
+        assert det._snap_history == 17
+
+        det.reset()  # must not raise even if SnapDetector internals are renamed
+
+        # After reset the detector still works: quiet baseline then a loud snap fires.
+        sense = _make_sense(speech=False)
+        for _ in range(30):
+            det.update(sense, _silent_chunk())
+        assert det.update(sense, _snap_chunk()) is True
+
 
 # ---------------------------------------------------------------------------
 # 3. Graceful degrade — engine absent, no exception raised

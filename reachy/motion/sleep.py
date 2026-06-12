@@ -171,6 +171,10 @@ class SleepProducer:
     # ---- internal pacing state ----
     _t0: float | None = field(default=None, init=False, repr=False)
     _last_pose_t: float | None = field(default=None, init=False, repr=False)
+    # Timestamp of the most recent entry into ASLEEP; the sleep-breathe ramp and
+    # phase are measured from here (not producer lifetime) so every fresh sleep
+    # cycle ramps in softly. Reset to None whenever the producer leaves ASLEEP.
+    _asleep_t0: float | None = field(default=None, init=False, repr=False)
     _rng: random.Random = field(init=False, repr=False)
     # config objects built once per instance
     _alert_config: AliveConfig = field(init=False, repr=False)
@@ -233,11 +237,17 @@ class SleepProducer:
         elapsed = t - self._t0
 
         if self.state is SleepState.ASLEEP:
-            self._submit_sleep_breathe(elapsed)
-        elif self.state is SleepState.DROWSY:
-            self._submit_drowsy_idle(elapsed)
+            # Measure the breathe ramp/phase from when this ASLEEP cycle began so
+            # the 8-second soft entry re-arms on every fresh transition into sleep.
+            if self._asleep_t0 is None:
+                self._asleep_t0 = t
+            self._submit_sleep_breathe(t - self._asleep_t0)
         else:
-            self._submit_alert_idle(elapsed)
+            self._asleep_t0 = None
+            if self.state is SleepState.DROWSY:
+                self._submit_drowsy_idle(elapsed)
+            else:
+                self._submit_alert_idle(elapsed)
 
         return None
 
@@ -251,6 +261,7 @@ class SleepProducer:
         """
         self.state = SleepState.ALERT
         self._last_pose_t = None  # reset pacing so idle fires immediately after wake
+        self._asleep_t0 = None  # re-arm the sleep-breathe ramp for the next cycle
 
         action = MotionAction(
             label="wake_reengage",

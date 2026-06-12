@@ -179,6 +179,36 @@ class TestAsleepBreath:
         # Amplitude is capped at SLEEP_ROCK_BODY degrees (12.0 from reachy_nova)
         assert max(body_yaws) <= SLEEP_BREATHE_BODY_YAW + 1.0
 
+    def test_sleep_ramp_rearms_per_asleep_entry(self) -> None:
+        """The 8s sleep-breathe ramp is measured from ASLEEP *entry*, not producer
+        lifetime — so dropping into sleep after long uptime still eases in softly.
+
+        Regression: the ramp used the producer's single ``_t0``, so after the
+        process had run longer than the ramp window it saturated to 1.0 and the
+        soft entry was skipped on every later sleep cycle.
+        """
+        from reachy.behavior.sense import EMPTY_SENSE
+
+        q, prod = _make(SleepState.ALERT)
+        prod.update(0.0, EMPTY_SENSE)  # anchors producer _t0 at 0
+
+        # Enter ASLEEP only after long uptime (well past the ramp window from _t0).
+        prod.state = SleepState.ASLEEP
+        entry = prod.update(1000.0, EMPTY_SENSE)
+        if entry is None and q.pending():
+            entry = q.pending()[-1]
+        settled = prod.update(1000.0 + 20.0, EMPTY_SENSE)
+        if settled is None and q.pending():
+            settled = q.pending()[-1]
+
+        assert entry is not None and settled is not None
+        entry_pitch = abs((entry.head or {}).get("pitch", 0.0))
+        settled_pitch = abs((settled.head or {}).get("pitch", 0.0))
+        # At the moment of entry the ramp is ~0, so amplitude is near-zero and far
+        # below the settled amplitude reached once the ramp completes.
+        assert entry_pitch < 0.5, f"ASLEEP entry should ramp from ~0, got {entry_pitch}"
+        assert entry_pitch < settled_pitch
+
     def test_asleep_action_has_near_still_head(self) -> None:
         """The sleep-breathe head is near-neutral — minimal yaw, minimal roll."""
         q, prod = _make(SleepState.ASLEEP)

@@ -134,6 +134,10 @@ class SleepStateMachine:
         SleepState
             Always :attr:`SleepState.ALERT` after a reset.
         """
+        # Clamp backwards ticks, exactly as update() does — a stale now must not
+        # plant the idle clock in the past (the class contract documents this).
+        if self._last_now is not None and now < self._last_now:
+            now = self._last_now
         self._idle_start = now
         self._last_now = now
         self._state = SleepState.ALERT

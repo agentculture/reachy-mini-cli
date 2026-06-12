@@ -492,17 +492,21 @@ def cmd_sleep_restart(args: argparse.Namespace) -> int:
 
 
 def cmd_sleep_status(args: argparse.Namespace) -> int:
-    """Report loop process state + the current sleep state + idle seconds.
+    """Report the loop's process state plus the cross-process ASLEEP signal.
 
-    The current sleep *state* is read from the persisted ``sleep_active.flag``:
-    while the running loop holds it up the robot is ASLEEP; otherwise it reports
-    ALERT (the loop owns the live machine in another process, so the flag is the
-    only cross-process signal of wakefulness available here).
+    The live state machine (and its idle timer) lives inside the running loop's
+    *own* process; the only thing observable from here is the persisted
+    ``sleep_active.flag`` it raises while ASLEEP. So this verb reports the
+    process health (running / stale / not-running) and ASLEEP-vs-ALERT from the
+    flag. ``idle_seconds`` is reported as ``null`` because the live timer is not
+    readable across processes — drive ``sleep demo`` (or read the running loop's
+    own ``--json`` output) to observe the full alert->drowsy->asleep arc.
     """
     data = supervisor.status()
     asleep = sleep_signal.is_active()
     data["state"] = SleepState.ASLEEP.name if asleep else SleepState.ALERT.name
-    data["idle_seconds"] = 0.0
+    # The idle timer is owned by the loop process; it is not observable here.
+    data["idle_seconds"] = None
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
 
@@ -631,7 +635,9 @@ def _register_process_verbs(noun_sub: argparse._SubParsersAction) -> None:
     )
     stop.set_defaults(func=cmd_sleep_stop)
 
-    st = noun_sub.add_parser("status", help="Report sleep state + idle seconds + process state.")
+    st = noun_sub.add_parser(
+        "status", help="Report loop process state + the cross-process ALERT/ASLEEP signal."
+    )
     st.add_argument("--json", action="store_true", help=_JSON_HELP)
     st.set_defaults(func=cmd_sleep_status)
 
