@@ -27,12 +27,21 @@ cannot keep itself awake by speaking.
 Boundary: ``now == mute_until`` is treated as *expired* (not suppressed), matching
 the ``now < mute_until`` check in ``think``'s ``_guarded_feed``.
 
+audio_wake flag
+---------------
+When ``audio_wake=False`` the three acoustic stimuli (``doa_shift``,
+``sense.speech_detected``, ``snap``) are silently ignored — only ``pat`` can
+return ``True``.  Use this when the microphone array is disabled or the operator
+wants the robot to wake only on physical touch.  The self-mute guard still applies
+first regardless of ``audio_wake``.  The default ``audio_wake=True`` preserves
+the existing behavior byte-for-byte.
+
 Dependencies: stdlib + numpy only (numpy imported transitively via the ``Sense``
 import chain, but this module itself uses only stdlib).  No transport, no SDK.
 
 Public API
 ----------
-.. function:: is_stimulus(sense, *, doa_shift, snap, pat, now, mute_until) -> bool
+.. function:: is_stimulus(sense, *, doa_shift, snap, pat, now, mute_until, audio_wake) -> bool
 
     The single public entry point.  All qualifier flags are keyword-only after
     ``sense`` to prevent positional mis-ordering at the call site.
@@ -51,6 +60,7 @@ def is_stimulus(
     pat: bool,
     now: float,
     mute_until: float,
+    audio_wake: bool = True,
 ) -> bool:
     """Return ``True`` when *sense* + event flags represent a qualifying stimulus.
 
@@ -76,6 +86,12 @@ def is_stimulus(
         End of the self-mute window (monotonic seconds) stamped by the speech
         playback guard.  Pass ``0.0`` when no mute is active.  While
         ``now < mute_until`` the function returns ``False`` regardless of events.
+    audio_wake:
+        When ``True`` (default) all four event kinds are considered; preserves
+        existing behavior.  When ``False`` the three acoustic stimuli
+        (``doa_shift``, ``sense.speech_detected``, ``snap``) are ignored and
+        only ``pat`` can trigger a ``True`` return — use this when the
+        microphone array is off or the operator wants touch-only wake.
 
     Returns
     -------
@@ -88,5 +104,9 @@ def is_stimulus(
     if now < mute_until:
         return False
 
-    # Any one of the four qualifying event kinds is sufficient.
-    return doa_shift or sense.speech_detected or snap or pat
+    if audio_wake:
+        # Any one of the four qualifying event kinds is sufficient.
+        return doa_shift or sense.speech_detected or snap or pat
+    else:
+        # Acoustic stimuli are disabled; only physical touch (pat) qualifies.
+        return pat

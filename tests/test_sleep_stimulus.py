@@ -154,3 +154,123 @@ class TestNoStimulus:
         assert not is_stimulus(
             sense, doa_shift=False, snap=False, pat=False, now=_NOW, mute_until=_NO_MUTE
         )
+
+
+# ---------------------------------------------------------------------------
+# audio_wake=False flag tests
+# ---------------------------------------------------------------------------
+
+
+class TestAudioWakeFlag:
+    """When audio_wake=False, only pat can trigger a stimulus; all acoustic
+    signals (doa_shift, speech_detected, snap) are silently ignored.
+    """
+
+    def test_audio_wake_false_pat_true_is_stimulus(self) -> None:
+        """audio_wake=False: pat=True still qualifies as a stimulus."""
+        sense = _sense()
+        assert is_stimulus(
+            sense,
+            doa_shift=False,
+            snap=False,
+            pat=True,
+            now=_NOW,
+            mute_until=_NO_MUTE,
+            audio_wake=False,
+        )
+
+    def test_audio_wake_false_doa_shift_ignored(self) -> None:
+        """audio_wake=False: doa_shift=True is NOT a stimulus."""
+        sense = _sense(doa_angle=math.pi / 4)
+        assert not is_stimulus(
+            sense,
+            doa_shift=True,
+            snap=False,
+            pat=False,
+            now=_NOW,
+            mute_until=_NO_MUTE,
+            audio_wake=False,
+        )
+
+    def test_audio_wake_false_speech_detected_ignored(self) -> None:
+        """audio_wake=False: speech_detected=True is NOT a stimulus."""
+        sense = _sense(speech_detected=True)
+        assert not is_stimulus(
+            sense,
+            doa_shift=False,
+            snap=False,
+            pat=False,
+            now=_NOW,
+            mute_until=_NO_MUTE,
+            audio_wake=False,
+        )
+
+    def test_audio_wake_false_snap_ignored(self) -> None:
+        """audio_wake=False: snap=True is NOT a stimulus."""
+        sense = _sense()
+        assert not is_stimulus(
+            sense,
+            doa_shift=False,
+            snap=True,
+            pat=False,
+            now=_NOW,
+            mute_until=_NO_MUTE,
+            audio_wake=False,
+        )
+
+    def test_audio_wake_false_all_audio_signals_no_pat_is_not_stimulus(self) -> None:
+        """audio_wake=False: even all audio signals together with pat=False → False."""
+        sense = _sense(doa_angle=math.pi / 3, speech_detected=True)
+        assert not is_stimulus(
+            sense,
+            doa_shift=True,
+            snap=True,
+            pat=False,
+            now=_NOW,
+            mute_until=_NO_MUTE,
+            audio_wake=False,
+        )
+
+    def test_audio_wake_false_mute_window_still_suppresses_pat(self) -> None:
+        """audio_wake=False: self-mute window still suppresses pat (full guard applies)."""
+        mute_until = _NOW + 1.0
+        sense = _sense()
+        assert not is_stimulus(
+            sense,
+            doa_shift=False,
+            snap=False,
+            pat=True,
+            now=_NOW,
+            mute_until=mute_until,
+            audio_wake=False,
+        )
+
+    def test_audio_wake_true_default_preserves_doa_shift(self) -> None:
+        """audio_wake=True (default) still treats doa_shift as a stimulus."""
+        sense = _sense(doa_angle=math.pi / 4)
+        assert is_stimulus(
+            sense,
+            doa_shift=True,
+            snap=False,
+            pat=False,
+            now=_NOW,
+            mute_until=_NO_MUTE,
+            audio_wake=True,
+        )
+
+    def test_audio_wake_default_equals_true_behavior(self) -> None:
+        """Omitting audio_wake behaves identically to audio_wake=True."""
+        sense = _sense(speech_detected=True)
+        result_default = is_stimulus(
+            sense, doa_shift=False, snap=False, pat=False, now=_NOW, mute_until=_NO_MUTE
+        )
+        result_explicit = is_stimulus(
+            sense,
+            doa_shift=False,
+            snap=False,
+            pat=False,
+            now=_NOW,
+            mute_until=_NO_MUTE,
+            audio_wake=True,
+        )
+        assert result_default == result_explicit == True  # noqa: E712
