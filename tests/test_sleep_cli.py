@@ -213,6 +213,9 @@ class _SilentSession:
     """A media session (context manager) that yields no DoA and no audio — so the
     sleep loop senses 'nothing' every tick and the idle clock runs uninterrupted."""
 
+    #: The SDK exposes the real mic rate on the MediaSession (not the transport).
+    samplerate = 48000
+
     def __enter__(self) -> "_SilentSession":
         return self
 
@@ -257,6 +260,35 @@ def test_sleep_run_bounded_exits_zero(
     payload = json.loads(last)
     assert payload["status"] == "ok"
     assert payload["ticks"] == 5
+
+
+def test_sdk_feed_threads_session_samplerate() -> None:
+    """_make_sdk_feed surfaces the MediaSession's real mic rate (not transport.*).
+
+    Regression: cmd_sleep_run used getattr(transport, "samplerate", None), but the
+    SDK exposes samplerate on the MediaSession — so the wake-word WAV header always
+    fell back to the 16 kHz default."""
+    import reachy.cli._commands.sleep as sleep_mod
+
+    sense, snap, audio, close, rate = sleep_mod._make_sdk_feed(_FakeSdkTransport())
+    try:
+        assert rate == 48000  # the session's samplerate, threaded out
+    finally:
+        close()
+
+
+def test_http_feed_has_no_samplerate() -> None:
+    """The http transport has no mic session, so the feed reports rate=None."""
+    import reachy.cli._commands.sleep as sleep_mod
+
+    class _HttpTransport:
+        name = "http"
+
+        def doa(self, *, timeout: float | None = None) -> object:
+            return None
+
+    *_rest, rate = sleep_mod._make_http_feed(_HttpTransport())
+    assert rate is None
 
 
 # --- arc unit test (fake clock + injected sense, zero robot/wall-clock) ----

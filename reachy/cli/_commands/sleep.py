@@ -450,19 +450,28 @@ def run_sleep_arc(
 
 def _make_sdk_feed(
     transport: object,
-) -> tuple[Callable[[], Sense], Callable[[], bool], Callable[[], np.ndarray], Callable[[], None]]:
-    """Open the SDK media session and return ``(sense, snap, audio, close)``.
+) -> tuple[
+    Callable[[], Sense],
+    Callable[[], bool],
+    Callable[[], np.ndarray],
+    Callable[[], None],
+    int | None,
+]:
+    """Open the SDK media session and return ``(sense, snap, audio, close, rate)``.
 
     The session is entered eagerly so a missing ``[sdk]`` / dead daemon raises its
     clean CliError before the loop starts.  ``sense()`` returns the latest DoA
     snapshot; ``snap()`` returns whether the latest mic chunk was a loud transient;
     ``audio()`` returns that same latest mic chunk (so the wake-WORD backend sees
-    real audio, not silence).
+    real audio, not silence).  ``rate`` is the session's real mic sample rate (the
+    SDK exposes it on the ``MediaSession``, not the transport) — threaded out so
+    the wake-word WAV header reflects the actual mic rate, not the 16 kHz default.
     """
     session = transport.media_session()  # type: ignore[attr-defined]
     cm = session if (hasattr(session, "__enter__") and hasattr(session, "__exit__")) else None
     if cm is not None:
         session = cm.__enter__()
+    sample_rate = getattr(session, "samplerate", None)
     poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
     detector = SnapDetector()
     last_snap = {"v": False}
@@ -489,14 +498,21 @@ def _make_sdk_feed(
         if cm is not None:
             cm.__exit__(None, None, None)
 
-    return _sense, _snap, _audio, _close
+    return _sense, _snap, _audio, _close, sample_rate
 
 
 def _make_http_feed(
     transport: object,
-) -> tuple[Callable[[], Sense], Callable[[], bool], Callable[[], np.ndarray], Callable[[], None]]:
+) -> tuple[
+    Callable[[], Sense],
+    Callable[[], bool],
+    Callable[[], np.ndarray],
+    Callable[[], None],
+    int | None,
+]:
     """Poll the daemon's DoA route — no audio source, so ``snap`` is always False
-    and ``audio`` is always a silent buffer (no mic on the http transport)."""
+    and ``audio`` is always a silent buffer (no mic on the http transport).  No
+    session means no real mic rate, so ``rate`` is ``None`` (backend default)."""
     poller = DoaPoller(read=lambda: read_doa(transport, timeout=DOA_TIMEOUT))
 
     def _sense() -> Sense:
@@ -511,7 +527,7 @@ def _make_http_feed(
     def _close() -> None:
         return None
 
-    return _sense, _snap, _audio, _close
+    return _sense, _snap, _audio, _close, None
 
 
 # --- run (foreground loop) ------------------------------------------------
@@ -632,9 +648,9 @@ def cmd_sleep_run(args: argparse.Namespace) -> int:
     # media session eagerly, so a missing [sdk] extra raises a clean exit-2
     # CliError here — never a traceback.
     if hasattr(transport, "media_session"):
-        sense, snap, audio, close = _make_sdk_feed(transport)
+        sense, snap, audio, close, mic_rate = _make_sdk_feed(transport)
     else:
-        sense, snap, audio, close = _make_http_feed(transport)
+        sense, snap, audio, close, mic_rate = _make_http_feed(transport)
 
     # Pat-only mode wires a PatWakeSource off the SDK head-pose read-back; audio
     # mode leaves it absent (None → the arc's pat source defaults to "no pat").
@@ -658,9 +674,7 @@ def cmd_sleep_run(args: argparse.Namespace) -> int:
             max_ticks=max_ticks,
             stop=stop,
             audio_wake=audio_wake,
-            wake_detector_factory=_make_wake_detector_factory(
-                args, sample_rate=getattr(transport, "samplerate", None)
-            ),
+            wake_detector_factory=_make_wake_detector_factory(args, sample_rate=mic_rate),
             pat=pat,
             commanded_pose_sink=pose_sink,
         )
