@@ -3,17 +3,22 @@
 Tier-1 — ALWAYS on, zero new base dependencies:
     Fires when :attr:`~reachy.behavior.sense.Sense.speech_detected` is ``True``
     **or** when :class:`~reachy.motion.snap.SnapDetector` registers a loud audio
-    transient.  This tier is active for every install profile.
+    transient.  This tier is active for every install profile and lives here.
 
-Tier-2 — OPTIONAL, lazy:
-    A wake-*word* phrase detector (e.g. ``"hey reachy"``).  The engine is imported
-    *lazily* and only when both conditions hold:
+Tier-2 — OPTIONAL, pluggable wake-*word* backend:
+    A wake-*word* phrase detector (e.g. ``"hey reachy"``).  The concern is owned
+    by :mod:`reachy.sleep.wakeword`; :class:`WakeDetector` obtains a backend via
+    :func:`reachy.sleep.wakeword.resolve_backend` and calls ``backend.update``
+    once per tick.  There are exactly two backends:
 
-    * ``wake_word_enabled=True`` was passed to :class:`WakeDetector`.
-    * The ``[cpu]`` or ``[gpu]`` extra is installed and the engine can be imported.
+    * an **external HTTP STT** override (the DEFAULT) reached over stdlib urllib;
+    * **openwakeword** behind the ``[cpu]`` extra (lazy-imported there, never
+      here).
 
-    If the engine is absent or fails to load, :class:`WakeDetector` falls back
-    to Tier-1 silently — it **never raises**.
+    A configured-but-unreachable/absent backend degrades to "no wake-word"
+    (returns ``False``) and **never raises** — :class:`WakeDetector` then falls
+    back to Tier-1 transparently.  Importing this module pulls in NO
+    ``openwakeword`` and no ASR library.
 
 Public API (consumed by task t8 / the sleep loop)::
 
@@ -21,65 +26,22 @@ Public API (consumed by task t8 / the sleep loop)::
 
     det = WakeDetector(wake_word_enabled=False)   # or True for phrase detection
     fired: bool = det.update(sense, audio_chunk)  # call once per tick
-
-Cited pattern for Tier-2 ASR phrase matching:
-    ``reachy_nova.wake_word.WakeWordDetector`` — phrase substring match,
-    periodic transcribe in a background thread.  We keep the same design but
-    gate the import so the base profile never touches NeMo/ASR deps.
 """
 
 from __future__ import annotations
 
-import contextlib
 import logging
-from typing import TYPE_CHECKING
 
 import numpy as np
 
 from reachy.behavior.sense import Sense
 from reachy.motion.snap import SnapDetector
-
-if TYPE_CHECKING:
-    pass  # no TYPE_CHECKING-only imports needed
+from reachy.sleep import wakeword
+from reachy.sleep.wakeword import (  # noqa: F401  (back-compat re-export)
+    DEFAULT_PHRASE as _DEFAULT_PHRASE,
+)
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Wake-word phrase (Tier-2)
-# ---------------------------------------------------------------------------
-
-_DEFAULT_PHRASE = "hey reachy"
-
-
-def _try_load_wake_word_engine(phrase: str):
-    """Attempt to import the wake-word engine and return a detector instance.
-
-    The import lives *inside* this function so that the module can be imported on
-    any install profile without pulling in ``openwakeword`` or any ``[cpu]``/``[gpu]``
-    package.
-
-    Returns the engine instance on success, or ``None`` on ``ImportError`` / any
-    other load failure (so the caller degrades cleanly to Tier-1).
-    """
-    try:
-        # Lazy import — only reached when wake_word_enabled=True AND the package
-        # is installed.  A bare `pip install reachy-mini-cli` never executes this.
-        import openwakeword  # noqa: F401  # [cpu] extra
-        from openwakeword.model import Model  # type: ignore[import-untyped]
-
-        oww = Model(wakeword_models=[], inference_framework="tflite")
-        logger.info("[WakeDetector] Tier-2 openwakeword engine loaded, phrase=%r", phrase)
-        return oww
-    except ImportError:
-        logger.debug(
-            "[WakeDetector] openwakeword not installed; Tier-2 disabled, using Tier-1 only."
-        )
-        return None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[WakeDetector] Tier-2 engine failed to load (%s); falling back to Tier-1.", exc
-        )
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -93,11 +55,15 @@ class WakeDetector:
     Parameters
     ----------
     wake_word_enabled:
-        If ``True``, attempt to load the wake-word engine (Tier-2).  If the
-        engine is unavailable, fall back to Tier-1 transparently.
+        If ``True``, resolve a Tier-2 wake-word backend (default the external
+        HTTP STT override).  If the backend is unavailable/unreachable, fall back
+        to Tier-1 transparently — it never raises.
     phrase:
         The wake phrase for Tier-2 (default ``"hey reachy"``).  Ignored when
-        Tier-2 is disabled or unavailable.
+        Tier-2 is disabled.
+    wake_word_kind:
+        Which Tier-2 backend to build (``"http"`` default, or ``"openwakeword"``).
+        Forwarded to :func:`reachy.sleep.wakeword.resolve_backend`.
     snap_ratio:
         Loudness ratio threshold forwarded to :class:`~reachy.motion.snap.SnapDetector`.
     snap_min_rms:
@@ -111,6 +77,7 @@ class WakeDetector:
         *,
         wake_word_enabled: bool = False,
         phrase: str = _DEFAULT_PHRASE,
+        wake_word_kind: str = wakeword.DEFAULT_KIND,
         snap_ratio: float = 5.0,
         snap_min_rms: float = 0.02,
         snap_history: int = 30,
@@ -128,9 +95,15 @@ class WakeDetector:
         self._wake_word_enabled = wake_word_enabled
         self._phrase = phrase
 
-        # Tier-2 engine — None until (lazily) loaded, or if unavailable.
-        self._engine = None
-        self._engine_loaded: bool = False  # sentinel to avoid re-attempting each tick
+        # Tier-2 backend (pluggable).  resolve_backend is side-effect-free: no
+        # network call, no openwakeword import happens here — both are deferred
+        # to the backend's first update().  When disabled, this is a null backend
+        # that never fires.
+        self._backend = wakeword.resolve_backend(
+            enabled=wake_word_enabled,
+            kind=wake_word_kind,
+            phrase=phrase,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -164,12 +137,10 @@ class WakeDetector:
             logger.debug("[WakeDetector] Tier-1 fired (snap)")
             return True
 
-        # Tier-2: wake word (only if enabled + engine available)
-        if self._wake_word_enabled:
-            engine = self._get_engine()
-            if engine is not None and self._engine_check(engine, audio):
-                logger.info("[WakeDetector] Tier-2 fired (wake word)")
-                return True
+        # Tier-2: pluggable wake-word backend (never raises; null when disabled)
+        if self._backend.update(sense, audio):
+            logger.info("[WakeDetector] Tier-2 fired (wake word)")
+            return True
 
         return False
 
@@ -180,36 +151,7 @@ class WakeDetector:
             min_rms=self._snap_min_rms,
             history=self._snap_history,
         )
-        # Delegate to the engine's own reset if it has one
-        engine = self._engine
-        if engine is not None and hasattr(engine, "reset"):
-            # Degrade silently: a flaky engine reset must never crash wake handling.
-            with contextlib.suppress(Exception):
-                engine.reset()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _get_engine(self):
-        """Return the Tier-2 engine, loading it lazily on first call.
-
-        Returns ``None`` if unavailable; never raises.
-        """
-        if not self._engine_loaded:
-            self._engine_loaded = True
-            self._engine = _try_load_wake_word_engine(self._phrase)
-        return self._engine
-
-    def _engine_check(self, engine, audio: np.ndarray) -> bool:
-        """Ask the Tier-2 engine whether the wake phrase was heard.
-
-        Wraps the call in a broad except so an engine crash never kills the
-        sleep loop.
-        """
-        try:
-            result = engine.detect(audio) if hasattr(engine, "detect") else False
-            return bool(result)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[WakeDetector] Tier-2 engine error: %s; ignoring.", exc)
-            return False
+        # Delegate to the backend's own reset (a no-op for the null/HTTP backends).
+        reset = getattr(self._backend, "reset", None)
+        if callable(reset):
+            reset()
