@@ -235,10 +235,23 @@ you touch the CLI.
     the robot cannot wake itself from its own speaker output.
   - `reachy/sleep/wake.py` — two-tier wake: Tier 1 (default) wakes on detected
     speech or a loud RMS snap transient (same signals as `listen` Tier 2).
-    Tier 2 adds optional wake-word detection behind generic `[cpu]` / `[gpu]`
-    extras (compute-class pins for the wake-word backend); the path is lazy-loaded
-    and degrades gracefully when the extra is absent — a missing extra never raises
-    at import time.
+    **Audio wake can be disabled** via `--no-audio-wake` (alias `--wake pat`) —
+    in that mode only a physical head pat rouses the robot; requires the `sdk`
+    transport (`http` raises a clean exit-2). Tier 2 adds optional wake-word
+    detection (`--wake-word`) via a pluggable backend (`reachy/sleep/wakeword.py`
+    `resolve_backend`): `http` (default — external HTTP STT service, stdlib
+    `urllib`; `REACHY_STT_URL` / `REACHY_STT_PHRASE` / `REACHY_STT_TIMEOUT`,
+    mirrors the Magpie TTS pattern; no extra required) or `openwakeword` (on-box,
+    `[cpu]` extra, lazy-loaded). The `[gpu]` extra is a generic compute-class pin
+    for future GPU features — it does NOT carry an on-box STT model.
+  - `reachy/sleep/patwake.py` — `PatWakeDetector`: pat-based wake detector that
+    measures head-pose deviation against the **moving** sleep-breathe commanded
+    pose (not a fixed baseline), reusing `reachy/motion/pat.py` `PatDetector`
+    (numpy + stdlib only). Used when `--no-audio-wake` is active.
+  - `reachy/sleep/wakeword.py` — `resolve_backend(kind)`: factory for the
+    pluggable wake-word backend (`http` / `openwakeword`). The `http` backend
+    calls an external STT HTTP service (pure stdlib); `openwakeword` is
+    lazy-imported from the `[cpu]` extra and degrades gracefully when absent.
   - `reachy/sleep/supervisor.py` — manages `sleep`'s background process (PID +
     log as `sleep.pid`/`sleep.log` under `$REACHY_STATE_DIR`). **Distinct** from
     `listen`'s `reachy/motion/supervisor.py` and `think`'s
@@ -273,11 +286,13 @@ you touch the CLI.
   The HTTP transport stays available via `--transport http` / `REACHY_TRANSPORT=http`.
   Adding a *new* base runtime dep beyond `numpy` needs an explicit decision (keep the
   base light enough for the remote profile). `teken` remains dev-only; `whoami` still
-  hand-rolls YAML; `reachy/daemon.py` still uses stdlib only. The `[cpu]` / `[gpu]`
-  extras (introduced for `sleep`'s optional wake-word path) are generic compute-class
-  extras that pin the appropriate backend wheel; they are lazy-loaded and the Tier 1
-  wake (speech/snap) never requires them — a bare `pip install reachy-mini-cli` still
-  gets full Tier 1 wake functionality.
+  hand-rolls YAML; `reachy/daemon.py` still uses stdlib only. The `[cpu]` extra is
+  the home for on-box `openwakeword` (lazy-loaded; dep list empty until it gains a
+  cp312 wheel). The `[gpu]` extra is a generic compute-class pin for future
+  GPU-accelerated features — it does NOT bundle an on-box STT model (heavy STT is
+  externally managed behind the HTTP STT service, `REACHY_STT_URL`). Both are
+  lazy-loaded and the Tier 1 wake (speech/snap) never requires them — a bare
+  `pip install reachy-mini-cli` still gets full Tier 1 wake functionality.
 - **Python ≥ 3.12** (uses `X | None`, `tomllib`, etc.).
 - **Every PR bumps the version**, even docs/config/CI-only changes — the
   `version-check` CI job blocks the merge otherwise (it compares

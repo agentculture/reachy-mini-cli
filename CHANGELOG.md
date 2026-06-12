@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-06-12
+
+### Added
+
+- sleep run --no-audio-wake (alias --wake pat): pat always wakes a sleeping robot; this flag disables audio-wake so only a physical head pat rouses it — requires the SDK transport (pat reads head_pose; http raises a clean exit-2 CliError)
+- sleep run --wake-word (+ --wake-word-kind {http,openwakeword}, --wake-phrase): opt-in Tier-2 wake-word detection with a pluggable backend — external HTTP STT service (default, stdlib urllib; REACHY_STT_URL / REACHY_STT_PHRASE / REACHY_STT_TIMEOUT, mirrors the Magpie TTS pattern) or on-box openwakeword under the [cpu] extra (lazy-loaded)
+- reachy/sleep/wakeword.py resolve_backend: pluggable wake-word backend resolver — http (external STT service, no extra required) or openwakeword ([cpu] extra, lazy import)
+- reachy/sleep/patwake.py PatWakeDetector: pat-based wake detector that measures head-pose deviation against the MOVING sleep-breathe commanded pose (not a fixed baseline), reusing reachy/motion/pat.py PatDetector (numpy + stdlib only)
+
+### Changed
+
+- [gpu] extra no longer implies an on-box STT model — it is a generic compute-class pin for future GPU-accelerated features; wake-word on GPU is not a current use case and the [gpu] comment is updated accordingly
+
 ## [0.16.0] - 2026-06-12
 
 ### Added

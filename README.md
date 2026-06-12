@@ -419,9 +419,26 @@ from its own speaker output.
 
 **Two-tier wake** — `reachy/sleep/wake.py`: Tier 1 (default) wakes on detected
 speech or a loud RMS snap transient (same signals as `listen` Tier 2). Tier 2
-adds optional wake-word detection, available behind generic `[cpu]` / `[gpu]`
-extras that pin the appropriate compute-class backend; the wake-word path is
-lazy-loaded and degrades gracefully if the extra is absent.
+adds optional wake-word detection via a pluggable backend (see below); the
+wake-word path is lazy-loaded and degrades gracefully if the extra is absent.
+
+**Pat-only wake (`--no-audio-wake` / `--wake pat`)** — pass this flag to disable
+all audio wake so only a physical head pat rouses the sleeping robot. Useful when
+the robot is in a noisy environment where speech/snap signals would cause false
+wakes. Requires the `sdk` transport (pat detection reads live `head_pose`); on
+`--transport http` it exits `2` with a clean `CliError`.
+
+**Pluggable wake-word backend** — opt in with `--wake-word` (+ optional
+`--wake-word-kind {http,openwakeword}` and `--wake-phrase`). Two backends:
+
+- **`http` (default)** — an external HTTP STT service (stdlib `urllib`; mirrors
+  the Magpie TTS pattern). Configure with `REACHY_STT_URL`, `REACHY_STT_PHRASE`,
+  `REACHY_STT_TIMEOUT`. No extra required; the service is externally managed.
+- **`openwakeword`** — on-box wake-word engine under the `[cpu]` extra
+  (lazy-loaded; the dep list is empty until `openwakeword` gains a cp312 wheel).
+
+The `[gpu]` extra is a generic GPU compute-class pin for future GPU-accelerated
+features — it does **not** bundle an on-box STT model.
 
 **Idle interrupt — strongest suppressor:** `sleep` writes `sleep_active.flag`
 (via `reachy/motion/sleep_signal.py`) while the robot is in DROWSY or ASLEEP
@@ -440,6 +457,10 @@ extra raises a clean exit-2 `CliError`. `sleep` has its own supervisor
 reachy-mini-cli sleep run                                 # foreground decay loop (Ctrl-C to stop)
 reachy-mini-cli sleep run --ticks 300                     # bounded run (testing/ops)
 reachy-mini-cli sleep run --idle-timeout 30               # fall asleep after 30 s of quiet
+reachy-mini-cli sleep run --no-audio-wake                 # pat-only wake (ignore all sound)
+reachy-mini-cli sleep run --wake pat                      # same as --no-audio-wake
+reachy-mini-cli sleep run --wake-word                     # opt-in wake-word (HTTP STT default)
+reachy-mini-cli sleep run --wake-word --wake-word-kind openwakeword --wake-phrase "hey reachy"
 reachy-mini-cli sleep start                               # background tracked process
 reachy-mini-cli sleep status --json                       # state + idle timer + health
 reachy-mini-cli sleep stop

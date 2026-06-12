@@ -1,6 +1,6 @@
 [project]
 name = "reachy-mini-cli"
-version = "0.16.0"
+version = "0.17.0"
 description = "Agent and CLI for operating the Reachy Mini expressive robot — device setup, app management, and runtime ops."
 readme = "README.md"
 license = "MIT"
@@ -31,11 +31,13 @@ dependencies = ["numpy>=1.24"]
 daemon = ["reachy-mini>=1.0"]
 sdk = ["reachy-mini>=1.0"]
 # Generic compute-class extras — intentionally broad so they also serve future
-# speech/STT features beyond wake detection.  The actual engine packages are
-# a parked detail (plan risk r1): openwakeword lacks a cp312 wheel and the
-# GPU engine is TBD.  The code tolerates a missing engine (lazy import +
-# graceful Tier-1 degrade), so these extras are declared now for the API
-# surface and populated once the engines gain Python 3.12 support.
+# features beyond wake detection.
+# [cpu] is the home for on-box openwakeword (lazy-loaded; openwakeword lacks a
+# cp312 wheel as of 2026-06, so the dep list stays empty until it gains one).
+# [gpu] is a generic GPU compute-class pin for future GPU-accelerated features;
+# it does NOT bundle an on-box STT model — heavy STT is externally managed
+# behind the HTTP STT service (REACHY_STT_URL).  The code tolerates a missing
+# engine (lazy import + graceful Tier-1 degrade).
 # Do NOT promote any engine package to base dependencies.
 cpu = []
 gpu = []
