@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-06-14
+
+### Added
+
+- `think run --export -` / `--export-blocks`: export the robot's thinking / message / emotion blocks as a live newline-delimited JSON feed on stdout for an external display (e.g. the reTerminal). New `reachy/export/` package (event model + `to_jsonl`, block-selection parser, broken-pipe-safe stdout exporter); a passive cognition export hook taps the raw LLM turn stream (thinking.text) before the MarkerParser discard. stdlib `json` only — no new dependency; the renderer stays out of the repo. Schema: `docs/export-schema.md`.
+
 ## [0.18.1] - 2026-06-14
 
 ### Added
