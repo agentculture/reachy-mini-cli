@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-06-14
+
+### Added
+
+- `listen` now detects head **pats** inside its sdk loop (motion + pat in one mode): each tick reads `head_pose` back through the loop's own fast sdk client and feeds a `PatDetector`, enqueuing a lean→nuzzle→settle `PatReaction` and raising the `pat_active` flag on a press. A separate `pat` process can't (sdk contention throttles head_pose to ~1Hz). New `--pat/--no-pat` (default on, sdk-only) + `--press-threshold`/`--min-presses`; new `on_tick` seam on `reachy.motion.server.run`; new `reachy/motion/listen_pat.py`.
+
 ## [0.19.0] - 2026-06-14
 
 ### Added
