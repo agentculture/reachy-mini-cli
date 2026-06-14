@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-06-14
+
+### Added
+
+- `.claude/skills/ask-colleague/` — first-party **ask-colleague** skill (origin: colleague). Drives the `colleague` CLI to hand a scoped repo task to a *different* backend/model (a second, independent mind) and fold the answer back: `review` (diverse second opinion on a committed diff), `explore` (fresh read-only read of an area), `write` (preview-by-default implementation; `--apply`/`--pr` to land), `feedback` (grade a finished work item — the ROI loop), and `clean` (reap stale `colleague/*` branches/artifacts a crashed run left behind). `explore`/`review` are read-only via throwaway-worktree isolation. Added via the mass-update skill (PR #46).
+
 ## [0.20.0] - 2026-06-14
 
 ### Added
