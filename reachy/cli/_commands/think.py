@@ -28,7 +28,9 @@ collaborators — never a Python traceback.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
+import sys
 import threading
 import time
 from typing import Callable
@@ -38,8 +40,10 @@ import numpy as np
 from reachy.behavior.sense import DOA_TIMEOUT, DoaPoller, read_doa
 from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
-from reachy.cli._errors import CliError
+from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.cli._output import emit_diagnostic, emit_result
+from reachy.export.blocks import Selection, parse_blocks
+from reachy.export.exporter import JsonlExporter
 from reachy.motion.expression import ExpressionProducer
 from reachy.motion.queue import MotionQueue
 from reachy.motion.server import run as run_motion
@@ -500,12 +504,39 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     _guarded_feed.close = getattr(feed, "close", None)  # type: ignore[attr-defined]
 
     system_prompt = _build_system_prompt(emojis=_expression_emojis())
+
+    # --- export sink wiring -----------------------------------------------
+    export_target = getattr(args, "export", None)
+    export_hook = None
+    pose_resolver = None
+    if export_target is not None:
+        if export_target != "-":
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"unsupported export target: {export_target!r}",
+                remediation="only '-' (stdout) is supported in this version; "
+                "HTTP and file sinks are future work",
+            )
+        # Parse --export-blocks (default: all three block types).
+        export_blocks_csv = getattr(args, "export_blocks", None)
+        if export_blocks_csv is not None:
+            selection = parse_blocks(export_blocks_csv)
+        else:
+            selection = Selection.all()
+        exporter = JsonlExporter(sys.stdout, selection)
+        export_hook = exporter.emit
+        # Pose resolver: look up each emoji in the expression catalog.
+        catalog = Catalog()
+        pose_resolver = lambda emoji: dataclasses.asdict(catalog.get(emoji))  # noqa: E731
+
     engine = CognitionEngine(
         buffer=buffer,
         stream_sentences=_stream_sentences,
         synthesize=_synthesize,
         play_audio=_guarded_play,
         express=motion.express,
+        export=export_hook,
+        pose_resolver=pose_resolver,
         system_prompt=system_prompt,
         llm_kwargs=_llm_kwargs(args),
         tts_kwargs=_tts_kwargs(args),
@@ -540,7 +571,11 @@ def cmd_think_run(args: argparse.Namespace) -> int:
             if close is not None:
                 close()
 
-    if json_mode:
+    # STDOUT PURITY: when exporting to stdout, the status summary must go to
+    # stderr so the JSONL feed on stdout is uncontaminated by non-event text.
+    if export_target == "-":
+        emit_diagnostic(f"[think] stopped after {turns} spoken turn(s) (export: stdout)")
+    elif json_mode:
         emit_result({"status": "ok", "turns": turns}, json_mode=True)
     else:
         emit_diagnostic(f"[think] stopped after {turns} spoken turn(s)")
@@ -794,6 +829,23 @@ def _register_run(noun_sub: argparse._SubParsersAction) -> None:
         default=None,
         dest="max_ticks",
         help="Stop after this many loop iterations (idle turns included).",
+    )
+    run.add_argument(
+        "--export",
+        default=None,
+        dest="export",
+        metavar="TARGET",
+        help="Export events as JSONL to TARGET.  Only '-' (stdout) is supported in this "
+        "version.  When set, stdout carries a pure JSONL event feed and the run summary "
+        "is redirected to stderr.",
+    )
+    run.add_argument(
+        "--export-blocks",
+        default=None,
+        dest="export_blocks",
+        metavar="BLOCKS",
+        help="Comma-separated list of block types to include in the export feed "
+        "(valid: thinking, message, emotion).  Default: all three when --export is set.",
     )
     run.set_defaults(func=cmd_think_run)
 
