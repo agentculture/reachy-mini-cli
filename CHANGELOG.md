@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.1] - 2026-06-14
+
+### Added
+
+- Spec: export reachy's thinking/message/emotion blocks as a live stdout JSONL feed for an external reTerminal display (`docs/specs/`, via /think) — `think run --export -`; renderer stays out of the repo; transport is stdout-only for v1.
+
 ## [0.18.0] - 2026-06-12
 
 ### Changed
