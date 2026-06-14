@@ -369,6 +369,27 @@ Key pacing flags: `--turn-interval` (seconds between turns), `--mute-after-speak
 (self-mute window after speaking, default 2.5 s).
 See `reachy explain think` for the full reference.
 
+**Export feed** — `think run` can stream a live newline-delimited JSON (NDJSON)
+feed to stdout so an external display or logging pipeline can consume it without
+any code inside this repo:
+
+```bash
+# All three block types (thinking / message / emotion) on stdout
+reachy-mini-cli think run --export -
+
+# Select a subset of block types
+reachy-mini-cli think run --export - --export-blocks thinking,message
+
+# Pipe to a remote renderer — the renderer stays out of this repo
+reachy-mini-cli think run --export - | ssh pi@reterminal renderer
+```
+
+Each line is one JSON object with a block-type discriminator `t`
+(`"thinking"` / `"message"` / `"emotion"`) and a unix timestamp `ts`.
+The export is a passive, broken-pipe-safe tap on the cognition loop — it never
+blocks or raises when the consumer disconnects.
+See [`docs/export-schema.md`](docs/export-schema.md) for the full event contract.
+
 ### Pat — proprioceptive touch + snuggle
 
 `pat` makes the robot **feel a head pat and lean into it** — with no touch sensor.
