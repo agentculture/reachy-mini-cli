@@ -105,3 +105,10 @@ for raw_line in sys.stdin:
   cognition turn was timer-driven rather than sense-triggered.
 - Consumers should treat unknown `t` values as forward-compatible extensions
   and skip them gracefully.
+- **`thinking.text` includes all LLM output** — the `text` field of a `"thinking"`
+  block is the **full raw LLM turn stream**, including prose that appears before the
+  first `*emoji*` or `"speech"` marker. By the engine's existing design, leading
+  prose (text before the first delimiter) is also spoken aloud — so such text can
+  appear **both** inside `thinking.text` and as a separate `"message"` block. Do
+  not assume `thinking.text` and the set of `"message"` blocks for the same turn
+  are disjoint.

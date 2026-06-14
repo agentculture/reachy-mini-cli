@@ -199,6 +199,20 @@ you touch the CLI.
     `before_turn` sense feed checks this window and discards any sample captured
     inside it, preventing the robot from reacting to its own voice through the
     shared USB audio device.
+  - **`--export` / `--export-blocks` stdout JSONL sink** — `think run --export -`
+    writes a live newline-delimited JSON (NDJSON) feed to stdout. Each line is one
+    JSON object: `t` (block type), `ts` (unix timestamp), plus type-specific fields.
+    Three block types: `thinking` (sense cues + full raw LLM turn text, including
+    `*emoji*`/`"speech"` markers and any leading prose), `message` (text spoken
+    aloud), `emotion` (emoji + 9-axis pose snapshot or `null`). `--export-blocks`
+    accepts a comma-separated subset (e.g. `thinking,message`; default: all three).
+    The sink lives in `reachy/export/` (`events.py` event model + `to_jsonl`,
+    `blocks.py` `Selection` / `parse_blocks`, `exporter.py` `JsonlExporter`); wired
+    in `reachy/cli/_commands/think.py`. The exporter is a passive tap on the
+    cognition loop — it catches `BrokenPipeError`/`OSError`/`ValueError`, logs once
+    to stderr, and silently disables itself so a disconnecting consumer never kills
+    `think`. Only `-` (stdout) is supported in this version. See
+    `docs/export-schema.md` for the full wire-format contract.
 - **`pat` noun — proprioceptive touch + snuggle (SDK-first):**
   `reachy/cli/_commands/pat.py` exposes `run` (foreground proprioceptive loop) +
   `demo` (synthesize pat events, NO robot / NO `[sdk]` extra) + `overview`. There
