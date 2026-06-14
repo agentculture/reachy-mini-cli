@@ -37,8 +37,8 @@ import reachy.motion.pat_signal as ps
 from reachy.cli import main
 from reachy.motion.listen_pat import PatHook
 from reachy.motion.pat import PatDetector
-from reachy.motion.queue import MotionQueue
-from reachy.motion.server import run
+from reachy.motion.queue import MotionAction, MotionQueue
+from reachy.motion.server import LoopHooks, run
 
 # ---------------------------------------------------------------------------
 # Isolation: pin the pat-active flag into a throwaway state dir
@@ -222,8 +222,8 @@ class _TurningHeadTransport:
 
     Models listen committing a smooth minjerk turn to a held heading: the actual
     pose ramps up to the target and stays there. The pat hook commands baseline
-    (0, 0), so the read-back appears as a yaw deviation — the test verifies a
-    *sustained* turn does not register as a side_pat.
+    (0, 0) (no ``commanded_head`` passed), so the read-back appears as a yaw
+    deviation — the test verifies a *sustained* turn does not register as a side_pat.
     """
 
     name = "sdk"
@@ -264,6 +264,89 @@ def test_sustained_listen_turn_does_not_false_fire_pat() -> None:
 
     assert hook.events == 0, "a sustained sound-orient turn must not fire a pat"
     assert not queue.pending(), "no pat gesture should be enqueued for a held turn"
+
+
+# ---------------------------------------------------------------------------
+# 2c. (FIX 1) actual that FOLLOWS the commanded baseline never fires a pat
+# ---------------------------------------------------------------------------
+
+
+class _FollowsCommandedTransport:
+    """A transport whose head_pose exactly equals whatever it is told to track.
+
+    The test sets each read-back to the commanded pose handed to the hook on that
+    tick, modelling the robot settling onto ``listen``'s own non-neutral idle /
+    orient pose. With deviation = actual − commanded = 0, no press should register.
+    """
+
+    name = "sdk"
+
+    def __init__(self) -> None:
+        self.next_pose = (0.0, 0.0)
+
+    def head_pose(self) -> tuple[float, float]:
+        return self.next_pose
+
+
+def test_actual_following_nonzero_commanded_pose_does_not_fire_pat() -> None:
+    """When the read-back tracks a non-zero commanded idle pose, no pat fires.
+
+    This is the Qodo bug fix: ``listen`` commands non-neutral pitch/yaw (idle
+    wander + orient turns), and the hook is now told that commanded pose. The
+    actual pose equalling the commanded pose means zero deviation — so the robot's
+    own deliberate motion is never mistaken for an external press.
+    """
+    transport = _FollowsCommandedTransport()
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector)
+
+    now = 0.0
+    for i in range(40):
+        # listen drives a lively idle pose: pitch breathes, yaw wanders far past
+        # the press threshold — and the head exactly follows it.
+        commanded = {"pitch": 5.0 + 2.0 * (i % 3), "yaw": 25.0 * ((i % 5) - 2)}
+        transport.next_pose = (commanded["pitch"], commanded["yaw"])
+        hook(transport, queue, now, commanded)
+        now += 0.05
+
+    assert hook.events == 0, "actual following the commanded pose must not fire a pat"
+    assert not queue.pending(), "listen's own non-neutral motion must enqueue no pat gesture"
+
+
+def test_actual_deviating_from_commanded_baseline_fires_pat() -> None:
+    """A press *on top of* a non-zero commanded pose still fires a pat.
+
+    The robot holds a non-neutral commanded idle pose; an external hand presses
+    the head down, so the read-back deviates from the commanded baseline by more
+    than the press threshold (alternating to produce distinct press edges). The
+    deviation is measured against the commanded pose — so the real press is caught
+    even while ``listen`` is mid-pose.
+    """
+    transport = _FollowsCommandedTransport()
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector)
+
+    commanded = {"pitch": 6.0, "yaw": 15.0}  # a held, non-neutral listen pose
+    fired = False
+    now = 0.0
+    for i in range(8):
+        pressed = i % 2 == 0
+        # Alternate a deep downward press (−20° below commanded) and a release
+        # (back to commanded) to produce distinct press edges past the threshold.
+        actual_pitch = commanded["pitch"] - 20.0 if pressed else commanded["pitch"]
+        transport.next_pose = (actual_pitch, commanded["yaw"])
+        hook(transport, queue, now, commanded)
+        if hook.events >= 1:
+            fired = True
+            break
+        now += 0.4  # inside the pat_window (3.0 s) so presses accumulate
+
+    assert fired, "a press deviating from the commanded baseline must fire a pat"
+    labels = [a.label for a in queue.pending()]
+    assert any(label.startswith("pat_") for label in labels), labels
+    assert ps.is_active() is True
 
 
 # ---------------------------------------------------------------------------
@@ -369,23 +452,23 @@ def test_run_on_tick_none_is_unchanged() -> None:
         tick=0.05,
         settle=0.2,
         max_ticks=60,
-        on_tick=None,
+        hooks=LoopHooks(on_tick=None),
     )
     assert ticks_a == ticks_b == 60
     assert tr_a.gotos == tr_b.gotos  # identical move stream with and without the kwarg
 
 
 def test_run_on_tick_invoked_before_producer_each_tick() -> None:
-    """on_tick fires once per tick, before the producer is consulted."""
+    """on_tick fires once per tick, before the producer is consulted, with 4 args."""
     tr = _RecTransport()
-    seen: list[tuple[object, object, float]] = []
+    seen: list[tuple[object, object, float, dict]] = []
 
     class _NullProducer:
         def update(self, *_a, **_k):
             return None
 
-    def _hook(transport, queue, t):
-        seen.append((transport, queue, t))
+    def _hook(transport, queue, t, commanded_head):
+        seen.append((transport, queue, t, commanded_head))
 
     ticks = run(
         tr,
@@ -394,14 +477,57 @@ def test_run_on_tick_invoked_before_producer_each_tick() -> None:
         sleep=lambda *_: None,
         tick=0.05,
         max_ticks=5,
-        on_tick=_hook,
+        hooks=LoopHooks(on_tick=_hook),
     )
     assert ticks == 5
     assert len(seen) == 5
-    for transport_seen, queue_seen, t in seen:
+    for transport_seen, queue_seen, t, commanded_head in seen:
         assert transport_seen is tr
         assert isinstance(queue_seen, MotionQueue)
         assert t > 0.0
+        # No move dispatched (null producer) → commanded head stays neutral.
+        assert commanded_head == {"pitch": 0.0, "yaw": 0.0}
+
+
+def test_on_tick_receives_last_dispatched_commanded_head() -> None:
+    """The commanded_head handed to on_tick tracks the loop's last dispatched move.
+
+    Before the first move it is neutral; after the loop dispatches a move with a
+    non-zero head pose, on_tick sees that exact pitch/yaw — the baseline a folded
+    pat detector measures deviation against.
+    """
+    tr = _RecTransport()
+    commanded_seen: list[dict] = []
+
+    class _LookThenIdle:
+        """Emit one (pitch+yaw) move on the first tick, then nothing."""
+
+        def __init__(self):
+            self.done = False
+
+        def update(self, t, sense, **_kwargs):
+            if self.done:
+                return None
+            self.done = True
+            return MotionAction(label="orient", head={"pitch": 4.0, "yaw": 12.0}, duration=1.0)
+
+    def _hook(transport, queue, t, commanded_head):
+        commanded_seen.append(dict(commanded_head))
+
+    run(
+        tr,
+        _LookThenIdle(),
+        now=_Clock(0.05),
+        sleep=lambda *_: None,
+        tick=0.05,
+        settle=0.2,
+        max_ticks=6,
+        hooks=LoopHooks(on_tick=_hook),
+    )
+    # First tick: before the move is dispatched → neutral.
+    assert commanded_seen[0] == {"pitch": 0.0, "yaw": 0.0}
+    # Once the move has been accepted, on_tick sees the commanded head pose.
+    assert commanded_seen[-1] == {"pitch": 4.0, "yaw": 12.0}
 
 
 # ---------------------------------------------------------------------------

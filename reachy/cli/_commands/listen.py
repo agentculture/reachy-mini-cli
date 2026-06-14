@@ -38,6 +38,7 @@ from reachy.motion.listen import ListenParams, ListenProducer
 from reachy.motion.listen_pat import PatHook
 from reachy.motion.pat import PatDetector
 from reachy.motion.queue import MotionQueue
+from reachy.motion.server import LoopHooks
 from reachy.motion.server import run as run_loop
 from reachy.motion.snap import SnapDetector
 from reachy.robot import add_robot_args, get_transport
@@ -211,39 +212,39 @@ def _add_pat_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+# 1:1 ``(arg attr, ListenParams attr)`` flags: an unset CLI flag (``None``) keeps
+# the param's default. The genuinely special cases (--speed sets two fields,
+# --speech-only is a bool flag, --pat is a default-True toggle) are handled apart.
+_SIMPLE_PARAM_MAP: tuple[tuple[str, str], ...] = (
+    ("gain", "gain"),
+    ("max_yaw", "max_yaw"),
+    ("deadband", "deadband"),
+    ("dwell", "dwell"),
+    ("hold", "hold"),
+    ("recenter_after", "recenter_after"),
+    ("idle_energy", "idle_energy"),
+    ("drift_speed", "drift_speed"),
+    ("antenna_gain", "antenna_gain"),
+    ("antenna_max", "antenna_max"),
+    ("body_yaw_max", "body_yaw_max"),
+    ("body_speed", "body_speed"),
+    ("head_only_band", "head_only_band"),
+)
+
+
 def _params_from_args(args: argparse.Namespace) -> ListenParams:
     """A :class:`ListenParams` from CLI flags (each unset flag keeps its default)."""
     p = ListenParams()
-    if args.gain is not None:
-        p.gain = args.gain
-    if args.max_yaw is not None:
-        p.max_yaw = args.max_yaw
-    if args.deadband is not None:
-        p.deadband = args.deadband
-    if args.dwell is not None:
-        p.dwell = args.dwell
-    if args.hold is not None:
-        p.hold = args.hold
-    if args.speed is not None:
+    for arg_name, attr in _SIMPLE_PARAM_MAP:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            setattr(p, attr, value)
+    # Special cases: --speed drives both slew speeds; --speech-only / --no-pat are
+    # bool toggles, not value flags.
+    if getattr(args, "speed", None) is not None:
         p.alert_speed = p.relax_speed = args.speed
-    if args.recenter_after is not None:
-        p.recenter_after = args.recenter_after
-    if getattr(args, "idle_energy", None) is not None:
-        p.idle_energy = args.idle_energy
-    if getattr(args, "drift_speed", None) is not None:
-        p.drift_speed = args.drift_speed
     if getattr(args, "speech_only", False):
         p.speech_only = True
-    if getattr(args, "antenna_gain", None) is not None:
-        p.antenna_gain = args.antenna_gain
-    if getattr(args, "antenna_max", None) is not None:
-        p.antenna_max = args.antenna_max
-    if getattr(args, "body_yaw_max", None) is not None:
-        p.body_yaw_max = args.body_yaw_max
-    if getattr(args, "body_speed", None) is not None:
-        p.body_speed = args.body_speed
-    if getattr(args, "head_only_band", None) is not None:
-        p.head_only_band = args.head_only_band
     if getattr(args, "pat", True) is False:
         p.pat = False
     return p
@@ -377,11 +378,8 @@ def _run_sdk_loop(
             return run_loop(
                 transport,
                 producer,
-                sense=poller,
-                audio=_audio,
+                hooks=LoopHooks(sense=poller, audio=_audio, on_action=on_action, on_tick=pat_hook),
                 queue=queue,
-                on_action=on_action,
-                on_tick=pat_hook,
                 max_ticks=args.max_ticks,
             )
         finally:
@@ -398,7 +396,10 @@ def _run_http_loop(
     """Drive the loop over the HTTP transport's DoA (no audio source / loudness)."""
     poller = DoaPoller(read=lambda: read_doa(transport, timeout=DOA_TIMEOUT))
     return run_loop(
-        transport, producer, sense=poller, on_action=on_action, max_ticks=args.max_ticks
+        transport,
+        producer,
+        hooks=LoopHooks(sense=poller, on_action=on_action),
+        max_ticks=args.max_ticks,
     )
 
 

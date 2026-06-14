@@ -9,17 +9,19 @@ SDK client and gets throttled to roughly 1 Hz, far too slow for the
 :class:`~reachy.motion.pat.PatDetector`. The two also fight over the head.
 
 This module resolves both problems by providing :class:`PatHook` — a per-tick
-hook (``(transport, queue, t) -> None``) that mirrors ``pat``'s
+hook (``(transport, queue, t, commanded_head) -> None``) that mirrors ``pat``'s
 ``_sense_and_maybe_react`` / ``_proprioceptive_loop`` logic exactly, but runs
 *inside* ``listen``'s loop via :func:`reachy.motion.server.run`'s ``on_tick``
 seam. On every tick it:
 
 * reads the actual head pose back via ``transport.head_pose()`` (a
-  :class:`~reachy.cli._errors.CliError` is treated as the baseline, never raised),
-* feeds the commanded-vs-actual deviation to a :class:`PatDetector` (the
-  commanded baseline is neutral pitch/yaw — ``listen``'s sound-orienting turns
-  are smooth and mostly yaw, which the detector's slow EMA baseline absorbs, so
-  they do not false-fire), and
+  :class:`~reachy.cli._errors.CliError` is treated as no deviation, never raised),
+* feeds the commanded-vs-actual deviation to a :class:`PatDetector`, using the
+  **actual commanded head pose** the loop last dispatched (handed in as
+  ``commanded_head`` by the ``on_tick`` seam) as the commanded baseline — so
+  ``listen``'s own non-neutral idle pose and sound-orienting turns read as zero
+  deviation (the detector measures *external* force, ``actual − commanded``) and
+  never false-fire a pat, and
 * on a detection enqueues a calm lean→nuzzle→settle gesture via
   :class:`~reachy.motion.pat_reaction.PatReaction` onto the *same* queue the loop
   drives, writes the ``pat_active`` flag (so the ``listen`` idle wander yields for
@@ -41,12 +43,12 @@ from reachy.motion.pat import PatDetector
 from reachy.motion.pat_reaction import PatReaction, reaction_duration
 from reachy.motion.queue import MotionQueue
 
-#: The neutral commanded head pose ``listen`` rests at when not reacting — pitch
-#: and yaw are zero, so the detector's commanded baseline is (0, 0). ``listen``'s
-#: sound-orienting yaw turns are smooth and absorbed by the detector's slow EMA
-#: baseline, so they do not register as presses.
-_BASELINE_PITCH = 0.0
-_BASELINE_YAW = 0.0
+#: The pre-first-action commanded head pose ``listen`` rests at before it has
+#: dispatched any move. The loop hands the *actual* last-dispatched head pose to
+#: the hook each tick (see :meth:`PatHook.__call__`); this neutral default only
+#: applies before the first move and as the no-deviation fallback when a head-pose
+#: read-back raises.
+_NEUTRAL_HEAD: dict[str, float] = {"pitch": 0.0, "yaw": 0.0}
 
 
 class PatHook:
@@ -84,7 +86,13 @@ class PatHook:
         #: Count of pats detected this run (for diagnostics / tests).
         self.events = 0
 
-    def __call__(self, transport: object, queue: MotionQueue, t: float) -> None:
+    def __call__(
+        self,
+        transport: object,
+        queue: MotionQueue,
+        t: float,
+        commanded_head: dict[str, float] | None = None,
+    ) -> None:
         """One tick: clear an expired window, then sense + maybe react.
 
         While ``t`` is inside the reaction window the robot is executing its own
@@ -92,31 +100,41 @@ class PatHook:
         (avoid self-trigger). Once the window has elapsed, clear the flag and run
         one sensing pass. ``queue`` is the live loop queue (identical to the one
         this hook was constructed with); the parameter keeps the ``on_tick``
-        contract self-describing.
+        contract self-describing. ``commanded_head`` is the
+        ``{"pitch": float, "yaw": float}`` head pose the loop last dispatched — the
+        baseline the detected deviation is measured against (defaults to neutral
+        before the loop has commanded any move).
         """
         if t < self._reacting_until:
             return
         if self._flag_up:
             pat_signal.clear()
             self._flag_up = False
-        self._sense_and_maybe_react(transport, t)
+        self._sense_and_maybe_react(transport, t, commanded_head or _NEUTRAL_HEAD)
 
-    def _sense_and_maybe_react(self, transport: object, now: float) -> None:
+    def _sense_and_maybe_react(
+        self, transport: object, now: float, commanded_head: dict[str, float]
+    ) -> None:
         """Read the head pose, feed the detector, and react on a detection.
 
         Mirrors :func:`reachy.cli._commands.pat._sense_and_maybe_react`: a
-        :class:`CliError` from ``head_pose`` is swallowed and treated as the
-        baseline (no deviation), so a transient transport drop degrades to "no
-        pat" rather than killing the loop. On an event it enqueues the lean,
-        resets the detector, raises the ``pat_active`` flag, and opens the
-        reaction window.
+        :class:`CliError` from ``head_pose`` is swallowed and treated as no
+        deviation (the actual pose is taken to equal the commanded pose), so a
+        transient transport drop degrades to "no pat" rather than killing the loop.
+        The commanded baseline is ``commanded_head`` — the pose ``listen`` actually
+        dispatched — so the detector measures only *external* force (``actual −
+        commanded``) and ``listen``'s own idle/orient motion never false-fires. On
+        an event it enqueues the lean, resets the detector, raises the
+        ``pat_active`` flag, and opens the reaction window.
         """
+        commanded_pitch = float(commanded_head.get("pitch", 0.0))
+        commanded_yaw = float(commanded_head.get("yaw", 0.0))
         try:
             actual_pitch, actual_yaw = transport.head_pose()  # type: ignore[attr-defined]
         except CliError:
-            actual_pitch, actual_yaw = _BASELINE_PITCH, _BASELINE_YAW
+            actual_pitch, actual_yaw = commanded_pitch, commanded_yaw
         event = self.detector.update(
-            _BASELINE_PITCH, actual_pitch, _BASELINE_YAW, actual_yaw, now=now
+            commanded_pitch, actual_pitch, commanded_yaw, actual_yaw, now=now
         )
         if event is None:
             return

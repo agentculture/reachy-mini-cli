@@ -16,7 +16,7 @@ from reachy.behavior.sense import EMPTY_SENSE, Sense
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.motion.listen import ListenParams, ListenProducer
 from reachy.motion.queue import ANTENNA_KEY, IDLE_KEY, LOOK_KEY, MotionAction, MotionQueue
-from reachy.motion.server import run
+from reachy.motion.server import LoopHooks, run
 
 
 def _look(label: str, yaw: float) -> MotionAction:
@@ -716,7 +716,7 @@ def test_run_forwards_audio_kwargs_to_producer() -> None:
     run(
         tr,
         prod,
-        audio=_audio,
+        hooks=LoopHooks(audio=_audio),
         now=_Clock(0.05),
         sleep=lambda *_: None,
         tick=0.05,
@@ -735,7 +735,7 @@ def test_run_no_audio_passes_false_none_to_producer() -> None:
     run(
         tr,
         prod,
-        audio=None,
+        hooks=LoopHooks(audio=None),
         now=_Clock(0.05),
         sleep=lambda *_: None,
         tick=0.05,
