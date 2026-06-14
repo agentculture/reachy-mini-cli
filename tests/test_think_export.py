@@ -272,15 +272,17 @@ def test_no_export_no_jsonl_on_stdout(monkeypatch, capsys) -> None:
 
 
 def test_no_export_engine_receives_no_export_hook(monkeypatch) -> None:
-    """Without --export, the CognitionEngine is constructed with export=None."""
+    """Without --export, the CognitionEngine is constructed with export=None.
+
+    The export seam is a single ``ExportHook`` parameter (emit + pose_resolver +
+    time_fn bundled), so the only thing to assert is that it is ``None``.
+    """
     built_engines: list[dict] = []
 
     original_init = think_mod.CognitionEngine.__init__
 
     def capturing_init(self, **kwargs):
-        built_engines.append(
-            {"export": kwargs.get("export"), "pose_resolver": kwargs.get("pose_resolver")}
-        )
+        built_engines.append({"export": kwargs.get("export")})
         original_init(self, **kwargs)
 
     _install_fakes(monkeypatch)
@@ -290,7 +292,6 @@ def test_no_export_engine_receives_no_export_hook(monkeypatch) -> None:
 
     assert built_engines, "engine was never constructed"
     assert built_engines[0]["export"] is None
-    assert built_engines[0]["pose_resolver"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -334,14 +335,36 @@ def test_real_engine_export_emotion_has_pose(monkeypatch) -> None:
     emotion_blocks = [obj for obj in parsed if obj["t"] == "emotion"]
 
     assert emotion_blocks, "expected at least one emotion block"
-    # The emoji in the stream is '😮'; it's in the default catalog so pose should
-    # be a non-None dict.
+    # The emoji in the stream is '😮'; it's in the default catalog so pose must be
+    # a non-None dict (a known emoji resolves to a real pose).
     for block in emotion_blocks:
         assert "emoji" in block
-        # pose may be None only for unknown emoji; 😮 is in the catalog.
-        # We can't guarantee the exact pose value without reading the TOML, but
-        # we can verify the key is present.
-        assert "pose" in block
+        assert block["pose"] is not None, "known emoji should carry a resolved pose"
+
+
+def test_real_engine_export_unknown_emoji_pose_is_null(monkeypatch) -> None:
+    """An emoji NOT in the catalog yields pose=null (Qodo #1 fix).
+
+    ``Catalog.get()`` falls back to the neutral pose for unknown keys, but the
+    export schema requires ``"pose": null`` for unknown emoji so consumers can
+    detect them. The pose_resolver guards on ``emoji in catalog``.
+    """
+
+    def unknown_emoji_stream(messages, **_kw):
+        # '🦄' (unicorn) is not in the starter expression catalog.
+        yield '*🦄* "surprise."'
+
+    _install_fakes(monkeypatch, stream_fn=unknown_emoji_stream)
+
+    _rc, stdout, _stderr = _run(["think", "run", "--export", "-", "--max-turns", "1"])
+
+    parsed = [json.loads(ln) for ln in stdout.splitlines() if ln.strip()]
+    emotion_blocks = [obj for obj in parsed if obj["t"] == "emotion"]
+
+    assert emotion_blocks, "expected at least one emotion block"
+    for block in emotion_blocks:
+        assert block["emoji"] == "🦄"
+        assert block["pose"] is None, "unknown emoji must export pose=null"
 
 
 def test_real_engine_export_thinking_carries_raw_text(monkeypatch) -> None:

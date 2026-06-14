@@ -61,6 +61,7 @@ from collections.abc import Iterator
 from typing import Callable, Protocol
 
 from reachy.export.events import EmotionEvent, MessageEvent, ThinkingEvent
+from reachy.export.exporter import ExportHook
 from reachy.speech import llm as _llm
 from reachy.speech import playback as _playback
 from reachy.speech import tts as _tts
@@ -100,14 +101,6 @@ class _PlayAudio(Protocol):
 
 class _Express(Protocol):
     def __call__(self, emoji: str) -> None: ...
-
-
-class _Export(Protocol):
-    def __call__(self, event: object) -> None: ...
-
-
-class _PoseResolver(Protocol):
-    def __call__(self, emoji: str) -> dict | None: ...
 
 
 class _BufferLike(Protocol):
@@ -169,28 +162,21 @@ class CognitionEngine:
         **not** import :mod:`reachy.motion` — the producer is injected through this
         callback, preserving the say/think and speech/motion boundaries.
     export:
-        Optional callable ``(event) -> None`` — the **export hook**. When given,
-        each turn emits export blocks as it runs: one
-        :class:`~reachy.export.events.EmotionEvent` per expression marker, one
-        :class:`~reachy.export.events.MessageEvent` per quoted speech span (both
+        Optional :class:`~reachy.export.exporter.ExportHook` — the **export hook**,
+        bundling ``emit`` (the sink, e.g. ``JsonlExporter.emit``, which never
+        raises), ``pose_resolver`` (emoji → 9-axis pose dict, or ``None`` for an
+        unknown emoji; fills :attr:`EmotionEvent.pose`), and ``time_fn`` (the
+        wall-clock source used to stamp each event's ``ts`` — tests inject a
+        constant for determinism). When given, each turn emits export blocks as it
+        runs: one :class:`~reachy.export.events.EmotionEvent` per expression marker,
+        one :class:`~reachy.export.events.MessageEvent` per quoted speech span (both
         interleaved in stream order, alongside the existing speech/motion side
         effects), and exactly one :class:`~reachy.export.events.ThinkingEvent` at
         the end of the turn carrying the snapshot's sense cues and the **raw**
-        concatenated LLM text for the turn (see the raw-thought tap below). The CLI
-        passes ``JsonlExporter.emit`` (which never raises). Defaults to ``None`` —
-        when absent the engine's output, control flow, and timing are *byte-identical*
-        to a build without this hook: no events are built and the export branch is
-        never entered.
-    pose_resolver:
-        Optional callable ``(emoji: str) -> dict | None`` mapping an emoji to a
-        9-axis pose dict (or ``None`` for an unknown emoji). Used only when
-        ``export`` is set; fills :attr:`EmotionEvent.pose`. Defaults to ``None``
-        (every emitted ``EmotionEvent`` then carries ``pose=None``).
-    time_fn:
-        Injectable wall-clock source ``() -> float`` used to stamp every exported
-        event's ``ts``. Defaults to :func:`time.time`; tests inject a constant for
-        determinism. (Distinct from ``sleep`` / the buffer's monotonic clock — the
-        export wire-format uses unix timestamps.)
+        concatenated LLM text for the turn (see the raw-thought tap below). Defaults
+        to ``None`` — when absent the engine's output, control flow, and timing are
+        *byte-identical* to a build without this hook: no events are built and the
+        export branch is never entered.
     system_prompt:
         The system message prepended to every turn's prompt.
     llm_kwargs / tts_kwargs / playback_kwargs:
@@ -226,9 +212,7 @@ class CognitionEngine:
         synthesize: _Synthesize | None = None,
         play_audio: _PlayAudio | None = None,
         express: _Express | None = None,
-        export: _Export | None = None,
-        pose_resolver: _PoseResolver | None = None,
-        time_fn: Callable[[], float] = time.time,
+        export: ExportHook | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         llm_kwargs: dict | None = None,
         tts_kwargs: dict | None = None,
@@ -243,11 +227,10 @@ class CognitionEngine:
         # Optional motion seam: fired once per expression marker, in stream order.
         # None → a no-op (markers parsed out of the speech, emoji simply not driven).
         self._express = express
-        # Optional export hook + its helpers. None → the export path is never
-        # entered, so behaviour is byte-identical to a build without the hook.
+        # Optional export hook (bundles emit + pose_resolver + time_fn). None →
+        # the export path is never entered, so behaviour is byte-identical to a
+        # build without the hook.
         self._export = export
-        self._pose_resolver = pose_resolver
-        self._time_fn = time_fn
         self._system_prompt = system_prompt
         self._llm_kwargs = dict(llm_kwargs or {})
         self._tts_kwargs = dict(tts_kwargs or {})
@@ -361,28 +344,29 @@ class CognitionEngine:
             raise worker_error[0]
         # Turn-end thinking block: the full raw stream + this turn's sense cues.
         if self._export is not None:
-            self._export(
+            self._export.emit(
                 ThinkingEvent(
                     cues=[cue.text for cue in cues],
                     text="".join(raw_parts),
-                    ts=self._time_fn(),
+                    ts=self._export.time_fn(),
                 )
             )
 
     def _emit_for_item(self, item: tuple[str, str]) -> None:
         """Export the block for one work item, in producer (stream) order.
 
-        ``("express", emoji)`` → :class:`EmotionEvent` (pose via
-        :attr:`_pose_resolver` when set); ``("speak", text)`` → :class:`MessageEvent`.
-        Only called when :attr:`_export` is set; ``self._export`` is the caller's
-        sink (the real :class:`JsonlExporter.emit` never raises).
+        ``("express", emoji)`` → :class:`EmotionEvent` (pose via the hook's
+        ``pose_resolver`` when set); ``("speak", text)`` → :class:`MessageEvent`.
+        Only called when :attr:`_export` is set; the hook's ``emit`` is the
+        caller's sink (the real :class:`JsonlExporter.emit` never raises).
         """
+        hook = self._export  # never None: only called from the guarded export branch
         kind, payload = item
         if kind == "express":
-            pose = self._pose_resolver(payload) if self._pose_resolver is not None else None
-            self._export(EmotionEvent(emoji=payload, pose=pose, ts=self._time_fn()))
+            pose = hook.pose_resolver(payload) if hook.pose_resolver is not None else None
+            hook.emit(EmotionEvent(emoji=payload, pose=pose, ts=hook.time_fn()))
         else:  # "speak"
-            self._export(MessageEvent(text=payload, ts=self._time_fn()))
+            hook.emit(MessageEvent(text=payload, ts=hook.time_fn()))
 
     def _speak_worker(self, speak_q: queue.Queue, error_out: list) -> None:
         """Drain the work queue in order: speak quoted text, fire expressions.

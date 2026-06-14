@@ -11,17 +11,47 @@ never see :exc:`BrokenPipeError`, :exc:`OSError`, or :exc:`ValueError`.
 Public API
 ----------
 :class:`JsonlExporter`
-    The only public symbol.  Construct once; call :meth:`~JsonlExporter.emit` for
-    every event produced by the cognition loop.
+    Construct once; call :meth:`~JsonlExporter.emit` for every event produced by
+    the cognition loop.
+:class:`ExportHook`
+    A small bundle of the export seams (``emit`` / ``pose_resolver`` / ``time_fn``)
+    handed to the cognition engine as a single parameter.
 """
 
 from __future__ import annotations
 
 import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import IO
 
 from reachy.export.blocks import Selection
 from reachy.export.events import Event, to_jsonl
+
+# ---------------------------------------------------------------------------
+# Export hook
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExportHook:
+    """Bundle of export collaborators handed to the cognition engine.
+
+    Groups the three export-time seams so the engine takes ONE optional parameter
+    instead of three:
+
+    - ``emit``: called with each built export event (typically
+      :meth:`JsonlExporter.emit`).
+    - ``pose_resolver``: maps an emoji to a pose dict, or ``None`` when the emoji
+      is unknown; fills :attr:`~reachy.export.events.EmotionEvent.pose`.
+    - ``time_fn``: wall-clock source used to stamp every event's ``ts``.
+    """
+
+    emit: Callable[[object], None]
+    pose_resolver: Callable[[str], dict | None] | None = None
+    time_fn: Callable[[], float] = field(default=time.time)
+
 
 # ---------------------------------------------------------------------------
 # Exporter
@@ -88,9 +118,17 @@ class JsonlExporter:
         try:
             self._stream.write(line)
             self._stream.flush()
-        except (BrokenPipeError, OSError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
+            # BrokenPipeError is a subclass of OSError, so it is caught here too.
             self._broken = True
-            print(
-                f"reachy export: stream closed, export disabled ({type(exc).__name__}: {exc})",
-                file=sys.stderr,
-            )
+            # The warning itself must not break pipe-safety: if stderr is also a
+            # closed/broken pipe (e.g. ``2>&1 | head``), printing it would raise
+            # and still kill the loop — so guard the warning write as well.
+            try:
+                print(
+                    f"reachy export: stream closed, export disabled "
+                    f"({type(exc).__name__}: {exc})",
+                    file=sys.stderr,
+                )
+            except (OSError, ValueError):
+                pass

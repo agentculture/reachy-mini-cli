@@ -28,6 +28,7 @@ from __future__ import annotations
 import threading
 
 from reachy.export.events import EmotionEvent, MessageEvent, ThinkingEvent
+from reachy.export.exporter import ExportHook
 from reachy.speech.cognition import CognitionEngine
 from reachy.speech.events import EventBuffer
 
@@ -88,8 +89,7 @@ def test_export_emits_emotion_message_interleaved_then_thinking_last():
         synthesize=rec.synth,
         play_audio=rec.play,
         express=rec.express,
-        export=exported.append,
-        time_fn=lambda: 42.0,
+        export=ExportHook(emit=exported.append, time_fn=lambda: 42.0),
         system_prompt="SYS",
     )
     spoke = engine.run_turn()
@@ -138,9 +138,7 @@ def test_export_pose_resolver_fills_emotion_pose():
         stream_sentences=fake_stream,
         synthesize=rec.synth,
         play_audio=rec.play,
-        export=exported.append,
-        pose_resolver=poses.get,
-        time_fn=lambda: 7.0,
+        export=ExportHook(emit=exported.append, pose_resolver=poses.get, time_fn=lambda: 7.0),
         system_prompt="SYS",
     )
     engine.run_turn()
@@ -169,8 +167,7 @@ def test_export_thinking_carries_snapshot_cues_as_list_of_str():
         stream_sentences=fake_stream,
         synthesize=rec.synth,
         play_audio=rec.play,
-        export=exported.append,
-        time_fn=lambda: 1.0,
+        export=ExportHook(emit=exported.append, time_fn=lambda: 1.0),
         system_prompt="SYS",
     )
     engine.run_turn()
@@ -194,8 +191,7 @@ def test_export_emits_exactly_one_thinking_per_turn():
         stream_sentences=fake_stream,
         synthesize=rec.synth,
         play_audio=rec.play,
-        export=exported.append,
-        time_fn=lambda: 0.0,
+        export=ExportHook(emit=exported.append, time_fn=lambda: 0.0),
         system_prompt="SYS",
     )
     engine.run_turn()
@@ -239,8 +235,7 @@ def test_raw_thought_tap_captures_full_stream_including_discarded_prose():
         stream_sentences=fake_stream,
         synthesize=rec.synth,
         play_audio=rec.play,
-        export=exported.append,
-        time_fn=lambda: 0.0,
+        export=ExportHook(emit=exported.append, time_fn=lambda: 0.0),
         system_prompt="SYS",
     )
     engine.run_turn()
@@ -275,8 +270,7 @@ def test_raw_thought_tap_reassembles_chunks_split_mid_marker():
         stream_sentences=fake_stream,
         synthesize=rec.synth,
         play_audio=rec.play,
-        export=exported.append,
-        time_fn=lambda: 0.0,
+        export=ExportHook(emit=exported.append, time_fn=lambda: 0.0),
         system_prompt="SYS",
     )
     engine.run_turn()
@@ -302,8 +296,7 @@ def test_raw_thought_tap_includes_unclosed_dropped_span():
         stream_sentences=fake_stream,
         synthesize=rec.synth,
         play_audio=rec.play,
-        export=exported.append,
-        time_fn=lambda: 0.0,
+        export=ExportHook(emit=exported.append, time_fn=lambda: 0.0),
         system_prompt="SYS",
     )
     engine.run_turn()
@@ -402,8 +395,7 @@ def test_empty_buffer_turn_emits_nothing_even_with_export():
         stream_sentences=fake_stream,
         synthesize=lambda t, **_kw: b"pcm",
         play_audio=lambda pcm, **_kw: None,
-        export=exported.append,
-        time_fn=lambda: 0.0,
+        export=ExportHook(emit=exported.append, time_fn=lambda: 0.0),
         system_prompt="SYS",
     )
     spoke = engine.run_turn()

@@ -43,7 +43,7 @@ from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.blocks import Selection, parse_blocks
-from reachy.export.exporter import JsonlExporter
+from reachy.export.exporter import ExportHook, JsonlExporter
 from reachy.motion.expression import ExpressionProducer
 from reachy.motion.queue import MotionQueue
 from reachy.motion.server import run as run_motion
@@ -508,7 +508,6 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     # --- export sink wiring -----------------------------------------------
     export_target = getattr(args, "export", None)
     export_hook = None
-    pose_resolver = None
     if export_target is not None:
         if export_target != "-":
             raise CliError(
@@ -524,10 +523,15 @@ def cmd_think_run(args: argparse.Namespace) -> int:
         else:
             selection = Selection.all()
         exporter = JsonlExporter(sys.stdout, selection)
-        export_hook = exporter.emit
-        # Pose resolver: look up each emoji in the expression catalog.
         catalog = Catalog()
-        pose_resolver = lambda emoji: dataclasses.asdict(catalog.get(emoji))  # noqa: E731
+
+        def _resolve_pose(emoji: str) -> dict | None:
+            # Unknown emoji → pose null: Catalog.get() would fall back to the
+            # neutral pose, but the export schema requires null for unknown emoji
+            # so consumers can detect them.
+            return dataclasses.asdict(catalog.get(emoji)) if emoji in catalog else None
+
+        export_hook = ExportHook(emit=exporter.emit, pose_resolver=_resolve_pose)
 
     engine = CognitionEngine(
         buffer=buffer,
@@ -536,7 +540,6 @@ def cmd_think_run(args: argparse.Namespace) -> int:
         play_audio=_guarded_play,
         express=motion.express,
         export=export_hook,
-        pose_resolver=pose_resolver,
         system_prompt=system_prompt,
         llm_kwargs=_llm_kwargs(args),
         tts_kwargs=_tts_kwargs(args),

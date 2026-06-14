@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 
 from reachy.export.blocks import Selection
 from reachy.export.events import EmotionEvent, MessageEvent, ThinkingEvent
@@ -208,6 +209,24 @@ class TestBrokenPipe:
         buf.close()
         exporter = JsonlExporter(buf, Selection.all())
         exporter.emit(EMOTION)  # must not raise
+
+    def test_broken_stderr_warning_does_not_propagate(self, monkeypatch):
+        """When stderr is ALSO broken (e.g. ``2>&1 | head``), the warning write
+        must be swallowed too — emit stays pipe-safe (Qodo #2)."""
+
+        class _BrokenStderr:
+            def write(self, *_a, **_kw):
+                raise BrokenPipeError("stderr broken")
+
+            def flush(self, *_a, **_kw):
+                raise BrokenPipeError("stderr broken")
+
+        monkeypatch.setattr(sys, "stderr", _BrokenStderr())
+        stream = _CallLog(raise_on_write=BrokenPipeError)
+        exporter = JsonlExporter(stream, Selection.all())
+        # Both stdout and stderr are broken pipes: emit must STILL not raise.
+        exporter.emit(EMOTION)
+        exporter.emit(MESSAGE)  # subsequent emits are silent no-ops
 
     def test_warning_written_to_stderr_exactly_once(self, capsys):
         """A warning is written to stderr exactly once across repeated failures."""
