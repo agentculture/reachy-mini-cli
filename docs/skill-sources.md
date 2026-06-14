@@ -11,6 +11,14 @@ Three skills (`think`, `spec-to-plan`, `assign-to-workforce`) originate in
 only **re-broadcasts** them. Cite guildmaster's copy; track devague as the true
 origin.
 
+One skill is the exception to the guildmaster supply line: `ask-colleague` is
+**first-party from [`agentculture/colleague`](https://github.com/agentculture/colleague)**
+— colleague is *both* its upstream and its origin (the inverse of the vendored
+skills, whose SKILL.md describes them as vendored *from* guildmaster). It is
+copied here, not symlinked or depended on; the `cite, don't import` policy still
+holds, so its script/prompt bodies are not edited downstream — real fixes land
+upstream in colleague and re-vendor.
+
 Every vendored `SKILL.md` carries `type: command`. reachy-mini-cli
 declares a culture agent (`culture.yaml`, `backend: claude`), and
 `core.skill_loader` silently skips any `SKILL.md` lacking `type:` — so the field
@@ -29,6 +37,7 @@ is load-bearing, even where guildmaster's upstream copy omits it.
 | `think` | `../guildmaster/.claude/skills/think/` | **devague** (re-broadcast via guildmaster) | idea→spec leg of the devague workflow chain. Verbatim (already carried `type: command` at guildmaster). Origin/broadcast prose left verbatim. | 2026-05-26 (guildmaster 0.6.0) |
 | `spec-to-plan` | `../guildmaster/.claude/skills/spec-to-plan/` | **devague** (re-broadcast via guildmaster) | spec→plan leg of the devague workflow chain. Verbatim (already carried `type: command`). | 2026-05-26 (guildmaster 0.6.0) |
 | `assign-to-workforce` | `../guildmaster/.claude/skills/assign-to-workforce/` | **devague** (re-broadcast via guildmaster) | plan→parallel-implementation leg of the devague workflow chain. Verbatim (already carried `type: command`). | 2026-05-26 (guildmaster 0.6.0) |
+| `ask-colleague` | `../colleague/.claude/skills/ask-colleague/` | **colleague** (first-party) | The **exception** to the guildmaster supply line — colleague is both upstream and origin. Drives the `colleague` CLI to hand a scoped repo task to a *different* backend/model: `review` / `explore` (read-only, throwaway-worktree) / `write` (preview-by-default; `--apply`/`--pr`) / `feedback` (ROI loop) / `clean`. Only consumer-identifying prose adapted in SKILL.md (`colleague` → `reachy-mini-cli`); script + prompt bodies have **no downstream edits** (already carried `type: command`). Snapshot may trail current colleague HEAD — re-sync from `../colleague/`. Vendored via the mass-update skill (PR #46). | 2026-06-14 (colleague mass-update) |
 
 ## Re-sync procedure
 
