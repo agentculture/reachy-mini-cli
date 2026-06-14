@@ -35,6 +35,9 @@ from reachy.cli._errors import CliError
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.motion import supervisor
 from reachy.motion.listen import ListenParams, ListenProducer
+from reachy.motion.listen_pat import PatHook
+from reachy.motion.pat import PatDetector
+from reachy.motion.queue import MotionQueue
 from reachy.motion.server import run as run_loop
 from reachy.motion.snap import SnapDetector
 from reachy.robot import add_robot_args, get_transport
@@ -171,6 +174,43 @@ def _add_tuning_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_pat_args(parser: argparse.ArgumentParser) -> None:
+    """Head-pat detection toggle + tuning (SDK transport only; on by default).
+
+    ``--pat`` / ``--no-pat`` fold proprioceptive head-pat detection into the SDK
+    loop (the loop owns the single SDK client, so its head-pose read-backs are
+    fast enough to detect a pat). The tuning knobs mirror the standalone ``pat``
+    noun; unset ⇒ the detector's built-in default.
+    """
+    parser.add_argument(
+        "--pat",
+        action="store_true",
+        dest="pat",
+        default=True,
+        help="detect head pats inside the sdk loop and lean into them (default: on).",
+    )
+    parser.add_argument(
+        "--no-pat",
+        action="store_false",
+        dest="pat",
+        help="do not detect head pats (sound-orienting only).",
+    )
+    parser.add_argument(
+        "--press-threshold",
+        type=float,
+        default=None,
+        dest="press_threshold",
+        help="pat: pitch deviation (deg) past which a head-press counts (default 1.2).",
+    )
+    parser.add_argument(
+        "--min-presses",
+        type=int,
+        default=None,
+        dest="min_presses",
+        help="pat: presses within the window needed to trigger a pat (default 2).",
+    )
+
+
 def _params_from_args(args: argparse.Namespace) -> ListenParams:
     """A :class:`ListenParams` from CLI flags (each unset flag keeps its default)."""
     p = ListenParams()
@@ -204,6 +244,8 @@ def _params_from_args(args: argparse.Namespace) -> ListenParams:
         p.body_speed = args.body_speed
     if getattr(args, "head_only_band", None) is not None:
         p.head_only_band = args.head_only_band
+    if getattr(args, "pat", True) is False:
+        p.pat = False
     return p
 
 
@@ -230,6 +272,10 @@ def cmd_listen_overview(args: argparse.Namespace) -> int:
                 "then drifts slowly back to front after silence (never frozen, never a "
                 "hard snap). Tune with --idle-energy / --drift-speed (--idle-energy 0 "
                 "restores hold-still).",
+                "Head pats too (sdk only): the loop reads the head pose back in-process "
+                "each tick, so a downward press or sideways nudge is detected as a pat and "
+                "the robot leans into it (lean→nuzzle→settle) while still reacting to sound. "
+                "On by default; --no-pat turns it off.",
                 "Smooth by construction — drives the daemon's minjerk 'goto' planner, "
                 "one move at a time through a serial motion queue (no jerky streaming).",
                 "Graceful: no mic / no daemon DoA ⇒ no reaction, no crash.",
@@ -253,6 +299,8 @@ def cmd_listen_overview(args: argparse.Namespace) -> int:
                 "Tier-2 knobs: --head-only-band / --body-yaw-max / --body-speed",
                 "idle knobs: --idle-energy / --drift-speed / --recenter-after",
                 "feel knobs: --dwell / --hold / --speed / --deadband / --gain",
+                "head-pat (sdk only): --pat / --no-pat (default on), "
+                "--press-threshold / --min-presses",
                 "snap detector: --snap-ratio / --snap-floor (SDK profile only)",
                 "exit codes: 0 ok, 1 user error, 2 environment (daemon unreachable)",
             ],
@@ -269,18 +317,51 @@ def cmd_listen_overview(args: argparse.Namespace) -> int:
 # --- run (foreground loop) ------------------------------------------------
 
 
+def _build_pat_hook(args: argparse.Namespace, transport: object, queue) -> PatHook | None:
+    """A :class:`PatHook` bound to the loop's queue, or ``None`` when pat is off.
+
+    Pat detection is only meaningful on the SDK transport (``head_pose`` is an
+    SDK-only read-back) and is on by default; ``--no-pat`` (``args.pat`` False)
+    suppresses it, as does a transport that cannot read the head pose back. The
+    hook reads the head pose back each tick *inside* the loop that owns the single
+    SDK client, so the read-backs are fast enough to detect a pat — a separate
+    ``pat`` process would be throttled by SDK contention.
+    """
+    if not getattr(args, "pat", True):
+        return None
+    if not hasattr(transport, "head_pose"):
+        return None
+    kw: dict[str, float] = {}
+    if getattr(args, "press_threshold", None) is not None:
+        kw["press_threshold"] = args.press_threshold
+    if getattr(args, "min_presses", None) is not None:
+        kw["min_presses"] = args.min_presses
+    detector = PatDetector(**kw) if kw else None
+    return PatHook(queue, detector=detector)
+
+
 def _run_sdk_loop(
     transport: object,
     producer: ListenProducer,
     args: argparse.Namespace,
     on_action: Callable[[object], None],
 ) -> int:
-    """Drive the loop over an open SDK media session (real DoA + mic-audio loudness)."""
+    """Drive the loop over an open SDK media session (real DoA + mic-audio loudness).
+
+    The loop also folds in proprioceptive head-pat detection (unless ``--no-pat``):
+    a :class:`~reachy.motion.listen_pat.PatHook` runs once per tick via the
+    executor's ``on_tick`` seam, reading the head pose back through the *same* SDK
+    client the loop owns. On a detected pat it enqueues a lean→nuzzle→settle
+    gesture onto the loop's queue and raises the ``pat_active`` flag (so the idle
+    wander yields) — so ``listen`` reacts to both sound and touch at once.
+    """
     snap_kwargs: dict[str, float] = {}
     if getattr(args, "snap_ratio", None) is not None:
         snap_kwargs["ratio"] = args.snap_ratio
     if getattr(args, "snap_floor", None) is not None:
         snap_kwargs["min_rms"] = args.snap_floor
+    queue = MotionQueue()
+    pat_hook = _build_pat_hook(args, transport, queue)
     with transport.media_session() as session:  # type: ignore[attr-defined]
         poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
         detector = SnapDetector(**snap_kwargs)
@@ -292,14 +373,20 @@ def _run_sdk_loop(
             rms = float(np.sqrt(np.mean(sample**2)))
             return (detector.feed(sample), rms > detector.min_rms)
 
-        return run_loop(
-            transport,
-            producer,
-            sense=poller,
-            audio=_audio,
-            on_action=on_action,
-            max_ticks=args.max_ticks,
-        )
+        try:
+            return run_loop(
+                transport,
+                producer,
+                sense=poller,
+                audio=_audio,
+                queue=queue,
+                on_action=on_action,
+                on_tick=pat_hook,
+                max_ticks=args.max_ticks,
+            )
+        finally:
+            if pat_hook is not None:
+                pat_hook.close()
 
 
 def _run_http_loop(
@@ -404,6 +491,7 @@ def _register_run(noun_sub: argparse._SubParsersAction) -> None:
     add_robot_args(run)
     run.set_defaults(transport=os.environ.get("REACHY_TRANSPORT", "sdk"))
     _add_tuning_args(run)
+    _add_pat_args(run)
     run.add_argument(
         "--max-ticks",
         type=int,
@@ -419,12 +507,14 @@ def _register_process_verbs(noun_sub: argparse._SubParsersAction) -> None:
     add_robot_args(start)
     start.set_defaults(transport=os.environ.get("REACHY_TRANSPORT", "sdk"))
     _add_tuning_args(start)
+    _add_pat_args(start)
     start.set_defaults(func=cmd_listen_start)
 
     restart = noun_sub.add_parser("restart", help="Restart the background loop (re-reads tuning).")
     add_robot_args(restart)
     restart.set_defaults(transport=os.environ.get("REACHY_TRANSPORT", "sdk"))
     _add_tuning_args(restart)
+    _add_pat_args(restart)
     restart.set_defaults(func=cmd_listen_restart)
 
     stop = noun_sub.add_parser("stop", help="Stop the loop this CLI started.")

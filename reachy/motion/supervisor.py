@@ -137,6 +137,8 @@ def build_run_command(
     ]
     if params.speech_only:
         cmd.append("--speech-only")
+    if not params.pat:
+        cmd.append("--no-pat")
     return cmd
 
 

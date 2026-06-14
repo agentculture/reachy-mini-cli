@@ -91,12 +91,15 @@ def _drive(
     max_ticks,
     max_errors,
     on_action,
+    on_tick,
     stop,
 ) -> int:
     """The serial body: drain the producer into the queue, run one move at a time."""
     st = _DriveState()
     while not stop["flag"]:
         t = now()
+        if on_tick is not None:
+            on_tick(transport, q, t)
         snap, sp = audio(t) if audio is not None else (False, None)
         sense_val = sense(t) if sense is not None else EMPTY_SENSE
         action = producer.update(t, sense_val, snap=snap, sound_present=sp)
@@ -126,6 +129,7 @@ def run(
     max_ticks: int | None = None,
     max_errors: int = 5,
     on_action: Callable | None = None,
+    on_tick: Callable | None = None,
     stop: dict | None = None,
 ) -> int:
     """Drive the robot from ``producer`` actions until stopped. Returns ticks run.
@@ -136,6 +140,13 @@ def run(
     source — when provided, its values are forwarded to the producer each tick so it can use
     real mic loudness rather than the degraded ``sound_present=None`` fallback.
     Moves are run one at a time via ``transport.move_goto`` — never overlapping.
+
+    ``on_tick`` is an optional ``(transport, queue, t) -> None`` hook invoked once per tick
+    *before* the producer is consulted, with the live transport, the working
+    :class:`~reachy.motion.queue.MotionQueue`, and the current time. It lets a caller fold a
+    second, queue-driven behaviour into the same loop that owns the single SDK client — e.g.
+    ``listen`` reads the head pose back through it to detect a head pat and enqueue a lean,
+    all without a competing process. Default ``None`` so every existing caller is unaffected.
     """
     q = queue if queue is not None else MotionQueue()
     own_stop = stop is None
@@ -155,6 +166,7 @@ def run(
             max_ticks=max_ticks,
             max_errors=max_errors,
             on_action=on_action,
+            on_tick=on_tick,
             stop=stop,
         )
     finally:

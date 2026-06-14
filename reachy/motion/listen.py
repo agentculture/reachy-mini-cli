@@ -79,6 +79,9 @@ class ListenParams:
     body_yaw_max: float = 45.0  # maximum body yaw rotation in degrees
     body_speed: float = 12.0  # deg/s (slow — body turn is deliberate, not snappy)
     head_only_band: float = 30.0  # |desired| <= this → head-only; beyond → body escalation
+    # Proprioceptive head-pat detection folded into the SDK loop (default on; only
+    # effective on the sdk transport — head_pose is an SDK-only read-back).
+    pat: bool = True
 
 
 def _head(yaw: float) -> dict[str, float]:
