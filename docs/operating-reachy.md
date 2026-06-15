@@ -64,32 +64,39 @@ graph TD
     SESS --> SENSE["per-tick DoA + mic RMS"]
     HEAD --> QUEUE["serial MotionQueue<br/>one move at a time"]
 
-    subgraph NOUNS["sense-driven nouns compete for the media session"]
+    subgraph NOUNS["sdk-sense nouns compete for the one SDK client"]
         LISTEN["listen"]
         THINK["think"]
         SLEEP["sleep"]
+        VISION["vision / camera frames"]
         PAT["pat / head-pose read-back"]
     end
 
     SENSE --> LISTEN
     SENSE --> THINK
     SENSE --> SLEEP
+    SESS -.->|SDK client| VISION
     SESS -.->|SDK client| PAT
 
     LISTEN --> QUEUE
     THINK --> QUEUE
     SLEEP --> QUEUE
+    VISION --> QUEUE
     PAT --> QUEUE
 ```
 
-1. **The SDK media session — the mic.** On the `sdk` transport, a noun reads
-   live direction-of-arrival and microphone loudness by opening a
-   `media_session()` against the in-process `reachy_mini` client. That session
-   is **single-consumer**: it is *"obtained exclusively through
-   `SdkTransport.media_session`"* and opens against the *one* `ReachyMini` media
-   subsystem (`reachy/robot/sdk_transport.py`). `listen`, `think`, and `sleep`
-   each open their own session; `pat` opens the same SDK client to read the head
-   pose back. **Only one of them can own it at a time.**
+1. **The SDK client — and its single-consumer media session.** On the `sdk`
+   transport every noun runs against **one in-process `ReachyMini` client**, and
+   the robot serves a single live SDK client at a time. The mic path is the
+   strictest case: `listen`, `think`, and `sleep` read live direction-of-arrival
+   and loudness by opening a `media_session()` that is **single-consumer** —
+   *"obtained exclusively through `SdkTransport.media_session`"*, against the
+   *one* `ReachyMini` media subsystem (`reachy/robot/sdk_transport.py`). `vision`
+   reads camera frames (`transport.get_frame()` → `media_manager.camera`) and
+   `pat` reads the head pose back — both through that same one SDK client (these
+   two do *not* open a `media_session()`; they contend at the `ReachyMini`-client
+   level, which serializes all SDK access). So **only one `sdk`-sense noun can own
+   the robot at a time.**
 
 2. **The head — motion.** Every move (idle wander, sound-orienting turn,
    expression, snuggle, sleep-breathe) flows through **one serial
@@ -105,14 +112,15 @@ single-consumer SDK client and gets starved — a separate `pat` process running
 alongside `listen` is throttled to roughly **1 Hz**, far too slow to feel a pat
 (`reachy/motion/listen_pat.py`).
 
+The `sdk`-sense nouns are `listen`, `think`, `sleep`, `vision`, and `pat`.
+
 | Combination (both on `sdk`) | Works? | Why |
 |---|---|---|
-| `listen` + `think` (two processes) | ❌ | Both open `media_session()` → contend for the one SDK client |
+| any two of `listen` / `think` / `sleep` (two processes) | ❌ | Both open `media_session()` → contend for the one SDK client |
 | `listen` + `pat` (two processes) | ❌ | Contend → `pat` throttled ~1 Hz. **This is why #43 folds pat into listen** |
-| `listen` + `sleep` (two processes) | ❌ | Both open `media_session()` → contend |
-| `think` + `sleep` (two processes) | ❌ | Both open `media_session()` → contend |
-| one sense noun + `demo-mode`/`behavior` | ⚠️ | No media-session clash (motion-only), but both drive the head — run **one** motion owner |
-| one sense noun (`sdk`) + another noun (`http`) | ✅ | The `http` noun polls the daemon's DoA route and opens **no** media session |
+| `listen`/`think`/`sleep` + `vision` (two processes) | ❌ | `vision` rides the same one SDK client for camera frames → contend |
+| one sense noun + `demo-mode`/`behavior` | ⚠️ | No SDK-client clash (motion-only), but both drive the head — run **one** motion owner |
+| one sense noun (`sdk`) + another noun (`http`) | ✅ | The `http` noun polls the daemon's DoA route and opens **no** SDK client |
 
 ### How to compose behaviors anyway
 
@@ -293,7 +301,7 @@ vars override the built-in default.
 | `REACHY_TTS_VOICE` | `Magpie-Multilingual.EN-US.Mia.Calm` | TTS voice identifier | `speech/tts.py` |
 | `REACHY_LLM_BASE_URL` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `think` | `speech/llm.py` |
 | `REACHY_LLM_MODEL` | `default` | LLM model name for `think` | `speech/llm.py` |
-| `REACHY_LLM_API_KEY` | (none) | API key for the LLM endpoint (optional) | `speech/llm.py` |
+| `REACHY_LLM_API_KEY` | (unset) | API key for the LLM endpoint (only sent when present) | `speech/llm.py` |
 | `REACHY_STT_URL` | `http://localhost:9002` | OpenAI-compatible STT (Parakeet) for `sleep` wake-word | `sleep/wakeword.py` |
 | `REACHY_STT_PHRASE` | `hey reachy` | Wake phrase matched against the STT transcript | `sleep/wakeword.py` |
 | `REACHY_STT_LANGUAGE` | `en` | STT language hint | `sleep/wakeword.py` |
@@ -331,7 +339,8 @@ The CLI never leaks a Python traceback — every failure is a structured
 
 Each noun's capability, the sense it reads, where its motion goes, and which
 transports apply. Run `reachy explain <noun>` for the full flag reference, and
-see [`CLAUDE.md`](../CLAUDE.md#architecture) for the implementation map.
+see [`CLAUDE.md`](../CLAUDE.md#architecture-the-agent-first-cli) for the
+implementation map.
 
 ### Daemon & low-level ops
 

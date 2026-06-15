@@ -119,16 +119,19 @@ operator-facing explanation, the conflict matrix, and the diagram live in
 [the operating guide](docs/operating-reachy.md#the-single-sdk-owner-model); the
 contributor summary:
 
-- **One SDK media session (the mic).** `SdkTransport.media_session()` opens
-  against the *one* `ReachyMini` media subsystem and is single-consumer
+- **One SDK client (and its single-consumer media session).** Every `sdk` noun
+  runs against one in-process `ReachyMini` client. `SdkTransport.media_session()`
+  opens against the *one* `ReachyMini` media subsystem and is single-consumer
   (`reachy/robot/sdk_transport.py`, `MediaSession`). `listen` / `think` / `sleep`
-  each open one; `pat` opens the same SDK client for `head_pose()`.
+  each open a media session; `vision` reads camera frames (`get_frame()` →
+  `media_manager.camera`) and `pat` reads `head_pose()` — both through that same
+  one SDK client.
 - **One head (motion).** Every move flows through one serial `MotionQueue`
   (`reachy/motion/queue.py`), drained one move at a time.
 
 | Two `sdk`-sense nouns as separate processes | Result |
 |---|---|
-| `listen`+`think`, `listen`+`sleep`, `think`+`sleep`, `listen`+`pat` | Contend for the single-consumer SDK client; the loser throttles to ~1 Hz |
+| any two of `listen`/`think`/`sleep`/`vision`/`pat` | Contend for the single-consumer SDK client; the loser throttles to ~1 Hz |
 
 Two consequences for code you write:
 
