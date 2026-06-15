@@ -5,7 +5,7 @@ The coherent, end-to-end guide to running a **Reachy Mini** with
 compose behaviors (**the single-SDK-owner model**), how to bring the robot up
 live, how to verify it, and how to get unstuck.
 
-If you just want the copy-paste bring-up, run `reachy quickstart` (or jump to
+If you just want the copy-paste bring-up, run `reachy-mini-cli quickstart` (or jump to
 [Bring Reachy up live](#bring-reachy-up-live)). If something is silently not
 working, jump to [Troubleshooting](#troubleshooting) — the **`~/.asoundrc`
 mic-array gotcha** is the most common silent failure.
@@ -40,7 +40,7 @@ a **noun** you run from the shell or an agent loop:
 - **Fall asleep when left alone and wake when addressed** (`sleep`).
 
 See the [noun map in the README](../README.md#noun-map) for the one-line table,
-and `reachy explain <noun>` for the full reference of any noun.
+and `reachy-mini-cli explain <noun>` for the full reference of any noun.
 
 ---
 
@@ -156,11 +156,11 @@ pyaudio) needs system libraries a bare box or CI lacks — so `reachy-mini` is a
 
 | Profile | Install | Use it for |
 |---|---|---|
-| **Real mode (recommended)** | `uv tool install 'reachy-mini-cli[daemon]'` (or `pip install 'reachy-mini-cli[daemon]'`) | A local robot: pulls `reachy-mini`, so the `sdk` transport and `reachy daemon start` work out of the box. |
+| **Real mode (recommended)** | `uv tool install 'reachy-mini-cli[daemon]'` (or `pip install 'reachy-mini-cli[daemon]'`) | A local robot: pulls `reachy-mini`, so the `sdk` transport and `reachy-mini-cli daemon start` work out of the box. |
 | **HTTP remote** | `pip install reachy-mini-cli` (no extra) | No local robot — `numpy`-only; talk to a daemon elsewhere with `--transport http` + `REACHY_BASE_URL`. |
 
-The installed command is **`reachy`** (alias `reachy-mini-cli`). Running the
-`sdk` transport without the extra exits `2` with a hint to install `[sdk]` —
+The installed command is **`reachy-mini-cli`** (short alias: `reachy`). Running
+the `sdk` transport without the extra exits `2` with a hint to install `[sdk]` —
 never a traceback. `reachy-cli` remains a transitional alias dist that just
 pulls in `reachy-mini-cli`.
 
@@ -168,31 +168,31 @@ pulls in `reachy-mini-cli`.
 
 ## Bring Reachy up live
 
-The canonical sequence (also printed by `reachy quickstart`):
+The canonical sequence (also printed by `reachy-mini-cli quickstart`):
 
 ```bash
 # 1. Install once (CLI + daemon binary + SDK)
 uv tool install 'reachy-mini-cli[daemon]'
 
 # 2. Start the daemon — wakes the robot on start
-reachy daemon start
+reachy-mini-cli daemon start
 
 # 3. Verify it answers
-reachy device status
+reachy-mini-cli device status
 
 # 4. Make it do something
-reachy listen run            # orient to sound (Ctrl-C to stop)
-#   or: reachy demo-mode start    # feel-alive idle loop (background)
-#   or: reachy move goto --z 10 --pitch -5 --duration 2
+reachy-mini-cli listen run            # orient to sound (Ctrl-C to stop)
+#   or: reachy-mini-cli demo-mode start    # feel-alive idle loop (background)
+#   or: reachy-mini-cli move goto --z 10 --pitch -5 --duration 2
 
 # 5. Put it back down when you're done
-reachy daemon stop
+reachy-mini-cli daemon stop
 ```
 
-`reachy daemon start` spawns `reachy-mini-daemon` in the background and polls
+`reachy-mini-cli daemon start` spawns `reachy-mini-daemon` in the background and polls
 its health route until ready (idempotent). It defaults to `--wake-up-on-start`,
 so the robot wakes as part of step 2. Forward daemon args after `--`, e.g.
-`reachy daemon start -- --sim --no-wake-up-on-start`. The daemon's PID + log
+`reachy-mini-cli daemon start -- --sim --no-wake-up-on-start`. The daemon's PID + log
 live under `$XDG_STATE_HOME/reachy` (`~/.local/state/reachy`).
 
 ### Transports — `sdk` vs `http`
@@ -223,11 +223,11 @@ env var. If no daemon is reachable, the command exits `2` with a clean
 A quick liveness checklist after `daemon start`:
 
 ```bash
-reachy device status            # -> state, version, wireless/lite, sim, IP (exit 0)
-reachy device state             # -> live head pose / antennas / body yaw
-reachy say run "hello"          # you should hear it (checks TTS + speaker)
-reachy move goto --z 10 --pitch -5 --duration 2   # head visibly moves
-reachy listen run               # speak near it — antennas lean, then it turns; Ctrl-C
+reachy-mini-cli device status            # -> state, version, wireless/lite, sim, IP (exit 0)
+reachy-mini-cli device state             # -> live head pose / antennas / body yaw
+reachy-mini-cli say run "hello"          # you should hear it (checks TTS + speaker)
+reachy-mini-cli move goto --z 10 --pitch -5 --duration 2   # head visibly moves
+reachy-mini-cli listen run               # speak near it — antennas lean, then it turns; Ctrl-C
 ```
 
 What "working" looks like:
@@ -238,7 +238,7 @@ What "working" looks like:
   head→body turn on speech/snap. If the head never reacts to sound, you are
   almost certainly hitting the [`~/.asoundrc` gotcha](#the-asoundrc-mic-array-gotcha)
   below — the SDK opened but found no live mic source.
-- `reachy <noun> status --json` (for `demo-mode` / `listen` / `think` / `sleep`)
+- `reachy-mini-cli <noun> status --json` (for `demo-mode` / `listen` / `think` / `sleep`)
   reports the background process + health.
 
 ---
@@ -266,8 +266,8 @@ not always fire on first bring-up. Ensure `~/.asoundrc` defines the
 `reachymini_audio_src` ALSA device and restart the daemon:
 
 ```bash
-reachy daemon stop
-reachy daemon start
+reachy-mini-cli daemon stop
+reachy-mini-cli daemon start
 ```
 
 **Confirmation** — a healthy capture path logs:
@@ -326,7 +326,7 @@ The CLI never leaks a Python traceback — every failure is a structured
 | Symptom (the actual `error:` line) | Cause | Fix |
 |---|---|---|
 | `error: the reachy_mini SDK is not installed` (exit 2) | You ran an `sdk`-transport noun on a bare install | `pip install 'reachy-mini-cli[sdk]'` (or `[daemon]`), or use `--transport http` |
-| `error: cannot reach the Reachy daemon at http://localhost:8000 (…)` (exit 2) | No daemon reachable on the `http` transport | `reachy daemon start`, or set `REACHY_BASE_URL` / `--base-url` to a running daemon |
+| `error: cannot reach the Reachy daemon at http://localhost:8000 (…)` (exit 2) | No daemon reachable on the `http` transport | `reachy-mini-cli daemon start`, or set `REACHY_BASE_URL` / `--base-url` to a running daemon |
 | `error: 'reachy-mini-daemon' not found on PATH` (exit 2) | The `[daemon]` extra (which ships the daemon binary) isn't installed | `pip install 'reachy-mini-cli[daemon]'`, or point `--daemon-cmd` / `REACHY_DAEMON_CMD` at the binary |
 | `listen`/`think`/`sleep` run but the robot never reacts to sound | `No Reachy Mini Audio Source card found` — mic not exposed as an ALSA source | The [`~/.asoundrc` gotcha](#the-asoundrc-mic-array-gotcha): pin `reachymini_audio_src`, restart the daemon |
 | A second sense noun is sluggish / `pat` feels dead next to `listen` | Two `sdk`-sense processes contending for the single-consumer SDK client (throttled ~1 Hz) | Run **one** `sdk` sense owner; fold the second in (#43 `PatHook`) or run it on `--transport http`. See [the conflict matrix](#what-this-means-the-conflict-matrix) |
@@ -338,7 +338,7 @@ The CLI never leaks a Python traceback — every failure is a structured
 ## Noun reference (technical layer)
 
 Each noun's capability, the sense it reads, where its motion goes, and which
-transports apply. Run `reachy explain <noun>` for the full flag reference, and
+transports apply. Run `reachy-mini-cli explain <noun>` for the full flag reference, and
 see [`CLAUDE.md`](../CLAUDE.md#architecture-the-agent-first-cli) for the
 implementation map.
 
@@ -363,7 +363,7 @@ implementation map.
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
 | `listen` | two-tier sound orienting: antenna lean (Tier 1) + head→body turn on speech/snap (Tier 2); hosts the always-alive idle layer + the #43 `PatHook` | mic DoA + RMS (`media_session`) | serial MotionQueue (minjerk `goto`) | `sdk` default; `http` polls daemon DoA |
-| `vision` | turn toward motion (frame-diff) or light (brightness centroid); pure pixel math, no ML/GPU | camera frames (`media_session`) | serial MotionQueue | `sdk` default; `http` = metadata only (`vision specs`) |
+| `vision` | turn toward motion (frame-diff) or light (brightness centroid); pure pixel math, no ML/GPU | camera frames (`get_frame()`) | serial MotionQueue | `sdk` default; `http` = metadata only (`vision specs`) |
 | `think` | LLM cognition loop: speaks `"quoted"` text + drives `*emoji*` expressions; sentence-streamed; can `--export` a JSONL feed | mic DoA + RMS (`media_session`) | expression moves on the MotionQueue | `sdk` default; `http` polls daemon DoA |
 | `pat` | feel a head pat (commanded-vs-actual pose deviation) and lean into it (lean→nuzzle→settle) | head-pose read-back (SDK client) | snuggle gesture on the MotionQueue | `sdk` only (pose read-back); `demo` needs no robot |
 | `sleep` | decay ALERT→DROWSY→ASLEEP when idle, wake on speech/snap/wake-word/pat | mic DoA + RMS (`media_session`); head pose for pat-wake | drowsy fade / sleep-breathe / wake gesture | `sdk` default; `http` for non-pose ops |
@@ -394,9 +394,9 @@ never blocks or kills `think`.
 The full wire-format contract is in [`docs/export-schema.md`](export-schema.md).
 
 ```bash
-reachy think run --export -                              # all three block types
-reachy think run --export - --export-blocks message,emotion
-reachy think run --export - | <your renderer>           # the renderer stays out of this repo
+reachy-mini-cli think run --export -                              # all three block types
+reachy-mini-cli think run --export - --export-blocks message,emotion
+reachy-mini-cli think run --export - | <your renderer>           # the renderer stays out of this repo
 ```
 
 **The renderer lives out of repo by design.** This is the export decoupling
@@ -418,6 +418,6 @@ log strings end-to-end on real hardware — is tracked as a separate follow-up
 (it intentionally does not block the docs).
 
 - Implementation map for contributors: [`CLAUDE.md`](../CLAUDE.md)
-- Per-noun flag reference: `reachy explain <noun>`
+- Per-noun flag reference: `reachy-mini-cli explain <noun>`
 - Export wire format: [`docs/export-schema.md`](export-schema.md)
 - SDK-transport rationale: [`docs/adr-0001-sdk-transport-extra.md`](adr-0001-sdk-transport-extra.md)

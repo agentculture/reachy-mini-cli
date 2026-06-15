@@ -6,12 +6,12 @@ app management, and live runtime ops.
 ```bash
 # Real mode (local robot: daemon binary + SDK):
 uv tool install 'reachy-mini-cli[daemon]'
-reachy quickstart      # copy-paste install + bring-up sequence
-reachy daemon start    # bring the daemon up (wakes the robot)
-reachy listen run      # orient the head toward sound (Ctrl-C to stop)
+reachy-mini-cli quickstart      # copy-paste install + bring-up sequence
+reachy-mini-cli daemon start    # bring the daemon up (wakes the robot)
+reachy-mini-cli listen run      # orient the head toward sound (Ctrl-C to stop)
 ```
 
-The installed command is `reachy` (alias: `reachy-mini-cli`).
+The installed command is `reachy-mini-cli` (short alias: `reachy`).
 **New here? Read the [Operating Reachy Mini guide](docs/operating-reachy.md)** —
 it covers bring-up, verification, and the one model you must understand before
 running two behaviors at once.
@@ -29,7 +29,7 @@ think out loud and move in step with its thoughts (`think`), feel a head pat
 ## Noun map
 
 The complete robot surface. Every noun supports `--json`; run
-`reachy explain <noun>` for the full flag reference.
+`reachy-mini-cli explain <noun>` for the full flag reference.
 
 | Noun | What it does | Transport |
 |------|--------------|-----------|
@@ -49,9 +49,9 @@ The complete robot surface. Every noun supports `--json`; run
 
 > ⚠️ **Before you run two behaviors at once, read
 > [the single-SDK-owner model](docs/operating-reachy.md#the-single-sdk-owner-model).**
-> The mic (one SDK media session) and the head (one motion queue) are each a
-> *single resource*: `listen`, `think`, `pat`, and `sleep` are **mutually
-> exclusive on the `sdk` transport**. This trips up humans and agents
+> The robot serves one in-process SDK client and one motion queue, each a
+> *single resource*: `listen`, `think`, `sleep`, `vision`, and `pat` are
+> **mutually exclusive on the `sdk` transport**. This trips up humans and agents
 > repeatedly. The conflict matrix and the two ways to compose behaviors anyway
 > are in the guide.
 
@@ -85,22 +85,22 @@ The full operating guide is **[`docs/operating-reachy.md`](docs/operating-reachy
 ### Common commands
 
 ```bash
-reachy daemon start                                   # bring the daemon up (wakes the robot)
-reachy device status                                  # verify it answers
-reachy move goto --z 10 --pitch -5 --duration 2       # one motion command
-reachy demo-mode start                                # feel-alive idle loop (background)
-reachy listen run                                     # orient to sound (sdk; Ctrl-C to stop)
-reachy vision run                                     # orient to motion/light (sdk)
-reachy say run "Hello from Reachy"                    # text-to-speech
-reachy think run                                      # LLM cognition loop (speaks + moves)
-reachy pat run                                        # feel a head pat and lean in
-reachy sleep run                                      # fall asleep when idle, wake when addressed
-reachy daemon stop                                    # put it back down
+reachy-mini-cli daemon start                                   # bring the daemon up (wakes the robot)
+reachy-mini-cli device status                                  # verify it answers
+reachy-mini-cli move goto --z 10 --pitch -5 --duration 2       # one motion command
+reachy-mini-cli demo-mode start                                # feel-alive idle loop (background)
+reachy-mini-cli listen run                                     # orient to sound (sdk; Ctrl-C to stop)
+reachy-mini-cli vision run                                     # orient to motion/light (sdk)
+reachy-mini-cli say run "Hello from Reachy"                    # text-to-speech
+reachy-mini-cli think run                                      # LLM cognition loop (speaks + moves)
+reachy-mini-cli pat run                                        # feel a head pat and lean in
+reachy-mini-cli sleep run                                      # fall asleep when idle, wake when addressed
+reachy-mini-cli daemon stop                                    # put it back down
 ```
 
 The background nouns (`demo-mode`, `listen`, `think`, `sleep`) also expose
 `start` / `stop` / `restart` / `status`; the sense nouns also expose `demo` (no
-robot needed). See `reachy explain <noun>`.
+robot needed). See `reachy-mini-cli explain <noun>`.
 
 ## Export feed
 
@@ -110,9 +110,9 @@ renderer stays **out of this repo** by design (the export decoupling boundary):
 `reachy-mini-cli` emits a documented contract, a separate consumer renders it.
 
 ```bash
-reachy think run --export -                              # all block types
-reachy think run --export - --export-blocks message,emotion
-reachy think run --export - | <your renderer>
+reachy-mini-cli think run --export -                              # all block types
+reachy-mini-cli think run --export - --export-blocks message,emotion
+reachy-mini-cli think run --export - | <your renderer>
 ```
 
 Wire format: [`docs/export-schema.md`](docs/export-schema.md). For the renderer
