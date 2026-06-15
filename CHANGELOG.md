@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-06-15
+
+### Added
+
+- docs/operating-reachy.md: a coherent operating guide — what Reachy can do, the single-SDK-owner model (with a mermaid diagram + conflict matrix), live bring-up, transports, verification, the ~/.asoundrc mic-array gotcha, a full environment-variable reference table, a troubleshooting table, and a per-noun technical reference (#44)
+- README: a complete noun map covering every robot noun, and a prominent pointer to the single-SDK-owner model
+
+### Changed
+
+- README reorganized into a lean front door (overview + noun map + quickstart + links into the operating guide); cross-cutting install/transport/daemon detail now lives once in the guide
+- CLAUDE.md architecture section restructured for navigability (overview map, Core CLI contract, single-SDK-owner contributor note, noun catalog table, per-noun internals headings) and updated to reflect #43 (pat folded into listen)
+
+### Fixed
+
+- CLAUDE.md no longer claims the repo is an unmodified template with no robot functionality (the framing was stale)
+
 ## [0.21.0] - 2026-06-14
 
 ### Added

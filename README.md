@@ -1,28 +1,123 @@
 # reachy-mini-cli
 
-Agent and CLI for operating the Reachy Mini expressive robot — device setup, app management, and runtime ops.
+Agent and CLI for operating the **Reachy Mini** expressive robot — device setup,
+app management, and live runtime ops.
+
+```bash
+# Real mode (local robot: daemon binary + SDK):
+uv tool install 'reachy-mini-cli[daemon]'
+reachy quickstart      # copy-paste install + bring-up sequence
+reachy daemon start    # bring the daemon up (wakes the robot)
+reachy listen run      # orient the head toward sound (Ctrl-C to stop)
+```
+
+The installed command is `reachy` (alias: `reachy-mini-cli`).
+**New here? Read the [Operating Reachy Mini guide](docs/operating-reachy.md)** —
+it covers bring-up, verification, and the one model you must understand before
+running two behaviors at once.
+
+## What Reachy Mini can do
+
+Reachy Mini is an expressive desk robot — a movable head, two antennas, a
+rotating body, a USB mic array (with direction-of-arrival), a camera, and a
+speaker. `reachy-mini-cli` exposes each capability as a **noun** you run from a
+shell or an agent loop: hold the hardware (`daemon`), feel alive when idle
+(`demo-mode`), orient to sound (`listen`) or sight (`vision`), speak (`say`),
+think out loud and move in step with its thoughts (`think`), feel a head pat
+(`pat`), and fall asleep when left alone (`sleep`).
+
+## Noun map
+
+The complete robot surface. Every noun supports `--json`; run
+`reachy explain <noun>` for the full flag reference.
+
+| Noun | What it does | Transport |
+|------|--------------|-----------|
+| [`daemon`](docs/operating-reachy.md#bring-reachy-up-live) | Start/stop/status the local `reachy-mini-daemon` process | none (manages the process) |
+| `device` | Daemon + live robot state (`status`, `state`) | `http` (default) |
+| `app` | List / start / stop daemon apps | `http` |
+| `move` | One-shot `goto` / `wake` / `sleep` animations | `http` (default) |
+| `demo-mode` | Always-on "feel alive" idle loop (breathe, glances, sway) | `sdk`/`http` |
+| `behavior` | 50 Hz engine that composes named behaviors per channel | `sdk`/`http` |
+| [`listen`](docs/operating-reachy.md#senses-one-sdk-media-owner-at-a-time) | Two-tier sound orienting (antenna lean → head/body turn) | `sdk` default |
+| `vision` | Turn toward motion or light (pure pixel math, no ML) | `sdk` default |
+| `say` | Dumb TTS pipe: text → speaker | `sdk` default |
+| `think` | LLM cognition loop: speaks + expresses; `--export` JSONL feed | `sdk` default |
+| `pat` | Feel a head pat and lean into it (no touch sensor) | `sdk` only |
+| `sleep` | Decay to sleep when idle; wake on sound / wake-word / pat | `sdk` default |
+| `whoami` `quickstart` `learn` `explain` `overview` `doctor` `cli` | Agent-first introspection — no robot needed | — |
+
+> ⚠️ **Before you run two behaviors at once, read
+> [the single-SDK-owner model](docs/operating-reachy.md#the-single-sdk-owner-model).**
+> The mic (one SDK media session) and the head (one motion queue) are each a
+> *single resource*: `listen`, `think`, `pat`, and `sleep` are **mutually
+> exclusive on the `sdk` transport**. This trips up humans and agents
+> repeatedly. The conflict matrix and the two ways to compose behaviors anyway
+> are in the guide.
 
 ## Install
 
-```bash
-# Recommended — real mode (local robot: daemon binary + SDK):
-uv tool install 'reachy-mini-cli[daemon]'
-# or with pip:  pip install 'reachy-mini-cli[daemon]'
+| Profile | Install | For |
+|---|---|---|
+| **Real mode (recommended)** | `uv tool install 'reachy-mini-cli[daemon]'` | A local robot — pulls `reachy-mini`, so the `sdk` transport and `daemon start` work out of the box. |
+| **HTTP remote** | `pip install reachy-mini-cli` | No local robot — `numpy`-only; talk to a daemon elsewhere with `--transport http` + `REACHY_BASE_URL`. |
 
-# HTTP-only remote profile (no local robot; talk to a daemon elsewhere):
-uv tool install reachy-mini-cli
+`reachy-mini` is an **extra**, not a base dep (its pycairo/gstreamer/pyaudio
+stack needs system libraries a bare box lacks). Running the `sdk` transport on a
+bare install exits `2` with a hint to install `[sdk]` — never a traceback. See
+[Install profiles](docs/operating-reachy.md#install-profiles) for the full
+rationale. `reachy-cli` remains a transitional alias that pulls in
+`reachy-mini-cli`.
+
+## Operating Reachy live
+
+The full operating guide is **[`docs/operating-reachy.md`](docs/operating-reachy.md)**:
+
+- [Bring Reachy up live](docs/operating-reachy.md#bring-reachy-up-live) — install → daemon → verify → behavior
+- [The single-SDK-owner model](docs/operating-reachy.md#the-single-sdk-owner-model) — the conflict matrix + how to compose behaviors
+- [Transports — `sdk` vs `http`](docs/operating-reachy.md#transports--sdk-vs-http)
+- [Verify it's working](docs/operating-reachy.md#verify-its-working)
+- [The `~/.asoundrc` mic-array gotcha](docs/operating-reachy.md#the-asoundrc-mic-array-gotcha) — the most common silent failure
+- [Environment variables](docs/operating-reachy.md#environment-variables) — every `REACHY_*` var in one table
+- [Troubleshooting](docs/operating-reachy.md#troubleshooting) — symptoms → fixes, exit codes
+- [Noun reference](docs/operating-reachy.md#noun-reference-technical-layer) — each noun's sense, motion, and transport
+
+### Common commands
+
+```bash
+reachy daemon start                                   # bring the daemon up (wakes the robot)
+reachy device status                                  # verify it answers
+reachy move goto --z 10 --pitch -5 --duration 2       # one motion command
+reachy demo-mode start                                # feel-alive idle loop (background)
+reachy listen run                                     # orient to sound (sdk; Ctrl-C to stop)
+reachy vision run                                     # orient to motion/light (sdk)
+reachy say run "Hello from Reachy"                    # text-to-speech
+reachy think run                                      # LLM cognition loop (speaks + moves)
+reachy pat run                                        # feel a head pat and lean in
+reachy sleep run                                      # fall asleep when idle, wake when addressed
+reachy daemon stop                                    # put it back down
 ```
 
-The installed command is `reachy-mini-cli` (short alias: `reachy`). Then:
+The background nouns (`demo-mode`, `listen`, `think`, `sleep`) also expose
+`start` / `stop` / `restart` / `status`; the sense nouns also expose `demo` (no
+robot needed). See `reachy explain <noun>`.
+
+## Export feed
+
+`think run --export -` streams a live newline-delimited JSON (NDJSON) feed of
+what the robot is **thinking / saying / feeling** — one object per line. The
+renderer stays **out of this repo** by design (the export decoupling boundary):
+`reachy-mini-cli` emits a documented contract, a separate consumer renders it.
 
 ```bash
-reachy-mini-cli quickstart     # copy-paste install + start-real-mode sequence
-reachy-mini-cli daemon start   # bring the local daemon up (wakes the robot)
-reachy-mini-cli device status  # verify it answers
-reachy-mini-cli listen run     # orient the head toward sound (Ctrl-C to stop)
+reachy think run --export -                              # all block types
+reachy think run --export - --export-blocks message,emotion
+reachy think run --export - | <your renderer>
 ```
 
-See [Install profiles](#install-profiles) below for why `reachy-mini` is an extra.
+Wire format: [`docs/export-schema.md`](docs/export-schema.md). For the renderer
+boundary and the reference `reterminal` consumer, see
+[Export feed & the external renderer](docs/operating-reachy.md#export-feed--the-external-renderer).
 
 ## What you get
 
@@ -48,11 +143,14 @@ uv run reachy learn                   # self-teaching prompt (add --json)
 uv run teken cli doctor . --strict    # the agent-first rubric gate CI runs
 ```
 
-## CLI
+## CLI (introspection)
+
+The agent-first verbs that work with no robot attached:
 
 | Verb | What it does |
 |------|--------------|
-| `whoami` | Report this agent's nick, version, backend, and model from `culture.yaml`. |
+| `whoami` | Report this agent's nick, version, backend, model from `culture.yaml`. |
+| `quickstart` | Print the copy-paste install + bring-up sequence. |
 | `learn` | Print a structured self-teaching prompt. |
 | `explain <path>` | Markdown docs for any noun/verb path. |
 | `overview` | Read-only descriptive snapshot of the agent. |
@@ -63,445 +161,10 @@ Every command supports `--json`. Results go to stdout, errors/diagnostics to
 stderr (never mixed). Exit codes: `0` success, `1` user error, `2` environment
 error, `3+` reserved.
 
-## Robot operations
-
-The `daemon`, `device`, `app`, and `move` noun groups operate the Reachy Mini.
-
-### Install profiles
-
-`listen` is **SDK-first** — the `sdk` transport is its default, giving direct
-in-process access to the mic array (real DoA + RMS loudness via `reachy_mini`).
-`numpy` is a base dependency (the RMS detector; a pure wheel). `reachy-mini` itself
-stays an **extra**, not a base dep, because its transitive stack (pycairo /
-gstreamer / pyaudio) needs system libraries a bare box / CI lack — so the
-recommended install bundles it via an extra.
-
-- **Recommended — with the SDK + daemon:** `uv tool install 'reachy-mini-cli[daemon]'`
-  (or `pip install 'reachy-mini-cli[daemon]'` / `[sdk]`). Pulls `reachy-mini`, so the
-  `sdk` transport `listen` defaults to works out of the box and `reachy daemon start`
-  can bring the daemon up locally.
-- **Bare — HTTP remote profile:** `pip install reachy-mini-cli` (no extra). `numpy`-only;
-  use `--transport http` (or `REACHY_TRANSPORT=http`) with `--base-url` /
-  `REACHY_BASE_URL` to talk to a daemon running elsewhere via its REST API. Running
-  the `sdk` transport here exits `2` with a hint to install the `[sdk]` extra.
-
-> `reachy-cli` still works as a transitional alias (`pip install reachy-cli`) — it
-> just pulls in `reachy-mini-cli`. Either package installs the same tool, and the
-> command is `reachy` (or `reachy-mini-cli`).
-
-### Bring the daemon up
-
-`device`/`app`/`move` are clients of a running daemon; `daemon` is the other
-half — it manages the local `reachy-mini-daemon` process.
-
-| Verb | What it does |
-|------|--------------|
-| `daemon start` | Spawn `reachy-mini-daemon` in the background, then poll its health route until ready. Idempotent. |
-| `daemon stop` | Stop the daemon this CLI started (SIGTERM, then SIGKILL). |
-| `daemon status` | Reconcile the tracked process (running/stopped/stale) with the HTTP health check. |
-
-`reachy-mini-daemon` defaults to `--wake-up-on-start`, so `daemon start` already
-wakes the robot. Forward daemon args after `--`, e.g.
-`reachy daemon start -- --sim --no-wake-up-on-start`. State (PID + log) lives
-under `$XDG_STATE_HOME/reachy` (`~/.local/state/reachy`).
-
-### Transports
-
-The `device`, `app`, `move`, and `listen` verbs talk to the robot through a
-selectable **transport flavor**:
-
-- **`http`** — the Reachy daemon's REST API. Uses only the Python standard library.
-  Point it at a daemon with `--base-url` or `REACHY_BASE_URL` (default
-  `http://localhost:8000`). This is the default for `device`, `app`, and `move`.
-- **`sdk`** — the in-process `reachy_mini` client (included in the base install).
-  Covers motion/state and live audio streaming. **This is the default for `listen`**:
-  it streams mic audio directly in-process for real DoA + RMS loudness. Daemon and
-  app verbs still require `http`.
-
-Select per command with `--transport {http,sdk}` (or `REACHY_TRANSPORT`). Action
-verbs also accept `--timeout`. If no daemon is reachable, the command exits `2`
-with a clean `error:`/`hint:` pair — never a traceback.
-
-| Verb | What it does |
-|------|--------------|
-| `device status` | Daemon status: state, version, wireless/lite, simulation, IP. |
-| `device state` | Live robot state: head pose, antenna positions, body yaw. |
-| `app list` | Available apps (installed and installable). |
-| `app status` | The currently running app, if any. |
-| `app start <name>` | Start an installed app by name. |
-| `app stop` | Stop the currently running app. |
-| `move goto` | Move head/antennas (mm + degrees); see `reachy explain move` for flags. |
-| `move wake` | Play the wake-up animation. |
-| `move sleep` | Play the go-to-sleep animation. |
-
-Each noun also exposes `overview` (e.g. `reachy move overview`).
-
-```bash
-uv run reachy daemon start            # bring the local daemon up (and wake the robot)
-uv run reachy device status           # now answers instead of exit-2
-uv run reachy app list --json
-uv run reachy move goto --z 10 --pitch -5 --duration 2
-uv run reachy move wake
-uv run reachy daemon stop             # put it back down when you're done
-```
-
-### Demo mode — make the robot feel alive
-
-`demo-mode` runs a continuous loop that streams gentle idle motion to the robot —
-a slow breathing oscillation, the occasional glance to a new gaze target, and a
-little antenna sway — so an idle robot looks present rather than frozen. It drives
-the robot through the same transport, so it needs a running daemon. It is built to
-run always-on and improve over time, so it has three layers.
-
-**Process** (tracked background loop; PID + log under `$REACHY_STATE_DIR` /
-`$XDG_STATE_HOME/reachy`):
-
-| Verb | What it does |
-|------|--------------|
-| `demo-mode start` | Spawn the feel-alive loop in the background (idempotent; preflights the daemon first). |
-| `demo-mode stop` | Stop the loop this CLI started (SIGTERM eases the robot back to neutral, then SIGKILL). |
-| `demo-mode restart` | Apply an update — restart the service if active, else relaunch the background loop. |
-| `demo-mode status` | Loop process state + systemd unit state + whether the daemon answers. |
-| `demo-mode run` | Run the loop in the foreground (what `start`/the service launch); Ctrl-C to stop. |
-
-**Config** — persisted tuning at `$XDG_CONFIG_HOME/reachy/demo-mode.json`, read by
-`run`/`start` (CLI flags override per-invocation):
-
-```bash
-uv run reachy demo-mode config                       # show resolved config
-uv run reachy demo-mode config --init                # write defaults
-uv run reachy demo-mode config --set energy=0.8 interval=3
-```
-
-Keys: `transport`, `base_url`, `timeout`, `interval` (tempo), `energy`
-(liveliness `0`–`n`), `interpolation`, `seed`, `wake`, `settle`.
-
-**Service** — run it always-on as a systemd `--user` unit (auto-restart on crash,
-start on boot):
-
-```bash
-uv run reachy demo-mode install      # write the reachy-demo-mode.service unit
-uv run reachy demo-mode enable       # enable --now + linger (survives reboot)
-uv run reachy demo-mode disable      # stop + disable
-uv run reachy demo-mode uninstall    # remove the unit
-```
-
-The full flow:
-
-```bash
-uv run reachy daemon start                    # something for the loop to drive
-uv run reachy demo-mode config --set energy=0.7
-uv run reachy demo-mode start                 # robot starts feeling alive
-uv run reachy demo-mode restart               # apply config/code updates
-uv run reachy demo-mode stop                  # eases back to neutral
-```
-
-As you make the motion richer over time, edit `reachy/alive.py` (or the config)
-and `demo-mode restart` to apply it.
-
-### Behaviors — compose motion on a 50 Hz engine
-
-`behavior` runs a 50 Hz engine that **composes** named behaviors on a per-channel
-contention model (`head` / `antennas` / `body_yaw`), with `feel-alive` as a passive
-base layer. Push behaviors onto the running engine from separate commands:
-
-```bash
-uv run reachy behavior engine start            # bring the 50 Hz loop up
-uv run reachy behavior run speak --duration 8  # head bobs like speech
-uv run reachy behavior status --json
-uv run reachy behavior stop all                # keeps the feel-alive base layer
-```
-
-See `reachy explain behavior` for the full catalog, channels, and contention model.
-
-### Listen — two-tier sound orienting (SDK-first)
-
-`listen` is **SDK-first** and **two-tier**: it streams live mic audio from the
-`reachy_mini` SDK in-process (the `sdk` transport is the default), giving it real
-Direction of Arrival and real RMS loudness without polling the daemon.
-
-**Tier 1 — antenna lean:** On every tick, the antennas lean toward the live DoA
-(head holds). This gives the robot a subtle "perked ear" reaction to any live sound.
-
-**Tier 2 — head→body turn:** On detected *speech* or a loud RMS "snap" transient
-(a sudden noise spike detected by `SnapDetector`), the robot executes a smooth
-head→body turn. The head turns first; if the source is beyond `--head-only-band`
-degrees from center, the body rotates to face it and the head re-centers. A
-latched-DoA guard prevents stale angles from firing a spurious turn at rest.
-
-Both tiers drive the daemon's smooth minjerk `goto` planner through a serial motion
-queue, so turns are soft and never conflict. The HTTP transport is available via
-`--transport http` / `REACHY_TRANSPORT=http` for a control box connecting remotely.
-
-```bash
-uv run reachy daemon start                          # bring the daemon up
-uv run reachy listen run                             # foreground, SDK transport (default)
-uv run reachy listen run --transport http            # foreground, HTTP transport
-uv run reachy listen start                           # background, tracked process
-uv run reachy listen status --json
-uv run reachy listen stop                            # eases back to center
-```
-
-Key tuning flags: `--gain`, `--deadband`, `--hold`, `--speed`, `--recenter-after`,
-`--speech-only` (Tier-2 speech only; Tier-1 still runs), `--antenna-max`,
-`--body-yaw-max`, `--head-only-band`, `--snap-ratio`, `--snap-floor`.
-See `reachy explain listen` for the full reference.
-
-### Vision — pixel-based motion + light orienting
-
-`vision` is the camera counterpart to `listen`: it reads frames from the robot's
-camera and orients the head toward the strongest visual event. The camera was
-previously unused by the CLI — this is a **net-new perception channel**.
-
-**Pixel-based; no ML and no GPU.** Two detectors run in pure pixel math on every
-frame:
-
-- **Motion (primary cue) — frame differencing:** the centroid of pixel change
-  between consecutive frames maps to a head-yaw offset.
-- **Light (fallback cue) — brightness/centroid:** when no motion fires, the
-  weighted brightness centroid of the frame drives a softer look toward the bright
-  region.
-
-Like `listen`, `vision` **mirrors the serial motion queue**: both detectors drive the
-daemon's smooth minjerk `goto` planner one move at a time, so turns are soft and
-never conflict.
-
-**Local-profile only.** Frames come via the in-process `reachy_mini` SDK (the `sdk`
-transport is the default); the `http` transport gives camera-metadata-only access
-(`vision specs`). The `[sdk]` / `[daemon]` extra is required for `vision run` and the
-background process.
-
-```bash
-reachy-mini-cli vision specs         # check camera metadata (remote-safe)
-reachy-mini-cli daemon start         # bring the daemon up
-reachy-mini-cli vision run           # foreground, SDK transport (default)
-reachy-mini-cli vision start         # background, tracked process
-reachy-mini-cli vision status --json
-reachy-mini-cli vision stop          # eases back to center
-```
-
-Key tuning flags: `--gain`, `--max-yaw`, `--deadband`, `--hold`, `--speed`,
-`--motion-threshold`.
-See `reachy explain vision` for the full reference.
-
-### Say — text-to-speech pipe
-
-`say` is a **dumb pipe**: text → TTS synthesis → robot speaker playback. No LLM,
-no senses — deliberately boundary-clean so agents can compose it into pipelines.
-Pass `"-"` as the text argument to read from stdin.
-
-```bash
-reachy-mini-cli say run "Hello from Reachy"
-echo "Hello from stdin" | reachy-mini-cli say run -
-reachy-mini-cli say run "Remote" --transport http --base-url http://reachy.local:8000
-```
-
-**TTS endpoint** — Magpie-style HTTP server: `REACHY_TTS_URL` (default
-`http://localhost:9000`), `REACHY_TTS_VOICE` (voice identifier), `--speed`
-(forwarded, a no-op if the server ignores it). **Playback transport** —
-`REACHY_TRANSPORT` (`sdk` default; `http` for remote) via the same
-`--transport` flag as `listen`/`vision`. See `reachy explain say`.
-
-### Think — continuous cognition loop with body expression
-
-`think` runs a **sentence-streamed cognition loop** that also **moves the robot's
-body in step with its thoughts**. On each turn it snapshots live senses (DoA + mic
-loudness) into an event buffer, sends the buffer to an LLM (streamed), and plays
-each synthesized sentence through the speaker while the LLM is still generating
-the next — so speech starts before the turn completes. An empty buffer (no notable
-events) is a silent no-op turn (no LLM call, no audio).
-
-**Convention — `*emoji*` / `"quoted"` output format:** the LLM interleaves
-expression markers and speech in its output stream. Only `"quoted"` text is spoken
-aloud; each `*emoji*` marker (e.g. `*🤔*`) drives one calm expression move on the
-robot. Text outside these delimiters is silently discarded.
-
-**Expression catalog** — `reachy/speech/expressions.toml` is an editable,
-emoji-keyed data file mapping each emoji to a target head/antenna/body pose. Tune
-expressions by editing this file directly; no code change is needed. Starter set:
-🤔 😮 🙂 👂 😐 🎉 😔 (+ neutral fallback for unknown emoji). Unknown emoji fall
-back to neutral silently.
-
-**Focused idle:** while `think run` is active it writes a file flag
-(`think_active.flag` under `$REACHY_STATE_DIR`). A co-running `listen`/idle loop
-reads this flag and drops to a low-energy "focused breathe" — so the body quiets
-and stillness becomes the thinking posture even if both `listen` and `think` run
-together.
-
-Like `listen`, `think` is **SDK-first**: the `sdk` transport (default) streams real
-DoA + mic RMS in-process; `--transport http` polls the daemon's DoA route. Like
-`daemon`, it has a foreground loop (`run`) and a tracked background process
-(`start`/`stop`/`restart`/`status`) managed by its own supervisor
-(`reachy/speech/supervisor.py`).
-
-```bash
-reachy-mini-cli daemon start                              # bring the daemon up
-reachy-mini-cli think run                                 # foreground loop (Ctrl-C to stop)
-reachy-mini-cli think run --max-turns 3                   # stop after 3 spoken turns
-reachy-mini-cli think start --llm-model mistral-small     # background process
-reachy-mini-cli think status --json
-reachy-mini-cli think stop
-reachy-mini-cli think demo                                # drive a scripted *emoji* "speech" stream (no LLM)
-```
-
-`think demo` runs a fixed `*emoji* "speech"` script through the same path the
-cognition loop uses (marker parser → expression moves + spoken quoted text) so
-you can watch the body language on a live robot without an LLM. See
-`docs/verification/think-body-expression.md` for the manual observer checklist.
-
-**Catalog tooling:**
-
-```bash
-reachy-mini-cli think expressions           # list catalog emojis + pose descriptors
-reachy-mini-cli think expressions list      # same (explicit verb)
-reachy-mini-cli think expressions check     # flag poses too similar to tell apart
-reachy-mini-cli think expressions check --json
-```
-
-`expressions check` exits `0` always — a flagged pair is a warning, not an error.
-The `--json` `ok` field is the machine-readable signal.
-
-**LLM endpoint** — `REACHY_LLM_BASE_URL`, `REACHY_LLM_API_KEY`,
-`REACHY_LLM_MODEL`; pure `urllib` streaming (no OpenAI SDK, no new base dep).
-**TTS endpoint** — `REACHY_TTS_URL`, `REACHY_TTS_VOICE` (same as `say`).
-**Playback** — `REACHY_TRANSPORT` (`sdk`/`http`); same transport flag as `say`.
-Key pacing flags: `--turn-interval` (seconds between turns), `--mute-after-speak`
-(self-mute window after speaking, default 2.5 s).
-See `reachy explain think` for the full reference.
-
-**Export feed** — `think run` can stream a live newline-delimited JSON (NDJSON)
-feed to stdout so an external display or logging pipeline can consume it without
-any code inside this repo:
-
-```bash
-# All three block types (thinking / message / emotion) on stdout
-reachy-mini-cli think run --export -
-
-# Select a subset of block types
-reachy-mini-cli think run --export - --export-blocks thinking,message
-
-# Pipe to a remote renderer — the renderer stays out of this repo
-reachy-mini-cli think run --export - | ssh pi@reterminal renderer
-```
-
-Each line is one JSON object with a block-type discriminator `t`
-(`"thinking"` / `"message"` / `"emotion"`) and a unix timestamp `ts`.
-The export is a passive, broken-pipe-safe tap on the cognition loop — it never
-blocks or raises when the consumer disconnects.
-See [`docs/export-schema.md`](docs/export-schema.md) for the full event contract.
-
-### Pat — proprioceptive touch + snuggle
-
-`pat` makes the robot **feel a head pat and lean into it** — with no touch sensor.
-It holds a baseline head pose, reads the *actual* head pose back from the robot,
-and detects a pat from the **commanded-vs-actual deviation**: a downward pitch
-press is a **scratch** (head/neck pat) and a sideways yaw nudge is a **side-nudge**
-(`side_pat`). On a detected pat it leans in — a calm lean→nuzzle→settle snuggle
-(a pitch-down dip for a scratch; a yaw-toward + soft body-yaw for a side_pat) —
-enqueued onto the same shared serial `MotionQueue` the executor drains one move at
-a time, so the reaction is smooth and never fights other motion.
-
-Like `listen`/`think`, `pat` is **SDK-first**: the `head_pose` read-back is an
-SDK-only capability, so the `sdk` transport (default) is required to feel a pat;
-`--transport http` is available for non-pose ops but cannot read `head_pose`. The
-`demo` verb needs **no robot and no `[sdk]` extra** — it synthesizes pat events
-and runs them through the real lean planner so you can verify the wiring in CI or
-by eye.
-
-```bash
-reachy-mini-cli pat run                                   # foreground loop (Ctrl-C to stop)
-reachy-mini-cli pat run --ticks 200                       # bounded run (testing/ops)
-reachy-mini-cli pat run --press-threshold 1.5 --min-presses 3   # retune sensitivity
-reachy-mini-cli pat demo                                  # synthesize pats, no robot
-reachy-mini-cli pat demo --json --count 1                 # one scripted reaction, JSON
-```
-
-**Breaks idle stillness:** while a pat reaction is enqueued, `pat` writes a file
-flag (`pat_active.flag` under `$REACHY_STATE_DIR`, the counterpart to think's
-`think_active.flag`). A co-running `listen`/idle loop reads this flag and **pauses
-its idle wander entirely** so the lean/snuggle owns the motion — a scratch fully
-breaks stillness, where a `think` turn only quiets it to a focused breathe. See
-`reachy explain pat` for the full reference.
-
-### Sleep — decay-to-sleep + wake
-
-`sleep` makes the robot **fall asleep when left alone and wake up when addressed**.
-It tracks idle time against configurable thresholds and decays through three states —
-**ALERT** → **DROWSY** → **ASLEEP** — using a purely injected-clock idle timer (no
-wall-clock dependency). Motion follows the state: a drowsy fade on the way down, a
-quiet sleep-breathe cycle while asleep, and a wake gesture on resumption.
-
-**Idle timer and state machine** — `reachy/sleep/state.py` holds `SleepState`
-(ALERT/DROWSY/ASLEEP) and the injected-clock timer. Any qualifying stimulus
-resets the timer; without one, the robot decays through the thresholds automatically.
-`reachy/sleep/stimulus.py` classifies incoming sense events as qualifying
-stimulation, including a self-mute exclusion so the robot does not wake itself
-from its own speaker output.
-
-**Two-tier wake** — `reachy/sleep/wake.py`: Tier 1 (default) wakes on detected
-speech or a loud RMS snap transient (same signals as `listen` Tier 2). Tier 2
-adds optional wake-word detection via a pluggable backend (see below); the
-wake-word path is lazy-loaded and degrades gracefully if the extra is absent.
-
-**Pat-only wake (`--no-audio-wake` / `--wake pat`)** — pass this flag to disable
-all audio wake so only a physical head pat rouses the sleeping robot. Useful when
-the robot is in a noisy environment where speech/snap signals would cause false
-wakes. Requires the `sdk` transport (pat detection reads live `head_pose`); on
-`--transport http` it exits `2` with a clean `CliError`.
-
-**Pluggable wake-word backend** — opt in with `--wake-word` (+ optional
-`--wake-word-kind {http,openwakeword}` and `--wake-phrase`). Two backends:
-
-- **`http` (default)** — an external **OpenAI-compatible** STT service, targeting
-  the model-gear / NVIDIA **Parakeet** endpoint (`POST /v1/audio/transcriptions`,
-  a multipart WAV upload; stdlib `urllib`, no extra required). It buffers a
-  rolling ~1.5 s audio window (one tick's mic chunk is too short to transcribe a
-  phrase) and matches the wake phrase against the response `text`. Configure with
-  `REACHY_STT_URL` (default `http://localhost:9002`), `REACHY_STT_PHRASE`,
-  `REACHY_STT_LANGUAGE`, `REACHY_STT_TIMEOUT`. The service is externally managed.
-- **`openwakeword`** — on-box wake-word engine under the `[cpu]` extra
-  (lazy-loaded; the dep list is empty until `openwakeword` gains a cp312 wheel).
-
-The `[gpu]` extra is a generic GPU compute-class pin for future GPU-accelerated
-features — it does **not** bundle an on-box STT model.
-
-**Idle interrupt — strongest suppressor:** `sleep` writes `sleep_active.flag`
-(via `reachy/motion/sleep_signal.py`) while the robot is in DROWSY or ASLEEP
-state. A co-running `listen`/idle loop reads this flag as the **highest-priority
-idle interrupt** — above `pat_active.flag` and `think_active.flag` — and yields
-the motion channel entirely to `sleep`'s `SleepProducer`
-(`reachy/motion/sleep.py`).
-
-Like `pat`/`think`, `sleep` is **SDK-first**: the `sdk` transport (default) is
-the full path; `--transport http` is available for non-pose ops. A missing `[sdk]`
-extra raises a clean exit-2 `CliError`. `sleep` has its own supervisor
-(`reachy/sleep/supervisor.py`, tracking `sleep.pid`/`sleep.log` under
-`$REACHY_STATE_DIR`) separate from the `listen` and `think` supervisors.
-
-```bash
-reachy-mini-cli sleep run                                 # foreground decay loop (Ctrl-C to stop)
-reachy-mini-cli sleep run --ticks 300                     # bounded run (testing/ops)
-reachy-mini-cli sleep run --idle-timeout 30               # fall asleep after 30 s of quiet
-reachy-mini-cli sleep run --no-audio-wake                 # pat-only wake (ignore all sound)
-reachy-mini-cli sleep run --wake pat                      # same as --no-audio-wake
-reachy-mini-cli sleep run --wake-word                     # opt-in wake-word (HTTP STT default)
-reachy-mini-cli sleep run --wake-word --wake-word-kind openwakeword --wake-phrase "hey reachy"
-reachy-mini-cli sleep start                               # background tracked process
-reachy-mini-cli sleep status --json                       # state + idle timer + health
-reachy-mini-cli sleep stop
-reachy-mini-cli sleep restart
-reachy-mini-cli sleep demo                                # walk ALERT→DROWSY→ASLEEP→wake, no robot
-reachy-mini-cli sleep demo --json                         # machine-readable event trace
-```
-
-`sleep demo` uses injected senses and a fake clock to walk the full state
-machine deterministically — no robot and no `[sdk]` extra needed. See
-`reachy explain sleep` for the full flag reference.
-
 ## Make it your own
 
-1. Rename the package `reachy/` and the `reachy-mini-cli`
-   CLI/dist name throughout `pyproject.toml`, the package, `tests/`, and
+1. Rename the package `reachy/` and the `reachy-mini-cli` CLI/dist name
+   throughout `pyproject.toml`, the package, `tests/`, and
    `sonar-project.properties`.
 2. Edit `culture.yaml` with your `suffix` and `backend`.
 3. Rewrite `CLAUDE.md` for your agent and run `/init`.

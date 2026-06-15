@@ -2,19 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## What this repo is (and is not, yet)
+## What this repo is
 
-`reachy-mini-cli` is an **AgentCulture mesh agent** whose intended domain is
-*operating the Reachy Mini expressive robot — device setup, app management, and
-runtime ops* (see `culture.yaml` and the README).
+`reachy-mini-cli` is an **AgentCulture mesh agent** whose domain is *operating
+the Reachy Mini expressive robot — device setup, app management, and live
+runtime ops* (see `culture.yaml`, the [README](README.md), and the
+[operating guide](docs/operating-reachy.md)).
 
-**Today the code is still the unmodified clone of `culture-agent-template`.** The
-CLI exposes only the template's agent-first introspection verbs (`whoami`,
-`learn`, `explain`, `overview`, `doctor`, `cli`). **No Reachy / robot
-functionality exists yet** — there is no device, app, or runtime-ops code. When
-you add robot features, you are building the real agent on top of this scaffold,
-not modifying a finished product. Treat the existing verbs as the *pattern to
-copy*, not the *feature set*.
+It began as a clone of `culture-agent-template`, and the template's agent-first
+introspection verbs (`whoami`, `quickstart`, `learn`, `explain`, `overview`,
+`doctor`, `cli`) are still the *pattern to copy* when you add a verb. But the
+robot agent is now real and extensive: the CLI drives the daemon (`daemon`,
+`device`, `app`, `move`), idle presence (`demo-mode`, `behavior`), the senses
+(`listen`, `vision`, `think`, `pat`, `sleep`), speech (`say`), and a `think
+--export` JSONL feed. When you build a new robot feature you are extending a
+working agent — follow the existing nouns as the model, summarized in the
+[Noun catalog](#noun-catalog) below.
 
 ## Critical naming gotcha
 
@@ -66,6 +69,18 @@ Everything routes through `reachy.cli.main()` → `_build_parser()`
 rubric** (`teken cli doctor . --strict`), which gates CI — keep it green when
 you touch the CLI.
 
+**Map of this section:**
+
+- [Core CLI contract](#core-cli-contract) — routing, adding a verb, the error
+  contract, output split, `explain` catalog, identity/`doctor`.
+- [The single-SDK-owner model](#the-single-sdk-owner-model-contributor-note) —
+  the one hardware constraint every sense noun shares.
+- [Noun catalog](#noun-catalog) — one table: each noun → module, key classes,
+  transport.
+- [Noun internals](#noun-internals) — the per-noun deep notes.
+
+### Core CLI contract
+
 - **Adding a verb:** create `reachy/cli/_commands/<verb>.py` exposing
   `register(sub)` (add a `--json` flag, `set_defaults(func=...)`), then import it
   and call `<verb>.register(sub)` inside `_build_parser()`. That is the only
@@ -95,207 +110,285 @@ you touch the CLI.
   line scanner (no YAML library) and walks up from `__file__` to find it.
   `doctor` re-implements the steward invariants (prompt-file-present,
   backend-consistency `claude`→`CLAUDE.md`, skills-present).
-- **`daemon` noun & process module:** `device`/`app`/`move` are *clients* of a
-  running daemon; `reachy/cli/_commands/daemon.py` + `reachy/daemon.py` are the
-  other half — they start/stop/status the local `reachy-mini-daemon` OS process
-  (background spawn + PID/log under `$REACHY_STATE_DIR` / `$XDG_STATE_HOME/reachy`,
-  health-poll via `GET /api/daemon/status`). Pure stdlib (`subprocess`/`signal`/
-  `urllib`); the daemon *binary* comes from the `[daemon]` extra. Its `overview`
-  is hand-built (no `--transport sdk` line) — `daemon` does NOT use a transport,
-  so it does not call `_robot.noun_overview`/`get_transport`. A missing binary
-  raises a clean exit-2 `CliError` pointing at the `[daemon]` install.
-  `is_robot_live()` (also in `reachy/daemon.py`) provides SDK-based daemon
-  liveness that stays correct across a daemon restart (fixes issue #21).
-- **`listen` noun — two-tier `ListenProducer` (SDK-first):** The `listen` loop is
-  implemented as a two-tier `ListenProducer`:
-  - *Tier 1 — antenna lean:* On every tick the antennas lean toward the current
-    DoA (head holds). Always active; gives a subtle "perked ear" reaction to live
-    sound.
-  - *Tier 2 — head→body turn:* Fires on detected speech or a loud RMS "snap"
-    transient. The head turns first; if the DoA is beyond `--head-only-band` the
-    body rotates to face the source and the head re-centers. A **latched-DoA guard**
-    prevents the daemon's frozen DoA angle (which stays at the last live angle at
-    rest) from firing a spurious turn — Tier 2 only fires on live speech/snap.
-  - `SnapDetector` (`reachy/motion/snap.py`) detects RMS spikes: an RMS value
-    above `snap_ratio × floor` triggers a snap. Algorithm cited from
-    `reachy_nova`'s `TrackingManager.detect_snap`.
-  - The `sdk` transport streams mic audio via `reachy_mini.ReachyMini().media` /
-    `media_session()` in-process — real DoA + real RMS per tick. This is listen's
-    default transport. The `http` transport polls the daemon's DoA endpoint instead;
-    use `--transport http` / `REACHY_TRANSPORT=http` for remote control-box
-    deployments.
-  - Both tiers drive the smooth minjerk `goto` planner one move at a time (serial
-    motion queue), so turns are soft and never conflict.
-- **`say` noun — dumb TTS pipe:** `reachy/cli/_commands/say.py` exposes `run`
-  (text → TTS → playback) and `overview`. It MUST NOT import `reachy.speech.llm`
-  or `reachy.speech.events` — tests assert this boundary. TTS is via
-  `reachy.speech.tts.synthesize` (Magpie-style HTTP: `REACHY_TTS_URL` /
-  `REACHY_TTS_VOICE`). Playback is via `reachy.speech.playback.play_audio` —
-  `sdk` (default, pushes PCM via `reachy_mini.media`) or `http` (daemon
-  `/media/play` route). No LLM, no event bus, no senses; safe to compose in
-  pipelines.
-- **`think` noun — continuous cognition loop (SDK-first):** `reachy/cli/_commands/think.py`
-  exposes `run` (foreground) + `start`/`stop`/`restart`/`status` (background
-  process) + `demo` (drive a fixed scripted `*emoji*` / `"speech"` stream through
-  the real marker→expression+TTS path, no LLM — for on-robot verification) +
-  `overview`. The `reachy/speech/` package provides the engine:
-  - `reachy/speech/llm.py` — pure `urllib` streaming LLM client
-    (`REACHY_LLM_BASE_URL` / `REACHY_LLM_API_KEY` / `REACHY_LLM_MODEL`; no
-    OpenAI SDK, no new base dep).
-  - `reachy/speech/tts.py` + `reachy/speech/playback.py` — shared with `say`;
-    `think` reuses the same TTS + playback leg.
-  - `reachy/speech/events.py` — `EventBuffer` accumulates per-tick DoA / RMS /
-    speech cues; `CognitionEngine.run()` consumes them.
-  - `reachy/speech/cognition.py` — `CognitionEngine`: calls the LLM with the
-    buffer snapshot, streams sentences, synthesizes + plays each sentence while
-    the LLM streams the next (sentence-streamed overlap).
-  - `reachy/speech/supervisor.py` — manages `think`'s background process (PID +
-    log under `$REACHY_STATE_DIR`). **Distinct** from `listen`'s
-    `reachy/motion/supervisor.py` — they track separate processes.
-  - Sense feed mirrors `listen`: `sdk` transport opens a `ReachyMini`
-    `media_session()` and reads DoA + mic RMS per tick; `http` transport polls
-    the daemon's DoA route (no audio source, RMS = 0). Two-noun split: `say` =
-    dumb TTS pipe; `think` = cognition loop that reuses `say`'s speech leg.
-  - **`*emoji*` / `"quoted"` output convention:** the cognition LLM interleaves
-    expression markers and speech. `reachy/speech/markers.py` — streaming
-    `MarkerParser` state machine: `*…*` → `MarkerEvent(emoji=…)` (drives a body
-    expression); `"…"` → `SpeechEvent(text=…)` (spoken aloud). Text outside
-    these delimiters is silently discarded. The parser is incremental (char-by-char)
-    so split LLM token chunks are assembled correctly; unclosed spans at flush-time
-    are silently dropped.
-  - **Expression catalog** — `reachy/speech/expressions.toml`: emoji-keyed TOML
-    tables, each mapping to a 9-axis `ExpressionPose` (head mm/deg, antenna deg,
-    body_yaw deg). Loaded via stdlib `tomllib` (no new dep). `NEUTRAL_KEY =
-    "neutral"` is the all-zeros fallback for unknown emoji. `Catalog` (thin
-    wrapper), `load_catalog`, and `get_pose` in `reachy/speech/expressions.py`.
-    Starter set: 🤔 😮 🙂 👂 😐 🎉 😔 and neutral. Edit this file to tune poses
-    without any code change.
-  - **`ExpressionProducer`** (`reachy/motion/expression.py`) — enqueues calm
-    one-shot expression moves onto the shared serial `MotionQueue` from the
-    cognition thread. `think`'s `_MotionExecutor` runs a dedicated background
-    thread that drains the queue to the robot; motion errors degrade silently so
-    a transport drop never kills the cognition loop.
-  - **`reachy/speech/distinctness.py`** — `find_too_similar(catalog, threshold)`
-    computes weighted Euclidean pose distances (normalised by per-axis amplitude
-    σ) and returns pairs below the threshold. The neutral entry is excluded from
-    pairwise comparison. Default threshold `0.5`; starter catalog passes cleanly.
-  - **`think expressions` sub-noun** (registered in `_register_expressions`):
-    - `think expressions` / `think expressions list` — emit each catalog emoji
-      with a generated pose descriptor (non-zero axes and signed magnitudes).
-    - `think expressions check` — run `find_too_similar`; exit 0 always
-      (flagged pairs are warnings); `--json` `ok` is the machine-readable signal.
-    - `think expressions overview` — describe the sub-noun (rubric-required).
-    Both verbs support `--json`.
-  - **Cognition signal** (`reachy/speech/cognition_signal.py`) — `cognition_active()`
-    context manager writes `think_active.flag` (under `state_dir()`) on enter and
-    removes it on exit (including on exception). `is_active()` is a pure
-    `Path.exists()` check with no I/O cost. The `listen` motion producer
-    (`reachy/motion/listen.py`) calls `cognition_signal.is_active()` on every
-    idle tick and swaps in a low-energy `_focused` `AliveConfig` while the flag
-    is present — so the idle wander drops to a quiet "focused breathe" while
-    `think` runs, making stillness the thinking posture.
-  - **Self-mute guard** — `think run` wraps `play_audio` so after each clip it
-    stamps `mute["until"] = monotonic() + mute_after` (default 2.5 s). The
-    `before_turn` sense feed checks this window and discards any sample captured
-    inside it, preventing the robot from reacting to its own voice through the
-    shared USB audio device.
-  - **`--export` / `--export-blocks` stdout JSONL sink** — `think run --export -`
-    writes a live newline-delimited JSON (NDJSON) feed to stdout. Each line is one
-    JSON object: `t` (block type), `ts` (unix timestamp), plus type-specific fields.
-    Three block types: `thinking` (sense cues + full raw LLM turn text, including
-    `*emoji*`/`"speech"` markers and any leading prose), `message` (text spoken
-    aloud), `emotion` (emoji + 9-axis pose snapshot or `null`). `--export-blocks`
-    accepts a comma-separated subset (e.g. `thinking,message`; default: all three).
-    The sink lives in `reachy/export/` (`events.py` event model + `to_jsonl`,
-    `blocks.py` `Selection` / `parse_blocks`, `exporter.py` `JsonlExporter`); wired
-    in `reachy/cli/_commands/think.py`. The exporter is a passive tap on the
-    cognition loop — it catches `BrokenPipeError`/`OSError`/`ValueError`, logs once
-    to stderr, and silently disables itself so a disconnecting consumer never kills
-    `think`. Only `-` (stdout) is supported in this version. See
-    `docs/export-schema.md` for the full wire-format contract.
-- **`pat` noun — proprioceptive touch + snuggle (SDK-first):**
-  `reachy/cli/_commands/pat.py` exposes `run` (foreground proprioceptive loop) +
-  `demo` (synthesize pat events, NO robot / NO `[sdk]` extra) + `overview`. There
-  is no touch sensor: the loop holds a baseline head pose, reads the *actual* pose
-  back via `reachy/robot` `head_pose()` (an SDK-only read-back), and feeds the
-  commanded-vs-actual deviation to a `PatDetector` (`reachy/motion/pat.py`, cited
-  from `reachy_nova` — numpy + stdlib only). A downward **pitch** press → `scratch`;
-  a sideways **yaw** nudge → `side_pat`; two intensities (`level1`/`level2`). On a
-  detection `PatReaction` (`reachy/motion/pat_reaction.py`) — a pure planner —
-  enqueues a calm lean→nuzzle→settle gesture (pitch-down for scratch; yaw-toward +
-  body_yaw for side_pat) onto the shared serial `MotionQueue`, drained by the same
-  `_MotionExecutor`/`reachy.motion.server.run` background-thread pattern as
-  `listen`/`think` (motion errors degrade silently). SDK-first by default; the
-  `http` transport cannot read `head_pose`. A missing `[sdk]` extra raises a clean
-  exit-2 `CliError`; `demo` works with no robot. While a reaction is enqueued, `pat`
-  writes `pat_active.flag` via `reachy/motion/pat_signal.py` (the counterpart to
-  think's `think_active.flag`) — the `listen` idle producer reads it and **pauses
-  the idle wander entirely** so the snuggle owns the motion (full suppression,
-  vs. think's focused-breathe). Determinism seams for tests: `PatDetector.update`
-  takes `now=` and the constructor takes `level2_threshold_fn`; `pat run` takes a
-  bounded `--ticks N` and injects the transport via `get_transport`.
 
-- **`sleep` noun — decay-to-sleep + wake (SDK-first):**
-  `reachy/cli/_commands/sleep.py` exposes `run` (foreground decay loop) +
-  `start`/`stop`/`restart`/`status` (background process; `status --json` reports
-  state + idle timer + health) + `demo` (injected sense + fake clock, walks
-  ALERT→DROWSY→ASLEEP→wake in `--json`, NO robot / NO `[sdk]` extra) + `overview`.
-  The sleep subsystem lives in `reachy/sleep/`:
-  - `reachy/sleep/state.py` — `SleepState` enum (ALERT/DROWSY/ASLEEP) + an
-    injected-clock idle timer; wall-clock dependency is fully factored out for
-    determinism in tests.
-  - `reachy/sleep/stimulus.py` — qualifying-stimulation classifier: decides which
-    incoming sense events reset the idle timer; includes a self-mute exclusion so
-    the robot cannot wake itself from its own speaker output.
-  - `reachy/sleep/wake.py` — two-tier wake: Tier 1 (default) wakes on detected
-    speech or a loud RMS snap transient (same signals as `listen` Tier 2).
-    **Audio wake can be disabled** via `--no-audio-wake` (alias `--wake pat`) —
-    in that mode only a physical head pat rouses the robot; requires the `sdk`
-    transport (`http` raises a clean exit-2). Tier 2 adds optional wake-word
-    detection (`--wake-word`) via a pluggable backend (`reachy/sleep/wakeword.py`
-    `resolve_backend`): `http` (default — external **OpenAI-compatible** STT,
-    stdlib `urllib`, targets the model-gear / NVIDIA **Parakeet** service
-    `POST /v1/audio/transcriptions` as a multipart WAV upload; `REACHY_STT_URL`
-    default `http://localhost:9002` / `REACHY_STT_PHRASE` / `REACHY_STT_LANGUAGE`
-    / `REACHY_STT_TIMEOUT`; no extra required) or `openwakeword` (on-box, `[cpu]`
-    extra, lazy-loaded). The `[gpu]` extra is a generic compute-class pin for
-    future GPU features — it does NOT carry an on-box STT model. The HTTP backend
-    accumulates a rolling ~1.5 s audio window (a single tick's mic chunk is far
-    too short to transcribe a phrase) and POSTs at most once per `min_interval`;
-    the real mic sample rate (from the SDK transport) is carried in the WAV
-    header. Server-side serving is tracked in model-gear#39 (Parakeet GPU) /
-    model-gear#40 (realtime facade route).
-  - `reachy/sleep/patwake.py` — `PatWakeDetector`: pat-based wake detector that
-    measures head-pose deviation against the **moving** sleep-breathe commanded
-    pose (not a fixed baseline), reusing `reachy/motion/pat.py` `PatDetector`
-    (numpy + stdlib only). Used when `--no-audio-wake` is active.
-  - `reachy/sleep/wakeword.py` — `resolve_backend(kind)`: factory for the
-    pluggable wake-word backend (`http` / `openwakeword`). The `http`
-    `HttpSttBackend` calls the external OpenAI-compatible STT (Parakeet)
-    `/v1/audio/transcriptions` as a multipart WAV upload (pure stdlib), matching
-    the wake phrase against the response `text` (OpenAI/Parakeet shape; legacy
-    `transcript`/`detected`/`phrase` also honoured). It buffers a rolling audio
-    window + throttles POSTs (`window_seconds` / `min_interval`, both injectable);
-    `openwakeword` is lazy-imported from the `[cpu]` extra and degrades gracefully
-    when absent.
-  - `reachy/sleep/supervisor.py` — manages `sleep`'s background process (PID +
-    log as `sleep.pid`/`sleep.log` under `$REACHY_STATE_DIR`). **Distinct** from
-    `listen`'s `reachy/motion/supervisor.py` and `think`'s
-    `reachy/speech/supervisor.py` — each noun tracks its own process.
-  - `reachy/motion/sleep.py` — `SleepProducer`: drowsy fade on the way down,
-    quiet sleep-breathe cycle while ASLEEP, wake gesture on resumption; enqueued
-    onto the same shared serial `MotionQueue` as `pat`/`listen`/`think`.
-  - `reachy/motion/sleep_signal.py` — `sleep_active.flag` counterpart to
-    `pat_active.flag`/`think_active.flag`. Written while the robot is in DROWSY or
-    ASLEEP state. The `listen` idle layer reads this flag as the **strongest idle
-    interrupt** — higher priority than `pat_active.flag` (which pauses idle) and
-    `think_active.flag` (which drops to focused-breathe) — and yields the motion
-    channel entirely to `sleep`'s `SleepProducer`.
-  SDK-first by default; the `http` transport is available for non-pose ops. A
-  missing `[sdk]` extra raises a clean exit-2 `CliError`. Determinism seams for
-  tests: `SleepState` timer takes an injected clock; `sleep run` takes a bounded
-  `--ticks N` and injects the transport via `get_transport`; `demo` needs no
-  robot.
+### The single-SDK-owner model (contributor note)
+
+The hardware has **two single resources**, and the sense nouns share them — this
+is the constraint behind several design choices below (notably #43). The
+operator-facing explanation, the conflict matrix, and the diagram live in
+[the operating guide](docs/operating-reachy.md#the-single-sdk-owner-model); the
+contributor summary:
+
+- **One SDK media session (the mic).** `SdkTransport.media_session()` opens
+  against the *one* `ReachyMini` media subsystem and is single-consumer
+  (`reachy/robot/sdk_transport.py`, `MediaSession`). `listen` / `think` / `sleep`
+  each open one; `pat` opens the same SDK client for `head_pose()`.
+- **One head (motion).** Every move flows through one serial `MotionQueue`
+  (`reachy/motion/queue.py`), drained one move at a time.
+
+| Two `sdk`-sense nouns as separate processes | Result |
+|---|---|
+| `listen`+`think`, `listen`+`sleep`, `think`+`sleep`, `listen`+`pat` | Contend for the single-consumer SDK client; the loser throttles to ~1 Hz |
+
+Two consequences for code you write:
+
+- **Fold senses into one loop instead of running two processes.** #43 does this:
+  `reachy/motion/listen_pat.py` `PatHook` runs head-pat detection *inside*
+  `listen`'s loop (via the `on_tick` seam) rather than as a separate `pat`
+  process that would contend and get throttled.
+- **The `*_active.flag` files coordinate the shared *head*, not the media
+  session.** `think_active.flag` / `pat_active.flag` / `sleep_active.flag` let
+  `listen`'s idle layer yield the motion channel by priority
+  (`sleep` > `pat` > `think`); they do not lift the single-media-session limit.
+
+### Noun catalog
+
+Every noun → its command module, key engine module(s)/classes, and default
+transport. Deep notes for the non-trivial nouns follow in
+[Noun internals](#noun-internals).
+
+| Noun | Command module | Engine / key pieces | Transport |
+|---|---|---|---|
+| `daemon` | `_commands/daemon.py` | `reachy/daemon.py` (process mgmt, `is_robot_live`) | none |
+| `device`/`app`/`move` | `_commands/{device,app,move}.py` | `reachy/robot/*` transports | `http` default |
+| `demo-mode` | `_commands/demo_mode.py` | `reachy/alive.py`, `reachy/motion/idle.py`, `demo_config.py`, `demo_service.py` | `sdk`/`http` |
+| `behavior` | `_commands/behavior.py` | 50 Hz engine, per-channel contention | `sdk`/`http` |
+| `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43), `motion/supervisor.py` | `sdk` default |
+| `vision` | `_commands/vision.py` | pixel motion/light detectors, serial MotionQueue | `sdk` default |
+| `say` | `_commands/say.py` | `reachy/speech/{tts,playback}.py` | `sdk` default |
+| `think` | `_commands/think.py` | `reachy/speech/{llm,cognition,events,markers,expressions,distinctness,cognition_signal}.py`, `reachy/motion/expression.py`, `reachy/export/*`, `speech/supervisor.py` | `sdk` default |
+| `pat` | `_commands/pat.py` | `reachy/motion/{pat,pat_reaction,pat_signal}.py` | `sdk` only |
+| `sleep` | `_commands/sleep.py` | `reachy/sleep/{state,stimulus,wake,patwake,wakeword,supervisor}.py`, `reachy/motion/{sleep,sleep_signal}.py` | `sdk` default |
+
+## Noun internals
+
+### `daemon` noun & process module
+
+`device`/`app`/`move` are *clients* of a running daemon;
+`reachy/cli/_commands/daemon.py` + `reachy/daemon.py` are the other half — they
+start/stop/status the local `reachy-mini-daemon` OS process (background spawn +
+PID/log under `$REACHY_STATE_DIR` / `$XDG_STATE_HOME/reachy`, health-poll via
+`GET /api/daemon/status`). Pure stdlib (`subprocess`/`signal`/`urllib`); the
+daemon *binary* comes from the `[daemon]` extra. Its `overview` is hand-built (no
+`--transport sdk` line) — `daemon` does NOT use a transport, so it does not call
+`_robot.noun_overview`/`get_transport`. A missing binary raises a clean exit-2
+`CliError` pointing at the `[daemon]` install. `is_robot_live()` (also in
+`reachy/daemon.py`) provides SDK-based daemon liveness that stays correct across a
+daemon restart (fixes issue #21).
+
+### `listen` noun — two-tier `ListenProducer` (SDK-first)
+
+The `listen` loop is implemented as a two-tier `ListenProducer`:
+
+- *Tier 1 — antenna lean:* On every tick the antennas lean toward the current
+  DoA (head holds). Always active; gives a subtle "perked ear" reaction to live
+  sound.
+- *Tier 2 — head→body turn:* Fires on detected speech or a loud RMS "snap"
+  transient. The head turns first; if the DoA is beyond `--head-only-band` the
+  body rotates to face the source and the head re-centers. A **latched-DoA guard**
+  prevents the daemon's frozen DoA angle (which stays at the last live angle at
+  rest) from firing a spurious turn — Tier 2 only fires on live speech/snap.
+- `SnapDetector` (`reachy/motion/snap.py`) detects RMS spikes: an RMS value
+  above `snap_ratio × floor` triggers a snap. Algorithm cited from
+  `reachy_nova`'s `TrackingManager.detect_snap`.
+- The `sdk` transport streams mic audio via `reachy_mini.ReachyMini().media` /
+  `media_session()` in-process — real DoA + real RMS per tick. This is listen's
+  default transport. The `http` transport polls the daemon's DoA endpoint instead;
+  use `--transport http` / `REACHY_TRANSPORT=http` for remote control-box
+  deployments.
+- Both tiers drive the smooth minjerk `goto` planner one move at a time (serial
+  motion queue), so turns are soft and never conflict.
+- **Pat folded in (#43):** head-pat detection runs *inside* the `listen` loop via
+  `reachy/motion/listen_pat.py` `PatHook` (a per-tick `on_tick` seam), not as a
+  separate `pat` process — a separate process would contend for the
+  single-consumer SDK client and get throttled to ~1 Hz. The hook mirrors `pat`'s
+  detect→react logic, measuring deviation against the loop's *commanded* head pose
+  (so `listen`'s own turns read as zero deviation and never false-fire). See
+  [the single-SDK-owner model](#the-single-sdk-owner-model-contributor-note).
+
+### `say` noun — dumb TTS pipe
+
+`reachy/cli/_commands/say.py` exposes `run` (text → TTS → playback) and
+`overview`. It MUST NOT import `reachy.speech.llm` or `reachy.speech.events` —
+tests assert this boundary. TTS is via `reachy.speech.tts.synthesize`
+(Magpie-style HTTP: `REACHY_TTS_URL` / `REACHY_TTS_VOICE`). Playback is via
+`reachy.speech.playback.play_audio` — `sdk` (default, pushes PCM via
+`reachy_mini.media`) or `http` (daemon `/media/play` route). No LLM, no event
+bus, no senses; safe to compose in pipelines.
+
+### `think` noun — continuous cognition loop (SDK-first)
+
+`reachy/cli/_commands/think.py` exposes `run` (foreground) +
+`start`/`stop`/`restart`/`status` (background process) + `demo` (drive a fixed
+scripted `*emoji*` / `"speech"` stream through the real marker→expression+TTS
+path, no LLM — for on-robot verification) + `overview`. The `reachy/speech/`
+package provides the engine:
+
+- `reachy/speech/llm.py` — pure `urllib` streaming LLM client
+  (`REACHY_LLM_BASE_URL` / `REACHY_LLM_API_KEY` / `REACHY_LLM_MODEL`; no
+  OpenAI SDK, no new base dep).
+- `reachy/speech/tts.py` + `reachy/speech/playback.py` — shared with `say`;
+  `think` reuses the same TTS + playback leg.
+- `reachy/speech/events.py` — `EventBuffer` accumulates per-tick DoA / RMS /
+  speech cues; `CognitionEngine.run()` consumes them.
+- `reachy/speech/cognition.py` — `CognitionEngine`: calls the LLM with the
+  buffer snapshot, streams sentences, synthesizes + plays each sentence while
+  the LLM streams the next (sentence-streamed overlap).
+- `reachy/speech/supervisor.py` — manages `think`'s background process (PID +
+  log under `$REACHY_STATE_DIR`). **Distinct** from `listen`'s
+  `reachy/motion/supervisor.py` — they track separate processes.
+- Sense feed mirrors `listen`: `sdk` transport opens a `ReachyMini`
+  `media_session()` and reads DoA + mic RMS per tick; `http` transport polls
+  the daemon's DoA route (no audio source, RMS = 0). Two-noun split: `say` =
+  dumb TTS pipe; `think` = cognition loop that reuses `say`'s speech leg.
+- **`*emoji*` / `"quoted"` output convention:** the cognition LLM interleaves
+  expression markers and speech. `reachy/speech/markers.py` — streaming
+  `MarkerParser` state machine: `*…*` → `MarkerEvent(emoji=…)` (drives a body
+  expression); `"…"` → `SpeechEvent(text=…)` (spoken aloud). Text outside
+  these delimiters is silently discarded. The parser is incremental (char-by-char)
+  so split LLM token chunks are assembled correctly; unclosed spans at flush-time
+  are silently dropped.
+- **Expression catalog** — `reachy/speech/expressions.toml`: emoji-keyed TOML
+  tables, each mapping to a 9-axis `ExpressionPose` (head mm/deg, antenna deg,
+  body_yaw deg). Loaded via stdlib `tomllib` (no new dep). `NEUTRAL_KEY =
+  "neutral"` is the all-zeros fallback for unknown emoji. `Catalog` (thin
+  wrapper), `load_catalog`, and `get_pose` in `reachy/speech/expressions.py`.
+  Starter set: 🤔 😮 🙂 👂 😐 🎉 😔 and neutral. Edit this file to tune poses
+  without any code change.
+- **`ExpressionProducer`** (`reachy/motion/expression.py`) — enqueues calm
+  one-shot expression moves onto the shared serial `MotionQueue` from the
+  cognition thread. `think`'s `_MotionExecutor` runs a dedicated background
+  thread that drains the queue to the robot; motion errors degrade silently so
+  a transport drop never kills the cognition loop.
+- **`reachy/speech/distinctness.py`** — `find_too_similar(catalog, threshold)`
+  computes weighted Euclidean pose distances (normalised by per-axis amplitude
+  σ) and returns pairs below the threshold. The neutral entry is excluded from
+  pairwise comparison. Default threshold `0.5`; starter catalog passes cleanly.
+- **`think expressions` sub-noun** (registered in `_register_expressions`):
+  - `think expressions` / `think expressions list` — emit each catalog emoji
+    with a generated pose descriptor (non-zero axes and signed magnitudes).
+  - `think expressions check` — run `find_too_similar`; exit 0 always
+    (flagged pairs are warnings); `--json` `ok` is the machine-readable signal.
+  - `think expressions overview` — describe the sub-noun (rubric-required).
+  - Both verbs support `--json`.
+- **Cognition signal** (`reachy/speech/cognition_signal.py`) — `cognition_active()`
+  context manager writes `think_active.flag` (under `state_dir()`) on enter and
+  removes it on exit (including on exception). `is_active()` is a pure
+  `Path.exists()` check with no I/O cost. The `listen` motion producer
+  (`reachy/motion/listen.py`) calls `cognition_signal.is_active()` on every
+  idle tick and swaps in a low-energy `_focused` `AliveConfig` while the flag
+  is present — so the idle wander drops to a quiet "focused breathe" while
+  `think` runs, making stillness the thinking posture.
+- **Self-mute guard** — `think run` wraps `play_audio` so after each clip it
+  stamps `mute["until"] = monotonic() + mute_after` (default 2.5 s). The
+  `before_turn` sense feed checks this window and discards any sample captured
+  inside it, preventing the robot from reacting to its own voice through the
+  shared USB audio device.
+- **`--export` / `--export-blocks` stdout JSONL sink** — `think run --export -`
+  writes a live newline-delimited JSON (NDJSON) feed to stdout. Each line is one
+  JSON object: `t` (block type), `ts` (unix timestamp), plus type-specific fields.
+  Three block types: `thinking` (sense cues + full raw LLM turn text, including
+  `*emoji*`/`"speech"` markers and any leading prose), `message` (text spoken
+  aloud), `emotion` (emoji + 9-axis pose snapshot or `null`). `--export-blocks`
+  accepts a comma-separated subset (e.g. `thinking,message`; default: all three).
+  The sink lives in `reachy/export/` (`events.py` event model + `to_jsonl`,
+  `blocks.py` `Selection` / `parse_blocks`, `exporter.py` `JsonlExporter`); wired
+  in `reachy/cli/_commands/think.py`. The exporter is a passive tap on the
+  cognition loop — it catches `BrokenPipeError`/`OSError`/`ValueError`, logs once
+  to stderr, and silently disables itself so a disconnecting consumer never kills
+  `think`. Only `-` (stdout) is supported in this version. See
+  `docs/export-schema.md` for the full wire-format contract.
+
+### `pat` noun — proprioceptive touch + snuggle (SDK-first)
+
+`reachy/cli/_commands/pat.py` exposes `run` (foreground proprioceptive loop) +
+`demo` (synthesize pat events, NO robot / NO `[sdk]` extra) + `overview`. There
+is no touch sensor: the loop holds a baseline head pose, reads the *actual* pose
+back via `reachy/robot` `head_pose()` (an SDK-only read-back), and feeds the
+commanded-vs-actual deviation to a `PatDetector` (`reachy/motion/pat.py`, cited
+from `reachy_nova` — numpy + stdlib only). A downward **pitch** press → `scratch`;
+a sideways **yaw** nudge → `side_pat`; two intensities (`level1`/`level2`). On a
+detection `PatReaction` (`reachy/motion/pat_reaction.py`) — a pure planner —
+enqueues a calm lean→nuzzle→settle gesture (pitch-down for scratch; yaw-toward +
+body_yaw for side_pat) onto the shared serial `MotionQueue`, drained by the same
+`_MotionExecutor`/`reachy.motion.server.run` background-thread pattern as
+`listen`/`think` (motion errors degrade silently). SDK-first by default; the
+`http` transport cannot read `head_pose`. A missing `[sdk]` extra raises a clean
+exit-2 `CliError`; `demo` works with no robot. While a reaction is enqueued, `pat`
+writes `pat_active.flag` via `reachy/motion/pat_signal.py` (the counterpart to
+think's `think_active.flag`) — the `listen` idle producer reads it and **pauses
+the idle wander entirely** so the snuggle owns the motion (full suppression,
+vs. think's focused-breathe). Determinism seams for tests: `PatDetector.update`
+takes `now=` and the constructor takes `level2_threshold_fn`; `pat run` takes a
+bounded `--ticks N` and injects the transport via `get_transport`. **Standalone
+`pat run` is for an isolated bench check** — for live use alongside hearing, the
+folded-in `PatHook` in `listen` (#43) is the supported path (see the
+[single-SDK-owner model](#the-single-sdk-owner-model-contributor-note)).
+
+### `sleep` noun — decay-to-sleep + wake (SDK-first)
+
+`reachy/cli/_commands/sleep.py` exposes `run` (foreground decay loop) +
+`start`/`stop`/`restart`/`status` (background process; `status --json` reports
+state + idle timer + health) + `demo` (injected sense + fake clock, walks
+ALERT→DROWSY→ASLEEP→wake in `--json`, NO robot / NO `[sdk]` extra) + `overview`.
+The sleep subsystem lives in `reachy/sleep/`:
+
+- `reachy/sleep/state.py` — `SleepState` enum (ALERT/DROWSY/ASLEEP) + an
+  injected-clock idle timer; wall-clock dependency is fully factored out for
+  determinism in tests.
+- `reachy/sleep/stimulus.py` — qualifying-stimulation classifier: decides which
+  incoming sense events reset the idle timer; includes a self-mute exclusion so
+  the robot cannot wake itself from its own speaker output.
+- `reachy/sleep/wake.py` — two-tier wake: Tier 1 (default) wakes on detected
+  speech or a loud RMS snap transient (same signals as `listen` Tier 2).
+  **Audio wake can be disabled** via `--no-audio-wake` (alias `--wake pat`) —
+  in that mode only a physical head pat rouses the robot; requires the `sdk`
+  transport (`http` raises a clean exit-2). Tier 2 adds optional wake-word
+  detection (`--wake-word`) via a pluggable backend (`reachy/sleep/wakeword.py`
+  `resolve_backend`): `http` (default — external **OpenAI-compatible** STT,
+  stdlib `urllib`, targets the model-gear / NVIDIA **Parakeet** service
+  `POST /v1/audio/transcriptions` as a multipart WAV upload; `REACHY_STT_URL`
+  default `http://localhost:9002` / `REACHY_STT_PHRASE` / `REACHY_STT_LANGUAGE`
+  / `REACHY_STT_TIMEOUT`; no extra required) or `openwakeword` (on-box, `[cpu]`
+  extra, lazy-loaded). The `[gpu]` extra is a generic compute-class pin for
+  future GPU features — it does NOT carry an on-box STT model. The HTTP backend
+  accumulates a rolling ~1.5 s audio window (a single tick's mic chunk is far
+  too short to transcribe a phrase) and POSTs at most once per `min_interval`;
+  the real mic sample rate (from the SDK transport) is carried in the WAV
+  header. Server-side serving is tracked in model-gear#39 (Parakeet GPU) /
+  model-gear#40 (realtime facade route).
+- `reachy/sleep/patwake.py` — `PatWakeDetector`: pat-based wake detector that
+  measures head-pose deviation against the **moving** sleep-breathe commanded
+  pose (not a fixed baseline), reusing `reachy/motion/pat.py` `PatDetector`
+  (numpy + stdlib only). Used when `--no-audio-wake` is active.
+- `reachy/sleep/wakeword.py` — `resolve_backend(kind)`: factory for the
+  pluggable wake-word backend (`http` / `openwakeword`). The `http`
+  `HttpSttBackend` calls the external OpenAI-compatible STT (Parakeet)
+  `/v1/audio/transcriptions` as a multipart WAV upload (pure stdlib), matching
+  the wake phrase against the response `text` (OpenAI/Parakeet shape; legacy
+  `transcript`/`detected`/`phrase` also honoured). It buffers a rolling audio
+  window + throttles POSTs (`window_seconds` / `min_interval`, both injectable);
+  `openwakeword` is lazy-imported from the `[cpu]` extra and degrades gracefully
+  when absent.
+- `reachy/sleep/supervisor.py` — manages `sleep`'s background process (PID +
+  log as `sleep.pid`/`sleep.log` under `$REACHY_STATE_DIR`). **Distinct** from
+  `listen`'s `reachy/motion/supervisor.py` and `think`'s
+  `reachy/speech/supervisor.py` — each noun tracks its own process.
+- `reachy/motion/sleep.py` — `SleepProducer`: drowsy fade on the way down,
+  quiet sleep-breathe cycle while ASLEEP, wake gesture on resumption; enqueued
+  onto the same shared serial `MotionQueue` as `pat`/`listen`/`think`.
+- `reachy/motion/sleep_signal.py` — `sleep_active.flag` counterpart to
+  `pat_active.flag`/`think_active.flag`. Written while the robot is in DROWSY or
+  ASLEEP state. The `listen` idle layer reads this flag as the **strongest idle
+  interrupt** — higher priority than `pat_active.flag` (which pauses idle) and
+  `think_active.flag` (which drops to focused-breathe) — and yields the motion
+  channel entirely to `sleep`'s `SleepProducer`.
+
+SDK-first by default; the `http` transport is available for non-pose ops. A
+missing `[sdk]` extra raises a clean exit-2 `CliError`. Determinism seams for
+tests: `SleepState` timer takes an injected clock; `sleep run` takes a bounded
+`--ticks N` and injects the transport via `get_transport`; `demo` needs no
+robot.
 
 ## Hard constraints
 
