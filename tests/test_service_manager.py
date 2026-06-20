@@ -362,3 +362,43 @@ def test_default_daemon_health_is_callable(unit_dir):
     """A manager built without an explicit daemon_health still has a callable one."""
     mgr = ServiceManager(run=FakeSystemctl(), unit_dir=unit_dir)
     assert callable(mgr.daemon_health)
+
+
+# --------------------------------------------------------------------------- #
+# Qodo PR #50 fixes: single-line errors + sibling-disable safety
+# --------------------------------------------------------------------------- #
+
+
+def test_systemctl_failure_message_is_single_line(make_manager):
+    """A multi-line systemctl failure collapses to ONE line.
+
+    Text CLI errors must stay exactly two lines (``error:`` then ``hint:``); a
+    raw multi-line systemctl message embedded in ``CliError.message`` would break
+    that contract (Qodo PR #50, comment 1).
+    """
+    fake = FakeSystemctl()
+    fake.fail[("enable", DAEMON_UNIT)] = ("Failed to enable unit:\nUnit not found\nsee logs", 1)
+    mgr = make_manager(run=fake)
+
+    with pytest.raises(CliError) as ei:
+        mgr.enable("live")
+
+    assert "\n" not in ei.value.message
+    assert "Unit not found" in ei.value.message  # detail preserved, just flattened
+
+
+def test_enable_writes_both_presence_units(make_manager, unit_dir):
+    """enable() writes BOTH presence unit files, not just the chosen one.
+
+    The sibling-disable in step 4 (``disable --now <sibling>``) must target an
+    installed unit; a first-time enable has no sibling on disk yet, and
+    ``systemctl disable`` on a missing unit fails and would abort the enable
+    (Qodo PR #50, comment 5).
+    """
+    fake = FakeSystemctl()
+    mgr = make_manager(run=fake)
+
+    mgr.enable("live")  # fresh enable — nothing pre-installed
+
+    assert (unit_dir / LIVE_UNIT).is_file()
+    assert (unit_dir / DEMO_UNIT).is_file()  # sibling written too -> disable is safe

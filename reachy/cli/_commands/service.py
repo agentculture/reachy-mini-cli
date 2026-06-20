@@ -182,7 +182,11 @@ def _require(args: list[str], action: str) -> None:
     result = _systemctl_run(args)
     rc = getattr(result, "returncode", 0)
     if rc != 0:
-        detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+        # Collapse systemctl's (possibly multi-line) output to ONE line — text CLI
+        # errors must stay exactly two lines (error: / hint:).
+        detail = " ".join(
+            (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").split()
+        )
         raise CliError(
             code=EXIT_ENV_ERROR,
             message=f"{action} failed: {detail}" if detail else f"{action} failed",

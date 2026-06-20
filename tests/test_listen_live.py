@@ -465,3 +465,36 @@ def test_default_listen_does_not_leak_per_tick(monkeypatch) -> None:
         "plain listen scaled per-call SDK opens with ticks — issue #51 leak present "
         f"({short.base_calls} at 5 ticks, {long.base_calls} at 40)"
     )
+
+
+def test_sample_tap_reads_audio_once_and_rms_matches_snap_chunk():
+    """Qodo PR #50 (comment 4): the --live sample tap must read audio ONCE per tick.
+
+    The mic chunk is read once inside ``_audio`` (which stashes its loudness in
+    ``audio_rms``); the sense tap reuses that exact value, so the stored
+    ``SenseSample.rms`` reflects the SAME chunk the snap/sound_present decision
+    used — no second ``get_audio_sample()`` (which would desync the RMS and drop
+    half the audio).
+    """
+    holder = listen_mod.SampleHolder()
+    audio_rms = {"rms": 0.0}
+    reads = {"n": 0}
+
+    def fake_audio(t):
+        reads["n"] += 1  # stands in for the single get_audio_sample() read
+        audio_rms["rms"] = 0.7  # _audio stashes this tick's loudness
+        return (True, True)  # snap, sound_present
+
+    class _FakeSense:
+        doa_angle = np.pi / 2
+        speech_detected = False
+
+    sense_tap, audio_tap = listen_mod._build_sample_tap(
+        holder, lambda t: _FakeSense(), fake_audio, audio_rms
+    )
+    audio_tap(0.0)  # server.run calls the audio tap...
+    sense_tap(0.0)  # ...then the sense tap, each tick
+
+    assert reads["n"] == 1, "the tick must read the mic chunk exactly once"
+    assert holder.latest.rms == 0.7, "stored RMS must be the chunk audio() actually read"
+    assert holder.latest.speech is True  # snap OR speech -> speech True

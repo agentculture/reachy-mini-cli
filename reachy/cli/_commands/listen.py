@@ -471,26 +471,23 @@ def _build_sample_tap(
     holder: SampleHolder,
     poller: DoaPoller,
     audio: Callable[[float], tuple[bool, bool | None]],
-    session: object,
+    audio_rms: dict[str, float],
 ) -> tuple[Callable[[float], Sense], Callable[[float], tuple[bool, bool | None]]]:
     """Wrap the loop's sense/audio taps so each tick publishes a shared SenseSample.
 
-    The loop already computes one DoA + RMS + speech reading per tick. We tap *that*
-    exact value into ``holder`` — no second audio consume — so the folded audio
-    hooks (think, sleep) read the loop's own reading through ``holder.provider``.
+    The loop reads ONE mic chunk per tick — inside ``audio(t)`` (the loop's
+    ``_audio``), which computes snap/sound_present AND stashes that chunk's loudness
+    into ``audio_rms``. We reuse that exact value here rather than re-reading the
+    session (a second ``get_audio_sample()`` would consume a *different* chunk,
+    desyncing the stored RMS from the snap decision and dropping half the audio).
     ``server.run`` calls ``audio(t)`` then ``sense(t)`` each tick, so the audio
-    wrapper stashes this tick's loudness and the sense wrapper (running second)
-    assembles the full :class:`SenseSample` and publishes it. The wrappers are pure
-    pass-throughs to the loop otherwise — the producer still sees the same values.
+    wrapper records this tick's snap and the sense wrapper (running second)
+    assembles the full :class:`SenseSample` from the same chunk and publishes it.
     """
-    last: dict[str, float | bool | None] = {"rms": 0.0, "snap": False, "sound_present": None}
+    last: dict[str, bool | None] = {"snap": False, "sound_present": None}
 
     def _audio_tap(t: float) -> tuple[bool, bool | None]:
-        snap, sound_present = audio(t)
-        # Recompute the same RMS the audio tap derived (it's cheap and keeps the tap
-        # a pure read of the one media sample the loop already pulled this tick).
-        sample = session.get_audio_sample()  # type: ignore[attr-defined]
-        last["rms"] = 0.0 if sample is None else float(np.sqrt(np.mean(sample**2)))
+        snap, sound_present = audio(t)  # reads the chunk ONCE; stashes rms in audio_rms
         last["snap"] = bool(snap)
         last["sound_present"] = sound_present
         return snap, sound_present
@@ -500,7 +497,7 @@ def _build_sample_tap(
         doa_deg = None if sense.doa_angle is None else math.degrees(sense.doa_angle)
         holder.update(
             SenseSample(
-                rms=float(last["rms"]),  # type: ignore[arg-type]
+                rms=float(audio_rms["rms"]),
                 doa=doa_deg,
                 speech=bool(sense.speech_detected) or bool(last["snap"]),
                 ts=t,
@@ -545,12 +542,17 @@ def _run_sdk_loop(
         loop_transport = _SessionBoundTransport(transport, session)
         poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
         detector = SnapDetector(**snap_kwargs)
+        # The ONE mic chunk read per tick; _audio stashes its loudness here so the
+        # --live sample tap reuses it instead of reading a second (different) chunk.
+        audio_rms: dict[str, float] = {"rms": 0.0}
 
         def _audio(_t: float) -> tuple[bool, bool | None]:
             sample = session.get_audio_sample()
             if sample is None:
+                audio_rms["rms"] = 0.0
                 return (False, None)
             rms = float(np.sqrt(np.mean(sample**2)))
+            audio_rms["rms"] = rms
             return (detector.feed(sample), rms > detector.min_rms)
 
         # --live composes all four sense hooks into one HookChain *and* taps the
@@ -558,7 +560,7 @@ def _run_sdk_loop(
         # The default keeps the established single-PatHook on_tick and the bare
         # sense/audio taps byte-for-byte (no chain, no holder tap, no extra read).
         if getattr(args, "live", False):
-            sense_tap, audio_tap = _build_sample_tap(holder, poller, _audio, session)
+            sense_tap, audio_tap = _build_sample_tap(holder, poller, _audio, audio_rms)
             hooks_list = _build_live_hooks(loop_transport, queue, holder.provider, pat_hook)
             on_tick: object = HookChain(hooks_list)
         else:

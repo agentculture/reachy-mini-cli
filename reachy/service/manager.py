@@ -102,7 +102,11 @@ class ServiceManager:
         result = self._systemctl(args)
         rc = getattr(result, "returncode", 0)
         if rc != 0:
-            detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+            # Collapse systemctl's (possibly multi-line) output to ONE line — text
+            # CLI errors must stay exactly two lines (error: / hint:).
+            detail = " ".join(
+                (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").split()
+            )
             raise CliError(
                 code=EXIT_ENV_ERROR,
                 message=f"{action} failed: {detail}" if detail else f"{action} failed",
@@ -147,11 +151,18 @@ class ServiceManager:
                 message=f"unknown presence mode: {mode!r}",
                 remediation=f"choose one of: {', '.join(_MODES)}",
             )
-        presence_unit, sibling_unit, render = _PRESENCE[mode]
+        presence_unit, sibling_unit, _ = _PRESENCE[mode]
 
-        # 1. Write the daemon + chosen presence unit text (t1's renderers).
+        # 1. Write the daemon + BOTH presence unit files (t1's renderers). Writing
+        #    the sibling too means step 4's `disable --now <sibling>` always targets
+        #    an installed unit — a first-time enable has no sibling on disk yet, and
+        #    `systemctl disable` on a missing unit fails and would abort the enable.
         daemon_path = self._write_unit(DAEMON_UNIT, daemon_unit_text())
-        presence_path = self._write_unit(presence_unit, render())
+        written = {
+            unit: self._write_unit(unit, render_fn())
+            for unit, _sib, render_fn in _PRESENCE.values()
+        }
+        presence_path = written[presence_unit]
 
         # 2. Reload the user manager so it sees the freshly-written units.
         self._require(["daemon-reload"], "reload the systemd user manager")
