@@ -398,6 +398,46 @@ def _build_think_hook(provider: Callable[[], SenseSample | None]) -> ThinkHook |
         return None
 
 
+class _SessionBoundTransport:
+    """Route the loop's per-tick pose / move / frame reads through the ONE open
+    media session instead of opening a fresh ``ReachyMini`` per call.
+
+    ``SdkTransport.head_pose`` / ``move_goto`` / ``get_frame`` each open a new SDK
+    client per call, and the SDK's ``GStreamerAudio`` teardown leaks file
+    descriptors — so at the loop's tick/move/frame rate they exhaust the process
+    fd limit in minutes and crash-loop the service (issue #51). The loop already
+    holds one open client via ``media_session()``; this proxy serves those three
+    reads from it and delegates everything else to the base transport untouched.
+    """
+
+    def __init__(self, base: object, session: object) -> None:
+        self._base = base
+        self._session = session
+
+    def _via(self, name: str):  # type: ignore[no-untyped-def]
+        """Prefer the open session for *name*; fall back to the base transport.
+
+        The production :class:`~reachy.robot.sdk_transport.MediaSession` serves
+        all of ``head_pose``/``move_goto``/``get_frame``, so the real loop always
+        rides the one open client (the issue-#51 fix). The fallback only matters
+        for the HTTP profile / minimal fakes whose session does not expose them.
+        """
+        fn = getattr(self._session, name, None)
+        return fn if callable(fn) else getattr(self._base, name)
+
+    def head_pose(self) -> tuple[float, float]:
+        return self._via("head_pose")()
+
+    def move_goto(self, **kwargs: object) -> object:
+        return self._via("move_goto")(**kwargs)
+
+    def get_frame(self) -> object:
+        return self._via("get_frame")()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._base, name)
+
+
 def _build_live_hooks(
     transport: object,
     queue: MotionQueue,
@@ -501,6 +541,8 @@ def _run_sdk_loop(
     pat_hook = _build_pat_hook(args, transport, queue)
     holder = SampleHolder()
     with transport.media_session() as session:  # type: ignore[attr-defined]
+        # Per-tick pose / move / frame reads ride the ONE open client (issue #51).
+        loop_transport = _SessionBoundTransport(transport, session)
         poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
         detector = SnapDetector(**snap_kwargs)
 
@@ -517,7 +559,7 @@ def _run_sdk_loop(
         # sense/audio taps byte-for-byte (no chain, no holder tap, no extra read).
         if getattr(args, "live", False):
             sense_tap, audio_tap = _build_sample_tap(holder, poller, _audio, session)
-            hooks_list = _build_live_hooks(transport, queue, holder.provider, pat_hook)
+            hooks_list = _build_live_hooks(loop_transport, queue, holder.provider, pat_hook)
             on_tick: object = HookChain(hooks_list)
         else:
             sense_tap, audio_tap = poller, _audio
@@ -525,7 +567,7 @@ def _run_sdk_loop(
 
         try:
             return run_loop(
-                transport,
+                loop_transport,
                 producer,
                 hooks=LoopHooks(
                     sense=sense_tap, audio=audio_tap, on_action=on_action, on_tick=on_tick

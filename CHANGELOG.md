@@ -18,6 +18,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Live presence is now the CLI-generated `reachy-live.service` running `listen run --live`, retiring the hand-authored `reachy-listen.service`.
 - README + CLAUDE.md noun catalogs and `docs/operating-reachy.md` document the `service` noun + the `--live` folded loop; the `explain` catalog gains a `service` entry.
 
+### Fixed
+
+- The SDK `listen` loop no longer leaks file descriptors: per-tick `head_pose` reads, per-move `move_goto`, and (in `--live`) per-frame `get_frame` now ride the loop's ONE open `ReachyMini` client through `MediaSession` instead of opening a fresh client per call. Each per-call `ReachyMini` construction leaked fds via the SDK's `GStreamerAudio` teardown, exhausting the process fd limit (`Too many open files`) and crash-looping `reachy-listen.service` every ~5 minutes (issue #51). A shared `_goto_kwargs` helper + a `_SessionBoundTransport` proxy route the loop's reads through the held session; tick-invariance and one-client-per-loop tests guard the regression.
+
 ## [0.22.0] - 2026-06-15
 
 ### Added

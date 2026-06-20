@@ -78,21 +78,64 @@ def _euler_pitch_yaw(pose: "np.ndarray") -> tuple[float, float]:
     return float(pitch), float(yaw)
 
 
+def _goto_kwargs(
+    create_head_pose,  # type: ignore[no-untyped-def]
+    *,
+    head: dict[str, float] | None,
+    antennas: tuple[float, float] | None,
+    body_yaw: float | None,
+    duration: float,
+    interpolation: str,
+) -> dict[str, object]:
+    """Build ``goto_target`` kwargs (friendly mm/deg → SDK metres/radians).
+
+    Shared by :meth:`SdkTransport.move_goto` (opens a client per call) and
+    :meth:`MediaSession.move_goto` (reuses the loop's one open client).
+    """
+    kwargs: dict[str, object] = {
+        "duration": duration,
+        "method": _INTERP_TO_SDK.get(interpolation, "minjerk"),
+    }
+    if head is not None:
+        kwargs["head"] = create_head_pose(
+            x=head["x"],
+            y=head["y"],
+            z=head["z"],
+            roll=head["roll"],
+            pitch=head["pitch"],
+            yaw=head["yaw"],
+            mm=True,
+            degrees=True,
+        )
+    if antennas is not None:
+        kwargs["antennas"] = [math.radians(antennas[0]), math.radians(antennas[1])]
+    if body_yaw is not None:
+        kwargs["body_yaw"] = math.radians(body_yaw)
+    return kwargs
+
+
 class MediaSession:
-    """A live audio + DoA session open against the ``ReachyMini`` media subsystem.
+    """A live session open against the one in-process ``ReachyMini`` client.
 
     Obtained exclusively through :meth:`SdkTransport.media_session` — do not
-    instantiate directly.  All audio reads happen through this object so the
-    loop pays the ``ReachyMini`` open/close cost once (not per tick).
+    instantiate directly.  Audio + DoA reads, the head-pose read-back, moves, and
+    camera frames ALL happen through this one held client, so the loop pays the
+    ``ReachyMini`` open/close cost exactly once (not per tick / per move / per
+    frame).  Routing every per-tick read here is what keeps the loop from leaking
+    file descriptors through the SDK's ``GStreamerAudio`` teardown (issue #51).
 
     The AEC (acoustic-echo-cancelled) channel is the recorder's default
     (channel 0) — ``start_recording()`` activates it automatically.
     """
 
-    def __init__(self, media) -> None:  # type: ignore[no-untyped-def]
-        self._media = media
-        self.samplerate: int = media.get_input_audio_samplerate()
-        self.channels: int = media.get_input_channels()
+    def __init__(self, mini, create_head_pose) -> None:  # type: ignore[no-untyped-def]
+        self._mini = mini
+        self._media = mini.media
+        self._create_head_pose = create_head_pose
+        self.samplerate: int = mini.media.get_input_audio_samplerate()
+        self.channels: int = mini.media.get_input_channels()
+        self._camera: object | None = None
+        self._camera_resolved = False
 
     def doa(self, **_kwargs: object) -> object:
         """Read the sound Direction of Arrival.
@@ -108,6 +151,60 @@ class MediaSession:
     def get_audio_sample(self) -> "np.ndarray | None":
         """Return one mic chunk (``np.float32`` ndarray) or ``None`` when unavailable."""
         return self._media.get_audio_sample()  # type: ignore[return-value]
+
+    def head_pose(self) -> tuple[float, float]:
+        """Read the ACTUAL head pose as ``(pitch_deg, yaw_deg)`` through the one open client.
+
+        The loop reads the pose back every tick (pat detection). Serving it from
+        this already-open ``ReachyMini`` — instead of ``SdkTransport.head_pose``,
+        which opens a fresh client per call — is what stops the loop leaking file
+        descriptors via the SDK's ``GStreamerAudio`` teardown (issue #51).
+        """
+        return _euler_pitch_yaw(self._mini.get_current_head_pose())
+
+    def move_goto(
+        self,
+        *,
+        head: dict[str, float] | None = None,
+        antennas: tuple[float, float] | None = None,
+        body_yaw: float | None = None,
+        duration: float,
+        interpolation: str,
+    ) -> object:
+        """Stream a goto through the one open client (no per-move session open)."""
+        self._mini.goto_target(
+            **_goto_kwargs(
+                self._create_head_pose,
+                head=head,
+                antennas=antennas,
+                body_yaw=body_yaw,
+                duration=duration,
+                interpolation=interpolation,
+            )
+        )
+        return {"status": "ok", "transport": "sdk", "action": "goto"}
+
+    def get_frame(self) -> "np.ndarray":
+        """Capture one camera frame through the one open client (no per-frame session open).
+
+        Resolves the local camera once (lazily) off the held ``ReachyMini`` and
+        reuses it — unlike ``SdkTransport.get_frame``, which builds a fresh client
+        per frame and never closes it.
+        """
+        if not self._camera_resolved:
+            available = bool(self._mini.is_local_camera_available())
+            self._camera = self._mini.media_manager.camera if available else None
+            self._camera_resolved = True
+        if self._camera is None:
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message="no local camera is available on this Reachy Mini",
+                remediation=(
+                    "check the camera is connected and run on the robot itself "
+                    "(local camera frames need connection_mode 'localhost_only')"
+                ),
+            )
+        return self._camera.get_frame()
 
 
 class _SdkSink:
@@ -278,25 +375,14 @@ class SdkTransport(Transport):
         interpolation: str,
     ) -> object:
         reachy_mini_cls, create_head_pose = self._import()
-        kwargs: dict[str, object] = {
-            "duration": duration,
-            "method": _INTERP_TO_SDK.get(interpolation, "minjerk"),
-        }
-        if head is not None:
-            kwargs["head"] = create_head_pose(
-                x=head["x"],
-                y=head["y"],
-                z=head["z"],
-                roll=head["roll"],
-                pitch=head["pitch"],
-                yaw=head["yaw"],
-                mm=True,
-                degrees=True,
-            )
-        if antennas is not None:
-            kwargs["antennas"] = [math.radians(antennas[0]), math.radians(antennas[1])]
-        if body_yaw is not None:
-            kwargs["body_yaw"] = math.radians(body_yaw)
+        kwargs = _goto_kwargs(
+            create_head_pose,
+            head=head,
+            antennas=antennas,
+            body_yaw=body_yaw,
+            duration=duration,
+            interpolation=interpolation,
+        )
         with reachy_mini_cls() as mini:
             mini.goto_target(**kwargs)
         return {"status": "ok", "transport": self.name, "action": "goto"}
@@ -347,10 +433,10 @@ class SdkTransport(Transport):
         is running so the SDK session and the mic recorder are opened once for
         the loop's lifetime rather than per read.
         """
-        reachy_mini_cls, _ = self._import()
+        reachy_mini_cls, create_head_pose = self._import()
         with reachy_mini_cls() as mini:
             mini.media.start_recording()
             try:
-                yield MediaSession(mini.media)
+                yield MediaSession(mini, create_head_pose)
             finally:
                 mini.media.stop_recording()

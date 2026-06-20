@@ -48,11 +48,39 @@ class _FakeMedia:
         return self._channels
 
 
+class _FakeCamera:
+    def __init__(self, frame) -> None:  # type: ignore[no-untyped-def]
+        self._frame = frame
+
+    def get_frame(self):
+        return self._frame
+
+
+class _FakeMediaManager:
+    def __init__(self, frame) -> None:  # type: ignore[no-untyped-def]
+        self.camera = _FakeCamera(frame)
+
+
 class _FakeMini:
     """Minimal stand-in for a ``ReachyMini`` instance returned by context manager."""
 
-    def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
-        self.media = _FakeMedia(**kwargs)
+    def __init__(
+        self, *, camera_available=True, frame=None, head_pose=None, **media_kwargs
+    ) -> None:  # type: ignore[no-untyped-def]
+        self.media = _FakeMedia(**media_kwargs)
+        self.gotos: list[dict] = []  # type: ignore[type-arg]
+        self._head_pose = np.eye(4) if head_pose is None else head_pose
+        self._camera_available = camera_available
+        self.media_manager = _FakeMediaManager(frame)
+
+    def get_current_head_pose(self):
+        return self._head_pose
+
+    def goto_target(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        self.gotos.append(kwargs)
+
+    def is_local_camera_available(self) -> bool:
+        return self._camera_available
 
     def __enter__(self):
         return self
@@ -243,3 +271,78 @@ def test_media_session_yields_media_session(monkeypatch) -> None:  # type: ignor
 
     with SdkTransport().media_session() as session:
         assert isinstance(session, MediaSession)
+
+
+# ---------------------------------------------------------------------------
+# MediaSession serves pose / move / frame through the ONE open client (issue #51)
+# ---------------------------------------------------------------------------
+
+
+def test_media_session_head_pose_uses_held_client(monkeypatch) -> None:
+    """head_pose() reads the pose off the already-open client (identity -> (0, 0))."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+
+    with SdkTransport().media_session() as session:
+        assert session.head_pose() == (0.0, 0.0)
+
+
+def test_media_session_move_goto_streams_through_held_client(monkeypatch) -> None:
+    """move_goto() drives goto_target on the held client (no new session)."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+
+    with SdkTransport().media_session() as session:
+        result = session.move_goto(
+            head={"x": 0, "y": 0, "z": 0, "roll": 0, "pitch": 5, "yaw": 0},
+            duration=0.3,
+            interpolation="minjerk",
+        )
+
+    assert result == {"status": "ok", "transport": "sdk", "action": "goto"}
+    assert len(fake_cls.last.gotos) == 1
+    assert fake_cls.last.gotos[0]["method"] == "minjerk"
+
+
+def test_media_session_get_frame_uses_held_camera(monkeypatch) -> None:
+    """get_frame() returns the held client's camera frame (no new session)."""
+    fake_cls = _FakeMiniCls(frame="FRAME")
+    _patch_import(monkeypatch, fake_cls)
+
+    with SdkTransport().media_session() as session:
+        assert session.get_frame() == "FRAME"
+
+
+def test_media_session_get_frame_raises_when_no_camera(monkeypatch) -> None:
+    """get_frame() raises a clean CliError when the local camera is unavailable."""
+    from reachy.cli._errors import CliError
+
+    fake_cls = _FakeMiniCls(camera_available=False)
+    _patch_import(monkeypatch, fake_cls)
+
+    with SdkTransport().media_session() as session:
+        with pytest.raises(CliError):
+            session.get_frame()
+
+
+def test_per_tick_reads_open_exactly_one_client(monkeypatch) -> None:
+    """Issue #51: many per-tick pose/move/frame reads must construct ONE client.
+
+    The crash-loop was a fd leak from ``head_pose``/``move_goto``/``get_frame``
+    each opening (and the SDK's ``GStreamerAudio`` teardown leaking) a fresh
+    ``ReachyMini`` per call. Routing them through the open ``MediaSession`` means
+    the whole loop builds exactly one client, no matter how many reads.
+    """
+    fake_cls = _FakeMiniCls(frame="FRAME")
+    _patch_import(monkeypatch, fake_cls)
+
+    with SdkTransport().media_session() as session:
+        for _ in range(50):  # 50 ticks' worth of reads
+            session.head_pose()
+            session.get_frame()
+            session.move_goto(duration=0.1, interpolation="minjerk")
+
+    assert len(fake_cls._instances) == 1, (
+        "per-tick reads must reuse the one open client, not open a new ReachyMini "
+        f"per call; opened {len(fake_cls._instances)}"
+    )

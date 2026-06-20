@@ -76,20 +76,35 @@ def _isolate(monkeypatch, tmp_path):
 
 
 class _Session:
-    """A quiet, front-facing media session that counts how often it is opened.
+    """The ONE open client for the loop: audio + DoA + pose + move + frame all
+    ride this object.
 
-    Opening a second session against the single-consumer SDK client is exactly
-    the failure mode ``--live`` must avoid — so this records the open count and
-    the tests assert it is opened EXACTLY once for the whole loop.
+    Opening a second session — or a fresh per-call client for pose/move/frame —
+    is exactly the contention/fd-leak failure ``--live`` must avoid (issue #51),
+    so the tests assert it is opened EXACTLY once and the per-call path is never
+    hit.
     """
 
     _SAMPLE = np.full(512, 0.001, dtype=np.float32)  # below min_rms → no snap
+
+    def __init__(self):
+        self.gotos: list[dict] = []
 
     def doa(self, *, timeout=None):  # noqa: ARG002
         return {"angle": np.pi / 2, "speech_detected": False}  # front, no speech
 
     def get_audio_sample(self):
         return self._SAMPLE
+
+    def head_pose(self) -> tuple[float, float]:
+        return (0.0, 0.0)  # flat: no pat
+
+    def get_frame(self):
+        return None  # no camera frame → vision is a quiet no-op
+
+    def move_goto(self, *, head=None, antennas=None, body_yaw=None, duration, interpolation):
+        self.gotos.append({"head": head, "duration": duration})
+        return {"uuid": "fake"}
 
     @property
     def samplerate(self):
@@ -101,29 +116,34 @@ class _Session:
 
 
 class _LiveSdkTransport:
-    """A fake sdk transport: a single counted media_session() + head_pose() + camera.
-
-    Exposes everything the four hooks need off the ONE client: ``media_session``
-    (audio, for the loop + think/sleep via the shared sample), ``head_pose``
-    (pat + sleep pat-wake), and ``get_frame`` (vision). ``media_opens`` counts how
-    many sessions were opened — the live composition must open exactly one.
+    """A fake sdk transport. ``head_pose``/``move_goto``/``get_frame`` here stand
+    in for the LEAKY per-call-client path (each opens a fresh ``ReachyMini``); the
+    loop must route those through the open session instead, so they bump
+    ``base_calls`` and the issue-#51 tests assert it stays 0. ``media_opens``
+    counts sessions opened — the loop must open exactly one.
     """
 
     name = "sdk-live"
 
     def __init__(self):
-        self.gotos: list[dict] = []
         self.media_opens = 0
+        self.base_calls = 0
         self._session = _Session()
 
+    @property
+    def gotos(self):  # moves now ride the one open session
+        return self._session.gotos
+
     def head_pose(self) -> tuple[float, float]:
-        return (0.0, 0.0)  # flat: no pat
+        self.base_calls += 1
+        return (0.0, 0.0)
 
     def get_frame(self):
-        return None  # no camera frame → vision is a quiet no-op
+        self.base_calls += 1
+        return None
 
     def move_goto(self, *, head=None, antennas=None, body_yaw=None, duration, interpolation):
-        self.gotos.append({"head": head, "duration": duration})
+        self.base_calls += 1
         return {"uuid": "fake"}
 
     @contextlib.contextmanager
@@ -375,3 +395,73 @@ def test_live_flag_defaults_off(monkeypatch) -> None:
     assert getattr(ns, "live", False) is False
     ns2 = parser.parse_args(["listen", "run", "--live"])
     assert ns2.live is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #51 — pose/move/frame reads ride the ONE open session, never a per-call
+# (leaking) client. Covers both the --live loop and the deployed plain listen.
+# ---------------------------------------------------------------------------
+
+
+def _run_plain_listen(monkeypatch, transport, *, max_ticks):
+    """Run the DEPLOYED path — plain ``listen run`` (no --live) — against *transport*."""
+    monkeypatch.setattr("reachy.cli._commands.listen.get_transport", lambda _: transport)
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        return main(
+            [
+                "listen",
+                "run",
+                "--json",
+                "--transport",
+                "sdk",
+                "--deadband",
+                "0",
+                "--max-ticks",
+                str(max_ticks),
+            ]
+        )
+    finally:
+        sys.stdout = old
+
+
+def test_live_pose_move_frame_do_not_leak_per_tick(monkeypatch) -> None:
+    """Issue #51: ``--live`` must not open a per-call SDK client per tick.
+
+    The crash-loop was a per-tick fd leak — ``head_pose`` (every tick) and
+    ``move_goto`` (per move) each opened *and leaked* a fresh ReachyMini (via the
+    SDK's ``GStreamerAudio`` teardown). After the fix those ride the one open
+    session, so the base per-call path is hit only a small CONSTANT number of
+    times (the one-shot preflight/settle recenters) that does NOT grow with ticks.
+    """
+    short = _LiveSdkTransport()
+    assert _run_live_cli(monkeypatch, short, max_ticks=5) == 0
+    long = _LiveSdkTransport()
+    assert _run_live_cli(monkeypatch, long, max_ticks=40) == 0
+
+    assert short.media_opens == 1 and long.media_opens == 1
+    assert long.base_calls == short.base_calls, (
+        "per-call SDK client opens scaled with ticks — the issue #51 per-tick fd "
+        f"leak is still present ({short.base_calls} at 5 ticks, {long.base_calls} at 40)"
+    )
+
+
+def test_default_listen_does_not_leak_per_tick(monkeypatch) -> None:
+    """The DEPLOYED crash path (plain ``listen run``, no --live) is leak-free too.
+
+    Same tick-invariance proof as the live case: the standard listen service's
+    per-tick PatHook ``head_pose`` read and per-move ``move_goto`` now route
+    through the one open session, so base per-call opens do not grow with ticks.
+    """
+    short = _LiveSdkTransport()
+    assert _run_plain_listen(monkeypatch, short, max_ticks=5) == 0
+    long = _LiveSdkTransport()
+    assert _run_plain_listen(monkeypatch, long, max_ticks=40) == 0
+
+    assert short.media_opens == 1 and long.media_opens == 1
+    assert long.base_calls == short.base_calls, (
+        "plain listen scaled per-call SDK opens with ticks — issue #51 leak present "
+        f"({short.base_calls} at 5 ticks, {long.base_calls} at 40)"
+    )
