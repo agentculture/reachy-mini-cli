@@ -988,6 +988,71 @@ transport at all.
 """
 
 
+_SERVICE = """\
+# reachy-mini-cli service
+
+Make the robot boot-persistent in **exactly one** presence mode. The robot has a
+single presence at a time (the single-SDK-owner model): either the idle
+`demo-mode` loop or the folded live sense loop (`listen run --live`) — never both.
+This noun installs systemd `--user` units so that one chosen presence survives a
+reboot and auto-restarts on crash, and enabling one mode always disables the
+sibling (the single-presence-owner invariant).
+
+Like `daemon`, `service` does **not** drive the robot through a transport — it
+talks to **systemd** (`systemctl --user`), so there is no `--transport` flag.
+
+## Three units
+
+- `reachy-daemon.service` — the local `reachy-mini-daemon` process. A boot
+  dependency: both presence units `Requires=` / `After=` it, so the daemon comes
+  up first. `disable` leaves the daemon enabled deliberately (other clients of
+  the robot depend on it).
+- `reachy-demo-mode.service` — the idle `demo-mode run` presence loop.
+- `reachy-live.service` — the folded live loop (`listen run --live`): hearing +
+  pat + think + vision + sleep in one process.
+
+## Verbs
+
+- `reachy-mini-cli service enable demo` — boot-persist the idle demo-mode
+  presence; disables the live sibling.
+- `reachy-mini-cli service enable live` — boot-persist the folded live sense
+  loop; disables the demo sibling.
+- `reachy-mini-cli service disable` — disable whichever presence unit is enabled
+  (the daemon is left enabled, reported as `daemon=left-enabled`).
+- `reachy-mini-cli service status` — which presence mode is enabled (or none) +
+  per-unit `is-enabled` / `is-active` + daemon health.
+- `reachy-mini-cli service install` — write all three unit files +
+  `daemon-reload`, WITHOUT enabling anything (a separate `enable` chooses the
+  mode).
+- `reachy-mini-cli service uninstall` — remove the unit files + `daemon-reload`.
+- `reachy-mini-cli service overview` — this summary.
+
+## Boot persistence (systemd --user)
+
+The presence runs as a `systemctl --user` service. For it to start at machine
+boot (before you log in), the user session needs **linger**
+(`loginctl enable-linger $USER`); otherwise it starts at first login. A true
+machine-reboot check is therefore a manual on-robot step.
+
+## Notes
+
+- Unit files live under `$XDG_CONFIG_HOME/systemd/user`
+  (`~/.config/systemd/user`).
+- A missing `systemctl` on PATH raises a clean exit-2 `CliError`; an invalid mode
+  is an exit-1 user error — never a traceback.
+- Every verb supports `--json`, results to stdout / errors+diagnostics to stderr.
+
+## Usage
+
+    reachy-mini-cli service install                  # write the units, enable nothing
+    reachy-mini-cli service enable live              # boot-persist the live loop
+    reachy-mini-cli service enable demo              # switch to idle demo (disables live)
+    reachy-mini-cli service status --json            # enabled mode + daemon health
+    reachy-mini-cli service disable                  # stop the presence (daemon stays up)
+    reachy-mini-cli service uninstall                # remove the units
+"""
+
+
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
     ("reachy",): _ROOT,
@@ -1086,4 +1151,11 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("sleep", "restart"): _SLEEP,
     ("sleep", "status"): _SLEEP,
     ("sleep", "demo"): _SLEEP,
+    ("service",): _SERVICE,
+    ("service", "overview"): _SERVICE,
+    ("service", "enable"): _SERVICE,
+    ("service", "disable"): _SERVICE,
+    ("service", "status"): _SERVICE,
+    ("service", "install"): _SERVICE,
+    ("service", "uninstall"): _SERVICE,
 }

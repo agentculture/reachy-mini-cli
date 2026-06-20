@@ -218,6 +218,69 @@ env var. If no daemon is reachable, the command exits `2` with a clean
 
 ---
 
+## Boot persistence — one presence per reboot
+
+By default nothing comes back after a reboot — you re-run `daemon start` and a
+presence noun by hand. To make the robot a **self-healing, boot-surviving
+presence**, use the `service` noun. It installs systemd `--user` units so the
+robot boots into **exactly one** presence mode and auto-restarts on crash. This
+is the single-SDK-owner model expressed across reboots: only one presence owns
+the robot, so `service` lets you persist only one mode at a time.
+
+### The two presence modes
+
+| Mode | What boots | Best for |
+|---|---|---|
+| `demo` | `reachy-mini-cli demo-mode run` — the idle feel-alive loop | A robot that just looks present (breathing, glances, sway) |
+| `live` | `reachy-mini-cli listen run --live` — the folded live sense loop | A robot that hears, sees, thinks, sleeps, and feels pats |
+
+The `live` mode is the [folded live loop](#senses-one-sdk-media-owner-at-a-time):
+**one** process running every live sense (hearing + pat + think + vision +
+sleep) over the **one** SDK media session — the supported way to run all the
+senses at once.
+
+### The workflow
+
+```bash
+reachy-mini-cli service install          # write the three systemd --user units (enable nothing)
+reachy-mini-cli service enable live      # boot-persist listen run --live
+#   or: reachy-mini-cli service enable demo   # boot-persist the idle demo loop instead
+
+reachy-mini-cli service status           # which mode is enabled (or none) + daemon health
+reachy-mini-cli service disable          # stop the enabled presence (the daemon stays up)
+reachy-mini-cli service uninstall        # remove the unit files
+```
+
+- **Exactly one presence is boot-persistent.** Enabling one mode **disables the
+  sibling** — `service enable demo` after `service enable live` flips the robot
+  to the idle loop and turns the live loop off. You never end up with two
+  presences fighting for the robot.
+- **It auto-restarts.** Each unit is `Restart=on-failure` with a 5 s back-off, so
+  a presence that crashes comes straight back.
+- **The daemon is a boot dependency.** `service` writes a `reachy-daemon.service`
+  unit and the presence units `Requires=` / `After=` it, so the daemon is always
+  up first. `service disable` stops only the presence and **leaves the daemon
+  enabled** (other clients of the robot depend on it) — reported as
+  `daemon=left-enabled`.
+- **`install` vs `enable`.** `install` writes all three unit files and reloads
+  systemd **without enabling anything**, so you can stage the units and choose the
+  mode separately; `enable {demo|live}` is the all-in-one (write + enable + disable
+  the sibling). Every verb supports `--json`.
+
+> **Reboot at machine power-on needs linger.** A `systemctl --user` service
+> normally starts at **first login**, not at machine boot. For a headless robot
+> that should come up before anyone logs in, enable **linger** for the user:
+> `loginctl enable-linger $USER`. A true machine-reboot check (power-cycle the
+> robot, confirm the presence comes back on its own) is therefore a **manual
+> on-robot step** — it is not something the CLI can self-verify.
+
+Unit files live under `$XDG_CONFIG_HOME/systemd/user` (`~/.config/systemd/user`).
+A missing `systemctl` on PATH exits `2` with a hint (this needs a Linux systemd
+user session); an invalid mode is an exit-1 user error. Run
+`reachy-mini-cli explain service` for the full reference.
+
+---
+
 ## Verify it's working
 
 A quick liveness checklist after `daemon start`:
@@ -360,9 +423,18 @@ implementation map.
 
 ### Senses (one `sdk` media owner at a time)
 
+Because only one `sdk` media owner can run at a time, the supported way to run
+**all** the senses at once is `reachy-mini-cli listen run --live`: it folds
+`think` + `vision` + `sleep` into `listen`'s single loop (alongside the head-pat
+hook), so every live sense rides the **one** SDK media session and the **one**
+motion queue in **one** process — arbitrated by the `sleep > pat > think`
+priority flags. This is the loop the [`live` boot presence](#boot-persistence--one-presence-per-reboot)
+runs (`service enable live`). Bare `listen run` (no `--live`) is the
+sound-orient + pat loop only; `--live` is `sdk`-only.
+
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
-| `listen` | two-tier sound orienting: antenna lean (Tier 1) + head→body turn on speech/snap (Tier 2); hosts the always-alive idle layer + the #43 `PatHook` | mic DoA + RMS (`media_session`) | serial MotionQueue (minjerk `goto`) | `sdk` default; `http` polls daemon DoA |
+| `listen` | two-tier sound orienting: antenna lean (Tier 1) + head→body turn on speech/snap (Tier 2); hosts the always-alive idle layer + the #43 `PatHook`; `--live` folds in think + vision + sleep | mic DoA + RMS (`media_session`) | serial MotionQueue (minjerk `goto`) | `sdk` default; `http` polls daemon DoA |
 | `vision` | turn toward motion (frame-diff) or light (brightness centroid); pure pixel math, no ML/GPU | camera frames (`get_frame()`) | serial MotionQueue | `sdk` default; `http` = metadata only (`vision specs`) |
 | `think` | LLM cognition loop: speaks `"quoted"` text + drives `*emoji*` expressions; sentence-streamed; can `--export` a JSONL feed | mic DoA + RMS (`media_session`) | expression moves on the MotionQueue | `sdk` default; `http` polls daemon DoA |
 | `pat` | feel a head pat (commanded-vs-actual pose deviation) and lean into it (lean→nuzzle→settle) | head-pose read-back (SDK client) | snuggle gesture on the MotionQueue | `sdk` only (pose read-back); `demo` needs no robot |
@@ -373,6 +445,15 @@ implementation map.
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
 | `say` | dumb TTS pipe: text → TTS → speaker (boundary-clean, no LLM/senses) | — | — (audio out) | `sdk` default playback; `http` via daemon `/media/play` |
+
+### Boot persistence
+
+| Noun | Does | Sense in | Motion out | Transport |
+|---|---|---|---|---|
+| `service` | boot-persist exactly one presence (`demo` or `live`) via systemd `--user`; enabling one disables the sibling; daemon is a boot dependency | — | — | none (talks to `systemctl --user`, not the robot) |
+
+See [Boot persistence — one presence per reboot](#boot-persistence--one-presence-per-reboot)
+for the operator workflow.
 
 ### Agent-first introspection (no robot needed)
 
