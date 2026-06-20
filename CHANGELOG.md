@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-06-20
+
+### Added
+
+- `reachy service` noun — make the robot boot-persistent in **exactly one** presence mode (demo idle, or the live folded sense loop) via systemd `--user` units: `service enable demo|live` / `disable` / `status` / `install` / `uninstall`. Enabling one mode disables the sibling (the single-presence-owner invariant), and the daemon (`reachy-daemon.service`) is a boot dependency the presence units `Requires=` / `After=`. Backed by `reachy/service/units.py` (unit-text renderers) + `reachy/service/manager.py` (`ServiceManager`).
+- `listen run --live` — the folded live sense loop: `think`, `vision`, and `sleep` run *inside* `listen`'s single loop alongside `pat` (via `reachy/motion/listen_hooks.py` `HookChain` + the shared `reachy/motion/sense_sample.py` `SenseSample` provider), so all senses share one SDK media session and one motion queue, arbitrated by the `sleep > pat > think` flags — no second media session, no ~1 Hz contention. New hooks: `reachy/motion/listen_{think,vision,sleep}.py`.
+- Reboot-survival integration test (`tests/test_service_integration.py`) proving the single-presence-owner invariant and daemon-first ordering across a simulated re-login.
+
+### Changed
+
+- Live presence is now the CLI-generated `reachy-live.service` running `listen run --live`, retiring the hand-authored `reachy-listen.service`.
+- README + CLAUDE.md noun catalogs and `docs/operating-reachy.md` document the `service` noun + the `--live` folded loop; the `explain` catalog gains a `service` entry.
+
 ## [0.22.0] - 2026-06-15
 
 ### Added
