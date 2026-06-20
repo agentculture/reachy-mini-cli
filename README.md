@@ -24,7 +24,9 @@ speaker. `reachy-mini-cli` exposes each capability as a **noun** you run from a
 shell or an agent loop: hold the hardware (`daemon`), feel alive when idle
 (`demo-mode`), orient to sound (`listen`) or sight (`vision`), speak (`say`),
 think out loud and move in step with its thoughts (`think`), feel a head pat
-(`pat`), and fall asleep when left alone (`sleep`).
+(`pat`), and fall asleep when left alone (`sleep`). `listen run --live` folds
+every live sense into one loop, and `service` makes one presence mode survive a
+reboot.
 
 ## Noun map
 
@@ -39,12 +41,13 @@ The complete robot surface. Every noun supports `--json`; run
 | `move` | One-shot `goto` / `wake` / `sleep` animations | `http` (default) |
 | `demo-mode` | Always-on "feel alive" idle loop (breathe, glances, sway) | `sdk`/`http` |
 | `behavior` | 50 Hz engine that composes named behaviors per channel | `sdk`/`http` |
-| [`listen`](docs/operating-reachy.md#senses-one-sdk-media-owner-at-a-time) | Two-tier sound orienting (antenna lean → head/body turn) | `sdk` default |
+| [`listen`](docs/operating-reachy.md#senses-one-sdk-media-owner-at-a-time) | Two-tier sound orienting (antenna lean → head/body turn); `--live` folds every sense into one loop | `sdk` default |
 | `vision` | Turn toward motion or light (pure pixel math, no ML) | `sdk` default |
 | `say` | Dumb TTS pipe: text → speaker | `sdk` default |
 | `think` | LLM cognition loop: speaks + expresses; `--export` JSONL feed | `sdk` default |
 | `pat` | Feel a head pat and lean into it (no touch sensor) | `sdk` only |
 | `sleep` | Decay to sleep when idle; wake on sound / wake-word / pat | `sdk` default |
+| [`service`](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot) | Boot-persist exactly one presence mode (`demo` or `live`) via systemd `--user` | none (manages systemd) |
 | `whoami` `quickstart` `learn` `explain` `overview` `doctor` `cli` | Agent-first introspection — no robot needed | — |
 
 > ⚠️ **Before you run two behaviors at once, read
@@ -76,6 +79,7 @@ The full operating guide is **[`docs/operating-reachy.md`](docs/operating-reachy
 - [Bring Reachy up live](docs/operating-reachy.md#bring-reachy-up-live) — install → daemon → verify → behavior
 - [The single-SDK-owner model](docs/operating-reachy.md#the-single-sdk-owner-model) — the conflict matrix + how to compose behaviors
 - [Transports — `sdk` vs `http`](docs/operating-reachy.md#transports--sdk-vs-http)
+- [Boot persistence](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot) — make one presence (`demo`/`live`) survive a reboot via `service`
 - [Verify it's working](docs/operating-reachy.md#verify-its-working)
 - [The `~/.asoundrc` mic-array gotcha](docs/operating-reachy.md#the-asoundrc-mic-array-gotcha) — the most common silent failure
 - [Environment variables](docs/operating-reachy.md#environment-variables) — every `REACHY_*` var in one table
@@ -95,12 +99,37 @@ reachy-mini-cli say run "Hello from Reachy"                    # text-to-speech
 reachy-mini-cli think run                                      # LLM cognition loop (speaks + moves)
 reachy-mini-cli pat run                                        # feel a head pat and lean in
 reachy-mini-cli sleep run                                      # fall asleep when idle, wake when addressed
+reachy-mini-cli listen run --live                              # ALL senses in one loop (the "live presence" mode)
 reachy-mini-cli daemon stop                                    # put it back down
 ```
 
 The background nouns (`demo-mode`, `listen`, `think`, `sleep`) also expose
 `start` / `stop` / `restart` / `status`; the sense nouns also expose `demo` (no
 robot needed). See `reachy-mini-cli explain <noun>`.
+
+### The live loop and boot persistence
+
+`listen run --live` folds **think + vision + sleep** into `listen`'s single loop
+(alongside the head-pat hook), so every live sense rides **one** SDK media
+session and **one** motion queue in **one** process — arbitrated by the
+`sleep > pat > think` priority flags. It is the supported way to run all the
+senses at once (one media owner; see the single-SDK-owner model below).
+
+`service` makes one presence boot-persistent via systemd `--user`. Exactly one
+mode is enabled at a time — enabling one disables the sibling — and it
+auto-restarts on crash. The daemon is a boot dependency of both presence units.
+
+```bash
+reachy-mini-cli service install                                # write the systemd units (enable nothing)
+reachy-mini-cli service enable live                            # boot-persist listen run --live (disables demo)
+reachy-mini-cli service enable demo                            # switch to the idle demo loop (disables live)
+reachy-mini-cli service status --json                          # which mode is enabled + daemon health
+reachy-mini-cli service disable                                # stop the presence (daemon stays up)
+```
+
+A true machine-reboot check is manual: a `systemctl --user` service starts at
+boot only when the user has **linger** enabled (`loginctl enable-linger $USER`).
+See [Boot persistence](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot).
 
 ## Export feed
 

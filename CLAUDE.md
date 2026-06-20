@@ -156,12 +156,13 @@ transport. Deep notes for the non-trivial nouns follow in
 | `device`/`app`/`move` | `_commands/{device,app,move}.py` | `reachy/robot/*` transports | `http` default |
 | `demo-mode` | `_commands/demo_mode.py` | `reachy/alive.py`, `reachy/motion/idle.py`, `demo_config.py`, `demo_service.py` | `sdk`/`http` |
 | `behavior` | `_commands/behavior.py` | 50 Hz engine, per-channel contention | `sdk`/`http` |
-| `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43), `motion/supervisor.py` | `sdk` default |
+| `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43); `--live`: `listen_hooks.py` `HookChain` + `sense_sample.py` + `listen_{think,vision,sleep}.py`; `motion/supervisor.py` | `sdk` default |
 | `vision` | `_commands/vision.py` | pixel motion/light detectors, serial MotionQueue | `sdk` default |
 | `say` | `_commands/say.py` | `reachy/speech/{tts,playback}.py` | `sdk` default |
 | `think` | `_commands/think.py` | `reachy/speech/{llm,cognition,events,markers,expressions,distinctness,cognition_signal}.py`, `reachy/motion/expression.py`, `reachy/export/*`, `speech/supervisor.py` | `sdk` default |
 | `pat` | `_commands/pat.py` | `reachy/motion/{pat,pat_reaction,pat_signal}.py` | `sdk` only |
 | `sleep` | `_commands/sleep.py` | `reachy/sleep/{state,stimulus,wake,patwake,wakeword,supervisor}.py`, `reachy/motion/{sleep,sleep_signal}.py` | `sdk` default |
+| `service` | `_commands/service.py` | `reachy/service/{units,manager}.py` (`ServiceManager`, systemd `--user`) | none (systemd) |
 
 ## Noun internals
 
@@ -208,6 +209,20 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
   detect→react logic, measuring deviation against the loop's *commanded* head pose
   (so `listen`'s own turns read as zero deviation and never false-fire). See
   [the single-SDK-owner model](#the-single-sdk-owner-model-contributor-note).
+- **`--live` — all four senses in one loop:** `listen run --live` folds `think`,
+  `vision`, and `sleep` *into* `listen`'s loop alongside the `PatHook`, so every
+  live sense rides the **one** SDK media session and the **one** `MotionQueue` in
+  **one** process — the same single-SDK-owner argument that motivated #43, applied
+  to every sense. The folded hooks are `reachy/motion/listen_{think,vision,sleep}.py`,
+  composed by `reachy/motion/listen_hooks.py` `HookChain` — a single `on_tick`
+  callable that fans the seam out across the hook list (per-tick `try/except`
+  isolation + per-hook `close`). The audio hooks (`think`, `sleep`) do **not** open
+  a second `media_session()`; they read the loop's own per-tick reading through the
+  shared `reachy/motion/sense_sample.py` `SenseSample` provider (a per-tick tap on
+  the value the loop already pulls). Hooks run in descending idle-interrupt priority
+  `sleep > pat > think` (vision rides last; it competes for nothing the flags
+  arbitrate). Off by default (`sdk` only) — bare `listen run` is unchanged. This is
+  the loop the `live` boot-presence service runs (see the `service` noun below).
 
 ### `say` noun — dumb TTS pipe
 
@@ -392,6 +407,41 @@ missing `[sdk]` extra raises a clean exit-2 `CliError`. Determinism seams for
 tests: `SleepState` timer takes an injected clock; `sleep run` takes a bounded
 `--ticks N` and injects the transport via `get_transport`; `demo` needs no
 robot.
+
+### `service` noun — boot-persistent single-presence (systemd `--user`)
+
+`reachy/cli/_commands/service.py` exposes `enable {demo|live}` / `disable` /
+`status` / `install` / `uninstall` / `overview`. It is the operator front for
+making the robot survive a reboot in **exactly one** presence mode — the idle
+`demo-mode` loop or the folded `listen run --live` loop, never both — the
+single-SDK-owner model expressed across reboots. Like `daemon`, it does **not**
+use a transport: it talks to **systemd** (`systemctl --user`), so it never calls
+`_robot.get_transport` / `noun_overview` and its `overview` is hand-built.
+
+- **Units (`reachy/service/units.py`).** Pure unit-text renderers (every function
+  returns a `str`, no side effects) for the three units, with their canonical
+  names exported as the cross-module contract `DAEMON_UNIT` /
+  `DEMO_UNIT` / `LIVE_UNIT` (`reachy-daemon.service` /
+  `reachy-demo-mode.service` / `reachy-live.service`). All three share
+  `Type=simple` + `Restart=on-failure` + `RestartSec=5` (so a crash auto-restarts)
+  and `WantedBy=default.target`. The two presence units additionally `Requires=` /
+  `After=` the daemon unit — **the daemon is a boot dependency**, started first.
+  The live unit's `ExecStart` is `<python> -m reachy listen run --live`.
+- **Manager (`reachy/service/manager.py` `ServiceManager`).** Enforces the
+  **single-presence-owner invariant**: `enable(mode)` writes + `enable --now`s the
+  daemon and the chosen presence unit and **always `disable --now`s the sibling**,
+  so any sequence of enables leaves at most one presence enabled. `disable()`
+  stops only the enabled presence and **leaves the daemon enabled** (explicit,
+  reported as `daemon="left-enabled"` — other clients depend on it). `status()`
+  reads `is-enabled` / `is-active` per unit + folds a daemon-health probe. Every
+  side effect goes through injected seams (`run` / `unit_dir` / `daemon_health`),
+  so it is exhaustively testable without real systemd.
+- The command module's `install` / `uninstall` write/remove **all three** unit
+  files + `daemon-reload` without enabling anything (so a separate `enable` chooses
+  the mode). A missing `systemctl` on PATH raises a clean exit-2 `CliError`; an
+  invalid mode is an exit-1 user error. Every verb supports `--json`. Boot at
+  machine power-on (vs. first login) needs `loginctl enable-linger`; a true
+  reboot check is a manual on-robot step.
 
 ## Hard constraints
 
