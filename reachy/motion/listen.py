@@ -51,7 +51,40 @@ from reachy.behavior.sense import Sense, doa_angle_to_yaw
 from reachy.motion import pat_signal, sleep_signal
 from reachy.motion.idle import AliveConfig, next_pose
 from reachy.motion.queue import ANTENNA_KEY, IDLE_KEY, LOOK_KEY, MotionAction
+from reachy.motion.sense_sample import SenseSample
 from reachy.speech import cognition_signal
+
+
+class SampleHolder:
+    """The single-writer holder for the loop's per-tick shared :class:`SenseSample`.
+
+    The ``listen`` loop already derives one DoA + RMS + speech reading per tick (to
+    drive the Tier-1 antenna lean and Tier-2 turn). Under ``listen run --live`` the
+    folded audio-sense hooks (``think`` / ``sleep``) must consume *that* reading
+    rather than open a second, single-consumer media session — see the
+    single-SDK-owner model in ``CLAUDE.md`` and :mod:`reachy.motion.sense_sample`.
+
+    The composition layer (``listen run --live``) constructs one holder, wires the
+    loop's sense/audio taps to call :meth:`update` once per tick, and hands the
+    hooks a provider (``holder.provider`` / ``lambda: holder.latest``). It is a
+    plain attribute swap — a single writer (the loop tick) and one or more readers
+    (the hooks, all on the same loop thread), so no lock is needed; a hook simply
+    sees the most recent sample, or ``None`` before the first tick.
+    """
+
+    __slots__ = ("latest",)
+
+    def __init__(self) -> None:
+        #: The most recent per-tick sample, or ``None`` before the first update.
+        self.latest: SenseSample | None = None
+
+    def update(self, sample: SenseSample) -> None:
+        """Publish this tick's shared sample (called once per loop tick)."""
+        self.latest = sample
+
+    def provider(self) -> SenseSample | None:
+        """A :data:`~reachy.motion.sense_sample.SampleProvider` reading the latest sample."""
+        return self.latest
 
 
 @dataclass
