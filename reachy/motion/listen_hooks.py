@@ -113,5 +113,5 @@ class HookChain:
                 continue
             try:
                 close()
-            except Exception:  # noqa: BLE001 — one bad close must not block the rest
+            except Exception:  # noqa: BLE001
                 logger.warning("on_tick hook %r close() raised; skipping it", hook, exc_info=True)

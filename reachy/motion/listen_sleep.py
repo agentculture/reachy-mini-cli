@@ -240,7 +240,7 @@ class SleepHook:
         """Read the shared sample, degrading any provider error to ``None``."""
         try:
             return self._sample()
-        except Exception:  # noqa: BLE001 — a provider hiccup is "no sample", never fatal
+        except Exception:  # noqa: BLE001
             return None
 
     def _doa_shifted(self, curr: float | None) -> bool:
@@ -267,7 +267,7 @@ class SleepHook:
             return False
         try:
             actual_pitch, actual_yaw = head_pose()
-        except Exception:  # noqa: BLE001 — a CliError/transport hiccup is "no pat", never fatal
+        except Exception:  # noqa: BLE001
             actual_pitch, actual_yaw = commanded_pitch, commanded_yaw
         event = self._pat.update(commanded_pitch, actual_pitch, commanded_yaw, actual_yaw, now=now)
         return event is not None

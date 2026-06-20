@@ -177,7 +177,7 @@ class ThinkHook:
         """
         try:
             sample = self._provider()
-        except Exception:  # noqa: BLE001 - a faulty sensor must never kill the loop
+        except Exception:  # noqa: BLE001
             logger.warning("ThinkHook sample provider raised; skipping tick", exc_info=True)
             return
         if sample is None:
@@ -185,7 +185,7 @@ class ThinkHook:
         try:
             self._feed(sample)
             self._ensure_worker()
-        except Exception:  # noqa: BLE001 - degrade silently, exactly like PatHook
+        except Exception:  # noqa: BLE001
             logger.warning("ThinkHook tick degraded (feed/spawn fault)", exc_info=True)
 
     # ------------------------------------------------------------------
@@ -235,7 +235,7 @@ class ThinkHook:
         """
         try:
             self._engine.run(stop=lambda: self._stop)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001 - cognition faults must not kill listen
+        except Exception:  # noqa: BLE001
             logger.warning("ThinkHook cognition worker raised; cognition stopped", exc_info=True)
 
     def close(self) -> None:
@@ -255,7 +255,7 @@ class ThinkHook:
                 join = getattr(worker, "join", None)
                 if join is not None:
                     join(timeout=5.0)
-            except Exception:  # noqa: BLE001 - best-effort join
+            except Exception:  # noqa: BLE001
                 logger.warning("ThinkHook worker join failed", exc_info=True)
         if self._flag_up or cognition_signal.is_active():
             cognition_signal.clear()

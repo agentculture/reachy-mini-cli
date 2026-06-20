@@ -179,7 +179,7 @@ class VisionHook:
         while not self._stop.is_set():
             try:
                 frame = self._frame_source()
-            except Exception:  # noqa: BLE001 — degrade silently, never a traceback
+            except Exception:  # noqa: BLE001
                 frame = None
             if frame is not None:
                 self._holder.publish(frame)
@@ -213,7 +213,7 @@ class VisionHook:
             return
         try:
             action = self.detector.decide(frame, t)
-        except Exception:  # noqa: BLE001 — a detector hiccup never kills the loop
+        except Exception:  # noqa: BLE001
             return
         if action is None:
             return

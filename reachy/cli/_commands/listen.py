@@ -391,7 +391,7 @@ def _build_think_hook(provider: Callable[[], SenseSample | None]) -> ThinkHook |
         buffer = EventBuffer()
         engine = CognitionEngine(buffer=buffer)
         return ThinkHook(provider, engine=engine, buffer=buffer)
-    except Exception:  # noqa: BLE001 — cognition is optional; never kill the live loop
+    except Exception:  # noqa: BLE001
         logger.warning(
             "listen --live: cognition engine unavailable; think fold-in disabled", exc_info=True
         )
@@ -399,7 +399,6 @@ def _build_think_hook(provider: Callable[[], SenseSample | None]) -> ThinkHook |
 
 
 def _build_live_hooks(
-    args: argparse.Namespace,
     transport: object,
     queue: MotionQueue,
     provider: Callable[[], SenseSample | None],
@@ -433,7 +432,6 @@ def _build_sample_tap(
     poller: DoaPoller,
     audio: Callable[[float], tuple[bool, bool | None]],
     session: object,
-    detector: SnapDetector,
 ) -> tuple[Callable[[float], Sense], Callable[[float], tuple[bool, bool | None]]]:
     """Wrap the loop's sense/audio taps so each tick publishes a shared SenseSample.
 
@@ -518,8 +516,8 @@ def _run_sdk_loop(
         # The default keeps the established single-PatHook on_tick and the bare
         # sense/audio taps byte-for-byte (no chain, no holder tap, no extra read).
         if getattr(args, "live", False):
-            sense_tap, audio_tap = _build_sample_tap(holder, poller, _audio, session, detector)
-            hooks_list = _build_live_hooks(args, transport, queue, holder.provider, pat_hook)
+            sense_tap, audio_tap = _build_sample_tap(holder, poller, _audio, session)
+            hooks_list = _build_live_hooks(transport, queue, holder.provider, pat_hook)
             on_tick: object = HookChain(hooks_list)
         else:
             sense_tap, audio_tap = poller, _audio
