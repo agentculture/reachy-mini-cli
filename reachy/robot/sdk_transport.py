@@ -78,24 +78,20 @@ def _euler_pitch_yaw(pose: "np.ndarray") -> tuple[float, float]:
     return float(pitch), float(yaw)
 
 
-def _goto_kwargs(
+def _target_kwargs(
     create_head_pose,  # type: ignore[no-untyped-def]
     *,
     head: dict[str, float] | None,
     antennas: tuple[float, float] | None,
     body_yaw: float | None,
-    duration: float,
-    interpolation: str,
 ) -> dict[str, object]:
-    """Build ``goto_target`` kwargs (friendly mm/deg → SDK metres/radians).
+    """Build the head / antennas / body_yaw kwargs (friendly mm/deg → SDK units).
 
-    Shared by :meth:`SdkTransport.move_goto` (opens a client per call) and
-    :meth:`MediaSession.move_goto` (reuses the loop's one open client).
+    The single source of truth for the friendly→SDK conversion, shared by the
+    streaming sink (:meth:`_SdkSink.set_target`) and the goto path
+    (:func:`_goto_kwargs`).
     """
-    kwargs: dict[str, object] = {
-        "duration": duration,
-        "method": _INTERP_TO_SDK.get(interpolation, "minjerk"),
-    }
+    kwargs: dict[str, object] = {}
     if head is not None:
         kwargs["head"] = create_head_pose(
             x=head["x"],
@@ -111,6 +107,26 @@ def _goto_kwargs(
         kwargs["antennas"] = [math.radians(antennas[0]), math.radians(antennas[1])]
     if body_yaw is not None:
         kwargs["body_yaw"] = math.radians(body_yaw)
+    return kwargs
+
+
+def _goto_kwargs(
+    create_head_pose,  # type: ignore[no-untyped-def]
+    *,
+    head: dict[str, float] | None,
+    antennas: tuple[float, float] | None,
+    body_yaw: float | None,
+    duration: float,
+    interpolation: str,
+) -> dict[str, object]:
+    """Build ``goto_target`` kwargs (target kwargs + duration/method).
+
+    Shared by :meth:`SdkTransport.move_goto` (opens a client per call) and
+    :meth:`MediaSession.move_goto` (reuses the loop's one open client).
+    """
+    kwargs = _target_kwargs(create_head_pose, head=head, antennas=antennas, body_yaw=body_yaw)
+    kwargs["duration"] = duration
+    kwargs["method"] = _INTERP_TO_SDK.get(interpolation, "minjerk")
     return kwargs
 
 
@@ -226,22 +242,9 @@ class _SdkSink:
         antennas: tuple[float, float] | None = None,
         body_yaw: float | None = None,
     ) -> object:
-        kwargs: dict[str, object] = {}
-        if head is not None:
-            kwargs["head"] = self._create_head_pose(
-                x=head["x"],
-                y=head["y"],
-                z=head["z"],
-                roll=head["roll"],
-                pitch=head["pitch"],
-                yaw=head["yaw"],
-                mm=True,
-                degrees=True,
-            )
-        if antennas is not None:
-            kwargs["antennas"] = [math.radians(antennas[0]), math.radians(antennas[1])]
-        if body_yaw is not None:
-            kwargs["body_yaw"] = math.radians(body_yaw)
+        kwargs = _target_kwargs(
+            self._create_head_pose, head=head, antennas=antennas, body_yaw=body_yaw
+        )
         self._mini.set_target(**kwargs)
         return {"status": "ok", "transport": "sdk", "action": "set_target"}
 
