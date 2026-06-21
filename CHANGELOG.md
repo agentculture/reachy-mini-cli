@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-06-21
+
+### Added
+
+- `listen run --live --transcribe`: optional STT transcribes nearby speech (model-gear / Parakeet at `REACHY_STT_URL`) and feeds the recognised WORDS into live cognition, so the robot reasons about what was said, not just that a sound came from a direction. Off by default; requires `--live` + the `sdk` transport. A self-mute window stops the robot transcribing its own voice; an unreachable STT degrades to no-words and never stalls the loop. Not a dialogue/turn-taking assistant.
+- `reachy/speech/stt.py` shared `Transcriber` — the Parakeet `/v1/audio/transcriptions` WAV-multipart leg (stdlib urllib + numpy), returning transcript text.
+- `SenseSample.audio` optional raw per-tick mic chunk; `EventBuffer.feed_transcript` transcript cue; `reachy/motion/listen_transcribe.py` `TranscribeHook` (rides the shared sample, opens no second media session).
+
+### Changed
+
+- `sleep` wake-word `HttpSttBackend` now delegates transcription to the shared `Transcriber` (one STT client, no duplicated WAV/multipart/urllib stack).
+- the systemd `live` boot unit runs `listen run --live --transcribe`, so the on-robot presence hears words by default (CLI default stays off).
+
 ## [0.25.0] - 2026-06-21
 
 ### Added
