@@ -97,8 +97,10 @@ def test_synthesize_empty_text_returns_empty(monkeypatch: pytest.MonkeyPatch) ->
     assert called == [], "network should not be called for empty-after-clean text"
 
 
-def test_synthesize_sends_correct_form_fields(monkeypatch: pytest.MonkeyPatch) -> None:
-    """synthesize() POSTs expected form fields to /v1/audio/synthesize."""
+def test_synthesize_sends_json_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """synthesize() POSTs a JSON {"text","voice"} body to /v1/audio/synthesize (Chatterbox)."""
+    import json as _json
+
     captured: list[urllib.request.Request] = []
 
     def _capture(req, timeout=None):
@@ -113,10 +115,27 @@ def test_synthesize_sends_correct_form_fields(monkeypatch: pytest.MonkeyPatch) -
     req = captured[0]
     assert req.full_url.endswith("/v1/audio/synthesize")
     assert req.method == "POST"
-    body = req.data.decode("utf-8")
-    assert "text=" in body
-    assert "encoding=LINEAR_PCM" in body
-    assert "language=en-US" in body
+    assert req.headers["Content-type"] == "application/json"
+    payload = _json.loads(req.data.decode("utf-8"))
+    assert payload == {"text": "Speak this.", "voice": "en-US-female"}
+
+
+def test_synthesize_default_voice_is_null(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no voice set, the JSON body sends "voice": null (Chatterbox default voice)."""
+    import json as _json
+
+    captured: list[bytes] = []
+
+    def _capture(req, timeout=None):
+        captured.append(req.data)
+        return _FakeResponse(_fake_pcm(40_000))
+
+    monkeypatch.setattr("urllib.request.urlopen", _capture)
+
+    synthesize("Hello.", tts_url="http://stub:9000")
+    assert captured
+    payload = _json.loads(captured[0].decode("utf-8"))
+    assert payload["voice"] is None
 
 
 # ---------------------------------------------------------------------------

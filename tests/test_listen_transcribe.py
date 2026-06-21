@@ -46,9 +46,11 @@ class _RecordingBuffer:
 
     def __init__(self) -> None:
         self.transcripts: list[str] = []
+        self.directions: list[str | None] = []
 
-    def feed_transcript(self, text: str) -> None:
+    def feed_transcript(self, text: str, *, direction: str | None = None) -> None:
         self.transcripts.append(text)
+        self.directions.append(direction)
 
 
 class _FakeTranscriber:
@@ -60,10 +62,17 @@ class _FakeTranscriber:
 
     def __init__(self, results: list | None = None) -> None:
         self.calls: list[np.ndarray] = []
+        self.once_calls: list[np.ndarray] = []
         self._results = list(results or [])
 
     def transcribe(self, audio: np.ndarray):
         self.calls.append(audio)
+        if self._results:
+            return self._results.pop(0)
+        return None
+
+    def transcribe_once(self, audio: np.ndarray):
+        self.once_calls.append(audio)
         if self._results:
             return self._results.pop(0)
         return None
@@ -80,6 +89,30 @@ def _make_hook(provider, **kwargs):
     transcriber = kwargs.pop("transcriber", None) or _FakeTranscriber()
     hook = TranscribeHook(provider, buffer=buffer, transcriber=transcriber, **kwargs)
     return hook, buffer, transcriber
+
+
+def _make_driven_hook(*, transcriber=None, buffer=None, **kwargs):
+    """A hook reading a *mutable* holder so a test can feed speech then a pause.
+
+    Defaults ``min_utterance_s=0`` so even a small test chunk flushes (tests that
+    care about the minimum-duration gate set it explicitly). Returns the holder so
+    the test can swap the sample between ticks.
+    """
+    kwargs.setdefault("min_utterance_s", 0.0)
+    holder: dict = {"s": None}
+    hook, buf, tr = _make_hook(
+        lambda: holder["s"], transcriber=transcriber, buffer=buffer, **kwargs
+    )
+    return hook, buf, tr, holder
+
+
+def _utterance(hook, holder, *, t_speech=0.0, t_pause=1.0, doa=10.0, audio=None) -> None:
+    """Drive ONE utterance: a speech tick, then a pause tick (> silence_hold) that flushes."""
+    chunk = _audio() if audio is None else audio
+    holder["s"] = SenseSample(rms=0.1, doa=doa, speech=True, ts=t_speech, audio=chunk)
+    hook(object(), MotionQueue(), t_speech, {"pitch": 0.0, "yaw": 0.0})
+    holder["s"] = SenseSample(rms=0.0, doa=doa, speech=False, ts=t_pause, audio=None)
+    hook(object(), MotionQueue(), t_pause, {"pitch": 0.0, "yaw": 0.0})
 
 
 # ---------------------------------------------------------------------------
@@ -128,21 +161,22 @@ def test_speech_but_no_audio_does_not_transcribe() -> None:
     assert buffer.transcripts == []
 
 
-def test_speech_and_audio_not_muted_transcribes_and_feeds() -> None:
-    """speech + audio + not muted → transcribe is called and a hit is fed."""
-    audio = _audio()
-    sample = SenseSample(rms=0.09, doa=10.0, speech=True, ts=1.0, audio=audio)
-    transcriber = _FakeTranscriber(results=["hello there"])
-    hook, buffer, _t = _make_hook(lambda: sample, transcriber=transcriber)
+def test_utterance_transcribes_once_on_pause_and_feeds() -> None:
+    """A whole utterance is transcribed ONCE on the pause and fed (name → engages)."""
+    transcriber = _FakeTranscriber(results=["reachy hello there"])  # name → engagement
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
 
-    # mute_until defaults to never-muted (0.0), so this tick is eligible.
-    hook(object(), MotionQueue(), 0.1, {"pitch": 0.0, "yaw": 0.0})
+    # Speech tick: accumulate only — no STT POST mid-utterance.
+    holder["s"] = SenseSample(rms=0.1, doa=10.0, speech=True, ts=0.0, audio=_audio())
+    hook(object(), MotionQueue(), 0.0, {"pitch": 0.0, "yaw": 0.0})
+    assert transcriber.once_calls == [], "no transcription mid-utterance"
+    assert buffer.transcripts == []
 
-    assert len(transcriber.calls) == 1, "an eligible tick must transcribe exactly once"
-    # The hook fed the shared sample's raw audio (not a reconstruction).
-    assert transcriber.calls[0] is audio
-    assert buffer.transcripts == ["hello there"], "a non-empty transcript is fed to cognition"
-    # Diagnostics counter advanced.
+    # Pause tick (> silence_hold) → flush the whole utterance once and feed it.
+    holder["s"] = SenseSample(rms=0.0, doa=10.0, speech=False, ts=1.0, audio=None)
+    hook(object(), MotionQueue(), 1.0, {"pitch": 0.0, "yaw": 0.0})
+    assert len(transcriber.once_calls) == 1, "the pause flushes exactly one POST"
+    assert buffer.transcripts == ["reachy hello there"]
     assert hook.transcripts == 1
 
 
@@ -165,21 +199,108 @@ def test_self_mute_window_discards_audio_before_transcription() -> None:
     assert buffer.transcripts == [], "muted tick feeds nothing"
 
 
-def test_outside_mute_window_transcribes() -> None:
-    """Once ``t`` reaches/passes ``mute_until`` the tick transcribes again."""
-    audio = _audio()
-    sample = SenseSample(rms=0.09, doa=10.0, speech=True, ts=1.0, audio=audio)
-    transcriber = _FakeTranscriber(results=["after the mute"])
-    hook, buffer, _t = _make_hook(lambda: sample, transcriber=transcriber, mute_until=lambda: 2.5)
+def test_muted_speech_is_not_accumulated_only_outside_mute() -> None:
+    """Speech inside the mute window is dropped; only post-mute speech is transcribed."""
+    transcriber = _FakeTranscriber(results=["reachy after the mute"])
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber, mute_until=lambda: 2.5)
 
-    # t below the mute deadline → discarded.
+    # Speech while muted (t < 2.5) → discarded, never accumulated.
+    holder["s"] = SenseSample(rms=0.1, doa=10.0, speech=True, ts=1.0, audio=_audio())
     hook(object(), MotionQueue(), 1.0, {"pitch": 0.0, "yaw": 0.0})
-    assert transcriber.calls == []
+    assert transcriber.once_calls == []
 
-    # t at/after the mute deadline → eligible.
-    hook(object(), MotionQueue(), 3.0, {"pitch": 0.0, "yaw": 0.0})
-    assert len(transcriber.calls) == 1
-    assert buffer.transcripts == ["after the mute"]
+    # Speech once the mute clears (t >= 2.5), then a pause → flush.
+    _utterance(hook, holder, t_speech=3.0, t_pause=4.0)
+    assert len(transcriber.once_calls) == 1
+    assert buffer.transcripts == ["reachy after the mute"]
+
+
+def test_transcript_carries_doa_direction() -> None:
+    """The hook derives the speaker's direction from the utterance's DoA and feeds it.
+
+    doa=10° (near the left in the 0=left/90=front/180=right convention) → "left".
+    """
+    transcriber = _FakeTranscriber(results=["reachy hello"])  # name → engages
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
+
+    _utterance(hook, holder, doa=10.0)
+
+    assert buffer.transcripts == ["reachy hello"]
+    assert buffer.directions == ["left"], "the words' DoA direction must be passed through"
+
+
+def test_transcript_direction_none_when_no_doa() -> None:
+    """An utterance with no DoA reading feeds the words with direction=None (plain cue)."""
+    transcriber = _FakeTranscriber(results=["reachy no direction"])
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
+
+    _utterance(hook, holder, doa=None)
+
+    assert buffer.transcripts == ["reachy no direction"]
+    assert buffer.directions == [None]
+
+
+# ---------------------------------------------------------------------------
+# 3b. Engagement gate — clear sentences, addressed by name or ongoing conversation
+# ---------------------------------------------------------------------------
+
+
+def test_name_engages_even_when_idle() -> None:
+    """An utterance naming the robot is fed even with no prior conversation."""
+    transcriber = _FakeTranscriber(results=["robot what time is it"])
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
+    _utterance(hook, holder, t_speech=0.0, t_pause=1.0)
+    assert buffer.transcripts == ["robot what time is it"]
+
+
+def test_unaddressed_coherent_sentence_is_ignored_when_idle() -> None:
+    """A coherent sentence with no name and no ongoing conversation is ignored."""
+    transcriber = _FakeTranscriber(results=["the weather is nice today"])
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
+    _utterance(hook, holder, t_speech=0.0, t_pause=1.0)
+    assert buffer.transcripts == [], "ambient speech not addressed to the robot is ignored"
+
+
+def test_short_fragment_is_ignored() -> None:
+    """A 1-2 word fragment (no name) is below the coherence floor → ignored."""
+    transcriber = _FakeTranscriber(results=["uh yeah"])
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
+    _utterance(hook, holder, t_speech=0.0, t_pause=1.0)
+    assert buffer.transcripts == [], "a short fragment is not a clear sentence"
+
+
+def test_coherent_followup_engages_within_conversation_window() -> None:
+    """After a name-addressed turn, a coherent follow-up (no name) is accepted in-window."""
+    transcriber = _FakeTranscriber(results=["reachy hello", "what is the weather like"])
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber, engage_window_s=20.0)
+
+    _utterance(hook, holder, t_speech=0.0, t_pause=1.0)  # name → engages, opens window
+    _utterance(hook, holder, t_speech=5.0, t_pause=6.0)  # follow-up within 20s → accepted
+    assert buffer.transcripts == ["reachy hello", "what is the weather like"]
+
+
+def test_followup_ignored_after_conversation_window_expires() -> None:
+    """A coherent follow-up (no name) after the window expires is ignored again."""
+    transcriber = _FakeTranscriber(results=["reachy hello", "what is the weather like"])
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber, engage_window_s=10.0)
+
+    _utterance(hook, holder, t_speech=0.0, t_pause=1.0)  # engages until ~11.0
+    _utterance(hook, holder, t_speech=30.0, t_pause=31.0)  # well past the window → ignored
+    assert buffer.transcripts == ["reachy hello"]
+
+
+def test_too_short_utterance_is_not_transcribed() -> None:
+    """An utterance below min_utterance_s never reaches the STT (no POST)."""
+    transcriber = _FakeTranscriber(results=["reachy hello there"])
+    # Default min_utterance_s=0.3s @16k = 4800 samples; a 1000-sample chunk is too short.
+    holder: dict = {"s": None}
+    hook, buffer, _t = _make_hook(lambda: holder["s"], transcriber=transcriber, sample_rate=16000)
+    holder["s"] = SenseSample(rms=0.1, doa=10.0, speech=True, ts=0.0, audio=_audio(1000))
+    hook(object(), MotionQueue(), 0.0, {"pitch": 0.0, "yaw": 0.0})
+    holder["s"] = SenseSample(rms=0.0, doa=10.0, speech=False, ts=1.0, audio=None)
+    hook(object(), MotionQueue(), 1.0, {"pitch": 0.0, "yaw": 0.0})
+    assert transcriber.once_calls == [], "a sub-min-duration blip is not transcribed"
+    assert buffer.transcripts == []
 
 
 # ---------------------------------------------------------------------------
@@ -188,25 +309,23 @@ def test_outside_mute_window_transcribes() -> None:
 
 
 def test_none_transcript_feeds_nothing() -> None:
-    """A ``None`` transcript (not enough audio / throttled) feeds nothing."""
-    sample = SenseSample(rms=0.09, doa=10.0, speech=True, ts=1.0, audio=_audio())
+    """A ``None`` transcript (STT failure) feeds nothing even after a flush."""
     transcriber = _FakeTranscriber(results=[None])
-    hook, buffer, _t = _make_hook(lambda: sample, transcriber=transcriber)
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
 
-    hook(object(), MotionQueue(), 0.1, {"pitch": 0.0, "yaw": 0.0})
+    _utterance(hook, holder)
 
-    assert len(transcriber.calls) == 1, "we still attempt a transcription"
+    assert len(transcriber.once_calls) == 1, "we still attempt a transcription on the pause"
     assert buffer.transcripts == [], "a None transcript feeds nothing"
     assert hook.transcripts == 0, "a None transcript does not advance the counter"
 
 
 def test_empty_transcript_feeds_nothing() -> None:
     """An empty-string transcript feeds nothing."""
-    sample = SenseSample(rms=0.09, doa=10.0, speech=True, ts=1.0, audio=_audio())
     transcriber = _FakeTranscriber(results=[""])
-    hook, buffer, _t = _make_hook(lambda: sample, transcriber=transcriber)
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
 
-    hook(object(), MotionQueue(), 0.1, {"pitch": 0.0, "yaw": 0.0})
+    _utterance(hook, holder)
 
     assert buffer.transcripts == [], "an empty transcript feeds nothing"
 
@@ -240,23 +359,22 @@ def test_faulty_provider_degrades_silently() -> None:
 
 
 def test_faulty_transcriber_degrades_silently() -> None:
-    """A transcriber that raises is swallowed; the tick returns, no feed."""
+    """A transcriber that raises on flush is swallowed; the tick returns, no feed."""
 
     class _BadTranscriber:
         def __init__(self) -> None:
             self.calls = 0
 
-        def transcribe(self, audio):  # noqa: ARG002
+        def transcribe_once(self, audio):  # noqa: ARG002
             self.calls += 1
             raise RuntimeError("STT blew up")
 
-    sample = SenseSample(rms=0.09, doa=10.0, speech=True, ts=1.0, audio=_audio())
     bad = _BadTranscriber()
-    hook, buffer, _t = _make_hook(lambda: sample, transcriber=bad)
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=bad)
 
-    # The transcription fault must not escape the tick.
-    hook(object(), MotionQueue(), 0.1, {"pitch": 0.0, "yaw": 0.0})
-    assert bad.calls == 1, "the hook did attempt a transcription"
+    # The transcription fault on the flush must not escape the tick.
+    _utterance(hook, holder)
+    assert bad.calls == 1, "the hook did attempt a transcription on the pause"
     assert buffer.transcripts == [], "a failed transcription feeds nothing"
 
 
@@ -264,16 +382,15 @@ def test_faulty_feed_degrades_silently() -> None:
     """A buffer whose feed_transcript raises is swallowed; the tick returns."""
 
     class _BadBuffer(_RecordingBuffer):
-        def feed_transcript(self, text):  # noqa: ARG002
+        def feed_transcript(self, text, *, direction=None):  # noqa: ARG002
             raise RuntimeError("buffer fault")
 
-    sample = SenseSample(rms=0.09, doa=10.0, speech=True, ts=1.0, audio=_audio())
-    transcriber = _FakeTranscriber(results=["words"])
-    hook, _b, _t = _make_hook(lambda: sample, buffer=_BadBuffer(), transcriber=transcriber)
+    transcriber = _FakeTranscriber(results=["reachy words"])  # name → reaches the feed
+    hook, _b, _t, holder = _make_driven_hook(transcriber=transcriber, buffer=_BadBuffer())
 
     # The feed fault must not escape the tick.
-    hook(object(), MotionQueue(), 0.1, {"pitch": 0.0, "yaw": 0.0})
-    assert len(transcriber.calls) == 1
+    _utterance(hook, holder)
+    assert len(transcriber.once_calls) == 1
 
 
 def test_close_is_idempotent() -> None:
@@ -300,13 +417,17 @@ def test_hook_never_opens_a_media_session() -> None:
         def head_pose(self):  # pragma: no cover
             raise AssertionError("TranscribeHook must not read head_pose either")
 
-    sample = SenseSample(rms=0.09, doa=10.0, speech=True, ts=1.0, audio=_audio())
-    transcriber = _FakeTranscriber(results=["hi"])
-    hook, buffer, _t = _make_hook(lambda: sample, transcriber=transcriber)
+    transcriber = _FakeTranscriber(results=["reachy hi there"])  # name → engages
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
+    xport = _ExplodingTransport()
 
-    # Passing a transport whose media_session explodes proves it is never called.
-    hook(_ExplodingTransport(), MotionQueue(), 0.1, {"pitch": 0.0, "yaw": 0.0})
-    assert buffer.transcripts == ["hi"]
+    # Drive a full utterance through a transport whose media_session explodes —
+    # proving the hook rides only the provider and never opens a session.
+    holder["s"] = SenseSample(rms=0.1, doa=10.0, speech=True, ts=0.0, audio=_audio())
+    hook(xport, MotionQueue(), 0.0, {"pitch": 0.0, "yaw": 0.0})
+    holder["s"] = SenseSample(rms=0.0, doa=10.0, speech=False, ts=1.0, audio=None)
+    hook(xport, MotionQueue(), 1.0, {"pitch": 0.0, "yaw": 0.0})
+    assert buffer.transcripts == ["reachy hi there"]
 
 
 def test_module_does_not_import_reachy_mini_or_media_session() -> None:

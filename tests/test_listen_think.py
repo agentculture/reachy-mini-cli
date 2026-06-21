@@ -203,6 +203,23 @@ def test_speech_sample_feeds_engine_and_raises_flag() -> None:
     assert cs.is_active() is False, "close() must clear the think-active flag"
 
 
+def test_feed_doa_cues_false_suppresses_raw_cues_but_still_runs_worker() -> None:
+    """With feed_doa_cues=False (words-only / --transcribe), no raw DoA cue is fed.
+
+    The worker still starts (it consumes transcripts fed by the TranscribeHook), but
+    the raw DoA/RMS/speech cue is NOT pushed — so the robot can't react to its own
+    TTS as sound and chatter in a feedback loop.
+    """
+    sample = SenseSample(rms=0.5, doa=10.0, speech=True, ts=1.0)
+    hook, engine, spawn = _make_hook(lambda: sample, feed_doa_cues=False)
+
+    hook(object(), MotionQueue(), 0.1, {"pitch": 0.0, "yaw": 0.0})
+
+    assert engine.buffer.doa_feeds == [], "words-only mode must feed no raw DoA cues"
+    assert hook.events == 1, "the tick is still counted"
+    assert len(spawn.spawned) == 1, "the cognition worker still starts (to consume words)"
+
+
 def test_flag_is_raised_while_cognition_runs() -> None:
     """While the cognition worker is in its run loop, the flag is up."""
     engine = _FakeEngine()

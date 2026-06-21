@@ -209,6 +209,26 @@ class Transcriber:
             logger.debug("[stt] transcription request failed (%s); no transcript this tick", exc)
             return None
 
+    def transcribe_once(self, audio: np.ndarray) -> str | None:
+        """Transcribe a COMPLETE utterance buffer in a single POST — no window/throttle.
+
+        For callers that do their own endpointing (accumulate a whole utterance,
+        then transcribe on a pause), this bypasses the rolling-window + throttle of
+        :meth:`transcribe` so the STT server sees the *full phrase* rather than a
+        ``window_seconds`` slice — the difference between "dog near the riverbank"
+        and the whole sentence. Returns the transcript string, or ``None`` for empty
+        input / any network or parse failure. Never raises.
+        """
+        if audio is None or len(audio) == 0:
+            return None
+        buf = np.asarray(audio, dtype=np.float32).reshape(-1)
+        try:
+            return self._extract_text(self._post(buf))
+        # Degrade cleanly: a network/parse failure must never crash the caller's loop.
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[stt] utterance transcription failed (%s); no transcript", exc)
+            return None
+
     def reset(self) -> None:
         """Clear the rolling window + throttle so the next window starts fresh."""
         self._buffer.clear()

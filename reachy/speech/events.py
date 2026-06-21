@@ -274,7 +274,7 @@ class EventBuffer:
             else:
                 self._append("the light dimmed")
 
-    def feed_transcript(self, text: str) -> None:
+    def feed_transcript(self, text: str, *, direction: str | None = None) -> None:
         """Append a cue for already-transcribed spoken words.
 
         Parameters
@@ -283,16 +283,25 @@ class EventBuffer:
             The transcribed text (already produced upstream by STT).  Stripped
             of surrounding whitespace.  If empty after stripping, no cue is
             appended.
+        direction:
+            Optional direction word the words came from (``"left"`` / ``"right"``
+            / ``"ahead"``, from the DoA of the transcribed chunk).  When given the
+            cue names where the speaker is — so cognition hears *words and where
+            they came from*.
 
         Cue rules
         ---------
-        * Non-empty stripped text → ``'heard someone say: "<text>"'``
+        * Non-empty text, no direction → ``'heard someone say: "<text>"'``
+        * Non-empty text + direction → ``'heard someone say (from the <dir>): "<text>"'``
         * Empty / whitespace-only → no cue.
         """
         stripped = text.strip()
         if not stripped:
             return
-        self._append(f'heard someone say: "{stripped}"')
+        if direction:
+            self._append(f'heard someone say (from the {direction}): "{stripped}"')
+        else:
+            self._append(f'heard someone say: "{stripped}"')
 
     # ------------------------------------------------------------------
     # Snapshot

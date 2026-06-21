@@ -388,6 +388,20 @@ class TestFeedTranscript:
         assert "heard someone say" in cues[0].text
         assert "hello world" in cues[0].text
 
+    def test_transcript_with_direction_names_where_words_came_from(self):
+        buf = _make_buffer()
+        buf.feed_transcript("hello there", direction="left")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == 'heard someone say (from the left): "hello there"'
+
+    def test_transcript_without_direction_is_unchanged(self):
+        buf = _make_buffer()
+        buf.feed_transcript("hello there")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == 'heard someone say: "hello there"'
+
     def test_empty_text_appends_no_cue(self):
         buf = _make_buffer()
         buf.feed_transcript("")

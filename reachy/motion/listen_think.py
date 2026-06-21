@@ -122,9 +122,15 @@ class ThinkHook:
         buffer: Optional[EventBuffer] = None,
         spawn: Callable[..., object] | None = None,
         clock: Callable[[], float] | None = None,
+        feed_doa_cues: bool = True,
     ) -> None:
         self._provider = sample_provider
         self._engine = engine
+        # When False (the --transcribe / words-only mode), raw DoA/RMS/speech cues
+        # are NOT pushed to cognition — only transcribed words (via TranscribeHook)
+        # drive it. This stops the robot reacting to its own TTS as "loud sound"
+        # (a feedback loop) and keeps it quiet until someone actually says words.
+        self._feed_doa_cues = feed_doa_cues
         # Feed cues into the engine's own buffer when it exposes one (the real
         # CognitionEngine and the test fake both do via `.buffer`); otherwise build
         # a fresh buffer. The composition layer passes a shared buffer explicitly.
@@ -201,13 +207,18 @@ class ThinkHook:
         is converted here (``None`` stays ``None`` — "no reading"). The buffer's
         own thresholds decide whether the reading is notable enough to become a cue.
         """
+        self.events += 1
+        if not self._feed_doa_cues:
+            # Words-only mode: cognition is driven solely by transcribed words
+            # (TranscribeHook → feed_transcript). Skipping the raw DoA/RMS cue here
+            # is what keeps the robot from reacting to its own voice and chattering.
+            return
         angle_rad = None if sample.doa is None else math.radians(sample.doa)
         self._buffer.feed_doa(  # type: ignore[attr-defined]
             angle_rad=angle_rad,
             rms=float(sample.rms),
             is_speech=bool(sample.speech),
         )
-        self.events += 1
 
     def _ensure_worker(self) -> None:
         """Start the cognition worker once and raise the ``think_active`` flag.

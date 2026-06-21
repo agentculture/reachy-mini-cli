@@ -22,7 +22,7 @@ Public API::
     play_audio(
         pcm_bytes,
         *,
-        samplerate=22050,
+        samplerate=24000,
         transport=None,          # "sdk" | "http" | None → env/default
         base_url="http://localhost:8000",
         media_session=None,      # inject a fake for testing; sdk path only
@@ -49,6 +49,10 @@ from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 _CHUNK_FRAMES = 512
 # Bytes per int16 sample.
 _INT16_BYTES = 2
+# Fallback SDK speaker rate when the media session can't report one. The reachy_mini
+# GStreamer backend fixes its playback appsrc caps at this rate and does NOT resample
+# pushed buffers, so PCM at any other rate must be resampled to it before pushing.
+_SDK_OUTPUT_RATE_FALLBACK = 16000
 
 DEFAULT_BASE_URL = "http://localhost:8000"
 # The daemon mounts its routers under /api (health is /api/daemon/status).
@@ -97,6 +101,22 @@ def _pcm_bytes_to_float32(pcm: bytes) -> np.ndarray:
         return np.empty(0, dtype=np.float32)
     int16_array = np.frombuffer(pcm, dtype=np.int16)
     return int16_array.astype(np.float32) / 32768.0
+
+
+def _resample_mono(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """Linearly resample mono float32 *samples* from *src_rate* to *dst_rate* Hz.
+
+    The SDK speaker plays pushed buffers at its own fixed rate without resampling,
+    so audio synthesized at a different rate (e.g. Chatterbox's 24 kHz vs the
+    speaker's 16 kHz) must be converted here or it plays at the wrong pitch/speed.
+    Linear interpolation is adequate for speech and keeps the dependency to numpy.
+    A no-op when the rates already match or the input is empty.
+    """
+    if src_rate <= 0 or dst_rate <= 0 or src_rate == dst_rate or samples.size == 0:
+        return samples
+    n_dst = max(1, int(round(samples.size * dst_rate / src_rate)))
+    src_index = np.linspace(0.0, samples.size - 1, num=n_dst)
+    return np.interp(src_index, np.arange(samples.size), samples).astype(np.float32)
 
 
 def _make_wav_bytes(pcm: bytes, samplerate: int) -> bytes:
@@ -186,9 +206,16 @@ def _http_post_multipart(url: str, body: bytes, content_type: str, timeout: floa
 def _play_sdk(
     pcm: bytes,
     *,
+    samplerate: int = _SDK_OUTPUT_RATE_FALLBACK,
     media_session: Any | None = None,
 ) -> None:
     """Stream PCM to the robot speaker via the SDK media session.
+
+    *samplerate* is the rate the PCM was synthesized at. The SDK speaker plays
+    pushed buffers at its own fixed output rate without resampling, so the PCM is
+    resampled to the session's ``get_output_audio_samplerate()`` (falling back to
+    :data:`_SDK_OUTPUT_RATE_FALLBACK`) before pushing — otherwise audio at a
+    different rate plays at the wrong pitch/speed.
 
     If ``media_session`` is provided it is used directly (dependency injection
     for testing).  Otherwise ``_open_sdk_media()`` is called to open a real one
@@ -213,6 +240,15 @@ def _play_sdk(
     samples = _pcm_bytes_to_float32(pcm)
     if len(samples) == 0:
         return
+
+    # Resample to the speaker's real output rate (the SDK does not do this for us).
+    try:
+        target_rate = int(media_session.get_output_audio_samplerate())
+    except Exception:  # noqa: BLE001 — any backend hiccup falls back to the known rate
+        target_rate = _SDK_OUTPUT_RATE_FALLBACK
+    if target_rate <= 0:
+        target_rate = _SDK_OUTPUT_RATE_FALLBACK
+    samples = _resample_mono(samples, samplerate, target_rate)
 
     media_session.start_playing()
 
@@ -281,7 +317,10 @@ def play_audio(
     pcm_bytes:
         Raw 16-bit signed PCM audio (mono, little-endian).
     samplerate:
-        Sample rate of the PCM data (default 22 050 Hz — typical TTS output).
+        Sample rate of the PCM data (default 24 000 Hz — Chatterbox TTS output).
+        On the sdk path the audio is resampled from this rate to the speaker's
+        real output rate before being pushed; on the http path it sets the
+        uploaded WAV's header so the daemon resamples it.
     transport:
         ``"sdk"`` or ``"http"``.  ``None`` reads ``REACHY_TRANSPORT`` from the
         environment, falling back to ``"sdk"`` when unset (matching the listen
@@ -297,7 +336,7 @@ def play_audio(
     effective_transport = transport or os.environ.get("REACHY_TRANSPORT", "sdk")
 
     if effective_transport == "sdk":
-        _play_sdk(pcm_bytes, media_session=media_session)
+        _play_sdk(pcm_bytes, samplerate=samplerate, media_session=media_session)
     elif effective_transport == "http":
         _play_http(pcm_bytes, samplerate=samplerate, base_url=base_url, timeout=timeout)
     else:

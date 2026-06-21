@@ -1,11 +1,16 @@
-"""TTS synth client for Magpie-style HTTP `/v1/audio/synthesize`.
+"""TTS synth client for Chatterbox HTTP `/v1/audio/synthesize`.
 
 Sends cleaned text to the endpoint via synchronous ``urllib.request`` (stdlib
-only — no httpx / requests) and returns raw PCM16 bytes.
+only — no httpx / requests) and returns raw PCM16 bytes. The body is a JSON
+object ``{"text": …, "voice": …}`` and the server replies with bare PCM16 mono
+@ 24 kHz (``Content-Type: audio/pcm``) — the contract of model-gear's Chatterbox
+TTS sidecar, which replaced the earlier Magpie NIM. ``_extract_pcm`` still
+unwraps a RIFF/WAVE container so a WAV-returning server keeps working.
 
 Configuration (environment variables):
     ``REACHY_TTS_URL``   — base URL of the TTS server (default ``http://localhost:9000``).
-    ``REACHY_TTS_VOICE`` — voice id sent in the POST form (default a Magpie voice).
+    ``REACHY_TTS_VOICE`` — voice id sent in the JSON body. Unset → ``null``, i.e.
+                           Chatterbox's single built-in default voice.
 
 Function-argument overrides take precedence over env vars.
 
@@ -16,11 +21,11 @@ Cited from: autonomous-intelligence/realtime-api/src/realtime_api/tts_client.py
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import re
 import urllib.error
-import urllib.parse
 import urllib.request
 import wave
 
@@ -33,15 +38,15 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_TTS_URL = "http://localhost:9000"
-# Magpie multilingual default (matches the reference TTS in ../model-gear). Override
-# with --voice / REACHY_TTS_VOICE; list valid ids at GET {TTS_URL}/v1/audio/list_voices.
-DEFAULT_VOICE = "Magpie-Multilingual.EN-US.Mia.Calm"
-DEFAULT_LANGUAGE = "en-US"
-DEFAULT_ENCODING = "LINEAR_PCM"
-DEFAULT_SAMPLE_RATE = 22050
+# Chatterbox exposes a single built-in default voice; ``None`` → ``"voice": null``
+# in the JSON body selects it. Override with --voice / REACHY_TTS_VOICE only if the
+# server defines named voices.
+DEFAULT_VOICE: str | None = None
+# Chatterbox returns PCM16 mono @ 24 kHz; the playback stage must use the same rate.
+DEFAULT_SAMPLE_RATE = 24000
 DEFAULT_TIMEOUT = 30.0
 
-# Max *cleaned* characters per TTS request (Magpie Triton model sequence limit).
+# Max *cleaned* characters per TTS request (TTS model sequence limit).
 # ~660 clean chars is the empirically safe ceiling; we use 600 for headroom.
 _MAX_CLEAN_CHARS = 600
 
@@ -154,19 +159,20 @@ def _resolve_tts_url(override: str | None) -> str:
     return (override or os.environ.get("REACHY_TTS_URL") or DEFAULT_TTS_URL).rstrip("/")
 
 
-def _resolve_voice(override: str | None) -> str:
-    """Return the TTS voice: explicit arg > env var > default."""
+def _resolve_voice(override: str | None) -> str | None:
+    """Return the TTS voice: explicit arg > env var > default (``None`` → server default)."""
     return override or os.environ.get("REACHY_TTS_VOICE") or DEFAULT_VOICE
 
 
 def _extract_pcm(raw: bytes) -> bytes:
     """Return bare PCM16 samples from *raw*.
 
-    The Magpie TTS returns a full RIFF/WAVE container even for ``LINEAR_PCM``,
-    but the rest of the pipeline (playback / cognition) expects raw PCM16 @
-    22050 Hz — feeding it a WAV would double-wrap the header and play noise.
-    Unwrap the ``data`` chunk when *raw* is a WAV; pass it through unchanged for
-    a server that already returns bare PCM.
+    Chatterbox returns bare PCM16 (``Content-Type: audio/pcm``), so the common
+    path is a straight pass-through. But a Magpie-style server returns a full
+    RIFF/WAVE container, and the rest of the pipeline (playback / cognition)
+    expects raw PCM16 @ 24 kHz — feeding it a WAV would double-wrap the header
+    and play noise. Unwrap the ``data`` chunk when *raw* is a WAV; pass it
+    through unchanged for a server that already returns bare PCM.
     """
     if raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
         return raw
@@ -178,8 +184,8 @@ def _extract_pcm(raw: bytes) -> bytes:
 
 
 # Minimum plausible audio: ~15 ms per cleaned char (real speech at this voice is
-# ~60-80 ms/char, so 15 ms is a conservative floor). The Magpie server
-# intermittently returns a truncated clip; anything below this is a bad response
+# ~60-80 ms/char, so 15 ms is a conservative floor). The TTS server may
+# intermittently return a truncated clip; anything below this is a bad response
 # we retry. Cited from realtime-api's tts_client truncation guard.
 _MIN_SECONDS_PER_CHAR = 0.015
 _BYTES_PER_SAMPLE = 2  # PCM16
@@ -197,12 +203,12 @@ def _is_truncated(clean: str, pcm: bytes) -> bool:
 def _post_synth(
     clean: str,
     endpoint_url: str,
-    voice: str,
+    voice: str | None,
     timeout: float,
 ) -> bytes:
     """Synthesize *clean*, retrying when the server returns truncated audio.
 
-    The Magpie endpoint occasionally returns a short/truncated clip for valid
+    The TTS endpoint occasionally returns a short/truncated clip for valid
     input; we re-request up to ``_SYNTH_ATTEMPTS`` times and keep the longest
     result rather than play a clipped fragment. Raises
     :class:`~reachy.cli._errors.CliError` (code 2) on network/HTTP failure.
@@ -227,29 +233,23 @@ def _post_synth(
 def _synth_once(
     clean: str,
     endpoint_url: str,
-    voice: str,
+    voice: str | None,
     timeout: float,
 ) -> bytes:
     """POST *clean* text to *endpoint_url* and return raw PCM bytes (one attempt).
 
+    The body is JSON ``{"text": …, "voice": …}`` (Chatterbox's contract); a
+    ``None`` voice serialises to ``null``, selecting the server's default voice.
     Raises :class:`~reachy.cli._errors.CliError` (code 2) on any network or
     HTTP-level failure — no raw exception ever escapes this function.
     """
-    form_data = urllib.parse.urlencode(
-        {
-            "text": clean,
-            "language": DEFAULT_LANGUAGE,
-            "voice": voice,
-            "encoding": DEFAULT_ENCODING,
-            "sample_rate_hz": str(DEFAULT_SAMPLE_RATE),
-        }
-    ).encode("utf-8")
+    body = json.dumps({"text": clean, "voice": voice}).encode("utf-8")
 
     req = urllib.request.Request(  # nosec B310 — URL is caller-controlled config, not user input
         url=endpoint_url,
-        data=form_data,
+        data=body,
         method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={"Content-Type": "application/json"},
     )
 
     try:
@@ -308,10 +308,10 @@ def synthesize(
     voice: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> bytes:
-    """Synthesize *text* via a Magpie-style TTS endpoint, returning PCM16 bytes.
+    """Synthesize *text* via the Chatterbox TTS endpoint, returning PCM16 bytes.
 
     The text is cleaned (markdown/emoji stripped, whitespace normalized) and
-    split into chunks that stay within Magpie's sequence-length limit before
+    split into chunks that stay within the model's sequence-length limit before
     being sent.  All chunks are concatenated into a single bytes object.
 
     Args:

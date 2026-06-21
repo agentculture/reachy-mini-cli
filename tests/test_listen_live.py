@@ -798,23 +798,29 @@ def test_transcribe_feeds_words_into_shared_cognition_buffer(monkeypatch) -> Non
     buffer (the one the cognition engine snapshots) carries a ``heard someone
     say`` cue — proving the words reach cognition.
     """
-    fixed = {"text": "hello there robot"}
+    fixed = {"text": "hello there robot"}  # names the robot → passes the engagement gate
 
-    def _fake_transcribe(self, audio):  # noqa: ANN001
+    def _fake_once(self, audio):  # noqa: ANN001 — the hook transcribes the whole utterance
         return fixed["text"]
 
-    monkeypatch.setattr("reachy.speech.stt.Transcriber.transcribe", _fake_transcribe)
+    monkeypatch.setattr("reachy.speech.stt.Transcriber.transcribe_once", _fake_once)
 
     captured: dict[str, object] = {}
     real_tr_init = TranscribeHook.__init__
 
     def _tr_init(self, sample_provider, **kw):
+        # The hook now buffers a whole utterance and flushes on a pause / max length.
+        # Force a flush on the very first speech tick (max_utterance_s=0) with no
+        # minimum-duration floor, so the end-to-end path fires within the mocked ticks.
+        kw.setdefault("max_utterance_s", 0.0)
+        kw.setdefault("min_utterance_s", 0.0)
         captured["buffer"] = kw.get("buffer")
         return real_tr_init(self, sample_provider, **kw)
 
     monkeypatch.setattr(TranscribeHook, "__init__", _tr_init)
 
-    # The fake session reports speech so the sample carries speech=True + audio.
+    # The fake session reports speech so the sample carries speech=True + audio; with
+    # max_utterance_s=0 the first speech tick accumulates one chunk and flushes it.
     class _SpeechSession(_Session):
         def doa(self, *, timeout=None):  # noqa: ARG002
             return {"angle": np.pi / 2, "speech_detected": True}

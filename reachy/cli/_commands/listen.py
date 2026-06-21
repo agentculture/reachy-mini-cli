@@ -396,6 +396,7 @@ def _build_think_hook(
     export: object | None = None,
     buffer: object | None = None,
     play_audio: object | None = None,
+    feed_doa_cues: bool = True,
 ) -> ThinkHook | None:
     """A :class:`ThinkHook` driving cognition from the shared sample, or ``None``.
 
@@ -437,7 +438,7 @@ def _build_think_hook(
         if play_audio is not None:
             engine_kwargs["play_audio"] = play_audio
         engine = CognitionEngine(**engine_kwargs)
-        return ThinkHook(provider, engine=engine, buffer=buf)
+        return ThinkHook(provider, engine=engine, buffer=buf, feed_doa_cues=feed_doa_cues)
     except Exception:  # noqa: BLE001
         logger.warning(
             "listen --live: cognition engine unavailable; think fold-in disabled", exc_info=True
@@ -554,11 +555,17 @@ def _build_live_hooks(
     # reads the SAME mute window the playback wrapper stamps.
     think_buffer: object | None = None
     mute = {"until": 0.0}
-    think_play_audio: object | None = None
+    # Always route --live cognition playback over HTTP to the daemon: speech plays
+    # through the daemon's mixer (proven to coexist with the loop's one SDK session)
+    # rather than opening a second ReachyMini client (single-SDK-owner). The wrapper
+    # also stamps the self-mute window the TranscribeHook reads after each spoken clip.
+    think_play_audio: object | None = _make_self_mute_play_audio(
+        mute, clock, playback_transport="http"
+    )
 
     if transcribe:
-        # Build the shared buffer + self-mute playback wrapper up front, so they can
-        # be wired into the engine (via _build_think_hook) and the TranscribeHook.
+        # Build the shared buffer up front so it can be wired into both the engine
+        # (via _build_think_hook) and the TranscribeHook.
         try:
             from reachy.speech.events import EventBuffer
 
@@ -566,10 +573,17 @@ def _build_live_hooks(
         except Exception:  # noqa: BLE001
             logger.warning("listen --live --transcribe: EventBuffer unavailable", exc_info=True)
             think_buffer = None
-        think_play_audio = _make_self_mute_play_audio(mute, clock)
 
+    # Under --transcribe, cognition is driven by transcribed WORDS only: the ThinkHook
+    # stops pushing raw DoA/RMS sound cues, so the robot doesn't react to its own TTS
+    # (a feedback loop) and stays quiet until someone actually speaks. Without
+    # --transcribe there are no transcripts, so DoA cues remain the cognition input.
     think_hook = _build_think_hook(
-        provider, export=export, buffer=think_buffer, play_audio=think_play_audio
+        provider,
+        export=export,
+        buffer=think_buffer,
+        play_audio=think_play_audio,
+        feed_doa_cues=not transcribe,
     )
 
     ordered: list[object] = [sleep_hook]
@@ -604,7 +618,11 @@ def _build_live_hooks(
 
 
 def _make_self_mute_play_audio(
-    mute: dict[str, float], clock: Callable[[], float], *, mute_after: float | None = None
+    mute: dict[str, float],
+    clock: Callable[[], float],
+    *,
+    mute_after: float | None = None,
+    playback_transport: str | None = None,
 ) -> Callable[..., None]:
     """Wrap the real playback so each clip stamps the shared self-mute window.
 
@@ -613,15 +631,31 @@ def _make_self_mute_play_audio(
     (reading ``mute_until=lambda: mute["until"]``) drops any audio captured while —
     and just after — the robot speaks. Mirrors ``think``'s ``_guarded_play``; the
     default ``mute_after`` is the documented ``_DEFAULT_MUTE_AFTER_SPEAK`` (2.5 s).
+
+    ``playback_transport`` (e.g. ``"http"``) is injected as ``transport=`` into the
+    playback call unless the caller already set one. ``--live`` passes ``"http"`` so
+    cognition speech plays through the daemon's mixer — which coexists with the loop's
+    one open SDK session — instead of opening a *second* ``ReachyMini`` client (the
+    single-SDK-owner model; see ``CLAUDE.md``).
     """
     after = _DEFAULT_MUTE_AFTER_SPEAK if mute_after is None else max(0.0, float(mute_after))
 
     def _guarded_play(pcm: bytes, **kwargs: object) -> None:
         from reachy.speech.playback import play_audio as _play
+        from reachy.speech.tts import DEFAULT_SAMPLE_RATE
 
+        if playback_transport is not None and "transport" not in kwargs:
+            kwargs["transport"] = playback_transport
         _play(pcm, **kwargs)
         if after > 0:
-            mute["until"] = clock() + after
+            # Mute for the clip's full play duration PLUS the margin. Playback may be
+            # async (HTTP play_sound returns before the audio finishes), so a fixed
+            # pad alone would expire mid-utterance and let the robot transcribe its
+            # own (long) voice — a slower feedback loop. Base the window on the audio
+            # length so the whole utterance is covered.
+            rate = float(DEFAULT_SAMPLE_RATE or 24000)
+            clip_seconds = len(pcm) / (2.0 * rate) if rate > 0 else 0.0
+            mute["until"] = clock() + clip_seconds + after
 
     return _guarded_play
 
@@ -875,6 +909,12 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
     _require_export_transport(export_hook, transport)
     _require_transcribe_transport(transcribe, transport)
     params = _params_from_args(args)
+    if transcribe:
+        # In the words-only live mode the head must NOT swing toward every sound
+        # (it should turn only on its name) — and suppressing the large Tier-2
+        # escalate-turns also sidesteps the SDK goto fault they can trip. Tier-1
+        # antenna lean still reacts to sound.
+        params.turn_enabled = False
     producer = ListenProducer(params)
     # When exporting, stdout is reserved for the pure JSONL feed: every banner,
     # action line, and summary goes to stderr regardless of --json.

@@ -92,8 +92,10 @@ def test_sdk_push_receives_float32_samples(monkeypatch: pytest.MonkeyPatch) -> N
     pcm = int16_data.tobytes()
     expected_f32 = int16_data.astype(np.float32) / 32768.0
 
-    media = _FakeOutputMedia()
-    play_audio(pcm, transport="sdk", media_session=media)
+    # Match source rate to the fake speaker's output rate so no resampling occurs —
+    # this test verifies the int16 → float32 normalisation only.
+    media = _FakeOutputMedia(output_samplerate=22050)
+    play_audio(pcm, transport="sdk", samplerate=22050, media_session=media)
 
     assert len(media.push_calls) >= 1, "No push_audio_sample calls recorded"
     # Concatenate all pushed chunks and compare with expected.
@@ -120,6 +122,31 @@ def test_sdk_push_not_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     play_audio(pcm, transport="sdk", media_session=media)
 
     assert len(media.push_calls) >= 1
+
+
+def test_sdk_resamples_to_device_rate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """24 kHz PCM pushed to a 16 kHz speaker is resampled to ~2/3 the sample count."""
+    n = 2400  # 0.1 s @ 24 kHz
+    pcm = _make_pcm_bytes(n_samples=n)
+    media = _FakeOutputMedia(output_samplerate=16000)
+
+    play_audio(pcm, transport="sdk", samplerate=24000, media_session=media)
+
+    total_pushed = sum(len(chunk) for chunk in media.push_calls)
+    # 2400 * 16000/24000 = 1600 samples expected.
+    assert total_pushed == 1600, f"expected 1600 resampled samples, got {total_pushed}"
+
+
+def test_sdk_no_resample_when_rates_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When source rate equals the device rate, the sample count is unchanged."""
+    n = 1500
+    pcm = _make_pcm_bytes(n_samples=n)
+    media = _FakeOutputMedia(output_samplerate=16000)
+
+    play_audio(pcm, transport="sdk", samplerate=16000, media_session=media)
+
+    total_pushed = sum(len(chunk) for chunk in media.push_calls)
+    assert total_pushed == n, f"expected {n} samples unchanged, got {total_pushed}"
 
 
 # ---------------------------------------------------------------------------

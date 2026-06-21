@@ -66,12 +66,19 @@ dependency.
 from __future__ import annotations
 
 import logging
+import math
+import re
 from typing import Callable
+
+import numpy as np
 
 from reachy.motion.queue import MotionQueue
 from reachy.motion.sense_sample import SampleProvider, SenseSample
-from reachy.speech.events import EventBuffer
+from reachy.speech.events import EventBuffer, _doa_direction
 from reachy.speech.stt import Transcriber
+
+#: Words counted for the coherence gate (letters + intra-word apostrophes).
+_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +135,12 @@ class TranscribeHook:
         sample_rate: int | None = None,
         mute_until: Callable[[], float] | None = None,
         clock: Callable[[], float] | None = None,
+        silence_hold_s: float = 0.7,
+        max_utterance_s: float = 15.0,
+        min_utterance_s: float = 0.3,
+        min_words: int = 3,
+        engage_window_s: float = 20.0,
+        names: tuple[str, ...] = ("reachy", "robot"),
     ) -> None:
         self._provider = sample_provider
         self._buffer = buffer
@@ -149,7 +162,26 @@ class TranscribeHook:
 
             self._clock = time.monotonic
 
-        #: Count of ticks that yielded a non-empty transcript (diagnostics / tests).
+        # --- Endpointing: accumulate a whole utterance, transcribe on a pause. ---
+        self._rate = int(sample_rate) if sample_rate else 16000
+        self._silence_hold_s = float(silence_hold_s)
+        self._max_utterance_s = float(max_utterance_s)
+        self._min_utt_samples = int(max(0.0, min_utterance_s) * self._rate)
+        #: Chunks of the current utterance (cleared on flush / mute / reset).
+        self._utt: list[np.ndarray] = []
+        self._utt_samples = 0
+        self._utt_started_t: float | None = None
+        self._last_speech_t: float | None = None
+        self._utt_direction: str | None = None
+
+        # --- Engagement gate: only respond to clear sentences that are addressed
+        #     to the robot (its name) or continue an ongoing conversation. ---
+        self._min_words = int(min_words)
+        self._engage_window_s = float(engage_window_s)
+        self._names = tuple(n.lower() for n in names)
+        self._engaged_until = 0.0
+
+        #: Count of utterances fed to cognition (diagnostics / tests).
         self.transcripts = 0
         #: Count of samples seen (diagnostics / tests).
         self.events = 0
@@ -199,27 +231,97 @@ class TranscribeHook:
     # ------------------------------------------------------------------
 
     def _maybe_transcribe(self, sample: SenseSample, t: float) -> None:
-        """Transcribe the sample's audio when eligible and feed any recognised words.
+        """Accumulate a whole utterance, then transcribe + gate it on a pause.
 
-        Eligibility (cheap-first): the sample must carry speech AND a raw audio
-        chunk, and the tick must be outside the self-mute window. The self-mute
-        check happens **before** :meth:`Transcriber.transcribe` is called, so no STT
-        POST ever happens while the robot is muted (it must not transcribe its own
-        voice). A non-empty transcript is fed via
-        :meth:`~reachy.speech.events.EventBuffer.feed_transcript`; a ``None`` /
-        empty transcript feeds nothing.
+        Endpointing: while the sample carries speech (and we are outside the
+        self-mute window) the raw chunk is appended to the current utterance. When
+        speech stops for ``silence_hold_s`` — or the utterance grows past
+        ``max_utterance_s`` — the *whole* buffer is transcribed in one POST (so the
+        STT sees a full sentence, not a 1.5 s slice) and run through the engagement
+        gate before being fed to cognition.
+
+        The self-mute window is checked first: while (and just after) the robot
+        speaks, the current utterance is discarded and nothing is accumulated — the
+        robot must never transcribe its own voice.
         """
-        if not sample.speech or sample.audio is None:
-            return
         if t < self._mute_until():
-            # Inside the self-mute window — drop the audio BEFORE transcription so
-            # the robot never POSTs (and so never transcribes) its own speech.
+            # Robot is speaking — drop any partial utterance; never capture its voice.
+            self._reset_utt()
             return
-        text = self._transcriber.transcribe(sample.audio)  # type: ignore[attr-defined]
+
+        if sample.speech and sample.audio is not None:
+            chunk = np.asarray(sample.audio, dtype=np.float32).reshape(-1)
+            if self._utt_samples == 0:
+                self._utt_started_t = t
+                self._utt_direction = self._direction_of(sample)
+            self._utt.append(chunk)
+            self._utt_samples += len(chunk)
+            self._last_speech_t = t
+            started = self._utt_started_t
+            if started is not None and (t - started) >= self._max_utterance_s:
+                self._flush(t)  # cap a very long monologue
+            return
+
+        # Non-speech tick: a long-enough pause ends the utterance → transcribe it.
+        if (
+            self._utt
+            and self._last_speech_t is not None
+            and (t - self._last_speech_t) >= self._silence_hold_s
+        ):
+            self._flush(t)
+
+    def _flush(self, t: float) -> None:
+        """Transcribe the buffered utterance, gate it, and feed it if it qualifies."""
+        samples, direction = self._utt_samples, self._utt_direction
+        utt = self._utt
+        self._reset_utt()
+        if samples < self._min_utt_samples or not utt:
+            return  # too short to be a real utterance (a blip, not speech)
+        audio = np.concatenate(utt)
+        text = self._transcriber.transcribe_once(audio)  # type: ignore[attr-defined]
         if not text:
             return
-        self._buffer.feed_transcript(text)
+        if not self._should_engage(text, t):
+            # A coherent-enough utterance, but not addressed to the robot and not part
+            # of an ongoing conversation — ignore it (ambient speech / noise).
+            logger.debug("[transcribe] ignoring un-addressed utterance: %r", text)
+            return
+        self._buffer.feed_transcript(text, direction=direction)
+        self._engaged_until = t + self._engage_window_s
         self.transcripts += 1
+
+    def _should_engage(self, text: str, t: float) -> bool:
+        """Decide whether *text* should drive cognition.
+
+        Engage when the utterance names the robot (``"reachy"`` / ``"robot"``), OR
+        it is a clear sentence (``>= min_words`` words) arriving while a conversation
+        is still ongoing (within ``engage_window_s`` of the last exchange). Short
+        fragments and ambient speech that isn't addressed to the robot are ignored —
+        "don't reply to unintelligible sound, just clear, coherent sentences".
+        """
+        lowered = text.lower()
+        if any(name in lowered for name in self._names):
+            return True
+        words = _WORD_RE.findall(text)
+        coherent = len(words) >= self._min_words
+        return coherent and t < self._engaged_until
+
+    def _direction_of(self, sample: SenseSample) -> str | None:
+        """Direction word the utterance came from (DoA in degrees → label), or None."""
+        if sample.doa is None:
+            return None
+        try:
+            return _doa_direction(math.radians(sample.doa))
+        except Exception:  # noqa: BLE001 — a bad angle must never drop the words
+            return None
+
+    def _reset_utt(self) -> None:
+        """Clear the current utterance accumulator."""
+        self._utt = []
+        self._utt_samples = 0
+        self._utt_started_t = None
+        self._last_speech_t = None
+        self._utt_direction = None
 
     def close(self) -> None:
         """No-op cleanup, present for the hook contract (safe + idempotent).

@@ -112,6 +112,11 @@ class ListenParams:
     body_yaw_max: float = 45.0  # maximum body yaw rotation in degrees
     body_speed: float = 12.0  # deg/s (slow — body turn is deliberate, not snappy)
     head_only_band: float = 30.0  # |desired| <= this → head-only; beyond → body escalation
+    # When False, the Tier-2 head/body turn is suppressed entirely — only the Tier-1
+    # antenna lean (and idle) react to sound. ``listen --live --transcribe`` sets this
+    # so the head does NOT swing toward every sound (it should turn only on its name),
+    # which also avoids the large escalate-turns that trip the SDK goto planner.
+    turn_enabled: bool = True
     # Proprioceptive head-pat detection folded into the SDK loop (default on; only
     # effective on the sdk transport — head_pose is an SDK-only read-back).
     pat: bool = True
@@ -278,7 +283,7 @@ class ListenProducer:
         p = self.params
         raw_desired = doa_angle_to_yaw(angle, p.gain)  # unclamped — drives escalation
         desired = max(-p.max_yaw, min(p.max_yaw, raw_desired))  # clamped head-only target
-        if triggered and abs(desired - self.committed) > p.deadband:
+        if p.turn_enabled and triggered and abs(desired - self.committed) > p.deadband:
             if abs(raw_desired) > p.head_only_band:
                 return self._escalate_to_body(raw_desired, t)
             return self._move_to(desired, t)
