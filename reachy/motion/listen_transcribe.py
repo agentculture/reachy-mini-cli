@@ -159,12 +159,9 @@ class TranscribeHook:
         robot is self-muted — while ``t < mute_until()`` the tick discards the audio
         **before** transcription (no STT POST). Defaults to ``lambda: 0.0`` (never
         muted). Wire it to the speak path's mute window so the robot never
-        transcribes its own voice.
-    clock:
-        Injectable ``() -> float`` (unused by the core logic today — the tick's
-        ``t`` is the time used for the mute gate, mirroring
-        :mod:`reachy.motion.listen_sleep`; reserved for future deterministic
-        stamping). Defaults to :func:`time.monotonic`.
+        transcribes its own voice. The tick's own ``t`` is the clock used for the
+        mute gate (mirroring :mod:`reachy.motion.listen_sleep`), so the hook needs
+        no separate clock seam.
     """
 
     def __init__(
@@ -177,7 +174,6 @@ class TranscribeHook:
         on_engage: Callable[[], None] | None = None,
         sample_rate: int | None = None,
         mute_until: Callable[[], float] | None = None,
-        clock: Callable[[], float] | None = None,
         silence_hold_s: float = 0.7,
         max_utterance_s: float = 15.0,
         min_utterance_s: float = 0.3,
@@ -198,12 +194,6 @@ class TranscribeHook:
         else:
             self._transcriber = Transcriber()
         self._mute_until = mute_until if mute_until is not None else (lambda: 0.0)
-        if clock is not None:
-            self._clock = clock
-        else:
-            import time
-
-            self._clock = time.monotonic
 
         # --- Endpointing: accumulate a whole utterance, transcribe on a pause. ---
         self._rate = int(sample_rate) if sample_rate else 16000

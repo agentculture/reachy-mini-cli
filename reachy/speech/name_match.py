@@ -81,6 +81,29 @@ def _combined_score(word: str, name: str) -> float:
     return seq_ratio * len_ratio
 
 
+def _word_matches_name(word: str, name: str, threshold: float) -> bool:
+    """Whether one tokenised *word* matches one canonical *name*.
+
+    The guard ladder (documented on :func:`is_name_match`): an exact match always
+    accepts; the prefix, superstring, and initial guards each reject this pair (so
+    the caller moves on to the next name/word); otherwise the combined similarity
+    score decides. Factored out of :func:`is_name_match` so the public function
+    stays a flat ``any(...)`` over word/name pairs.
+    """
+    if word == name:
+        return True  # exact whole-word match — always accept
+    if name.startswith(word):
+        return False  # prefix guard: "reach" is a strict prefix of "reachy" → truncation
+    if name in word:
+        return False  # superstring guard: "reachy" in "preachy" → morphological extension
+    # Initial guard: a fuzzy match must share the name's first letter. STT mishearings
+    # of "reachy" keep the leading phoneme ("richie", "reachie"); same-length score
+    # collisions ("speech") do not.
+    if word[:1] != name[:1]:
+        return False
+    return _combined_score(word, name) >= threshold
+
+
 def is_name_match(
     text: str,
     names: Iterable[str] = ("reachy", "robot"),
@@ -124,23 +147,4 @@ def is_name_match(
     """
     words = _WORD_RE.findall(text.lower())
     name_list = [n.lower() for n in names]
-    for word in words:
-        for name in name_list:
-            # Exact whole-word match — always accept.
-            if word == name:
-                return True
-            # Prefix guard: "reach" is a strict prefix of "reachy" → truncation.
-            if name.startswith(word):
-                continue
-            # Superstring guard: "reachy" in "preachy" → morphological extension.
-            if name in word:
-                continue
-            # Initial guard: a fuzzy match must share the name's first letter.
-            # STT mishearings of "reachy" keep the leading phoneme ("richie",
-            # "reachie"); same-length score collisions ("speech") do not.
-            if word[:1] != name[:1]:
-                continue
-            # Fuzzy match via combined score.
-            if _combined_score(word, name) >= threshold:
-                return True
-    return False
+    return any(_word_matches_name(word, name, threshold) for word in words for name in name_list)
