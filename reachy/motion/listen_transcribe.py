@@ -125,12 +125,22 @@ class TranscribeHook:
         *,
         buffer: EventBuffer,
         transcriber: object | None = None,
+        sample_rate: int | None = None,
         mute_until: Callable[[], float] | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._provider = sample_provider
         self._buffer = buffer
-        self._transcriber = transcriber if transcriber is not None else Transcriber()
+        # Build the default Transcriber with the REAL mic sample rate when known so
+        # the WAV header sent to STT matches the audio (a wrong rate makes the STT
+        # mis-decode and return nothing — the bug live-testing surfaced). An explicit
+        # transcriber (tests) wins; else honour sample_rate; else the 16 kHz default.
+        if transcriber is not None:
+            self._transcriber = transcriber
+        elif sample_rate:
+            self._transcriber = Transcriber(sample_rate=sample_rate)
+        else:
+            self._transcriber = Transcriber()
         self._mute_until = mute_until if mute_until is not None else (lambda: 0.0)
         if clock is not None:
             self._clock = clock

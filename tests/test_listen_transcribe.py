@@ -351,3 +351,24 @@ def test_default_transcriber_is_constructed_without_network() -> None:
     # A None-sample tick is still a no-op even with the real transcriber wired.
     hook(object(), MotionQueue(), 0.1, {"pitch": 0.0, "yaw": 0.0})
     hook.close()
+
+
+def test_sample_rate_threads_into_default_transcriber() -> None:
+    """The session's real mic rate must label the WAV sent to STT.
+
+    A WAV header that lies about the rate makes STT mis-decode (the gap
+    live-testing probed for); the hook builds its default Transcriber with the
+    real ``session.samplerate``, mirroring ``sleep``'s wake-word STT. An explicit
+    ``transcriber`` still wins; omitting the rate keeps the 16 kHz default.
+    """
+    rated = TranscribeHook(lambda: None, buffer=_RecordingBuffer(), sample_rate=48000)
+    assert rated._transcriber._sample_rate == 48000
+
+    default = TranscribeHook(lambda: None, buffer=_RecordingBuffer())
+    assert default._transcriber._sample_rate == 16000
+
+    explicit = _FakeTranscriber(results=[])
+    won = TranscribeHook(
+        lambda: None, buffer=_RecordingBuffer(), transcriber=explicit, sample_rate=48000
+    )
+    assert won._transcriber is explicit

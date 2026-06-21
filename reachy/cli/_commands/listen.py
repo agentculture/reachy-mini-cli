@@ -490,6 +490,7 @@ def _build_transcribe_hook(
     *,
     buffer: object,
     mute_until: Callable[[], float],
+    sample_rate: int | None = None,
 ) -> TranscribeHook:
     """A :class:`TranscribeHook` feeding STT words into the shared cognition buffer.
 
@@ -498,8 +499,11 @@ def _build_transcribe_hook(
     become cognition cues) and a real :class:`~reachy.speech.stt.Transcriber` (no
     network I/O at construction). ``mute_until`` reads the shared self-mute window
     the playback wrapper stamps, so the robot never transcribes its own TTS.
+    ``sample_rate`` is the REAL mic rate from the SDK session (``session.samplerate``)
+    so the WAV sent to STT is labelled correctly — a wrong rate makes STT return
+    nothing (the gap live-testing exposed); ``None`` falls back to the 16 kHz default.
     """
-    return TranscribeHook(provider, buffer=buffer, mute_until=mute_until)
+    return TranscribeHook(provider, buffer=buffer, mute_until=mute_until, sample_rate=sample_rate)
 
 
 def _build_live_hooks(
@@ -510,6 +514,7 @@ def _build_live_hooks(
     *,
     export: object | None = None,
     transcribe: bool = False,
+    sample_rate: int | None = None,
     clock: Callable[[], float] | None = None,
 ) -> list[object]:
     """Build the ``--live`` sense hooks in ``sleep > pat > think`` priority order.
@@ -582,7 +587,10 @@ def _build_live_hooks(
         if feed_buffer is not None:
             ordered.append(
                 _build_transcribe_hook(
-                    provider, buffer=feed_buffer, mute_until=lambda: mute["until"]
+                    provider,
+                    buffer=feed_buffer,
+                    mute_until=lambda: mute["until"],
+                    sample_rate=sample_rate,
                 )
             )
         else:
@@ -744,6 +752,7 @@ def _run_sdk_loop(
                 pat_hook,
                 export=export,
                 transcribe=transcribe,
+                sample_rate=getattr(session, "samplerate", None),
             )
             on_tick: object = HookChain(hooks_list)
         else:
