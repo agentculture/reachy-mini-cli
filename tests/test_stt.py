@@ -139,6 +139,64 @@ class TestReturnsText:
 
 
 # ---------------------------------------------------------------------------
+# transcribe_payload — returns the RAW JSON dict (no text extraction)
+# ---------------------------------------------------------------------------
+
+
+class TestTranscribePayload:
+    """transcribe_payload() returns the parsed JSON dict, or None on any failure."""
+
+    def test_returns_full_payload_dict(self):
+        payload = {"text": "hi", "detected": True, "phrase": "p"}
+        backend = _nowindow(stt_url="http://stt.invalid")
+        backend._post = lambda audio: dict(payload)  # noqa: SLF001
+        assert backend.transcribe_payload(_chunk()) == payload
+
+    def test_payload_without_text_still_returned(self):
+        """Unlike transcribe(), a textless payload is returned verbatim (not None)."""
+        backend = _nowindow(stt_url="http://stt.invalid")
+        backend._post = lambda audio: {"detected": True}  # noqa: SLF001
+        assert backend.transcribe_payload(_chunk()) == {"detected": True}
+
+    def test_post_returning_none_yields_none(self):
+        backend = _nowindow(stt_url="http://stt.invalid")
+        backend._post = lambda audio: None  # noqa: SLF001
+        assert backend.transcribe_payload(_chunk()) is None
+
+    def test_sub_window_yields_none(self):
+        from reachy.speech.stt import Transcriber
+
+        # 1.0 s window @ 1000 Hz = 1000 samples; one 400-sample chunk is too short.
+        backend = Transcriber(
+            stt_url="http://stt.local", sample_rate=1000, window_seconds=1.0, min_interval=0.0
+        )
+        backend._post = lambda audio: {"text": "x"}  # noqa: SLF001
+        assert backend.transcribe_payload(_chunk(400)) is None
+
+    def test_throttled_yields_none(self):
+        clock = {"t": 100.0}
+        backend = _nowindow(stt_url="http://stt.local", min_interval=5.0)
+        backend._clock = lambda: clock["t"]  # noqa: SLF001
+        backend._post = lambda audio: {"text": "x"}  # noqa: SLF001
+        assert backend.transcribe_payload(_chunk()) == {"text": "x"}  # first post
+        assert backend.transcribe_payload(_chunk()) is None  # throttled (same time)
+
+    def test_post_raising_is_swallowed(self):
+        def _boom(audio):
+            raise RuntimeError("network exploded")
+
+        backend = _nowindow(stt_url="http://stt.invalid")
+        backend._post = _boom  # noqa: SLF001
+        assert backend.transcribe_payload(_chunk()) is None
+
+    def test_transcribe_delegates_to_payload(self):
+        """transcribe() == _extract_text(transcribe_payload(...)) — same window state."""
+        backend = _nowindow(stt_url="http://stt.invalid")
+        backend._post = lambda audio: {"text": "delegated text"}  # noqa: SLF001
+        assert backend.transcribe(_chunk()) == "delegated text"
+
+
+# ---------------------------------------------------------------------------
 # Criterion 2 — failure modes return None and NEVER raise
 # ---------------------------------------------------------------------------
 

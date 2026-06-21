@@ -180,6 +180,20 @@ class Transcriber:
         POST is throttled, or any network / parse failure occurs. Never raises —
         every failure degrades to ``None``.
         """
+        return self._extract_text(self.transcribe_payload(audio))
+
+    def transcribe_payload(self, audio: np.ndarray) -> dict | None:
+        """Accumulate audio; POST the window when full + due; return the raw JSON.
+
+        Identical window + throttle + POST logic to :meth:`transcribe`, but
+        returns the *parsed JSON payload dict* (the response body before any
+        ``text`` extraction) rather than the transcript string — so callers that
+        need other response fields (e.g. the wake-word backend's ``detected`` /
+        ``phrase`` echo) can inspect them. Returns ``None`` when there is not
+        enough audio yet, the POST is throttled, the body is empty / non-JSON /
+        non-dict, or any network failure occurs. Never raises — every failure
+        degrades to ``None``.
+        """
         self._accumulate(audio)
         if self._buffered < self._window_samples:
             return None  # not enough audio yet to transcribe a phrase
@@ -189,12 +203,11 @@ class Transcriber:
         self._last_post = now
         window = self._collect_window()
         try:
-            payload = self._post(window)
+            return self._post(window)
         # Degrade cleanly: a network/parse failure must never crash the loop.
         except Exception as exc:  # noqa: BLE001
             logger.debug("[stt] transcription request failed (%s); no transcript this tick", exc)
             return None
-        return self._extract_text(payload)
 
     def reset(self) -> None:
         """Clear the rolling window + throttle so the next window starts fresh."""
