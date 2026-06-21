@@ -44,6 +44,7 @@ with head close to centre. The near-side antenna is folded into the same action.
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
 
@@ -117,6 +118,23 @@ class ListenParams:
     # so the head does NOT swing toward every sound (it should turn only on its name),
     # which also avoids the large escalate-turns that trip the SDK goto planner.
     turn_enabled: bool = True
+    # --- 3-tier motion ladder (graduated by perception level) -----------------
+    # Under transcribe-style operation (``turn_enabled=False``) the reaction is graded by
+    # *what was perceived*, rather than turning toward every sound:
+    #   * noise   → Tier-1 antenna lean only (existing behaviour).
+    #   * speech  → a LARGER orienting move: a bounded HEAD-ONLY nudge toward the DoA
+    #               (``speech_orient_max`` degrees), never a body rotation.
+    #   * engaged → the full deliberate head/body turn toward the utterance DoA (the
+    #               existing Tier-2 escalate path), with a guaranteed duration floor.
+    # The speech tier's orienting move is fractioned/clamped so it stays smaller than a
+    # full escalate turn and never escalates to the body.
+    speech_orient_gain: float = 0.6  # fraction of the clamped head target the speech tier uses
+    speech_orient_max: float = 20.0  # hard cap (deg) on the speech-tier head-only nudge
+    # The engaged deliberate turn floors its duration to this many seconds even at the
+    # most extreme angle, so the SDK ``goto`` planner's ``time_trajectory(t/duration)``
+    # can never see ``t/duration > 1`` (the "time value is out of range [0,1]" fault).
+    # It is ``max(min_dur, engaged_min_dur)`` in practice — a real, never-degenerate floor.
+    engaged_min_dur: float = 1.5
     # Proprioceptive head-pat detection folded into the SDK loop (default on; only
     # effective on the sdk transport — head_pose is an SDK-only read-back).
     pat: bool = True
@@ -194,6 +212,11 @@ class ListenProducer:
     body: float = field(default=0.0)  # current body yaw
     _last_live_t: float | None = None
     _hold_until: float = 0.0
+    # One-shot engaged latch: ``set_engaged()`` arms it; the next ``update`` consumes it
+    # (OR'd with the per-tick ``engaged=`` kwarg) and clears it. This is the ergonomic seam
+    # the engagement gate (task t7) drives — latch once when the gate accepts an utterance,
+    # the next tick performs the deliberate turn, and a later tick (no re-latch) does not.
+    _engaged_latch: bool = field(default=False, init=False)
     # Always-alive idle layer state (built in __post_init__; paced to AliveConfig.interval).
     _t0: float | None = field(default=None, init=False)
     _last_idle_t: float | None = field(default=None, init=False)
@@ -210,20 +233,56 @@ class ListenProducer:
         # breathes — see AliveConfig.focused).
         self._focused = self._alive.focused()
 
-    def _move_to(self, target: float, t: float, *, body_yaw: float | None = None) -> MotionAction:
+    def set_engaged(self) -> None:
+        """Arm the one-shot engaged latch (consumed on the next :meth:`update`).
+
+        The engagement gate (task t7) calls this when it decides the current utterance
+        is addressed to the robot; the next tick then performs the deliberate Tier-2
+        head/body turn toward the utterance DoA. The latch is one-shot — a single
+        :meth:`update` consumes and clears it, so the turn fires once per latch.
+        """
+        self._engaged_latch = True
+
+    def _clamp_dur(self, raw: float, *, floor: float | None = None) -> float:
+        """Clamp a computed move *duration* to a sane, never-degenerate positive range.
+
+        Returns ``max(floor, min(max_dur, raw))`` with NaN/non-finite/non-positive
+        ``raw`` collapsed to the floor. This is the single guarantee behind the SDK
+        ``goto`` planner's contract: ``time_trajectory(t/duration)`` raises
+        ``ValueError("time value is out of range [0,1]")`` when ``t/duration > 1``, which
+        only happens if ``duration`` is too small (or zero/negative/NaN) relative to the
+        move's elapsed wall-clock. A real, positive floor (``min_dur`` by default, or the
+        larger ``engaged_min_dur`` for the deliberate engaged turn) keeps ``t/duration``
+        inside ``[0, 1]`` for the whole move, at any angle.
+        """
+        p = self.params
+        lo = p.min_dur if floor is None else max(p.min_dur, floor)
+        if not math.isfinite(raw) or raw <= 0.0:
+            return lo
+        return max(lo, min(p.max_dur, raw))
+
+    def _move_to(
+        self,
+        target: float,
+        t: float,
+        *,
+        body_yaw: float | None = None,
+        dur_floor: float | None = None,
+    ) -> MotionAction:
         """Commit a head turn to *target*; optionally drive ``body_yaw`` in the same move.
 
         The near-side antenna pose is folded into the same action so the head
         and antenna move together.  On recentering to 0 the antennas return to
         neutral ``(0.0, 0.0)``.  ``body_yaw`` is left ``None`` (body not driven)
         except on a recenter, where it is ``0.0`` to bring the body home too.
+        ``dur_floor`` raises the duration floor above ``min_dur`` for the deliberate
+        engaged turn (see :meth:`_clamp_dur`).
         """
         p = self.params
         toward_center = abs(target) < abs(self.committed)
         speed = p.relax_speed if toward_center else p.alert_speed
-        dur = max(
-            p.min_dur, min(p.max_dur, abs(target - self.committed) / speed if speed else p.max_dur)
-        )
+        raw = abs(target - self.committed) / speed if speed else p.max_dur
+        dur = self._clamp_dur(raw, floor=dur_floor)
         self.committed = target
         # Commit to this heading: ignore new directions until the move lands AND we've
         # dwelt `hold` seconds there, so the head doesn't whip back and forth.
@@ -240,14 +299,17 @@ class ListenProducer:
             coalesce_key=LOOK_KEY,
         )
 
-    def _escalate_to_body(self, desired: float, t: float) -> MotionAction:
+    def _escalate_to_body(
+        self, desired: float, t: float, *, dur_floor: float | None = None
+    ) -> MotionAction:
         """Emit a combined head+body action that brings the robot to face *desired*.
 
         The body rotates toward the source (clamped to ±``body_yaw_max``); the
         head takes the residual ``desired - new_body_yaw`` (clamped to
         ±``max_yaw``) so head + body together point at the source and the head
         sits closer to centre.  The near-side antenna (relative to the final head
-        yaw) is folded into the same action.
+        yaw) is folded into the same action.  ``dur_floor`` raises the duration floor
+        above ``min_dur`` for the deliberate engaged turn (see :meth:`_clamp_dur`).
         """
         p = self.params
         sign = 1.0 if desired >= 0 else -1.0
@@ -256,10 +318,8 @@ class ListenProducer:
         new_head = max(-p.max_yaw, min(p.max_yaw, residual))
 
         body_delta = abs(new_body - self.body)
-        dur = max(
-            p.min_dur,
-            min(p.max_dur, body_delta / p.body_speed if p.body_speed else p.max_dur),
-        )
+        raw = body_delta / p.body_speed if p.body_speed else p.max_dur
+        dur = self._clamp_dur(raw, floor=dur_floor)
 
         self.committed = new_head
         self.body = new_body
@@ -276,17 +336,70 @@ class ListenProducer:
             coalesce_key=LOOK_KEY,
         )
 
+    def _speech_orient(self, desired: float, t: float) -> MotionAction:
+        """The speech-tier orienting move: a bounded HEAD-ONLY nudge toward *desired*.
+
+        Larger than the Tier-1 antenna lean (the head actually turns) but smaller than
+        the full engaged escalate turn — a fraction of the clamped head target, hard-capped
+        at ``speech_orient_max`` and never escalating to the body. This is the response to
+        *detected speech* that has not (yet) been judged addressed to the robot.
+        """
+        p = self.params
+        mag = min(abs(desired) * p.speech_orient_gain, p.speech_orient_max)
+        target = math.copysign(mag, desired) if desired else 0.0
+        return self._move_to(target, t)
+
+    def _engaged_turn(self, raw_desired: float, desired: float, t: float) -> MotionAction:
+        """The engaged-tier deliberate turn toward the utterance DoA (head, esc. to body).
+
+        Reuses the Tier-2 escalate/head paths but pins the duration floor to
+        ``engaged_min_dur`` so the largest engaged moves can never feed the SDK ``goto``
+        planner a degenerate duration (see :meth:`_clamp_dur`).
+        """
+        floor = self.params.engaged_min_dur
+        if abs(raw_desired) > self.params.head_only_band:
+            return self._escalate_to_body(raw_desired, t, dur_floor=floor)
+        return self._move_to(desired, t, dur_floor=floor)
+
     def _react_to_angle(
-        self, angle: float, t: float, *, triggered: bool, live: bool
+        self,
+        angle: float,
+        t: float,
+        *,
+        triggered: bool,
+        live: bool,
+        speech: bool = False,
+        engaged: bool = False,
     ) -> MotionAction | None:
-        """A Tier-2 turn (on a speech/snap trigger) or a Tier-1 antenna lean, or ``None``."""
+        """The graduated motion ladder for one tick (or ``None``).
+
+        Tiered by perception level (highest first):
+
+        * **engaged** — the gate decided the utterance is addressed to the robot: a
+          deliberate head/body turn toward the DoA (:meth:`_engaged_turn`). Fires
+          regardless of ``turn_enabled`` (the engaged signal is itself the gate).
+        * **legacy turn** — with ``turn_enabled`` (normal ``listen``) and a deliberate
+          ``triggered`` event off the current heading: the existing Tier-2 turn,
+          unchanged.
+        * **speech** — detected speech (no engaged signal) under transcribe-style
+          operation: a larger HEAD-ONLY orienting move (:meth:`_speech_orient`).
+        * **noise** — any other live tick: the Tier-1 antenna lean.
+        """
         p = self.params
         raw_desired = doa_angle_to_yaw(angle, p.gain)  # unclamped — drives escalation
         desired = max(-p.max_yaw, min(p.max_yaw, raw_desired))  # clamped head-only target
-        if p.turn_enabled and triggered and abs(desired - self.committed) > p.deadband:
+        off_heading = abs(desired - self.committed) > p.deadband
+        # Engaged: the deliberate turn, independent of turn_enabled (the gate IS the turn).
+        if engaged and off_heading:
+            return self._engaged_turn(raw_desired, desired, t)
+        # Legacy turn path (normal listen, turn_enabled=True) — unchanged.
+        if p.turn_enabled and triggered and off_heading:
             if abs(raw_desired) > p.head_only_band:
                 return self._escalate_to_body(raw_desired, t)
             return self._move_to(desired, t)
+        # Speech tier (transcribe-style, turn suppressed): a larger head-only orient.
+        if speech and off_heading:
+            return self._speech_orient(desired, t)
         if live:
             return _antenna_lean(desired, p)
         return None
@@ -392,6 +505,7 @@ class ListenProducer:
         *,
         snap: bool = False,
         sound_present: bool | None = None,
+        engaged: bool = False,
     ) -> MotionAction | None:
         """Return a look-at (or antenna-lean) action to submit this tick, or ``None``.
 
@@ -410,6 +524,17 @@ class ListenProducer:
         ``sound_present`` when an audio path exists, else (HTTP/remote)
         ``sense.doa_angle is not None`` as a degraded best-effort — never a stale
         latched angle during true silence.
+
+        **3-tier ladder (transcribe-style, ``turn_enabled=False``).** When the legacy
+        turn is suppressed, the response is graded by perception level via the
+        ``engaged`` seam: ambient **noise** → Tier-1 antenna lean only; detected
+        **speech** (``sense.speech_detected``) → a larger HEAD-ONLY orienting move;
+        and **engaged** → a deliberate head/body turn toward the DoA. The engaged
+        signal is either the ``engaged=`` keyword or the one-shot
+        :meth:`set_engaged` latch (consumed here, OR'd with the kwarg) — the seam the
+        engagement gate (task t7) drives. The engaged turn's duration is clamped so it
+        can never feed the SDK ``goto`` planner ``t/duration > 1`` (see
+        :meth:`_clamp_dur`).
 
         **Idle (always-alive):** whenever no reaction fires — *including during the
         hold window*, so the robot is never frozen — emit a gentle idle pose
@@ -433,9 +558,23 @@ class ListenProducer:
         # so the robot keeps breathing instead of freezing. Drift-home stays gated on
         # silence inside the idle/recenter paths, so it won't start during the hold.
         if t >= self._hold_until:
+            # Consume the one-shot engaged latch (set by ``set_engaged``) OR'd with the
+            # per-tick ``engaged=`` kwarg, then clear it — so the deliberate turn fires
+            # once per latch/signal. Consumed only inside the dispatch (not during a
+            # hold window) so an engaged latch set mid-hold survives until the hold
+            # clears and still drives the turn.
+            is_engaged = engaged or self._engaged_latch
+            self._engaged_latch = False
             triggered = sense.speech_detected or snap  # deliberate event: speech / snap
             if angle is not None:
-                reaction = self._react_to_angle(angle, t, triggered=triggered, live=live)
+                reaction = self._react_to_angle(
+                    angle,
+                    t,
+                    triggered=triggered,
+                    live=live,
+                    speech=sense.speech_detected,
+                    engaged=is_engaged,
+                )
                 if reaction is not None:
                     return reaction
 
