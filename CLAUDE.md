@@ -241,6 +241,26 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
   thread, ahead of and independent of the speak worker). Standalone `think run` /
   `say` keep the strict default (an unreachable TTS is a clean exit-2). The
   `CognitionEngine(audio_optional=...)` flag lives in `reachy/speech/cognition.py`.
+- **`--transcribe` — live cognition hears WORDS, not just sound:** `listen run
+  --live --transcribe` (requires `--live`, `sdk`-only) transcribes nearby speech and
+  feeds the recognised words into the *same* cognition `EventBuffer` the folded
+  `ThinkHook` engine consumes, so the LLM reasons about *what* was said — not just
+  "speech from the left". Off by default; when off `SenseSample.audio` stays `None`,
+  no `TranscribeHook` is built, and no STT request is made (byte-identical). The path:
+  the loop's **single** per-tick mic read (`_audio` in `_run_sdk_loop`) also retains
+  the raw chunk on `SenseSample.audio` (no second `get_audio_sample()`); the folded
+  `reachy/motion/listen_transcribe.py` `TranscribeHook` rides that shared sample
+  (single-SDK-owner — it opens no media session), gates on `speech` + a self-mute
+  window, and hands the chunk to the shared `reachy/speech/stt.py` `Transcriber`
+  (the model-gear / Parakeet `/v1/audio/transcriptions` leg, also reused by `sleep`'s
+  wake-word `HttpSttBackend`); a non-empty transcript is fed via
+  `EventBuffer.feed_transcript`. A **self-mute window** stamped by the cognition
+  `play_audio` wrapper after each spoken clip means the robot never transcribes its
+  own TTS; an unreachable STT degrades to "no words" and never stalls the loop. It is
+  **not** a dialogue/turn-taking/barge-in assistant and **not** the wake-word path —
+  words are one more perception. The deployed `live` boot unit opts in
+  (`listen run --live --transcribe`) so the on-robot presence hears words; STT is
+  external behind `REACHY_STT_URL` (default `localhost:9002`), no on-box model bundled.
 
 ### `say` noun — dumb TTS pipe
 

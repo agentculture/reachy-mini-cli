@@ -115,6 +115,21 @@ session and **one** motion queue in **one** process — arbitrated by the
 `sleep > pat > think` priority flags. It is the supported way to run all the
 senses at once (one media owner; see the single-SDK-owner model below).
 
+Add **`--transcribe`** and live cognition *hears words*: nearby speech is
+transcribed via the external STT service (model-gear / Parakeet at
+`REACHY_STT_URL`, default `localhost:9002`) and the recognised words flow into
+the think loop, so the robot reasons about *what* was said — not just that a
+sound came from the left. Off by default (the live loop is unchanged when off);
+`--transcribe` requires `--live` and the `sdk` transport. A self-mute window
+means the robot never transcribes its own voice, and an unreachable STT degrades
+to "no words" rather than stalling the loop. It is **not** a chat/turn-taking
+assistant — words are one more perception. The deployed `live` boot service runs
+with `--transcribe` on, so the on-robot presence hears words out of the box.
+
+```bash
+reachy-mini-cli listen run --live --transcribe                 # hear words + react to them
+```
+
 `service` makes one presence boot-persistent via systemd `--user`. Exactly one
 mode is enabled at a time — enabling one disables the sibling — and it
 auto-restarts on crash. The daemon is a boot dependency of both presence units.

@@ -432,6 +432,18 @@ priority flags. This is the loop the [`live` boot presence](#boot-persistence--o
 runs (`service enable live`). Bare `listen run` (no `--live`) is the
 sound-orient + pat loop only; `--live` is `sdk`-only.
 
+Add **`--transcribe`** (`listen run --live --transcribe`, `sdk`-only) and live
+cognition *hears the words*: nearby speech is transcribed via the external STT
+service (model-gear / Parakeet at `REACHY_STT_URL`, default `localhost:9002`) and
+fed into the think loop, so the robot reacts to *what* was said rather than only
+that a sound arrived from a direction. Off by default (when off, behavior and the
+mic read are unchanged); a self-mute window after each spoken clip stops the robot
+transcribing its own voice, and an unreachable STT degrades to "no words" without
+stalling the loop. It is *not* a dialogue/turn-taking assistant and *not* the
+wake-word path — words are one more perception. The deployed `live` boot unit runs
+with `--transcribe` on, so the on-robot presence hears words by default; STT stays
+external (no on-box model bundled).
+
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
 | `listen` | two-tier sound orienting: antenna lean (Tier 1) + head→body turn on speech/snap (Tier 2); hosts the always-alive idle layer + the #43 `PatHook`; `--live` folds in think + vision + sleep | mic DoA + RMS (`media_session`) | serial MotionQueue (minjerk `goto`) | `sdk` default; `http` polls daemon DoA |

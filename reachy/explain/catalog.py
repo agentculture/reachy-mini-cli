@@ -824,6 +824,20 @@ Feel knobs (each defaults to a tuned value; unset keeps it):
 - `--snap-ratio X` — RMS spike must be this many times the floor to count as a snap.
 - `--snap-floor RMS` — minimum floor RMS below which snap detection is suppressed.
 
+## Live mode
+
+- `--live` — fold `think` + `vision` + `sleep` into this one loop (alongside the
+  head-pat hook), so every sense rides the one SDK media session and the one motion
+  queue in one process. `sdk`-only. This is the loop the `live` boot presence runs.
+- `--transcribe` — (requires `--live`, `sdk`-only) transcribe nearby speech via the
+  external STT service (model-gear / Parakeet at `REACHY_STT_URL`, default
+  `localhost:9002`) and feed the recognised **words** into live cognition, so the
+  robot reasons about *what* was said, not just that a sound came from a direction.
+  Off by default; when off the live loop is unchanged and no STT request is made. A
+  self-mute window after each spoken clip drops the robot's own voice (it never
+  transcribes itself); an unreachable STT degrades to "no words" and never stalls
+  the loop. Not a dialogue/turn-taking assistant — words are one more perception.
+
 ## Transport
 
 The `sdk` transport (default) streams mic audio via `reachy_mini` in-process —
