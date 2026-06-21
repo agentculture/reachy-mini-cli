@@ -35,6 +35,10 @@ from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 _DEFAULT_BASE_URL = "http://localhost:8000"
 _DEFAULT_MODEL = "default"
 _DEFAULT_TIMEOUT = 120.0
+# Shorter default for the non-streaming single-shot ``complete()`` — a
+# classifier call should surface a slow/dead endpoint quickly rather than
+# hanging for two minutes.
+_DEFAULT_COMPLETE_TIMEOUT = 10.0
 
 # Fallback regex: any .!? + whitespace — used when the buffer grows very long
 # without a proper sentence break so we don't starve TTS of input. (Cited
@@ -245,12 +249,13 @@ def _build_request(
     *,
     temperature: float,
     max_tokens: int | None,
+    stream: bool = True,
 ) -> urllib.request.Request:
     url = cfg.base_url.rstrip("/") + "/v1/chat/completions"
     payload: dict = {
         "model": cfg.model,
         "messages": messages,
-        "stream": True,
+        "stream": stream,
         "temperature": temperature,
         "chat_template_kwargs": {"enable_thinking": False},
     }
@@ -324,6 +329,48 @@ def stream_chat_completion(
         # as it arrives — ``readline`` pulls only the next line off the wire, so
         # deltas are parsed incrementally rather than buffered to completion.
         yield from _iter_sse_deltas(resp)
+
+
+def complete(
+    messages: list[dict],
+    *,
+    model: str | None = None,
+    temperature: float = 0.8,
+    max_tokens: int | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    timeout: float = _DEFAULT_COMPLETE_TIMEOUT,
+) -> str:
+    """Issue a single non-streaming chat completion and return the full text.
+
+    Posts ``stream=false`` to the OpenAI-compatible ``/v1/chat/completions``
+    endpoint, reads the whole JSON response body, and returns
+    ``choices[0].message.content`` as one string.
+
+    Designed for short-latency classifier calls where the caller needs the
+    whole response before doing anything else.  The default *timeout* is
+    intentionally short (``_DEFAULT_COMPLETE_TIMEOUT``, 10 s) so a slow or
+    unreachable endpoint surfaces as a fast exception rather than a long hang.
+    Pass an explicit ``timeout=`` to override.
+
+    Config resolution (``base_url`` / ``model`` / ``api_key``) honours the same
+    ``REACHY_OPENAI_*`` / ``REACHY_LLM_*`` environment variables and explicit-
+    kwarg precedence as :func:`stream_chat_completion`.  The caller is
+    responsible for catching ``urllib.error.URLError`` / ``OSError`` /
+    ``socket.timeout`` if it wants to handle network failures gracefully; this
+    function lets them propagate so the caller can decide the error policy.
+    """
+    cfg = LlmConfig.resolve(base_url=base_url, model=model, api_key=api_key)
+    req = _build_request(
+        cfg, messages, temperature=temperature, max_tokens=max_tokens, stream=False
+    )
+
+    resp_cm = urllib.request.urlopen(req, timeout=timeout)  # nosec B310
+    with resp_cm as resp:
+        raw = resp.read()
+
+    body = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    return body["choices"][0]["message"]["content"]
 
 
 def _iter_sse_deltas(resp) -> Iterator[str]:  # noqa: ANN001
