@@ -65,8 +65,10 @@ dependency.
 
 from __future__ import annotations
 
+import collections
 import logging
 import math
+import os
 import re
 from typing import Callable
 
@@ -74,13 +76,29 @@ import numpy as np
 
 from reachy.motion.queue import MotionQueue
 from reachy.motion.sense_sample import SampleProvider, SenseSample
+from reachy.speech.engagement import Decision, decide_engagement
 from reachy.speech.events import EventBuffer, _doa_direction
+from reachy.speech.name_match import is_name_match
 from reachy.speech.stt import Transcriber
+
+#: Truthy strings recognised by the ``REACHY_ENGAGE_HEURISTIC`` escape hatch.
+_TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
+
+#: How many recent accepted utterances to pass to the classifier as conversation
+#: context.  A sane default; the exact count is a parked follow-up (issue #55).
+_HISTORY_MAXLEN = 6
 
 #: Words counted for the coherence gate (letters + intra-word apostrophes).
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 
 logger = logging.getLogger(__name__)
+
+
+def _env_truthy(value: str | None) -> bool:
+    """Return ``True`` for the usual truthy env strings; ``False`` for unset/"0"/""."""
+    if value is None:
+        return False
+    return value.strip().lower() in _TRUTHY
 
 
 class TranscribeHook:
@@ -113,6 +131,16 @@ class TranscribeHook:
         transcript string (it accumulates a rolling window, throttles its POSTs,
         and never raises). Defaults to a real :class:`Transcriber` (constructed with
         no network I/O); tests inject a fake recording its calls.
+    classifier:
+        Optional :class:`~reachy.speech.engagement.EngagementClassifier`-like
+        object (anything with ``judge(text, context) -> bool``) used by the
+        layered engagement gate (:meth:`_decide` →
+        :func:`~reachy.speech.engagement.decide_engagement`). Default ``None``
+        keeps the gate byte-identical to the pure :meth:`_should_engage`
+        heuristic (no classifier call); inject one to let the LLM judge
+        addressed-vs-ambient. The ``REACHY_ENGAGE_HEURISTIC`` env flag (truthy)
+        forces the heuristic even when a classifier is injected, and a classifier
+        that raises degrades back to the heuristic so the loop never stalls.
     mute_until:
         Zero-arg callable returning the monotonic deadline (seconds) until which the
         robot is self-muted — while ``t < mute_until()`` the tick discards the audio
@@ -132,6 +160,7 @@ class TranscribeHook:
         *,
         buffer: EventBuffer,
         transcriber: object | None = None,
+        classifier: object | None = None,
         sample_rate: int | None = None,
         mute_until: Callable[[], float] | None = None,
         clock: Callable[[], float] | None = None,
@@ -180,6 +209,16 @@ class TranscribeHook:
         self._engage_window_s = float(engage_window_s)
         self._names = tuple(n.lower() for n in names)
         self._engaged_until = 0.0
+
+        # --- Layered engagement decision (t6): delegate to the t5 engine when a
+        #     classifier is injected, else stay byte-identical to the pure
+        #     heuristic.  The escape hatch is read ONCE here so flipping it
+        #     mid-run never matters. ---
+        self._classifier = classifier
+        self._force_heuristic = _env_truthy(os.environ.get("REACHY_ENGAGE_HEURISTIC"))
+        #: Recent accepted utterances, oldest-first, handed to the classifier as
+        #: conversation context (only appended on an ENGAGE decision).
+        self._history: collections.deque[str] = collections.deque(maxlen=_HISTORY_MAXLEN)
 
         #: Count of utterances fed to cognition (diagnostics / tests).
         self.transcripts = 0
@@ -281,14 +320,60 @@ class TranscribeHook:
         text = self._transcriber.transcribe_once(audio)  # type: ignore[attr-defined]
         if not text:
             return
-        if not self._should_engage(text, t):
+        if not self._decide(text, t):
             # A coherent-enough utterance, but not addressed to the robot and not part
             # of an ongoing conversation — ignore it (ambient speech / noise).
-            logger.debug("[transcribe] ignoring un-addressed utterance: %r", text)
             return
         self._buffer.feed_transcript(text, direction=direction)
         self._engaged_until = t + self._engage_window_s
         self.transcripts += 1
+
+    def _decide(self, text: str, t: float) -> bool:
+        """Layered engagement decision: delegate to the t5 engine, or the heuristic.
+
+        Two paths, chosen once per utterance:
+
+        * **Heuristic path** — when the escape hatch ``REACHY_ENGAGE_HEURISTIC``
+          is set (read once at construction) OR no classifier was injected, the
+          decision is exactly :meth:`_should_engage` (byte-identical to today's
+          shipped behaviour, and zero classifier calls).
+        * **LLM-gate path** — otherwise :func:`~reachy.speech.engagement.decide_engagement`
+          decides against the recent conversation ``context``:
+
+          - :data:`~reachy.speech.engagement.Decision.ENGAGE` → engage (label
+            ``"name"`` if the utterance fuzzy-matches the robot's name, else
+            ``"context"``);
+          - :data:`~reachy.speech.engagement.Decision.DROP` → drop (label
+            ``"dropped"``);
+          - :data:`~reachy.speech.engagement.Decision.DEGRADE` (classifier
+            unavailable) → fall back to :meth:`_should_engage` so the hearing
+            loop **never stalls** (label ``"degrade->heuristic"``).
+
+        The per-utterance outcome is logged (the observability label) and, on an
+        ENGAGE, the utterance is appended to the conversation ``_history`` so it
+        becomes context for the next decision.
+        """
+        if self._force_heuristic or self._classifier is None:
+            engaged = self._should_engage(text, t)
+            label = "engaged-heuristic" if engaged else "dropped-heuristic"
+        else:
+            decision = decide_engagement(
+                text, list(self._history), classifier=self._classifier, names=self._names
+            )
+            if decision is Decision.ENGAGE:
+                engaged = True
+                label = "name" if is_name_match(text, self._names) else "context"
+            elif decision is Decision.DROP:
+                engaged = False
+                label = "dropped"
+            else:  # Decision.DEGRADE — classifier unavailable, keep hearing.
+                engaged = self._should_engage(text, t)
+                label = "degrade->heuristic"
+
+        logger.info('engagement: %s :: "%s"', label, text[:40])
+        if engaged:
+            self._history.append(text)
+        return engaged
 
     def _should_engage(self, text: str, t: float) -> bool:
         """Decide whether *text* should drive cognition.
