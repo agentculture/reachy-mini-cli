@@ -1,7 +1,9 @@
 """Sense-event buffer — live sensor readings → human-readable cue strings.
 
 This module is the "what the robot perceives" feed for the (future) think engine.
-It is NOT transcription (no STT).  It turns already-read sensory sample values
+It does NOT perform STT itself — transcription happens upstream (in the
+listen-loop hook) and finished text is handed in via :meth:`EventBuffer.feed_transcript`.
+It turns already-read sensory sample values
 into timestamped :class:`SenseCue` strings held in a rolling, thread-safe buffer
 that the think engine can snapshot at any time.
 
@@ -271,6 +273,26 @@ class EventBuffer:
                 self._append("the light brightened")
             else:
                 self._append("the light dimmed")
+
+    def feed_transcript(self, text: str) -> None:
+        """Append a cue for already-transcribed spoken words.
+
+        Parameters
+        ----------
+        text:
+            The transcribed text (already produced upstream by STT).  Stripped
+            of surrounding whitespace.  If empty after stripping, no cue is
+            appended.
+
+        Cue rules
+        ---------
+        * Non-empty stripped text → ``'heard someone say: "<text>"'``
+        * Empty / whitespace-only → no cue.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return
+        self._append(f'heard someone say: "{stripped}"')
 
     # ------------------------------------------------------------------
     # Snapshot

@@ -370,3 +370,43 @@ class TestSenseCue:
     def test_repr_contains_text(self):
         cue = SenseCue(text="motion on the right", timestamp=2.5)
         assert "motion" in repr(cue)
+
+
+# ---------------------------------------------------------------------------
+# feed_transcript
+# ---------------------------------------------------------------------------
+
+
+class TestFeedTranscript:
+    """feed_transcript(text) → correct transcript cues."""
+
+    def test_transcript_appends_one_cue_with_heard_someone_say(self):
+        buf = _make_buffer()
+        buf.feed_transcript("hello world")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert "heard someone say" in cues[0].text
+        assert "hello world" in cues[0].text
+
+    def test_empty_text_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_transcript("")
+        cues = buf.snapshot()
+        assert len(cues) == 0
+
+    def test_whitespace_only_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_transcript("   ")
+        cues = buf.snapshot()
+        assert len(cues) == 0
+
+    def test_transcript_cue_survives_snapshot_and_build_messages(self):
+        from reachy.speech.cognition import build_messages
+
+        buf = _make_buffer()
+        buf.feed_transcript("the robot is alive")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        messages = build_messages("system prompt", cues)
+        user_msg = messages[1]["content"]
+        assert "the robot is alive" in user_msg
