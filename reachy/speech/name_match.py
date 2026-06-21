@@ -98,8 +98,9 @@ def _word_matches_name(word: str, name: str, threshold: float) -> bool:
         return False  # superstring guard: "reachy" in "preachy" → morphological extension
     # Initial guard: a fuzzy match must share the name's first letter. STT mishearings
     # of "reachy" keep the leading phoneme ("richie", "reachie"); same-length score
-    # collisions ("speech") do not.
-    if word[:1] != name[:1]:
+    # collisions ("speech") do not. (``name[:1]`` is a safe single-char prefix — "" for
+    # an empty name — so ``startswith`` never raises.)
+    if not word.startswith(name[:1]):
         return False
     return _combined_score(word, name) >= threshold
 

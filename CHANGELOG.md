@@ -12,7 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `reachy/speech/name_match.py`: extracted the per-word/per-name guard ladder into a
   flat `_word_matches_name()` helper so `is_name_match()` is a single `any(...)` over
   word/name pairs — behaviour byte-identical, Cognitive Complexity dropped from 18 to
-  within the 15 limit (SonarCloud maintainability).
+  within the 15 limit (SonarCloud maintainability). The initial guard now reads
+  `not word.startswith(name[:1])` instead of the slice comparison `word[:1] != name[:1]`
+  (SonarCloud `S6659`), behaviour-preserving for all real inputs.
 - `reachy/motion/listen_transcribe.py`: removed the unused `clock=` constructor seam
   (it was never injected by any caller and `self._clock` was assigned but never read),
   bringing `TranscribeHook.__init__` to 13 parameters (SonarCloud `S107`). The mute gate
