@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class SenseSample:
@@ -33,12 +35,15 @@ class SenseSample:
     - ``doa`` — direction of arrival in degrees, or ``None`` when not available.
     - ``speech`` — whether speech was detected this tick.
     - ``ts`` — a monotonic timestamp for the sample (seconds).
+    - ``audio`` — the raw mic chunk for this tick (float32 ndarray), or ``None``
+      when not captured — consumed by the optional STT transcribe path.
     """
 
     rms: float = 0.0
     doa: Optional[float] = None
     speech: bool = False
     ts: float = 0.0
+    audio: np.ndarray | None = None
 
 
 #: A hook reads the latest sample via this callable. ``None`` means "no fresh

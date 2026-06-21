@@ -1,5 +1,7 @@
 """Tests for the shared per-tick :class:`SenseSample` value type."""
 
+import numpy as np
+
 from reachy.motion.sense_sample import SenseSample
 
 
@@ -23,3 +25,16 @@ def test_is_frozen():
     except Exception:  # FrozenInstanceError is a dataclasses exception
         return
     raise AssertionError("SenseSample should be immutable (frozen)")
+
+
+def test_default_audio_is_none():
+    # The raw-audio field is opt-in; default construction stays audio-free so
+    # every existing SenseSample(...) call is unchanged.
+    assert SenseSample().audio is None
+
+
+def test_audio_round_trips():
+    chunk = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+    s = SenseSample(audio=chunk)
+    assert s.audio is chunk
+    assert np.array_equal(s.audio, chunk)
