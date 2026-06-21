@@ -141,6 +141,19 @@ class TranscribeHook:
         addressed-vs-ambient. The ``REACHY_ENGAGE_HEURISTIC`` env flag (truthy)
         forces the heuristic even when a classifier is injected, and a classifier
         that raises degrades back to the heuristic so the loop never stalls.
+    on_engage:
+        Optional zero-arg callback fired **exactly once per ENGAGE decision** —
+        when an utterance clears the engagement gate (:meth:`_decide` returns
+        True) and is about to be fed to cognition. It is **not** fired on a
+        drop or a degrade-to-drop, so ambient / un-addressed speech never
+        triggers it. The composition layer wires this to
+        :meth:`~reachy.motion.listen.ListenProducer.set_engaged` so an addressed
+        utterance latches exactly one deliberate head/body turn toward the
+        speaker's DoA on the next tick (the engaged signal of the motion
+        ladder). The callback is invoked inside a ``try/except`` — a callback
+        fault is logged and swallowed so it can never kill the loop or block the
+        words from reaching cognition. Default ``None`` is a no-op (no turn), so
+        a build that does not inject it is byte-identical to today.
     mute_until:
         Zero-arg callable returning the monotonic deadline (seconds) until which the
         robot is self-muted — while ``t < mute_until()`` the tick discards the audio
@@ -161,6 +174,7 @@ class TranscribeHook:
         buffer: EventBuffer,
         transcriber: object | None = None,
         classifier: object | None = None,
+        on_engage: Callable[[], None] | None = None,
         sample_rate: int | None = None,
         mute_until: Callable[[], float] | None = None,
         clock: Callable[[], float] | None = None,
@@ -215,6 +229,7 @@ class TranscribeHook:
         #     heuristic.  The escape hatch is read ONCE here so flipping it
         #     mid-run never matters. ---
         self._classifier = classifier
+        self._on_engage = on_engage
         self._force_heuristic = _env_truthy(os.environ.get("REACHY_ENGAGE_HEURISTIC"))
         #: Recent accepted utterances, oldest-first, handed to the classifier as
         #: conversation context (only appended on an ENGAGE decision).
@@ -322,11 +337,34 @@ class TranscribeHook:
             return
         if not self._decide(text, t):
             # A coherent-enough utterance, but not addressed to the robot and not part
-            # of an ongoing conversation — ignore it (ambient speech / noise).
+            # of an ongoing conversation — ignore it (ambient speech / noise). No
+            # engaged turn fires for dropped / degrade-to-dropped utterances.
             return
+        # The gate ENGAGED: signal the motion ladder to turn toward the speaker (a
+        # deliberate one-shot turn on the next tick) BEFORE feeding cognition. The
+        # callback (wired to ListenProducer.set_engaged) is guarded so a fault can
+        # neither kill the loop nor stop the words reaching cognition.
+        self._notify_engaged()
         self._buffer.feed_transcript(text, direction=direction)
         self._engaged_until = t + self._engage_window_s
         self.transcripts += 1
+
+    def _notify_engaged(self) -> None:
+        """Fire the ``on_engage`` callback once for an ENGAGE decision (guarded).
+
+        Called from :meth:`_flush` only when :meth:`_decide` returned True — i.e.
+        exactly once per addressed/named utterance, never on a drop or a
+        degrade-to-drop. ``on_engage`` is wired by the composition layer to
+        :meth:`~reachy.motion.listen.ListenProducer.set_engaged` (latch one
+        deliberate turn toward the DoA). A callback fault is logged and swallowed:
+        a raising motion seam must never kill the hearing loop or block the words.
+        """
+        if self._on_engage is None:
+            return
+        try:
+            self._on_engage()
+        except Exception:  # noqa: BLE001 — a turn-signal fault must not kill the loop
+            logger.warning("TranscribeHook on_engage callback raised; ignoring", exc_info=True)
 
     def _decide(self, text: str, t: float) -> bool:
         """Layered engagement decision: delegate to the t5 engine, or the heuristic.

@@ -895,3 +895,187 @@ def test_transcribe_self_mute_wired_to_play_audio(monkeypatch) -> None:
     # Playing a clip stamps the shared window forward (default ~2.5s mute-after).
     play(b"\x00\x00")
     assert mute_until() > 100.0, "play_audio must stamp the mute window the hook reads"
+
+
+# ---------------------------------------------------------------------------
+# t7 — wire the engagement classifier + the motion-ladder engaged signal,
+# ONLY under `--transcribe`.
+#
+# Under `--transcribe`: an EngagementClassifier is built (sharing cognition's
+# REACHY_OPENAI_* endpoint, i.e. NO connection overrides) and injected into the
+# TranscribeHook, and `on_engage` is wired to the loop's ListenProducer.set_engaged
+# so the gate's ENGAGE decision turns the head. Without `--transcribe`: NO
+# classifier is built and the off path stays byte-identical (criterion 1).
+# ---------------------------------------------------------------------------
+
+from reachy.motion.listen import ListenProducer  # noqa: E402
+from reachy.speech.engagement import EngagementClassifier  # noqa: E402
+
+
+def test_transcribe_builds_classifier_and_wires_on_engage(monkeypatch) -> None:
+    """``--transcribe`` ON: a classifier is built and ``on_engage`` is the producer's seam.
+
+    Capture (a) every ``EngagementClassifier`` constructed and the connection kwargs
+    it was built with, and (b) the ``classifier`` / ``on_engage`` passed to the
+    TranscribeHook. Prove: exactly one classifier is built with NO endpoint overrides
+    (so it resolves the same ``REACHY_OPENAI_*`` env cognition uses), and ``on_engage``
+    is the loop ``ListenProducer``'s bound ``set_engaged``.
+    """
+    built: list[dict] = []
+    real_cls_init = EngagementClassifier.__init__
+
+    def _cls_init(self, **kw):
+        built.append(dict(kw))
+        return real_cls_init(self, **kw)
+
+    monkeypatch.setattr(EngagementClassifier, "__init__", _cls_init)
+
+    captured: dict[str, object] = {}
+    real_tr_init = TranscribeHook.__init__
+
+    def _tr_init(self, sample_provider, **kw):
+        captured["classifier"] = kw.get("classifier")
+        captured["on_engage"] = kw.get("on_engage")
+        return real_tr_init(self, sample_provider, **kw)
+
+    monkeypatch.setattr(TranscribeHook, "__init__", _tr_init)
+
+    # Track set_engaged on the real producer so we can match the bound method identity.
+    engaged_calls = {"n": 0}
+    real_set_engaged = ListenProducer.set_engaged
+
+    def _spy_engaged(self):
+        engaged_calls["n"] += 1
+        return real_set_engaged(self)
+
+    monkeypatch.setattr(ListenProducer, "set_engaged", _spy_engaged)
+
+    transport = _LiveSdkTransport()
+    rc = _run_live_cli(
+        monkeypatch, transport, max_ticks=3, extra_args=["--idle-energy", "0", "--transcribe"]
+    )
+    assert rc == 0
+
+    # Exactly one classifier was built, with NO connection overrides → it resolves the
+    # SAME REACHY_OPENAI_* endpoint the cognition engine resolves (shared config).
+    assert len(built) == 1, f"expected one EngagementClassifier built, got {len(built)}"
+    kw = built[0]
+    for k in ("base_url", "model", "api_key"):
+        assert kw.get(k) is None, f"classifier must not override {k} (share cognition's endpoint)"
+
+    # The hook received that classifier and a callable on_engage...
+    assert isinstance(captured.get("classifier"), EngagementClassifier)
+    on_engage = captured.get("on_engage")
+    assert callable(on_engage), "TranscribeHook must receive a callable on_engage"
+
+    # ...and on_engage IS the producer's bound set_engaged: invoking it bumps the spy.
+    before = engaged_calls["n"]
+    on_engage()
+    assert engaged_calls["n"] == before + 1, "on_engage must be the producer's set_engaged"
+
+
+def test_transcribe_off_builds_no_classifier(monkeypatch) -> None:
+    """``--transcribe`` OFF (live and bare): NO EngagementClassifier is constructed.
+
+    The keystone byte-identical guarantee for criterion 1: nothing new is built
+    without ``--transcribe`` — neither in a bare ``listen run`` nor in
+    ``listen run --live`` without ``--transcribe``.
+    """
+    built = {"n": 0}
+    real_cls_init = EngagementClassifier.__init__
+
+    def _cls_init(self, **kw):
+        built["n"] += 1
+        return real_cls_init(self, **kw)
+
+    monkeypatch.setattr(EngagementClassifier, "__init__", _cls_init)
+
+    # 1) live WITHOUT --transcribe → no classifier.
+    transport = _LiveSdkTransport()
+    rc = _run_live_cli(monkeypatch, transport, max_ticks=4, extra_args=["--idle-energy", "0"])
+    assert rc == 0
+    assert built["n"] == 0, "live without --transcribe must build NO EngagementClassifier"
+
+
+def test_transcribe_bare_run_builds_no_classifier(monkeypatch) -> None:
+    """A bare ``listen run`` (no ``--live``, no ``--transcribe``) builds no classifier."""
+    built = {"n": 0}
+    real_cls_init = EngagementClassifier.__init__
+
+    def _cls_init(self, **kw):
+        built["n"] += 1
+        return real_cls_init(self, **kw)
+
+    monkeypatch.setattr(EngagementClassifier, "__init__", _cls_init)
+    monkeypatch.setattr("reachy.cli._commands.listen.get_transport", lambda _: _LiveSdkTransport())
+
+    out = io.StringIO()
+    old = sys.stdout
+    sys.stdout = out
+    try:
+        rc = main(
+            [
+                "listen",
+                "run",
+                "--json",
+                "--transport",
+                "sdk",
+                "--deadband",
+                "0",
+                "--max-ticks",
+                "3",
+                "--idle-energy",
+                "0",
+            ]
+        )
+    finally:
+        sys.stdout = old
+    assert rc == 0
+    assert built["n"] == 0, "a bare listen run must build NO EngagementClassifier"
+
+
+def test_escape_hatch_skips_classifier_build(monkeypatch) -> None:
+    """``REACHY_ENGAGE_HEURISTIC`` truthy: ``--transcribe`` builds NO classifier.
+
+    When the escape hatch forces the heuristic, the hook would ignore a classifier
+    anyway, so the build is skipped entirely (the wiring helper short-circuits).
+    """
+    monkeypatch.setenv("REACHY_ENGAGE_HEURISTIC", "1")
+    built = {"n": 0}
+    real_cls_init = EngagementClassifier.__init__
+
+    def _cls_init(self, **kw):
+        built["n"] += 1
+        return real_cls_init(self, **kw)
+
+    monkeypatch.setattr(EngagementClassifier, "__init__", _cls_init)
+
+    transport = _LiveSdkTransport()
+    rc = _run_live_cli(
+        monkeypatch, transport, max_ticks=3, extra_args=["--idle-energy", "0", "--transcribe"]
+    )
+    assert rc == 0
+    assert built["n"] == 0, "the escape hatch must skip the classifier build"
+
+
+# ---------------------------------------------------------------------------
+# t7 — no new base dependency, feature lives inside the --transcribe live loop
+# ---------------------------------------------------------------------------
+
+
+def test_base_dependencies_unchanged_no_new_dep() -> None:
+    """The base ``project.dependencies`` is still just numpy — no new runtime dep.
+
+    The engagement classifier reuses the stdlib-``urllib`` ``llm`` client and the
+    name match is stdlib-only, so the whole feature adds NO base dependency
+    (criterion 2). This guards against an accidental requirements creep.
+    """
+    import pathlib
+    import tomllib
+
+    root = pathlib.Path(__file__).parent.parent
+    data = tomllib.loads((root / "pyproject.toml").read_text())
+    base_deps = data.get("project", {}).get("dependencies", [])
+
+    names = sorted(d.split(">=")[0].split("==")[0].split("[")[0].strip().lower() for d in base_deps)
+    assert names == ["numpy"], f"base dependencies must remain exactly [numpy], got {base_deps!r}"

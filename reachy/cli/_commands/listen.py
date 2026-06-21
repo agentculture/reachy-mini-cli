@@ -486,12 +486,54 @@ class _SessionBoundTransport:
         return getattr(self._base, name)
 
 
+def _build_engagement_classifier() -> object | None:
+    """Build the LLM engagement classifier for the ``--transcribe`` gate, or ``None``.
+
+    The classifier judges *addressed-to-the-robot* vs *ambient* speech (issue #55).
+    It is constructed with the SAME LLM endpoint config the folded
+    :class:`~reachy.speech.cognition.CognitionEngine` uses: both leave
+    ``base_url`` / ``model`` / ``api_key`` unset so the underlying
+    :func:`reachy.speech.llm.complete` resolves the one ``REACHY_OPENAI_*`` endpoint
+    (the cognition engine resolves the *same* env via :func:`reachy.speech.llm`),
+    so the gate and cognition always hit the same backend — no separate config and
+    no new remote API surface. Construction does **no** network I/O.
+
+    Imported lazily (like :func:`_build_think_hook`) so a bare live run without the
+    speech stack configured doesn't pull the cognition modules at import time, and a
+    construction fault degrades to ``None`` (the gate then stays on the pure
+    :meth:`~reachy.motion.listen_transcribe.TranscribeHook._should_engage` heuristic).
+
+    When the ``REACHY_ENGAGE_HEURISTIC`` escape hatch is truthy the hook ignores any
+    injected classifier, so we skip building one entirely — saving the import and
+    keeping the path identical to the un-injected heuristic.
+    """
+    from reachy.motion.listen_transcribe import _env_truthy  # local: stdlib-only helper
+
+    if _env_truthy(os.environ.get("REACHY_ENGAGE_HEURISTIC")):
+        return None
+    try:
+        from reachy.speech.engagement import EngagementClassifier
+
+        # No base_url/model/api_key overrides → llm.complete resolves the same
+        # REACHY_OPENAI_* env the CognitionEngine's LLM client resolves.
+        return EngagementClassifier()
+    except Exception:  # noqa: BLE001 — a build fault must not disable hearing
+        logger.warning(
+            "listen --live --transcribe: engagement classifier unavailable; "
+            "gate stays on the heuristic",
+            exc_info=True,
+        )
+        return None
+
+
 def _build_transcribe_hook(
     provider: Callable[[], SenseSample | None],
     *,
     buffer: object,
     mute_until: Callable[[], float],
     sample_rate: int | None = None,
+    classifier: object | None = None,
+    on_engage: Callable[[], None] | None = None,
 ) -> TranscribeHook:
     """A :class:`TranscribeHook` feeding STT words into the shared cognition buffer.
 
@@ -503,8 +545,21 @@ def _build_transcribe_hook(
     ``sample_rate`` is the REAL mic rate from the SDK session (``session.samplerate``)
     so the WAV sent to STT is labelled correctly — a wrong rate makes STT return
     nothing (the gap live-testing exposed); ``None`` falls back to the 16 kHz default.
+
+    ``classifier`` is the optional :class:`~reachy.speech.engagement.EngagementClassifier`
+    that runs the addressed-vs-ambient LLM gate (``None`` keeps the pure heuristic).
+    ``on_engage`` is the motion-ladder signal fired exactly when the gate ENGAGES —
+    the composition layer wires it to ``ListenProducer.set_engaged`` so an addressed
+    utterance latches one deliberate turn toward the speaker.
     """
-    return TranscribeHook(provider, buffer=buffer, mute_until=mute_until, sample_rate=sample_rate)
+    return TranscribeHook(
+        provider,
+        buffer=buffer,
+        mute_until=mute_until,
+        sample_rate=sample_rate,
+        classifier=classifier,
+        on_engage=on_engage,
+    )
 
 
 def _build_live_hooks(
@@ -517,6 +572,7 @@ def _build_live_hooks(
     transcribe: bool = False,
     sample_rate: int | None = None,
     clock: Callable[[], float] | None = None,
+    producer: object | None = None,
 ) -> list[object]:
     """Build the ``--live`` sense hooks in ``sleep > pat > think`` priority order.
 
@@ -541,6 +597,18 @@ def _build_live_hooks(
     transcribes its own voice. If cognition is unavailable (no LLM env →
     :func:`_build_think_hook` returns ``None``) there is no buffer to feed, so the
     transcribe hook is skipped (logged once) and the loop still runs the rest.
+
+    Under ``transcribe`` the transcribe hook is also given (a) an
+    :class:`~reachy.speech.engagement.EngagementClassifier` (the LLM addressed-vs-ambient
+    gate, built with the SAME ``REACHY_OPENAI_*`` endpoint config as cognition — see
+    :func:`_build_engagement_classifier`) and (b) ``on_engage=producer.set_engaged``,
+    the motion-ladder signal. The result: an addressed/named utterance latches exactly
+    one deliberate turn toward the speaker's DoA (via the producer's one-shot engaged
+    latch) while ambient/dropped speech latches no turn at all (no barge-in). ``producer``
+    is the loop's :class:`~reachy.motion.listen.ListenProducer`; when it is ``None`` (or
+    has no ``set_engaged``) the engaged signal is simply not wired and the gate still
+    runs (words flow, no engaged turn). WITHOUT ``transcribe`` no classifier is built and
+    no engaged signal is wired — the off path is byte-identical to today.
     """
     if clock is None:
         import time as _time
@@ -599,12 +667,21 @@ def _build_live_hooks(
         # (no ThinkHook) there is no buffer to feed — skip transcription gracefully.
         feed_buffer = getattr(think_hook, "_buffer", None) if think_hook is not None else None
         if feed_buffer is not None:
+            # The engagement gate (addressed-vs-ambient LLM classifier) + the
+            # motion-ladder engaged signal are built ONLY here, under --transcribe.
+            # The classifier shares cognition's REACHY_OPENAI_* endpoint; on_engage
+            # is the producer's one-shot turn latch — fired only when the gate
+            # ENGAGES, so ambient speech never latches a barge-in turn.
+            classifier = _build_engagement_classifier()
+            on_engage = getattr(producer, "set_engaged", None) if producer is not None else None
             ordered.append(
                 _build_transcribe_hook(
                     provider,
                     buffer=feed_buffer,
                     mute_until=lambda: mute["until"],
                     sample_rate=sample_rate,
+                    classifier=classifier,
+                    on_engage=on_engage,
                 )
             )
         else:
@@ -787,6 +864,7 @@ def _run_sdk_loop(
                 export=export,
                 transcribe=transcribe,
                 sample_rate=getattr(session, "samplerate", None),
+                producer=producer,
             )
             on_tick: object = HookChain(hooks_list)
         else:

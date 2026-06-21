@@ -413,3 +413,80 @@ def test_history_not_grown_on_drop() -> None:
     assert hook._decide("the weather looks nice today", 0.0) is False
     assert hook._decide("did you see the game last night", 1.0) is False
     assert classifier.calls[1][1] == (), "a dropped utterance must not enter history"
+
+
+# ---------------------------------------------------------------------------
+# 7. on_engage seam (t7): the gate's ENGAGE decision fires the motion-ladder
+#    signal exactly once per engage — and NEVER on a drop/degrade-to-drop.
+# ---------------------------------------------------------------------------
+
+
+def test_on_engage_fires_once_on_named_engage() -> None:
+    """An addressed (named) utterance fires ``on_engage`` exactly once, via ``_flush``."""
+    fired = {"n": 0}
+    transcriber = _FakeTranscriber(results=["reachy what time is it"])  # names the robot
+    hook, buffer, _tr, holder = _make_driven_hook(
+        transcriber=transcriber, on_engage=lambda: fired.__setitem__("n", fired["n"] + 1)
+    )
+    _utterance(hook, holder, t_speech=0.5, t_pause=1.5)
+    assert buffer.transcripts == ["reachy what time is it"], "the named utterance must engage"
+    assert fired["n"] == 1, "on_engage must fire exactly once when the gate engages"
+
+
+def test_on_engage_does_not_fire_on_drop() -> None:
+    """A dropped (ambient, un-addressed) utterance must NOT fire ``on_engage``."""
+    fired = {"n": 0}
+    # Coherent line, but the LLM gate says NO (ambient) → dropped → no turn.
+    classifier = _RecordingClassifier(verdict=False)
+    transcriber = _FakeTranscriber(results=["the weather looks nice today"])
+    hook, buffer, _tr, holder = _make_driven_hook(
+        transcriber=transcriber,
+        classifier=classifier,
+        on_engage=lambda: fired.__setitem__("n", fired["n"] + 1),
+    )
+    _utterance(hook, holder, t_speech=0.5, t_pause=1.5)
+    assert buffer.transcripts == [], "an ambient utterance must be dropped (no cue fed)"
+    assert fired["n"] == 0, "a dropped utterance must NEVER latch an engaged turn (no barge-in)"
+
+
+def test_on_engage_does_not_fire_on_degrade_to_drop() -> None:
+    """A DEGRADE that the heuristic then DROPS must NOT fire ``on_engage``.
+
+    A raising classifier degrades to the heuristic; out of the conversation window
+    a coherent-but-unnamed line is dropped — so no engaged turn fires.
+    """
+    fired = {"n": 0}
+    classifier = _RaisingClassifier()  # → DEGRADE → heuristic
+    transcriber = _FakeTranscriber(results=["the weather looks nice today"])
+    hook, buffer, _tr, holder = _make_driven_hook(
+        transcriber=transcriber,
+        classifier=classifier,
+        on_engage=lambda: fired.__setitem__("n", fired["n"] + 1),
+    )
+    # Out of window (no open conversation) → heuristic drops the unnamed coherent line.
+    _utterance(hook, holder, t_speech=100.0, t_pause=101.0)
+    assert buffer.transcripts == [], "degrade-to-drop must feed nothing"
+    assert fired["n"] == 0, "a degrade-to-drop must not latch an engaged turn"
+
+
+def test_on_engage_fault_never_kills_the_flush() -> None:
+    """A raising ``on_engage`` is swallowed — the words still reach cognition."""
+
+    def _boom() -> None:
+        raise RuntimeError("set_engaged blew up")
+
+    transcriber = _FakeTranscriber(results=["reachy hello there"])  # named → engage
+    hook, buffer, _tr, holder = _make_driven_hook(transcriber=transcriber, on_engage=_boom)
+    # The raising callback must not escape _flush; the transcript still gets fed.
+    _utterance(hook, holder, t_speech=0.5, t_pause=1.5)
+    assert buffer.transcripts == ["reachy hello there"], "a callback fault must not block the words"
+    assert hook.transcripts == 1
+
+
+def test_no_on_engage_is_a_noop_default() -> None:
+    """The default (no ``on_engage``) engages normally with no callback — byte-identical."""
+    transcriber = _FakeTranscriber(results=["reachy what time is it"])
+    hook, buffer, _tr, holder = _make_driven_hook(transcriber=transcriber)
+    _utterance(hook, holder, t_speech=0.5, t_pause=1.5)
+    assert buffer.transcripts == ["reachy what time is it"]
+    assert hook.transcripts == 1
