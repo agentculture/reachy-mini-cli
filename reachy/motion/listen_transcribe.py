@@ -298,11 +298,13 @@ class TranscribeHook:
         is still ongoing (within ``engage_window_s`` of the last exchange). Short
         fragments and ambient speech that isn't addressed to the robot are ignored —
         "don't reply to unintelligible sound, just clear, coherent sentences".
+
+        The name match is **whole-word**, not a substring, so "robotic"/"robots" do
+        not falsely trigger on the name "robot".
         """
-        lowered = text.lower()
-        if any(name in lowered for name in self._names):
+        words = _WORD_RE.findall(text.lower())
+        if any(name in words for name in self._names):
             return True
-        words = _WORD_RE.findall(text)
         coherent = len(words) >= self._min_words
         return coherent and t < self._engaged_until
 

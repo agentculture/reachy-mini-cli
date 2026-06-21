@@ -261,6 +261,14 @@ def test_unaddressed_coherent_sentence_is_ignored_when_idle() -> None:
     assert buffer.transcripts == [], "ambient speech not addressed to the robot is ignored"
 
 
+def test_name_match_is_whole_word_not_substring() -> None:
+    """ "robotic" (contains 'robot' as a substring) must NOT trigger the name gate."""
+    transcriber = _FakeTranscriber(results=["the robotic arm is interesting"])
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
+    _utterance(hook, holder, t_speech=0.0, t_pause=1.0)
+    assert buffer.transcripts == [], "a substring of the name must not engage when idle"
+
+
 def test_short_fragment_is_ignored() -> None:
     """A 1-2 word fragment (no name) is below the coherence floor → ignored."""
     transcriber = _FakeTranscriber(results=["uh yeah"])
