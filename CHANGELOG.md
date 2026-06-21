@@ -14,7 +14,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - LLM config resolution prefers the REACHY_OPENAI_* names, keeping the legacy REACHY_LLM_BASE_URL / REACHY_LLM_API_KEY / REACHY_LLM_MODEL names working as a non-breaking fallback; help text, explain catalog, and the operating-guide env table updated to the new names
-- LLM env precedence is by *presence*, not truthiness: a set-but-empty REACHY_OPENAI_* variable (or an explicit empty --llm-* override) wins over the legacy name and the default, so an empty REACHY_OPENAI_API_KEY means "no auth" instead of silently sending a stale REACHY_LLM_API_KEY
+- LLM env precedence is by presence, not truthiness: a set-but-empty `REACHY_OPENAI_*` variable (or an explicit empty `--llm-*` override) wins over the legacy name and the default, so an empty `REACHY_OPENAI_API_KEY` means "no auth" instead of silently sending a stale `REACHY_LLM_API_KEY`
 
 ## [0.23.0] - 2026-06-20
 
