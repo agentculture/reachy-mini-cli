@@ -11,8 +11,8 @@ Four assertions:
 2. No ``import reterminal`` / ``from reterminal`` statement in any ``reachy/**/*.py``.
 3. No server/network-library import inside ``reachy/export/*.py``.
 4. ``JsonlExporter`` / ``to_jsonl`` are referenced (imported) only from within
-   ``reachy/export/`` and ``reachy/cli/_commands/think.py`` — no other ``reachy/``
-   module imports them.
+   ``reachy/export/`` and the shared CLI wiring ``reachy/cli/_export.py`` — no other
+   ``reachy/`` module imports them.
 """
 
 from __future__ import annotations
@@ -128,10 +128,12 @@ def test_export_package_has_no_server_imports() -> None:
 
 
 def test_jsonl_exporter_and_to_jsonl_imported_only_from_allowed_modules() -> None:
-    """JsonlExporter and to_jsonl must be imported only from reachy/export/ and think.py.
+    """JsonlExporter and to_jsonl must be imported only from reachy/export/ and _export.py.
 
     Any other reachy/ module that imports these symbols would indicate a second,
-    unintended structured-export path has been added — this test prevents that.
+    unintended structured-export path has been added — this test prevents that. The
+    one CLI wiring point ``reachy/cli/_export.py`` builds the sink for *both*
+    ``think run`` and ``listen run --live`` so the two feeds can never drift.
 
     Note: docstring *mentions* (e.g. in cognition.py type-annotation prose) are
     allowed; only Python import statements are checked.
@@ -141,10 +143,10 @@ def test_jsonl_exporter_and_to_jsonl_imported_only_from_allowed_modules() -> Non
         re.MULTILINE,
     )
 
-    # Allowed locations: anything inside reachy/export/ or the wiring in think.py
+    # Allowed locations: anything inside reachy/export/ or the shared CLI wiring.
     _allowed_rel_parts = (
         ("reachy", "export"),
-        ("reachy", "cli", "_commands", "think.py"),
+        ("reachy", "cli", "_export.py"),
     )
 
     def _is_allowed(path: Path) -> bool:

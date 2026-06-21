@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] - 2026-06-21
+
+### Added
+
+- listen run --live --export -/--export-blocks — the folded live loop now streams the same thinking/message/emotion JSONL feed as think run --export, so the boot-persistent presence loop can publish what the robot is thinking to any subscriber (reTerminal panel, log, audio renderer) over the one documented wire contract. Built on a shared reachy/cli/_export.py used by both think and listen.
+- CognitionEngine(audio_optional=...) — TTS/playback is now a degradable output: in audio-optional mode a synth failure degrades to no-speech (logged once, clip skipped) instead of crashing the cognition worker, and latches off after consecutive failures so a wedged TTS never throttles cognition. The folded listen --live engine opts in, so a dead TTS endpoint no longer silently kills live thinking.
+
+### Changed
+
+- Factored the --export/--export-blocks wiring out of think.py into the shared reachy/cli/_export.py (build_export_hook + add_export_args); think run is behaviourally unchanged.
+
+### Fixed
+
+- listen --live cognition no longer dies when the TTS endpoint is unreachable/wedged (it previously raised TimeoutError out of the cognition worker and stopped thinking for the life of the process).
+- test_motion.py now isolates REACHY_STATE_DIR so the pure idle-producer tests no longer read the real *_active flags a running listen --live service toggles — removing an intermittent pytest -n auto flake on the robot box.
+
 ## [0.24.0] - 2026-06-21
 
 ### Added

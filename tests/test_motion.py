@@ -11,12 +11,29 @@ import contextlib
 import math
 
 import numpy as np
+import pytest
 
 from reachy.behavior.sense import EMPTY_SENSE, Sense
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.motion.listen import ListenParams, ListenProducer
 from reachy.motion.queue import ANTENNA_KEY, IDLE_KEY, LOOK_KEY, MotionAction, MotionQueue
 from reachy.motion.server import LoopHooks, run
+
+
+@pytest.fixture(autouse=True)
+def _isolate_state_dir(monkeypatch, tmp_path):
+    """Pin the ``*_active`` flag state dir to a throwaway dir.
+
+    ``ListenProducer.update`` consults ``cognition_signal`` / ``pat_signal`` /
+    ``sleep_signal`` (``state_dir()/<x>_active.flag``) to decide whether to drop
+    the idle wander into focused / yield mode. Without this, these pure producer
+    tests read the *real* state dir — and on a box where the ``listen --live``
+    service is running, those flags toggle under the test's feet and flip the idle
+    assertions (``a is None``) intermittently under ``pytest -n auto``. A clean tmp
+    dir has no flags, so the producer runs in its normal idle mode deterministically.
+    """
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
 
 
 def _look(label: str, yaw: float) -> MotionAction:

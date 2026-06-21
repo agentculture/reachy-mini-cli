@@ -223,6 +223,24 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
   `sleep > pat > think` (vision rides last; it competes for nothing the flags
   arbitrate). Off by default (`sdk` only) — bare `listen run` is unchanged. This is
   the loop the `live` boot-presence service runs (see the `service` noun below).
+- **`--live --export -` — stream what the robot is thinking:** `--live` exposes the
+  same `--export`/`--export-blocks` JSONL feed as `think run --export` (built by the
+  shared `reachy/cli/_export.py` `build_export_hook`, so the two feeds can't drift).
+  The folded `ThinkHook` engine is wired with that export hook, so the boot-persistent
+  presence loop can publish `thinking`/`message`/`emotion` blocks to any subscriber
+  (a reTerminal panel, a log tail, an audio renderer) over the one documented wire
+  contract (`docs/export-schema.md`). `--export` requires `--live` and the `sdk`
+  transport (both clean exit-1 errors otherwise); when exporting, stdout is reserved
+  for the pure JSONL feed and every banner/action/summary line goes to stderr.
+- **`--live` cognition is TTS-resilient:** the folded engine is built
+  `audio_optional=True`, so a wedged/unreachable TTS endpoint degrades to "no speech"
+  (logged once, the clip skipped) instead of raising out of the cognition worker and
+  killing live thinking — and the audio sink latches off after a short run of
+  consecutive failures so a hard-down TTS never throttles cognition. Thoughts keep
+  flowing to the expression + export sinks regardless (they are driven on the producer
+  thread, ahead of and independent of the speak worker). Standalone `think run` /
+  `say` keep the strict default (an unreachable TTS is a clean exit-2). The
+  `CognitionEngine(audio_optional=...)` flag lives in `reachy/speech/cognition.py`.
 
 ### `say` noun — dumb TTS pipe
 

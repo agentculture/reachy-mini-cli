@@ -33,7 +33,8 @@ import numpy as np
 from reachy.behavior.sense import DOA_TIMEOUT, DoaPoller, Sense, read_doa
 from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
-from reachy.cli._errors import CliError
+from reachy.cli._errors import EXIT_USER_ERROR, CliError
+from reachy.cli._export import add_export_args, build_export_hook
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.motion import supervisor
 from reachy.motion.listen import ListenParams, ListenProducer, SampleHolder
@@ -371,7 +372,11 @@ def _build_pat_hook(args: argparse.Namespace, transport: object, queue) -> PatHo
     return PatHook(queue, detector=detector)
 
 
-def _build_think_hook(provider: Callable[[], SenseSample | None]) -> ThinkHook | None:
+def _build_think_hook(
+    provider: Callable[[], SenseSample | None],
+    *,
+    export: object | None = None,
+) -> ThinkHook | None:
     """A :class:`ThinkHook` driving cognition from the shared sample, or ``None``.
 
     Builds a real :class:`~reachy.speech.cognition.CognitionEngine` over a shared
@@ -381,6 +386,14 @@ def _build_think_hook(provider: Callable[[], SenseSample | None]) -> ThinkHook |
     Construction is wrapped: if the cognition stack can't be assembled (e.g. the LLM
     env isn't configured), we log once and return ``None`` so ``--live`` still runs
     the other three senses — the loop must never die because cognition is absent.
+
+    The folded-live engine is built ``audio_optional=True``: a TTS/playback outage
+    degrades to "no speech" instead of killing the cognition worker (the bug where a
+    wedged TTS endpoint silently took down ``listen --live``'s thinking). When
+    ``export`` is an :class:`~reachy.export.exporter.ExportHook`, the engine also
+    emits the ``thinking`` / ``message`` / ``emotion`` JSONL feed — so the live loop
+    streams what the robot is thinking to any subscriber (a reTerminal panel, a log,
+    an audio renderer) over the one documented wire contract.
     """
     try:
         # Imported lazily so a bare (no-LLM) live run, or a box without the speech
@@ -389,7 +402,7 @@ def _build_think_hook(provider: Callable[[], SenseSample | None]) -> ThinkHook |
         from reachy.speech.events import EventBuffer
 
         buffer = EventBuffer()
-        engine = CognitionEngine(buffer=buffer)
+        engine = CognitionEngine(buffer=buffer, export=export, audio_optional=True)
         return ThinkHook(provider, engine=engine, buffer=buffer)
     except Exception:  # noqa: BLE001
         logger.warning(
@@ -443,6 +456,8 @@ def _build_live_hooks(
     queue: MotionQueue,
     provider: Callable[[], SenseSample | None],
     pat_hook: PatHook | None,
+    *,
+    export: object | None = None,
 ) -> list[object]:
     """Build the ``--live`` sense hooks in ``sleep > pat > think`` priority order.
 
@@ -453,10 +468,11 @@ def _build_live_hooks(
     none opens its own audio/camera/pose — they ride the single SDK client the loop
     owns. A hook whose optional stack is unavailable is simply omitted. The list is
     handed to a :class:`~reachy.motion.listen_hooks.HookChain` as the loop's single
-    ``on_tick``.
+    ``on_tick``. ``export`` (an :class:`~reachy.export.exporter.ExportHook` or
+    ``None``) is threaded into the think hook's engine to stream the cognition feed.
     """
     sleep_hook = SleepHook(provider)
-    think_hook = _build_think_hook(provider)
+    think_hook = _build_think_hook(provider, export=export)
     vision_hook = VisionHook(queue=queue, transport=transport)
     ordered: list[object] = [sleep_hook]
     if pat_hook is not None:
@@ -513,6 +529,8 @@ def _run_sdk_loop(
     producer: ListenProducer,
     args: argparse.Namespace,
     on_action: Callable[[object], None],
+    *,
+    export: object | None = None,
 ) -> int:
     """Drive the loop over an open SDK media session (real DoA + mic-audio loudness).
 
@@ -561,7 +579,9 @@ def _run_sdk_loop(
         # sense/audio taps byte-for-byte (no chain, no holder tap, no extra read).
         if getattr(args, "live", False):
             sense_tap, audio_tap = _build_sample_tap(holder, poller, _audio, audio_rms)
-            hooks_list = _build_live_hooks(loop_transport, queue, holder.provider, pat_hook)
+            hooks_list = _build_live_hooks(
+                loop_transport, queue, holder.provider, pat_hook, export=export
+            )
             on_tick: object = HookChain(hooks_list)
         else:
             sense_tap, audio_tap = poller, _audio
@@ -601,23 +621,47 @@ def _run_http_loop(
 
 def cmd_listen_run(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
+    # Export sink (None unless `--export -`). Built + validated *before* the
+    # preflight move so a bad target / mode is a clean error, not a half-run. The
+    # cognition feed only exists under `--live` on the SDK transport, so guard both.
+    export_hook = build_export_hook(args)
+    if export_hook is not None and not getattr(args, "live", False):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="--export needs --live",
+            remediation="the export feed carries cognition blocks, which only the "
+            "folded live loop produces; add --live (it runs on the sdk transport)",
+        )
     transport = get_transport(args)
+    if export_hook is not None and not hasattr(transport, "media_session"):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="--export/--live require the sdk transport",
+            remediation="run with --transport sdk (the default); the http profile has "
+            "no media session to fold cognition into",
+        )
     params = _params_from_args(args)
     producer = ListenProducer(params)
+    # When exporting, stdout is reserved for the pure JSONL feed: every banner,
+    # action line, and summary goes to stderr regardless of --json.
+    exporting = export_hook is not None
+    text_diagnostics = (not json_mode) or exporting
 
     # Preflight: ease to center. Validates the transport (a dead daemon raises a
     # clean CliError → tidy exit) and gives the loop a known starting pose.
     transport.move_goto(head=dict(_CENTER), duration=0.8, interpolation="minjerk")
-    if not json_mode:
+    if text_diagnostics:
         emit_diagnostic(
             f"[listen] orienting to sound via {transport.name}: dwell={params.dwell:g}s "
             f"hold={params.hold:g}s speed={params.alert_speed:g}deg/s"
-            f"{' (speech only)' if params.speech_only else ''}; Ctrl-C to stop"
+            f"{' (speech only)' if params.speech_only else ''}"
+            f"{' (live: think/vision/sleep folded in)' if getattr(args, 'live', False) else ''}"
+            f"{' [export: stdout]' if exporting else ''}; Ctrl-C to stop"
         )
 
     def _on_action(action) -> None:
         yaw = action.head.get("yaw") if action.head else None
-        if json_mode:
+        if json_mode and not exporting:
             emit_result(
                 {"action": action.label, "yaw": yaw, "duration": round(action.duration, 3)},
                 json_mode=True,
@@ -628,7 +672,7 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
     # SDK profile streams real DoA + mic loudness through a media session; the HTTP/remote
     # profile polls transport.doa() with no audio source.
     if hasattr(transport, "media_session"):
-        ticks = _run_sdk_loop(transport, producer, args, _on_action)
+        ticks = _run_sdk_loop(transport, producer, args, _on_action, export=export_hook)
     else:
         ticks = _run_http_loop(transport, producer, args, _on_action)
 
@@ -637,7 +681,7 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
         transport.move_goto(head=dict(_CENTER), duration=0.8, interpolation="minjerk")
     except CliError:
         pass
-    if not json_mode:
+    if text_diagnostics:
         emit_diagnostic(f"[listen] stopped after {ticks} tick(s)")
     return 0
 
@@ -690,6 +734,7 @@ def _register_run(noun_sub: argparse._SubParsersAction) -> None:
     _add_tuning_args(run)
     _add_pat_args(run)
     _add_live_arg(run)
+    add_export_args(run)
     run.add_argument(
         "--max-ticks",
         type=int,
