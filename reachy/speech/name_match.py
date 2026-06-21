@@ -1,0 +1,139 @@
+"""Fuzzy name matcher — recognise the robot's name even when STT mishears it.
+
+The robot's name ("reachy") and its generic label ("robot") are short phonetic
+words that a speech-to-text model can transcribe as near-homophones: "Richie",
+"Reachie", "Richy", etc.  A pure whole-word equality check (used by the
+engagement gate before this module) misses every mishearing.
+
+This module provides :func:`is_name_match`, which tokenises an utterance into
+words (same ``[A-Za-z]+(?:'[A-Za-z]+)?`` regex the listen/transcribe pipeline
+uses) and, for each word, checks whether it is close enough to any of the
+robot's canonical names via a combined similarity score:
+
+    score = difflib_ratio(word, name) × length_ratio(word, name)
+
+where ``length_ratio = min(len)/max(len)`` penalises large length mismatches so
+that short fragments like "reach" (a prefix of "reachy") or "rich" do not
+score above the threshold even when their character-overlap ratio is high.
+
+**Two structural guards supplement the score:**
+
+1. *Prefix guard* — if the word is a strict prefix of a name (e.g. ``"reach"``
+   starts ``"reachy"``) the word is treated as a truncation and skipped; a
+   truncation is never a mishearing.
+2. *Superstring guard* — if any canonical name is a literal substring of the
+   word (e.g. ``"reachy"`` ⊂ ``"preachy"``, ``"robot"`` ⊂ ``"robots"``) the
+   word is a morphological extension, not a mishearing, and is skipped.
+
+**Chosen default threshold: 0.50**
+
+Empirically verified across the required accept/reject table:
+
+  accept  — "reachy"  (1.000), "robot"   (1.000), "reachie" (0.659),
+             "richy"   (0.606), "richie"  (0.500)
+  reject  — "reach"   (prefix guard), "preachy" (superstring guard),
+             "rich"    (0.400), "hello"   (0.200), "robotics" (superstring guard),
+             "robots"  (superstring guard)
+
+0.50 is the tightest value that still accepts "richie" (the farthest-from-name
+mishearing in the required table) while keeping "rich" (0.40) below the line.
+
+**Known boundary case:** "speech" scores exactly 0.500 against "reachy" (both
+are 6 characters with the same SequenceMatcher ratio as "richie").  At
+``threshold=0.50`` "speech" is therefore accepted as a false positive — this is
+an inherent property of the chosen threshold.  Since "richie" is a required
+accept case and the two words are tied, the threshold cannot be raised to
+eliminate this false positive without also losing "richie".  In practice the
+engagement gate's ``min_words`` filter means a bare "speech" utterance is
+rejected anyway; the false positive only fires if "speech" is said in isolation.
+"""
+
+from __future__ import annotations
+
+import difflib
+import re
+from collections.abc import Iterable
+
+# Same word-tokenisation pattern used by listen_transcribe.py
+_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+
+#: Default similarity threshold for :func:`is_name_match`.
+#:
+#: Set to 0.50 — the tightest value that accepts "richie" (score 0.500) against
+#: "reachy" while rejecting "rich" (score 0.400).  Callers may lower this to be
+#: more permissive or raise it to be stricter.
+DEFAULT_THRESHOLD: float = 0.50
+
+
+def _combined_score(word: str, name: str) -> float:
+    """Combined similarity: difflib ratio × length ratio.
+
+    ``difflib.SequenceMatcher.ratio()`` measures character-sequence overlap
+    (0..1).  Multiplying by the length ratio (shorter/longer) penalises pairs
+    that differ substantially in length, which matters for "rich" (4 chars) vs
+    "reachy" (6 chars) — the length penalty pulls the score below 0.50 even
+    though the character overlap alone is 0.60.
+    """
+    seq_ratio = difflib.SequenceMatcher(None, word, name).ratio()
+    len_ratio = min(len(word), len(name)) / max(len(word), len(name))
+    return seq_ratio * len_ratio
+
+
+def is_name_match(
+    text: str,
+    names: Iterable[str] = ("reachy", "robot"),
+    threshold: float = DEFAULT_THRESHOLD,
+) -> bool:
+    """Return ``True`` when *text* contains a word that plausibly names the robot.
+
+    The function tokenises *text* into words and, for each word, checks every
+    canonical name in *names*.  A word matches when any of the following hold:
+
+    * **Exact match** — the word equals the name (case-insensitive).  Always
+      passes regardless of threshold.
+    * **Fuzzy match** — after two structural guards (prefix and superstring)
+      are applied, the combined similarity score
+      ``difflib_ratio × length_ratio`` meets or exceeds *threshold*.
+
+    Structural guards (applied before the fuzzy score):
+
+    * *Prefix guard*: if the word is a strict prefix of the name (e.g.
+      ``"reach"`` is a prefix of ``"reachy"``), skip it — it is a truncation.
+    * *Superstring guard*: if the name is a literal substring of the word
+      (e.g. ``"reachy" ⊂ "preachy"``), skip it — it is a morphological
+      extension, not a mishearing.
+
+    Parameters
+    ----------
+    text:
+        The utterance to check (may be a full sentence or a single word).
+    names:
+        Canonical names to match against.  Defaults to ``("reachy", "robot")``.
+        All comparisons are case-insensitive.
+    threshold:
+        Minimum combined similarity score to accept a fuzzy match.
+        Defaults to :data:`DEFAULT_THRESHOLD` (0.50).
+
+    Returns
+    -------
+    bool
+        ``True`` if any word in *text* is an exact or close-enough match for
+        any name in *names*.
+    """
+    words = _WORD_RE.findall(text.lower())
+    name_list = [n.lower() for n in names]
+    for word in words:
+        for name in name_list:
+            # Exact whole-word match — always accept.
+            if word == name:
+                return True
+            # Prefix guard: "reach" is a strict prefix of "reachy" → truncation.
+            if name.startswith(word):
+                continue
+            # Superstring guard: "reachy" in "preachy" → morphological extension.
+            if name in word:
+                continue
+            # Fuzzy match via combined score.
+            if _combined_score(word, name) >= threshold:
+                return True
+    return False
