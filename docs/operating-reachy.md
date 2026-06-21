@@ -362,9 +362,9 @@ vars override the built-in default.
 | `XDG_CONFIG_HOME` | `~/.config` | Base for config (`<…>/reachy/demo-mode.json`) | `demo_config.py` |
 | `REACHY_TTS_URL` | `http://localhost:9000` | Magpie-style TTS HTTP endpoint | `speech/tts.py` (`say`, `think`) |
 | `REACHY_TTS_VOICE` | `Magpie-Multilingual.EN-US.Mia.Calm` | TTS voice identifier | `speech/tts.py` |
-| `REACHY_LLM_BASE_URL` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `think` | `speech/llm.py` |
-| `REACHY_LLM_MODEL` | `default` | LLM model name for `think` | `speech/llm.py` |
-| `REACHY_LLM_API_KEY` | (unset) | API key for the LLM endpoint (only sent when present) | `speech/llm.py` |
+| `REACHY_OPENAI_URL_BASE` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `think` (legacy: `REACHY_LLM_BASE_URL`) | `speech/llm.py` |
+| `REACHY_OPENAI_MODEL_ID` | `default` | LLM model id for `think` — must be a model the endpoint serves (legacy: `REACHY_LLM_MODEL`) | `speech/llm.py` |
+| `REACHY_OPENAI_API_KEY` | (unset) | Bearer key for the LLM endpoint, only sent when present (legacy: `REACHY_LLM_API_KEY`) | `speech/llm.py` |
 | `REACHY_STT_URL` | `http://localhost:9002` | OpenAI-compatible STT (Parakeet) for `sleep` wake-word | `sleep/wakeword.py` |
 | `REACHY_STT_PHRASE` | `hey reachy` | Wake phrase matched against the STT transcript | `sleep/wakeword.py` |
 | `REACHY_STT_LANGUAGE` | `en` | STT language hint | `sleep/wakeword.py` |

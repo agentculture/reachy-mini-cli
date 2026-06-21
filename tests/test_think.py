@@ -154,7 +154,7 @@ def test_run_unreachable_llm_exits_2_with_hint(monkeypatch, capsys) -> None:
         raise CliError(
             code=EXIT_ENV_ERROR,
             message="cannot reach LLM at http://localhost:8000",
-            remediation="start the LLM server or set REACHY_LLM_BASE_URL",
+            remediation="start the LLM server or set REACHY_OPENAI_URL_BASE",
         )
         yield  # pragma: no cover - generator marker
 

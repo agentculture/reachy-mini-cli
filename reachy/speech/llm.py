@@ -55,9 +55,13 @@ _MARKDOWN_CHARS = frozenset("*_~`#")
 class LlmConfig:
     """Resolved LLM connection config.
 
-    Read from ``REACHY_LLM_BASE_URL`` / ``REACHY_LLM_API_KEY`` /
-    ``REACHY_LLM_MODEL`` with explicit ``base_url=`` / ``model=`` /
-    ``api_key=`` argument overrides taking precedence over the environment.
+    Read from the canonical ``REACHY_OPENAI_URL_BASE`` / ``REACHY_OPENAI_API_KEY``
+    / ``REACHY_OPENAI_MODEL_ID`` environment variables, with explicit
+    ``base_url=`` / ``model=`` / ``api_key=`` argument overrides taking
+    precedence over the environment. The legacy ``REACHY_LLM_BASE_URL`` /
+    ``REACHY_LLM_API_KEY`` / ``REACHY_LLM_MODEL`` names are still honoured as a
+    fallback (used only when the matching ``REACHY_OPENAI_*`` var is unset), so
+    older configs keep working.
     """
 
     base_url: str
@@ -72,10 +76,22 @@ class LlmConfig:
         model: str | None = None,
         api_key: str | None = None,
     ) -> "LlmConfig":
+        env = os.environ.get
         return cls(
-            base_url=base_url or os.environ.get("REACHY_LLM_BASE_URL") or _DEFAULT_BASE_URL,
-            model=model or os.environ.get("REACHY_LLM_MODEL") or _DEFAULT_MODEL,
-            api_key=api_key if api_key is not None else os.environ.get("REACHY_LLM_API_KEY"),
+            base_url=(
+                base_url
+                or env("REACHY_OPENAI_URL_BASE")
+                or env("REACHY_LLM_BASE_URL")
+                or _DEFAULT_BASE_URL
+            ),
+            model=(
+                model or env("REACHY_OPENAI_MODEL_ID") or env("REACHY_LLM_MODEL") or _DEFAULT_MODEL
+            ),
+            api_key=(
+                api_key
+                if api_key is not None
+                else (env("REACHY_OPENAI_API_KEY") or env("REACHY_LLM_API_KEY"))
+            ),
         )
 
 
@@ -261,8 +277,8 @@ def stream_chat_completion(
             code=EXIT_ENV_ERROR,
             message=f"LLM endpoint returned HTTP {err.code} ({cfg.base_url})",
             remediation=(
-                "check REACHY_LLM_MODEL is served by this endpoint and "
-                "REACHY_LLM_API_KEY is valid"
+                "check REACHY_OPENAI_MODEL_ID is served by this endpoint and "
+                "REACHY_OPENAI_API_KEY is valid"
             ),
         ) from err
     except OSError as err:  # URLError is an OSError subclass — this covers both
@@ -270,8 +286,8 @@ def stream_chat_completion(
             code=EXIT_ENV_ERROR,
             message=f"cannot reach LLM at {cfg.base_url}: {err}",
             remediation=(
-                "start the LLM server or set REACHY_LLM_BASE_URL (and "
-                "REACHY_LLM_API_KEY / REACHY_LLM_MODEL) to a reachable endpoint"
+                "start the LLM server or set REACHY_OPENAI_URL_BASE (and "
+                "REACHY_OPENAI_API_KEY / REACHY_OPENAI_MODEL_ID) to a reachable endpoint"
             ),
         ) from err
 

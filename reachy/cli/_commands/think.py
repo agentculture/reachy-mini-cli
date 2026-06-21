@@ -169,8 +169,8 @@ def cmd_think_overview(args: argparse.Namespace) -> int:
             "title": "Conventions",
             "items": [
                 "every command supports --json",
-                "LLM endpoint: --llm-base-url / --llm-model (env REACHY_LLM_BASE_URL / "
-                "REACHY_LLM_MODEL)",
+                "LLM endpoint: --llm-base-url / --llm-model (env REACHY_OPENAI_URL_BASE / "
+                "REACHY_OPENAI_MODEL_ID)",
                 "TTS endpoint: --tts-url / --voice (env REACHY_TTS_URL / REACHY_TTS_VOICE)",
                 "pacing: --turn-interval (seconds between turns)",
                 "bound a run for testing/ops with --max-turns / --max-ticks",
@@ -790,13 +790,13 @@ def _add_cognition_args(parser: argparse.ArgumentParser) -> None:
         "--llm-base-url",
         default=None,
         dest="llm_base_url",
-        help="LLM base URL (overrides REACHY_LLM_BASE_URL).",
+        help="LLM base URL (overrides REACHY_OPENAI_URL_BASE).",
     )
     parser.add_argument(
         "--llm-model",
         default=None,
         dest="llm_model",
-        help="LLM model name (overrides REACHY_LLM_MODEL).",
+        help="LLM model name (overrides REACHY_OPENAI_MODEL_ID).",
     )
     parser.add_argument(
         "--tts-url",

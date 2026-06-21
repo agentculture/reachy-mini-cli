@@ -243,8 +243,9 @@ path, no LLM — for on-robot verification) + `overview`. The `reachy/speech/`
 package provides the engine:
 
 - `reachy/speech/llm.py` — pure `urllib` streaming LLM client
-  (`REACHY_LLM_BASE_URL` / `REACHY_LLM_API_KEY` / `REACHY_LLM_MODEL`; no
-  OpenAI SDK, no new base dep).
+  (`REACHY_OPENAI_URL_BASE` / `REACHY_OPENAI_API_KEY` / `REACHY_OPENAI_MODEL_ID`,
+  with the legacy `REACHY_LLM_*` names honoured as a fallback; no OpenAI SDK, no
+  new base dep).
 - `reachy/speech/tts.py` + `reachy/speech/playback.py` — shared with `say`;
   `think` reuses the same TTS + playback leg.
 - `reachy/speech/events.py` — `EventBuffer` accumulates per-tick DoA / RMS /

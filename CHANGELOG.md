@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-06-21
+
+### Added
+
+- think/cognition LLM endpoint is now configured by the canonical REACHY_OPENAI_URL_BASE / REACHY_OPENAI_API_KEY / REACHY_OPENAI_MODEL_ID environment variables (OpenAI-compatible naming)
+
+### Changed
+
+- LLM config resolution prefers the REACHY_OPENAI_* names, keeping the legacy REACHY_LLM_BASE_URL / REACHY_LLM_API_KEY / REACHY_LLM_MODEL names working as a non-breaking fallback; help text, explain catalog, and the operating-guide env table updated to the new names
+
 ## [0.23.0] - 2026-06-20
 
 ### Added

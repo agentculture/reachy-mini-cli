@@ -692,9 +692,12 @@ cleared on every exit path, including Ctrl-C and errors.
 
 ## LLM endpoint
 
-Configure with `--llm-base-url` / `REACHY_LLM_BASE_URL` (base URL) and
-`--llm-model` / `REACHY_LLM_MODEL` (model name). The client is a pure
-`urllib`-based streaming HTTP client (no new base dep; no `openai` SDK required).
+Configure with `--llm-base-url` / `REACHY_OPENAI_URL_BASE` (base URL),
+`--llm-model` / `REACHY_OPENAI_MODEL_ID` (model name), and `REACHY_OPENAI_API_KEY`
+(bearer key, only sent when present). The legacy `REACHY_LLM_BASE_URL` /
+`REACHY_LLM_MODEL` / `REACHY_LLM_API_KEY` names still work as a fallback. The
+client is a pure `urllib`-based streaming HTTP client (no new base dep; no
+`openai` SDK required).
 
 ## TTS endpoint
 

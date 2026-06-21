@@ -16,6 +16,27 @@ import pytest
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.speech import llm
 
+_LLM_ENV_VARS = (
+    "REACHY_OPENAI_URL_BASE",
+    "REACHY_OPENAI_MODEL_ID",
+    "REACHY_OPENAI_API_KEY",
+    "REACHY_LLM_BASE_URL",
+    "REACHY_LLM_MODEL",
+    "REACHY_LLM_API_KEY",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_env(monkeypatch):
+    """Clear every LLM env var so config resolution is hermetic.
+
+    The operator box exports ``REACHY_OPENAI_*`` in ``.bashrc``; without this the
+    real shell env would leak into the resolution tests and shadow the
+    monkeypatched values.
+    """
+    for var in _LLM_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
 
 def _sse_chunk(content: str) -> bytes:
     """Encode one OpenAI SSE ``data:`` line carrying a content delta."""
@@ -231,18 +252,44 @@ def test_stream_sentences_flushes_tail(monkeypatch):
 
 
 def test_config_from_env(monkeypatch):
-    monkeypatch.setenv("REACHY_LLM_BASE_URL", "http://env-host:9000")
-    monkeypatch.setenv("REACHY_LLM_API_KEY", "env-key")
-    monkeypatch.setenv("REACHY_LLM_MODEL", "env-model")
+    """Canonical ``REACHY_OPENAI_*`` vars drive resolution."""
+    monkeypatch.setenv("REACHY_OPENAI_URL_BASE", "http://env-host:9000")
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "env-key")
+    monkeypatch.setenv("REACHY_OPENAI_MODEL_ID", "env-model")
     cfg = llm.LlmConfig.resolve()
     assert cfg.base_url == "http://env-host:9000"
     assert cfg.api_key == "env-key"
     assert cfg.model == "env-model"
 
 
+def test_config_legacy_llm_env_fallback(monkeypatch):
+    """Legacy ``REACHY_LLM_*`` names still resolve when no ``REACHY_OPENAI_*`` set."""
+    monkeypatch.setenv("REACHY_LLM_BASE_URL", "http://legacy-host:9000")
+    monkeypatch.setenv("REACHY_LLM_API_KEY", "legacy-key")
+    monkeypatch.setenv("REACHY_LLM_MODEL", "legacy-model")
+    cfg = llm.LlmConfig.resolve()
+    assert cfg.base_url == "http://legacy-host:9000"
+    assert cfg.api_key == "legacy-key"
+    assert cfg.model == "legacy-model"
+
+
+def test_config_openai_env_takes_precedence_over_legacy(monkeypatch):
+    """When both name sets are present, ``REACHY_OPENAI_*`` wins."""
+    monkeypatch.setenv("REACHY_OPENAI_URL_BASE", "http://new-host:1111")
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "new-key")
+    monkeypatch.setenv("REACHY_OPENAI_MODEL_ID", "new-model")
+    monkeypatch.setenv("REACHY_LLM_BASE_URL", "http://legacy-host:9000")
+    monkeypatch.setenv("REACHY_LLM_API_KEY", "legacy-key")
+    monkeypatch.setenv("REACHY_LLM_MODEL", "legacy-model")
+    cfg = llm.LlmConfig.resolve()
+    assert cfg.base_url == "http://new-host:1111"
+    assert cfg.api_key == "new-key"
+    assert cfg.model == "new-model"
+
+
 def test_config_arg_overrides_env(monkeypatch):
-    monkeypatch.setenv("REACHY_LLM_BASE_URL", "http://env-host:9000")
-    monkeypatch.setenv("REACHY_LLM_MODEL", "env-model")
+    monkeypatch.setenv("REACHY_OPENAI_URL_BASE", "http://env-host:9000")
+    monkeypatch.setenv("REACHY_OPENAI_MODEL_ID", "env-model")
     cfg = llm.LlmConfig.resolve(base_url="http://override:1234", model="override-model")
     assert cfg.base_url == "http://override:1234"
     assert cfg.model == "override-model"
@@ -251,7 +298,7 @@ def test_config_arg_overrides_env(monkeypatch):
 def test_bearer_header_set_when_key_present(monkeypatch):
     body = b"data: [DONE]\n\n"
     captured = _stub_urlopen(monkeypatch, body)
-    monkeypatch.setenv("REACHY_LLM_API_KEY", "secret123")
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "secret123")
     list(llm.stream_chat_completion([{"role": "user", "content": "hi"}]))
     assert captured["req"].get_header("Authorization") == "Bearer secret123"
 
@@ -259,7 +306,7 @@ def test_bearer_header_set_when_key_present(monkeypatch):
 def test_bearer_header_absent_for_empty_key(monkeypatch):
     body = b"data: [DONE]\n\n"
     captured = _stub_urlopen(monkeypatch, body)
-    monkeypatch.setenv("REACHY_LLM_API_KEY", "EMPTY")
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "EMPTY")
     list(llm.stream_chat_completion([{"role": "user", "content": "hi"}]))
     assert captured["req"].get_header("Authorization") is None
 
