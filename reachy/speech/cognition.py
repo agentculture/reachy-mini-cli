@@ -454,7 +454,9 @@ class CognitionEngine:
             if pcm:
                 self._play_audio(pcm, **self._playback_kwargs)
             self._audio_fail_streak = 0
-        except Exception:  # noqa: BLE001 — strict mode re-raises, optional mode absorbs
+        except Exception:  # noqa: BLE001
+            # Strict mode re-raises (the worker stashes it for the turn thread);
+            # audio_optional absorbs it so the turn completes and cognition continues.
             if not self._audio_optional:
                 raise
             self._note_audio_failure()
