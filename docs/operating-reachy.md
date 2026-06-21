@@ -444,6 +444,26 @@ wake-word path — words are one more perception. The deployed `live` boot unit 
 with `--transcribe` on, so the on-robot presence hears words by default; STT stays
 external (no on-box model bundled).
 
+The engagement gate that decides which utterances reach cognition is **layered,
+cheapest-first**: (1) a **fuzzy name fast-path** recognises "reachy"/"robot" and
+common STT mishearings ("richie", "reachie") with an initial-letter guard that
+prevents false triggers from unrelated words like "speech" — matched utterances
+engage immediately with no LLM call; (2) for everything else, a **single-shot LLM
+classifier** (`reachy/speech/engagement.py`) judges "is this addressed to me, given
+recent conversation?" — the key question is *addressed-to-the-robot*, not *could I
+help*; (3) if the classifier times out or errors, a **DEGRADE fallback** silently
+reverts to the original coherent-sentence-in-window heuristic so the hearing loop
+never stalls. Set `REACHY_ENGAGE_HEURISTIC=1` to bypass the LLM gate entirely and
+run the pure heuristic (useful when the LLM endpoint is unavailable).
+
+Motion reaction under `--transcribe` follows a **3-tier ladder** keyed by what was
+perceived: ambient **noise** → Tier-1 antenna lean only; detected **speech** → a
+bounded head-only orienting nudge toward the source; an **engaged** utterance (gate
+decided it is addressed to the robot) → a deliberate head/body turn toward the
+speaker's DoA, clamped to a minimum duration so it never trips the SDK `goto`
+planner. The robot thus faces the person who spoke to it while staying still for
+ambient conversation.
+
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
 | `listen` | two-tier sound orienting: antenna lean (Tier 1) + head→body turn on speech/snap (Tier 2); hosts the always-alive idle layer + the #43 `PatHook`; `--live` folds in think + vision + sleep | mic DoA + RMS (`media_session`) | serial MotionQueue (minjerk `goto`) | `sdk` default; `http` polls daemon DoA |

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-06-21
+
+### Added
+
+- Layered engagement gate under `listen run --live --transcribe`: fuzzy name fast-path
+  (`reachy/speech/name_match.py`) recognises "reachy"/"robot" and common STT mishearings
+  ("richie", "reachie") with an initial-letter guard, engaging immediately with no LLM
+  call; for nameless utterances a single-shot LLM classifier
+  (`reachy/speech/engagement.py`, `EngagementClassifier`) judges "is this addressed to
+  the robot, given recent conversation?" — ENGAGE on yes, DROP on ambient chatter.
+- `REACHY_ENGAGE_HEURISTIC=1` escape hatch: set to bypass the LLM classifier and run
+  the original coherent-sentence-in-window heuristic for the full process lifetime.
+- DEGRADE graceful degradation: if the classifier errors or times out, the gate silently
+  falls back to the heuristic so the hearing loop never stalls.
+- `reachy/speech/llm.py` non-streaming `complete()` — single-shot completion used by
+  the classifier (tight ~5 s timeout, same `REACHY_OPENAI_*` endpoint as cognition).
+
+### Changed
+
+- 3-tier motion ladder under `--transcribe` replaces the previous blanket turn
+  suppression: ambient noise → Tier-1 antenna lean; detected speech → bounded head-only
+  orienting nudge toward DoA; engaged utterance (gate ENGAGE) → deliberate head/body
+  turn toward the speaker's DoA, clamped to a minimum duration to prevent SDK
+  `goto` planner faults. The robot now faces you when you speak to it.
+
 ## [0.27.0] - 2026-06-21
 
 ### Added

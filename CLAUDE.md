@@ -260,29 +260,62 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
     at `max_utterance_s`, via `Transcriber.transcribe_once` (a single-POST that
     bypasses the rolling-window/throttle of `transcribe`) — so the LLM gets full
     sentences, not 1.5 s fragments. Sub-`min_utterance_s` blips are dropped.
-  - **Engagement gate (`_should_engage`).** A transcribed utterance reaches cognition
-    only when it **names the robot** (`reachy`/`robot`) OR is a clear sentence
-    (`>= min_words`) arriving inside the ongoing-conversation window
-    (`engage_window_s` after the last accepted turn). Ambient speech and short
-    fragments are ignored — "clear, coherent sentences addressed to the robot", not
-    every sound. (True context-judging is an LLM enhancement; this is the heuristic.)
+  - **Layered engagement gate (`reachy/speech/engagement.py` + `reachy/speech/name_match.py`).**
+    A transcribed utterance passes through a cheapest-first decision stack before reaching
+    cognition. After the built-in self-mute and min-utterance shortcuts:
+    1. **Fuzzy name fast-path** (`is_name_match` in `reachy/speech/name_match.py`) — checks
+       every word in the utterance against the canonical names (`reachy`/`robot`) and a set
+       of common STT mishearings (`richie`, `reachie`, `richy`). The matcher uses a combined
+       `difflib_ratio × length_ratio` score with three structural guards (prefix guard,
+       superstring guard, initial-letter guard) so the ubiquitous word "speech" never
+       false-triggers. An exact or close-enough match → ENGAGE immediately, **zero classifier
+       calls**.
+    2. **Single-shot LLM classifier** (`EngagementClassifier` in `reachy/speech/engagement.py`,
+       backed by the new non-streaming `reachy/speech/llm.py` `complete()`) — for a coherent
+       utterance with no name hit, judges "is this addressed to the robot, given the recent
+       conversation?" against up to the last 6 accepted turns. Verdict YES → ENGAGE;
+       NO → DROP. At most one `REACHY_OPENAI_*` endpoint call per utterance (same endpoint
+       as cognition, `DEFAULT_CLASSIFIER_TIMEOUT = 5 s`).
+    3. **DEGRADE fallback** — if the classifier raises (network error / timeout / unparseable
+       response), `decide_engagement` returns `Decision.DEGRADE` and `TranscribeHook._decide`
+       falls back to `_should_engage` (the original coherent-sentence-in-window heuristic).
+       The hearing loop never stalls; classifier failures are logged once.
+    4. Anything else is **DROP** — ambient human-to-human chatter never feeds cognition.
+    - **Escape hatch:** `REACHY_ENGAGE_HEURISTIC=1` (or `true`/`yes`/`on`) forces the pure
+      heuristic gate (`_should_engage`) throughout the process lifetime — no classifier is
+      even built. Useful for debugging or when the LLM endpoint is unavailable at boot.
+    - **History context:** on an ENGAGE decision the utterance is appended to a rolling deque
+      (`_HISTORY_MAXLEN = 6`) handed to subsequent classifier calls, so ongoing conversation
+      context flows forward without accumulating unboundedly.
+  - **3-tier motion ladder** (`reachy/motion/listen.py` `ListenProducer`), replacing the
+    blanket `turn_enabled=False` suppression that previously muted all head motion under
+    `--transcribe`. Reaction is graded by perception level:
+    - **Noise** (live sound, no speech flag) → Tier-1 antenna lean only (near-side antenna
+      deflects toward DoA — unchanged).
+    - **Speech** (detected speech, no engaged signal) → a bounded head-only orienting nudge
+      toward the DoA (`speech_orient_gain × clamped_target`, capped at `speech_orient_max`
+      degrees, never escalates to body rotation).
+    - **Engaged** (gate ENGAGE → `set_engaged()` latch) → the full deliberate head/body
+      turn (`_engaged_turn`), identical to Tier-2 except its duration is floored to
+      `engaged_min_dur` (default 1.5 s) so the SDK `goto` planner's
+      `time value out of range [0,1]` fault can never fire on a large turn angle.
+    - `on_engage` wiring: `TranscribeHook.__init__` accepts an `on_engage` callback; the
+      composition layer (`_commands/listen.py`) wires it to `producer.set_engaged`, so
+      exactly one deliberate turn fires per addressed utterance, independently of cognition
+      (the words still reach `EventBuffer` even if the motion callback raises).
   - **Words drive cognition, not raw sound.** Under `--transcribe` the `ThinkHook` is
     built `feed_doa_cues=False`, so raw DoA/loudness cues no longer feed cognition —
     only transcripts do. With `run_turn` cue-gated, the robot stays **quiet until
     someone speaks words** and never reacts to its own TTS as "loud sound" (the
     feedback loop that motivated this). The transcript carries direction:
     `feed_transcript(text, direction=...)` → `heard someone say (from the left): "…"`.
-  - **No auto-turn.** `--transcribe` sets `ListenParams.turn_enabled=False`, so the
-    Tier-2 head/body turn is suppressed (the head should turn only on its name — a
-    follow-up) and the large escalate-turns that can trip the SDK `goto` planner never
-    fire. Tier-1 antenna lean still reacts to sound.
   - **Self-mute covers the whole clip.** The `play_audio` wrapper stamps
     `mute["until"]` for the clip's full play **duration** + a margin, so the robot
     never transcribes its own (possibly long) voice. An unreachable STT degrades to
     "no words" and never stalls the loop.
   The deployed `live` boot unit opts in (`listen run --live --transcribe`). It is
   still **not** a barge-in assistant — words are one more perception, now gated to
-  coherent, addressed speech.
+  clear, addressed speech by the layered engagement gate.
 
 ### `say` noun — dumb TTS pipe
 
