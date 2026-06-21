@@ -295,6 +295,37 @@ def test_config_arg_overrides_env(monkeypatch):
     assert cfg.model == "override-model"
 
 
+def test_empty_openai_key_does_not_fall_back_to_legacy(monkeypatch):
+    """An explicitly empty ``REACHY_OPENAI_API_KEY`` must NOT leak the legacy key.
+
+    Precedence is presence-based: a *set* (even empty) primary wins over the
+    legacy name, so an empty canonical key means "no auth", not "use
+    ``REACHY_LLM_API_KEY``" (Qodo PR #52 finding 1 — empty env breaks precedence).
+    """
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "")
+    monkeypatch.setenv("REACHY_LLM_API_KEY", "legacy-secret")
+    cfg = llm.LlmConfig.resolve()
+    assert cfg.api_key == ""
+
+
+def test_empty_openai_key_sends_no_bearer_header(monkeypatch):
+    """The empty-key precedence fix reaches the wire: no stale legacy Bearer."""
+    body = b"data: [DONE]\n\n"
+    captured = _stub_urlopen(monkeypatch, body)
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "")
+    monkeypatch.setenv("REACHY_LLM_API_KEY", "legacy-secret")
+    list(llm.stream_chat_completion([{"role": "user", "content": "hi"}]))
+    assert captured["req"].get_header("Authorization") is None
+
+
+def test_empty_openai_url_base_overrides_legacy(monkeypatch):
+    """A set-but-empty ``REACHY_OPENAI_URL_BASE`` wins over legacy + default."""
+    monkeypatch.setenv("REACHY_OPENAI_URL_BASE", "")
+    monkeypatch.setenv("REACHY_LLM_BASE_URL", "http://legacy-host:9000")
+    cfg = llm.LlmConfig.resolve()
+    assert cfg.base_url == ""
+
+
 def test_bearer_header_set_when_key_present(monkeypatch):
     body = b"data: [DONE]\n\n"
     captured = _stub_urlopen(monkeypatch, body)

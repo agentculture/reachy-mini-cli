@@ -51,6 +51,22 @@ _MAX_BUFFER_BEFORE_LOOSE = 200
 _MARKDOWN_CHARS = frozenset("*_~`#")
 
 
+def _env_pref(primary: str, legacy: str, default: str | None) -> str | None:
+    """Presence-based precedence between the canonical + legacy env names.
+
+    A primary variable that is *set* wins even when its value is empty — only a
+    truly **unset** primary falls through to the legacy name, then the default.
+    A truthiness ``or`` chain would instead treat ``""`` as "unset" and silently
+    pick up the legacy/default value (e.g. sending a stale legacy API key when
+    the operator explicitly set ``REACHY_OPENAI_API_KEY=""`` to mean "no auth").
+    """
+    if primary in os.environ:
+        return os.environ[primary]
+    if legacy in os.environ:
+        return os.environ[legacy]
+    return default
+
+
 @dataclass
 class LlmConfig:
     """Resolved LLM connection config.
@@ -62,6 +78,10 @@ class LlmConfig:
     ``REACHY_LLM_API_KEY`` / ``REACHY_LLM_MODEL`` names are still honoured as a
     fallback (used only when the matching ``REACHY_OPENAI_*`` var is unset), so
     older configs keep working.
+
+    Precedence is by *presence*, not truthiness: an explicitly provided argument
+    or a set-but-empty ``REACHY_OPENAI_*`` variable wins over the legacy name and
+    the default. See :func:`_env_pref`.
     """
 
     base_url: str
@@ -76,21 +96,21 @@ class LlmConfig:
         model: str | None = None,
         api_key: str | None = None,
     ) -> "LlmConfig":
-        env = os.environ.get
         return cls(
             base_url=(
                 base_url
-                or env("REACHY_OPENAI_URL_BASE")
-                or env("REACHY_LLM_BASE_URL")
-                or _DEFAULT_BASE_URL
+                if base_url is not None
+                else _env_pref("REACHY_OPENAI_URL_BASE", "REACHY_LLM_BASE_URL", _DEFAULT_BASE_URL)
             ),
             model=(
-                model or env("REACHY_OPENAI_MODEL_ID") or env("REACHY_LLM_MODEL") or _DEFAULT_MODEL
+                model
+                if model is not None
+                else _env_pref("REACHY_OPENAI_MODEL_ID", "REACHY_LLM_MODEL", _DEFAULT_MODEL)
             ),
             api_key=(
                 api_key
                 if api_key is not None
-                else (env("REACHY_OPENAI_API_KEY") or env("REACHY_LLM_API_KEY"))
+                else _env_pref("REACHY_OPENAI_API_KEY", "REACHY_LLM_API_KEY", None)
             ),
         )
 
