@@ -147,8 +147,8 @@ def test_audio_latches_off_after_threshold_consecutive_failures():
         synthesize=synth,
         play_audio=lambda *a, **k: None,
         audio_optional=True,
-        audio_mute_threshold=2,
     )
+    # DEFAULT_AUDIO_MUTE_THRESHOLD == 2:
     # Turn 1: synth tried + fails (streak 1). Turn 2: tried + fails (streak 2 → mute).
     # Turn 3+: muted, synth never called again.
     for _ in range(4):

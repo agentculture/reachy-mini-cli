@@ -619,11 +619,14 @@ def _run_http_loop(
     )
 
 
-def cmd_listen_run(args: argparse.Namespace) -> int:
-    json_mode = bool(getattr(args, "json", False))
-    # Export sink (None unless `--export -`). Built + validated *before* the
-    # preflight move so a bad target / mode is a clean error, not a half-run. The
-    # cognition feed only exists under `--live` on the SDK transport, so guard both.
+def _resolve_export_hook(args: argparse.Namespace) -> object | None:
+    """Build the ``--export`` hook (or ``None``), requiring ``--live`` for it.
+
+    A bare ``--export`` (no ``--live``) is a clean exit-1 user error — the feed
+    carries cognition blocks only the folded live loop produces. This runs *before*
+    ``get_transport`` so the combo error fires regardless of whether the sdk extra
+    is installed (the tests rely on this ordering).
+    """
     export_hook = build_export_hook(args)
     if export_hook is not None and not getattr(args, "live", False):
         raise CliError(
@@ -632,7 +635,11 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
             remediation="the export feed carries cognition blocks, which only the "
             "folded live loop produces; add --live (it runs on the sdk transport)",
         )
-    transport = get_transport(args)
+    return export_hook
+
+
+def _require_export_transport(export_hook: object | None, transport: object) -> None:
+    """The cognition feed needs the sdk media session; the http profile can't fold it."""
     if export_hook is not None and not hasattr(transport, "media_session"):
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -640,6 +647,26 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
             remediation="run with --transport sdk (the default); the http profile has "
             "no media session to fold cognition into",
         )
+
+
+def _orienting_banner(transport: object, params: object, *, live: bool, exporting: bool) -> str:
+    """The one-line '[listen] orienting…' preflight banner (stderr)."""
+    return (
+        f"[listen] orienting to sound via {transport.name}: dwell={params.dwell:g}s "
+        f"hold={params.hold:g}s speed={params.alert_speed:g}deg/s"
+        f"{' (speech only)' if params.speech_only else ''}"
+        f"{' (live: think/vision/sleep folded in)' if live else ''}"
+        f"{' [export: stdout]' if exporting else ''}; Ctrl-C to stop"
+    )
+
+
+def cmd_listen_run(args: argparse.Namespace) -> int:
+    json_mode = bool(getattr(args, "json", False))
+    # Export sink (None unless `--export -`). Built + validated *before* the preflight
+    # move so a bad target / mode is a clean error, not a half-run.
+    export_hook = _resolve_export_hook(args)
+    transport = get_transport(args)
+    _require_export_transport(export_hook, transport)
     params = _params_from_args(args)
     producer = ListenProducer(params)
     # When exporting, stdout is reserved for the pure JSONL feed: every banner,
@@ -652,11 +679,9 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
     transport.move_goto(head=dict(_CENTER), duration=0.8, interpolation="minjerk")
     if text_diagnostics:
         emit_diagnostic(
-            f"[listen] orienting to sound via {transport.name}: dwell={params.dwell:g}s "
-            f"hold={params.hold:g}s speed={params.alert_speed:g}deg/s"
-            f"{' (speech only)' if params.speech_only else ''}"
-            f"{' (live: think/vision/sleep folded in)' if getattr(args, 'live', False) else ''}"
-            f"{' [export: stdout]' if exporting else ''}; Ctrl-C to stop"
+            _orienting_banner(
+                transport, params, live=getattr(args, "live", False), exporting=exporting
+            )
         )
 
     def _on_action(action) -> None:

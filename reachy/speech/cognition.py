@@ -93,6 +93,11 @@ logger = logging.getLogger(__name__)
 # Default minimum gap between turns in the run() loop (seconds).
 DEFAULT_TURN_INTERVAL = 1.0
 
+# Consecutive audio-sink failures (in audio_optional mode) before the engine
+# latches the audio sink off — see CognitionEngine._note_audio_failure. A small
+# streak (not 1) tolerates a single transient blip without muting the session.
+DEFAULT_AUDIO_MUTE_THRESHOLD = 2
+
 
 # ---------------------------------------------------------------------------
 # Collaborator protocols (documentation; engine accepts any matching callable)
@@ -232,7 +237,6 @@ class CognitionEngine:
         sleep: Callable[[float], None] | None = None,
         turn_interval: float = DEFAULT_TURN_INTERVAL,
         audio_optional: bool = False,
-        audio_mute_threshold: int = 2,
     ) -> None:
         self._buffer = buffer
         self._stream_sentences = stream_sentences or _llm.stream_sentences
@@ -243,13 +247,15 @@ class CognitionEngine:
         # thought still flows to every other sink — expression motion + the export
         # feed are produced on the producer thread, ahead of and independent of the
         # speak worker — so a screen/log consumer is unaffected by a dead TTS. After
-        # ``audio_mute_threshold`` consecutive failures the audio sink latches off
-        # (no further synth attempts) so a hard-down TTS never throttles cognition to
-        # one turn per request-timeout. Default False keeps the strict, fail-fast
+        # ``DEFAULT_AUDIO_MUTE_THRESHOLD`` consecutive failures the audio sink latches
+        # off (no further synth attempts) so a hard-down TTS never throttles cognition
+        # to one turn per request-timeout. Default False keeps the strict, fail-fast
         # contract (an unreachable TTS raises CliError → exit 2) for `say`/standalone
-        # `think run`; the folded `listen --live` cognition opts in.
+        # `think run`; the folded `listen --live` cognition opts in. The threshold is a
+        # module constant (not a ctor arg) — internal tuning, rarely overridden; tests
+        # set ``_audio_mute_threshold`` directly when they need a different value.
         self._audio_optional = audio_optional
-        self._audio_mute_threshold = audio_mute_threshold
+        self._audio_mute_threshold = DEFAULT_AUDIO_MUTE_THRESHOLD
         self._audio_muted = False
         self._audio_fail_streak = 0
         # Optional motion seam: fired once per expression marker, in stream order.
@@ -426,23 +432,32 @@ class CognitionEngine:
                 if kind == "express":
                     if self._express is not None:
                         self._express(payload)
-                    continue
-                if self._audio_muted:
-                    continue  # audio latched off; the thought still reaches other sinks
-                try:
-                    pcm = self._synthesize(payload, **self._tts_kwargs)
-                    if pcm:
-                        self._play_audio(pcm, **self._playback_kwargs)
-                    self._audio_fail_streak = 0
-                except Exception:  # noqa: BLE001 — strict mode re-raises below
-                    if not self._audio_optional:
-                        raise
-                    self._note_audio_failure()
+                elif not self._audio_muted:
+                    self._speak_clip(payload)
         except Exception as exc:  # noqa: BLE001 — re-raised on the turn thread
             error_out.append(exc)
             # Drain any remaining items so a blocked producer's put() unblocks and
             # the sentinel is consumed; we are abandoning playback for this turn.
             _drain(speak_q)
+
+    def _speak_clip(self, payload: str) -> None:
+        """Synthesize + play one spoken clip (empty synth output is skipped).
+
+        Strict mode (``audio_optional`` False) lets a synth/playback exception
+        propagate to :meth:`_speak_worker`, which stashes it for the turn thread to
+        re-raise. In audio-optional mode the failure is absorbed via
+        :meth:`_note_audio_failure` (logged once, the clip skipped) so the turn
+        completes and cognition keeps running.
+        """
+        try:
+            pcm = self._synthesize(payload, **self._tts_kwargs)
+            if pcm:
+                self._play_audio(pcm, **self._playback_kwargs)
+            self._audio_fail_streak = 0
+        except Exception:  # noqa: BLE001 — strict mode re-raises, optional mode absorbs
+            if not self._audio_optional:
+                raise
+            self._note_audio_failure()
 
     def _note_audio_failure(self) -> None:
         """Record one audio-sink failure in audio-optional mode (log once, maybe latch).
@@ -487,8 +502,14 @@ class CognitionEngine:
         Parameters
         ----------
         max_turns:
-            Stop after this many *spoken* turns (no-op idle turns don't count).
-            ``None`` runs until ``stop`` fires.
+            Stop after this many turns that *ran* — i.e. turns where cues existed
+            and a cognition turn was produced (LLM output + expression markers +
+            export blocks); no-op idle turns (empty buffer) don't count. ``None``
+            runs until ``stop`` fires. Note: in ``audio_optional`` mode a counted
+            turn may complete with **no audio** once the audio sink has latched off
+            — it still produced a cognition turn, so it counts. (The folded
+            ``listen --live`` loop drives ``run`` with ``stop`` and no ``max_turns``,
+            so muted turns never cause premature termination there.)
         stop:
             Optional zero-arg predicate; the loop exits when it returns truthy
             (checked before each turn). Keeps the loop testable / bounded.
@@ -501,7 +522,9 @@ class CognitionEngine:
         Returns
         -------
         int
-            The number of turns that actually spoke.
+            The number of turns that ran (produced a cognition turn). In strict
+            mode every such turn also spoke; in ``audio_optional`` mode a muted turn
+            is counted even though it played no audio.
         """
         spoken = 0
         first = True
