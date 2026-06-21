@@ -261,3 +261,39 @@ def test_complete_disables_thinking_in_template_kwargs(monkeypatch):
     llm.complete([{"role": "user", "content": "hi"}])
     sent_body = json.loads(captured["req"].data)
     assert sent_body.get("chat_template_kwargs", {}).get("enable_thinking") is False
+
+
+# ---------------------------------------------------------------------------
+# Qodo #2: Accept header matches the response shape we parse
+# ---------------------------------------------------------------------------
+
+
+def test_complete_requests_json_accept_header(monkeypatch):
+    """``complete()`` parses a JSON body, so it must send ``Accept: application/json``.
+
+    A hardcoded ``Accept: text/event-stream`` (the streaming default) can cause an
+    OpenAI-compatible server to reply with SSE even for ``stream=false``, breaking the
+    ``json.loads`` and degrading the engagement classifier for no reason.
+    """
+    body = _non_streaming_response("ok")
+    captured = _stub_urlopen(monkeypatch, body)
+    llm.complete([{"role": "user", "content": "hi"}])
+    assert captured["req"].get_header("Accept") == "application/json"
+
+
+def test_streaming_request_still_sends_sse_accept_header():
+    """The streaming path is unchanged: ``_build_request(stream=True)`` keeps SSE Accept."""
+    cfg = llm.LlmConfig(base_url="http://x", model="m", api_key="EMPTY")
+    req = llm._build_request(
+        cfg, [{"role": "user", "content": "hi"}], temperature=0.8, max_tokens=None, stream=True
+    )
+    assert req.get_header("Accept") == "text/event-stream"
+
+
+def test_non_streaming_build_request_sends_json_accept_header():
+    """``_build_request(stream=False)`` advertises a JSON response."""
+    cfg = llm.LlmConfig(base_url="http://x", model="m", api_key="EMPTY")
+    req = llm._build_request(
+        cfg, [{"role": "user", "content": "hi"}], temperature=0.8, max_tokens=None, stream=False
+    )
+    assert req.get_header("Accept") == "application/json"

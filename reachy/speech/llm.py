@@ -262,7 +262,14 @@ def _build_request(
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
 
-    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    # Match the Accept header to the response shape we actually parse: SSE for the
+    # streaming caller, plain JSON for the non-streaming ``complete()``. Some
+    # OpenAI-compatible servers honour ``Accept: text/event-stream`` and reply with
+    # an SSE body even when ``stream=false`` was requested, which would break the
+    # ``json.loads`` in ``complete()`` and degrade the engagement classifier for no
+    # reason.
+    accept = "text/event-stream" if stream else "application/json"
+    headers = {"Content-Type": "application/json", "Accept": accept}
     # Bearer auth only when a real key is present (the reference treats the
     # literal "EMPTY" as "no key" for local OpenAI-compatible servers).
     if cfg.api_key and cfg.api_key != "EMPTY":

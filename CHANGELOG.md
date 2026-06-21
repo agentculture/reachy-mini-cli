@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.1] - 2026-06-22
+
+### Fixed
+
+- `reachy/speech/llm.py`: the non-streaming `complete()` (engagement classifier) now
+  sends `Accept: application/json` instead of the streaming `Accept: text/event-stream`,
+  so an OpenAI-compatible server can no longer reply with an SSE body that breaks the
+  `json.loads` and degrades the classifier for no reason (Qodo review #2).
+- `reachy/motion/listen.py`: the one-shot engaged latch (`set_engaged`) is now consumed
+  **only** on a tick that carries a usable `doa_angle`. A transient `doa_angle is None`
+  tick — silence right after an addressed utterance, or a degraded DoA read — no longer
+  swallows the latch, so the deliberate engaged turn-toward-the-speaker is never silently
+  lost (Qodo review #3).
+
 ## [0.28.0] - 2026-06-21
 
 ### Added

@@ -170,6 +170,30 @@ def test_set_engaged_latch_consumed_on_next_tick() -> None:
     assert a2.body_yaw is None, f"latch must be one-shot; second tick not engaged: {a2}"
 
 
+def test_engaged_latch_survives_none_angle_tick() -> None:
+    """A ``doa_angle is None`` tick must NOT consume the engaged latch (Qodo #3 regression).
+
+    ``set_engaged()`` arms a one-shot deliberate turn. If the latch were cleared on a
+    tick where the DoA is unavailable — silence right after the addressed utterance, or a
+    degraded/exception DoA read that surfaces as ``doa_angle=None`` — the engaged turn
+    would be silently lost. The latch must stay armed until a tick carries a usable angle,
+    then fire exactly once.
+    """
+    p = _transcribe_params()
+    prod = ListenProducer(p)
+    prod.set_engaged()
+    # Tick 1: no DoA available (silence / degraded read). The latch must survive and no
+    # engaged body turn may fire (there is nothing to turn toward).
+    a1 = prod.update(0.1, _sense(None), sound_present=False)
+    assert prod._engaged_latch is True, "latch must survive a None-angle tick"
+    assert a1 is None or a1.body_yaw is None, "no engaged body turn without a usable DoA"
+    # Tick 2: a real DoA arrives → the deliberate engaged turn fires, latch consumed once.
+    prod._hold_until = 0.0
+    a2 = prod.update(0.5, _sense(_LEFT, speech=True), sound_present=True)
+    assert a2 is not None and a2.body_yaw is not None, "engaged turn fires once an angle arrives"
+    assert prod._engaged_latch is False, "latch consumed exactly when the turn fires"
+
+
 # ---------------------------------------------------------------------------
 # Criterion 2 — duration clamp keeps t/duration in [0, 1] at the LARGEST angle
 # ---------------------------------------------------------------------------

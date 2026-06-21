@@ -559,14 +559,18 @@ class ListenProducer:
         # silence inside the idle/recenter paths, so it won't start during the hold.
         if t >= self._hold_until:
             # Consume the one-shot engaged latch (set by ``set_engaged``) OR'd with the
-            # per-tick ``engaged=`` kwarg, then clear it — so the deliberate turn fires
-            # once per latch/signal. Consumed only inside the dispatch (not during a
-            # hold window) so an engaged latch set mid-hold survives until the hold
-            # clears and still drives the turn.
+            # per-tick ``engaged=`` kwarg — so the deliberate turn fires once per
+            # latch/signal. Consumed only inside the dispatch (not during a hold window)
+            # so an engaged latch set mid-hold survives until the hold clears and still
+            # drives the turn. The latch is cleared only when ``angle is not None`` (i.e.
+            # there is a real DoA to turn toward): a transient ``doa_angle is None`` tick
+            # — silence right after the addressed utterance, or a degraded DoA read — must
+            # not swallow the latch and lose the engaged turn. Leaving it armed lets the
+            # turn fire on the next tick that carries a usable angle.
             is_engaged = engaged or self._engaged_latch
-            self._engaged_latch = False
             triggered = sense.speech_detected or snap  # deliberate event: speech / snap
             if angle is not None:
+                self._engaged_latch = False
                 reaction = self._react_to_angle(
                     angle,
                     t,
