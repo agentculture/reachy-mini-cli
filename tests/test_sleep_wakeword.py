@@ -112,7 +112,8 @@ class TestResolveBackend:
         from reachy.sleep.wakeword import resolve_backend
 
         backend = resolve_backend(enabled=True, kind="http", stt_url="http://127.0.0.1:1")
-        backend._window_samples = 0  # noqa: SLF001  (post immediately, no real net wait)
+        # Window/throttle now live on the delegated Transcriber.
+        backend._transcriber._window_samples = 0  # noqa: SLF001  (post immediately, no net wait)
         out = backend.update(_make_sense(), _chunk())
         assert out in (True, False)
 
@@ -135,25 +136,30 @@ class TestHttpSttBackend:
     def test_fires_when_transcript_matches_phrase(self):
         """A successful STT response containing the phrase fires True.
 
-        We inject the HTTP POST so no real server is needed."""
+        We inject the HTTP POST so no real server is needed. The POST seam now
+        lives on the delegated Transcriber (`backend._transcriber._post`)."""
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._post = lambda audio: {"text": "well, hey Reachy, wake up"}  # noqa: SLF001
+        backend._transcriber._post = lambda audio: {  # noqa: SLF001
+            "text": "well, hey Reachy, wake up"
+        }
         assert backend.update(_make_sense(), _chunk()) is True
 
     def test_no_match_returns_false(self):
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._post = lambda audio: {"text": "the weather is nice today"}  # noqa: SLF001
+        backend._transcriber._post = lambda audio: {  # noqa: SLF001
+            "text": "the weather is nice today"
+        }
         assert backend.update(_make_sense(), _chunk()) is False
 
     def test_detected_field_fires(self):
         """A response with an explicit boolean `detected` field is honoured."""
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._post = lambda audio: {"detected": True}  # noqa: SLF001
+        backend._transcriber._post = lambda audio: {"detected": True}  # noqa: SLF001
         assert backend.update(_make_sense(), _chunk()) is True
 
     def test_post_returning_none_is_false(self):
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._post = lambda audio: None  # noqa: SLF001
+        backend._transcriber._post = lambda audio: None  # noqa: SLF001
         assert backend.update(_make_sense(), _chunk()) is False
 
     def test_post_raising_is_swallowed(self):
@@ -163,7 +169,7 @@ class TestHttpSttBackend:
             raise RuntimeError("network exploded")
 
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._post = _boom  # noqa: SLF001
+        backend._transcriber._post = _boom  # noqa: SLF001
         assert backend.update(_make_sense(), _chunk()) is False
 
     def test_env_var_default_url(self, monkeypatch):
@@ -337,20 +343,22 @@ class TestHttpPostLeg:
 
 
 class TestEncodeAudio:
+    # The WAV/PCM machinery moved to the shared reachy.speech.stt.Transcriber;
+    # these assertions are byte-identical, just against the new owner class.
     def test_empty_audio_encodes_to_empty_bytes(self):
-        from reachy.sleep.wakeword import HttpSttBackend
+        from reachy.speech.stt import Transcriber
 
-        assert HttpSttBackend._encode_audio(np.zeros(0, dtype=np.float32)) == b""
+        assert Transcriber._encode_audio(np.zeros(0, dtype=np.float32)) == b""
 
     def test_none_audio_encodes_to_empty_bytes(self):
-        from reachy.sleep.wakeword import HttpSttBackend
+        from reachy.speech.stt import Transcriber
 
-        assert HttpSttBackend._encode_audio(None) == b""
+        assert Transcriber._encode_audio(None) == b""
 
     def test_normal_audio_encodes_to_pcm16(self):
-        from reachy.sleep.wakeword import HttpSttBackend
+        from reachy.speech.stt import Transcriber
 
-        out = HttpSttBackend._encode_audio(np.array([0.0, 1.0, -1.0], dtype=np.float32))
+        out = Transcriber._encode_audio(np.array([0.0, 1.0, -1.0], dtype=np.float32))
         assert isinstance(out, bytes) and len(out) == 6  # 3 samples * 2 bytes
 
 
@@ -358,17 +366,17 @@ class TestWavBytes:
     """_wav_bytes wraps the PCM16 window in a self-describing WAV container."""
 
     def test_empty_audio_is_empty_wav(self):
-        from reachy.sleep.wakeword import HttpSttBackend
+        from reachy.speech.stt import Transcriber
 
-        assert HttpSttBackend._wav_bytes(np.zeros(0, dtype=np.float32), 16000) == b""
+        assert Transcriber._wav_bytes(np.zeros(0, dtype=np.float32), 16000) == b""
 
     def test_wav_has_riff_header_and_rate(self):
         import io
         import wave
 
-        from reachy.sleep.wakeword import HttpSttBackend
+        from reachy.speech.stt import Transcriber
 
-        out = HttpSttBackend._wav_bytes(np.zeros(800, dtype=np.float32), 16000)
+        out = Transcriber._wav_bytes(np.zeros(800, dtype=np.float32), 16000)
         assert out[:4] == b"RIFF" and out[8:12] == b"WAVE"
         with wave.open(io.BytesIO(out), "rb") as wf:
             assert wf.getframerate() == 16000
@@ -380,21 +388,30 @@ class TestWavBytes:
         import io
         import wave
 
-        from reachy.sleep.wakeword import HttpSttBackend
+        from reachy.speech.stt import Transcriber
 
-        out = HttpSttBackend._wav_bytes(np.zeros(100, dtype=np.float32), 48000)
+        out = Transcriber._wav_bytes(np.zeros(100, dtype=np.float32), 48000)
         with wave.open(io.BytesIO(out), "rb") as wf:
             assert wf.getframerate() == 48000
 
 
 class TestMultipartBody:
-    """_multipart_body emits a file=WAV + language form the STT server can parse."""
+    """_multipart_body emits a file=WAV + language form the STT server can parse.
+
+    The multipart leg moved to the shared Transcriber; the only changed
+    assertion is the filename (``wake.wav`` -> ``audio.wav``) because the shared
+    client is no longer wake-word-specific. Everything else is byte-identical.
+    """
 
     def test_body_contains_file_and_language_fields(self):
-        backend = _nowindow(stt_url="http://stt.local", language="en")
+        from reachy.speech.stt import Transcriber
+
+        backend = Transcriber(
+            stt_url="http://stt.local", language="en", window_seconds=0.0, min_interval=0.0
+        )
         body, content_type = backend._multipart_body(b"RIFFfake")
         assert content_type.startswith("multipart/form-data; boundary=")
-        assert b'name="file"; filename="wake.wav"' in body
+        assert b'name="file"; filename="audio.wav"' in body
         assert b"Content-Type: audio/wav" in body
         assert b'name="language"' in body and b"\r\nen\r\n" in body
         assert b"RIFFfake" in body
@@ -528,6 +545,8 @@ class TestWindowing:
     """update() accumulates audio and only POSTs a full window, at most once/min_interval."""
 
     def _counting_backend(self, **kw):
+        # The window/throttle/POST leg moved to the delegated Transcriber, so the
+        # injected seams now live on backend._transcriber (assertions unchanged).
         backend = _nowindow(stt_url="http://stt.local", phrase="hey reachy", **kw)
         calls = {"n": 0}
 
@@ -535,7 +554,7 @@ class TestWindowing:
             calls["n"] += 1
             return {"text": "hey reachy"}
 
-        backend._post = _post  # noqa: SLF001
+        backend._transcriber._post = _post  # noqa: SLF001
         return backend, calls
 
     def test_no_post_until_window_full(self):
@@ -546,7 +565,9 @@ class TestWindowing:
             stt_url="http://stt.local", sample_rate=1000, window_seconds=1.0, min_interval=0.0
         )
         posted = {"n": 0}
-        backend._post = lambda audio: posted.__setitem__("n", posted["n"] + 1) or {"text": "x"}
+        backend._transcriber._post = lambda audio: posted.__setitem__(  # noqa: SLF001
+            "n", posted["n"] + 1
+        ) or {"text": "x"}
 
         assert backend.update(_make_sense(), _chunk(400)) is False  # 400 < 1000
         assert backend.update(_make_sense(), _chunk(400)) is False  # 800 < 1000
@@ -558,8 +579,8 @@ class TestWindowing:
         # Fake clock that does not advance → second tick is throttled.
         clock = {"t": 100.0}
         backend, calls = self._counting_backend()
-        backend._clock = lambda: clock["t"]  # noqa: SLF001
-        backend._min_interval = 5.0  # noqa: SLF001
+        backend._transcriber._clock = lambda: clock["t"]  # noqa: SLF001
+        backend._transcriber._min_interval = 5.0  # noqa: SLF001
 
         assert backend.update(_make_sense(), _chunk()) is True  # first post
         assert backend.update(_make_sense(), _chunk()) is False  # throttled (same time)
@@ -571,8 +592,8 @@ class TestWindowing:
     def test_reset_clears_window_and_throttle(self):
         backend, calls = self._counting_backend(min_interval=5.0)
         clock = {"t": 0.0}
-        backend._clock = lambda: clock["t"]  # noqa: SLF001
+        backend._transcriber._clock = lambda: clock["t"]  # noqa: SLF001
         assert backend.update(_make_sense(), _chunk()) is True
         backend.reset()  # a real wake → clear so we don't immediately re-fire on stale audio
-        assert backend._buffered == 0  # noqa: SLF001
-        assert backend._last_post is None  # noqa: SLF001
+        assert backend._transcriber._buffered == 0  # noqa: SLF001
+        assert backend._transcriber._last_post is None  # noqa: SLF001

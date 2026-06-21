@@ -49,21 +49,15 @@ error, or an unreachable host — all map to "not detected" (``False``).
 
 from __future__ import annotations
 
-import io
-import json
 import logging
 import os
 import time
-import urllib.error
-import urllib.request
-import uuid
-import wave
-from collections import deque
 from typing import Callable
 
 import numpy as np
 
 from reachy.behavior.sense import Sense
+from reachy.speech.stt import Transcriber
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +66,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_PHRASE = "hey reachy"
-#: model-gear / NVIDIA Parakeet STT (see ../model-gear; reachy runs on the same
-#: box, so localhost). Override with REACHY_STT_URL for a remote deployment.
-DEFAULT_STT_URL = "http://localhost:9002"
+#: Endpoint path + per-request timeout for the STT POST. The *transcription* leg
+#: (URL / language / sample-rate / window / throttle resolution) is now owned by
+#: :class:`reachy.speech.stt.Transcriber`; only the wake-word-specific defaults
+#: (and the test-pinned timeout) live here.
 DEFAULT_STT_PATH = "/v1/audio/transcriptions"
 DEFAULT_STT_TIMEOUT = 2.0  # seconds — short: a wake check must never stall the loop
-DEFAULT_LANGUAGE = "en"
 #: Parakeet expects 16 kHz mono; the WAV header carries whatever the mic feeds.
 DEFAULT_SAMPLE_RATE = 16000
 #: Accumulate this much audio before a transcription POST — a single tick's mic
@@ -92,19 +86,9 @@ KIND_OPENWAKEWORD = "openwakeword"
 DEFAULT_KIND = KIND_HTTP
 
 
-def _resolve_stt_url(override: str | None) -> str:
-    """Return the STT base URL: explicit arg > ``REACHY_STT_URL`` > default."""
-    return (override or os.environ.get("REACHY_STT_URL") or DEFAULT_STT_URL).rstrip("/")
-
-
 def _resolve_phrase(override: str | None) -> str:
     """Return the wake phrase: explicit arg > ``REACHY_STT_PHRASE`` > default."""
     return override or os.environ.get("REACHY_STT_PHRASE") or DEFAULT_PHRASE
-
-
-def _resolve_language(override: str | None) -> str:
-    """Return the STT language hint: explicit arg > ``REACHY_STT_LANGUAGE`` > 'en'."""
-    return override or os.environ.get("REACHY_STT_LANGUAGE") or DEFAULT_LANGUAGE
 
 
 def _resolve_stt_timeout(override: float | None) -> float:
@@ -197,19 +181,39 @@ class HttpSttBackend:
         min_interval: float = DEFAULT_MIN_INTERVAL,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.stt_url = _resolve_stt_url(stt_url)
         self.phrase = _resolve_phrase(phrase)
-        self.language = _resolve_language(language)
-        self._endpoint = f"{self.stt_url}{stt_path}"
-        self._timeout = _resolve_stt_timeout(timeout)
-        self._sample_rate = int(sample_rate) if sample_rate else DEFAULT_SAMPLE_RATE
-        self._window_samples = max(0, int(window_seconds * self._sample_rate))
-        self._min_interval = max(0.0, float(min_interval))
-        self._clock = clock
-        # Rolling audio window (oldest chunks dropped once the window is full).
-        self._buffer: deque[np.ndarray] = deque()
-        self._buffered = 0
-        self._last_post: float | None = None
+        # The transcription leg (WAV-multipart + urllib + rolling window +
+        # throttle) is owned by the shared Transcriber; this backend keeps only
+        # the wake-word-specific phrase matching on top of the raw JSON payload.
+        self._transcriber = Transcriber(
+            stt_url=stt_url,
+            stt_path=stt_path,
+            timeout=timeout,
+            language=language,
+            sample_rate=sample_rate,
+            window_seconds=window_seconds,
+            min_interval=min_interval,
+            clock=clock,
+        )
+
+    # ------------------------------------------------------------------
+    # Configuration (delegated to the shared Transcriber)
+    # ------------------------------------------------------------------
+
+    @property
+    def stt_url(self) -> str:
+        """Resolved STT base URL (owned by the shared :class:`Transcriber`)."""
+        return self._transcriber.stt_url
+
+    @property
+    def language(self) -> str:
+        """Resolved STT language hint (owned by the shared :class:`Transcriber`)."""
+        return self._transcriber.language
+
+    @property
+    def _endpoint(self) -> str:
+        """Full transcription endpoint URL (owned by the shared :class:`Transcriber`)."""
+        return self._transcriber._endpoint  # noqa: SLF001
 
     # ------------------------------------------------------------------
     # Public API
@@ -218,52 +222,18 @@ class HttpSttBackend:
     def update(self, _sense: Sense, audio: np.ndarray) -> bool:
         """Accumulate audio; POST the window when full + due; True on a match.
 
-        Never raises — any network / parse failure degrades to ``False``.
+        Delegates the WAV-multipart + urllib + rolling-window + throttle leg to
+        the shared :class:`~reachy.speech.stt.Transcriber`, then runs wake-word
+        :meth:`_matches` on the raw JSON payload. Never raises — any network /
+        parse failure degrades to ``False`` (``transcribe_payload`` returns
+        ``None``, which :meth:`_matches` maps to ``False``).
         """
-        self._accumulate(audio)
-        if self._buffered < self._window_samples:
-            return False  # not enough audio yet to transcribe a phrase
-        now = self._clock()
-        if self._last_post is not None and (now - self._last_post) < self._min_interval:
-            return False  # throttled — do not hammer the STT server
-        self._last_post = now
-        window = self._collect_window()
-        try:
-            payload = self._post(window)
-        # Degrade cleanly: a network/parse failure must never crash the loop.
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[wakeword] STT request failed (%s); no wake-word this tick", exc)
-            return False
+        payload = self._transcriber.transcribe_payload(audio)
         return self._matches(payload)
 
     def reset(self) -> None:
         """Clear the rolling window + throttle so a fresh wake does not re-fire."""
-        self._buffer.clear()
-        self._buffered = 0
-        self._last_post = None
-
-    # ------------------------------------------------------------------
-    # Rolling audio window
-    # ------------------------------------------------------------------
-
-    def _accumulate(self, audio: np.ndarray) -> None:
-        """Append a mic chunk, trimming the oldest so the window stays bounded."""
-        if audio is None or len(audio) == 0:
-            return
-        chunk = np.asarray(audio, dtype=np.float32).reshape(-1)
-        self._buffer.append(chunk)
-        self._buffered += len(chunk)
-        # Drop oldest chunks once we hold more than one window (keep ≥1 chunk).
-        while (
-            len(self._buffer) > 1 and self._buffered - len(self._buffer[0]) >= self._window_samples
-        ):
-            self._buffered -= len(self._buffer.popleft())
-
-    def _collect_window(self) -> np.ndarray:
-        """Concatenate the buffered chunks into a single float32 window."""
-        if not self._buffer:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(list(self._buffer))
+        self._transcriber.reset()
 
     # ------------------------------------------------------------------
     # Phrase matching
@@ -289,82 +259,6 @@ class HttpSttBackend:
         if isinstance(transcript, str) and transcript:
             return self.phrase.lower() in transcript.lower()
         return False
-
-    # ------------------------------------------------------------------
-    # HTTP leg (stdlib urllib only) — seam for tests
-    # ------------------------------------------------------------------
-
-    def _post(self, audio: np.ndarray) -> dict | None:
-        """POST the audio window (multipart WAV upload) and return the parsed JSON.
-
-        Returns the decoded dict, or ``None`` for an empty / non-JSON / non-dict
-        body. Raises only the underlying urllib/OS error, which :meth:`update`
-        catches — kept as a raising seam so tests can stub it both ways.
-        """
-        wav = self._wav_bytes(audio, self._sample_rate)
-        if not wav:
-            return None
-        body, content_type = self._multipart_body(wav)
-        req = urllib.request.Request(  # nosec B310 — URL is operator config, not user input
-            url=self._endpoint,
-            data=body,
-            method="POST",
-            headers={"Content-Type": content_type},
-        )
-        with urllib.request.urlopen(req, timeout=self._timeout) as resp:  # nosec B310
-            status = getattr(resp, "status", None) or resp.getcode()
-            if int(status) >= 400:
-                logger.debug("[wakeword] STT returned HTTP %s; no wake-word", status)
-                return None
-            raw = resp.read()
-        if not raw:
-            return None
-        try:
-            decoded = json.loads(raw.decode("utf-8"))
-        except ValueError:  # UnicodeDecodeError is a ValueError subclass
-            logger.debug("[wakeword] STT response was not JSON; no wake-word")
-            return None
-        return decoded if isinstance(decoded, dict) else None
-
-    def _multipart_body(self, wav: bytes) -> tuple[bytes, str]:
-        """Build a ``multipart/form-data`` body with ``file`` (WAV) + ``language``.
-
-        Hand-rolled (stdlib only) so the wake path never grows a ``requests`` dep.
-        """
-        boundary = f"----reachywake{uuid.uuid4().hex}"
-        crlf = b"\r\n"
-        parts = [
-            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
-            'filename="wake.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode(),
-            wav,
-            crlf,
-            f"--{boundary}\r\nContent-Disposition: form-data; "
-            f'name="language"\r\n\r\n{self.language}\r\n'.encode(),
-            f"--{boundary}--\r\n".encode(),
-        ]
-        return b"".join(parts), f"multipart/form-data; boundary={boundary}"
-
-    @staticmethod
-    def _encode_audio(audio: np.ndarray) -> bytes:
-        """Encode the float32 audio window as little-endian PCM16 bytes."""
-        if audio is None or len(audio) == 0:
-            return b""
-        clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
-        return (clipped * 32767.0).astype("<i2").tobytes()
-
-    @classmethod
-    def _wav_bytes(cls, audio: np.ndarray, sample_rate: int) -> bytes:
-        """Wrap the float32 window in a PCM16 mono WAV container (stdlib ``wave``)."""
-        pcm = cls._encode_audio(audio)
-        if not pcm:
-            return b""
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(int(sample_rate) or DEFAULT_SAMPLE_RATE)
-            wf.writeframes(pcm)
-        return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
