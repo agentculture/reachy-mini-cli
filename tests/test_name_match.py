@@ -69,9 +69,10 @@ def test_robot_extensions_rejected(text: str) -> None:
         ("reachie turn around please", True),
         ("okay robot can you move", True),
         ("i need to reach the shelf", False),
-        # NOTE: "speech" scores 0.500 against "reachy" (same as "richie"), so a
-        # sentence containing "speech" will match at DEFAULT_THRESHOLD=0.50.
-        # "this is preachy nonsense" — "preachy" is caught by superstring guard.
+        # "speech" ties "richie" on the raw score but starts with 's', so the
+        # initial guard rejects it — critical, since this is a hearing feature.
+        ("let me give a speech about this", False),
+        # "preachy" — caught by the superstring guard.
         ("this is preachy nonsense", False),
         ("the robotics competition starts tomorrow", False),
     ],
@@ -140,17 +141,18 @@ def test_low_threshold_accepts_more() -> None:
     assert is_name_match("rich", threshold=0.30) is True
 
 
-def test_speech_known_boundary_case() -> None:
-    """'speech' scores exactly 0.500 against 'reachy' — same as the required
-    'richie' mishearing.  Since we cannot distinguish them at this threshold,
-    'speech' is accepted as an inherent false positive of the 0.50 boundary.
+@pytest.mark.parametrize("text", ["speech", "each", "beach", "preach", "leech"])
+def test_initial_guard_rejects_same_score_collisions(text: str) -> None:
+    """Same-length words that tie 'richie' on the raw similarity score but start
+    with a different letter are rejected by the initial guard.
 
-    This test documents the known limitation rather than asserting a wrong
-    expectation.  Callers who need to suppress 'speech' should raise the
-    threshold, accepting that 'richie' will then be rejected too.
+    "speech" scores 0.500 against "reachy" — identical to the required "richie"
+    accept — but begins with 's', not 'r'.  An STT mishearing of "reachy" keeps
+    the leading phoneme, so the initial guard separates the genuine mishearings
+    ("richie"/"reachie") from these homophone collisions.  This matters most for
+    "speech", which is ubiquitous in a hearing/transcription feature.
     """
-    # score("speech", "reachy") == score("richie", "reachy") == 0.500
-    assert is_name_match("speech") is True  # known false positive at threshold 0.50
+    assert is_name_match(text) is False, f"'{text}' should be rejected by the initial guard"
 
 
 def test_exact_match_always_passes_regardless_of_threshold() -> None:

@@ -24,6 +24,14 @@ score above the threshold even when their character-overlap ratio is high.
 2. *Superstring guard* — if any canonical name is a literal substring of the
    word (e.g. ``"reachy"`` ⊂ ``"preachy"``, ``"robot"`` ⊂ ``"robots"``) the
    word is a morphological extension, not a mishearing, and is skipped.
+3. *Initial guard* — a *fuzzy* match (not an exact one) must share its first
+   letter with the name.  Both canonical names start with ``r``; an STT
+   mishearing of "reachy" almost never drops the leading phoneme entirely
+   ("richie"/"reachie"/"richy" all start with ``r``), whereas same-length
+   non-name homophones that collide on the raw similarity score ("speech",
+   "each", "beach") start with a different letter.  This is what keeps the very
+   common word "speech" — central to a hearing feature — from false-triggering
+   the name path.
 
 **Chosen default threshold: 0.50**
 
@@ -33,19 +41,13 @@ Empirically verified across the required accept/reject table:
              "richy"   (0.606), "richie"  (0.500)
   reject  — "reach"   (prefix guard), "preachy" (superstring guard),
              "rich"    (0.400), "hello"   (0.200), "robotics" (superstring guard),
-             "robots"  (superstring guard)
+             "robots"  (superstring guard), "speech"  (initial guard),
+             "each"    (initial guard), "beach"   (initial guard)
 
 0.50 is the tightest value that still accepts "richie" (the farthest-from-name
-mishearing in the required table) while keeping "rich" (0.40) below the line.
-
-**Known boundary case:** "speech" scores exactly 0.500 against "reachy" (both
-are 6 characters with the same SequenceMatcher ratio as "richie").  At
-``threshold=0.50`` "speech" is therefore accepted as a false positive — this is
-an inherent property of the chosen threshold.  Since "richie" is a required
-accept case and the two words are tied, the threshold cannot be raised to
-eliminate this false positive without also losing "richie".  In practice the
-engagement gate's ``min_words`` filter means a bare "speech" utterance is
-rejected anyway; the false positive only fires if "speech" is said in isolation.
+mishearing in the required table) while keeping "rich" (0.40) below the line;
+the initial guard removes the same-length same-score collisions ("speech") that
+the threshold alone cannot separate from "richie".
 """
 
 from __future__ import annotations
@@ -132,6 +134,11 @@ def is_name_match(
                 continue
             # Superstring guard: "reachy" in "preachy" → morphological extension.
             if name in word:
+                continue
+            # Initial guard: a fuzzy match must share the name's first letter.
+            # STT mishearings of "reachy" keep the leading phoneme ("richie",
+            # "reachie"); same-length score collisions ("speech") do not.
+            if word[:1] != name[:1]:
                 continue
             # Fuzzy match via combined score.
             if _combined_score(word, name) >= threshold:
