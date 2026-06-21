@@ -498,3 +498,394 @@ def test_sample_tap_reads_audio_once_and_rms_matches_snap_chunk():
     assert reads["n"] == 1, "the tick must read the mic chunk exactly once"
     assert holder.latest.rms == 0.7, "stored RMS must be the chunk audio() actually read"
     assert holder.latest.speech is True  # snap OR speech -> speech True
+
+
+# ---------------------------------------------------------------------------
+# t6 — `--transcribe`: fold STT words into live cognition
+#
+# `listen run --live --transcribe` composes the already-built TranscribeHook so
+# nearby speech is transcribed and the WORDS flow into the SAME EventBuffer the
+# ThinkHook's CognitionEngine consumes. Off by default; byte-identical when off.
+# ---------------------------------------------------------------------------
+
+
+from reachy.cli._errors import EXIT_USER_ERROR, CliError  # noqa: E402
+from reachy.motion.listen_transcribe import TranscribeHook  # noqa: E402
+
+
+class _NoMediaTransport:
+    """An http-style transport with NO ``media_session`` (no mic audio source).
+
+    ``--transcribe`` (like ``--export``) requires the sdk media session; this
+    transport must be rejected with a clean exit-1 user error.
+    """
+
+    name = "http"
+
+    def move_goto(self, *, head=None, antennas=None, body_yaw=None, duration, interpolation):
+        return {"uuid": "fake"}
+
+    def doa(self, *, timeout=None):  # noqa: ARG002
+        return {"angle": np.pi / 2, "speech_detected": False}
+
+
+def _run_capture(monkeypatch, argv, *, transport=None):
+    """Run ``reachy <argv>`` (main catches CliError → rc); return (rc, stdout, stderr)."""
+    if transport is not None:
+        monkeypatch.setattr("reachy.cli._commands.listen.get_transport", lambda _a: transport)
+    out, err = io.StringIO(), io.StringIO()
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
+    try:
+        rc = main(argv)
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_transcribe_without_live_is_clean_exit_1_before_transport(monkeypatch) -> None:
+    """``--transcribe`` without ``--live`` is a clean exit-1 user error.
+
+    The transcribe path only has a cognition buffer to feed inside the folded
+    live loop, so a bare ``--transcribe`` is rejected — and rejected BEFORE
+    ``get_transport`` (mirrors the ``--export`` ordering), so the combo error
+    fires regardless of whether the sdk extra is installed. ``get_transport`` is
+    patched to a tripwire to prove it is never reached.
+    """
+    called = {"transport": False}
+
+    def _tripwire(_args):
+        called["transport"] = True
+        raise AssertionError("get_transport must not be reached")
+
+    monkeypatch.setattr("reachy.cli._commands.listen.get_transport", _tripwire)
+
+    rc, _out, err = _run_capture(
+        monkeypatch, ["listen", "run", "--transcribe", "--transport", "sdk", "--max-ticks", "1"]
+    )
+
+    assert rc == EXIT_USER_ERROR
+    assert "--transcribe needs --live" in err
+    assert "hint:" in err
+    assert called["transport"] is False, "validation must run before get_transport"
+
+
+def test_transcribe_resolver_requires_live_unit() -> None:
+    """The resolver helper raises the documented exit-1 CliError without ``--live``."""
+    import argparse
+
+    args = argparse.Namespace(transcribe=True, live=False)
+    with pytest.raises(CliError) as ei:
+        listen_mod._resolve_transcribe(args)
+    assert ei.value.code == EXIT_USER_ERROR
+    assert "--transcribe" in ei.value.message and "--live" in ei.value.message
+
+    # Off → resolver returns False (no error).
+    args_off = argparse.Namespace(transcribe=False, live=False)
+    assert listen_mod._resolve_transcribe(args_off) is False
+    # On + live → resolver returns True.
+    args_on = argparse.Namespace(transcribe=True, live=True)
+    assert listen_mod._resolve_transcribe(args_on) is True
+
+
+def test_transcribe_requires_sdk_transport(monkeypatch) -> None:
+    """``--transcribe --live`` on a transport without ``media_session`` is exit-1.
+
+    The http profile has no mic audio to transcribe; the transport check errors
+    cleanly (mirrors ``_require_export_transport``).
+    """
+    transport = _NoMediaTransport()
+    rc, _out, err = _run_capture(
+        monkeypatch,
+        ["listen", "run", "--live", "--transcribe", "--transport", "http", "--max-ticks", "1"],
+        transport=transport,
+    )
+
+    assert rc == EXIT_USER_ERROR
+    assert "--transcribe requires the sdk transport" in err
+    assert "hint:" in err
+
+
+def test_transcribe_transport_resolver_rejects_no_media() -> None:
+    """The transport guard rejects a transport lacking ``media_session``."""
+    with pytest.raises(CliError) as ei:
+        listen_mod._require_transcribe_transport(True, _NoMediaTransport())
+    assert ei.value.code == EXIT_USER_ERROR
+
+    # Off, or a transport WITH media_session → no error.
+    listen_mod._require_transcribe_transport(False, _NoMediaTransport())  # no raise
+    listen_mod._require_transcribe_transport(True, _LiveSdkTransport())  # no raise
+
+
+def test_transcribe_off_keeps_sample_audio_none_and_no_hook(monkeypatch) -> None:
+    """``--transcribe`` OFF: no TranscribeHook, ``SenseSample.audio`` stays None.
+
+    The byte-identical-when-off guarantee: without ``--transcribe`` the live loop
+    builds no TranscribeHook and the shared per-tick sample carries no raw audio
+    chunk (so the off path cannot POST a single byte to STT).
+    """
+    built = {"transcribe": 0}
+    real_init = TranscribeHook.__init__
+
+    def _count(self, *a, **k):
+        built["transcribe"] += 1
+        return real_init(self, *a, **k)
+
+    monkeypatch.setattr(TranscribeHook, "__init__", _count)
+
+    # Spy the live hook list to assert no TranscribeHook is composed.
+    captured = _spy_chain(monkeypatch)
+    transport = _LiveSdkTransport()
+    rc = _run_live_cli(monkeypatch, transport, max_ticks=5, extra_args=["--idle-energy", "0"])
+    assert rc == 0
+
+    assert built["transcribe"] == 0, "live without --transcribe must build NO TranscribeHook"
+    hooks = captured["hooks"]
+    assert not any(isinstance(h, TranscribeHook) for h in hooks), hooks
+
+    # And the shared per-tick sample carries no raw audio chunk when off.
+    holder = listen_mod.SampleHolder()
+    audio_rms = {"rms": 0.0, "audio": None}
+
+    def fake_audio(t):
+        audio_rms["rms"] = 0.3
+        return (False, True)
+
+    class _FakeSense:
+        doa_angle = np.pi / 2
+        speech_detected = True
+
+    sense_tap, audio_tap = listen_mod._build_sample_tap(
+        holder, lambda t: _FakeSense(), fake_audio, audio_rms, transcribe=False
+    )
+    audio_tap(0.0)
+    sense_tap(0.0)
+    assert holder.latest.audio is None, "off-mode must leave SenseSample.audio = None"
+
+
+def test_transcribe_off_makes_zero_stt_posts(monkeypatch) -> None:
+    """``--transcribe`` OFF: zero STT POSTs happen — the loop is observably unchanged.
+
+    Patch the real :class:`~reachy.speech.stt.Transcriber.transcribe` to count
+    calls; with ``--transcribe`` absent it must never be invoked.
+    """
+    posts = {"n": 0}
+
+    def _count_transcribe(self, audio):  # noqa: ANN001
+        posts["n"] += 1
+        return None
+
+    monkeypatch.setattr("reachy.speech.stt.Transcriber.transcribe", _count_transcribe, raising=True)
+
+    transport = _LiveSdkTransport()
+    rc = _run_live_cli(monkeypatch, transport, max_ticks=6, extra_args=["--idle-energy", "0"])
+    assert rc == 0
+    assert posts["n"] == 0, "off-mode must make zero STT transcription calls"
+
+
+def test_transcribe_stashes_raw_chunk_once_per_tick(monkeypatch) -> None:
+    """``--transcribe`` ON: the raw chunk lands on ``SenseSample.audio`` with ONE read.
+
+    The same single ``get_audio_sample()`` read that feeds RMS/snap also retains
+    the raw float32 chunk; the sense tap places it on ``SenseSample.audio``. There
+    must be NO second ``get_audio_sample()`` call.
+    """
+    holder = listen_mod.SampleHolder()
+    chunk = np.full(256, 0.4, dtype=np.float32)
+    audio_rms = {"rms": 0.0, "audio": None}
+    reads = {"n": 0}
+
+    def fake_audio(t):
+        reads["n"] += 1  # stands in for the ONE get_audio_sample() read
+        audio_rms["rms"] = 0.5
+        audio_rms["audio"] = chunk  # _audio stashes the raw chunk alongside rms
+        return (False, True)
+
+    class _FakeSense:
+        doa_angle = np.pi / 2
+        speech_detected = True
+
+    sense_tap, audio_tap = listen_mod._build_sample_tap(
+        holder, lambda t: _FakeSense(), fake_audio, audio_rms, transcribe=True
+    )
+    audio_tap(0.0)
+    sense_tap(0.0)
+
+    assert reads["n"] == 1, "the tick must read the mic chunk exactly once"
+    assert holder.latest.audio is chunk, "the raw chunk must land on SenseSample.audio"
+    assert holder.latest.rms == 0.5
+
+
+def test_transcribe_audio_stashed_via_full_loop(monkeypatch) -> None:
+    """End-to-end: ``--live --transcribe`` retains the loop's raw chunk on the sample.
+
+    Drive the real CLI loop; the fake session's ``get_audio_sample`` returns one
+    known chunk and counts its calls. After the bounded run the shared sample
+    carries that exact chunk, and the session was read once per tick (no second
+    read for STT).
+    """
+
+    class _CountingSession(_Session):
+        def __init__(self):
+            super().__init__()
+            self.audio_reads = 0
+            self._chunk = np.full(512, 0.001, dtype=np.float32)
+
+        def get_audio_sample(self):
+            self.audio_reads += 1
+            return self._chunk
+
+    class _CountingTransport(_LiveSdkTransport):
+        def __init__(self):
+            super().__init__()
+            self._session = _CountingSession()
+
+    transport = _CountingTransport()
+    rc = _run_live_cli(
+        monkeypatch, transport, max_ticks=4, extra_args=["--idle-energy", "0", "--transcribe"]
+    )
+    assert rc == 0
+    sess = transport._session
+    # One audio read per tick (max_ticks ticks); no second read for transcription.
+    assert sess.audio_reads == 4, f"expected one read per tick, got {sess.audio_reads}"
+
+
+def test_transcribe_hook_shares_thinkhook_buffer(monkeypatch) -> None:
+    """``--transcribe`` ON: the TranscribeHook's buffer IS the ThinkHook engine's buffer.
+
+    The crux of t6: words transcribed by the TranscribeHook must flow into the
+    SAME :class:`~reachy.speech.events.EventBuffer` the CognitionEngine consumes.
+    Capture the buffer passed to ThinkHook and the buffer passed to TranscribeHook
+    and assert they are the one same object.
+    """
+    captured: dict[str, object] = {}
+    real_think_init = ThinkHook.__init__
+    real_tr_init = TranscribeHook.__init__
+
+    def _think_init(self, sample_provider, **kw):
+        captured["think_buffer"] = kw.get("buffer")
+        return real_think_init(self, sample_provider, **kw)
+
+    def _tr_init(self, sample_provider, **kw):
+        captured["transcribe_buffer"] = kw.get("buffer")
+        captured["transcribe_provider"] = sample_provider
+        return real_tr_init(self, sample_provider, **kw)
+
+    monkeypatch.setattr(ThinkHook, "__init__", _think_init)
+    monkeypatch.setattr(TranscribeHook, "__init__", _tr_init)
+
+    captured_chain = _spy_chain(monkeypatch)
+    transport = _LiveSdkTransport()
+    rc = _run_live_cli(
+        monkeypatch, transport, max_ticks=3, extra_args=["--idle-energy", "0", "--transcribe"]
+    )
+    assert rc == 0
+
+    # A TranscribeHook is in the composed live chain.
+    hooks = captured_chain["hooks"]
+    assert any(isinstance(h, TranscribeHook) for h in hooks), hooks
+
+    assert captured.get("think_buffer") is not None, "ThinkHook must receive a buffer"
+    assert (
+        captured["transcribe_buffer"] is captured["think_buffer"]
+    ), "TranscribeHook must feed the SAME buffer the ThinkHook engine consumes"
+
+
+def test_transcribe_feeds_words_into_shared_cognition_buffer(monkeypatch) -> None:
+    """A transcript fed by the TranscribeHook lands as a cue in the shared buffer.
+
+    With a fake Transcriber returning a fixed phrase, after the loop the shared
+    buffer (the one the cognition engine snapshots) carries a ``heard someone
+    say`` cue — proving the words reach cognition.
+    """
+    fixed = {"text": "hello there robot"}
+
+    def _fake_transcribe(self, audio):  # noqa: ANN001
+        return fixed["text"]
+
+    monkeypatch.setattr("reachy.speech.stt.Transcriber.transcribe", _fake_transcribe)
+
+    captured: dict[str, object] = {}
+    real_tr_init = TranscribeHook.__init__
+
+    def _tr_init(self, sample_provider, **kw):
+        captured["buffer"] = kw.get("buffer")
+        return real_tr_init(self, sample_provider, **kw)
+
+    monkeypatch.setattr(TranscribeHook, "__init__", _tr_init)
+
+    # The fake session reports speech so the sample carries speech=True + audio.
+    class _SpeechSession(_Session):
+        def doa(self, *, timeout=None):  # noqa: ARG002
+            return {"angle": np.pi / 2, "speech_detected": True}
+
+    class _SpeechTransport(_LiveSdkTransport):
+        def __init__(self):
+            super().__init__()
+            self._session = _SpeechSession()
+
+    transport = _SpeechTransport()
+    rc = _run_live_cli(
+        monkeypatch, transport, max_ticks=4, extra_args=["--idle-energy", "0", "--transcribe"]
+    )
+    assert rc == 0
+
+    buffer = captured["buffer"]
+    assert buffer is not None
+    cues = buffer.snapshot()
+    texts = [c.text for c in cues]
+    assert any("hello there robot" in t for t in texts), texts
+
+
+def test_transcribe_self_mute_wired_to_play_audio(monkeypatch) -> None:
+    """The play_audio wrapper stamps the mute window the TranscribeHook reads.
+
+    Wiring proof (c10): the cognition engine's ``play_audio`` is wrapped so each
+    played clip stamps a shared ``mute["until"]``, and the TranscribeHook is given
+    a ``mute_until`` callable reading that same window. We capture both and prove
+    that invoking the wrapped play_audio moves the mute deadline the hook reads.
+    """
+    captured: dict[str, object] = {}
+    real_engine_init = None
+
+    import reachy.speech.cognition as cog_mod
+
+    real_engine_init = cog_mod.CognitionEngine.__init__
+
+    def _engine_init(self, **kw):
+        captured["play_audio"] = kw.get("play_audio")
+        return real_engine_init(self, **kw)
+
+    monkeypatch.setattr(cog_mod.CognitionEngine, "__init__", _engine_init)
+
+    real_tr_init = TranscribeHook.__init__
+
+    def _tr_init(self, sample_provider, **kw):
+        captured["mute_until"] = kw.get("mute_until")
+        return real_tr_init(self, sample_provider, **kw)
+
+    monkeypatch.setattr(TranscribeHook, "__init__", _tr_init)
+
+    # The play_audio wrapper imports reachy.speech.playback.play_audio lazily; stub
+    # it to a no-op so invoking the wrapper does not touch the (absent) SDK.
+    monkeypatch.setattr("reachy.speech.playback.play_audio", lambda *a, **k: None)
+
+    # Freeze the clock the wrapper stamps with so the assertion is deterministic.
+    monkeypatch.setattr("time.monotonic", lambda: 100.0)
+
+    transport = _LiveSdkTransport()
+    rc = _run_live_cli(
+        monkeypatch, transport, max_ticks=2, extra_args=["--idle-energy", "0", "--transcribe"]
+    )
+    assert rc == 0
+
+    play = captured.get("play_audio")
+    mute_until = captured.get("mute_until")
+    assert callable(play), "the cognition engine must receive a wrapped play_audio"
+    assert callable(mute_until), "the TranscribeHook must receive a mute_until callable"
+
+    # Before any clip, the mute window is in the past (not muted).
+    assert mute_until() <= 100.0
+    # Playing a clip stamps the shared window forward (default ~2.5s mute-after).
+    play(b"\x00\x00")
+    assert mute_until() > 100.0, "play_audio must stamp the mute window the hook reads"

@@ -42,6 +42,7 @@ from reachy.motion.listen_hooks import HookChain
 from reachy.motion.listen_pat import PatHook
 from reachy.motion.listen_sleep import SleepHook
 from reachy.motion.listen_think import ThinkHook
+from reachy.motion.listen_transcribe import TranscribeHook
 from reachy.motion.listen_vision import VisionHook
 from reachy.motion.pat import PatDetector
 from reachy.motion.queue import MotionQueue
@@ -55,6 +56,14 @@ logger = logging.getLogger(__name__)
 
 _JSON_HELP = "Emit structured JSON."
 _CENTER = {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+
+# Self-mute window (seconds) after a spoken clip during which the TranscribeHook
+# discards captured audio, so the robot never transcribes its own TTS through the
+# shared USB audio device. Re-declares ``think``'s documented default
+# (``think._DEFAULT_MUTE_AFTER_SPEAK``) rather than importing it, keeping this
+# module free of a cross-command import that would pull the cognition stack at
+# import time; the two are intended to agree.
+_DEFAULT_MUTE_AFTER_SPEAK = 2.5
 
 _VERBS = [
     "listen run — run the sound-orienting loop in the foreground",
@@ -241,6 +250,15 @@ def _add_live_arg(parser: argparse.ArgumentParser) -> None:
         help="fold think + vision + sleep into the loop alongside sound-orient + pat "
         "(sdk only; the mode the boot service runs).",
     )
+    parser.add_argument(
+        "--transcribe",
+        action="store_true",
+        dest="transcribe",
+        default=False,
+        help="transcribe nearby speech (STT) and feed the WORDS into live cognition "
+        "(requires --live + sdk; off by default; the robot never transcribes its own "
+        "voice — a self-mute window after each spoken clip drops its own audio).",
+    )
 
 
 # 1:1 ``(arg attr, ListenParams attr)`` flags: an unset CLI flag (``None``) keeps
@@ -376,6 +394,8 @@ def _build_think_hook(
     provider: Callable[[], SenseSample | None],
     *,
     export: object | None = None,
+    buffer: object | None = None,
+    play_audio: object | None = None,
 ) -> ThinkHook | None:
     """A :class:`ThinkHook` driving cognition from the shared sample, or ``None``.
 
@@ -394,6 +414,13 @@ def _build_think_hook(
     emits the ``thinking`` / ``message`` / ``emotion`` JSONL feed — so the live loop
     streams what the robot is thinking to any subscriber (a reTerminal panel, a log,
     an audio renderer) over the one documented wire contract.
+
+    ``buffer`` lets the composition layer pass the *shared* cognition event buffer
+    so the optional :class:`~reachy.motion.listen_transcribe.TranscribeHook` can feed
+    transcribed words into the *same* buffer the engine consumes (``--transcribe``);
+    when ``None`` a fresh buffer is created internally. ``play_audio`` lets the layer
+    inject a self-mute-stamping playback wrapper so the engine and the transcribe
+    hook's mute window agree; when ``None`` the engine's default playback is used.
     """
     try:
         # Imported lazily so a bare (no-LLM) live run, or a box without the speech
@@ -401,9 +428,16 @@ def _build_think_hook(
         from reachy.speech.cognition import CognitionEngine
         from reachy.speech.events import EventBuffer
 
-        buffer = EventBuffer()
-        engine = CognitionEngine(buffer=buffer, export=export, audio_optional=True)
-        return ThinkHook(provider, engine=engine, buffer=buffer)
+        buf = buffer if buffer is not None else EventBuffer()
+        engine_kwargs: dict[str, object] = {
+            "buffer": buf,
+            "export": export,
+            "audio_optional": True,
+        }
+        if play_audio is not None:
+            engine_kwargs["play_audio"] = play_audio
+        engine = CognitionEngine(**engine_kwargs)
+        return ThinkHook(provider, engine=engine, buffer=buf)
     except Exception:  # noqa: BLE001
         logger.warning(
             "listen --live: cognition engine unavailable; think fold-in disabled", exc_info=True
@@ -451,6 +485,23 @@ class _SessionBoundTransport:
         return getattr(self._base, name)
 
 
+def _build_transcribe_hook(
+    provider: Callable[[], SenseSample | None],
+    *,
+    buffer: object,
+    mute_until: Callable[[], float],
+) -> TranscribeHook:
+    """A :class:`TranscribeHook` feeding STT words into the shared cognition buffer.
+
+    Wired to the *same* :class:`~reachy.speech.events.EventBuffer` the
+    :class:`~reachy.speech.cognition.CognitionEngine` consumes (so transcribed words
+    become cognition cues) and a real :class:`~reachy.speech.stt.Transcriber` (no
+    network I/O at construction). ``mute_until`` reads the shared self-mute window
+    the playback wrapper stamps, so the robot never transcribes its own TTS.
+    """
+    return TranscribeHook(provider, buffer=buffer, mute_until=mute_until)
+
+
 def _build_live_hooks(
     transport: object,
     queue: MotionQueue,
@@ -458,6 +509,8 @@ def _build_live_hooks(
     pat_hook: PatHook | None,
     *,
     export: object | None = None,
+    transcribe: bool = False,
+    clock: Callable[[], float] | None = None,
 ) -> list[object]:
     """Build the ``--live`` sense hooks in ``sleep > pat > think`` priority order.
 
@@ -470,35 +523,126 @@ def _build_live_hooks(
     handed to a :class:`~reachy.motion.listen_hooks.HookChain` as the loop's single
     ``on_tick``. ``export`` (an :class:`~reachy.export.exporter.ExportHook` or
     ``None``) is threaded into the think hook's engine to stream the cognition feed.
+
+    ``transcribe`` (the ``--transcribe`` opt-in) additionally composes a
+    :class:`~reachy.motion.listen_transcribe.TranscribeHook` that transcribes the
+    loop's shared per-tick audio and feeds the recognised **words** into the SAME
+    :class:`~reachy.speech.events.EventBuffer` the cognition engine consumes — so the
+    composition layer creates one buffer here and wires it into both the engine (via
+    :func:`_build_think_hook`) and the transcribe hook. It also creates the shared
+    self-mute window: a ``play_audio`` wrapper stamps ``mute["until"]`` after every
+    spoken clip and the transcribe hook's ``mute_until`` reads it, so the robot never
+    transcribes its own voice. If cognition is unavailable (no LLM env →
+    :func:`_build_think_hook` returns ``None``) there is no buffer to feed, so the
+    transcribe hook is skipped (logged once) and the loop still runs the rest.
     """
+    if clock is None:
+        import time as _time
+
+        clock = _time.monotonic
+
     sleep_hook = SleepHook(provider)
-    think_hook = _build_think_hook(provider, export=export)
     vision_hook = VisionHook(queue=queue, transport=transport)
+
+    # The shared cognition buffer + self-mute window live here, at composition level,
+    # so the optional TranscribeHook feeds the SAME buffer the engine consumes and
+    # reads the SAME mute window the playback wrapper stamps.
+    think_buffer: object | None = None
+    mute = {"until": 0.0}
+    think_play_audio: object | None = None
+
+    if transcribe:
+        # Build the shared buffer + self-mute playback wrapper up front, so they can
+        # be wired into the engine (via _build_think_hook) and the TranscribeHook.
+        try:
+            from reachy.speech.events import EventBuffer
+
+            think_buffer = EventBuffer()
+        except Exception:  # noqa: BLE001
+            logger.warning("listen --live --transcribe: EventBuffer unavailable", exc_info=True)
+            think_buffer = None
+        think_play_audio = _make_self_mute_play_audio(mute, clock)
+
+    think_hook = _build_think_hook(
+        provider, export=export, buffer=think_buffer, play_audio=think_play_audio
+    )
+
     ordered: list[object] = [sleep_hook]
     if pat_hook is not None:
         ordered.append(pat_hook)
     if think_hook is not None:
         ordered.append(think_hook)
+
+    if transcribe:
+        # The transcribe hook feeds the buffer the ThinkHook's engine consumes. Use
+        # the buffer the hook was actually built with (it may differ if think_buffer
+        # was None and the hook built its own). If cognition is unavailable entirely
+        # (no ThinkHook) there is no buffer to feed — skip transcription gracefully.
+        feed_buffer = getattr(think_hook, "_buffer", None) if think_hook is not None else None
+        if feed_buffer is not None:
+            ordered.append(
+                _build_transcribe_hook(
+                    provider, buffer=feed_buffer, mute_until=lambda: mute["until"]
+                )
+            )
+        else:
+            logger.warning(
+                "listen --live --transcribe: cognition unavailable; no buffer to feed "
+                "transcribed words into — transcription disabled this run"
+            )
+
     ordered.append(vision_hook)
     return ordered
+
+
+def _make_self_mute_play_audio(
+    mute: dict[str, float], clock: Callable[[], float], *, mute_after: float | None = None
+) -> Callable[..., None]:
+    """Wrap the real playback so each clip stamps the shared self-mute window.
+
+    The returned callable plays the PCM (via :func:`reachy.speech.playback.play_audio`)
+    and then stamps ``mute["until"] = clock() + mute_after`` so the TranscribeHook
+    (reading ``mute_until=lambda: mute["until"]``) drops any audio captured while —
+    and just after — the robot speaks. Mirrors ``think``'s ``_guarded_play``; the
+    default ``mute_after`` is the documented ``_DEFAULT_MUTE_AFTER_SPEAK`` (2.5 s).
+    """
+    after = _DEFAULT_MUTE_AFTER_SPEAK if mute_after is None else max(0.0, float(mute_after))
+
+    def _guarded_play(pcm: bytes, **kwargs: object) -> None:
+        from reachy.speech.playback import play_audio as _play
+
+        _play(pcm, **kwargs)
+        if after > 0:
+            mute["until"] = clock() + after
+
+    return _guarded_play
 
 
 def _build_sample_tap(
     holder: SampleHolder,
     poller: DoaPoller,
     audio: Callable[[float], tuple[bool, bool | None]],
-    audio_rms: dict[str, float],
+    audio_rms: dict[str, object],
+    *,
+    transcribe: bool = False,
 ) -> tuple[Callable[[float], Sense], Callable[[float], tuple[bool, bool | None]]]:
     """Wrap the loop's sense/audio taps so each tick publishes a shared SenseSample.
 
     The loop reads ONE mic chunk per tick — inside ``audio(t)`` (the loop's
     ``_audio``), which computes snap/sound_present AND stashes that chunk's loudness
-    into ``audio_rms``. We reuse that exact value here rather than re-reading the
+    into ``audio_rms`` (and, under ``--transcribe``, the raw float32 chunk itself,
+    next to the rms). We reuse those exact values here rather than re-reading the
     session (a second ``get_audio_sample()`` would consume a *different* chunk,
     desyncing the stored RMS from the snap decision and dropping half the audio).
     ``server.run`` calls ``audio(t)`` then ``sense(t)`` each tick, so the audio
     wrapper records this tick's snap and the sense wrapper (running second)
     assembles the full :class:`SenseSample` from the same chunk and publishes it.
+
+    ``transcribe`` gates whether the raw chunk rides on :attr:`SenseSample.audio`:
+    only when ``--transcribe`` is on does the sense tap copy the chunk ``_audio``
+    already pulled (``audio_rms["audio"]``) onto the sample, so the STT hook can
+    transcribe it. When off, :attr:`SenseSample.audio` stays ``None`` — there is no
+    second read and the off path is byte-identical to today.
     """
     last: dict[str, bool | None] = {"snap": False, "sound_present": None}
 
@@ -511,12 +655,16 @@ def _build_sample_tap(
     def _sense_tap(t: float) -> Sense:
         sense = poller(t)
         doa_deg = None if sense.doa_angle is None else math.degrees(sense.doa_angle)
+        # Only ride the raw chunk onto the sample when transcription is on; the
+        # chunk was already read by _audio this tick (no second get_audio_sample()).
+        raw_audio = audio_rms.get("audio") if transcribe else None
         holder.update(
             SenseSample(
-                rms=float(audio_rms["rms"]),
+                rms=float(audio_rms["rms"]),  # type: ignore[arg-type]
                 doa=doa_deg,
                 speech=bool(sense.speech_detected) or bool(last["snap"]),
                 ts=t,
+                audio=raw_audio,  # type: ignore[arg-type]
             )
         )
         return sense
@@ -531,6 +679,7 @@ def _run_sdk_loop(
     on_action: Callable[[object], None],
     *,
     export: object | None = None,
+    transcribe: bool = False,
 ) -> int:
     """Drive the loop over an open SDK media session (real DoA + mic-audio loudness).
 
@@ -562,15 +711,22 @@ def _run_sdk_loop(
         detector = SnapDetector(**snap_kwargs)
         # The ONE mic chunk read per tick; _audio stashes its loudness here so the
         # --live sample tap reuses it instead of reading a second (different) chunk.
-        audio_rms: dict[str, float] = {"rms": 0.0}
+        # Under --transcribe the SAME read also retains the raw chunk (audio_rms[
+        # "audio"]) so the STT hook transcribes the exact chunk — still ONE read.
+        audio_rms: dict[str, object] = {"rms": 0.0, "audio": None}
 
         def _audio(_t: float) -> tuple[bool, bool | None]:
             sample = session.get_audio_sample()
             if sample is None:
                 audio_rms["rms"] = 0.0
+                audio_rms["audio"] = None
                 return (False, None)
             rms = float(np.sqrt(np.mean(sample**2)))
             audio_rms["rms"] = rms
+            # Retain the raw chunk for the transcribe hook only when transcribing —
+            # the same single read; when off this stays None (no STT input, byte-
+            # identical off path).
+            audio_rms["audio"] = sample if transcribe else None
             return (detector.feed(sample), rms > detector.min_rms)
 
         # --live composes all four sense hooks into one HookChain *and* taps the
@@ -578,9 +734,16 @@ def _run_sdk_loop(
         # The default keeps the established single-PatHook on_tick and the bare
         # sense/audio taps byte-for-byte (no chain, no holder tap, no extra read).
         if getattr(args, "live", False):
-            sense_tap, audio_tap = _build_sample_tap(holder, poller, _audio, audio_rms)
+            sense_tap, audio_tap = _build_sample_tap(
+                holder, poller, _audio, audio_rms, transcribe=transcribe
+            )
             hooks_list = _build_live_hooks(
-                loop_transport, queue, holder.provider, pat_hook, export=export
+                loop_transport,
+                queue,
+                holder.provider,
+                pat_hook,
+                export=export,
+                transcribe=transcribe,
             )
             on_tick: object = HookChain(hooks_list)
         else:
@@ -649,6 +812,37 @@ def _require_export_transport(export_hook: object | None, transport: object) -> 
         )
 
 
+def _resolve_transcribe(args: argparse.Namespace) -> bool:
+    """Whether to fold STT transcription in, requiring ``--live`` for it.
+
+    A bare ``--transcribe`` (no ``--live``) is a clean exit-1 user error — the
+    transcribed words are only useful when there is a folded cognition buffer to
+    feed, which only the live loop builds. This mirrors ``_resolve_export_hook``
+    and runs *before* ``get_transport`` so the combo error fires regardless of
+    whether the sdk extra is installed (the tests rely on this ordering).
+    """
+    transcribe = bool(getattr(args, "transcribe", False))
+    if transcribe and not getattr(args, "live", False):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="--transcribe needs --live",
+            remediation="transcription feeds words into the folded live cognition "
+            "buffer, which only --live builds; add --live (it runs on the sdk transport)",
+        )
+    return transcribe
+
+
+def _require_transcribe_transport(transcribe: bool, transport: object) -> None:
+    """STT transcription needs the sdk media session; the http profile has no mic."""
+    if transcribe and not hasattr(transport, "media_session"):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="--transcribe requires the sdk transport",
+            remediation="run with --transport sdk (the default); the http profile has "
+            "no mic audio to transcribe",
+        )
+
+
 def _orienting_banner(transport: object, params: object, *, live: bool, exporting: bool) -> str:
     """The one-line '[listen] orienting…' preflight banner (stderr)."""
     return (
@@ -662,11 +856,15 @@ def _orienting_banner(transport: object, params: object, *, live: bool, exportin
 
 def cmd_listen_run(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
-    # Export sink (None unless `--export -`). Built + validated *before* the preflight
-    # move so a bad target / mode is a clean error, not a half-run.
+    # Export sink (None unless `--export -`) and the --transcribe opt-in. Both are
+    # validated *before* get_transport so a bad combo (e.g. --transcribe without
+    # --live) is a clean exit-1 error regardless of whether the sdk extra is
+    # installed (the tests rely on this ordering).
     export_hook = _resolve_export_hook(args)
+    transcribe = _resolve_transcribe(args)
     transport = get_transport(args)
     _require_export_transport(export_hook, transport)
+    _require_transcribe_transport(transcribe, transport)
     params = _params_from_args(args)
     producer = ListenProducer(params)
     # When exporting, stdout is reserved for the pure JSONL feed: every banner,
@@ -697,7 +895,9 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
     # SDK profile streams real DoA + mic loudness through a media session; the HTTP/remote
     # profile polls transport.doa() with no audio source.
     if hasattr(transport, "media_session"):
-        ticks = _run_sdk_loop(transport, producer, args, _on_action, export=export_hook)
+        ticks = _run_sdk_loop(
+            transport, producer, args, _on_action, export=export_hook, transcribe=transcribe
+        )
     else:
         ticks = _run_http_loop(transport, producer, args, _on_action)
 
