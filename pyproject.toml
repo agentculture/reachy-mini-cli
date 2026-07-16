@@ -13,17 +13,21 @@ classifiers = [
     "Topic :: Software Development",
     "Intended Audience :: Developers",
 ]
-dependencies = ["numpy>=1.24"]
+dependencies = ["numpy>=1.24", "harmonics-cli>=0.8"]
 
-# SDK-first design, installability-aware: `numpy` (the RMS loudness detector) is a base
-# dependency — it is a pure wheel that installs everywhere. `reachy-mini` (the SDK + daemon
-# binary) is the DEFAULT `listen` transport but stays an *extra*, because its transitive
-# stack (pycairo / gstreamer / pyaudio) needs system libraries that aren't present on a bare
-# box or in CI. So the recommended install is `pip install 'reachy-mini-cli[daemon]'` (or
-# `[sdk]`), which the README documents; a bare `pip install reachy-mini-cli` gives the HTTP remote
-# profile, and running the SDK transport without the extra raises a clean CliError pointing
-# at `[sdk]`. (See the `version-check`/CI note: a hard reachy-mini base dep breaks `uv sync`
-# on the cairo build.)
+# SDK-first design, installability-aware: `numpy` (the RMS loudness detector) and
+# `harmonics-cli` (the harmonic voice backend, import package `harmonics`) are the two base
+# dependencies — both are pure wheels that install everywhere. `harmonics-cli` is allowed as
+# a base dep despite the "no engine packages" rule below because it has ZERO transitive
+# runtime dependencies (its `[audio]` extra, which pulls sounddevice/numpy, is not used here),
+# is org-owned (AgentCulture), and installs cleanly even on the bare remote/HTTP profile.
+# `reachy-mini` (the SDK + daemon binary) is the DEFAULT `listen` transport but stays an
+# *extra*, because its transitive stack (pycairo / gstreamer / pyaudio) needs system libraries
+# that aren't present on a bare box or in CI. So the recommended install is
+# `pip install 'reachy-mini-cli[daemon]'` (or `[sdk]`), which the README documents; a bare
+# `pip install reachy-mini-cli` gives the HTTP remote profile, and running the SDK transport
+# without the extra raises a clean CliError pointing at `[sdk]`. (See the `version-check`/CI
+# note: a hard reachy-mini base dep breaks `uv sync` on the cairo build.)
 #
 # `[daemon]` signals "I need the reachy-mini-daemon binary" and `[sdk]` signals "I need the
 # in-process SDK client" — both resolve to the same reachy-mini wheel.
