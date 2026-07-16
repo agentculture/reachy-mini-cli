@@ -156,10 +156,10 @@ transport. Deep notes for the non-trivial nouns follow in
 | `device`/`app`/`move` | `_commands/{device,app,move}.py` | `reachy/robot/*` transports | `http` default |
 | `demo-mode` | `_commands/demo_mode.py` | `reachy/alive.py`, `reachy/motion/idle.py`, `demo_config.py`, `demo_service.py` | `sdk`/`http` |
 | `behavior` | `_commands/behavior.py` | 50 Hz engine, per-channel contention | `sdk`/`http` |
-| `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43); `--live`: `listen_hooks.py` `HookChain` + `sense_sample.py` + `listen_{think,vision,sleep}.py`; `motion/supervisor.py` | `sdk` default |
+| `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43); `--live`: `listen_hooks.py` `HookChain` + `sense_sample.py` + `listen_{think,vision,sleep}.py` + `speech/voice.py` (`--voice-engine`, `--live` only); `motion/supervisor.py` | `sdk` default |
 | `vision` | `_commands/vision.py` | pixel motion/light detectors, serial MotionQueue | `sdk` default |
-| `say` | `_commands/say.py` | `reachy/speech/{tts,playback}.py` | `sdk` default |
-| `think` | `_commands/think.py` | `reachy/speech/{llm,cognition,events,markers,expressions,distinctness,cognition_signal}.py`, `reachy/motion/expression.py`, `reachy/export/*`, `speech/supervisor.py` | `sdk` default |
+| `say` | `_commands/say.py` | `reachy/speech/{tts,harmonic,voice,playback}.py` | `sdk` default |
+| `think` | `_commands/think.py` | `reachy/speech/{llm,cognition,events,markers,expressions,distinctness,cognition_signal,harmonic,voice}.py`, `reachy/motion/expression.py`, `reachy/export/*`, `speech/supervisor.py` | `sdk` default |
 | `pat` | `_commands/pat.py` | `reachy/motion/{pat,pat_reaction,pat_signal}.py` | `sdk` only |
 | `sleep` | `_commands/sleep.py` | `reachy/sleep/{state,stimulus,wake,patwake,wakeword,supervisor}.py`, `reachy/motion/{sleep,sleep_signal}.py` | `sdk` default |
 | `service` | `_commands/service.py` | `reachy/service/{units,manager}.py` (`ServiceManager`, systemd `--user`) | none (systemd) |
@@ -241,6 +241,14 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
   thread, ahead of and independent of the speak worker). Standalone `think run` /
   `say` keep the strict default (an unreachable TTS is a clean exit-2). The
   `CognitionEngine(audio_optional=...)` flag lives in `reachy/speech/cognition.py`.
+- **`--voice-engine {tts,harmonic}` — pick the folded cognition's speech
+  backend:** `--live`-only (a bare `--voice-engine` without `--live` is a
+  clean exit-1 error, see `_resolve_voice_engine`); default `tts`, env
+  `REACHY_VOICE_ENGINE`. `harmonic` swaps in `reachy/speech/harmonic.py`'s
+  in-process, offline note-melody synth (resolved via `reachy/speech/voice.py`,
+  shared with `say`/`think`) at its own sample rate — self-mute, playback, and
+  motion are unchanged downstream. The deployed `live` boot unit passes
+  `--voice-engine harmonic` (see the `service` noun below).
 - **`--transcribe` — live cognition hears WORDS, not just sound:** `listen run
   --live --transcribe` (requires `--live`, `sdk`-only) transcribes nearby speech and
   feeds the recognised words into the *same* cognition `EventBuffer` the folded
@@ -313,9 +321,10 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
     `mute["until"]` for the clip's full play **duration** + a margin, so the robot
     never transcribes its own (possibly long) voice. An unreachable STT degrades to
     "no words" and never stalls the loop.
-  The deployed `live` boot unit opts in (`listen run --live --transcribe`). It is
-  still **not** a barge-in assistant — words are one more perception, now gated to
-  clear, addressed speech by the layered engagement gate.
+  The deployed `live` boot unit opts in (`listen run --live --transcribe
+  --voice-engine harmonic`). It is still **not** a barge-in assistant — words
+  are one more perception, now gated to clear, addressed speech by the
+  layered engagement gate.
 
 ### `say` noun — dumb TTS pipe
 
@@ -332,6 +341,13 @@ resamples the PCM to the speaker's real output rate (16 kHz) before pushing, bec
 audio plays ~0.67× slow/low-pitched. No LLM, no event bus, no senses; safe to compose
 in pipelines.
 
+`--voice-engine {tts,harmonic}` (default `tts`; env `REACHY_VOICE_ENGINE`,
+resolved by `reachy.speech.voice.resolve_voice_engine`) swaps the whole leg for
+`reachy.speech.harmonic.synthesize` — an in-process, offline note-melody voice
+(see the `think` noun below for the shared `reachy/speech/{harmonic,voice}.py`
+module notes). The TTS-only flags (`--voice`/`--speed`/`--tts-url`) are
+accepted but ignored, and documented as such, under `--voice-engine harmonic`.
+
 ### `think` noun — continuous cognition loop (SDK-first)
 
 `reachy/cli/_commands/think.py` exposes `run` (foreground) +
@@ -346,6 +362,16 @@ package provides the engine:
   new base dep).
 - `reachy/speech/tts.py` + `reachy/speech/playback.py` — shared with `say`;
   `think` reuses the same TTS + playback leg.
+- `reachy/speech/voice.py` + `reachy/speech/harmonic.py` — `--voice-engine
+  {tts,harmonic}` (env `REACHY_VOICE_ENGINE`) selects the `synthesize`
+  callable + playback samplerate `CognitionEngine` uses; `harmonic` is a
+  pure-stdlib, offline note-melody voice (identity/articulation tunable via
+  `REACHY_HARMONIC_IDENTITY` / `REACHY_HARMONIC_ARTICULATION`), a drop-in for
+  the TTS leg with zero engine changes. `think demo` honours the same flag
+  (a no-LLM on-robot verification path, mirroring how `demo` already verifies
+  expressions); `think status --json` reports the running loop's
+  `voice_engine` (via a `think.voice` sidecar file written for the run's
+  lifetime); the startup banner names the active engine too.
 - `reachy/speech/events.py` — `EventBuffer` accumulates per-tick DoA / RMS /
   speech cues; `CognitionEngine.run()` consumes them.
 - `reachy/speech/cognition.py` — `CognitionEngine`: calls the LLM with the
@@ -525,7 +551,10 @@ use a transport: it talks to **systemd** (`systemctl --user`), so it never calls
   `Type=simple` + `Restart=on-failure` + `RestartSec=5` (so a crash auto-restarts)
   and `WantedBy=default.target`. The two presence units additionally `Requires=` /
   `After=` the daemon unit — **the daemon is a boot dependency**, started first.
-  The live unit's `ExecStart` is `<python> -m reachy listen run --live`.
+  The live unit's `ExecStart` is `<python> -m reachy listen run --live
+  --transcribe --voice-engine harmonic` — the boot presence hears words and
+  speaks with the offline harmonic voice by default (a user decision; see the
+  `listen` noun's `--voice-engine` bullet above).
 - **Manager (`reachy/service/manager.py` `ServiceManager`).** Enforces the
   **single-presence-owner invariant**: `enable(mode)` writes + `enable --now`s the
   daemon and the chosen presence unit and **always `disable --now`s the sibling**,
@@ -544,21 +573,29 @@ use a transport: it talks to **systemd** (`systemctl --user`), so it never calls
 
 ## Hard constraints
 
-- **Base runtime dependencies — SDK-first, but installable.** `numpy` is the only
-  **base** runtime dependency (`pyproject.toml`) — it powers the RMS loudness
-  detector and is a pure wheel that installs everywhere. The SDK transport is
-  `listen`'s **default**, but `reachy-mini` stays an **extra** (`[sdk]` / `[daemon]`),
-  not a base dep, because its transitive stack (pycairo / gstreamer / pyaudio) needs
-  system libraries absent on a bare box and in CI — a hard base dep breaks `uv sync`
-  on the cairo build (learned the hard way on PR #24). So the **recommended default
-  install is `pip install 'reachy-mini-cli[daemon]'`** (pulls `reachy-mini`); a bare
-  `pip install reachy-mini-cli` is the HTTP remote profile, and running the `sdk`
-  transport without the extra raises a clean exit-2 `CliError` pointing at `[sdk]`.
-  The HTTP transport stays available via `--transport http` / `REACHY_TRANSPORT=http`.
-  Adding a *new* base runtime dep beyond `numpy` needs an explicit decision (keep the
-  base light enough for the remote profile). `teken` remains dev-only; `whoami` still
-  hand-rolls YAML; `reachy/daemon.py` still uses stdlib only. The `[cpu]` extra is
-  the home for on-box `openwakeword` (lazy-loaded; dep list empty until it gains a
+- **Base runtime dependencies — SDK-first, but installable.** Two packages are
+  **base** runtime dependencies (`pyproject.toml`): `numpy` (the RMS loudness
+  detector) and `harmonics-cli>=0.8` (the harmonic voice backend, import
+  package `harmonics` — see the `say`/`think`/`listen` noun internals below).
+  Both are pure wheels that install everywhere; `harmonics-cli` additionally
+  has **zero transitive runtime deps** and is org-owned (AgentCulture), which
+  is why it earns a base-dep exception — that exception does NOT extend to any
+  other engine package (see the `[cpu]`/`[gpu]` note below). The SDK transport
+  is `listen`'s **default**, but `reachy-mini` stays an **extra** (`[sdk]` /
+  `[daemon]`), not a base dep, because its transitive stack (pycairo /
+  gstreamer / pyaudio) needs system libraries absent on a bare box and in CI —
+  a hard base dep breaks `uv sync` on the cairo build (learned the hard way on
+  PR #24). So the **recommended default install is
+  `pip install 'reachy-mini-cli[daemon]'`** (pulls `reachy-mini`); a bare
+  `pip install reachy-mini-cli` is the HTTP remote profile — it still gets
+  `numpy` + `harmonics-cli`, so `--voice-engine harmonic` works with no
+  extra — and running the `sdk` transport without the extra raises a clean
+  exit-2 `CliError` pointing at `[sdk]`. The HTTP transport stays available via
+  `--transport http` / `REACHY_TRANSPORT=http`. Adding a *new* base runtime dep
+  beyond these two needs an explicit decision (keep the base light enough for
+  the remote profile). `teken` remains dev-only; `whoami` still hand-rolls
+  YAML; `reachy/daemon.py` still uses stdlib only. The `[cpu]` extra is the
+  home for on-box `openwakeword` (lazy-loaded; dep list empty until it gains a
   cp312 wheel). The `[gpu]` extra is a generic compute-class pin for future
   GPU-accelerated features — it does NOT bundle an on-box STT model (heavy STT is
   externally managed behind the HTTP STT service, `REACHY_STT_URL`). Both are

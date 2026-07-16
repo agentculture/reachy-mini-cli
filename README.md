@@ -22,11 +22,11 @@ Reachy Mini is an expressive desk robot — a movable head, two antennas, a
 rotating body, a USB mic array (with direction-of-arrival), a camera, and a
 speaker. `reachy-mini-cli` exposes each capability as a **noun** you run from a
 shell or an agent loop: hold the hardware (`daemon`), feel alive when idle
-(`demo-mode`), orient to sound (`listen`) or sight (`vision`), speak (`say`),
-think out loud and move in step with its thoughts (`think`), feel a head pat
-(`pat`), and fall asleep when left alone (`sleep`). `listen run --live` folds
-every live sense into one loop, and `service` makes one presence mode survive a
-reboot.
+(`demo-mode`), orient to sound (`listen`) or sight (`vision`), speak in a TTS
+or offline harmonic voice (`say`), think out loud and move in step with its
+thoughts (`think`), feel a head pat (`pat`), and fall asleep when left alone
+(`sleep`). `listen run --live` folds every live sense into one loop, and
+`service` makes one presence mode survive a reboot.
 
 ## Noun map
 
@@ -43,8 +43,8 @@ The complete robot surface. Every noun supports `--json`; run
 | `behavior` | 50 Hz engine that composes named behaviors per channel | `sdk`/`http` |
 | [`listen`](docs/operating-reachy.md#senses-one-sdk-media-owner-at-a-time) | Two-tier sound orienting (antenna lean → head/body turn); `--live` folds every sense into one loop | `sdk` default |
 | `vision` | Turn toward motion or light (pure pixel math, no ML) | `sdk` default |
-| `say` | Dumb TTS pipe: text → speaker | `sdk` default |
-| `think` | LLM cognition loop: speaks + expresses; `--export` JSONL feed | `sdk` default |
+| `say` | Dumb pipe: text → voice (TTS or offline harmonic) → speaker | `sdk` default |
+| `think` | LLM cognition loop: speaks (TTS or harmonic) + expresses; `--export` JSONL feed | `sdk` default |
 | `pat` | Feel a head pat and lean into it (no touch sensor) | `sdk` only |
 | `sleep` | Decay to sleep when idle; wake on sound / wake-word / pat | `sdk` default |
 | [`service`](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot) | Boot-persist exactly one presence mode (`demo` or `live`) via systemd `--user` | none (manages systemd) |
@@ -130,9 +130,24 @@ with `--transcribe` on, so the on-robot presence hears words out of the box.
 reachy-mini-cli listen run --live --transcribe                 # hear words + react to them
 ```
 
-`service` makes one presence boot-persistent via systemd `--user`. Exactly one
-mode is enabled at a time — enabling one disables the sibling — and it
-auto-restarts on crash. The daemon is a boot dependency of both presence units.
+Add **`--voice-engine harmonic`** (or `REACHY_VOICE_ENGINE=harmonic`) and every
+spoken sentence is voiced as an offline note-melody instead of TTS — fully
+in-process, deterministic, no external service to reach. `say run`, `think
+run`/`demo`, and `listen run --live` all accept `--voice-engine
+{tts,harmonic}` (default `tts`); tune the voice with
+`REACHY_HARMONIC_IDENTITY` / `REACHY_HARMONIC_ARTICULATION`. See
+[The harmonic voice](docs/operating-reachy.md#the-harmonic-voice) for the full
+picture.
+
+```bash
+reachy-mini-cli say run "Hello" --voice-engine harmonic        # offline note-melody voice
+```
+
+`service` makes one presence boot-persistent via systemd `--user`; `enable
+live` now boots the harmonic-voiced loop by default (`--voice-engine
+harmonic`). Exactly one mode is enabled at a time — enabling one disables the
+sibling — and it auto-restarts on crash. The daemon is a boot dependency of
+both presence units.
 
 ```bash
 reachy-mini-cli service install                                # write the systemd units (enable nothing)

@@ -232,7 +232,7 @@ the robot, so `service` lets you persist only one mode at a time.
 | Mode | What boots | Best for |
 |---|---|---|
 | `demo` | `reachy-mini-cli demo-mode run` — the idle feel-alive loop | A robot that just looks present (breathing, glances, sway) |
-| `live` | `reachy-mini-cli listen run --live` — the folded live sense loop | A robot that hears, sees, thinks, sleeps, and feels pats |
+| `live` | `reachy-mini-cli listen run --live --transcribe --voice-engine harmonic` — the folded live sense loop | A robot that hears, sees, thinks, sleeps, feels pats, and speaks with its own offline voice |
 
 The `live` mode is the [folded live loop](#senses-one-sdk-media-owner-at-a-time):
 **one** process running every live sense (hearing + pat + think + vision +
@@ -266,6 +266,19 @@ reachy-mini-cli service uninstall        # remove the unit files
   systemd **without enabling anything**, so you can stage the units and choose the
   mode separately; `enable {demo|live}` is the all-in-one (write + enable + disable
   the sibling). Every verb supports `--json`.
+- **`live` boots into the harmonic voice.** The rendered `live` unit's
+  `ExecStart` is `listen run --live --transcribe --voice-engine harmonic` (see
+  [The harmonic voice](#the-harmonic-voice)) — a deliberate choice so the
+  robot has its own voice at boot, independent of whether the TTS service is
+  reachable. Because `--voice-engine harmonic` is an explicit flag baked into
+  the unit, setting `REACHY_VOICE_ENGINE=tts` as a unit environment override
+  does **not** revert it — an explicit flag always beats the env var. To run
+  the boot presence on TTS instead, override the unit's `ExecStart` with
+  `systemctl --user edit reachy-live.service` (clear it with a bare
+  `ExecStart=` line, then set a new one ending `--voice-engine tts`) and
+  `systemctl --user restart reachy-live.service`; or skip the boot service
+  and run `reachy-mini-cli listen run --live --transcribe --voice-engine tts`
+  in the foreground instead.
 
 > **Reboot at machine power-on needs linger.** A `systemctl --user` service
 > normally starts at **first login**, not at machine boot. For a headless robot
@@ -362,6 +375,9 @@ vars override the built-in default.
 | `XDG_CONFIG_HOME` | `~/.config` | Base for config (`<…>/reachy/demo-mode.json`) | `demo_config.py` |
 | `REACHY_TTS_URL` | `http://localhost:9000` | Magpie-style TTS HTTP endpoint | `speech/tts.py` (`say`, `think`) |
 | `REACHY_TTS_VOICE` | `Magpie-Multilingual.EN-US.Mia.Calm` | TTS voice identifier | `speech/tts.py` |
+| `REACHY_VOICE_ENGINE` | `tts` | Speech backend for `say`/`think`/`listen --live`: `tts` or `harmonic` | `speech/voice.py` |
+| `REACHY_HARMONIC_IDENTITY` | `reachy` | Harmonic voice identity signature (root pitch + instrument) | `speech/harmonic.py` |
+| `REACHY_HARMONIC_ARTICULATION` | `smooth` | Harmonic rendering style: `discrete` / `speechy` / `smooth` / `alien` | `speech/harmonic.py` |
 | `REACHY_OPENAI_URL_BASE` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `think` (legacy: `REACHY_LLM_BASE_URL`) | `speech/llm.py` |
 | `REACHY_OPENAI_MODEL_ID` | `default` | LLM model id for `think` — must be a model the endpoint serves (legacy: `REACHY_LLM_MODEL`) | `speech/llm.py` |
 | `REACHY_OPENAI_API_KEY` | (unset) | Bearer key for the LLM endpoint, only sent when present (legacy: `REACHY_LLM_API_KEY`) | `speech/llm.py` |
@@ -477,6 +493,48 @@ ambient conversation.
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
 | `say` | dumb TTS pipe: text → TTS → speaker (boundary-clean, no LLM/senses) | — | — (audio out) | `sdk` default playback; `http` via daemon `/media/play` |
+
+### The harmonic voice
+
+Every spoken sentence can be voiced two ways: **`tts`** (external Chatterbox
+HTTP synthesis, the default) or **`harmonic`** — a second, non-speech voice
+that renders the sentence in-process as a short melody instead of spoken
+words. Harmonic is not text-to-speech: it turns *meaning* into a
+word-tracking note contour, played in Reachy's own identity signature (root
+pitch, instrument, articulation), through the same playback leg TTS already
+uses.
+
+Why it exists: TTS depends on an external HTTP service (`REACHY_TTS_URL`) —
+if that service is wedged or unreachable, live cognition degrades to silence
+(`audio_optional`, #53) and the robot has no voice at all. The harmonic voice
+is fully offline and deterministic (the same text always renders the same
+PCM), so it never depends on a reachable TTS endpoint, and it gives the robot
+a recognizable non-speech identity distinct from any TTS voice.
+
+Select it with `--voice-engine {tts,harmonic}` on `say run`, `think run`,
+`think demo`, and `listen run --live` (the flag is a clean exit-1 error on a
+bare `listen run` without `--live`), or set it process-wide with
+`REACHY_VOICE_ENGINE=harmonic`. Tune the voice with
+`REACHY_HARMONIC_IDENTITY` (default `reachy`) and
+`REACHY_HARMONIC_ARTICULATION` (`discrete` / `speechy` / `smooth` — default —
+/ `alien`).
+
+```bash
+reachy-mini-cli say run "hello" --voice-engine harmonic       # one audible motif, offline
+reachy-mini-cli think demo --voice-engine harmonic            # scripted stream, harmonic voice, no LLM
+REACHY_VOICE_ENGINE=harmonic reachy-mini-cli listen run --live --transcribe
+```
+
+A nicety: the LLM's `*emphasis*` markers (which TTS speech simply drops)
+become musical stress under the harmonic voice — an emphasized word gets a
+distinct melodic accent, so the emphasis you write still comes through, just
+as sound instead of vocal stress.
+
+`say run`'s TTS-only flags (`--voice`, `--speed`, `--tts-url`) are accepted
+but ignored under `--voice-engine harmonic` — the help text says so; there is
+no hard error. `think status --json` reports the running loop's active
+`voice_engine`, and the `think` / `listen --live` startup banners name it too,
+so you can tell which voice a running loop uses without reading unit files.
 
 ### Boot persistence
 
