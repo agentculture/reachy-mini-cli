@@ -51,6 +51,7 @@ from reachy.motion.server import LoopHooks
 from reachy.motion.server import run as run_loop
 from reachy.motion.snap import SnapDetector
 from reachy.robot import add_robot_args, get_transport
+from reachy.speech.voice import VoiceEngine, resolve_voice_engine
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,30 @@ def _add_live_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_voice_engine_arg(parser: argparse.ArgumentParser) -> None:
+    """The ``--voice-engine`` opt-in: pick the folded live cognition's speech backend.
+
+    Selects between ``"tts"`` (default — the external Chatterbox HTTP speech engine,
+    :mod:`reachy.speech.tts`) and ``"harmonic"`` (in-process, fully offline melodic
+    gesture voice, :mod:`reachy.speech.harmonic`). The choice only matters inside the
+    folded live cognition loop, so — mirroring ``--export``/``--transcribe`` — it is
+    honoured ONLY with ``--live``; a bare ``--voice-engine`` is a clean exit-1 error
+    (see :func:`_resolve_voice_engine`). Left unset (``None``), it defers to
+    :func:`reachy.speech.voice.resolve_voice_engine`'s own fallback (the
+    ``REACHY_VOICE_ENGINE`` env var, then ``"tts"``), so a bare ``listen run --live``
+    with no flag stays behaviourally identical to before this feature.
+    """
+    parser.add_argument(
+        "--voice-engine",
+        choices=("tts", "harmonic"),
+        default=None,
+        dest="voice_engine",
+        help="folded live cognition speech backend: 'tts' (default; Chatterbox HTTP) "
+        "or 'harmonic' (in-process melodic gesture, fully offline); overrides "
+        "REACHY_VOICE_ENGINE (requires --live).",
+    )
+
+
 # 1:1 ``(arg attr, ListenParams attr)`` flags: an unset CLI flag (``None``) keeps
 # the param's default. The genuinely special cases (--speed sets two fields,
 # --speech-only is a bool flag, --pat is a default-True toggle) are handled apart.
@@ -397,6 +422,7 @@ def _build_think_hook(
     buffer: object | None = None,
     play_audio: object | None = None,
     feed_doa_cues: bool = True,
+    voice_engine: VoiceEngine | None = None,
 ) -> ThinkHook | None:
     """A :class:`ThinkHook` driving cognition from the shared sample, or ``None``.
 
@@ -422,6 +448,16 @@ def _build_think_hook(
     when ``None`` a fresh buffer is created internally. ``play_audio`` lets the layer
     inject a self-mute-stamping playback wrapper so the engine and the transcribe
     hook's mute window agree; when ``None`` the engine's default playback is used.
+
+    ``voice_engine`` is the resolved :class:`~reachy.speech.voice.VoiceEngine`
+    (``--voice-engine`` / ``REACHY_VOICE_ENGINE``, see :func:`_resolve_voice_engine`).
+    When given, its ``synthesize`` callable and an empty ``tts_kwargs`` are passed to
+    the engine explicitly — for the default ``"tts"`` engine this is the exact same
+    function object :class:`~reachy.speech.cognition.CognitionEngine` already defaults
+    to, so passing it is behaviourally byte-identical; for ``"harmonic"`` it swaps in
+    :func:`reachy.speech.harmonic.synthesize` with zero other engine changes. ``None``
+    (the default; only reachable from a direct test call, never from the CLI, which
+    always resolves an engine) skips the override entirely.
     """
     try:
         # Imported lazily so a bare (no-LLM) live run, or a box without the speech
@@ -437,6 +473,9 @@ def _build_think_hook(
         }
         if play_audio is not None:
             engine_kwargs["play_audio"] = play_audio
+        if voice_engine is not None:
+            engine_kwargs["synthesize"] = voice_engine.synthesize
+            engine_kwargs["tts_kwargs"] = {}
         engine = CognitionEngine(**engine_kwargs)
         return ThinkHook(provider, engine=engine, buffer=buf, feed_doa_cues=feed_doa_cues)
     except Exception:  # noqa: BLE001
@@ -573,6 +612,7 @@ def _build_live_hooks(
     sample_rate: int | None = None,
     clock: Callable[[], float] | None = None,
     producer: object | None = None,
+    voice_engine: VoiceEngine | None = None,
 ) -> list[object]:
     """Build the ``--live`` sense hooks in ``sleep > pat > think`` priority order.
 
@@ -609,6 +649,16 @@ def _build_live_hooks(
     has no ``set_engaged``) the engaged signal is simply not wired and the gate still
     runs (words flow, no engaged turn). WITHOUT ``transcribe`` no classifier is built and
     no engaged signal is wired — the off path is byte-identical to today.
+
+    ``voice_engine`` is the resolved :class:`~reachy.speech.voice.VoiceEngine`
+    (see :func:`_resolve_voice_engine`) selecting the folded cognition's speech
+    backend. It is threaded to BOTH the ``play_audio`` wrapper (so the self-mute
+    window is stamped from the clip's REAL duration at the engine's sample rate —
+    a fixed TTS-rate assumption would under/over-stamp a harmonic-rate clip) and
+    into :func:`_build_think_hook` (so the engine's ``synthesize`` matches). For
+    the default ``"tts"`` engine the wrapper's ``samplerate`` override is skipped
+    entirely, so playback + mute-stamping stay byte-identical to before this
+    feature; only ``"harmonic"`` threads a real override.
     """
     if clock is None:
         import time as _time
@@ -623,12 +673,19 @@ def _build_live_hooks(
     # reads the SAME mute window the playback wrapper stamps.
     think_buffer: object | None = None
     mute = {"until": 0.0}
+    # Only the non-default ("harmonic") engine gets an explicit samplerate override —
+    # the default "tts" engine's rate already matches _make_self_mute_play_audio's own
+    # hardcoded TTS-rate fallback, so leaving it unset keeps both the real playback
+    # call and the mute-duration math byte-identical to before this feature.
+    voice_samplerate = (
+        voice_engine.samplerate if voice_engine is not None and voice_engine.name != "tts" else None
+    )
     # Always route --live cognition playback over HTTP to the daemon: speech plays
     # through the daemon's mixer (proven to coexist with the loop's one SDK session)
     # rather than opening a second ReachyMini client (single-SDK-owner). The wrapper
     # also stamps the self-mute window the TranscribeHook reads after each spoken clip.
     think_play_audio: object | None = _make_self_mute_play_audio(
-        mute, clock, playback_transport="http"
+        mute, clock, playback_transport="http", samplerate=voice_samplerate
     )
 
     if transcribe:
@@ -652,6 +709,7 @@ def _build_live_hooks(
         buffer=think_buffer,
         play_audio=think_play_audio,
         feed_doa_cues=not transcribe,
+        voice_engine=voice_engine,
     )
 
     ordered: list[object] = [sleep_hook]
@@ -700,6 +758,7 @@ def _make_self_mute_play_audio(
     *,
     mute_after: float | None = None,
     playback_transport: str | None = None,
+    samplerate: int | None = None,
 ) -> Callable[..., None]:
     """Wrap the real playback so each clip stamps the shared self-mute window.
 
@@ -714,6 +773,16 @@ def _make_self_mute_play_audio(
     cognition speech plays through the daemon's mixer — which coexists with the loop's
     one open SDK session — instead of opening a *second* ``ReachyMini`` client (the
     single-SDK-owner model; see ``CLAUDE.md``).
+
+    ``samplerate`` (the active :class:`~reachy.speech.voice.VoiceEngine`'s rate, e.g.
+    16000 for the harmonic voice) is injected as ``samplerate=`` into the playback
+    call the SAME way — unless the caller already set one — and is ALSO the rate the
+    mute-duration math below converts the clip's byte length with, so the mute window
+    reflects the clip's REAL duration regardless of which engine rendered it. ``None``
+    (the default) keeps today's behaviour exactly: no ``samplerate`` kwarg is injected
+    into the playback call, and the duration math falls back to the hardcoded TTS
+    default (:data:`reachy.speech.tts.DEFAULT_SAMPLE_RATE`) — so the default ``"tts"``
+    voice engine's playback + mute stamping stay byte-identical to before this feature.
     """
     after = _DEFAULT_MUTE_AFTER_SPEAK if mute_after is None else max(0.0, float(mute_after))
 
@@ -723,6 +792,8 @@ def _make_self_mute_play_audio(
 
         if playback_transport is not None and "transport" not in kwargs:
             kwargs["transport"] = playback_transport
+        if samplerate is not None and "samplerate" not in kwargs:
+            kwargs["samplerate"] = samplerate
         _play(pcm, **kwargs)
         if after > 0:
             # Mute for the clip's full play duration PLUS the margin. Playback may be
@@ -730,7 +801,7 @@ def _make_self_mute_play_audio(
             # pad alone would expire mid-utterance and let the robot transcribe its
             # own (long) voice — a slower feedback loop. Base the window on the audio
             # length so the whole utterance is covered.
-            rate = float(DEFAULT_SAMPLE_RATE or 24000)
+            rate = float(samplerate if samplerate is not None else (DEFAULT_SAMPLE_RATE or 24000))
             clip_seconds = len(pcm) / (2.0 * rate) if rate > 0 else 0.0
             mute["until"] = clock() + clip_seconds + after
 
@@ -799,6 +870,7 @@ def _run_sdk_loop(
     *,
     export: object | None = None,
     transcribe: bool = False,
+    voice_engine: VoiceEngine | None = None,
 ) -> int:
     """Drive the loop over an open SDK media session (real DoA + mic-audio loudness).
 
@@ -813,7 +885,9 @@ def _run_sdk_loop(
     ``sleep > pat > think`` by idle-interrupt priority, plus vision. The loop opens
     ONE media session and every hook rides it via the shared-sample provider — no
     hook opens a second single-consumer session (see the single-SDK-owner model in
-    ``CLAUDE.md``).
+    ``CLAUDE.md``). ``voice_engine`` (see :func:`_resolve_voice_engine`) is threaded
+    into the live composition only — it selects the folded cognition's speech
+    backend and is ignored entirely outside ``--live``.
     """
     snap_kwargs: dict[str, float] = {}
     if getattr(args, "snap_ratio", None) is not None:
@@ -865,6 +939,7 @@ def _run_sdk_loop(
                 transcribe=transcribe,
                 sample_rate=getattr(session, "samplerate", None),
                 producer=producer,
+                voice_engine=voice_engine,
             )
             on_tick: object = HookChain(hooks_list)
         else:
@@ -964,13 +1039,51 @@ def _require_transcribe_transport(transcribe: bool, transport: object) -> None:
         )
 
 
-def _orienting_banner(transport: object, params: object, *, live: bool, exporting: bool) -> str:
+def _resolve_voice_engine(args: argparse.Namespace) -> VoiceEngine:
+    """Resolve the ``--voice-engine`` choice, requiring ``--live`` for the explicit flag.
+
+    A bare ``--voice-engine`` (no ``--live``) is a clean exit-1 user error — the
+    engine only selects the folded live cognition's speech backend, which only
+    ``--live`` builds. This mirrors ``_resolve_export_hook`` / ``_resolve_transcribe``
+    and runs *before* ``get_transport`` so the combo error fires regardless of
+    whether the sdk extra is installed (the tests rely on this ordering).
+
+    Unlike ``export``/``transcribe`` (which are booleans, off by default), a voice
+    engine is ALWAYS resolved — :func:`reachy.speech.voice.resolve_voice_engine`
+    falls back through the ``REACHY_VOICE_ENGINE`` env var to ``"tts"`` when no
+    explicit choice is given, so the return value is never ``None``. The resolved
+    engine is simply unused downstream when ``--live`` is not set.
+    """
+    explicit = getattr(args, "voice_engine", None)
+    if explicit is not None and not getattr(args, "live", False):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="--voice-engine needs --live",
+            remediation="the voice engine selects the folded live cognition's speech "
+            "backend, which only --live builds; add --live (it runs on the sdk "
+            "transport)",
+        )
+    return resolve_voice_engine(explicit)
+
+
+def _orienting_banner(
+    transport: object,
+    params: object,
+    *,
+    live: bool,
+    exporting: bool,
+    voice_engine: VoiceEngine | None = None,
+) -> str:
     """The one-line '[listen] orienting…' preflight banner (stderr)."""
+    voice_note = ""
+    if live and voice_engine is not None:
+        voice_note = f" (voice: {voice_engine.name})"
     return (
         f"[listen] orienting to sound via {transport.name}: dwell={params.dwell:g}s "
         f"hold={params.hold:g}s speed={params.alert_speed:g}deg/s"
         f"{' (speech only)' if params.speech_only else ''}"
         f"{' (live: think/vision/sleep folded in)' if live else ''}"
+        f"{voice_note}"
         f"{' [export: stdout]' if exporting else ''}; Ctrl-C to stop"
     )
 
@@ -983,6 +1096,7 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
     # installed (the tests rely on this ordering).
     export_hook = _resolve_export_hook(args)
     transcribe = _resolve_transcribe(args)
+    voice_engine = _resolve_voice_engine(args)
     transport = get_transport(args)
     _require_export_transport(export_hook, transport)
     _require_transcribe_transport(transcribe, transport)
@@ -1005,7 +1119,11 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
     if text_diagnostics:
         emit_diagnostic(
             _orienting_banner(
-                transport, params, live=getattr(args, "live", False), exporting=exporting
+                transport,
+                params,
+                live=getattr(args, "live", False),
+                exporting=exporting,
+                voice_engine=voice_engine,
             )
         )
 
@@ -1023,7 +1141,13 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
     # profile polls transport.doa() with no audio source.
     if hasattr(transport, "media_session"):
         ticks = _run_sdk_loop(
-            transport, producer, args, _on_action, export=export_hook, transcribe=transcribe
+            transport,
+            producer,
+            args,
+            _on_action,
+            export=export_hook,
+            transcribe=transcribe,
+            voice_engine=voice_engine,
         )
     else:
         ticks = _run_http_loop(transport, producer, args, _on_action)
@@ -1086,6 +1210,7 @@ def _register_run(noun_sub: argparse._SubParsersAction) -> None:
     _add_tuning_args(run)
     _add_pat_args(run)
     _add_live_arg(run)
+    _add_voice_engine_arg(run)
     add_export_args(run)
     run.add_argument(
         "--max-ticks",
