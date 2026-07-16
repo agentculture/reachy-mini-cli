@@ -91,15 +91,18 @@ def demo_exec_start(python: str | None = None, config_file: str | None = None) -
 def live_exec_start(python: str | None = None) -> str:
     """ExecStart for the live presence unit: the folded live loop.
 
-    ``listen run --live --transcribe`` runs the folded live loop (hearing + pat +
-    think + vision + sleep in one loop) with STT transcription on, so the deployed
-    boot presence reasons about the *words* spoken near it (not just direction).
-    ``--transcribe`` stays off at the CLI default; the unit opts in so the
-    on-robot presence runs the full hear-words behavior. The flags are implemented
-    elsewhere — this only renders the string.
+    ``listen run --live --transcribe --voice-engine harmonic`` runs the folded
+    live loop (hearing + pat + think + vision + sleep in one loop) with STT
+    transcription on, so the deployed boot presence reasons about the *words*
+    spoken near it (not just direction), and speaks through the harmonic voice
+    engine. Both ``--transcribe`` and ``--voice-engine harmonic`` stay off at
+    the CLI default (``--voice-engine`` defaults to ``tts``); the unit opts in
+    to both so the on-robot presence runs the full hear-words behavior with the
+    harmonic voice. The flags are implemented elsewhere — this only renders the
+    string.
     """
     py = python or _default_python()
-    return f"{_unit_arg(py)} -m reachy listen run --live --transcribe"
+    return f"{_unit_arg(py)} -m reachy listen run --live --transcribe --voice-engine harmonic"
 
 
 # --------------------------------------------------------------------------- #
