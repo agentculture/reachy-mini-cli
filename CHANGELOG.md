@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] - 2026-07-17
+
+### Added
+
+- Harmonic voice: a second, non-TTS speech engine — each spoken sentence renders in-process to a note melody in Reachy's own identity signature (harmonics-cli, offline, deterministic, PCM16 @ 16 kHz) and plays through the existing playback leg
+- --voice-engine {tts,harmonic} on say run, think run, think demo, and listen run (--live only), plus REACHY_VOICE_ENGINE env; tuning via REACHY_HARMONIC_IDENTITY / REACHY_HARMONIC_ARTICULATION
+- think status --json reports voice_engine; think/listen startup banners name the active engine
+- New reachy/speech/harmonic.py backend and reachy/speech/voice.py engine resolver; explain catalog + README + operating guide document the harmonic voice
+
+### Changed
+
+- harmonics-cli>=0.8 joins numpy as a base runtime dependency (pure-stdlib wheel, zero transitive deps; deviation d1 updated the three base-dep guard tests)
+- reachy-live.service boot unit ExecStart now runs listen run --live --transcribe --voice-engine harmonic — the robot boots into its harmonic voice
+- Self-mute clip-duration math derives from the active engine sample rate (16 kHz harmonic clips mute correctly)
+
 ## [0.30.0] - 2026-07-17
 
 ### Added
