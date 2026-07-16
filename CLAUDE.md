@@ -598,8 +598,9 @@ upstream into guildmaster and re-vendor. Most relevant for day-to-day work:
 - **`communicate`** — cross-repo issues + Culture mesh messages. Requires
   `agtag` on PATH. Issue posts auto-sign `- reachy-mini-cli (Claude)`.
 - **`version-bump`**, **`run-tests`**, **`sonarclaude`**, **`pypi-maintainer`**,
-  **`agent-config`**, and the devague chain (`think` → `spec-to-plan` →
-  `assign-to-workforce`).
+  **`agent-config`**, and the devague chain (`scope` → `think` → `challenge` →
+  `spec-to-plan` → `assign-to-workforce` → `summarize-delivery`, with `deviate`
+  as the mid-run escape hatch).
 
 ## Conventions and workflow
 

@@ -5,10 +5,25 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.30.0] - 2026-06-24
+## [0.30.0] - 2026-07-17
 
 ### Added
 
+- **Vendored four devague chain skills — `scope`, `challenge`, `deviate`, and
+  `summarize-delivery`** (cite-don't-import; origin = devague, broadcast via
+  guildmaster) — completing the idea→delivery chain around the three already
+  here. `scope` is the optional opening move (idea→scope: survey the surfaces an
+  idea touches and seed the coming frame with cited boundary/non-goal/assumption
+  claims); `challenge` runs a risk-scaled blind-spot pass between `think` and
+  `spec-to-plan`, routing findings back as proposed-only content the human
+  adjudicates; `deviate` stops an in-flight `assign-to-workforce` run when
+  execution must diverge from the confirmed plan and records the divergence as a
+  first-class append-only record instead of silent drift; `summarize-delivery`
+  closes the loop with a planned-versus-actual accountability artifact (and runs
+  on failed runs too — failure is reported faithfully, never smoothed over). The
+  full chain is now `scope` → `think` → `challenge` → `spec-to-plan` →
+  `assign-to-workforce` → `summarize-delivery`, with `deviate` as the mid-run
+  escape hatch; `CLAUDE.md`'s skills section is updated to match.
 - **Memory-discipline "Conventions and workflow" section in `CLAUDE.md`** — a
   per-task *recall-before / remember-after* convention (scope localized to this
   repo's nick) so the vendored `remember` / `recall` skills are actually used,
@@ -43,6 +58,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in-repo routing; on an older CLI the public records still work but are stored
   in `$HOME/.eidetic/memory` instead of in-repo. Propagated by rollout-cli's
   `eidetic-memory` recipe.
+
+### Fixed
+
+- **Green CI on `main` — refreshed the stale `uv.lock`.** v0.29.0 bumped
+  `pyproject.toml` without re-running `uv lock`, so the lock still pinned
+  `reachy-mini-cli` at `0.28.2`. That mismatch makes `uv sync` re-resolve the
+  whole graph instead of installing from the lock, and a re-resolve has to build
+  `pycairo` (via the `[daemon]` extra's `reachy-mini` → `pygobject` chain) from
+  an sdist against a system `cairo` that CI does not have — so **every** `test`
+  and `lint` job on `main` and on open PRs died in `uv sync` before running a
+  single test. The lock is regenerated here (resolution is unchanged — only the
+  version string moved), which restores `uv sync` to a lock-install and unbreaks
+  the branch. **Always run `uv lock` in the same commit as a version bump**; the
+  `version-bump` skill does not do it for you.
 
 ## [0.29.0] - 2026-06-23
 
