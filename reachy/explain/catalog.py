@@ -1067,8 +1067,9 @@ talks to **systemd** (`systemctl --user`), so there is no `--transport` flag.
   up first. `disable` leaves the daemon enabled deliberately (other clients of
   the robot depend on it).
 - `reachy-demo-mode.service` — the idle `demo-mode run` presence loop.
-- `reachy-live.service` — the folded live loop (`listen run --live`): hearing +
-  pat + think + vision + sleep in one process.
+- `reachy-live.service` — the folded live loop (`listen run --live --transcribe
+  --voice-engine harmonic`): hearing + pat + think + vision + sleep in one
+  process, speaking with the offline harmonic voice by default.
 
 ## Verbs
 
