@@ -12,24 +12,37 @@ Verbs
 
 Flags (``say run``)
 -------------------
-* ``text``         — positional; the string to speak, or ``-`` to read from stdin.
-* ``--voice``      — voice identifier forwarded to ``tts.synthesize``
-                     (overrides ``REACHY_TTS_VOICE``).
-* ``--speed``      — TTS speed (float; forwarded to synthesize — a no-op if the
-                     server does not support it, but the value is always passed
-                     through so callers are not silently dropped on the floor).
-* ``--tts-url``    — override TTS base URL (``REACHY_TTS_URL`` env if unset).
-* ``--tts-timeout``— per-request socket timeout for the TTS call (default 30 s).
-* ``--transport``  — playback transport: ``"sdk"`` (default) or ``"http"``.
-* ``--base-url``   — daemon base URL for the http playback transport.
-* ``--timeout``    — HTTP playback request timeout (default 10 s).
-* ``--json``       — emit a structured result on stdout.
+* ``text``           — positional; the string to speak, or ``-`` to read from stdin.
+* ``--voice-engine`` — which speech backend voices the text: ``"tts"`` (default,
+                       external Chatterbox HTTP) or ``"harmonic"`` (in-process
+                       melodic gesture, see :mod:`reachy.speech.harmonic`).
+                       Overrides ``REACHY_VOICE_ENGINE`` env var; with neither
+                       set, resolution falls back to ``"tts"`` (see
+                       :func:`reachy.speech.voice.resolve_voice_engine`).
+* ``--voice``        — voice identifier forwarded to ``tts.synthesize``
+                       (overrides ``REACHY_TTS_VOICE``). **tts engine only** —
+                       ignored under ``--voice-engine harmonic``.
+* ``--speed``        — TTS speed (float; forwarded to synthesize — a no-op if
+                       the server does not support it, but the value is always
+                       passed through so callers are not silently dropped on
+                       the floor). **tts engine only** — ignored under
+                       ``--voice-engine harmonic``.
+* ``--tts-url``      — override TTS base URL (``REACHY_TTS_URL`` env if unset).
+                       **tts engine only** — ignored under
+                       ``--voice-engine harmonic``.
+* ``--tts-timeout``  — per-request socket timeout for the TTS call (default
+                       30 s). **tts engine only**.
+* ``--transport``    — playback transport: ``"sdk"`` (default) or ``"http"``.
+* ``--base-url``     — daemon base URL for the http playback transport.
+* ``--timeout``      — HTTP playback request timeout (default 10 s).
+* ``--json``         — emit a structured result on stdout.
 
 Boundary invariant
 ------------------
 This module MUST NOT import ``reachy.speech.llm`` or ``reachy.speech.events``.
 CI-level tests in ``tests/test_say.py`` assert this at both module-import time
-and during ``cmd_say_run`` execution.
+and during ``cmd_say_run`` execution. ``reachy.speech.voice`` (the engine
+resolver) is safe to import here — it imports neither module either.
 """
 
 from __future__ import annotations
@@ -43,6 +56,7 @@ from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.speech.playback import play_audio as _play_audio  # noqa: E402 — intentional alias
 from reachy.speech.tts import synthesize as _synthesize  # noqa: E402 — intentional alias
+from reachy.speech.voice import resolve_voice_engine
 
 # ---------------------------------------------------------------------------
 # Thin wrappers — imported at module level so tests can monkeypatch them as
@@ -123,20 +137,35 @@ def cmd_say_run(args: argparse.Namespace) -> int:
     base_url: str = getattr(args, "base_url", "http://localhost:8000")
     playback_timeout: float = getattr(args, "timeout", 10.0)
 
+    # Resolve which speech backend voices this text: explicit --voice-engine >
+    # REACHY_VOICE_ENGINE env > "tts" (see reachy.speech.voice.resolve_voice_engine).
+    # An unknown engine name raises a CliError (exit 1) before anything is synthesized.
+    engine = resolve_voice_engine(getattr(args, "voice_engine", None))
+
     if not json_mode:
         emit_diagnostic(f"[say] synthesizing {len(text)} char(s) …")
 
-    # Synthesize — forward TTS-specific args.
-    # NOTE: tts.synthesize does not currently expose a ``speed`` parameter, so
-    # ``--speed`` is accepted as a forward-compatible placeholder — stored on the
-    # Namespace but intentionally not forwarded (a no-op, not silently dropped)
-    # until tts.py gains speed/SSML prosody support. Tracked for a follow-up.
-    pcm = _synthesize(
-        text,
-        tts_url=getattr(args, "tts_url", None),
-        voice=getattr(args, "voice", None),
-        timeout=getattr(args, "tts_timeout", 30.0),
-    )
+    playback_kwargs: dict[str, object] = {}
+    if engine.name == "tts":
+        # tts engine — unchanged from pre-voice-engine behaviour: forward the
+        # TTS-specific args through the module-level alias (so callers can
+        # monkeypatch say_mod._synthesize) and play back at the default rate.
+        # NOTE: tts.synthesize does not currently expose a ``speed`` parameter, so
+        # ``--speed`` is accepted as a forward-compatible placeholder — stored on the
+        # Namespace but intentionally not forwarded (a no-op, not silently dropped)
+        # until tts.py gains speed/SSML prosody support. Tracked for a follow-up.
+        pcm = _synthesize(
+            text,
+            tts_url=getattr(args, "tts_url", None),
+            voice=getattr(args, "voice", None),
+            timeout=getattr(args, "tts_timeout", 30.0),
+        )
+    else:
+        # Non-tts engine (e.g. "harmonic") — text only; --voice/--speed/--tts-url
+        # apply to the tts engine and are silently ignored here. Play back at the
+        # engine's own sample rate so the sdk playback path resamples correctly.
+        pcm = engine.synthesize(text)
+        playback_kwargs["samplerate"] = engine.samplerate
 
     if pcm:
         if not json_mode:
@@ -146,6 +175,7 @@ def cmd_say_run(args: argparse.Namespace) -> int:
             transport=transport,
             base_url=base_url,
             timeout=playback_timeout,
+            **playback_kwargs,
         )
 
     if json_mode:
@@ -198,22 +228,34 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="Text to synthesize, or '-' to read from stdin.",
     )
     run.add_argument(
+        "--voice-engine",
+        default=None,
+        dest="voice_engine",
+        choices=["tts", "harmonic"],
+        help="Speech backend: 'tts' (default, external Chatterbox HTTP) or "
+        "'harmonic' (in-process melodic gesture). Overrides REACHY_VOICE_ENGINE "
+        "env var; with neither set, defaults to 'tts'.",
+    )
+    run.add_argument(
         "--voice",
         default=None,
-        help="Voice identifier for the TTS server (overrides REACHY_TTS_VOICE).",
+        help="Voice identifier for the TTS server (overrides REACHY_TTS_VOICE). "
+        "tts engine only — ignored under --voice-engine harmonic.",
     )
     run.add_argument(
         "--speed",
         type=float,
         default=None,
         help="TTS speed multiplier (e.g. 0.9 for slower, 1.2 for faster); "
-        "forwarded to the TTS server — a no-op if the server ignores it.",
+        "forwarded to the TTS server — a no-op if the server ignores it. "
+        "tts engine only — ignored under --voice-engine harmonic.",
     )
     run.add_argument(
         "--tts-url",
         default=None,
         dest="tts_url",
-        help="Override the TTS base URL (default: REACHY_TTS_URL or http://localhost:9000).",
+        help="Override the TTS base URL (default: REACHY_TTS_URL or http://localhost:9000). "
+        "tts engine only — ignored under --voice-engine harmonic.",
     )
     run.add_argument(
         "--tts-timeout",
