@@ -207,3 +207,28 @@ def test_missing_harmonics_package_raises_cli_error(monkeypatch: pytest.MonkeyPa
     err = exc_info.value
     assert err.code == 2
     assert err.remediation
+
+
+def test_invalid_articulation_raises_user_cli_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bad REACHY_HARMONIC_ARTICULATION surfaces as CliError exit 1, not a traceback."""
+    monkeypatch.setenv("REACHY_HARMONIC_ARTICULATION", "operatic")
+
+    with pytest.raises(CliError) as exc_info:
+        synthesize("hello there")
+
+    err = exc_info.value
+    assert err.code == 1
+    assert "operatic" in err.message
+    assert err.remediation
+
+
+def test_unreadable_wav_container_raises_env_cli_error() -> None:
+    """Malformed WAV bytes from the renderer surface as CliError exit 2 (guarded parse)."""
+    from reachy.speech.harmonic import _extract_pcm
+
+    with pytest.raises(CliError) as exc_info:
+        _extract_pcm(b"not a wav container at all")
+
+    err = exc_info.value
+    assert err.code == 2
+    assert err.remediation

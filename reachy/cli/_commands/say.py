@@ -22,10 +22,11 @@ Flags (``say run``)
 * ``--voice``        — voice identifier forwarded to ``tts.synthesize``
                        (overrides ``REACHY_TTS_VOICE``). **tts engine only** —
                        ignored under ``--voice-engine harmonic``.
-* ``--speed``        — TTS speed (float; forwarded to synthesize — a no-op if
-                       the server does not support it, but the value is always
-                       passed through so callers are not silently dropped on
-                       the floor). **tts engine only** — ignored under
+* ``--speed``        — TTS speed (float). Accepted but **currently ignored**:
+                       a forward-compatible placeholder until
+                       ``tts.synthesize`` gains a speed/prosody parameter (it
+                       has none today, so the value is not forwarded).
+                       **tts engine only** — ignored under
                        ``--voice-engine harmonic``.
 * ``--tts-url``      — override TTS base URL (``REACHY_TTS_URL`` env if unset).
                        **tts engine only** — ignored under
@@ -246,9 +247,9 @@ def register(sub: argparse._SubParsersAction) -> None:
         "--speed",
         type=float,
         default=None,
-        help="TTS speed multiplier (e.g. 0.9 for slower, 1.2 for faster); "
-        "forwarded to the TTS server — a no-op if the server ignores it. "
-        "tts engine only — ignored under --voice-engine harmonic.",
+        help="TTS speed multiplier (e.g. 0.9 for slower, 1.2 for faster). "
+        "Accepted but currently ignored — a placeholder until the TTS "
+        "endpoint supports speed. tts engine only.",
     )
     run.add_argument(
         "--tts-url",

@@ -47,7 +47,7 @@ import logging
 import os
 import wave
 
-from reachy.cli._errors import EXIT_ENV_ERROR, CliError
+from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 
 log = logging.getLogger(__name__)
 
@@ -77,9 +77,24 @@ def _resolve_articulation(override: str | None) -> str:
 
 
 def _extract_pcm(wav_bytes: bytes) -> bytes:
-    """Strip a WAV container down to bare PCM16 frames."""
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
-        return wav.readframes(wav.getnframes())
+    """Strip a WAV container down to bare PCM16 frames.
+
+    Guarded like :func:`reachy.speech.tts` treats its own WAV handling: a
+    malformed/truncated container from the renderer surfaces as a structured
+    :class:`CliError` (exit 2), never a bare ``wave.Error`` traceback.
+    """
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+            return wav.readframes(wav.getnframes())
+    except (wave.Error, EOFError) as exc:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"harmonics returned an unreadable WAV container: {exc}",
+            remediation=(
+                "reinstall or upgrade harmonics-cli (`uv sync` or "
+                "`pip install -U harmonics-cli`)"
+            ),
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -114,8 +129,10 @@ def synthesize(
 
     Raises:
         :class:`~reachy.cli._errors.CliError` (code 2) if the ``harmonics``
-        package cannot be imported — reachy-mini-cli's install is broken,
-        since ``harmonics-cli`` is a base dependency.
+        package cannot be imported (reachy-mini-cli's install is broken,
+        since ``harmonics-cli`` is a base dependency) or if the renderer
+        returns an unreadable WAV container; (code 1) if the resolved
+        articulation is not one of harmonics' styles.
     """
     if not text or not text.strip():
         log.debug("[harmonic] empty/whitespace-only text, skipping render")
@@ -139,9 +156,24 @@ def synthesize(
     resolved_articulation = _resolve_articulation(articulation)
 
     notes = render_notes(text, agent=resolved_identity)
-    wav_bytes = render_wav(
-        notes,
-        sample_rate=HARMONIC_SAMPLE_RATE,
-        articulation=resolved_articulation,
-    )
+    try:
+        wav_bytes = render_wav(
+            notes,
+            sample_rate=HARMONIC_SAMPLE_RATE,
+            articulation=resolved_articulation,
+        )
+    except ValueError as exc:
+        # harmonics raises ValueError for an unknown articulation, naming the
+        # valid choices in its message — translate to the structured error
+        # contract instead of leaking a traceback (a bad
+        # REACHY_HARMONIC_ARTICULATION would otherwise crash say/think/live).
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid harmonic articulation {resolved_articulation!r}: {exc}",
+            remediation=(
+                "set REACHY_HARMONIC_ARTICULATION (or the articulation "
+                "override) to one of the styles named above, e.g. smooth, "
+                "discrete, speechy, alien"
+            ),
+        ) from exc
     return _extract_pcm(wav_bytes)
