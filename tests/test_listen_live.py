@@ -1064,11 +1064,13 @@ def test_escape_hatch_skips_classifier_build(monkeypatch) -> None:
 
 
 def test_base_dependencies_unchanged_no_new_dep() -> None:
-    """The base ``project.dependencies`` is still just numpy — no new runtime dep.
+    """The base ``project.dependencies`` is exactly {numpy, harmonics-cli}.
 
     The engagement classifier reuses the stdlib-``urllib`` ``llm`` client and the
-    name match is stdlib-only, so the whole feature adds NO base dependency
-    (criterion 2). This guards against an accidental requirements creep.
+    name match is stdlib-only, so the smart-hearing-engagement feature itself adds
+    NO base dependency (criterion 2). ``harmonics-cli`` was added separately as a
+    base dep by t2 (deviation d1); this guard still catches any *other* accidental
+    requirements creep, e.g. an engine package like reachy-mini.
     """
     import pathlib
     import tomllib
@@ -1078,4 +1080,7 @@ def test_base_dependencies_unchanged_no_new_dep() -> None:
     base_deps = data.get("project", {}).get("dependencies", [])
 
     names = sorted(d.split(">=")[0].split("==")[0].split("[")[0].strip().lower() for d in base_deps)
-    assert names == ["numpy"], f"base dependencies must remain exactly [numpy], got {base_deps!r}"
+    assert names == [
+        "harmonics-cli",
+        "numpy",
+    ], f"base dependencies must remain exactly [harmonics-cli, numpy], got {base_deps!r}"

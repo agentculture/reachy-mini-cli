@@ -743,6 +743,15 @@ wheels = [
 ]
 
 [[package]]
+name = "harmonics-cli"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/00/29/5746d9ee309ccf8ca88b9568404ccf80d2bbc713ae17478ead62b530e038/harmonics_cli-0.8.0.tar.gz", hash = "sha256:cce6ed38086bd37296c5d28ec56a81321b65c19daf92a7eb7f2b085f43e8f11a", size = 267990, upload-time = "2026-07-08T16:29:44.608Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/fa/1aa98836136f8096821f3599ec082f3ca55711a467895e94d8f6e7c0aef9/harmonics_cli-0.8.0-py3-none-any.whl", hash = "sha256:8ba906f45d5718c1371c1c50f1437f54886176c9d2a02f867241500c7bd0eb40", size = 94897, upload-time = "2026-07-08T16:29:43.362Z" },
+]
+
+[[package]]
 name = "hf-xet"
 version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1763,6 +1772,7 @@ name = "reachy-mini-cli"
 version = "0.30.0"
 source = { editable = "." }
 dependencies = [
+    { name = "harmonics-cli" },
     { name = "numpy" },
 ]
 
@@ -1788,6 +1798,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "harmonics-cli", specifier = ">=0.8" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "reachy-mini", marker = "extra == 'daemon'", specifier = ">=1.0" },
     { name = "reachy-mini", marker = "extra == 'sdk'", specifier = ">=1.0" },
