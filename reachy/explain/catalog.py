@@ -572,6 +572,20 @@ Pass `"-"` as the text argument to read from stdin (e.g.
   `"-"`) and play it through the robot speaker.
 - `reachy-mini-cli say overview` — this summary.
 
+## Voice engine
+
+`--voice-engine {tts,harmonic}` picks which speech backend voices the text
+(default `tts`; override with `REACHY_VOICE_ENGINE`):
+
+- `tts` — the Chatterbox HTTP endpoint described below.
+- `harmonic` — an in-process, offline, non-speech voice: text renders to a short
+  note melody in Reachy's own identity signature, played through the same
+  speaker leg. No TTS service needed. Tune with `REACHY_HARMONIC_IDENTITY`
+  (default `reachy`) / `REACHY_HARMONIC_ARTICULATION` (default `smooth`).
+
+`--voice`, `--speed`, and `--tts-url` are **tts-engine only** — accepted but
+silently ignored under `--voice-engine harmonic`.
+
 ## TTS
 
 The TTS step calls a Magpie-style HTTP endpoint (default `http://localhost:9000`,
@@ -600,6 +614,7 @@ assert this. Keep `say` as a pure TTS → playback pipe.
     reachy-mini-cli say run "Test" --voice en_US --tts-url http://localhost:9000
     reachy-mini-cli say run "Remote" --transport http --base-url http://reachy.local:8000
     reachy-mini-cli say run "JSON check" --json
+    reachy-mini-cli say run "Beep boop" --voice-engine harmonic  # offline harmonic voice
 """
 
 
@@ -617,8 +632,12 @@ The built-in script is:
     *🙂* "Ah — it's just the fan."
 
 Each `*emoji*` marker enqueues exactly one calm gesture via
-`ExpressionProducer`; each quoted phrase is synthesized via TTS and played
-through the robot speaker. The cognition-active signal is raised for the
+`ExpressionProducer`; each quoted phrase is synthesized via the active voice
+engine (`--voice-engine {tts,harmonic}`, default `tts`; override with
+`REACHY_VOICE_ENGINE`) and played through the robot speaker. `harmonic` is an
+in-process, offline, non-speech voice — a note melody in Reachy's own identity
+signature, no TTS service needed (tune with `REACHY_HARMONIC_IDENTITY` /
+`REACHY_HARMONIC_ARTICULATION`). The cognition-active signal is raised for the
 duration of the demo so a co-running `listen` backs off its idle motion.
 
 ## Usage
@@ -626,6 +645,7 @@ duration of the demo so a co-running `listen` backs off its idle motion.
     reachy-mini-cli think demo                            # built-in script, sdk transport
     reachy-mini-cli think demo --transport http           # use HTTP playback
     reachy-mini-cli think demo --script '*😮* "Oh!"'     # custom script
+    reachy-mini-cli think demo --voice-engine harmonic    # offline harmonic voice, no LLM
     reachy-mini-cli think demo --json                     # machine-readable result
 
 ## Manual verification
@@ -703,7 +723,20 @@ client is a pure `urllib`-based streaming HTTP client (no new base dep; no
 
 Same as `say`: `--tts-url` / `REACHY_TTS_URL`, `--voice` / `REACHY_TTS_VOICE`.
 `think` reuses `say`'s speech leg (`reachy.speech.tts.synthesize` +
-`reachy.speech.playback.play_audio`).
+`reachy.speech.playback.play_audio`). Both flags are **tts-engine only**.
+
+## Voice engine
+
+`--voice-engine {tts,harmonic}` picks which speech backend voices each spoken
+sentence (default `tts`; override with `REACHY_VOICE_ENGINE`). `harmonic` is an
+in-process, offline, non-speech voice: each sentence renders to a short note
+melody in Reachy's own identity signature (no TTS service needed) — cognition,
+expressions, sensing, and the export feed are unaffected by the choice. Tune
+with `REACHY_HARMONIC_IDENTITY` (default `reachy`) / `REACHY_HARMONIC_ARTICULATION`
+(default `smooth`). The startup banner and `think status --json` (`voice_engine`
+field) report the active engine of a running loop. `think demo --voice-engine
+harmonic` exercises the same leg with no LLM — see
+`reachy-mini-cli explain think demo`.
 
 ## Playback transport
 
@@ -734,6 +767,7 @@ iterations (useful for testing: idle ticks count, spoken turns don't).
     reachy-mini-cli daemon start                             # bring the daemon up
     reachy-mini-cli think run                                # foreground loop (Ctrl-C to stop)
     reachy-mini-cli think run --max-turns 3                  # stop after 3 spoken turns
+    reachy-mini-cli think run --voice-engine harmonic        # offline harmonic voice
     reachy-mini-cli think start --llm-model mistral-small    # background process
     reachy-mini-cli think status --json
     reachy-mini-cli think stop
@@ -837,6 +871,13 @@ Feel knobs (each defaults to a tuned value; unset keeps it):
   self-mute window after each spoken clip drops the robot's own voice (it never
   transcribes itself); an unreachable STT degrades to "no words" and never stalls
   the loop. Not a dialogue/turn-taking assistant — words are one more perception.
+- `--voice-engine {tts,harmonic}` — (requires `--live`; a bare `--voice-engine`
+  without `--live` is a clean exit-1 error) which speech backend voices the
+  folded cognition's spoken sentences (default `tts`; override with
+  `REACHY_VOICE_ENGINE`). `harmonic` is an in-process, offline, non-speech
+  voice — sentences render to a note melody in Reachy's own identity signature,
+  no TTS service needed (tune with `REACHY_HARMONIC_IDENTITY` /
+  `REACHY_HARMONIC_ARTICULATION`). The startup banner names the active engine.
 
 ## Transport
 
@@ -859,6 +900,7 @@ the daemon's DoA endpoint instead; use it with `--transport http` or
     reachy-mini-cli listen run --transport http               # foreground, HTTP transport
     reachy-mini-cli listen start --hold 3 --speech-only       # background, speech only
     reachy-mini-cli listen start --antenna-max 25 --snap-ratio 4
+    reachy-mini-cli listen run --live --transcribe --voice-engine harmonic  # offline voice
     reachy-mini-cli listen status --json
     reachy-mini-cli listen stop                               # eases back to center
 """
