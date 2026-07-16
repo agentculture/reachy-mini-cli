@@ -28,9 +28,11 @@ collaborators — never a Python traceback.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -41,6 +43,7 @@ from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import CliError
 from reachy.cli._export import add_export_args, build_export_hook
 from reachy.cli._output import emit_diagnostic, emit_result
+from reachy.daemon import state_dir
 from reachy.motion.expression import ExpressionProducer
 from reachy.motion.queue import MotionQueue
 from reachy.motion.server import run as run_motion
@@ -50,11 +53,13 @@ from reachy.speech.cognition import DEFAULT_SYSTEM_PROMPT, DEFAULT_TURN_INTERVAL
 from reachy.speech.distinctness import find_too_similar as _find_too_similar
 from reachy.speech.events import EventBuffer
 from reachy.speech.expressions import NEUTRAL_KEY, Catalog
+from reachy.speech.harmonic import synthesize as _harmonic_synthesize
 from reachy.speech.llm import stream_sentences as _stream_sentences
 from reachy.speech.markers import MarkerEvent, SpeechEvent
 from reachy.speech.markers import parse as _parse_marker_script
 from reachy.speech.playback import play_audio as _play_audio
 from reachy.speech.tts import synthesize as _synthesize
+from reachy.speech.voice import VOICE_ENGINE_ENV, VoiceEngine, resolve_voice_engine
 
 _JSON_HELP = "Emit structured JSON."
 
@@ -66,6 +71,18 @@ _DEFAULT_MAXLEN = 256
 # own voice — without this guard think reacts to itself in a runaway feedback loop.
 # v1 has no AEC/barge-in (intentional boundary); this is the minimal guard. 0 disables.
 _DEFAULT_MUTE_AFTER_SPEAK = 2.5
+
+# Sidecar file (next to the supervisor's own think.pid/think.log, under the shared
+# state dir) recording the active think run's voice engine name — the mechanism
+# `think status --json` reads to report which engine a *running* loop uses. Written
+# on run entry, removed on every exit path (mirrors cognition_signal.cognition_active()'s
+# enter/exit symmetry) so a stale name never survives a crash. Deliberately NOT added
+# to reachy.speech.supervisor (this feature stays inside think.py).
+_VOICE_SIDECAR_NAME = "think.voice"
+
+# The --voice-engine flag's argparse choices; kept in sync with
+# reachy.speech.voice's registered engine names ("tts", "harmonic").
+_VOICE_ENGINE_CHOICES = ("tts", "harmonic")
 
 _VERBS = [
     "think run — run the cognition loop in the foreground",
@@ -169,6 +186,8 @@ def cmd_think_overview(args: argparse.Namespace) -> int:
                 "LLM endpoint: --llm-base-url / --llm-model (env REACHY_OPENAI_URL_BASE / "
                 "REACHY_OPENAI_MODEL_ID)",
                 "TTS endpoint: --tts-url / --voice (env REACHY_TTS_URL / REACHY_TTS_VOICE)",
+                "voice engine: --voice-engine {tts,harmonic} (env REACHY_VOICE_ENGINE; "
+                "default tts); 'status --json' reports the running loop's voice_engine",
                 "pacing: --turn-interval (seconds between turns)",
                 "bound a run for testing/ops with --max-turns / --max-ticks",
                 "exit codes: 0 ok, 1 user error, 2 environment (LLM/TTS/daemon unreachable)",
@@ -369,6 +388,130 @@ def _playback_kwargs(args: argparse.Namespace) -> dict:
     }
 
 
+# --- voice engine selection (tts / harmonic) -------------------------------
+
+
+def _voice_sidecar_path() -> Path:
+    """Path to the ``think.voice`` sidecar — see :data:`_VOICE_SIDECAR_NAME`."""
+    return state_dir() / _VOICE_SIDECAR_NAME
+
+
+def _write_voice_sidecar(name: str) -> None:
+    """Record the active voice engine name for ``status`` to read (best effort).
+
+    A failed write only degrades the ``status --json`` ``voice_engine`` field —
+    it must never abort a think run.
+    """
+    try:
+        _voice_sidecar_path().write_text(name, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_voice_sidecar() -> None:
+    """Remove the sidecar on any run exit (clean stop, signal, or crash)."""
+    try:
+        _voice_sidecar_path().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _read_voice_sidecar() -> str | None:
+    """The recorded voice engine name, or ``None`` if absent/unreadable."""
+    try:
+        text = _voice_sidecar_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def _resolve_engine(args: argparse.Namespace) -> VoiceEngine:
+    """Resolve think's active voice engine: --voice-engine > REACHY_VOICE_ENGINE > tts."""
+    return resolve_voice_engine(getattr(args, "voice_engine", None))
+
+
+def _synthesize_for(engine: VoiceEngine) -> Callable[..., bytes]:
+    """The synthesize callable for *engine*.
+
+    Routed through the same module-level aliases the collaborators were always
+    wired from (``_synthesize`` for tts, ``_harmonic_synthesize`` for harmonic) —
+    not ``engine.synthesize`` directly — so existing tests that monkeypatch
+    ``think_mod._synthesize`` keep intercepting the default (tts) engine
+    unchanged, and a harmonic-engine test can monkeypatch
+    ``think_mod._harmonic_synthesize`` the same way.
+    """
+    return _harmonic_synthesize if engine.name == "harmonic" else _synthesize
+
+
+def _tts_kwargs_for(engine: VoiceEngine, args: argparse.Namespace) -> dict:
+    """tts_kwargs for *engine*: harmonic's ``synthesize()`` accepts no tts kwargs."""
+    if engine.name == "harmonic":
+        return {}
+    return _tts_kwargs(args)
+
+
+def _playback_kwargs_for(engine: VoiceEngine, args: argparse.Namespace) -> dict:
+    """playback_kwargs for *engine*.
+
+    Every non-tts engine pins ``samplerate`` to its own native rate (harmonic
+    renders at 16 kHz, not Chatterbox's 24 kHz) while keeping the other playback
+    kwargs (``transport`` / ``base_url``) unchanged. The tts engine keeps its
+    pre-existing kwargs unset (no ``samplerate`` key), preserving byte-identical
+    behaviour for bare ``think run`` / ``think demo``.
+    """
+    kwargs = _playback_kwargs(args)
+    if engine.name != "tts":
+        kwargs["samplerate"] = engine.samplerate
+    return kwargs
+
+
+def _mute_window(clip_pcm: bytes, samplerate: int, mute_after: float, *, now: float) -> float:
+    """The self-mute ``until`` timestamp for a just-played clip.
+
+    Covers the clip's own play duration (derived from *samplerate* — the active
+    engine's rate, not a hardcoded TTS assumption) PLUS the ``mute_after`` margin,
+    so a longer/slower-rendered clip (e.g. harmonic's 16 kHz vs tts's 24 kHz) is
+    never unmuted mid-utterance. Callers only invoke this when ``mute_after > 0``
+    (the guard-disabled path never calls it).
+    """
+    clip_seconds = len(clip_pcm) / (2.0 * samplerate) if samplerate > 0 else 0.0
+    return now + clip_seconds + mute_after
+
+
+@contextlib.contextmanager
+def _voice_engine_env(name: str | None):
+    """Temporarily set ``REACHY_VOICE_ENGINE`` for a spawned think-run subprocess.
+
+    ``think start`` / ``think restart`` re-exec this CLI via
+    :func:`reachy.speech.supervisor.start` / ``restart``, which spawn a *new*
+    process that inherits the current environment (``subprocess.Popen`` there is
+    called with no explicit ``env=``). An explicit ``--voice-engine`` flag on
+    ``start``/``restart`` is not itself forwarded as a CLI arg to the spawned
+    ``think run`` — that would require extending the supervisor's
+    ``build_run_command`` (deliberately out of scope: this feature stays inside
+    think.py) — so it is forwarded via the inherited environment instead:
+    temporarily set ``REACHY_VOICE_ENGINE`` for the duration of the spawn call,
+    restoring whatever value (or absence) was there before. A ``None`` *name* (no
+    explicit flag) is a no-op — the spawned loop then resolves its engine from
+    whatever ``REACHY_VOICE_ENGINE`` the operator already has set (or the "tts"
+    default), unchanged from before this feature existed.
+    """
+    if name is None:
+        yield
+        return
+    prior = os.environ.get(VOICE_ENGINE_ENV)
+    os.environ[VOICE_ENGINE_ENV] = name
+    try:
+        yield
+    finally:
+        if prior is None:
+            os.environ.pop(VOICE_ENGINE_ENV, None)
+        else:
+            os.environ[VOICE_ENGINE_ENV] = prior
+
+
 class _NullProducer:
     """A producer that never originates a move — the queue is filled externally.
 
@@ -494,17 +637,26 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     motion = _make_motion_executor(args)
     turn_interval = _resolve_turn_interval(args)
     mute_after = _resolve_mute_after(args)
+    engine_choice = _resolve_engine(args)
+    synthesize_fn = _synthesize_for(engine_choice)
+    tts_kwargs = _tts_kwargs_for(engine_choice, args)
+    playback_kwargs = _playback_kwargs_for(engine_choice, args)
 
     # Self-mute guard against the audio feedback loop: while the robot is speaking
     # and for `mute_after` seconds after, suppress sense cues so think never reacts
     # to its own voice (mic + speaker share one device). `play_audio` stamps the
-    # window forward on every clip; the feed drops anything captured inside it.
+    # window forward on every clip; the feed drops anything captured inside it. The
+    # window covers the clip's own play duration (see _mute_window) computed at the
+    # ACTIVE engine's samplerate — not a hardcoded TTS assumption — so a harmonic
+    # clip's (16 kHz) duration is never mis-measured against tts's 24 kHz rate.
     mute = {"until": 0.0}
 
     def _guarded_play(pcm: bytes, **kwargs: object) -> None:
         _play_audio(pcm, **kwargs)
         if mute_after > 0:
-            mute["until"] = time.monotonic() + mute_after
+            mute["until"] = _mute_window(
+                pcm, engine_choice.samplerate, mute_after, now=time.monotonic()
+            )
 
     def _guarded_feed() -> None:
         if time.monotonic() < mute["until"]:
@@ -522,21 +674,22 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     engine = CognitionEngine(
         buffer=buffer,
         stream_sentences=_stream_sentences,
-        synthesize=_synthesize,
+        synthesize=synthesize_fn,
         play_audio=_guarded_play,
         express=motion.express,
         export=export_hook,
         system_prompt=system_prompt,
         llm_kwargs=_llm_kwargs(args),
-        tts_kwargs=_tts_kwargs(args),
-        playback_kwargs=_playback_kwargs(args),
+        tts_kwargs=tts_kwargs,
+        playback_kwargs=playback_kwargs,
         turn_interval=turn_interval,
     )
 
     if not json_mode:
         emit_diagnostic(
             f"[think] thinking out loud via {getattr(args, 'transport', 'sdk')}; "
-            f"turn-interval={turn_interval:g}s mute-after-speak={mute_after:g}s; Ctrl-C to stop"
+            f"voice engine: {engine_choice.name}; turn-interval={turn_interval:g}s "
+            f"mute-after-speak={mute_after:g}s; Ctrl-C to stop"
         )
 
     # --max-ticks bounds the loop by *iterations* (idle turns included); --max-turns
@@ -544,21 +697,27 @@ def cmd_think_run(args: argparse.Namespace) -> int:
     max_turns = getattr(args, "max_turns", None)
     stop = _tick_stop(getattr(args, "max_ticks", None))
 
-    # cognition_active() publishes the file flag on enter and clears it on exit —
-    # on a clean stop, max-ticks/turns, Ctrl-C, OR an exception (its finally runs).
-    # The motion executor drains the expression queue to the robot in parallel.
-    with cognition_signal.cognition_active():
-        motion.start()
-        try:
-            turns = engine.run(max_turns=max_turns, stop=stop, before_turn=_guarded_feed)
-        finally:
-            # Stop the motion executor thread, then close the SDK media session
-            # (stops the mic recorder) on every exit path. Fakes/http feeds carry
-            # no closer.
-            motion.stop()
-            close = getattr(_guarded_feed, "close", None)
-            if close is not None:
-                close()
+    # Sidecar write/clear brackets the whole run so `think status --json` can report
+    # which engine a running loop uses (null once the run has exited, for any reason).
+    _write_voice_sidecar(engine_choice.name)
+    try:
+        # cognition_active() publishes the file flag on enter and clears it on exit —
+        # on a clean stop, max-ticks/turns, Ctrl-C, OR an exception (its finally runs).
+        # The motion executor drains the expression queue to the robot in parallel.
+        with cognition_signal.cognition_active():
+            motion.start()
+            try:
+                turns = engine.run(max_turns=max_turns, stop=stop, before_turn=_guarded_feed)
+            finally:
+                # Stop the motion executor thread, then close the SDK media session
+                # (stops the mic recorder) on every exit path. Fakes/http feeds carry
+                # no closer.
+                motion.stop()
+                close = getattr(_guarded_feed, "close", None)
+                if close is not None:
+                    close()
+    finally:
+        _clear_voice_sidecar()
 
     _emit_run_summary(turns, exporting=export_hook is not None, json_mode=json_mode)
     return 0
@@ -595,18 +754,22 @@ def _tick_stop(max_ticks: int | None) -> Callable[[], bool] | None:
 
 
 def cmd_think_start(args: argparse.Namespace) -> int:
-    data = supervisor.start(
-        transport=args.transport,
-        base_url=args.base_url,
-        timeout=args.timeout,
-        llm_base_url=getattr(args, "llm_base_url", None),
-        llm_model=getattr(args, "llm_model", None),
-        tts_url=getattr(args, "tts_url", None),
-        voice=getattr(args, "voice", None),
-        turn_interval=getattr(args, "turn_interval", None),
-        mute_after_speak=getattr(args, "mute_after_speak", None),
-        max_turns=getattr(args, "max_turns", None),
-    )
+    # An explicit --voice-engine is forwarded to the spawned `think run` via the
+    # inherited environment (see _voice_engine_env's docstring) — supervisor.start's
+    # build_run_command has no voice_engine parameter and stays untouched.
+    with _voice_engine_env(getattr(args, "voice_engine", None)):
+        data = supervisor.start(
+            transport=args.transport,
+            base_url=args.base_url,
+            timeout=args.timeout,
+            llm_base_url=getattr(args, "llm_base_url", None),
+            llm_model=getattr(args, "llm_model", None),
+            tts_url=getattr(args, "tts_url", None),
+            voice=getattr(args, "voice", None),
+            turn_interval=getattr(args, "turn_interval", None),
+            mute_after_speak=getattr(args, "mute_after_speak", None),
+            max_turns=getattr(args, "max_turns", None),
+        )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
 
@@ -618,24 +781,30 @@ def cmd_think_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_think_restart(args: argparse.Namespace) -> int:
-    data = supervisor.restart(
-        transport=args.transport,
-        base_url=args.base_url,
-        timeout=args.timeout,
-        llm_base_url=getattr(args, "llm_base_url", None),
-        llm_model=getattr(args, "llm_model", None),
-        tts_url=getattr(args, "tts_url", None),
-        voice=getattr(args, "voice", None),
-        turn_interval=getattr(args, "turn_interval", None),
-        mute_after_speak=getattr(args, "mute_after_speak", None),
-        max_turns=getattr(args, "max_turns", None),
-    )
+    # See cmd_think_start: the flag is forwarded via the environment, not build_run_command.
+    with _voice_engine_env(getattr(args, "voice_engine", None)):
+        data = supervisor.restart(
+            transport=args.transport,
+            base_url=args.base_url,
+            timeout=args.timeout,
+            llm_base_url=getattr(args, "llm_base_url", None),
+            llm_model=getattr(args, "llm_model", None),
+            tts_url=getattr(args, "tts_url", None),
+            voice=getattr(args, "voice", None),
+            turn_interval=getattr(args, "turn_interval", None),
+            mute_after_speak=getattr(args, "mute_after_speak", None),
+            max_turns=getattr(args, "max_turns", None),
+        )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
 
 
 def cmd_think_status(args: argparse.Namespace) -> int:
-    data = supervisor.status()
+    data = dict(supervisor.status())
+    # voice_engine is only meaningful while a tracked loop is actually alive — a
+    # stale/absent sidecar (or a stopped loop) always reports None, never a leftover
+    # name from a previous run.
+    data["voice_engine"] = _read_voice_sidecar() if data.get("process") == "running" else None
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
 
@@ -657,15 +826,18 @@ DEMO_SCRIPT: str = (
 
 
 def _demo_speak(args: argparse.Namespace, text: str) -> None:
-    """Synthesize ``text`` and play it, honoring the demo's TTS/playback flags."""
-    tts_kw: dict = {}
-    if getattr(args, "tts_url", None) is not None:
-        tts_kw["tts_url"] = args.tts_url
-    if getattr(args, "voice", None) is not None:
-        tts_kw["voice"] = args.voice
-    pcm = _synthesize(text, **tts_kw)
+    """Synthesize ``text`` and play it, honoring the demo's voice-engine/TTS/playback flags.
+
+    Mirrors ``cmd_think_run``'s per-engine wiring: the tts engine keeps its existing
+    ``--tts-url``/``--voice`` flags and unset playback samplerate (byte-identical to
+    before this feature existed); the harmonic engine takes no tts kwargs and pins
+    playback to its native 16 kHz samplerate.
+    """
+    engine_choice = _resolve_engine(args)
+    synthesize_fn = _synthesize_for(engine_choice)
+    pcm = synthesize_fn(text, **_tts_kwargs_for(engine_choice, args))
     if pcm:
-        _play_audio(pcm, **_playback_kwargs(args))
+        _play_audio(pcm, **_playback_kwargs_for(engine_choice, args))
 
 
 def cmd_think_demo(args: argparse.Namespace) -> int:
@@ -745,6 +917,13 @@ def _register_demo(noun_sub: argparse._SubParsersAction) -> None:
         default=None,
         help="TTS voice identifier (overrides REACHY_TTS_VOICE).",
     )
+    demo.add_argument(
+        "--voice-engine",
+        choices=_VOICE_ENGINE_CHOICES,
+        default=None,
+        dest="voice_engine",
+        help="Voice engine to speak through (overrides REACHY_VOICE_ENGINE; default: tts).",
+    )
     demo.set_defaults(func=cmd_think_demo)
 
 
@@ -775,6 +954,14 @@ def _add_cognition_args(parser: argparse.ArgumentParser) -> None:
         "--voice",
         default=None,
         help="TTS voice identifier (overrides REACHY_TTS_VOICE).",
+    )
+    parser.add_argument(
+        "--voice-engine",
+        choices=_VOICE_ENGINE_CHOICES,
+        default=None,
+        dest="voice_engine",
+        help="Voice engine to speak through (overrides REACHY_VOICE_ENGINE; default: tts). "
+        "On 'start'/'restart' this is forwarded to the spawned loop via the environment.",
     )
     parser.add_argument(
         "--turn-interval",
