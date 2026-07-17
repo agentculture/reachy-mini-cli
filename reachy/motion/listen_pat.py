@@ -94,6 +94,17 @@ logger = logging.getLogger(__name__)
 _NEUTRAL_HEAD: dict[str, float] = {"pitch": 0.0, "yaw": 0.0}
 
 
+#: Commanded-pose jump (deg, per axis) above which an observed dispatch also RESETS
+#: the detector's press accumulation. Live autopsies showed phantom fires landing
+#: exactly on dispatch-observation ticks (t0 == fire tick, head already at the new
+#: target while the expectation still pointed at the start) — boundary artifacts.
+#: A press edge counted before a large dispatch must not pair with one counted
+#: after it; a real hand re-accumulates its edges within a second of quiet, while
+#: a boundary artifact never survives its own dispatch tick. Sub-degree breathe
+#: dispatches don't reset, so pats on a calmly-breathing robot detect instantly.
+LARGE_MOVE_THRESHOLD_DEG: float = 1.0
+
+
 def minjerk_progress(tau: float) -> float:
     """The minimum-jerk position profile ``s(τ) = 10τ³ − 15τ⁴ + 6τ⁵`` on [0, 1].
 
@@ -266,6 +277,15 @@ class PatHook:
             self._move_target = current
             self._move_t0 = t
             self._move_end = self._busy_horizon()
+            if (
+                abs(current["pitch"] - prev["pitch"]) > LARGE_MOVE_THRESHOLD_DEG
+                or abs(current["yaw"] - prev["yaw"]) > LARGE_MOVE_THRESHOLD_DEG
+            ):
+                # A large move is starting: press edges counted before it must not
+                # pair with edges counted after — dispatch-boundary deviations are
+                # artifacts of the commanded/actual handoff, not a hand. Reset the
+                # accumulation; a real press re-earns its edges within a second.
+                self.detector.reset()
 
     def _expected_head(self, now: float, cmd: dict[str, float]) -> tuple[float, float]:
         """Where the head *should* be at ``now``: the tracked move's minjerk pose.

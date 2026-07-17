@@ -761,6 +761,53 @@ def test_dispatch_tracking_continues_through_reaction_window() -> None:
     assert hook.events == 1, "a tracked resume move must not re-seed a phantom reaction"
 
 
+def test_large_dispatch_resets_press_accumulation() -> None:
+    """Press edges must not pair across a large dispatch — boundary artifacts can't fire.
+
+    Live autopsies showed phantom fires landing exactly on dispatch-observation
+    ticks: a press edge counted just before a reaction/expression move dispatched
+    paired with a boundary-artifact edge right after it. Observing a large dispatch
+    now resets the detector's press accumulation, so an artifact edge starts from
+    zero and can never reach ``min_presses`` on its own — while a real hand simply
+    re-earns its edges within the next quiet second.
+    """
+    busy = {"until": 0.0}
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector, busy_horizon=lambda: busy["until"])
+    transport = _ScriptedPoseTransport()
+
+    # One genuine press edge accumulates on a settled head.
+    now = 0.0
+    transport.pose = (0.0, 0.0)
+    hook(transport, queue, now, {"pitch": 0.0, "yaw": 0.0})
+    now += 0.4
+    transport.pose = (-20.0, 0.0)
+    hook(transport, queue, now, {"pitch": 0.0, "yaw": 0.0})
+    assert len(detector.press_times) == 1
+
+    # A large move dispatches (an expression / reaction / look) — accumulation resets.
+    now += 0.4
+    busy["until"] = now + 1.7
+    transport.pose = (0.0, 0.0)
+    hook(transport, queue, now, {"pitch": 3.0, "yaw": 0.0})
+    assert len(detector.press_times) == 0, "a large dispatch must reset press accumulation"
+    assert hook.events == 0
+
+    # Sub-threshold breathe dispatches must NOT reset a fresh accumulation.
+    now += 2.0  # the move has landed
+    transport.pose = (-20.0, 0.0)
+    hook(transport, queue, now, {"pitch": 3.0, "yaw": 0.0})
+    assert len(detector.press_times) == 1
+    now += 0.4
+    transport.pose = (3.0, 0.0)  # released, tracking the commanded pose
+    hook(transport, queue, now, {"pitch": 3.5, "yaw": 0.0})  # 0.5 deg breathe dispatch
+    now += 0.4
+    transport.pose = (-20.0, 0.0)
+    hook(transport, queue, now, {"pitch": 3.5, "yaw": 0.0})
+    assert hook.events == 1, "a real press across small breathe dispatches must still fire"
+
+
 # ---------------------------------------------------------------------------
 # 4. server.run with on_tick=None is byte-identical to before
 # ---------------------------------------------------------------------------
