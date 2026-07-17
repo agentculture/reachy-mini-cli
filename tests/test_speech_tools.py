@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import logging
 import subprocess  # nosec B404 — fixed-arg subprocess for an import-boundary probe
 import sys
 
@@ -39,6 +40,17 @@ from reachy.speech.harmonic import HARMONIC_SAMPLE_RATE
 from reachy.speech.tools import ToolRegistry, function_tool
 from reachy.speech.tts import DEFAULT_SAMPLE_RATE as TTS_SAMPLE_RATE
 from reachy.speech.voice import VoiceEngine
+
+# ---------------------------------------------------------------------------
+# [SENSE] instrumentation (task t4)
+# ---------------------------------------------------------------------------
+
+_SENSE_LOGGER_NAME = "reachy.sense"
+
+
+def _sense_records(caplog) -> list:
+    return [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
+
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -399,6 +411,80 @@ def test_dispatch_tool_call_id_defaults_to_none() -> None:
 
 
 # ---------------------------------------------------------------------------
+# [SENSE] instrumentation (task t4)
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_logs_a_sense_action_line_naming_the_tool(caplog) -> None:
+    """Every dispatch call — successful or not — logs one [SENSE stage=action] line
+    naming the tool that was called."""
+    queue = _RecordingQueue()
+    producer = ExpressionProducer(queue=queue)
+    reg = ToolRegistry(express=producer.express)
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        result = reg.dispatch("apply_pose", json.dumps({"emoji": "🤔"}), tool_call_id="p")
+
+    assert result["role"] == "tool"
+    records = _sense_records(caplog)
+    action_records = [r for r in records if "stage=action" in r.getMessage()]
+    assert len(action_records) == 1
+    assert "source=apply_pose" in action_records[0].getMessage()
+
+
+def test_dispatch_success_emits_no_sense_drop_line(caplog) -> None:
+    queue = _RecordingQueue()
+    producer = ExpressionProducer(queue=queue)
+    reg = ToolRegistry(express=producer.express)
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        reg.dispatch("apply_pose", json.dumps({"emoji": "🤔"}), tool_call_id="p")
+
+    records = _sense_records(caplog)
+    drop_records = [r for r in records if "dropped" in r.getMessage()]
+    assert drop_records == []
+
+
+def test_dispatch_unknown_tool_emits_a_sense_drop_line_with_tool_error_reason(caplog) -> None:
+    reg = ToolRegistry()
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        reg.dispatch("does_not_exist", "{}", tool_call_id="u")
+
+    records = _sense_records(caplog)
+    drop_records = [r for r in records if "dropped reason=tool-error" in r.getMessage()]
+    assert len(drop_records) == 1
+
+
+def test_dispatch_malformed_arguments_emits_a_sense_drop_line(caplog) -> None:
+    reg = ToolRegistry(speak_engine=_fake_engine("tts", TTS_SAMPLE_RATE, []))
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        reg.dispatch("speak", "{not valid json", tool_call_id="m")
+
+    records = _sense_records(caplog)
+    drop_records = [r for r in records if "dropped reason=tool-error" in r.getMessage()]
+    assert len(drop_records) == 1
+
+
+def test_dispatch_handler_exception_emits_a_sense_drop_line(caplog) -> None:
+    def boom(_text: str, **_kw) -> bytes:
+        raise RuntimeError("synth exploded")
+
+    reg = ToolRegistry(
+        speak_engine=VoiceEngine(name="tts", synthesize=boom, samplerate=TTS_SAMPLE_RATE),
+        play=_PlayRecorder(),
+    )
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        reg.dispatch("speak", json.dumps({"text": "x"}), tool_call_id="b")
+
+    records = _sense_records(caplog)
+    drop_records = [r for r in records if "dropped reason=tool-error" in r.getMessage()]
+    assert len(drop_records) == 1
+
+
+# ---------------------------------------------------------------------------
 # Import boundary — no reachy.speech.llm / reachy.speech.events
 # ---------------------------------------------------------------------------
 
@@ -441,6 +527,21 @@ def test_importing_tools_does_not_pull_llm_or_events_into_sys_modules() -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "ok"
+
+
+def test_tools_module_does_not_import_motion_directly() -> None:
+    """CRITICAL BOUNDARY (task t4): adding reachy.senselog instrumentation to
+    dispatch() must not smuggle in a reachy.motion import — the pose seam stays a
+    plain injected callable (see the module docstring's Import boundary note)."""
+    for name in _imported_modules(tools_mod):
+        assert "reachy.motion" not in name, f"tools.py must not import motion ({name!r})"
+    assert "motion" not in tools_mod.__dict__
+
+
+def test_tools_module_imports_senselog_directly() -> None:
+    """reachy.senselog is none of llm/events/motion — it is the one new import this
+    task adds, and it is safe (stdlib-only logging helper)."""
+    assert tools_mod.senselog.__name__ == "reachy.senselog"
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -67,9 +67,11 @@ import logging
 import queue
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from typing import Callable, Protocol
 
+from reachy import senselog
 from reachy.export.events import EmotionEvent, MessageEvent, ThinkingEvent
 from reachy.export.exporter import ExportHook
 from reachy.speech import llm as _llm
@@ -309,6 +311,7 @@ class CognitionEngine:
             cues = self._buffer.snapshot()
             if not cues:
                 return False
+            senselog.stage("turn", "cognition", uuid.uuid4().hex[:8], f"cue_count={len(cues)}")
             messages = build_messages(self._system_prompt, cues)
             self._stream_and_speak(messages, cues)
             return True
@@ -475,6 +478,7 @@ class CognitionEngine:
                 "cognition audio sink failed; continuing without speech (audio is optional)",
                 exc_info=True,
             )
+            senselog.drop("action", "speech", uuid.uuid4().hex[:8], "audio-muted")
         if not self._audio_muted and self._audio_fail_streak >= self._audio_mute_threshold:
             self._audio_muted = True
             logger.warning(
@@ -482,6 +486,7 @@ class CognitionEngine:
                 "(expression + export sinks unaffected)",
                 self._audio_fail_streak,
             )
+            senselog.drop("action", "speech", uuid.uuid4().hex[:8], "audio-muted")
 
     # ------------------------------------------------------------------
     # The thin loop

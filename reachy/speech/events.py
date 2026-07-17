@@ -59,9 +59,12 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable
+
+from reachy import senselog
 
 # ---------------------------------------------------------------------------
 # Thresholds
@@ -251,7 +254,7 @@ class EventBuffer:
         else:
             return  # quiet, non-speech — below perceptual threshold
 
-        self._append(text)
+        self._append(text, source="doa")
 
     def feed_vision(
         self,
@@ -286,15 +289,15 @@ class EventBuffer:
         if motion_direction is not None:
             direction = _vision_direction(motion_direction)
             if direction == "ahead":
-                self._append("motion ahead")
+                self._append("motion ahead", source="vision")
             else:
-                self._append(f"motion on the {direction}")
+                self._append(f"motion on the {direction}", source="vision")
 
         if abs(brightness_delta) >= _BRIGHTNESS_THRESHOLD:
             if brightness_delta > 0:
-                self._append("the light brightened")
+                self._append("the light brightened", source="vision")
             else:
-                self._append("the light dimmed")
+                self._append("the light dimmed", source="vision")
 
     def feed_transcript(self, text: str, *, direction: str | None = None) -> None:
         """Append a cue for already-transcribed spoken words.
@@ -321,9 +324,11 @@ class EventBuffer:
         if not stripped:
             return
         if direction:
-            self._append(f'heard someone say (from the {direction}): "{stripped}"')
+            self._append(
+                f'heard someone say (from the {direction}): "{stripped}"', source="transcript"
+            )
         else:
-            self._append(f'heard someone say: "{stripped}"')
+            self._append(f'heard someone say: "{stripped}"', source="transcript")
 
     def feed_pat(self, kind: str, level: str) -> None:
         """Translate one detected touch event into zero or one cue and append it.
@@ -356,7 +361,7 @@ class EventBuffer:
         if phrase is None or intensity is None:
             return
 
-        self._append(f"felt a {intensity} {phrase} on the head")
+        self._append(f"felt a {intensity} {phrase} on the head", source="pat")
 
     # ------------------------------------------------------------------
     # Snapshot
@@ -385,8 +390,17 @@ class EventBuffer:
     # Internal
     # ------------------------------------------------------------------
 
-    def _append(self, text: str) -> None:
-        """Append a new cue under the lock."""
+    def _append(self, text: str, *, source: str) -> None:
+        """Append a new cue under the lock and emit its [SENSE stage=cue] line.
+
+        ``source`` names the feed kind that produced this cue (``"doa"``,
+        ``"vision"``, ``"transcript"``, ``"pat"``) — every ``feed_*`` call that
+        actually appends a cue routes through here, so every cue is logged exactly
+        once. A ``feed_*`` call that produces *no* cue because of a threshold never
+        reaches this method — it stays silent, not a drop (see the module/method
+        docstrings' "Cue rules").
+        """
         cue = SenseCue(text=text, timestamp=self._clock())
         with self._lock:
             self._buf.append(cue)
+        senselog.stage("cue", source, uuid.uuid4().hex[:8], text)

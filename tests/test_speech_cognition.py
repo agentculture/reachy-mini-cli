@@ -16,12 +16,24 @@ The three acceptance criteria:
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import pytest
 
 from reachy.speech.cognition import CognitionEngine
 from reachy.speech.events import EventBuffer
+
+# ---------------------------------------------------------------------------
+# [SENSE] instrumentation (task t4)
+# ---------------------------------------------------------------------------
+
+_SENSE_LOGGER_NAME = "reachy.sense"
+
+
+def _sense_records(caplog) -> list:
+    return [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
+
 
 # ---------------------------------------------------------------------------
 # Test fakes
@@ -454,3 +466,49 @@ def test_llm_error_propagates_out_of_run_turn():
     )
     with pytest.raises(CliError):
         engine.run_turn()
+
+
+# ---------------------------------------------------------------------------
+# [SENSE] instrumentation (task t4)
+# ---------------------------------------------------------------------------
+
+
+def test_run_turn_logs_a_sense_turn_line_with_cue_count(caplog):
+    """A turn that fires logs exactly one [SENSE stage=turn] line naming the cue count."""
+    rec = _Recorder()
+    buf = EventBuffer(clock=_const_clock())
+    buf.feed_doa(angle_rad=0.0, rms=0.1, is_speech=True)
+
+    def fake_stream(messages, **_kw):
+        yield '"hi"'
+
+    engine = CognitionEngine(
+        buffer=buf,
+        stream_sentences=fake_stream,
+        synthesize=rec.synth,
+        play_audio=rec.play,
+    )
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        assert engine.run_turn() is True
+
+    records = _sense_records(caplog)
+    turn_records = [r for r in records if "stage=turn" in r.getMessage()]
+    assert len(turn_records) == 1
+    assert "cue_count=1" in turn_records[0].getMessage()
+
+
+def test_run_turn_no_cues_logs_no_sense_turn_line(caplog):
+    """An empty-buffer no-op turn never fires the stage=turn line."""
+    rec = _Recorder()
+    engine = CognitionEngine(
+        buffer=EventBuffer(clock=_const_clock()),
+        stream_sentences=lambda m, **_kw: iter(()),
+        synthesize=rec.synth,
+        play_audio=rec.play,
+    )
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        assert engine.run_turn() is False
+
+    assert _sense_records(caplog) == []
