@@ -65,13 +65,14 @@ touches a network, an LLM, or ``reachy_mini``.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from reachy import senselog
 from reachy.behavior import library as behavior_library
 from reachy.behavior.model import Lifetime
 from reachy.behavior.rules import SENSE_FIELDS, Predicate, Rule, RulesConfig
 from reachy.behavior.sense import Sense
+from reachy.cli._errors import EXIT_USER_ERROR, CliError
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +209,33 @@ class RuleEngine:
         inhibited = self._current_inhibited(sense, now)
         self._run_inhibit(ctx, sense, now)
         self._run_react(ctx, sense, now, inhibited)
+
+    # -- runtime mode coordination (additive, t7) --------------------------- #
+
+    def set_active_mode(self, name: str | None) -> None:
+        """Swap the live config's active mode at runtime.
+
+        Purely additive: no other method's behavior changes, and every existing
+        read of ``self._config`` (:meth:`_active_mode_params`, :meth:`_build`)
+        keeps working unmodified since it only ever reads attributes off
+        whatever :class:`RulesConfig` is currently assigned. This is the
+        coordination point the ``set_mode`` intent
+        (:mod:`reachy.behavior.intents`) calls through an injected callback —
+        this module has no knowledge of intents, spools, or agent tools.
+
+        ``name`` must name an existing mode in the current config, or be
+        ``None`` to clear any active mode. Raises :class:`CliError` (never a
+        bare ``KeyError``) for an unknown name, mirroring every other
+        validation in this codebase.
+        """
+        if name is not None and name not in self._config.modes:
+            valid = ", ".join(sorted(self._config.modes)) or "(none configured)"
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"unknown mode {name!r}",
+                remediation=f"use one of: {valid}",
+            )
+        self._config = replace(self._config, active_mode=name)
 
     # -- presence tracking (absent_for) ------------------------------------ #
 
