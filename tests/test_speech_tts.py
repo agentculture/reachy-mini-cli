@@ -404,3 +404,242 @@ def test_synthesize_keeps_longest_when_all_truncated(monkeypatch: pytest.MonkeyP
 
     result = synthesize(text, tts_url="http://stub:9000")
     assert result == clips[1], "should keep the longest of the truncated attempts"
+
+
+# ---------------------------------------------------------------------------
+# Gateway OpenAI-style route (/v1/audio/speech) — REACHY_TTS_ROUTE=openai
+# ---------------------------------------------------------------------------
+
+
+def test_synthesize_openai_route_posts_to_speech_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """route="openai" posts an OpenAI-shaped {model, input, voice} body to /v1/audio/speech."""
+    import json as _json
+
+    captured: list[urllib.request.Request] = []
+
+    def _capture(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(_fake_pcm(40_000))
+
+    monkeypatch.setattr("urllib.request.urlopen", _capture)
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "test-key-123")
+
+    synthesize("Speak this.", tts_url="http://gateway:8001", route="openai")
+
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.full_url.endswith("/v1/audio/speech")
+    assert req.method == "POST"
+    assert req.headers["Content-type"] == "application/json"
+    assert req.headers["Authorization"] == "Bearer test-key-123"
+    payload = _json.loads(req.data.decode("utf-8"))
+    assert payload["input"] == "Speak this."
+    assert payload["voice"] is None
+    assert "model" in payload and payload["model"]
+
+
+def test_synthesize_openai_route_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REACHY_TTS_ROUTE=openai selects the gateway route without the kwarg."""
+    captured: list[urllib.request.Request] = []
+
+    def _capture(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(_fake_pcm(40_000))
+
+    monkeypatch.setattr("urllib.request.urlopen", _capture)
+    monkeypatch.setenv("REACHY_TTS_ROUTE", "openai")
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "test-key-123")
+
+    synthesize("Hi there.", tts_url="http://gateway:8001")
+
+    assert captured[0].full_url.endswith("/v1/audio/speech")
+
+
+def test_route_kwarg_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit route= kwarg wins over REACHY_TTS_ROUTE."""
+    captured: list[urllib.request.Request] = []
+
+    def _capture(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(_fake_pcm(40_000))
+
+    monkeypatch.setattr("urllib.request.urlopen", _capture)
+    monkeypatch.setenv("REACHY_TTS_ROUTE", "openai")
+
+    synthesize("Hi there.", tts_url="http://stub:9000", route="chatterbox")
+
+    assert captured[0].full_url.endswith("/v1/audio/synthesize")
+
+
+def test_synthesize_chatterbox_route_is_default_and_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no route selected at all (no env, no kwarg), behavior is byte-identical."""
+    import json as _json
+
+    captured: list[urllib.request.Request] = []
+
+    def _capture(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(_fake_pcm(40_000))
+
+    monkeypatch.setattr("urllib.request.urlopen", _capture)
+    monkeypatch.delenv("REACHY_TTS_ROUTE", raising=False)
+
+    synthesize("Hi there.", tts_url="http://stub:9000")
+
+    assert captured[0].full_url.endswith("/v1/audio/synthesize")
+    payload = _json.loads(captured[0].data.decode("utf-8"))
+    assert payload == {"text": "Hi there.", "voice": None}
+    assert "Authorization" not in captured[0].headers
+
+
+def test_synthesize_openai_route_no_auth_header_without_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without REACHY_OPENAI_API_KEY set, no Authorization header is sent (no crash)."""
+    captured: list[urllib.request.Request] = []
+
+    def _capture(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(_fake_pcm(40_000))
+
+    monkeypatch.setattr("urllib.request.urlopen", _capture)
+    monkeypatch.delenv("REACHY_OPENAI_API_KEY", raising=False)
+
+    synthesize("Hi there.", tts_url="http://gateway:8001", route="openai")
+
+    assert "Authorization" not in captured[0].headers
+
+
+def test_synthesize_openai_route_uses_gateway_env_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no tts_url override, the gateway route reads REACHY_OPENAI_URL_BASE."""
+    captured: list[str] = []
+
+    def _capture(req, timeout=None):
+        captured.append(req.full_url)
+        return _FakeResponse(_fake_pcm(40_000))
+
+    monkeypatch.setattr("urllib.request.urlopen", _capture)
+    monkeypatch.setenv("REACHY_OPENAI_URL_BASE", "http://gatewayhost:8001")
+    monkeypatch.delenv("REACHY_OPENAI_API_KEY", raising=False)
+
+    synthesize("Hi there.", route="openai")
+
+    assert any("gatewayhost:8001" in url for url in captured)
+
+
+def test_synthesize_openai_route_unwraps_wav(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gateway's verified WAV response (24 kHz mono PCM16) unwraps via _extract_pcm."""
+    pcm = _fake_pcm(4096)
+    wav = _wav_bytes(pcm, rate=24000)
+    assert wav[:4] == b"RIFF"
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _FakeResponse(wav))
+    monkeypatch.delenv("REACHY_OPENAI_API_KEY", raising=False)
+
+    result = synthesize("Speak this please.", tts_url="http://gateway:8001", route="openai")
+    assert result[:4] != b"RIFF", "WAV header leaked into the PCM stream"
+    assert result == pcm
+
+
+def test_synthesize_openai_route_bare_pcm_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bare-PCM gateway response (response_format=pcm, audio/pcm) passes through unchanged."""
+    pcm = _fake_pcm(40_000)
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _FakeResponse(pcm))
+    monkeypatch.delenv("REACHY_OPENAI_API_KEY", raising=False)
+
+    result = synthesize("Speak this please.", tts_url="http://gateway:8001", route="openai")
+    assert result == pcm
+
+
+def test_synthesize_openai_route_unreachable_raises_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable gateway raises CliError(code=2), matching the Chatterbox contract."""
+
+    def _fail(req, timeout=None):
+        raise urllib.error.URLError("Connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fail)
+
+    with pytest.raises(CliError) as exc_info:
+        synthesize("Hello.", tts_url="http://gateway:8001", route="openai")
+
+    err = exc_info.value
+    assert err.code == 2
+    assert err.remediation
+
+
+def test_synthesize_openai_route_http_error_raises_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401/HTTP-error gateway response raises CliError(code=2)."""
+
+    def _fail(req, timeout=None):
+        raise urllib.error.HTTPError(
+            url=req.full_url, code=401, msg="Unauthorized", hdrs=None, fp=None
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _fail)
+
+    with pytest.raises(CliError) as exc_info:
+        synthesize("Hello.", tts_url="http://gateway:8001", route="openai")
+
+    err = exc_info.value
+    assert err.code == 2
+    assert err.remediation
+
+
+def test_synthesize_openai_route_no_traceback_leaks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Errors on the gateway route are wrapped in CliError — no raw exception escapes."""
+
+    def _fail(req, timeout=None):
+        raise OSError("unexpected socket error")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fail)
+
+    with pytest.raises(CliError):
+        synthesize("Hello.", tts_url="http://gateway:8001", route="openai")
+
+
+def test_synthesize_invalid_route_raises_user_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unrecognised route name is a clean exit-1 user error, not a crash."""
+    monkeypatch.delenv("REACHY_TTS_ROUTE", raising=False)
+
+    with pytest.raises(CliError) as exc_info:
+        synthesize("Hello.", tts_url="http://stub:9000", route="bogus")
+
+    err = exc_info.value
+    assert err.code == 1
+    assert err.remediation
+
+
+def test_synthesize_invalid_route_env_raises_user_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unrecognised REACHY_TTS_ROUTE env value is also a clean exit-1 user error."""
+    monkeypatch.setenv("REACHY_TTS_ROUTE", "bogus-route")
+
+    with pytest.raises(CliError) as exc_info:
+        synthesize("Hello.", tts_url="http://stub:9000")
+
+    assert exc_info.value.code == 1
+
+
+def test_synthesize_openai_route_model_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit model= kwarg is sent verbatim in the OpenAI-shaped payload."""
+    import json as _json
+
+    captured: list[urllib.request.Request] = []
+
+    def _capture(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(_fake_pcm(40_000))
+
+    monkeypatch.setattr("urllib.request.urlopen", _capture)
+    monkeypatch.delenv("REACHY_OPENAI_API_KEY", raising=False)
+
+    synthesize("Hi.", tts_url="http://gateway:8001", route="openai", model="custom/tts-model")
+
+    payload = _json.loads(captured[0].data.decode("utf-8"))
+    assert payload["model"] == "custom/tts-model"
