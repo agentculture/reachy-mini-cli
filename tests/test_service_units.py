@@ -141,10 +141,13 @@ def test_live_exec_runs_listen_live():
     sec = parse_unit(text)
     exec_start = sec["Service"]["ExecStart"][0]
     # The deployed boot presence opts into --transcribe so on-robot it hears words
-    # (the CLI default stays off; the unit opts in), and defaults to the harmonic
-    # voice engine (--voice-engine tts is the CLI default; the unit opts in).
+    # (the CLI default stays off; the unit opts in), reasons with the tool-use
+    # agent engine (--cognition marker is the CLI default; the unit opts into
+    # "agent"), and defaults to the harmonic voice engine (--voice-engine tts is
+    # the CLI default; the unit opts in).
     assert exec_start == (
-        f'"{PY}" -m reachy listen run --live --transcribe --voice-engine harmonic'
+        f'"{PY}" -m reachy listen run --live --transcribe '
+        "--cognition agent --voice-engine harmonic"
     )
 
 

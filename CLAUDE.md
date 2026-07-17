@@ -156,7 +156,7 @@ transport. Deep notes for the non-trivial nouns follow in
 | `device`/`app`/`move` | `_commands/{device,app,move}.py` | `reachy/robot/*` transports | `http` default |
 | `demo-mode` | `_commands/demo_mode.py` | `reachy/alive.py`, `reachy/motion/idle.py`, `demo_config.py`, `demo_service.py` | `sdk`/`http` |
 | `behavior` | `_commands/behavior.py` | 50 Hz engine, per-channel contention | `sdk`/`http` |
-| `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43); `--live`: `listen_hooks.py` `HookChain` + `sense_sample.py` + `listen_{think,vision,sleep}.py` + `speech/voice.py` (`--voice-engine`, `--live` only); `motion/supervisor.py` | `sdk` default |
+| `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43); `--live`: `listen_hooks.py` `HookChain` + `sense_sample.py` + `listen_{think,vision,sleep}.py` + `speech/voice.py` (`--voice-engine`, `--live` only) + `speech/agent_turn.py` `AgentTurnEngine` + `speech/tools.py` `ToolRegistry` (`--cognition agent`, `--live` only); `motion/supervisor.py` | `sdk` default |
 | `vision` | `_commands/vision.py` | pixel motion/light detectors, serial MotionQueue | `sdk` default |
 | `say` | `_commands/say.py` | `reachy/speech/{tts,harmonic,voice,playback}.py` | `sdk` default |
 | `think` | `_commands/think.py` | `reachy/speech/{llm,cognition,events,markers,expressions,distinctness,cognition_signal,harmonic,voice}.py`, `reachy/motion/expression.py`, `reachy/export/*`, `speech/supervisor.py` | `sdk` default |
@@ -223,6 +223,9 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
   `sleep > pat > think` (vision rides last; it competes for nothing the flags
   arbitrate). Off by default (`sdk` only) — bare `listen run` is unchanged. This is
   the loop the `live` boot-presence service runs (see the `service` noun below).
+  Which engine drives the folded `ThinkHook` — the marker path or the tool-use
+  agent — is `--cognition`'s job (see its own bullet below); `--live` itself is
+  unopinionated about that choice.
 - **`--live --export -` — stream what the robot is thinking:** `--live` exposes the
   same `--export`/`--export-blocks` JSONL feed as `think run --export` (built by the
   shared `reachy/cli/_export.py` `build_export_hook`, so the two feeds can't drift).
@@ -249,6 +252,20 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
   shared with `say`/`think`) at its own sample rate — self-mute, playback, and
   motion are unchanged downstream. The deployed `live` boot unit passes
   `--voice-engine harmonic` (see the `service` noun below).
+- **`--cognition {marker,agent}` — pick the folded live cognition engine:**
+  `--live`-only (a bare `--cognition` without `--live` is a clean exit-1 error, see
+  `_resolve_cognition`); default `"marker"`, env `REACHY_COGNITION`. `"marker"` is
+  the established `CognitionEngine` (`*emoji*`/`"speech"` parsing, unchanged);
+  `"agent"` swaps in `reachy/speech/agent_turn.py`'s `AgentTurnEngine` — a tool-use
+  loop that acts through `reachy/speech/tools.py`'s `ToolRegistry` (`speak` /
+  `harmonics` / `apply_pose`) instead of parsing markers out of free text. Both
+  engines share the same folded `ThinkHook` seam, the same `EventBuffer`, and the
+  same export sinks, so `agent` is a drop-in with no new process and no second
+  media session. In `agent` mode `--voice-engine` is inert (both `tts` and
+  `harmonic` are always registered as separate tools — see the `say`/`think` noun
+  notes below); it still governs `marker` mode's single speech backend. The
+  deployed `live` boot unit passes `--cognition agent` (see the `service` noun
+  below) — the boot presence reasons via tool calls by default.
 - **`--transcribe` — live cognition hears WORDS, not just sound:** `listen run
   --live --transcribe` (requires `--live`, `sdk`-only) transcribes nearby speech and
   feeds the recognised words into the *same* cognition `EventBuffer` the folded
@@ -322,9 +339,9 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
     never transcribes its own (possibly long) voice. An unreachable STT degrades to
     "no words" and never stalls the loop.
   The deployed `live` boot unit opts in (`listen run --live --transcribe
-  --voice-engine harmonic`). It is still **not** a barge-in assistant — words
-  are one more perception, now gated to clear, addressed speech by the
-  layered engagement gate.
+  --cognition agent --voice-engine harmonic`). It is still **not** a barge-in
+  assistant — words are one more perception, now gated to clear, addressed
+  speech by the layered engagement gate.
 
 ### `say` noun — dumb TTS pipe
 
@@ -347,6 +364,13 @@ resolved by `reachy.speech.voice.resolve_voice_engine`) swaps the whole leg for
 (see the `think` noun below for the shared `reachy/speech/{harmonic,voice}.py`
 module notes). The TTS-only flags (`--voice`/`--speed`/`--tts-url`) are
 accepted but ignored, and documented as such, under `--voice-engine harmonic`.
+
+Under `--cognition agent` (the `listen --live` tool-use engine, below), `say`'s
+TTS leg and `think`'s harmonic leg are not an either/or choice: `reachy/speech/tools.py`
+registers **both** as separate tools — `speak` (TTS) and `harmonics` (the melodic
+voice) — reusing exactly the same `synthesize` + `play_audio` seams this noun and
+`think` already use. The agent picks per utterance instead of the process picking
+one engine for the whole run.
 
 ### `think` noun — continuous cognition loop (SDK-first)
 
@@ -552,9 +576,10 @@ use a transport: it talks to **systemd** (`systemctl --user`), so it never calls
   and `WantedBy=default.target`. The two presence units additionally `Requires=` /
   `After=` the daemon unit — **the daemon is a boot dependency**, started first.
   The live unit's `ExecStart` is `<python> -m reachy listen run --live
-  --transcribe --voice-engine harmonic` — the boot presence hears words and
-  speaks with the offline harmonic voice by default (a user decision; see the
-  `listen` noun's `--voice-engine` bullet above).
+  --transcribe --cognition agent --voice-engine harmonic` — the boot presence
+  hears words, reasons through the tool-use agent, and speaks with the offline
+  harmonic voice by default (a user decision; see the `listen` noun's
+  `--cognition` / `--voice-engine` bullets above).
 - **Manager (`reachy/service/manager.py` `ServiceManager`).** Enforces the
   **single-presence-owner invariant**: `enable(mode)` writes + `enable --now`s the
   daemon and the chosen presence unit and **always `disable --now`s the sibling**,
@@ -570,6 +595,36 @@ use a transport: it talks to **systemd** (`systemctl --user`), so it never calls
   invalid mode is an exit-1 user error. Every verb supports `--json`. Boot at
   machine power-on (vs. first login) needs `loginctl enable-linger`; a true
   reboot check is a manual on-robot step.
+
+### `reachy/stash/` package — behavior stash (not yet a noun)
+
+A persistent, semantically searchable store of body behaviors, for the agent
+tool-use path to fetch and adapt later (`docs/operating-reachy.md`'s "Behavior
+stash" section has the operator-facing walkthrough). Not wired to any CLI verb
+or agent tool yet — today it is driven via its Python API (`StashRecord`,
+`StashStore`, `apply_record`) directly, e.g. from a script or REPL.
+
+- `reachy/stash/record.py` `StashRecord` — a `reachy.behavior.library.LibraryEntry`-
+  shaped record: a name, a natural-language `explanation` (the text embedded for
+  search), a `generator` (must name an existing `reachy.behavior.library.LIBRARY`
+  entry), typed `params`, `channels`, `stop_class`, `lifetime` — **declarative data
+  only**. `StashRecord.from_dict` is the single validation gate and refuses
+  anything smelling of code (an extra field, a non-JSON value, an unknown
+  generator/channel/stop_class) with a clean `CliError`, by design — there is no
+  `exec`/`eval` anywhere in this package.
+- `reachy/stash/store.py` `StashStore` — `add(record)` embeds the explanation via
+  the lobes gateway `/v1/embeddings` route (`reachy/stash/embeddings.py`, stdlib
+  `urllib`, independent of `reachy/speech/llm.py`) and persists it; `search(query,
+  k)` returns the top-k cosine-nearest records (`numpy` only, already a base dep —
+  no new vector-db dependency). The index is one JSON file under
+  `<state_dir>/stash/index.json` (`reachy.daemon.state_dir()`), robust to a
+  missing/corrupt file (degrades to "start fresh", never raises).
+- `reachy/stash/apply.py` `apply_record` / `plan_keyframes` — realizes a fetched
+  record via the vetted `reachy.behavior.library.build()` path (the only callable
+  source) and samples it into a bounded (`DEFAULT_MAX_KEYFRAMES`, default 8) series
+  of `MotionAction` goto keyframes submitted onto a live loop's serial
+  `MotionQueue` — the same queue family `ExpressionProducer` drives, not the 50 Hz
+  `behavior` engine process.
 
 ## Hard constraints
 
