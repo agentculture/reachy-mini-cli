@@ -399,6 +399,208 @@ def test_pathook_close_clears_flag_even_mid_reaction() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 3b. (t1 fix) motion-in-flight gating + re-baseline kill the false-fire loop
+#
+# A minjerk goto takes >1 s in transit; during it the actual pose lags the
+# commanded target by construction, so the OLD hook read that lag as an external
+# press and false-fired (147 phantom pats in 51 min, nobody touching the robot).
+# The fix: a ``motion_busy`` probe pauses sensing while a commanded move is in
+# flight, and the first sensing pass after any suspension re-baselines the
+# detector so the settled pose reads as zero deviation (no self-sustaining loop).
+# A genuine press on a *steady* head must still fire at today's thresholds.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedPoseTransport:
+    """A bare sdk transport whose head_pose returns a caller-set pose, counted.
+
+    ``pose`` is set by the test each tick; ``pose_calls`` records how many times
+    the hook actually read the head pose back (so a test can prove sensing was
+    suppressed while a move was in flight — the read never happens).
+    """
+
+    name = "sdk"
+
+    def __init__(self) -> None:
+        self.pose: tuple[float, float] = (0.0, 0.0)
+        self.pose_calls = 0
+
+    def head_pose(self) -> tuple[float, float]:
+        self.pose_calls += 1
+        return self.pose
+
+
+def test_in_flight_move_suppresses_sensing_no_pat() -> None:
+    """While a commanded move is in flight, PatHook does not sense — no false pat.
+
+    The motion-busy probe reports "a move is in flight" for the whole run; the hook
+    must skip the head-pose read entirely, so a mid-transit pose (which reads like a
+    deep press) never reaches the detector and no pat fires. This is the core bug:
+    transit lag must never be mistaken for a hand.
+    """
+    busy = {"until": 100.0}  # always in flight
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector, motion_busy=lambda t: t < busy["until"])
+    transport = _ScriptedPoseTransport()
+
+    now = 0.0
+    for i in range(40):
+        # A hand-like alternating deep press — would fire if it were ever sensed.
+        transport.pose = (-20.0, 0.0) if i % 2 == 0 else (0.0, 0.0)
+        hook(transport, queue, now)
+        now += 0.1
+
+    assert hook.events == 0, "no pat may fire while a commanded move is in flight"
+    assert transport.pose_calls == 0, "head_pose must not be read while a move is in flight"
+    assert not queue.pending(), "no pat gesture should be enqueued during a commanded move"
+
+
+def test_first_pass_after_reaction_window_rebaselines() -> None:
+    """The first sensing pass after a reaction window closes re-baselines the detector.
+
+    After a pat reaction the idle wander resumes with a fresh goto whose transit used
+    to re-trigger the detector — a self-sustaining loop. The first sensing pass once
+    the window elapses must call ``detector.reset()`` so the settled resume pose reads
+    as zero deviation, and no second pat fires from the robot's own motion.
+    """
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+
+    # Count detector re-baselines (reset calls) via an instance-level spy.
+    resets = {"n": 0}
+    orig_reset = detector.reset
+
+    def _counting_reset() -> None:
+        resets["n"] += 1
+        orig_reset()
+
+    detector.reset = _counting_reset  # type: ignore[method-assign]
+
+    hook = PatHook(queue, detector=detector)
+    transport = _ScriptedPoseTransport()
+
+    # Phase 1: a real pat fires (alternating deep presses against a neutral command).
+    now = 0.0
+    for i in range(8):
+        transport.pose = (-20.0, 0.0) if i % 2 == 0 else (0.0, 0.0)
+        hook(transport, queue, now)
+        if hook.events >= 1:
+            break
+        now += 0.4
+    assert hook.events == 1
+    resets_at_fire = resets["n"]  # the fire path already reset once
+    calls_at_fire = transport.pose_calls
+    reacting_until = hook._reacting_until
+
+    # Phase 2: advance through the reaction window — sensing is paused (no pose reads).
+    t = now + 0.1
+    while t < reacting_until:
+        hook(transport, queue, t)
+        t += 0.1
+    assert transport.pose_calls == calls_at_fire, "head_pose must not be read during the window"
+
+    # Phase 3: first sensing pass AFTER the window, with a settled pose (actual ==
+    # commanded == neutral). It must re-baseline and read zero deviation — no re-fire.
+    transport.pose = (0.0, 0.0)
+    hook(transport, queue, reacting_until + 0.05)
+
+    assert resets["n"] == resets_at_fire + 1, "the first post-window pass must re-baseline"
+    assert hook.events == 1, "the settled resume pose must not re-fire a pat"
+    assert len(detector.press_times) == 0, "re-baseline must clear stale press state"
+
+
+def test_genuine_press_on_steady_head_still_detects_at_default_thresholds() -> None:
+    """A hand press on a steady (not-in-flight) head still fires a pat — today's thresholds.
+
+    The motion-busy probe reports "not in flight" (the robot holds a steady commanded
+    pose), so the hook senses every tick and a genuine external press still crosses the
+    DEFAULT detector thresholds (only the level2 jitter is pinned for determinism). The
+    fix suppresses self-motion, never a real pat on a settled head.
+    """
+    busy = {"until": 0.0}  # never in flight → steady head
+    queue: MotionQueue = MotionQueue()
+    # Default thresholds (min_presses=2, press_threshold=1.2, pat_cooldown=2.0) — only
+    # the level2 jitter is pinned so the test is deterministic.
+    detector = PatDetector(level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector, motion_busy=lambda t: t < busy["until"])
+    transport = _ScriptedPoseTransport()
+
+    commanded = {"pitch": 0.0, "yaw": 0.0}
+    fired = False
+    now = 0.0
+    for i in range(12):
+        transport.pose = (-20.0, 0.0) if i % 2 == 0 else (0.0, 0.0)
+        hook(transport, queue, now, commanded)
+        if hook.events >= 1:
+            fired = True
+            break
+        now += 0.4
+
+    assert fired, "a genuine press on a steady head must still fire a pat at today's thresholds"
+    labels = [a.label for a in queue.pending()]
+    assert any(label.startswith("pat_") for label in labels), labels
+    assert ps.is_active() is True
+
+
+def test_server_run_publishes_busy_and_gates_pathook() -> None:
+    """server.run publishes its busy horizon so a folded PatHook skips transit end-to-end.
+
+    A producer emits one long move; while it is in flight the loop's actual pose lags the
+    commanded target (transit). The PatHook, wired with a probe reading the loop's
+    published ``busy`` horizon, must NOT sense during that transit — proving the busy
+    publish + probe close the false-fire loop through the real ``server.run`` seam.
+    """
+    busy = {"until": 0.0}
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector, motion_busy=lambda t: t < busy["until"])
+
+    class _TransitTransport:
+        name = "sdk"
+
+        def __init__(self) -> None:
+            self.pose_calls = 0
+            self.gotos: list[float] = []
+
+        def head_pose(self) -> tuple[float, float]:
+            self.pose_calls += 1
+            return (-20.0, 0.0)  # would look like a deep press if sensed mid-transit
+
+        def move_goto(self, *, head=None, antennas=None, body_yaw=None, duration, interpolation):
+            self.gotos.append(duration)
+            return {"uuid": "x"}
+
+    class _OneLongMove:
+        def __init__(self) -> None:
+            self.done = False
+
+        def update(self, t, sense, **_kwargs):
+            if self.done:
+                return None
+            self.done = True
+            return MotionAction(label="idle", head={"pitch": 30.0}, duration=2.0)
+
+    transport = _TransitTransport()
+    run(
+        transport,
+        _OneLongMove(),
+        now=_Clock(0.1),
+        sleep=lambda *_: None,
+        tick=0.1,
+        settle=0.2,
+        max_ticks=15,  # 1.5 s < move (2.0) + settle (0.2) → the move stays in flight
+        queue=queue,
+        hooks=LoopHooks(on_tick=hook),
+        busy=busy,
+    )
+    assert hook.events == 0, "no pat may fire while the loop's move is in flight"
+    # Tick 1 senses (nothing dispatched yet); from tick 2 the move is in flight and the
+    # published busy horizon gates every further head-pose read.
+    assert transport.pose_calls <= 1, "head_pose must not be read once the move is in flight"
+
+
+# ---------------------------------------------------------------------------
 # 4. server.run with on_tick=None is byte-identical to before
 # ---------------------------------------------------------------------------
 

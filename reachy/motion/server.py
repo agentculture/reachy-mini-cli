@@ -135,11 +135,21 @@ def _drive(
     max_ticks,
     max_errors,
     stop,
+    busy: dict | None = None,
 ) -> int:
-    """The serial body: drain the producer into the queue, run one move at a time."""
+    """The serial body: drain the producer into the queue, run one move at a time.
+
+    When ``busy`` is a dict, the loop publishes ``busy["until"] = st.busy_until``
+    before each ``on_tick`` — the wall-clock horizon (dispatch + duration + settle)
+    the current move is in flight until. A folded hook (``listen``'s ``PatHook``)
+    reads it via a ``(t) -> t < busy["until"]`` probe to skip sensing while the head
+    is mid-move, so a move's transit lag is never mistaken for an external press.
+    """
     st = _DriveState(on_action=hooks.on_action)
     while not stop["flag"]:
         t = now()
+        if busy is not None:
+            busy["until"] = st.busy_until
         if hooks.on_tick is not None:
             hooks.on_tick(transport, q, t, st.commanded_head)
         snap, sp = hooks.audio(t) if hooks.audio is not None else (False, None)
@@ -168,6 +178,7 @@ def run(
     max_ticks: int | None = None,
     max_errors: int = 5,
     stop: dict | None = None,
+    busy: dict | None = None,
 ) -> int:
     """Drive the robot from ``producer`` actions until stopped. Returns ticks run.
 
@@ -191,6 +202,13 @@ def run(
       pat (deviation = actual − commanded), so ``listen``'s own commanded turns
       never read as a press.
 
+    ``busy`` (optional) is a mutable dict the loop publishes its ``busy_until``
+    horizon into each tick (``busy["until"]``) — the wall-clock time the current
+    move is in flight until. A folded ``on_tick`` hook reads it through a probe to
+    pause sensing while a commanded move is mid-flight (so transit lag never reads
+    as an external press). Default ``None`` publishes nothing — byte-identical to
+    before for every caller that does not pass it.
+
     Moves are run one at a time via ``transport.move_goto`` — never overlapping.
     """
     q = queue if queue is not None else MotionQueue()
@@ -210,6 +228,7 @@ def run(
             max_ticks=max_ticks,
             max_errors=max_errors,
             stop=stop,
+            busy=busy,
         )
     finally:
         if handlers is not None:
