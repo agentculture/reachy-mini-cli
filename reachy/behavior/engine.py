@@ -62,6 +62,57 @@ class ActiveBehavior:
     is_base: bool = False
 
 
+def _noop_emit(_event: dict) -> None:
+    """Default ``TickContext.emit`` when the seam registers no event consumers."""
+
+
+@dataclass
+class TickContext:
+    """The per-tick seam contract handed to ``engine.run(tick_seam=...)``.
+
+    The engine builds one fresh ``TickContext`` each tick — *after* that tick's
+    pose has streamed — and invokes ``tick_seam(ctx)`` exactly once with it. It
+    is the single, generous integration seam every per-tick rider shares (the
+    rules evaluator, the goto lane, the export feed); a rider reads perception,
+    admits/evicts behaviors, and publishes events through it without the engine
+    importing the rider. Fields:
+
+    * ``now`` / ``tick`` — the engine's injected monotonic clock reading for this
+      tick and the 1-based tick counter (both deterministic under the engine's
+      ``now`` / ``max_ticks`` seams).
+    * ``sense`` — this tick's :class:`~reachy.behavior.sense.Sense` snapshot,
+      read UNGATED whenever a ``tick_seam`` is installed (so a rider sees
+      perception every tick, not only while a ``wants_sense`` behavior is
+      active). :data:`~reachy.behavior.sense.EMPTY_SENSE` when no ``sense``
+      source was supplied.
+    * ``ownership`` — the ``{channel: owner_id | None}`` resolved this tick.
+    * ``emit`` — ``emit(event: dict) -> None``: publish a structured event; it
+      fans out to whatever event consumers the ``tick_seam`` registered (a
+      no-op, :func:`_noop_emit`, when the seam exposes no ``.emit``).
+    * ``admit`` — ``admit(behavior) -> dict``: put a
+      :func:`reachy.behavior.library.build` result onto the engine's active set
+      (see :meth:`Engine.admit_behavior`).
+    * ``evict`` — ``evict(name_or_id) -> dict``: stop every active behavior
+      matching that library name or id (see :meth:`Engine.stop`).
+    * ``active_names`` — ``active_names() -> set[str]``: the library names of the
+      behaviors currently active.
+
+    The ``tick_seam`` is invoked directly and is responsible for its own error
+    isolation (the engine adds none), so one rider raising never silently eats
+    another; :class:`reachy.behavior.rule_engine.TickBus` is the reusable
+    fault-isolating composition of drivers + event consumers.
+    """
+
+    now: float
+    tick: int
+    sense: Sense
+    ownership: dict
+    emit: Callable[[dict], None]
+    admit: Callable[[Behavior], dict]
+    evict: Callable[[str], dict]
+    active_names: Callable[[], set[str]]
+
+
 @dataclass
 class Engine:
     """The active-behavior set and the per-tick composition."""
@@ -118,6 +169,17 @@ class Engine:
         beh = library.build(name, params, stop_class, lifetime, self._next_id(name))
         if channels:
             beh = dataclasses.replace(beh, channels=frozenset(channels))
+        return self.admit_behavior(beh, now)
+
+    def admit_behavior(self, beh: Behavior, now: float) -> dict:
+        """Admit an already-built :class:`Behavior` onto the active set.
+
+        The shared admit -> evict -> append path behind :meth:`add`, and also the
+        per-tick seam's react entry point (``TickContext.admit``): a rules/goto
+        consumer hands a :func:`reachy.behavior.library.build` result straight
+        onto the active set without re-deriving eviction. Returns the same
+        outcome dict as :meth:`add`.
+        """
         result = admit(beh, self.behaviors())
         evicted_ids = {b.id for b in result.evicted}
         if evicted_ids:
@@ -127,8 +189,8 @@ class Engine:
             "ok": True,
             "op": "add",
             "id": beh.id,
-            "name": name,
-            "class": stop_class.value,
+            "name": beh.name,
+            "class": beh.stop_class.value,
             "channels": sorted(beh.channels),
             "evicted": [b.id for b in result.evicted],
             "blocked": result.blocked,
@@ -318,13 +380,17 @@ def _apply_commands(engine: Engine, control: "control_mod.CommandSpool | None", 
     return changed
 
 
-def _read_sense(engine: Engine, sense, t: float) -> Sense:
+def _read_sense(engine: Engine, sense, t: float, *, force: bool = False) -> Sense:
     """Poll the sense source — but only while some behavior wants it (else EMPTY).
 
     Gating on ``wants_sense`` keeps an idle engine from touching the mic endpoint
     at all; the :class:`~reachy.behavior.sense.DoaPoller` itself throttles the rate.
+    ``force`` overrides the gate: when a ``tick_seam`` is installed the seam
+    consumes perception every tick, so the read happens regardless of whether any
+    active behavior wants it (a rule can then react to sound even before it has
+    admitted a sensor-driven behavior).
     """
-    if sense is None or not any(ab.behavior.wants_sense for ab in engine.active):
+    if sense is None or not (force or any(ab.behavior.wants_sense for ab in engine.active)):
         return EMPTY_SENSE
     return sense(t)
 
@@ -342,18 +408,38 @@ def _drive(
     max_ticks: int | None,
     timing: _Timing,
     sense=None,
+    tick_seam=None,
 ) -> int:
     """The 50 Hz body: drain → compose → stream → publish, until stopped. Returns ticks."""
     ticks = 0
     consecutive = 0
     last_state_tick = -timing.heartbeat
+    seam_emit = _noop_emit
+    if tick_seam is not None:
+        candidate = getattr(tick_seam, "emit", None)
+        if callable(candidate):
+            seam_emit = candidate
     while not stop["flag"]:
         t = now()
         changed = _apply_commands(engine, control, t)
-        tick = engine.compose_tick(t, _read_sense(engine, sense, t))
+        snapshot = _read_sense(engine, sense, t, force=tick_seam is not None)
+        tick = engine.compose_tick(t, snapshot)
         changed = changed or bool(tick["expired"])
         consecutive = _stream_tick(sink, tick["pose"], consecutive, config.max_errors)
         ticks += 1
+        if tick_seam is not None:
+            tick_seam(
+                TickContext(
+                    now=t,
+                    tick=ticks,
+                    sense=snapshot,
+                    ownership=tick["ownership"],
+                    emit=seam_emit,
+                    admit=lambda beh, _t=t: engine.admit_behavior(beh, _t),
+                    evict=engine.stop,
+                    active_names=lambda: {ab.behavior.name for ab in engine.active},
+                )
+            )
         if control is not None and (changed or ticks - last_state_tick >= timing.heartbeat):
             control.write_state(engine.state(t, config))
             last_state_tick = ticks
@@ -377,6 +463,7 @@ def run(
     control: control_mod.CommandSpool | None = None,
     engine: Engine | None = None,
     sense=None,
+    tick_seam=None,
 ) -> int:
     """Drive the robot from composed behaviors until stopped. Returns ticks run.
 
@@ -386,8 +473,17 @@ def run(
 
     ``sense`` is an optional ``(t) -> Sense`` source (e.g. a
     :class:`~reachy.behavior.sense.DoaPoller`); it is polled only while a
-    sensor-driven behavior is active, and every behavior otherwise gets
-    :data:`EMPTY_SENSE`.
+    sensor-driven behavior is active (or every tick once a ``tick_seam`` is
+    installed), and every behavior otherwise gets :data:`EMPTY_SENSE`.
+
+    ``tick_seam`` is the single per-tick integration seam: an optional callable
+    invoked once per tick as ``tick_seam(ctx)`` with a fresh :class:`TickContext`
+    (see its docstring for the full contract). It is how the rules evaluator, the
+    goto lane, and the export feed ride the loop without the engine importing any
+    of them — compose the seam at the call site (e.g.
+    :func:`reachy.behavior.rule_engine.compose_rule_seam`). If the seam exposes an
+    ``emit(event)`` method it becomes ``ctx.emit``'s fan-out target. The seam is
+    invoked directly and owns its own error isolation.
     """
     engine = engine if engine is not None else Engine()
     if control is not None:
@@ -416,6 +512,7 @@ def run(
                     max_ticks=max_ticks,
                     timing=timing,
                     sense=sense,
+                    tick_seam=tick_seam,
                 )
             finally:
                 if config.settle:
