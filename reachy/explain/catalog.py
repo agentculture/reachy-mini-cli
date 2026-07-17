@@ -1155,6 +1155,57 @@ machine-reboot check is therefore a manual on-robot step.
 """
 
 
+_AGENT = """\
+# reachy-mini-cli agent
+
+Attach an **external AI agent** over the symbolic runtime's seams. The
+deterministic 50 Hz loop (`behavior engine run`) is AI-agnostic (decision c11):
+it ticks, evaluates its rules, and sustains intents entirely on its own. This
+noun is the agent client — a *separate process* that attaches from outside, with
+**no unit edit and no loop restart**, and never opens the robot's SDK.
+
+Three composition seams:
+
+- **INPUT** — `--feed <path|->`: read the runtime's own event feed
+  (`sense`/`rule`/`intent`/`motion` JSONL, produced by `behavior engine run
+  --export -`) from a path (stream/FIFO/file) or `-` for stdin. This client never
+  spawns the runtime; it only reads the feed the runtime writes. Each event maps
+  to a short first-person perception cue for the agent's turn.
+- **COGNITION** — a tool-use engine whose actions are **atomic intent-spool
+  writes** (`run_behavior` / `declare_goal` / `set_mode` / `set_inhibition`) the
+  running engine drains each tick. The agent moves the robot *through the runtime*
+  rather than around it. The built-in `speak`/`harmonics`/`apply_pose` tools are
+  present too but publish-only — they feed the cognition feed's
+  `message`/`emotion` blocks without the external client touching the robot.
+- **OUTPUT** — `--export -` / `--export-blocks`: the agent publishes its OWN
+  `thinking`/`message`/`emotion` feed through the SAME exporter `think`/`listen`
+  use (decision c27: the runtime feed carries no cognition block). See
+  `docs/export-schema.md`.
+
+Like `daemon` / `service`, `agent` does not use a `--transport` — it talks to
+feeds + the intent spool, not the robot.
+
+## Verbs
+
+- `reachy-mini-cli agent attach` — read the runtime feed, act via the intent
+  spool, publish the agent's own cognition feed. Flags: `--feed <path|->`,
+  `--spool-dir DIR` (default: the shared state dir), `--await-timeout SECONDS`,
+  `--max-turns N`, `--max-events N`, `--export -` / `--export-blocks`, `--json`.
+- `reachy-mini-cli agent overview` — this summary.
+
+## Usage
+
+    reachy-mini-cli behavior engine run --export - > /tmp/runtime.feed &   # the runtime
+    reachy-mini-cli agent attach --feed /tmp/runtime.feed --export -       # the agent
+
+## Exit codes
+
+- `0` success
+- `1` user-input error
+- `2` environment error (unreadable feed)
+"""
+
+
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
     ("reachy",): _ROOT,
@@ -1265,4 +1316,7 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("service", "status"): _SERVICE,
     ("service", "install"): _SERVICE,
     ("service", "uninstall"): _SERVICE,
+    ("agent",): _AGENT,
+    ("agent", "overview"): _AGENT,
+    ("agent", "attach"): _AGENT,
 }

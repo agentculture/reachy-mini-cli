@@ -62,6 +62,7 @@ def _argv_has_json(argv: list[str] | None) -> bool:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from reachy.cli._commands import agent as _agent_group
     from reachy.cli._commands import app as _app_group
     from reachy.cli._commands import behavior as _behavior_group
     from reachy.cli._commands import cli as _cli_group
@@ -127,6 +128,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _sleep_group.register(sub)
     # Boot persistence: one CLI surface over the presence-service manager.
     _service_group.register(sub)
+    # External agent client: attach over the runtime feed + intent spool.
+    _agent_group.register(sub)
 
     return parser
 
