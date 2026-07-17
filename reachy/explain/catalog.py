@@ -446,9 +446,18 @@ capability to feed a sensor-driven behavior a live reading, but ships none today
 - `reachy-mini-cli behavior stop <id|name|all>` — stop a running behavior
   (`all` keeps the passive base layer).
 - `reachy-mini-cli behavior status` — active behaviors, per-channel ownership,
-  and engine/daemon state.
+  engine/daemon state, rules-file health (path + counts), and — once the
+  engine has published one — the live agent-intents view (goal/inhibitions/
+  mode; see "Rules" below).
 - `reachy-mini-cli behavior reload` — reload `rules.toml` in the running
   engine, applied between ticks (see "Rules" below).
+- `reachy-mini-cli behavior rules` (alias `rules list`) — render the loaded
+  `rules.toml` (react/inhibit rules, modes, active mode). A missing file is
+  not an error; a malformed one is a clean exit-1 naming every reason. Reads
+  the file directly — no running engine needed.
+- `reachy-mini-cli behavior rules check` — validate `rules.toml` as a linter:
+  a malformed file reports `ok=false` with reasons but still exits 0; only an
+  unreadable path (permissions, a vanished mount, ...) is a clean exit-2.
 - `reachy-mini-cli behavior engine start|stop|status|run` — manage the 50 Hz
   engine process (start/stop in the background, or `run` in the foreground).
 - `reachy-mini-cli behavior overview` — the verb summary.
@@ -1197,6 +1206,10 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("behavior", "stop"): _BEHAVIOR,
     ("behavior", "status"): _BEHAVIOR,
     ("behavior", "reload"): _BEHAVIOR,
+    ("behavior", "rules"): _BEHAVIOR,
+    ("behavior", "rules", "list"): _BEHAVIOR,
+    ("behavior", "rules", "check"): _BEHAVIOR,
+    ("behavior", "rules", "overview"): _BEHAVIOR,
     ("behavior", "engine"): _BEHAVIOR,
     ("behavior", "engine", "overview"): _BEHAVIOR,
     ("behavior", "engine", "start"): _BEHAVIOR,
