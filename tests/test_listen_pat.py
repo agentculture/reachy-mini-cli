@@ -437,14 +437,15 @@ class _ScriptedPoseTransport:
 
 
 def test_in_flight_move_suppresses_sensing_no_pat() -> None:
-    """While an unknown-size move is in flight at startup, both axes are masked.
+    """While an unknown-start move is in flight at startup, sensing rides it out.
 
     On the very first tick the hook has no previous commanded pose to diff against,
-    so an in-flight move's size is unknown and both axes are masked (fed as
-    released) to the published horizon: a mid-transit pose (which reads like a deep
-    press) never reaches the detector as deviation and no pat fires. This is the
-    core bug: transit lag must never be mistaken for a hand. The head pose is still
-    read each tick — masking replaces skipping, so detection is never starved.
+    so an in-flight move's start is unknown and no expected trajectory can be
+    computed: sensing skips to the published horizon, so a mid-transit pose (which
+    reads like a deep press) never reaches the detector and no pat fires. This is
+    the core bug: transit lag must never be mistaken for a hand. It is also the
+    ONLY unsensed window — every tracked move afterwards is sensed via its
+    expected minjerk pose.
     """
     busy = {"until": 100.0}  # a move in flight from before the hook's first tick
     queue: MotionQueue = MotionQueue()
@@ -460,7 +461,7 @@ def test_in_flight_move_suppresses_sensing_no_pat() -> None:
         now += 0.1
 
     assert hook.events == 0, "no pat may fire while a commanded move is in flight"
-    assert transport.pose_calls == 40, "the pose is read every tick (masked, not skipped)"
+    assert transport.pose_calls == 0, "an unknown-start move is ridden out unsensed"
     assert not queue.pending(), "no pat gesture should be enqueued during a commanded move"
 
 
@@ -554,12 +555,12 @@ def test_genuine_press_on_steady_head_still_detects_at_default_thresholds() -> N
 def test_server_run_publishes_busy_and_gates_pathook() -> None:
     """server.run publishes its busy horizon so a folded PatHook skips transit end-to-end.
 
-    A producer emits one long LARGE move (a 30° pitch jump); while it is in flight the
-    loop's actual pose lags the commanded target (transit). The PatHook, wired with the
-    loop's published ``busy`` horizon, observes the commanded pitch jump and masks the
-    pitch axis for the transit — the lag never reads as a press — proving the busy
-    publish + horizon seam close the false-fire loop through the real ``server.run``
-    seam.
+    A producer emits one long LARGE move (a 30° pitch jump); the transport's actual
+    pose stays pinned (a lag-shaped worst case). Measured against the expected
+    minjerk pose, that reads as one long sustained deviation — a single press with
+    no release edges — which can never reach ``min_presses``, so no pat fires
+    through the real ``server.run`` seam. (A real hand alternates press/release
+    edges; sustained transit-shaped deviation does not.)
     """
     busy = {"until": 0.0}
     queue: MotionQueue = MotionQueue()
@@ -605,9 +606,8 @@ def test_server_run_publishes_busy_and_gates_pathook() -> None:
         busy=busy,
     )
     assert hook.events == 0, "no pat may fire while the loop's move is in flight"
-    # The pose is read every tick (masking, not skipping); the pitch mask starts on
-    # tick 2 (when the commanded jump is first observed), so at most tick 1's single
-    # unmasked deep read reaches the detector — below min_presses, so never a pat.
+    # The pose is read and sensed every tick — expectation-based sensing never skips;
+    # the sustained transit-shaped deviation simply never produces press edges.
     assert transport.pose_calls >= 2, "the pose keeps being read during the transit"
 
 
@@ -648,13 +648,14 @@ def test_press_detected_through_continuous_small_idle_moves() -> None:
 
 
 def test_pitch_scratch_detects_through_yaw_look_transit() -> None:
-    """Per-axis masking: a yaw look masks only yaw — a pitch scratch fires mid-transit.
+    """Expectation sensing: clean transit reads zero; a scratch mid-look still fires.
 
     Sequence mirrors the live journal's active wander (large yaw drifts nearly
-    back-to-back, which starved a whole-move gate for minutes). During a 13° yaw
-    look's transit the yaw axis is masked — its lag (which would read as a side_pat)
-    is fed as released and never fires — but the pitch axis keeps sensing, so a
-    genuine head scratch DURING the look still detects.
+    back-to-back, which starved every gating variant for minutes). During a 13° yaw
+    look, an actual pose that TRACKS the expected minjerk trajectory reads ≈ 0
+    deviation and never fires — and a deep alternating pitch press layered ON TOP
+    of that tracking pose (a hand scratching mid-move) fires a scratch while the
+    move is still in flight.
     """
     busy = {"until": 0.0}
     queue: MotionQueue = MotionQueue()
@@ -670,26 +671,29 @@ def test_pitch_scratch_detects_through_yaw_look_transit() -> None:
         now += 0.1
     assert hook.events == 0
 
-    # Phase 2: the look dispatches — commanded yaw jumps to 13° (large), horizon
-    # now+1.7. The yaw transit lag alone (actual trailing the target by up to 13°,
-    # far beyond the side_pat threshold) must NOT fire while masked.
-    look_horizon = now + 1.7
-    busy["until"] = look_horizon
+    # Phase 2: the look dispatches — commanded yaw jumps to 13°, horizon now+1.7.
+    # The actual pose follows the expected trajectory exactly (a head tracking its
+    # plan). On the dispatch tick the expectation starts at the move's start pose.
+    look_cmd = {"pitch": 0.0, "yaw": 13.0}
+    busy["until"] = now + 1.7
+    transport.pose = (0.0, 0.0)  # dispatch tick: still at the start pose
+    hook(transport, queue, now, look_cmd)
+    now += 0.1
     for _ in range(4):
-        transport.pose = (0.0, 4.0)  # yaw mid-transit; pitch untouched
-        hook(transport, queue, now, {"pitch": 0.0, "yaw": 13.0})
+        expected = hook._expected_head(now, look_cmd)
+        transport.pose = expected  # clean transit: tracking the plan
+        hook(transport, queue, now, look_cmd)
         now += 0.1
-    assert hook.events == 0, "yaw transit lag must not fire a side_pat while masked"
+    assert hook.events == 0, "a head tracking its planned trajectory must not fire"
 
     # Phase 3: still INSIDE the look's transit, a hand scratches — deep alternating
-    # pitch deviation. The pitch axis is unmasked (the look was yaw-only), so the
-    # scratch fires even though a large move is in flight and busy stays ahead.
+    # pitch deviation layered on top of the tracking pose. It fires mid-move.
     fired = False
     for i in range(8):
-        yaw_actual = 6.0 + i  # still travelling toward 13°
-        pitch = -20.0 if i % 2 == 0 else 0.0
-        transport.pose = (pitch, min(yaw_actual, 13.0))
-        hook(transport, queue, now, {"pitch": 0.0, "yaw": 13.0})
+        expected = hook._expected_head(now, look_cmd)
+        press = -20.0 if i % 2 == 0 else 0.0
+        transport.pose = (expected[0] + press, expected[1])
+        hook(transport, queue, now, look_cmd)
         if hook.events >= 1:
             fired = True
             break
