@@ -511,6 +511,56 @@ class TestFeedPat:
 
 
 # ---------------------------------------------------------------------------
+# feed_face (task t9)
+# ---------------------------------------------------------------------------
+
+
+class TestFeedFace:
+    """feed_face(name) -> a 'saw <name>' cue for a known/named face."""
+
+    def test_known_name_appends_saw_cue(self):
+        buf = _make_buffer()
+        buf.feed_face("Ada")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "saw Ada"
+
+    def test_name_is_stripped(self):
+        buf = _make_buffer()
+        buf.feed_face("  Ada  ")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "saw Ada"
+
+    def test_empty_name_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_face("")
+        assert buf.snapshot() == []
+
+    def test_whitespace_only_name_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_face("   ")
+        assert buf.snapshot() == []
+
+    def test_none_name_does_not_raise(self):
+        buf = _make_buffer()
+        buf.feed_face(None)  # type: ignore[arg-type]
+        assert buf.snapshot() == []
+
+    def test_face_cue_has_timestamp_from_injected_clock(self):
+        tick = [0.0]
+
+        def clock():
+            tick[0] += 1.0
+            return tick[0]
+
+        buf = _make_buffer(clock=clock)
+        buf.feed_face("Ada")
+        cues = buf.snapshot()
+        assert cues[0].timestamp == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
 # [SENSE] cue instrumentation (task t4)
 #
 # Every feed_* call that actually appends a cue emits exactly one parseable
@@ -625,5 +675,25 @@ class TestSenseLogCueInstrumentation:
         buf = _make_buffer()
         with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
             buf.feed_pat("tickle", "level1")
+
+        assert _sense_records(caplog) == []
+
+    def test_feed_face_logs_one_sense_line_with_source_face(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_face("Ada")
+
+        records = _sense_records(caplog)
+        assert len(records) == 1
+        match = _SENSE_LINE_RE.match(records[0].getMessage())
+        assert match is not None
+        assert match.group("stage") == "cue"
+        assert match.group("source") == "face"
+        assert "saw Ada" in match.group("detail")
+
+    def test_feed_face_empty_stays_silent(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_face("")
 
         assert _sense_records(caplog) == []

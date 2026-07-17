@@ -762,6 +762,54 @@ def _build_transcribe_hook(
     )
 
 
+def _build_face_hook(
+    vision_hook: object,
+    buffer: object | None,
+    *,
+    clock: Callable[[], float] | None = None,
+) -> object | None:
+    """Build a FaceHook sharing VisionHook's frame source, or ``None`` when unavailable.
+
+    Face recognition needs the ``[vision]`` extra (opencv). When cv2 is not
+    importable — CI's bare install, the HTTP remote profile — the hook is skipped
+    with a single logged warning rather than crashing the loop (the same lazy-extra
+    degrade the other sense engines use). When available it lazily builds the real
+    :class:`~reachy.vision.face.FaceEngine` +
+    :class:`~reachy.vision.face_store.FaceStore` and wires (a) the SHARED cognition
+    ``buffer`` (so a recognised face reaches cognition via the same buffer PatHook /
+    the think engine consume) and (b) the SHARED frame source
+    ``vision_hook.latest_frame`` — the non-consuming peek at VisionHook's ONE
+    grabber, so face detection never opens a second camera grabber.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("cv2") is None:
+        logger.warning(
+            "listen --live: face recognition needs the [vision] extra (opencv); "
+            "skipping FaceHook (install: pip install 'reachy-mini-cli[vision]')"
+        )
+        return None
+    try:
+        from reachy.motion.listen_face import FaceHook
+        from reachy.vision.face import FaceEngine
+        from reachy.vision.face_store import FaceStore
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "listen --live: face recognition unavailable; skipping FaceHook", exc_info=True
+        )
+        return None
+
+    kwargs: dict[str, object] = {
+        "engine": FaceEngine(),
+        "store": FaceStore(),
+        "frame_provider": vision_hook.latest_frame,  # type: ignore[attr-defined]
+        "buffer": buffer,
+    }
+    if clock is not None:
+        kwargs["clock"] = clock
+    return FaceHook(**kwargs)
+
+
 def _build_live_hooks(
     transport: object,
     queue: MotionQueue,
@@ -857,6 +905,11 @@ def _build_live_hooks(
     # cognition directly too (coalesced; see reachy.motion.listen_vision's module
     # docstring), the same way a detected pat already does.
     vision_hook = VisionHook(queue=queue, transport=transport, buffer=buffer)
+    # Face recognition rides the SAME ONE grabber vision owns (frame_provider=
+    # vision_hook.latest_frame — a non-consuming peek, no second grabber) and feeds
+    # the SAME shared cognition buffer. Skipped (logged) when the [vision] extra is
+    # not importable, so a bare install / CI never crashes on a missing cv2.
+    face_hook = _build_face_hook(vision_hook, buffer, clock=clock)
 
     # The shared cognition buffer (built by the caller, before pat_hook, and handed
     # in as ``buffer``) + self-mute window live at composition level, so pat_hook
@@ -928,6 +981,10 @@ def _build_live_hooks(
             ordered.append(transcribe_hook)
 
     ordered.append(vision_hook)
+    # Face recognition rides last too — like vision it competes for nothing the
+    # ``*_active`` flags arbitrate. Omitted when the [vision] extra is unavailable.
+    if face_hook is not None:
+        ordered.append(face_hook)
     return ordered
 
 

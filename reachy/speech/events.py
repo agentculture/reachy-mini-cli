@@ -25,6 +25,10 @@ Four feed methods accept values that callers read from hardware/daemons:
   and intensity level) from :class:`~reachy.motion.pat.PatDetector`.  Produces
   cues like ``"felt a gentle scratch on the head"``.
 
+* :meth:`EventBuffer.feed_face` — the name of a recognised (known, named) face
+  from :class:`~reachy.motion.listen_face.FaceHook`.  Produces cues like
+  ``"saw Ada"``.  An unknown/empty name yields no cue.
+
 Design constraints
 ------------------
 * **Pure in-process** — no I/O, no hardware access, no new dependencies.
@@ -363,6 +367,28 @@ class EventBuffer:
 
         self._append(f"felt a {intensity} {phrase} on the head", source="pat")
 
+    def feed_face(self, name: str) -> None:
+        """Translate one recognised face into zero or one cue and append it.
+
+        Parameters
+        ----------
+        name:
+            The name of the matched permanent-tier face, as reported by
+            :class:`~reachy.motion.listen_face.FaceHook`
+            (:class:`~reachy.vision.face_store.FaceMatch.name`).  Stripped of
+            surrounding whitespace.
+
+        Cue rules
+        ---------
+        * Non-empty *name* → ``"saw <name>"``
+        * ``None`` / empty / whitespace-only → no cue (an unknown or unnamed face
+          is never announced by name; defensive default, never raises).
+        """
+        if not name or not str(name).strip():
+            return
+
+        self._append(f"saw {str(name).strip()}", source="face")
+
     # ------------------------------------------------------------------
     # Snapshot
     # ------------------------------------------------------------------
@@ -394,11 +420,11 @@ class EventBuffer:
         """Append a new cue under the lock and emit its [SENSE stage=cue] line.
 
         ``source`` names the feed kind that produced this cue (``"doa"``,
-        ``"vision"``, ``"transcript"``, ``"pat"``) — every ``feed_*`` call that
-        actually appends a cue routes through here, so every cue is logged exactly
-        once. A ``feed_*`` call that produces *no* cue because of a threshold never
-        reaches this method — it stays silent, not a drop (see the module/method
-        docstrings' "Cue rules").
+        ``"vision"``, ``"transcript"``, ``"pat"``, ``"face"``) — every ``feed_*``
+        call that actually appends a cue routes through here, so every cue is
+        logged exactly once. A ``feed_*`` call that produces *no* cue because of a
+        threshold never reaches this method — it stays silent, not a drop (see the
+        module/method docstrings' "Cue rules").
         """
         cue = SenseCue(text=text, timestamp=self._clock())
         with self._lock:

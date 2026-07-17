@@ -210,6 +210,20 @@ class _FrameHolder:
             self._fresh = False
             return self._frame
 
+    def peek(self) -> object | None:
+        """Return the latest published frame WITHOUT consuming it.
+
+        Unlike :meth:`take` (which hands a frame out at most once so vision's own
+        per-tick detector never re-reads a stale frame), :meth:`peek` leaves the
+        ``_fresh`` flag untouched — so a *second* consumer (the folded
+        :class:`~reachy.motion.listen_face.FaceHook`) can read the most recent
+        grabbed frame off this ONE grabber without stealing it from vision's own
+        :meth:`take`. Face detection at ~2 Hz just wants the freshest frame
+        available; whether vision already looked at it is irrelevant.
+        """
+        with self._lock:
+            return self._frame
+
 
 class VisionHook:
     """A per-tick ``on_tick`` hook running vision detection inside ``listen``'s loop.
@@ -405,6 +419,19 @@ class VisionHook:
         self._last_cue_kind = kind
         self._last_cue_value = value
         self._last_cue_time = t
+
+    def latest_frame(self) -> object | None:
+        """Non-consuming peek at the most recent grabbed frame (the FaceHook seam).
+
+        Returns the latest frame this hook's background grabber has published
+        WITHOUT consuming it (see :meth:`_FrameHolder.peek`), so the folded
+        :class:`~reachy.motion.listen_face.FaceHook` can share this ONE grabber's
+        frames instead of opening a second camera grabber (single-SDK-owner). The
+        composition layer (:func:`reachy.cli._commands.listen._build_live_hooks`)
+        passes this bound method to ``FaceHook(frame_provider=...)``; vision's own
+        per-tick :meth:`__call__` is unaffected (it still uses :meth:`take`).
+        """
+        return self._holder.peek()
 
     def close(self) -> None:
         """Stop the background grabber thread (idempotent, bounded join).
