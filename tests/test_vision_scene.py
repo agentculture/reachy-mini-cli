@@ -277,8 +277,10 @@ def test_encode_jpeg_without_cv2_raises_scene_error(monkeypatch) -> None:
 
 def test_describe_frame_without_cv2_raises_scene_error(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "cv2", None)
+    frame = object()
+    transport = _Recorder("x")
     with pytest.raises(scene.SceneError):
-        scene.describe_frame(object(), transport=_Recorder("x"))
+        scene.describe_frame(frame, transport=transport)
 
 
 # ---------------------------------------------------------------------------

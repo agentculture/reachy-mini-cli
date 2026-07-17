@@ -167,8 +167,9 @@ def test_level_resolution_is_case_insensitive() -> None:
 
 
 def test_unknown_level_name_raises_value_error() -> None:
+    stream = io.StringIO()
     with pytest.raises(ValueError):
-        install_logging("NOT_A_REAL_LEVEL", stream=io.StringIO())
+        install_logging("NOT_A_REAL_LEVEL", stream=stream)
 
 
 def test_resolve_log_level_precedence(monkeypatch: pytest.MonkeyPatch) -> None:

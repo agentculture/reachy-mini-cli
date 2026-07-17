@@ -314,8 +314,9 @@ def test_on_tick_signature_accepts_commanded_head() -> None:
 
 
 def test_frame_provider_is_required() -> None:
+    describe = _FakeDescribe("scene")
     with pytest.raises(ValueError):
-        SceneHook(describe=_FakeDescribe("scene"), frame_provider=None)
+        SceneHook(describe=describe, frame_provider=None)
 
 
 # ---------------------------------------------------------------------------
