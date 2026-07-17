@@ -52,6 +52,15 @@ sdk = ["reachy-mini>=1.9.0,<1.10"]
 # Do NOT promote any engine package to base dependencies.
 cpu = []
 gpu = []
+# [vision] — OpenCV (headless: no GTK/Qt GUI bindings needed on a headless
+# robot box) for the face-recognition engine (reachy/vision/face.py, ported
+# from reachy_nova's YuNet+SFace face_recognition.py + face_manager.py). Like
+# [sdk]/[daemon]/[cpu], this is lazy-imported and stays an extra rather than a
+# base dep — cv2 is a much heavier wheel than numpy/harmonics-cli, and the
+# bare-install HTTP remote profile has no camera to run it against anyway. A
+# missing extra raises the same clean exit-2 CliError pattern as the other
+# lazy-imported engines.
+vision = ["opencv-python-headless>=4.9,<5"]
 
 [project.urls]
 Homepage = "https://github.com/agentculture/reachy-mini-cli"

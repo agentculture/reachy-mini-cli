@@ -44,3 +44,26 @@ def test_reachy_mini_is_in_sdk_and_daemon_extras():
         assert any(
             d.startswith("reachy-mini") for d in extras.get(name, [])
         ), f"reachy-mini not found in the [{name}] extra: {extras.get(name)}"
+
+
+def test_opencv_is_not_a_base_dep():
+    """opencv must NOT be a base dep — it's a much heavier wheel than numpy/harmonics-cli."""
+    deps = _base_deps()
+    assert not any(
+        "opencv" in d for d in deps
+    ), f"opencv must stay behind the [vision] extra, not base: {deps}"
+
+
+def test_opencv_is_in_vision_extra():
+    """opencv-python-headless must be available via the [vision] extra (task t8)."""
+    extras = _project()["optional-dependencies"]
+    assert any(
+        d.startswith("opencv-python-headless") for d in extras.get("vision", [])
+    ), f"opencv-python-headless not found in the [vision] extra: {extras.get('vision')}"
+
+
+def test_base_deps_are_exactly_numpy_and_harmonics_cli():
+    """The base install stays exactly numpy + harmonics-cli — no engine package creeps in."""
+    deps = _base_deps()
+    names = {d.split(">=")[0].split("==")[0].strip() for d in deps}
+    assert names == {"numpy", "harmonics-cli"}, f"unexpected base dependency set: {names}"
