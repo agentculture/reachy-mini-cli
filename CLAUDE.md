@@ -206,8 +206,16 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
   `reachy/motion/listen_pat.py` `PatHook` (a per-tick `on_tick` seam), not as a
   separate `pat` process — a separate process would contend for the
   single-consumer SDK client and get throttled to ~1 Hz. The hook mirrors `pat`'s
-  detect→react logic, measuring deviation against the loop's *commanded* head pose
-  (so `listen`'s own turns read as zero deviation and never false-fire). See
+  detect→react logic, measuring deviation against the loop's *commanded* head pose.
+  Because `commanded_head` is the *target* of the last dispatched `goto` (the head
+  spends >1 s in transit), the hook additionally takes a `motion_busy(t)` probe —
+  `server.run` publishes its `busy_until` horizon into a shared dict — and **skips
+  sensing while a commanded move is in flight**, re-baselining the detector on the
+  first pass after any suspension. Without that gate the robot's own transit reads
+  as external force and the reaction→idle-resume→transit cycle re-triggers forever
+  (the false-fire loop fixed in #66). Under `--live`, each detection also feeds
+  `EventBuffer.feed_pat` (touch reaches cognition — one cue per reaction cycle,
+  fault-isolated so a raising buffer never breaks the reflex). See
   [the single-SDK-owner model](#the-single-sdk-owner-model-contributor-note).
 - **`--live` — all four senses in one loop:** `listen run --live` folds `think`,
   `vision`, and `sleep` *into* `listen`'s loop alongside the `PatHook`, so every
@@ -258,7 +266,12 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
   the established `CognitionEngine` (`*emoji*`/`"speech"` parsing, unchanged);
   `"agent"` swaps in `reachy/speech/agent_turn.py`'s `AgentTurnEngine` — a tool-use
   loop that acts through `reachy/speech/tools.py`'s `ToolRegistry` (`speak` /
-  `harmonics` / `apply_pose`) instead of parsing markers out of free text. Both
+  `harmonics` / `apply_pose`) instead of parsing markers out of free text.
+  `apply_pose` advertises the expression catalog as a JSON-schema `enum`
+  (generated from the loaded `expressions.toml` keys, so a new TOML entry reaches
+  the model with no code change) and rejects an unknown emoji with an error
+  tool-result naming the valid keys — the model self-corrects in-turn instead of
+  silently no-oping to neutral. Both
   engines share the same folded `ThinkHook` seam, the same `EventBuffer`, and the
   same export sinks, so `agent` is a drop-in with no new process and no second
   media session. In `agent` mode `--voice-engine` is inert (both `tts` and
@@ -420,7 +433,7 @@ package provides the engine:
   body_yaw deg). Loaded via stdlib `tomllib` (no new dep). `NEUTRAL_KEY =
   "neutral"` is the all-zeros fallback for unknown emoji. `Catalog` (thin
   wrapper), `load_catalog`, and `get_pose` in `reachy/speech/expressions.py`.
-  Starter set: 🤔 😮 🙂 👂 😐 🎉 😔 and neutral. Edit this file to tune poses
+  Starter set: 🤔 😮 🙂 👂 😐 🎉 😔 😊 and neutral. Edit this file to tune poses
   without any code change.
 - **`ExpressionProducer`** (`reachy/motion/expression.py`) — enqueues calm
   one-shot expression moves onto the shared serial `MotionQueue` from the

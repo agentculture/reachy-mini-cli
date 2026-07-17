@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-07-17
+
+### Added
+
+- `EventBuffer.feed_pat` — head-pat detections become sense cues (`felt a gentle scratch on the head`); under `--live` the folded `PatHook` feeds one cue per reaction cycle into the shared cognition buffer, bypassing the engagement gate — touch is inherently addressed (#66)
+- 😊 contentment pose in `expressions.toml` — the natural answer to being petted; passes the distinctness check with margin
+- `apply_pose` advertises the expression catalog as a JSON-schema `enum` generated from the loaded TOML keys, so a new entry reaches the model with no code change; an unknown emoji returns an error tool-result naming the valid keys instead of silently no-oping to neutral (#67)
+- The agent system prompt names touch among the robot's perceptions
+
+### Fixed
+
+- Pat false-fire loop: `PatHook` skips sensing while a commanded move is in flight (`server.run` publishes its `busy_until` horizon) and re-baselines the detector after suspensions — the robot's own goto transit no longer reads as external force (147 false detections in 51 untouched minutes on the dev box), and real pats are no longer masked by wall-to-wall reaction windows (#66)
+
 ## [0.32.0] - 2026-07-17
 
 ### Added

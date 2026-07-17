@@ -402,7 +402,9 @@ vars override the built-in default.
 - **`agent`** — the LLM acts through explicit tool calls instead of text
   parsing. Three tools are published to the model as an OpenAI `tools=` array:
   `speak` (the TTS voice), `harmonics` (the offline melodic voice), and
-  `apply_pose` (a catalog-emoji body expression). Each `tool_calls` response is
+  `apply_pose` (a catalog-emoji body expression — the full catalog is advertised
+  to the model as an enum, and an unknown emoji comes back as an error naming the
+  valid keys instead of silently doing nothing). Each `tool_calls` response is
   executed and fed back as a tool result until the model returns plain text with
   no more calls. Both engines ride the exact same folded `ThinkHook` seam,
   `EventBuffer`, and export sinks as `marker` — swapping the flag adds no new
@@ -441,6 +443,13 @@ end to end:
 5. Idle presence never stops: the motion loop keeps breathing/glancing
    throughout, and the antenna-lean/turn/pat reactions from the other folded
    senses keep running alongside the agent's replies.
+
+Touch takes the same road, minus the gate: a head pat fires the reflex
+lean/nuzzle instantly (no LLM in that path), and the detection *also* lands in
+the shared buffer as a `felt a gentle scratch on the head` cue — one cue per
+reaction cycle — so the next agent turn can answer being petted (a word of
+thanks, the 😊 contentment pose). Pats skip the engagement gate entirely:
+touching the robot is inherently addressed to it.
 
 Try it: `reachy-mini-cli service enable live` (boots the agent-mode unit), then
 say *"Reachy, hello!"* near the robot and listen for a reply — or iterate faster
