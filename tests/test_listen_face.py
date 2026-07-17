@@ -373,8 +373,10 @@ def test_on_tick_signature_accepts_commanded_head():
 
 
 def test_frame_provider_is_required():
+    engine = _FakeEngine()
+    store = _FakeStore()
     with pytest.raises(ValueError):
-        FaceHook(engine=_FakeEngine(), store=_FakeStore(), frame_provider=None)
+        FaceHook(engine=engine, store=store, frame_provider=None)
 
 
 # ---------------------------------------------------------------------------
