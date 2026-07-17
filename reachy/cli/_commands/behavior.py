@@ -15,21 +15,33 @@ the dedicated ``reachy listen`` loop, which drives the daemon's smooth minjerk
 * ``behavior list`` — the built-in behavior catalog (no robot needed).
 * ``behavior run`` / ``stop`` / ``status`` — drive the running engine (auto-starts
   it) through the command spool.
+* ``behavior reload`` — reload ``rules.toml`` in the running engine, applied
+  between ticks (see ``reachy.behavior.reload_driver``).
 * ``behavior engine start|stop|status|run`` — manage the 50 Hz engine process.
 
 The engine streams immediate ``set_target`` poses, so it owns motion exclusively
 while running — don't drive the robot with ``move goto`` / ``demo-mode`` /
 ``reachy listen`` at the same time.
+
+``behavior engine run`` also loads ``rules.toml`` (see ``reachy.behavior.rules``)
+once at boot: a MISSING file is fine (no rules configured yet); a PRESENT but
+malformed file is rejected without crashing the process — the engine falls back
+to bare base presence (``feel-alive`` only) and logs the rejection (naming every
+reason) via ``reachy.senselog``. ``behavior reload`` then lets an operator push a
+corrected file into the already-running engine without a restart.
 """
 
 from __future__ import annotations
 
 import argparse
 
-from reachy.behavior import control, library, supervisor
+from reachy import senselog
+from reachy.behavior import control, library, reload_driver, supervisor
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.model import CHANNELS, StopClass
+from reachy.behavior.rule_engine import STAGE as RULE_STAGE
+from reachy.behavior.rules import RulesLoader
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
@@ -44,6 +56,7 @@ _VERBS = [
     "behavior run <name> — push a behavior onto the running engine (auto-starts it)",
     "behavior stop <id|name|all> — stop a running behavior (all = keep the idle base)",
     "behavior status — active behaviors + per-channel ownership + engine/daemon state",
+    "behavior reload — reload rules.toml in the running engine, applied between ticks",
     "behavior engine start — start the 50 Hz engine in the background",
     "behavior engine stop — stop the engine (eases the robot to neutral)",
     "behavior engine status — engine process + daemon reachability",
@@ -221,6 +234,64 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reload(args: argparse.Namespace) -> int:
+    """Ask the running engine to reload ``rules.toml`` between ticks.
+
+    A rejected reload is NOT a ``CliError`` — the engine keeps the last-good
+    rules config and simply reports why the candidate was refused (mirroring
+    ``cmd_run``/``cmd_stop``'s "engine did not confirm in time" idiom below): a
+    typo in the rules file is an operator fact to report, never a reason to
+    exit non-zero or take the running presence down.
+    """
+    json_mode = bool(getattr(args, "json", False))
+    cmd_id = reload_driver.submit_reload()
+    result = reload_driver.await_result(cmd_id, timeout=args.await_timeout)
+    if result is None:
+        result = {
+            "ok": False,
+            "submitted": cmd_id,
+            "note": "engine did not confirm in time — is 'behavior engine' running?",
+        }
+    emit_payload(result, json_mode=json_mode, empty="(submitted)")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# rules tick-seam composition (boot resilience)                               #
+# --------------------------------------------------------------------------- #
+
+
+def _boot_tick_seam() -> reload_driver.ReloadDriver | None:
+    """Build the ``behavior engine run`` tick seam, resiliently.
+
+    Loads the default rules file (``RulesLoader.reload()``, see
+    ``reachy.behavior.rules``) exactly once at boot. ``RulesLoader.reload()``
+    never raises a ``CliError`` itself — a MISSING rules file resolves to an
+    empty, inert config (nothing configured yet, not a rejection) — but on a
+    PRESENT, malformed file it keeps the loader's last-good config (here: the
+    all-empty default, since this is the first load) and records why in
+    ``loader.last_error``.
+
+    On a rejection this logs exactly one ``[SENSE stage=rule source=rules
+    event=boot]`` drop line naming every reason (the validator's own message,
+    which itself enumerates every offending field/id/value it found) and
+    returns ``None`` — the caller installs NO tick seam at all, so the engine
+    runs bare base presence (``feel-alive`` only, no rule seam): an operator's
+    typo in ``rules.toml`` must degrade gracefully, never crash the process
+    (which would otherwise feed a systemd ``Restart=on-failure`` crash loop).
+
+    On success (including "no rules file yet") returns a ready
+    :class:`~reachy.behavior.reload_driver.ReloadDriver`, which serves both rule
+    evaluation and any later ``behavior reload`` for the life of this run.
+    """
+    loader = RulesLoader()
+    loader.reload()
+    if loader.last_error is not None:
+        senselog.drop(RULE_STAGE, "rules", "boot", loader.last_error)
+        return None
+    return reload_driver.ReloadDriver(loader)
+
+
 # --------------------------------------------------------------------------- #
 # engine sub-noun (the 50 Hz process)                                         #
 # --------------------------------------------------------------------------- #
@@ -294,12 +365,16 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     transport = get_transport(args)
     config = _engine_config(args)
     spool = control.CommandSpool()
+    tick_seam = _boot_tick_seam()  # None on a rejected rules file -> base presence only
 
     def _on_start() -> None:
         if not json_mode:
+            rules_note = (
+                " + rules" if tick_seam is not None else " (rules rejected — base presence only)"
+            )
             emit_diagnostic(
                 f"[behavior] engine live: {config.compose_hz:g} Hz via {transport.name}"
-                f"{' + base layer' if config.base_layer else ''}; Ctrl-C to stop"
+                f"{' + base layer' if config.base_layer else ''}{rules_note}; Ctrl-C to stop"
             )
 
     def _emit(event: dict) -> None:
@@ -313,6 +388,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         emit=_emit,
         max_ticks=args.max_ticks,
         control=spool,
+        tick_seam=tick_seam,
     )
     if not json_mode:
         emit_diagnostic(f"[behavior] engine stopped after {ticks} tick(s)")
@@ -425,6 +501,21 @@ def _register_status(noun_sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=cmd_status)
 
 
+def _register_reload(noun_sub: argparse._SubParsersAction) -> None:
+    p = noun_sub.add_parser(
+        "reload", help="Reload rules.toml in the running engine (applied between ticks)."
+    )
+    p.add_argument(
+        "--await-timeout",
+        type=float,
+        default=1.0,
+        dest="await_timeout",
+        help="Seconds to wait for the engine to confirm (default: 1.0).",
+    )
+    p.add_argument("--json", action="store_true", help=_JSON_HELP)
+    p.set_defaults(func=cmd_reload)
+
+
 def _register_engine(noun_sub: argparse._SubParsersAction) -> None:
     eng = noun_sub.add_parser("engine", help="Manage the 50 Hz engine process.")
     eng.add_argument("--json", action="store_true", help=_JSON_HELP)
@@ -491,4 +582,5 @@ def register(sub: argparse._SubParsersAction) -> None:
     _register_run(noun_sub)
     _register_stop(noun_sub)
     _register_status(noun_sub)
+    _register_reload(noun_sub)
     _register_engine(noun_sub)
