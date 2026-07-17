@@ -27,6 +27,8 @@ import ast
 from collections.abc import Iterable
 from pathlib import Path
 
+from reachy.forge import lifecycle
+
 #: Top-level module names generated code may import.
 ALLOWED_IMPORTS = {"numpy", "math", "time", "typing", "dataclasses"}
 
@@ -126,12 +128,12 @@ def validate(
     skill_dir = Path(skill_dir)
     reasons: list[str] = []
 
-    skill_md = skill_dir / "SKILL.md"
-    executor = skill_dir / "executor.py"
+    skill_md = skill_dir / lifecycle.SKILL_FILENAME
+    executor = skill_dir / lifecycle.EXECUTOR_FILENAME
     if not skill_md.is_file() or not skill_md.read_text().strip():
-        reasons.append("SKILL.md missing or empty")
+        reasons.append(f"{lifecycle.SKILL_FILENAME} missing or empty")
     if not executor.is_file():
-        reasons.append("executor.py missing")
+        reasons.append(f"{lifecycle.EXECUTOR_FILENAME} missing")
         return False, reasons
 
     source = executor.read_text()

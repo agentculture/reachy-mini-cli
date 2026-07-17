@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import re
 import uuid
 from collections.abc import Callable, MutableMapping
 from pathlib import Path
@@ -78,8 +77,8 @@ ImporterFn = Callable[[Path, str], "Callable | None"]
 #: keys the skill's SKILL.md documents).
 DEFAULT_FORGED_PARAMS: dict = {"type": "object", "properties": {}}
 
-_NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
-_DESC_RE = re.compile(r"^description:\s*(.+)$", re.MULTILINE)
+#: The frontmatter key ``read_skill_description`` scans a SKILL.md for.
+_DESC_PREFIX = "description:"
 
 
 # ---------------------------------------------------------------------------
@@ -224,16 +223,22 @@ def wrap_executor(execute_fn: Callable, ctx: object, name: str) -> Callable[[dic
 
 
 def read_skill_description(skill_md_path: Path, name: str) -> str:
-    """Best-effort read of the ``description:`` frontmatter field, with a fallback."""
+    """Best-effort read of the ``description:`` frontmatter field, with a fallback.
+
+    A plain, backtracking-free line scan (rather than an anchored ``\\s*(.+)$``
+    regex, which SonarCloud flagged for super-linear worst-case behavior on
+    untrusted input — S8786) for the first line starting with ``description:``.
+    """
     try:
         text = skill_md_path.read_text()
     except OSError:
         return f"A forged skill: {name}."
-    match = _DESC_RE.search(text)
-    if match:
-        desc = match.group(1).strip().strip("\"'")
-        if desc:
-            return desc
+    for line in text.splitlines():
+        if line.startswith(_DESC_PREFIX):
+            desc = line[len(_DESC_PREFIX) :].strip().strip("\"'")
+            if desc:
+                return desc
+            break
     return f"A forged skill: {name}."
 
 
@@ -352,7 +357,10 @@ class ForgeActivator:
         for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
             if skill_dir.name.startswith("."):
                 continue  # hidden bookkeeping dir, never a skill
-            if not (skill_dir / "SKILL.md").is_file() or not (skill_dir / "executor.py").is_file():
+            if (
+                not (skill_dir / lifecycle.SKILL_FILENAME).is_file()
+                or not (skill_dir / lifecycle.EXECUTOR_FILENAME).is_file()
+            ):
                 continue  # not a forged-skill folder
             if self._register_dir(skill_dir.name, skill_dir):
                 registered.append(skill_dir.name)
@@ -374,7 +382,7 @@ class ForgeActivator:
         assert ok, "forged code must never be imported before validation passes"
 
         try:
-            execute_fn = self._importer(skill_dir / "executor.py", name)
+            execute_fn = self._importer(skill_dir / lifecycle.EXECUTOR_FILENAME, name)
         except Exception as err:  # noqa: BLE001 - a raising import skips just this skill
             logger.warning("forge activate: importing %s failed: %s", name, err)
             return False
@@ -382,7 +390,7 @@ class ForgeActivator:
             logger.warning("forge activate: %s has no usable execute(params, ctx)", name)
             return False
 
-        description = read_skill_description(skill_dir / "SKILL.md", name)
+        description = read_skill_description(skill_dir / lifecycle.SKILL_FILENAME, name)
         handler = wrap_executor(execute_fn, self._ctx, name)
         try:
             self._register(name, description, dict(DEFAULT_FORGED_PARAMS), handler)
