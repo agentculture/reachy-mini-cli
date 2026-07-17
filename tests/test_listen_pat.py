@@ -941,6 +941,57 @@ def test_on_tick_receives_last_dispatched_commanded_head() -> None:
     assert commanded_seen[-1] == {"pitch": 4.0, "yaw": 12.0}
 
 
+def test_blocking_goto_still_publishes_an_honest_busy_horizon() -> None:
+    """A move_goto that BLOCKS for the move's duration must not stale the horizon.
+
+    The live SDK media session's move_goto blocks until the move completes. Basing
+    busy_until on the pre-call clock then published a horizon that was already
+    ~expired at the next tick — every reader saw a "0.14 s move" for a 2.2 s goto
+    (the phantom-pat horizon bug). The horizon must be the LATER of the plan-based
+    end and the post-call clock, plus settle.
+    """
+    clock = _Clock(0.05)
+    busy: dict[str, float] = {"until": 0.0}
+    horizons: list[float] = []
+
+    class _BlockingTransport:
+        name = "sdk"
+
+        def move_goto(self, *, head=None, antennas=None, body_yaw=None, duration, interpolation):
+            clock.t += duration  # the SDK call blocks for the whole move
+            return {"uuid": "x"}
+
+    class _OneMove:
+        def __init__(self):
+            self.done = False
+
+        def update(self, t, sense, **_k):
+            if self.done:
+                return None
+            self.done = True
+            return MotionAction(label="look", head={"pitch": 0.0, "yaw": -20.0}, duration=2.0)
+
+    def _hook(transport, queue, t, commanded_head):
+        horizons.append(busy["until"] - t)
+
+    run(
+        _BlockingTransport(),
+        _OneMove(),
+        now=clock,
+        sleep=lambda *_: None,
+        tick=0.05,
+        settle=0.2,
+        max_ticks=6,
+        hooks=LoopHooks(on_tick=_hook),
+        busy=busy,
+    )
+    # The tick right after the (blocking) dispatch must still see a future horizon
+    # of about settle (0.2 s) — never an already-expired one from the stale clock.
+    post_dispatch = [h for h in horizons if h > 0.0]
+    assert post_dispatch, f"no future horizon ever published; horizons={horizons}"
+    assert max(post_dispatch) >= 0.1, f"published horizon still stale: {horizons}"
+
+
 def test_headless_actions_do_not_flap_commanded_head() -> None:
     """Antenna-only actions leave the commanded head where the last head move put it.
 

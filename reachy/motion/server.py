@@ -64,7 +64,14 @@ class LoopHooks:
     on_tick: Callable | None = None
 
 
-def _dispatch_next(transport, q: MotionQueue, t: float, settle: float, st: "_DriveState") -> float:
+def _dispatch_next(
+    transport,
+    q: MotionQueue,
+    t: float,
+    settle: float,
+    st: "_DriveState",
+    now: Callable[[], float] | None = None,
+) -> float:
     """Issue the next queued move; record its head pose; return the new ``busy_until``.
 
     Peeks the queue and only removes the action via :meth:`~MotionQueue.pop_if`
@@ -107,7 +114,15 @@ def _dispatch_next(transport, q: MotionQueue, t: float, settle: float, st: "_Dri
         }
     if st.on_action is not None:
         st.on_action(nxt)
-    return t + nxt.duration + settle
+    # The SDK's move_goto may BLOCK for the move's whole duration (the live media
+    # session does). Basing the horizon on the pre-call clock then publishes a
+    # busy_until that is already ~expired when the next tick runs — every hook
+    # reading it saw a "0.14s move" for a 2.2s goto (the phantom-pat horizon bug).
+    # Take the later of plan-based and post-call clocks so the horizon is honest
+    # under BOTH semantics: non-blocking gotos get t + duration + settle exactly
+    # as before; blocking gotos get return-time + settle.
+    t_after = now() if now is not None else t
+    return max(t + nxt.duration, t_after) + settle
 
 
 @dataclass
@@ -122,12 +137,12 @@ class _DriveState:
     commanded_head: dict[str, float] = field(default_factory=lambda: {"pitch": 0.0, "yaw": 0.0})
 
 
-def _service_queue(transport, q, t, st: _DriveState, *, settle, max_errors) -> None:
+def _service_queue(transport, q, t, st: _DriveState, *, settle, max_errors, now=None) -> None:
     """If idle and something is queued, run the next move; count/raise on errors."""
     if t < st.busy_until or not len(q):
         return
     try:
-        st.busy_until = _dispatch_next(transport, q, t, settle, st)
+        st.busy_until = _dispatch_next(transport, q, t, settle, st, now)
         st.consecutive = 0
     except CliError:
         st.consecutive += 1
@@ -171,7 +186,7 @@ def _drive(
         action = producer.update(t, sense_val, snap=snap, sound_present=sp)
         if action is not None:
             q.submit(action)
-        _service_queue(transport, q, t, st, settle=settle, max_errors=max_errors)
+        _service_queue(transport, q, t, st, settle=settle, max_errors=max_errors, now=now)
         st.ticks += 1
         if max_ticks is not None and st.ticks >= max_ticks:
             break
