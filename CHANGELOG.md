@@ -32,7 +32,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- forge validator: fail-closed call-target check — calls through subscripts, lambdas, or chained attributes on a non-allowed base now reject instead of silently passing; __builtins__ added to the forbidden-names list (Qodo finding)
+- forge validator: fail-closed call-target check — calls through subscripts, lambdas, or chained attributes on a non-allowed base now reject instead of silently passing; `__builtins__` added to the forbidden-names list (Qodo finding)
 - forge activate: wrap_executor now runs a forged execute(params, ctx) on a bounded daemon worker thread (default 10s, injectable) so a runaway skill (e.g. time.sleep(1e9)) can never wedge the cognition turn loop; a timeout returns an error tool-result and logs senselog.drop reason=skill-timeout (Qodo finding)
 - forge client: the forge auth resolution now treats the literal api key "EMPTY" as no-auth for both FORGE_API_KEY and the REACHY_OPENAI_API_KEY fallback, matching the repo-wide convention in reachy/speech/llm.py instead of sending Authorization: Bearer EMPTY (Qodo finding)
 
