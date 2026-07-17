@@ -217,26 +217,24 @@ Example lines:
 Emitted when a symbolic goal is declared, updated, or cleared through the
 intent-tools spool.
 
-**Producer status:** the intent-tools spool
+**Producer status:** live. The intent-tools spool
 (`reachy/speech/intent_tools.py`, the four tools `reachy-mini-cli agent
 attach` carries) and its engine-side consumer
-(`reachy.behavior.intents.IntentDriver`) are both built and independently
-tested (`tests/test_speech_intent_tools.py`, `tests/test_behavior_intents.py`),
-but two things are still open before a live `behavior engine run --export -`
-process actually emits this block: (1) `IntentDriver` is not yet composed into
-`behavior engine run`'s tick bus — `reachy/cli/_commands/behavior.py`'s
-`cmd_engine_run` composes the rules evaluator and a sense-snapshot publisher
-only; and (2) `IntentDriver` currently publishes its own `intent.applied` /
-`intent.blocked` `ctx.emit` event types rather than the `intent.declare` /
-`intent.update` / `intent.clear` shape `to_runtime_event()` maps below, so
-reconciling the two vocabularies is follow-up work even once (1) lands.
+(`reachy.behavior.intents.IntentDriver`) are both built and tested
+(`tests/test_speech_intent_tools.py`, `tests/test_behavior_intents.py`), and
+`IntentDriver` is composed into `behavior engine run`'s tick bus
+(`reachy/cli/_commands/behavior.py::cmd_engine_run`), so a live
+`behavior engine run --export -` process emits this block when intents land.
+The driver's own `intent.applied` / `intent.blocked` status emissions map to
+`action: "applied"` / `"blocked"` (with the intent kind as `name`), alongside
+the `declare`/`update`/`clear` vocabulary.
 
 | Key       | Type                              | Description                        |
 |-----------|------------------------------------|-------------------------------------|
 | `t`       | `"intent"`                         | Block-type discriminator            |
 | `ts`, `tick` | float, int                      | As above                            |
-| `action`  | `"declare"` / `"update"` / `"clear"` | What happened to the intent       |
-| `name`    | string                              | The intent's name                   |
+| `action`  | `"declare"` / `"update"` / `"clear"` / `"applied"` / `"blocked"` | What happened to the intent |
+| `name`    | string                              | The intent's name (or kind, for status actions) |
 | `payload` | object                              | Declarative data the intent tool attached |
 
 Example line:
@@ -249,14 +247,14 @@ Example line:
 
 Emitted for the engine's active-set churn.
 
-**Producer status:** the goto lane (`reachy.behavior.goto_lane.GotoLane`) is
-built and independently tested (`tests/test_behavior_goto_lane.py`), and
-publishes `ctx.emit` events for its own lifecycle
-(`goto.admitted` / `goto.done` / `goto.cancelled`), but it is not yet composed
-into `behavior engine run`'s tick bus, and those raw event-type strings do not
-yet match the `motion.admit` / `motion.evict` / `motion.goto` shape
-`to_runtime_event()` maps below — reconciling the two is follow-up work, the
-same as the `"intent"` block above.
+**Producer status:** partially live. The goto lane
+(`reachy.behavior.goto_lane.GotoLane`) is built and tested
+(`tests/test_behavior_goto_lane.py`), and its lifecycle emissions
+(`goto.admitted` / `goto.done` / `goto.cancelled`) map into this block as
+`action: "goto"` with `detail.phase` carrying the lifecycle phase — but the
+lane itself is not composed into `behavior engine run`'s tick bus yet: it is
+the adapter surface for MotionQueue-family callers, and wiring a live goto
+submission path into the runtime process is follow-up composition work.
 
 | Key        | Type                            | Description                          |
 |------------|-----------------------------------|---------------------------------------|

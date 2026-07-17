@@ -23,11 +23,12 @@ Four block types, each ``{t, ts, tick, ...payload}``:
   through ``ctx.emit`` (its module docstring is the source-of-truth for that raw
   shape: ``{type, rule, kind, field, op, reason, ts, tick}`` plus
   ``behavior``/``disable`` on a fire).
-- ``"intent"`` — a sustained symbolic goal declared/updated/cleared through the
-  intent-tools spool (schema defined here; no producer is wired until a later
-  task builds the intent tools).
-- ``"motion"`` — a behavior admission/eviction or goto (schema defined here; no
-  producer is wired until a later task builds the goto lane).
+- ``"intent"`` — a sustained symbolic goal flowing through the intent-tools
+  spool; the live producer is :class:`reachy.behavior.intents.IntentDriver`'s
+  ``intent.applied``/``intent.blocked`` status emissions.
+- ``"motion"`` — a behavior admission/eviction or goto; the goto lane's
+  ``goto.admitted``/``goto.done``/``goto.cancelled`` lifecycle maps here as
+  ``action="goto"`` with ``detail.phase``.
 
 This module never imports :mod:`reachy.behavior.rule_engine` (or any
 ``reachy.behavior`` module) — it only *interprets* the documented ``type``
@@ -82,7 +83,12 @@ _RAW_TYPE_SENSE = "sense"
 _RAW_TYPE_RULE_FIRE = "rule.fire"
 _RAW_TYPE_RULE_SUPPRESS = "rule.suppress"
 _RAW_INTENT_ACTIONS = frozenset({"declare", "update", "clear"})
+#: The IntentDriver's live status emissions (``intent.applied`` / ``intent.blocked``).
+_RAW_INTENT_STATUS_ACTIONS = frozenset({"applied", "blocked"})
 _RAW_MOTION_ACTIONS = frozenset({"admit", "evict", "goto"})
+#: The GotoLane's per-goto lifecycle emissions (``goto.admitted`` / ``goto.done`` /
+#: ``goto.cancelled``) — surfaced as ``motion`` blocks with ``action="goto"``.
+_RAW_GOTO_PHASES = frozenset({"admitted", "done", "cancelled"})
 
 # ---------------------------------------------------------------------------
 # Event types
@@ -317,6 +323,34 @@ def _intent_event(event: dict, *, action: str) -> IntentEvent:
     )
 
 
+def _intent_status_event(event: dict, *, action: str) -> IntentEvent:
+    """An ``intent.applied``/``intent.blocked`` status emission from the IntentDriver."""
+    payload = {k: event[k] for k in ("kind", "cmd_id", "result", "reason", "goal") if event.get(k)}
+    return IntentEvent(
+        action=action,
+        name=str(event.get("kind") or event.get("goal") or ""),
+        payload=payload,
+        ts=float(event.get("ts", 0.0)),
+        tick=int(event.get("tick", 0)),
+    )
+
+
+def _goto_event(event: dict, *, phase: str) -> MotionEvent:
+    """A GotoLane lifecycle emission, surfaced as a ``motion`` block."""
+    detail = {"phase": phase}
+    for k in ("id", "reason", "channel", "owner", "duration"):
+        if event.get(k) is not None:
+            detail[k] = event[k]
+    return MotionEvent(
+        action="goto",
+        behavior=event.get("label") or event.get("id"),
+        channels=list(event.get("channels") or []),
+        detail=detail,
+        ts=float(event.get("ts", 0.0)),
+        tick=int(event.get("tick", 0)),
+    )
+
+
 def _motion_event(event: dict, *, action: str) -> MotionEvent:
     return MotionEvent(
         action=action,
@@ -350,11 +384,18 @@ def to_runtime_event(event: dict) -> RuntimeEvent | None:
         action = kind.split(".", 1)[1]
         if action in _RAW_INTENT_ACTIONS:
             return _intent_event(event, action=action)
+        if action in _RAW_INTENT_STATUS_ACTIONS:
+            return _intent_status_event(event, action=action)
         return None
     if kind.startswith("motion."):
         action = kind.split(".", 1)[1]
         if action in _RAW_MOTION_ACTIONS:
             return _motion_event(event, action=action)
+        return None
+    if kind.startswith("goto."):
+        phase = kind.split(".", 1)[1]
+        if phase in _RAW_GOTO_PHASES:
+            return _goto_event(event, phase=phase)
         return None
     return None
 

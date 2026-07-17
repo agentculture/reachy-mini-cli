@@ -47,15 +47,18 @@ from reachy.behavior import rules as rules_mod
 from reachy.behavior import supervisor
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
+from reachy.behavior.intents import IntentDriver
 from reachy.behavior.model import CHANNELS, StopClass
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
+from reachy.behavior.sense import DoaPoller, read_doa
 from reachy.behavior.tick_metrics import TickMetrics, budget_from_hz
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from reachy.cli._export import add_runtime_export_args, build_runtime_export_consumer
+from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.runtime import SenseSnapshotDriver
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
@@ -563,6 +566,7 @@ def cmd_engine_status(args: argparse.Namespace) -> int:
 
 
 def cmd_engine_run(args: argparse.Namespace) -> int:
+    install_logging(getattr(args, "log_level", None))
     json_mode = bool(getattr(args, "json", False))
     transport = get_transport(args)
     config = _engine_config(args)
@@ -584,15 +588,24 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     # think/listen cognition feed (decision c27) — carries no thinking/message/
     # emotion blocks, only perception/rule/intent/motion runtime events.
     runtime_consumer = build_runtime_export_consumer(args)
+    # Live perception for the rules: the daemon's DoA route through this transport
+    # (DoaPoller throttles + swallows failures; a mic-less box reads EMPTY_SENSE).
+    sense_reader = DoaPoller(lambda: read_doa(transport))
+    # The act-in seam: agents/scripts submit intents through the spool; the driver
+    # sustains them tick over tick. Mode intents reach the LIVE rule engine.
+    intent_driver = IntentDriver(
+        mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
+        known_modes=rules_driver.known_modes if rules_driver is not None else None,
+    )
+    drivers = [d for d in (rules_driver, intent_driver) if d is not None]
+    consumers = []
     if runtime_consumer is not None:
-        # Rules ride the same bus as the export sink: one seam, every consumer.
-        drivers = [d for d in (rules_driver, SenseSnapshotDriver()) if d is not None]
-        tick_seam = TickBus(drivers=drivers, consumers=[runtime_consumer])
-    else:
-        tick_seam = rules_driver
-    if tick_seam is not None:
-        # Budget = one tick period; a breach surfaces as a [SENSE ... event=overrun] line (c22).
-        tick_seam = TickMetrics(tick_seam, budget_s=budget_from_hz(config.compose_hz))
+        drivers.append(SenseSnapshotDriver())
+        consumers.append(runtime_consumer)
+    # One seam, every rider: rules + intents (+ sense snapshots when exporting).
+    tick_seam = TickBus(drivers=drivers, consumers=consumers)
+    # Budget = one tick period; a breach surfaces as a [SENSE ... event=overrun] line (c22).
+    tick_seam = TickMetrics(tick_seam, budget_s=budget_from_hz(config.compose_hz))
 
     def _emit(event: dict) -> None:
         # Suppress the per-tick JSON summary while exporting so stdout carries
@@ -607,6 +620,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         emit=_emit,
         max_ticks=args.max_ticks,
         control=spool,
+        sense=sense_reader,
         tick_seam=tick_seam,
     )
     if runtime_consumer is not None:
@@ -791,6 +805,7 @@ def _register_engine(noun_sub: argparse._SubParsersAction) -> None:
     )
     add_runtime_export_args(run)
     add_robot_args(run)
+    add_log_level_arg(run)
     run.set_defaults(func=cmd_engine_run)
 
     stop = eng_sub.add_parser("stop", help="Stop the engine.")

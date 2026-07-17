@@ -166,6 +166,19 @@ class ReloadDriver:
         """The wrapped :class:`RulesLoader` (exposes ``.path`` / ``.current`` / ``.last_error``)."""
         return self._loader
 
+    def set_active_mode(self, name: str | None) -> None:
+        """Swap the active mode on the LIVE rule engine (the intent seam's mode_setter).
+
+        Delegates to the *current* :class:`RuleEngine` — after a live reload the
+        engine is replaced and the reload's ``active_mode`` wins, so a mode set
+        through this seam does not survive a subsequent reload (documented).
+        """
+        self._engine.set_active_mode(name)
+
+    def known_modes(self) -> tuple[str, ...]:
+        """Mode names the current config declares (the intent seam's validator)."""
+        return tuple(self._loader.current.modes)
+
     def __call__(self, ctx) -> None:
         """The ``tick_seam`` entry point: apply pending reloads, then evaluate rules."""
         for cmd in self._drain():
