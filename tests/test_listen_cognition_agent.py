@@ -55,6 +55,7 @@ from reachy.cli import main
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.motion.listen_face import FaceHook
 from reachy.motion.listen_pat import PatHook
+from reachy.motion.listen_scene import SceneHook
 from reachy.motion.listen_think import ThinkHook
 from reachy.motion.listen_transcribe import TranscribeHook
 from reachy.motion.listen_vision import VisionHook
@@ -1104,3 +1105,118 @@ def test_bare_listen_run_facehook_is_never_built(monkeypatch) -> None:
     )
     assert rc == 0
     assert face_captured == {}, "a non-live run must never construct a FaceHook"
+
+
+# ---------------------------------------------------------------------------
+# 8. SceneHook + describe_scene tool share the live buffer + VisionHook frames (t10)
+#
+# Scene description folds into the loop the same way vision/face do. Under --live:
+# (a) the periodic SceneHook feeds the SAME shared EventBuffer the cognition engine
+# consumes (so a described scene reaches cognition), (b) it reuses VisionHook's
+# frame source (NO second grabber), and (c) in --cognition agent mode the tool-use
+# ToolRegistry additionally receives a ``describe_scene`` seam so the agent can look
+# on demand — the SAME shared describe path. All gated on cv2 (the composition only
+# builds the scene path when the [vision] extra is importable; CI's bare install
+# skips these with a warning — see _build_scene_hook / _build_describe_scene_seam).
+# ---------------------------------------------------------------------------
+
+
+def _spy_scene_hook(monkeypatch) -> dict:
+    """Capture the ``buffer`` + ``frame_provider`` every constructed :class:`SceneHook` gets."""
+    captured: dict = {}
+    real_init = SceneHook.__init__
+
+    def _init(self, **kw):
+        captured["buffer"] = kw.get("buffer")
+        captured["frame_provider"] = kw.get("frame_provider")
+        return real_init(self, **kw)
+
+    monkeypatch.setattr(SceneHook, "__init__", _init)
+    return captured
+
+
+def test_live_agent_scenehook_shares_buffer_and_vision_frame_source(monkeypatch) -> None:
+    """``--live --cognition agent``: SceneHook shares the buffer AND VisionHook's frames."""
+    pytest.importorskip("cv2")
+    vision_captured = _spy_vision_hook_instance(monkeypatch)
+    scene_captured = _spy_scene_hook(monkeypatch)
+    pat_captured = _spy_pat_hook_buffer(monkeypatch)
+    think_captured: dict = {}
+    real_think_init = ThinkHook.__init__
+
+    def _think_init(self, provider, **kw):
+        think_captured["buffer"] = kw.get("buffer")
+        return real_think_init(self, provider, **kw)
+
+    monkeypatch.setattr(ThinkHook, "__init__", _think_init)
+
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(
+        monkeypatch, _live_argv("--cognition", "agent"), transport=transport
+    )
+    assert rc == 0
+
+    shared = pat_captured.get("buffer")
+    assert shared is not None, "PatHook must receive a shared buffer under --live"
+    assert think_captured.get("buffer") is shared
+    assert (
+        scene_captured.get("buffer") is shared
+    ), "SceneHook must receive the SAME shared buffer PatHook/ThinkHook consume"
+
+    # No second grabber: SceneHook's frame_provider is VisionHook's own latest-frame
+    # peek — bound to the exact VisionHook instance built in this run.
+    provider = scene_captured.get("frame_provider")
+    assert provider is not None, "SceneHook must be given a shared frame_provider"
+    assert getattr(provider, "__self__", None) is vision_captured.get(
+        "instance"
+    ), "SceneHook must reuse VisionHook's frame source (no second grabber)"
+
+
+def test_live_marker_scenehook_shares_buffer_with_cognition_engine(monkeypatch) -> None:
+    """Regression: the default (marker) ``--live`` engine shares the buffer with SceneHook."""
+    pytest.importorskip("cv2")
+    scene_captured = _spy_scene_hook(monkeypatch)
+    think_captured: dict = {}
+    real_think_init = ThinkHook.__init__
+
+    def _think_init(self, provider, **kw):
+        think_captured["buffer"] = kw.get("buffer")
+        return real_think_init(self, provider, **kw)
+
+    monkeypatch.setattr(ThinkHook, "__init__", _think_init)
+
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(monkeypatch, _live_argv(), transport=transport)
+    assert rc == 0
+
+    shared = think_captured.get("buffer")
+    assert shared is not None, "the marker engine must receive a shared buffer under --live"
+    assert scene_captured.get("buffer") is shared
+
+
+def test_bare_listen_run_scenehook_is_never_built(monkeypatch) -> None:
+    """A non-live ``listen run`` builds NO SceneHook (scene folds only under --live)."""
+    scene_captured = _spy_scene_hook(monkeypatch)
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(
+        monkeypatch,
+        ["listen", "run", "--json", "--transport", "sdk", "--deadband", "0", "--max-ticks", "3"],
+        transport=transport,
+    )
+    assert rc == 0
+    assert scene_captured == {}, "a non-live run must never construct a SceneHook"
+
+
+def test_live_agent_registry_receives_a_describe_scene_seam(monkeypatch) -> None:
+    """``--live --cognition agent``: the tool registry gets an on-demand describe_scene seam."""
+    pytest.importorskip("cv2")
+    _patch_registry(monkeypatch)
+    transport = _LiveSdkTransport()
+
+    rc, _out, _err = _run_capture(
+        monkeypatch, _live_argv("--cognition", "agent"), transport=transport
+    )
+    assert rc == 0
+
+    describe_scene = _FakeRegistry.last_kwargs.get("describe_scene")
+    assert callable(describe_scene), "agent registry must receive a describe_scene seam"

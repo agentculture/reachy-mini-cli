@@ -8,13 +8,19 @@ This is the tool layer a future *agent-cognition* engine consumes.  Where the
 and **executes** them, returning an OpenAI tool-result message the engine can
 append to the conversation.
 
-Three tools ship in v1:
+Three tools ship in v1, plus an optional fourth:
 
 * ``speak``      — text → Reachy's spoken (TTS) voice.
 * ``harmonics``  — text → Reachy's harmonic melodic voice (chirp/sing).
 * ``apply_pose`` — a catalog emoji → one calm body expression on the serial
   :class:`~reachy.motion.queue.MotionQueue` (the SAME action the ``*emoji*``
   marker path enqueues).
+* ``describe_scene`` — look through the camera and describe what is visible. Only
+  advertised when composition injects a ``describe_scene`` seam (a zero-arg
+  callable, the SAME :func:`reachy.vision.scene.describe_frame` path the periodic
+  :class:`~reachy.motion.listen_scene.SceneHook` uses); absent otherwise. The seam
+  is injected so this module never imports :mod:`reachy.vision` (see the boundary
+  note below).
 
 Design
 ------
@@ -78,11 +84,15 @@ Handler = Callable[[dict], str]
 PlaySeam = Callable[..., None]
 #: An expression seam: ``express(emoji)`` (see ``ExpressionProducer.express``).
 ExpressSeam = Callable[[str], object]
+#: A scene-describe seam: ``describe_scene() -> str`` (see
+#: ``reachy.vision.scene.describe_frame`` captured over the shared frame source).
+DescribeSceneSeam = Callable[[], str]
 
 # Canonical v1 tool names.
 SPEAK = "speak"
 HARMONICS = "harmonics"
 APPLY_POSE = "apply_pose"
+DESCRIBE_SCENE = "describe_scene"
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +208,26 @@ def _make_pose_handler(express: ExpressSeam | None, catalog_keys: frozenset[str]
     return handler
 
 
+def _make_describe_scene_handler(describe: DescribeSceneSeam) -> Handler:
+    """A describe_scene handler: call the injected zero-arg seam, return its text.
+
+    ``describe`` is the composition-injected callable that captures the shared
+    frame source (:meth:`VisionHook.latest_frame`) + :func:`reachy.vision.scene.describe_frame`
+    — the SAME describe path the periodic
+    :class:`~reachy.motion.listen_scene.SceneHook` uses. The description is returned
+    verbatim in the tool-result so the agent can react to it; an empty result or a
+    raising seam (a :class:`~reachy.vision.scene.SceneError` from an unreachable VLM)
+    surfaces as an error tool-result via :meth:`ToolRegistry.dispatch`."""
+
+    def handler(arguments: dict) -> str:  # noqa: ARG001 — no parameters
+        text = describe()
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("the scene description was empty")
+        return json.dumps({"status": "ok", "description": text.strip()})
+
+    return handler
+
+
 # ---------------------------------------------------------------------------
 # Built-in tool definitions
 # ---------------------------------------------------------------------------
@@ -262,6 +292,19 @@ def _apply_pose_tool(express: ExpressSeam | None, catalog_keys: Iterable[str]) -
     )
 
 
+def _describe_scene_tool(describe: DescribeSceneSeam) -> Tool:
+    return function_tool(
+        name=DESCRIBE_SCENE,
+        description=(
+            "Look through the camera and describe what is currently visible. Takes no "
+            "arguments; returns a short natural-language description of the scene so you "
+            "can react to what is actually in front of you."
+        ),
+        parameters={"type": "object", "properties": {}},
+        handler=_make_describe_scene_handler(describe),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -294,6 +337,14 @@ class ToolRegistry:
         catalog entry reaches the model with no code change.  Pass an
         explicit iterable (e.g. from a :class:`Catalog` built over a custom
         path) to advertise a different key set, such as in a test.
+    describe_scene:
+        The scene-describe seam — a zero-arg callable ``() -> str`` that captures
+        the shared camera frame source + :func:`reachy.vision.scene.describe_frame`
+        (the SAME describe path :class:`~reachy.motion.listen_scene.SceneHook` uses).
+        When given, the ``describe_scene`` tool is registered and advertised; when
+        ``None`` (the default) the tool is **not** advertised at all (unlike
+        ``apply_pose``, which is always listed but degrades). Injected — never
+        imported — so this module keeps its no-:mod:`reachy.vision` boundary.
     extra_tools:
         Additional :class:`Tool` objects to register at construction — proving a
         new capability needs only one definition + handler.
@@ -307,6 +358,7 @@ class ToolRegistry:
         harmonic_engine: VoiceEngine | None = None,
         play: PlaySeam | None = None,
         catalog_keys: Iterable[str] | None = None,
+        describe_scene: DescribeSceneSeam | None = None,
         extra_tools: Iterable[Tool] = (),
     ) -> None:
         speak_engine = speak_engine or resolve_voice_engine("tts")
@@ -323,6 +375,12 @@ class ToolRegistry:
             _apply_pose_tool(express, catalog_keys),
         ):
             self._tools[tool.name] = tool
+        # describe_scene is opt-in: only advertised when composition injects the seam
+        # (absent -> the tool is not listed, so the model is never offered a camera it
+        # cannot use — e.g. the [vision] extra is missing).
+        if describe_scene is not None:
+            scene_tool = _describe_scene_tool(describe_scene)
+            self._tools[scene_tool.name] = scene_tool
         for tool in extra_tools:
             self.register(tool)
 

@@ -29,6 +29,11 @@ Four feed methods accept values that callers read from hardware/daemons:
   from :class:`~reachy.motion.listen_face.FaceHook`.  Produces cues like
   ``"saw Ada"``.  An unknown/empty name yields no cue.
 
+* :meth:`EventBuffer.feed_scene` — a VLM scene description from
+  :class:`~reachy.motion.listen_scene.SceneHook` (or the ``describe_scene`` agent
+  tool).  Produces cues like ``"noticed: a person waving at the desk"``.  An
+  empty/whitespace description yields no cue.
+
 Design constraints
 ------------------
 * **Pure in-process** — no I/O, no hardware access, no new dependencies.
@@ -389,6 +394,27 @@ class EventBuffer:
 
         self._append(f"saw {str(name).strip()}", source="face")
 
+    def feed_scene(self, text: str) -> None:
+        """Translate one VLM scene description into zero or one cue and append it.
+
+        Parameters
+        ----------
+        text:
+            The scene description produced by :func:`reachy.vision.scene.describe_frame`
+            (via :class:`~reachy.motion.listen_scene.SceneHook` or the
+            ``describe_scene`` agent tool).  Stripped of surrounding whitespace.
+
+        Cue rules
+        ---------
+        * Non-empty *text* → ``"noticed: <text>"``
+        * ``None`` / empty / whitespace-only → no cue (defensive default, never
+          raises).
+        """
+        if not text or not str(text).strip():
+            return
+
+        self._append(f"noticed: {str(text).strip()}", source="scene")
+
     # ------------------------------------------------------------------
     # Snapshot
     # ------------------------------------------------------------------
@@ -420,9 +446,9 @@ class EventBuffer:
         """Append a new cue under the lock and emit its [SENSE stage=cue] line.
 
         ``source`` names the feed kind that produced this cue (``"doa"``,
-        ``"vision"``, ``"transcript"``, ``"pat"``, ``"face"``) — every ``feed_*``
-        call that actually appends a cue routes through here, so every cue is
-        logged exactly once. A ``feed_*`` call that produces *no* cue because of a
+        ``"vision"``, ``"transcript"``, ``"pat"``, ``"face"``, ``"scene"``) —
+        every ``feed_*`` call that actually appends a cue routes through here, so
+        every cue is logged exactly once. A ``feed_*`` call that produces *no* cue because of a
         threshold never reaches this method — it stays silent, not a drop (see the
         module/method docstrings' "Cue rules").
         """
