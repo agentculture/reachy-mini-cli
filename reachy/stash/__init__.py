@@ -16,6 +16,12 @@ Public API
 * :func:`~reachy.stash.embeddings.embed_text` / :class:`~reachy.stash.embeddings.EmbeddingConfig`
   — the injectable embedding client (stdlib ``urllib`` only; independent of
   :mod:`reachy.speech.llm`).
+* :func:`~reachy.stash.apply.apply_record` / :func:`~reachy.stash.apply.plan_keyframes`
+  — the apply adapter: realize a fetched record via the
+  :mod:`reachy.behavior.library` ``build()`` path and sample it into a bounded
+  sequence of :class:`~reachy.motion.queue.MotionAction` goto keyframes on the
+  live loop's serial :class:`~reachy.motion.queue.MotionQueue` (not the
+  behavior-engine process).
 
 The index (records + vectors) persists under the CLI's per-user state dir
 (:func:`reachy.daemon.state_dir`), in a ``stash/`` subdirectory.
@@ -23,6 +29,7 @@ The index (records + vectors) persists under the CLI's per-user state dir
 
 from __future__ import annotations
 
+from reachy.stash.apply import apply_record, plan_keyframes
 from reachy.stash.embeddings import EmbeddingConfig, embed_text
 from reachy.stash.record import StashParam, StashRecord
 from reachy.stash.store import ScoredRecord, StashStore
@@ -34,4 +41,6 @@ __all__ = [
     "ScoredRecord",
     "embed_text",
     "EmbeddingConfig",
+    "apply_record",
+    "plan_keyframes",
 ]
