@@ -64,7 +64,6 @@ PROMPT_TEMPLATE = (
     "blocks."
 )
 
-_NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
 _SANITIZE_RE = re.compile(r"[^a-z0-9-]+")
 _DASH_COLLAPSE_RE = re.compile(r"-+")
 
@@ -193,10 +192,16 @@ def _extract_and_sanitize_name(skill_md: str) -> str | None:
     ``../../etc/passwd`` cannot survive with a '/' or '.' in it, so the staged folder
     can never escape the staging root.
     """
-    match = _NAME_RE.search(skill_md)
-    if not match:
+    # Plain line scan, not a MULTILINE regex — same S8786 shape the sibling
+    # frontmatter regexes in activate.py were flagged for.
+    raw = None
+    for line in skill_md.splitlines():
+        if line.startswith("name:"):
+            raw = line[len("name:") :]
+            break
+    if raw is None:
         return None
-    raw = match.group(1).strip().strip("\"'").lower()
+    raw = raw.strip().strip("\"'").lower()
     raw = raw.replace("_", "-").replace(" ", "-")
     sanitized = _SANITIZE_RE.sub("", raw)
     sanitized = _DASH_COLLAPSE_RE.sub("-", sanitized).strip("-")
