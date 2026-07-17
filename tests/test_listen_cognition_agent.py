@@ -53,6 +53,7 @@ import reachy.motion.sleep_signal as ss
 import reachy.speech.cognition_signal as cs
 from reachy.cli import main
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
+from reachy.motion.listen_face import FaceHook
 from reachy.motion.listen_pat import PatHook
 from reachy.motion.listen_think import ThinkHook
 from reachy.motion.listen_transcribe import TranscribeHook
@@ -990,3 +991,116 @@ def test_bare_listen_run_visionhook_is_never_built(monkeypatch) -> None:
     )
     assert rc == 0
     assert vision_captured == {}, "a non-live run must never construct a VisionHook"
+
+
+# ---------------------------------------------------------------------------
+# 7. FaceHook shares the live cognition EventBuffer + VisionHook's frame source (t9)
+#
+# FaceHook folds face recognition into the loop the same way vision does. Two
+# properties matter under --live: (a) it feeds the SAME shared EventBuffer the
+# cognition engine consumes (so a recognised face reaches cognition), and (b) it
+# reuses VisionHook's frame source — NO second grabber. Both are object-identity
+# checks. Gated on cv2: the composition only builds FaceHook when the [vision]
+# extra is importable (CI's bare install has no cv2, so FaceHook is skipped there
+# with a warning — see _build_face_hook).
+# ---------------------------------------------------------------------------
+
+
+def _spy_vision_hook_instance(monkeypatch) -> dict:
+    """Capture the ``buffer`` kwarg + the constructed :class:`VisionHook` instance."""
+    captured: dict = {}
+    real_init = VisionHook.__init__
+
+    def _init(self, **kw):
+        captured["buffer"] = kw.get("buffer")
+        captured["instance"] = self
+        return real_init(self, **kw)
+
+    monkeypatch.setattr(VisionHook, "__init__", _init)
+    return captured
+
+
+def _spy_face_hook(monkeypatch) -> dict:
+    """Capture the ``buffer`` + ``frame_provider`` every constructed :class:`FaceHook` gets."""
+    captured: dict = {}
+    real_init = FaceHook.__init__
+
+    def _init(self, **kw):
+        captured["buffer"] = kw.get("buffer")
+        captured["frame_provider"] = kw.get("frame_provider")
+        return real_init(self, **kw)
+
+    monkeypatch.setattr(FaceHook, "__init__", _init)
+    return captured
+
+
+def test_live_agent_facehook_shares_buffer_and_vision_frame_source(monkeypatch) -> None:
+    """``--live --cognition agent``: FaceHook shares the buffer AND VisionHook's frames."""
+    pytest.importorskip("cv2")
+    vision_captured = _spy_vision_hook_instance(monkeypatch)
+    face_captured = _spy_face_hook(monkeypatch)
+    pat_captured = _spy_pat_hook_buffer(monkeypatch)
+    think_captured: dict = {}
+    real_think_init = ThinkHook.__init__
+
+    def _think_init(self, provider, **kw):
+        think_captured["buffer"] = kw.get("buffer")
+        return real_think_init(self, provider, **kw)
+
+    monkeypatch.setattr(ThinkHook, "__init__", _think_init)
+
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(
+        monkeypatch, _live_argv("--cognition", "agent"), transport=transport
+    )
+    assert rc == 0
+
+    shared = pat_captured.get("buffer")
+    assert shared is not None, "PatHook must receive a shared buffer under --live"
+    assert think_captured.get("buffer") is shared
+    assert (
+        face_captured.get("buffer") is shared
+    ), "FaceHook must receive the SAME shared buffer PatHook/ThinkHook consume"
+
+    # No second grabber: FaceHook's frame_provider is VisionHook's own latest-frame
+    # peek — bound to the exact VisionHook instance built in this run.
+    provider = face_captured.get("frame_provider")
+    assert provider is not None, "FaceHook must be given a shared frame_provider"
+    assert getattr(provider, "__self__", None) is vision_captured.get(
+        "instance"
+    ), "FaceHook must reuse VisionHook's frame source (no second grabber)"
+
+
+def test_live_marker_facehook_shares_buffer_with_cognition_engine(monkeypatch) -> None:
+    """Regression: the default (marker) ``--live`` engine shares the buffer with FaceHook too."""
+    pytest.importorskip("cv2")
+    face_captured = _spy_face_hook(monkeypatch)
+    think_captured: dict = {}
+    real_think_init = ThinkHook.__init__
+
+    def _think_init(self, provider, **kw):
+        think_captured["buffer"] = kw.get("buffer")
+        return real_think_init(self, provider, **kw)
+
+    monkeypatch.setattr(ThinkHook, "__init__", _think_init)
+
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(monkeypatch, _live_argv(), transport=transport)
+    assert rc == 0
+
+    shared = think_captured.get("buffer")
+    assert shared is not None, "the marker engine must receive a shared buffer under --live"
+    assert face_captured.get("buffer") is shared
+
+
+def test_bare_listen_run_facehook_is_never_built(monkeypatch) -> None:
+    """A non-live ``listen run`` builds NO FaceHook (vision folds only under --live)."""
+    face_captured = _spy_face_hook(monkeypatch)
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(
+        monkeypatch,
+        ["listen", "run", "--json", "--transport", "sdk", "--deadband", "0", "--max-ticks", "3"],
+        transport=transport,
+    )
+    assert rc == 0
+    assert face_captured == {}, "a non-live run must never construct a FaceHook"
