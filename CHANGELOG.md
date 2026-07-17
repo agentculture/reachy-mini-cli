@@ -9,18 +9,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `listen run --live --cognition {marker,agent}` (env `REACHY_COGNITION`) — agent mode swaps the folded marker cognition for `AgentTurnEngine`, a tool-use loop acting through the new `ToolRegistry` (`speak`, `harmonics`, `apply_pose`) on the same ThinkHook seam, EventBuffer, engagement gate, self-mute wrapper, and export sinks; no new process, no second media session
-- OpenAI tool-calling in the stdlib LLM client (`reachy/speech/llm.py`): `tools=`/`tool_choice=` payload support, streamed `tool_calls` delta assembly (`stream_turn`/`complete_turn` returning `TurnResult`), gateway-verified live (streaming and non-streaming)
-- `reachy/speech/tools.py` — agent tool registry with injected seams; `apply_pose` proven action-identical to the `*emoji*` marker path; both voices (TTS + harmonic) always registered as separate tools in agent mode
-- `reachy/stash/` — behavior stash: declarative LibraryEntry-shaped records (free-form code refused), explanations embedded via the lobes gateway `/v1/embeddings` (stdlib urllib), numpy cosine top-k search, atomic JSON index under the state dir, and `apply.py` sampling fetched records into bounded MotionQueue goto keyframes
-- Gateway TTS route: `synthesize(route="openai")` / `REACHY_TTS_ROUTE` targets the lobes gateway `POST /v1/audio/speech` (probe-verified WAV @ 24 kHz; bare-PCM opt-in), Chatterbox route unchanged as default
-- Gateway-gated integration tests: cortex full tool round trip (prompt → tool_calls → tool results → final text) and a cortex+muse parametrized run with per-model skip guards and latency bounds (deviation d1)
-- Operator docs: agent-cognition section with two on-robot demos, agent model choice (cortex local default / muse proxied from thor, tool-capable per lobes-cli#139 partial fix, audio-in still absent)
+- `listen run --live --cognition {marker,agent}` (env `REACHY_COGNITION`) — agent mode swaps the
+  folded marker cognition for `AgentTurnEngine`, a tool-use loop acting through the new
+  `ToolRegistry` (`speak`, `harmonics`, `apply_pose`) on the same ThinkHook seam, EventBuffer,
+  engagement gate, self-mute wrapper, and export sinks; no new process, no second media session
+- OpenAI tool-calling in the stdlib LLM client (`reachy/speech/llm.py`): `tools=`/`tool_choice=`
+  payload support, streamed `tool_calls` delta assembly (`stream_turn`/`complete_turn` returning
+  `TurnResult`), gateway-verified live (streaming and non-streaming)
+- `reachy/speech/tools.py` — agent tool registry with injected seams; `apply_pose` proven
+  action-identical to the `*emoji*` marker path; both voices (TTS + harmonic) always registered
+  as separate tools in agent mode
+- `reachy/stash/` — behavior stash: declarative LibraryEntry-shaped records (free-form code
+  refused), explanations embedded via the lobes gateway `/v1/embeddings` (stdlib urllib), numpy
+  cosine top-k search, atomic JSON index under the state dir, and `apply.py` sampling fetched
+  records into bounded MotionQueue goto keyframes
+- Gateway TTS route: `synthesize(route="openai")` / `REACHY_TTS_ROUTE` targets the lobes gateway
+  `POST /v1/audio/speech` (probe-verified WAV @ 24 kHz; bare-PCM opt-in), Chatterbox route
+  unchanged as default
+- Gateway-gated integration tests: cortex full tool round trip (prompt → tool_calls → tool
+  results → final text) and a cortex+muse parametrized run with per-model skip guards and
+  latency bounds (deviation d1)
+- Operator docs: agent-cognition section with two on-robot demos, agent model choice (cortex
+  local default / muse proxied from thor, tool-capable per lobes-cli#139 partial fix, audio-in
+  still absent)
 
 ### Changed
 
-- The deployed `live` boot unit ExecStart is now `listen run --live --transcribe --cognition agent --voice-engine harmonic` — the boot presence reasons via tool calls by default
-- CLAUDE.md noun catalog + listen/say/think/service sections updated for the agent mode and the stash package
+- The deployed `live` boot unit ExecStart is now
+  `listen run --live --transcribe --cognition agent --voice-engine harmonic` — the boot presence
+  reasons via tool calls by default
+- CLAUDE.md noun catalog + listen/say/think/service sections updated for the agent mode and the
+  stash package
 
 ## [0.31.0] - 2026-07-17
 
