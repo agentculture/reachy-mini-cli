@@ -1,10 +1,12 @@
 """``reachy-mini-cli service`` — boot-persistent presence in exactly one mode.
 
 This is the single CLI surface that makes the robot survive a reboot in *one*
-presence mode — either the idle ``demo-mode`` loop or the folded live sense loop
-(``listen run --live``), never both. It is the operator-facing front for the
-already-built :class:`reachy.service.manager.ServiceManager`, which enforces the
-single-presence-owner invariant (enable one mode → the sibling is disabled).
+presence mode — the idle ``demo-mode`` loop, the folded live sense loop
+(``listen run --live``), or the AI-agnostic symbolic runtime (``behavior engine
+run``, the boot default per decision c19) — never more than one at a time. It is
+the operator-facing front for the already-built
+:class:`reachy.service.manager.ServiceManager`, which enforces the
+single-presence-owner invariant (enable one mode → both siblings are disabled).
 
 Like ``daemon``, ``service`` does **not** talk to the robot through a transport —
 it talks to **systemd** (``systemctl --user``). So it never calls
@@ -12,13 +14,14 @@ it talks to **systemd** (``systemctl --user``). So it never calls
 
 Verbs:
 
-* ``enable {demo|live}`` — write the daemon + chosen presence unit, enable them,
-  and disable the sibling (mutual exclusion). Delegates to ``ServiceManager``.
+* ``enable {demo|live|runtime}`` — write the daemon + chosen presence unit,
+  enable them, and disable both siblings (mutual exclusion). Delegates to
+  ``ServiceManager``.
 * ``disable`` — disable whichever presence unit is enabled; the daemon is left
   enabled deliberately. Delegates to ``ServiceManager``.
 * ``status`` — which presence mode is enabled (or none) + daemon health.
   Delegates to ``ServiceManager``.
-* ``install`` — write all three unit files + ``daemon-reload`` WITHOUT enabling
+* ``install`` — write all four unit files + ``daemon-reload`` WITHOUT enabling
   anything (so a separate ``enable`` chooses the mode).
 * ``uninstall`` — remove the unit files + ``daemon-reload``.
 
@@ -41,24 +44,29 @@ from reachy.service.units import (
     DAEMON_UNIT,
     DEMO_UNIT,
     LIVE_UNIT,
+    RUNTIME_UNIT,
     daemon_unit_text,
     demo_unit_text,
     live_unit_text,
+    runtime_unit_text,
 )
 
 _JSON_HELP = "Emit structured JSON."
 
-# The three units this noun manages, with their pure text renderers (t1). Used
-# by install/uninstall to write/remove every unit file at once.
+# The four units this noun manages, with their pure text renderers (t1/t10).
+# Used by install/uninstall to write/remove every unit file at once.
 _ALL_UNITS = (
     (DAEMON_UNIT, daemon_unit_text),
     (DEMO_UNIT, demo_unit_text),
     (LIVE_UNIT, live_unit_text),
+    (RUNTIME_UNIT, runtime_unit_text),
 )
 
 _VERBS = [
-    "service enable demo — boot-persist the idle demo-mode presence (disables live)",
-    "service enable live — boot-persist the folded live sense loop (disables demo)",
+    "service enable demo — boot-persist the idle demo-mode presence (disables live/runtime)",
+    "service enable live — boot-persist the folded live sense loop (disables demo/runtime)",
+    "service enable runtime — boot-persist the AI-agnostic symbolic runtime "
+    "(disables demo/live)",
     "service disable — disable the enabled presence (daemon left enabled)",
     "service status — which presence mode is enabled (or none) + daemon health",
     "service install — write the unit files + daemon-reload, WITHOUT enabling",
@@ -119,8 +127,9 @@ def cmd_service_overview(args: argparse.Namespace) -> int:
             "title": "What",
             "items": [
                 "Makes the robot boot-persistent in EXACTLY ONE presence mode — the "
-                "idle demo-mode loop or the folded live sense loop — never both.",
-                "Backed by systemd --user units; enable one mode and the sibling is "
+                "idle demo-mode loop, the folded live sense loop, or the AI-agnostic "
+                "symbolic runtime — never more than one.",
+                "Backed by systemd --user units; enable one mode and BOTH siblings are "
                 "disabled (the single-presence-owner invariant).",
             ],
         },
@@ -131,6 +140,7 @@ def cmd_service_overview(args: argparse.Namespace) -> int:
                 f"daemon: {DAEMON_UNIT}",
                 f"demo presence: {DEMO_UNIT}",
                 f"live presence: {LIVE_UNIT}",
+                f"runtime presence: {RUNTIME_UNIT}",
                 f"unit dir: {_default_unit_dir()}",
             ],
         },
@@ -140,7 +150,8 @@ def cmd_service_overview(args: argparse.Namespace) -> int:
                 "every command supports --json",
                 "results to stdout, errors/diagnostics to stderr (never mixed)",
                 "talks to systemd, not the robot — no --transport flag",
-                "install writes units without enabling; enable {demo|live} chooses the mode",
+                "install writes units without enabling; "
+                "enable {demo|live|runtime} chooses the mode",
                 "exit codes: 0 ok, 1 user error, 2 environment (systemctl missing)",
             ],
         },
@@ -195,7 +206,7 @@ def _require(args: list[str], action: str) -> None:
 
 
 def cmd_service_install(args: argparse.Namespace) -> int:
-    """Write all three unit files + daemon-reload, WITHOUT enabling anything."""
+    """Write all four unit files + daemon-reload, WITHOUT enabling anything."""
     unit_dir = _default_unit_dir()
     unit_dir.mkdir(parents=True, exist_ok=True)
     written: dict[str, str] = {}
@@ -210,7 +221,7 @@ def cmd_service_install(args: argparse.Namespace) -> int:
 
 
 def cmd_service_uninstall(args: argparse.Namespace) -> int:
-    """Remove all three unit files + daemon-reload (best-effort, idempotent)."""
+    """Remove all four unit files + daemon-reload (best-effort, idempotent)."""
     unit_dir = _default_unit_dir()
     removed: list[str] = []
     for unit, _render in _ALL_UNITS:
@@ -249,8 +260,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     enable = noun_sub.add_parser("enable", help="Boot-persist exactly one presence mode.")
     enable.add_argument(
         "mode",
-        choices=("demo", "live"),
-        help="Which presence to boot-persist (the sibling is disabled).",
+        choices=("demo", "live", "runtime"),
+        help="Which presence to boot-persist (both siblings are disabled).",
     )
     enable.add_argument("--json", action="store_true", help=_JSON_HELP)
     enable.set_defaults(func=cmd_service_enable)
