@@ -198,8 +198,9 @@ def test_unknown_voice_engine_raises_cli_error(monkeypatch) -> None:
     _forbid_tts_call(monkeypatch)
     monkeypatch.setattr(say_mod, "_play_audio", lambda *a, **k: None)
 
+    args = _make_args(text="hi", voice_engine="nonexistent-engine")
     with pytest.raises(CliError) as exc_info:
-        cmd_say_run(_make_args(text="hi", voice_engine="nonexistent-engine"))
+        cmd_say_run(args)
 
     err = exc_info.value
     assert err.code == 1
@@ -213,8 +214,9 @@ def test_unknown_voice_engine_from_env_raises_cli_error(monkeypatch) -> None:
     _forbid_tts_call(monkeypatch)
     monkeypatch.setattr(say_mod, "_play_audio", lambda *a, **k: None)
 
+    args = _make_args(text="hi", voice_engine=None)
     with pytest.raises(CliError) as exc_info:
-        cmd_say_run(_make_args(text="hi", voice_engine=None))
+        cmd_say_run(args)
 
     assert exc_info.value.code == 1
 

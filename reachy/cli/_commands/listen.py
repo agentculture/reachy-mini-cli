@@ -689,15 +689,7 @@ def _build_live_hooks(
     )
 
     if transcribe:
-        # Build the shared buffer up front so it can be wired into both the engine
-        # (via _build_think_hook) and the TranscribeHook.
-        try:
-            from reachy.speech.events import EventBuffer
-
-            think_buffer = EventBuffer()
-        except Exception:  # noqa: BLE001
-            logger.warning("listen --live --transcribe: EventBuffer unavailable", exc_info=True)
-            think_buffer = None
+        think_buffer = _make_transcribe_buffer()
 
     # Under --transcribe, cognition is driven by transcribed WORDS only: the ThinkHook
     # stops pushing raw DoA/RMS sound cues, so the robot doesn't react to its own TTS
@@ -719,37 +711,74 @@ def _build_live_hooks(
         ordered.append(think_hook)
 
     if transcribe:
-        # The transcribe hook feeds the buffer the ThinkHook's engine consumes. Use
-        # the buffer the hook was actually built with (it may differ if think_buffer
-        # was None and the hook built its own). If cognition is unavailable entirely
-        # (no ThinkHook) there is no buffer to feed — skip transcription gracefully.
-        feed_buffer = getattr(think_hook, "_buffer", None) if think_hook is not None else None
-        if feed_buffer is not None:
-            # The engagement gate (addressed-vs-ambient LLM classifier) + the
-            # motion-ladder engaged signal are built ONLY here, under --transcribe.
-            # The classifier shares cognition's REACHY_OPENAI_* endpoint; on_engage
-            # is the producer's one-shot turn latch — fired only when the gate
-            # ENGAGES, so ambient speech never latches a barge-in turn.
-            classifier = _build_engagement_classifier()
-            on_engage = getattr(producer, "set_engaged", None) if producer is not None else None
-            ordered.append(
-                _build_transcribe_hook(
-                    provider,
-                    buffer=feed_buffer,
-                    mute_until=lambda: mute["until"],
-                    sample_rate=sample_rate,
-                    classifier=classifier,
-                    on_engage=on_engage,
-                )
-            )
-        else:
-            logger.warning(
-                "listen --live --transcribe: cognition unavailable; no buffer to feed "
-                "transcribed words into — transcription disabled this run"
-            )
+        transcribe_hook = _compose_transcribe_hook(
+            provider,
+            think_hook=think_hook,
+            mute=mute,
+            sample_rate=sample_rate,
+            producer=producer,
+        )
+        if transcribe_hook is not None:
+            ordered.append(transcribe_hook)
 
     ordered.append(vision_hook)
     return ordered
+
+
+def _make_transcribe_buffer() -> object | None:
+    """The shared ``--transcribe`` cognition buffer, or ``None`` if unavailable.
+
+    Built up front, at composition level, so it can be wired into both the
+    engine (via :func:`_build_think_hook`) and the TranscribeHook.
+    """
+    try:
+        from reachy.speech.events import EventBuffer
+
+        return EventBuffer()
+    except Exception:  # noqa: BLE001
+        logger.warning("listen --live --transcribe: EventBuffer unavailable", exc_info=True)
+        return None
+
+
+def _compose_transcribe_hook(
+    provider: Callable[[], SenseSample | None],
+    *,
+    think_hook: object | None,
+    mute: dict[str, float],
+    sample_rate: int | None,
+    producer: object | None,
+) -> object | None:
+    """Compose the ``--transcribe`` hook against the ThinkHook's REAL buffer.
+
+    The transcribe hook feeds the buffer the ThinkHook's engine consumes — the
+    buffer the hook was actually built with (it may differ if the shared buffer
+    was ``None`` and the hook built its own). If cognition is unavailable
+    entirely (no ThinkHook) there is no buffer to feed, so transcription is
+    skipped gracefully (logged once) and ``None`` is returned.
+
+    The engagement gate (addressed-vs-ambient LLM classifier) + the
+    motion-ladder engaged signal are built ONLY here, under ``--transcribe``.
+    The classifier shares cognition's ``REACHY_OPENAI_*`` endpoint; ``on_engage``
+    is the producer's one-shot turn latch — fired only when the gate ENGAGES,
+    so ambient speech never latches a barge-in turn.
+    """
+    feed_buffer = getattr(think_hook, "_buffer", None) if think_hook is not None else None
+    if feed_buffer is None:
+        logger.warning(
+            "listen --live --transcribe: cognition unavailable; no buffer to feed "
+            "transcribed words into — transcription disabled this run"
+        )
+        return None
+    classifier = _build_engagement_classifier()
+    on_engage = getattr(producer, "set_engaged", None) if producer is not None else None
+    return _build_transcribe_hook(
+        provider,
+        buffer=feed_buffer,
+        mute_until=lambda: mute["until"],
+        sample_rate=sample_rate,
+        classifier=classifier,
+        on_engage=on_engage,
+    )
 
 
 def _make_self_mute_play_audio(
@@ -788,24 +817,43 @@ def _make_self_mute_play_audio(
 
     def _guarded_play(pcm: bytes, **kwargs: object) -> None:
         from reachy.speech.playback import play_audio as _play
-        from reachy.speech.tts import DEFAULT_SAMPLE_RATE
 
-        if playback_transport is not None and "transport" not in kwargs:
-            kwargs["transport"] = playback_transport
-        if samplerate is not None and "samplerate" not in kwargs:
-            kwargs["samplerate"] = samplerate
+        _default_kwarg(kwargs, "transport", playback_transport)
+        _default_kwarg(kwargs, "samplerate", samplerate)
         _play(pcm, **kwargs)
         if after > 0:
-            # Mute for the clip's full play duration PLUS the margin. Playback may be
-            # async (HTTP play_sound returns before the audio finishes), so a fixed
-            # pad alone would expire mid-utterance and let the robot transcribe its
-            # own (long) voice — a slower feedback loop. Base the window on the audio
-            # length so the whole utterance is covered.
-            rate = float(samplerate if samplerate is not None else (DEFAULT_SAMPLE_RATE or 24000))
-            clip_seconds = len(pcm) / (2.0 * rate) if rate > 0 else 0.0
-            mute["until"] = clock() + clip_seconds + after
+            _stamp_mute_window(mute, clock, pcm, samplerate=samplerate, after=after)
 
     return _guarded_play
+
+
+def _default_kwarg(kwargs: dict[str, object], key: str, value: object | None) -> None:
+    """Inject ``key=value`` into a playback call's kwargs unless the caller set one."""
+    if value is not None and key not in kwargs:
+        kwargs[key] = value
+
+
+def _stamp_mute_window(
+    mute: dict[str, float],
+    clock: Callable[[], float],
+    pcm: bytes,
+    *,
+    samplerate: int | None,
+    after: float,
+) -> None:
+    """Advance ``mute["until"]`` past this clip's REAL duration plus the margin.
+
+    Playback may be async (HTTP play_sound returns before the audio finishes),
+    so a fixed pad alone would expire mid-utterance and let the robot
+    transcribe its own (long) voice — a slower feedback loop. Base the window
+    on the audio length so the whole utterance is covered; ``samplerate=None``
+    falls back to the hardcoded TTS default rate.
+    """
+    from reachy.speech.tts import DEFAULT_SAMPLE_RATE
+
+    rate = float(samplerate if samplerate is not None else (DEFAULT_SAMPLE_RATE or 24000))
+    clip_seconds = len(pcm) / (2.0 * rate) if rate > 0 else 0.0
+    mute["until"] = clock() + clip_seconds + after
 
 
 def _build_sample_tap(
