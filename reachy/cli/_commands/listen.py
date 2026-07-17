@@ -619,17 +619,25 @@ def _build_agent_think_hook(
         from reachy.motion.expression import ExpressionProducer
         from reachy.speech.agent_turn import AgentTurnEngine
         from reachy.speech.events import EventBuffer
+        from reachy.speech.playback import play_audio as _default_play_audio
         from reachy.speech.tools import ToolRegistry
         from reachy.speech.voice import resolve_voice_engine
 
         buf = buffer if buffer is not None else EventBuffer()
+        # Build the reaction seams ONCE and share them between the built-in tools and the
+        # forged-skill ctx, so a forged skill's ctx.speak / ctx.express render through the
+        # SAME synth+play / express seams the speak / apply_pose tools use.
+        express_seam = ExpressionProducer(queue=queue).express
+        speak_engine = resolve_voice_engine("tts")
+        harmonic_engine = resolve_voice_engine("harmonic")
+        play_seam = play_audio if play_audio is not None else _default_play_audio
         registry_kwargs: dict[str, object] = {
             # apply_pose enqueues on the loop's ONE MotionQueue (same serial queue the
             # other sense hooks drain), byte-for-byte the *emoji* marker path's action.
-            "express": ExpressionProducer(queue=queue).express,
+            "express": express_seam,
             # Both voices are tools side by side — --voice-engine does not gate them.
-            "speak_engine": resolve_voice_engine("tts"),
-            "harmonic_engine": resolve_voice_engine("harmonic"),
+            "speak_engine": speak_engine,
+            "harmonic_engine": harmonic_engine,
         }
         if play_audio is not None:
             # The SAME self-mute-stamping wrapper the marker engine + TranscribeHook
@@ -640,7 +648,39 @@ def _build_agent_think_hook(
             # SceneHook uses, over the shared VisionHook frame source. Omitted (tool
             # not advertised) when cv2 is absent.
             registry_kwargs["describe_scene"] = describe_scene
+
+        # The forge self-extension tool: a late-bound dispatch seam so the registry can be
+        # constructed with the `forge` tool listed BEFORE the ForgeClient (which needs the
+        # already-built registry, via the activator's register callback) exists. The seam
+        # dereferences the holder only at call time. Only advertised when the forge stack
+        # imports (like describe_scene, opt-in) — see _activate_forge for the activation
+        # side (auto-activation on stage + boot reload of active/).
+        forge_holder: list = []
+        if _forge_stack_available():
+
+            def _forge_seam(goal: str, improve: str | None = None) -> object:
+                if not forge_holder:
+                    return None
+                return forge_holder[0].dispatch(goal, improve=improve)
+
+            registry_kwargs["forge"] = _forge_seam
+
         registry = ToolRegistry(**registry_kwargs)
+
+        if "forge" in registry_kwargs:
+            # After the registry exists: wire the activation subsystem + ForgeClient and
+            # arm the seam. Best-effort — a failure leaves cognition running (the forge
+            # tool degrades to an inert no-op, logged).
+            _activate_forge(
+                registry,
+                buf,
+                forge_holder,
+                express=express_seam,
+                speak_engine=speak_engine,
+                harmonic_engine=harmonic_engine,
+                play=play_seam,
+            )
+
         engine = AgentTurnEngine(
             buffer=buf,
             registry=registry,
@@ -654,6 +694,72 @@ def _build_agent_think_hook(
             exc_info=True,
         )
         return None
+
+
+def _forge_stack_available() -> bool:
+    """Whether the forge self-extension stack is importable (advertise the tool only if so)."""
+    try:
+        import reachy.forge  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _activate_forge(
+    registry: object,
+    buffer: object,
+    holder: list,
+    *,
+    express: Callable[[str], object],
+    speak_engine: object,
+    harmonic_engine: object,
+    play: Callable[..., None],
+) -> None:
+    """Wire the forge auto-activation subsystem for the agent registry (best-effort).
+
+    Builds the restricted :class:`~reachy.forge.ForgedSkillContext` over the SAME seams the
+    built-in tools use, a register callback that HOT-registers a forged skill into the LIVE
+    ``registry``, a :class:`~reachy.forge.ForgeActivator` (validator-gated AUTO-activation
+    on ``forge/staged`` + boot reload of ``active/``), and a
+    :class:`~reachy.forge.ForgeClient` whose ``publish`` IS the activator. Finally arms the
+    late-bound dispatch seam by appending the client to ``holder``. The announce seam is the
+    shared cognition buffer's :meth:`~reachy.speech.events.EventBuffer.feed_scene` — kept a
+    plain callable, so the forge modules never import the event bus. A failure disables only
+    the forge tool; cognition keeps running.
+    """
+    try:
+        from reachy.forge import ForgeActivator, ForgeClient, build_ctx_seams
+        from reachy.forge.validator import DEFAULT_ALLOWED_CTX_ATTRS
+        from reachy.speech.tools import function_tool
+
+        def _register(name: str, description: str, parameters: dict, handler: object) -> None:
+            registry.register(
+                function_tool(
+                    name=name, description=description, parameters=parameters, handler=handler
+                )
+            )
+
+        ctx = build_ctx_seams(
+            speak_engine=speak_engine,
+            harmonic_engine=harmonic_engine,
+            play=play,
+            express=express,
+        )
+        announce = getattr(buffer, "feed_scene", None)
+        activator = ForgeActivator(register=_register, ctx=ctx, announce=announce)
+        # Boot reload: any active/<name> forged skill re-registers now (idempotent).
+        activator.reload_active()
+        holder.append(
+            ForgeClient(
+                publish=activator.publish,
+                allowed_ctx_attrs=set(DEFAULT_ALLOWED_CTX_ATTRS),
+            )
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "listen --live --cognition agent: forge subsystem unavailable; self-extension disabled",
+            exc_info=True,
+        )
 
 
 class _SessionBoundTransport:

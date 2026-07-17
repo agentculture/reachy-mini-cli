@@ -12,26 +12,39 @@ Ported (cite-don't-import) from ``reachy_nova``'s ``skill_forge.py`` +
 * :mod:`reachy.forge.client` — :class:`ForgeClient`, the background-thread dispatch
   client;
 * :mod:`reachy.forge.validator` — :func:`validate`, the AST-only static gate; and
-* :mod:`reachy.forge.lifecycle` — the staged/activated/rejected disk + event layer.
-
-The ``ctx`` tool surface a forged skill is handed, and the auto-activation wiring, are a
-later task's responsibility (t13); this package provides the client, the gate, and the
-move + event primitives only.
+* :mod:`reachy.forge.lifecycle` — the staged/activated/rejected disk + event layer; and
+* :mod:`reachy.forge.activate` — validator-gated AUTO-activation (no human gate): the
+  restricted :class:`ForgedSkillContext`, the ``spec_from_file_location`` importer, the
+  crash-catching handler wrapper, and :class:`ForgeActivator` (auto-activate on stage,
+  hot-register into the live registry, announce, and boot-reload ``active/``).
 """
 
 from __future__ import annotations
 
+from reachy.forge.activate import (
+    DEFAULT_FORGED_PARAMS,
+    ForgeActivator,
+    ForgedSkillContext,
+    build_ctx_seams,
+    import_forged_execute,
+    read_skill_description,
+    wrap_executor,
+)
 from reachy.forge.client import (
     DEFAULT_FORGE_BASE_URL,
     DEFAULT_FORGE_MODEL,
     DEFAULT_TIMEOUT,
     ForgeClient,
 )
+
+# NOTE: the lifecycle *move* helper ``lifecycle.activate`` is deliberately NOT re-exported
+# here — the ``reachy.forge.activate`` name now belongs to the AUTO-activation submodule
+# (:mod:`reachy.forge.activate`), and a same-named function attribute would shadow it. The
+# low-level move remains available as :func:`reachy.forge.lifecycle.activate`.
 from reachy.forge.lifecycle import (
     EVENT_ACTIVATED,
     EVENT_REJECTED,
     EVENT_STAGED,
-    activate,
     default_active_root,
     default_staging_root,
     reject,
@@ -49,6 +62,13 @@ from reachy.forge.validator import (
 
 __all__ = [
     "ForgeClient",
+    "ForgeActivator",
+    "ForgedSkillContext",
+    "import_forged_execute",
+    "wrap_executor",
+    "read_skill_description",
+    "build_ctx_seams",
+    "DEFAULT_FORGED_PARAMS",
     "DEFAULT_FORGE_BASE_URL",
     "DEFAULT_FORGE_MODEL",
     "DEFAULT_TIMEOUT",
@@ -58,7 +78,6 @@ __all__ = [
     "FORBIDDEN_NAMES",
     "SAFE_BUILTIN_CALLS",
     "MAX_EXECUTOR_LINES",
-    "activate",
     "default_active_root",
     "default_staging_root",
     "reject",
