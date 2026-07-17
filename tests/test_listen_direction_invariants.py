@@ -53,7 +53,7 @@ import reachy.motion.sleep_signal as ss
 import reachy.speech.cognition_signal as cs
 from reachy.cli import main
 from reachy.motion.listen_think import ThinkHook
-from reachy.motion.listen_transcribe import TranscribeHook
+from reachy.motion.listen_transcribe import TranscribeHook, TranscribeTuning
 from reachy.motion.queue import MotionQueue
 from reachy.motion.sense_sample import SenseSample
 from reachy.speech.events import EventBuffer
@@ -282,7 +282,7 @@ def test_transcribe_hook_direction_reaches_real_event_buffer_cue() -> None:
         lambda: holder["s"],
         buffer=buffer,
         transcriber=_FakeTranscriber("reachy hello there"),
-        min_utterance_s=0.0,
+        tuning=TranscribeTuning(min_utterance_s=0.0),
     )
     chunk = np.full(256, 0.05, dtype=np.float32)
 

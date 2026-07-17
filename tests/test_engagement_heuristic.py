@@ -31,10 +31,11 @@ threading involved.
 from __future__ import annotations
 
 import re
+from dataclasses import fields as _dc_fields
 
 import pytest
 
-from reachy.motion.listen_transcribe import TranscribeHook
+from reachy.motion.listen_transcribe import TranscribeHook, TranscribeTuning
 from tests.fixtures.engagement_transcripts import (
     ADDRESSED_FOLLOWUP,
     AMBIENT,
@@ -57,6 +58,16 @@ _DEFAULT_NAMES = ("reachy", "robot")
 _DEFAULT_MIN_WORDS = 3
 _DEFAULT_ENGAGE_WINDOW = 20.0
 
+#: Field names of TranscribeTuning — used to split tuning kwargs from seam kwargs
+#: at the test helper below (S107 split: the constructor now takes one grouped
+#: ``tuning=`` object instead of nine individual numeric parameters).
+_TUNING_FIELDS = {f.name for f in _dc_fields(TranscribeTuning)}
+
+
+def _pop_tuning(kwargs: dict) -> TranscribeTuning:
+    """Pop any TranscribeTuning-field keys out of *kwargs* and build a TranscribeTuning."""
+    return TranscribeTuning(**{k: kwargs.pop(k) for k in list(kwargs) if k in _TUNING_FIELDS})
+
 
 class _FakeBuffer:
     """Minimal EventBuffer stand-in (we never call feed_transcript in these tests)."""
@@ -77,10 +88,12 @@ def _make_hook(**kwargs) -> TranscribeHook:
             return None
 
     kwargs.setdefault("min_utterance_s", 0.0)
+    tuning = _pop_tuning(kwargs)
     return TranscribeHook(
         lambda: None,
         buffer=_FakeBuffer(),
         transcriber=_NullTranscriber(),
+        tuning=tuning,
         **kwargs,
     )
 

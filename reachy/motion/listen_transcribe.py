@@ -86,6 +86,7 @@ import math
 import os
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
@@ -126,6 +127,52 @@ def _env_truthy(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in _TRUTHY
+
+
+@dataclass(frozen=True)
+class TranscribeTuning:
+    """Grouped numeric knobs tuning HOW :class:`TranscribeHook` endpoints + gates.
+
+    Split out of :meth:`TranscribeHook.__init__` (SonarCloud S107 — too many
+    parameters) so the constructor's SEAM parameters (transcriber, buffer,
+    classifier, clocks, callbacks — the idiomatic injectables this codebase
+    favours) stay individual, while the pure-number tuning cluster travels as
+    one value object. Every field keeps its previously shipped default, so a
+    bare ``TranscribeTuning()`` reproduces today's behaviour byte-identically.
+
+    Endpointing (whole-utterance accumulation):
+
+    * ``silence_hold_s`` — pause length that ends an utterance and triggers the
+      single :meth:`~reachy.speech.stt.Transcriber.transcribe_once` POST.
+    * ``max_utterance_s`` — hard cap that force-flushes a very long monologue.
+    * ``min_utterance_s`` — floor below which a blip is dropped, never sent to
+      STT (measured over *speech* samples only, pre-roll excluded).
+
+    Pre-roll ring buffer + measured onset (cited from reachy_nova's
+    ``SpeechEventDetector``):
+
+    * ``ring_seconds`` — horizon of the rolling pre-flag audio buffer.
+    * ``pre_roll_s`` — lead-in kept before the measured onset.
+    * ``onset_threshold`` — RMS level (float PCM) an analysis window must clear
+      to count as the onset.
+    * ``onset_window_s`` — width of each onset-scan analysis window.
+
+    Engagement gate:
+
+    * ``min_words`` — word-count floor for the "clear sentence" heuristic.
+    * ``engage_window_s`` — how long a conversation stays "open" after an
+      ENGAGE decision, for the coherent-follow-up heuristic branch.
+    """
+
+    silence_hold_s: float = 0.7
+    max_utterance_s: float = 15.0
+    min_utterance_s: float = 0.3
+    ring_seconds: float = _DEFAULT_RING_SECONDS
+    pre_roll_s: float = _DEFAULT_PRE_ROLL_SECONDS
+    onset_threshold: float = _DEFAULT_SILENCE_THRESHOLD
+    onset_window_s: float = _ONSET_WINDOW_SECONDS
+    min_words: int = 3
+    engage_window_s: float = 20.0
 
 
 class TranscribeHook:
@@ -189,6 +236,13 @@ class TranscribeHook:
         transcribes its own voice. The tick's own ``t`` is the clock used for the
         mute gate (mirroring :mod:`reachy.motion.listen_sleep`), so the hook needs
         no separate clock seam.
+    tuning:
+        A :class:`TranscribeTuning` bundling the endpointing / pre-roll / gate
+        numeric knobs (``silence_hold_s``, ``max_utterance_s``, ``min_utterance_s``,
+        ``ring_seconds``, ``pre_roll_s``, ``onset_threshold``, ``onset_window_s``,
+        ``min_words``, ``engage_window_s``). Defaults to ``TranscribeTuning()`` —
+        today's shipped values, byte-identical when omitted. See that class's
+        docstring for what each field controls.
     """
 
     def __init__(
@@ -201,15 +255,7 @@ class TranscribeHook:
         on_engage: Callable[[], None] | None = None,
         sample_rate: int | None = None,
         mute_until: Callable[[], float] | None = None,
-        silence_hold_s: float = 0.7,
-        max_utterance_s: float = 15.0,
-        min_utterance_s: float = 0.3,
-        ring_seconds: float = _DEFAULT_RING_SECONDS,
-        pre_roll_s: float = _DEFAULT_PRE_ROLL_SECONDS,
-        onset_threshold: float = _DEFAULT_SILENCE_THRESHOLD,
-        onset_window_s: float = _ONSET_WINDOW_SECONDS,
-        min_words: int = 3,
-        engage_window_s: float = 20.0,
+        tuning: TranscribeTuning = TranscribeTuning(),
         names: tuple[str, ...] = ("reachy", "robot"),
     ) -> None:
         self._provider = sample_provider
@@ -228,9 +274,9 @@ class TranscribeHook:
 
         # --- Endpointing: accumulate a whole utterance, transcribe on a pause. ---
         self._rate = int(sample_rate) if sample_rate else 16000
-        self._silence_hold_s = float(silence_hold_s)
-        self._max_utterance_s = float(max_utterance_s)
-        self._min_utt_samples = int(max(0.0, min_utterance_s) * self._rate)
+        self._silence_hold_s = float(tuning.silence_hold_s)
+        self._max_utterance_s = float(tuning.max_utterance_s)
+        self._min_utt_samples = int(max(0.0, tuning.min_utterance_s) * self._rate)
         #: Chunks of the current utterance (cleared on flush / mute / reset).
         self._utt: list[np.ndarray] = []
         self._utt_samples = 0
@@ -253,18 +299,18 @@ class TranscribeHook:
         #     leading words the flag missed are kept. Trimmed by TOTAL samples with a
         #     cheap per-tick append — the only concat is one snapshot on the rising
         #     edge, never per tick. ---
-        self._ring_max = int(max(0.0, ring_seconds) * self._rate)
-        self._pre_roll_samples = int(max(0.0, pre_roll_s) * self._rate)
-        self._onset_threshold = float(onset_threshold)
-        self._onset_window = max(1, int(onset_window_s * self._rate))
+        self._ring_max = int(max(0.0, tuning.ring_seconds) * self._rate)
+        self._pre_roll_samples = int(max(0.0, tuning.pre_roll_s) * self._rate)
+        self._onset_threshold = float(tuning.onset_threshold)
+        self._onset_window = max(1, int(tuning.onset_window_s * self._rate))
         self._ring: list[np.ndarray] = []
         self._ring_samples = 0
         self._ring_total = 0
 
         # --- Engagement gate: only respond to clear sentences that are addressed
         #     to the robot (its name) or continue an ongoing conversation. ---
-        self._min_words = int(min_words)
-        self._engage_window_s = float(engage_window_s)
+        self._min_words = int(tuning.min_words)
+        self._engage_window_s = float(tuning.engage_window_s)
         self._names = tuple(n.lower() for n in names)
         self._engaged_until = 0.0
 

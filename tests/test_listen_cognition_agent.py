@@ -43,6 +43,7 @@ import argparse
 import contextlib
 import io
 import sys
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -57,7 +58,7 @@ from reachy.motion.listen_face import FaceHook
 from reachy.motion.listen_pat import PatHook
 from reachy.motion.listen_scene import SceneHook
 from reachy.motion.listen_think import ThinkHook
-from reachy.motion.listen_transcribe import TranscribeHook
+from reachy.motion.listen_transcribe import TranscribeHook, TranscribeTuning
 from reachy.motion.listen_vision import VisionHook
 from reachy.speech.agent_turn import AgentTurnEngine
 from reachy.speech.llm import TurnResult
@@ -253,8 +254,10 @@ def _force_flush_transcribe(monkeypatch):
     real_tr = TranscribeHook.__init__
 
     def _tr(self, provider, **kw):
-        kw.setdefault("max_utterance_s", 0.0)
-        kw.setdefault("min_utterance_s", 0.0)
+        # The endpointing knobs now travel as one TranscribeTuning; override just
+        # the two fields this test cares about, keeping every other default.
+        base = kw.pop("tuning", None) or TranscribeTuning()
+        kw["tuning"] = replace(base, max_utterance_s=0.0, min_utterance_s=0.0)
         return real_tr(self, provider, **kw)
 
     monkeypatch.setattr(TranscribeHook, "__init__", _tr)

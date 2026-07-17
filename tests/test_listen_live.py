@@ -34,6 +34,7 @@ No robot, no daemon, no network, no real sleeps.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import sys
 
@@ -510,7 +511,7 @@ def test_sample_tap_reads_audio_once_and_rms_matches_snap_chunk():
 
 
 from reachy.cli._errors import EXIT_USER_ERROR, CliError  # noqa: E402
-from reachy.motion.listen_transcribe import TranscribeHook  # noqa: E402
+from reachy.motion.listen_transcribe import TranscribeHook, TranscribeTuning  # noqa: E402
 
 
 class _NoMediaTransport:
@@ -812,8 +813,10 @@ def test_transcribe_feeds_words_into_shared_cognition_buffer(monkeypatch) -> Non
         # The hook now buffers a whole utterance and flushes on a pause / max length.
         # Force a flush on the very first speech tick (max_utterance_s=0) with no
         # minimum-duration floor, so the end-to-end path fires within the mocked ticks.
-        kw.setdefault("max_utterance_s", 0.0)
-        kw.setdefault("min_utterance_s", 0.0)
+        # The endpointing knobs now travel as one TranscribeTuning; override just the
+        # two fields this test cares about, keeping every other default.
+        base = kw.pop("tuning", None) or TranscribeTuning()
+        kw["tuning"] = dataclasses.replace(base, max_utterance_s=0.0, min_utterance_s=0.0)
         captured["buffer"] = kw.get("buffer")
         return real_tr_init(self, sample_provider, **kw)
 

@@ -31,12 +31,24 @@ Coverage (mirrors the acceptance criteria):
 from __future__ import annotations
 
 import logging
+from dataclasses import fields as _dc_fields
 
 import numpy as np
 
-from reachy.motion.listen_transcribe import TranscribeHook
+from reachy.motion.listen_transcribe import TranscribeHook, TranscribeTuning
 from reachy.motion.queue import MotionQueue
 from reachy.motion.sense_sample import SenseSample
+
+#: Field names of TranscribeTuning — used to split tuning kwargs from seam kwargs
+#: at the test helpers below (S107 split: the constructor now takes one grouped
+#: ``tuning=`` object instead of nine individual numeric parameters).
+_TUNING_FIELDS = {f.name for f in _dc_fields(TranscribeTuning)}
+
+
+def _pop_tuning(kwargs: dict) -> TranscribeTuning:
+    """Pop any TranscribeTuning-field keys out of *kwargs* and build a TranscribeTuning."""
+    return TranscribeTuning(**{k: kwargs.pop(k) for k in list(kwargs) if k in _TUNING_FIELDS})
+
 
 # ---------------------------------------------------------------------------
 # Fakes: a recording event buffer + a recording transcriber
@@ -89,7 +101,8 @@ def _make_hook(provider, **kwargs):
     """Build a TranscribeHook with a recording buffer + transcriber unless given."""
     buffer = kwargs.pop("buffer", None) or _RecordingBuffer()
     transcriber = kwargs.pop("transcriber", None) or _FakeTranscriber()
-    hook = TranscribeHook(provider, buffer=buffer, transcriber=transcriber, **kwargs)
+    tuning = _pop_tuning(kwargs)
+    hook = TranscribeHook(provider, buffer=buffer, transcriber=transcriber, tuning=tuning, **kwargs)
     return hook, buffer, transcriber
 
 
@@ -533,8 +546,7 @@ def test_preroll_includes_pre_flag_samples() -> None:
         buffer=buffer,
         transcriber=transcriber,
         sample_rate=rate,
-        min_utterance_s=0.0,
-        pre_roll_s=2.0,
+        tuning=TranscribeTuning(min_utterance_s=0.0, pre_roll_s=2.0),
     )
 
     pre = np.full(100, 0.3, dtype=np.float32)  # leading words, speech flag still False
@@ -578,7 +590,10 @@ def test_ring_buffer_trimmed_by_total_samples_not_chunk_count() -> None:
     """The pre-roll ring is bounded by TOTAL samples (~ring_seconds), not chunk count."""
     rate = 1000
     hook = TranscribeHook(
-        lambda: None, buffer=_RecordingBuffer(), sample_rate=rate, ring_seconds=1.0
+        lambda: None,
+        buffer=_RecordingBuffer(),
+        sample_rate=rate,
+        tuning=TranscribeTuning(ring_seconds=1.0),
     )  # 1000-sample cap
     for _ in range(30):  # 30 * 100 = 3000 samples, far over the cap
         hook._push_ring(np.full(100, 0.1, dtype=np.float32))
@@ -590,7 +605,10 @@ def test_onset_measured_skips_leading_silence() -> None:
     """Onset is MEASURED by an RMS scan (10ms windows), not an assumed fixed offset."""
     rate = 1000
     hook = TranscribeHook(
-        lambda: None, buffer=_RecordingBuffer(), sample_rate=rate, onset_threshold=0.02
+        lambda: None,
+        buffer=_RecordingBuffer(),
+        sample_rate=rate,
+        tuning=TranscribeTuning(onset_threshold=0.02),
     )
     snapshot = np.concatenate(
         [np.zeros(200, dtype=np.float32), np.full(100, 0.3, dtype=np.float32)]
@@ -611,8 +629,8 @@ def test_preroll_clamped_to_ring_start() -> None:
         buffer=_RecordingBuffer(),
         transcriber=transcriber,
         sample_rate=rate,
-        min_utterance_s=0.0,
-        pre_roll_s=5.0,  # 5000 samples — far more than the buffered audio
+        # pre_roll_s=5.0 -> 5000 samples — far more than the buffered audio.
+        tuning=TranscribeTuning(min_utterance_s=0.0, pre_roll_s=5.0),
     )
     chunk = np.full(100, 0.3, dtype=np.float32)
     holder["s"] = SenseSample(rms=0.3, doa=10.0, speech=True, ts=0.0, audio=chunk)
@@ -637,7 +655,7 @@ def test_preroll_does_not_pad_a_blip_past_the_min_gate() -> None:
         buffer=_RecordingBuffer(),
         transcriber=transcriber,
         sample_rate=rate,
-        min_utterance_s=0.3,  # 4800 samples
+        tuning=TranscribeTuning(min_utterance_s=0.3),  # 4800 samples
     )
     # 5 pre-flag ambient ticks (energetic) build a big ring, then a tiny speech blip.
     for ti in (0.0, 0.05, 0.1, 0.15, 0.2):
