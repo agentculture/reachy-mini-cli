@@ -175,6 +175,7 @@ def test_disallowed_import_from_rejects(tmp_path):
         "pickle",
         "marshal",
         "breakpoint",
+        "__builtins__",
     ],
 )
 def test_forbidden_name_rejects(tmp_path, name):
@@ -233,6 +234,62 @@ def test_unsanctioned_call_rejects(tmp_path):
     ok, reasons = validate(_write(tmp_path, executor=src))
     assert ok is False
     assert any("do_thing" in r for r in reasons)
+
+
+# ---------------------------------------------------------------------------
+# Negative: call-target allow-list — fail-closed on non-Name callees
+#
+# Qodo finding: the call-target check only validated calls whose callee is a
+# plain ``ast.Name``. A call through a subscript, a lambda result, or a
+# chained attribute off a non-allowed base slipped past the allow-list
+# entirely (the old ``_check_call`` just ``return``ed for anything that
+# wasn't an ``ast.Name``). Every shape below must now be rejected.
+# ---------------------------------------------------------------------------
+
+
+def test_subscript_callee_call_rejects(tmp_path):
+    """``d["k"]()`` — a call whose callee is a Subscript, not a Name/Attribute."""
+    src = (
+        "def execute(params, ctx):\n" "    ops = {'go': len}\n" "    return ops['go']([1, 2, 3])\n"
+    )
+    ok, reasons = validate(_write(tmp_path, executor=src))
+    assert ok is False
+    assert any("call target" in r and "line" in r for r in reasons)
+
+
+def test_lambda_result_call_rejects(tmp_path):
+    """``(lambda: 1)()`` — a call whose callee is a Lambda expression."""
+    src = "def execute(params, ctx):\n    return (lambda: 1)()\n"
+    ok, reasons = validate(_write(tmp_path, executor=src))
+    assert ok is False
+    assert any("call target" in r and "line" in r for r in reasons)
+
+
+def test_chained_attribute_call_on_non_allowed_base_rejects(tmp_path):
+    """``params.helper.compute()`` — attribute call whose root is neither ``ctx``
+    nor an allowed-import alias."""
+    src = "def execute(params, ctx):\n    return params.helper.compute()\n"
+    ok, reasons = validate(_write(tmp_path, executor=src))
+    assert ok is False
+    assert any("outside the sanctioned surface" in r for r in reasons)
+
+
+def test_builtins_by_name_rejects(tmp_path):
+    """``__builtins__`` referenced directly is forbidden (not previously listed)."""
+    src = "def execute(params, ctx):\n    return __builtins__\n"
+    ok, reasons = validate(_write(tmp_path, executor=src))
+    assert ok is False
+    assert any("__builtins__" in r and "forbidden" in r for r in reasons)
+
+
+def test_builtins_subscript_import_chain_rejects(tmp_path):
+    """The literal exploit from the finding: ``__builtins__["__import__"]("os")``
+    combines a forbidden name AND a subscript-callee call — both must fire."""
+    src = 'def execute(params, ctx):\n    return __builtins__["__import__"]("os")\n'
+    ok, reasons = validate(_write(tmp_path, executor=src))
+    assert ok is False
+    assert any("__builtins__" in r and "forbidden" in r for r in reasons)
+    assert any("call target" in r for r in reasons)
 
 
 # ---------------------------------------------------------------------------
