@@ -47,27 +47,34 @@ live robot). But only *large* jumps can false-fire — a commanded delta below t
 detector's press threshold cannot generate transit deviation above it, and the
 dominant idle dispatches are holds (delta 0) and sub-degree breaths.
 
+And the gate must be **per-axis**, not per-move: live wander phases dispatch
+large *yaw* drifts (looks, relax, drift-home — 7–37° jumps) nearly back-to-back,
+so even an amplitude-aware whole-move gate starves detection for whole minutes.
+But a yaw move's transit produces *yaw* lag only — a scratch is a *pitch* press,
+and the pitch channel has nothing to fear from a yaw look.
+
 So :class:`PatHook` takes an optional ``busy_horizon`` seam — ``() -> float``,
 the loop's published ``busy_until`` for the move currently in flight (see
 :func:`reachy.motion.server.run`'s ``busy`` argument, wired at the construction
 site in :func:`reachy.cli._commands.listen._run_sdk_loop`) — and tracks the
-per-tick ``commanded_head`` delta itself. When the commanded pose *jumps* by more
-than :data:`LARGE_MOVE_THRESHOLD_DEG` (a look/turn/reaction-scale move was just
-dispatched), sensing is suspended until **that move's** horizon passes; holds and
-small breaths dispatched afterwards do not extend the suspension, so sensing
-rides straight through the idle cadence. On the very first tick (no previous
-commanded pose to diff against) an in-flight move of unknown size is ridden out
-the same way. The ``on_tick`` contract ``(transport, queue, t, commanded_head)``
-is unchanged — the seam is a constructor argument, so the other folded hooks and
+per-tick ``commanded_head`` delta itself, **per axis**. When the commanded pose
+jumps by more than :data:`LARGE_MOVE_THRESHOLD_DEG` on an axis, that axis's
+deviation is *masked* (commanded taken = actual, i.e. read as released) until
+**that move's** horizon passes; the other axis keeps sensing untouched, and the
+head pose is read every tick regardless. Holds and small breaths mask nothing.
+On the very first tick (no previous commanded pose to diff against) an in-flight
+move of unknown size masks both axes to the horizon. The ``on_tick`` contract
+``(transport, queue, t, commanded_head)`` is unchanged — the seam is a
+constructor argument, so the other folded hooks and
 :class:`~reachy.motion.listen_hooks.HookChain` need no change.
 
-**Re-baseline on resume.** Whenever sensing is suspended — inside a reaction
-window or while a large commanded move is in flight — the *first* sensing pass
-once it resumes calls :meth:`PatDetector.reset` before feeding the fresh reading,
-so the settled pose seeds a clean zero-deviation baseline. The post-reaction
-resume move (idle wander) is a large jump itself, so its transit is skipped and
-the re-baseline lands only once the head has actually settled — the resume move
-can never re-trigger a pat.
+**Re-baseline on resume.** After a reaction window closes, the first sensing
+pass calls :meth:`PatDetector.reset` before feeding the fresh reading, so the
+settled pose seeds a clean zero-deviation baseline. The post-reaction resume
+move (idle wander) is a large jump itself, so its axes are masked for its
+transit and the detector sees "released" throughout — the resume move can never
+re-trigger a pat. Axis masking itself needs no reset: a masked axis is fed
+zero deviation (a clean release), never stale press state.
 
 The flag is always cleared on the way out (see :meth:`PatHook.close`), even if the
 loop is interrupted mid-reaction. ``now`` is taken straight from the loop's clock,
@@ -126,15 +133,16 @@ class PatHook:
         ``busy_until`` — the wall-clock horizon (dispatch + duration + settle) the
         move currently in flight runs until (see :func:`reachy.motion.server.run`'s
         ``busy`` argument). The hook reads it only when it observes a *large*
-        commanded jump (> ``large_move_threshold``) between ticks — or on the very
-        first tick, when the in-flight move's size is unknown — and suspends
-        sensing until that horizon passes. Holds and small breaths dispatched
-        afterwards do not extend the suspension, so sensing rides through the
-        always-alive idle cadence instead of being starved by it. ``None`` (the
-        default, used by the direct-seam unit tests) senses every tick as before.
+        commanded jump (> ``large_move_threshold``) on an axis between ticks — or
+        on the very first tick, when the in-flight move's size is unknown — and
+        *masks that axis's deviation* (fed as released) until the horizon passes.
+        The other axis keeps sensing and the head pose is read every tick, so a
+        pitch scratch still detects straight through a yaw look's transit — the
+        live wander is nearly all yaw, and whole-move gating starved detection.
+        ``None`` (the default, used by the direct-seam unit tests) masks nothing.
     large_move_threshold:
-        Commanded-jump size (deg) above which a dispatch counts as large. Default
-        :data:`LARGE_MOVE_THRESHOLD_DEG`.
+        Per-axis commanded-jump size (deg) above which a dispatch masks that
+        axis. Default :data:`LARGE_MOVE_THRESHOLD_DEG`.
     buffer:
         An optional duck-typed cognition sink exposing ``feed_pat(kind, level)``
         (the shape of :meth:`~reachy.speech.events.EventBuffer.feed_pat`) — kept
@@ -168,8 +176,10 @@ class PatHook:
         self._large_move_threshold = large_move_threshold
         #: The commanded head pose seen last tick (None before the first tick).
         self._prev_commanded: dict[str, float] | None = None
-        #: Loop-clock time until which sensing is suspended for a large move's transit.
-        self._suppress_until = 0.0
+        #: Per-axis loop-clock times until which that axis's deviation is masked
+        #: (read as released) while a large move's transit is in flight.
+        self._mask_pitch_until = 0.0
+        self._mask_yaw_until = 0.0
         #: Optional duck-typed cognition sink: ``feed_pat(kind, level) -> None``.
         self._buffer = buffer
         #: Wall-clock (loop-clock) time until which sensing is paused and the flag held.
@@ -193,15 +203,16 @@ class PatHook:
 
         While ``t`` is inside the reaction window the robot is executing its own
         lean — keep the ``pat_active`` flag up and do **not** read the head pose
-        (avoid self-trigger). Likewise, while a *large* commanded move is in
-        flight (a jump > ``large_move_threshold`` between this tick's
-        ``commanded_head`` and the last — or an in-flight move of unknown size on
-        the very first tick), the actual pose lags the target by construction, so
-        the hook skips the head-pose read until that move's ``busy_horizon``
-        passes (transit is not a hand). Holds and small breaths never suspend
-        sensing — their transit cannot clear the press threshold, and they are
-        what the always-alive idle dispatches ~90 % of the time. Both suspensions
-        arm a re-baseline: the first sensing pass once they lift resets the
+        (avoid self-trigger). Outside it the head pose is read every tick; what a
+        large in-flight move suspends is only *its own axis's* deviation: a jump
+        > ``large_move_threshold`` on pitch/yaw between this tick's
+        ``commanded_head`` and the last (or an unknown-size in-flight move on the
+        very first tick, which masks both axes) feeds that axis as released until
+        the move's ``busy_horizon`` passes — transit lag is not a hand, but a
+        pitch scratch during a yaw look still detects. Holds and small breaths
+        mask nothing — their transit cannot clear the press threshold, and they
+        are what the always-alive idle dispatches most of the time. The reaction
+        window arms a re-baseline: the first sensing pass after it resets the
         detector so the settled pose reads as zero deviation. ``queue`` is the
         live loop queue (identical to the one this hook was constructed with); the
         parameter keeps the ``on_tick`` contract self-describing. ``commanded_head``
@@ -219,23 +230,20 @@ class PatHook:
             self._flag_up = False
         cmd = commanded_head or _NEUTRAL_HEAD
         self._note_commanded_jump(cmd)
-        if t < self._suppress_until:
-            # A large move's transit is in flight: any deviation is lag, not a hand.
-            # Skip the head-pose read and re-baseline once the move settles.
-            self._needs_rebaseline = True
-            return
         self._sense_and_maybe_react(transport, t, cmd)
 
     def _note_commanded_jump(self, cmd: dict[str, float]) -> None:
-        """Track the commanded pose across ticks; arm suppression on a large jump.
+        """Track the commanded pose across ticks; mask an axis on a large jump.
 
-        A jump larger than ``large_move_threshold`` means a look/turn/reaction-scale
-        move was just dispatched — its transit would read as a phantom press, so
-        sensing is suspended until the loop's ``busy_horizon`` for *that* move. The
-        first-ever tick has no previous pose to diff against: if a move is in
-        flight then, its size is unknown, so it is ridden out the same way. Small
-        jumps (holds, breaths) never suspend. Without a ``busy_horizon`` seam (the
-        direct-seam unit tests) nothing is ever suspended, as before.
+        A per-axis jump larger than ``large_move_threshold`` means a
+        look/turn/reaction-scale move was just dispatched on that axis — its
+        transit would read as a phantom press *on that axis*, so the axis is
+        masked (fed as released) until the loop's ``busy_horizon`` for that move.
+        The other axis keeps sensing. The first-ever tick has no previous pose to
+        diff against: if a move is in flight then, its size is unknown, so both
+        axes are masked to the horizon. Small jumps (holds, breaths) mask
+        nothing. Without a ``busy_horizon`` seam (the direct-seam unit tests)
+        nothing is ever masked, as before.
         """
         prev = self._prev_commanded
         self._prev_commanded = {
@@ -245,14 +253,14 @@ class PatHook:
         if self._busy_horizon is None:
             return
         if prev is None:
-            self._suppress_until = max(self._suppress_until, self._busy_horizon())
+            horizon = self._busy_horizon()
+            self._mask_pitch_until = max(self._mask_pitch_until, horizon)
+            self._mask_yaw_until = max(self._mask_yaw_until, horizon)
             return
-        jump = max(
-            abs(self._prev_commanded["pitch"] - prev["pitch"]),
-            abs(self._prev_commanded["yaw"] - prev["yaw"]),
-        )
-        if jump > self._large_move_threshold:
-            self._suppress_until = max(self._suppress_until, self._busy_horizon())
+        if abs(self._prev_commanded["pitch"] - prev["pitch"]) > self._large_move_threshold:
+            self._mask_pitch_until = max(self._mask_pitch_until, self._busy_horizon())
+        if abs(self._prev_commanded["yaw"] - prev["yaw"]) > self._large_move_threshold:
+            self._mask_yaw_until = max(self._mask_yaw_until, self._busy_horizon())
 
     def _sense_and_maybe_react(
         self, transport: object, now: float, commanded_head: dict[str, float]
@@ -281,6 +289,13 @@ class PatHook:
             actual_pitch, actual_yaw = transport.head_pose()  # type: ignore[attr-defined]
         except CliError:
             actual_pitch, actual_yaw = commanded_pitch, commanded_yaw
+        # Per-axis transit masking: while a large move is in flight on an axis, feed
+        # that axis as released (commanded = actual → zero deviation) so its transit
+        # lag never reads as a press; the other axis keeps its real deviation.
+        if now < self._mask_pitch_until:
+            commanded_pitch = actual_pitch
+        if now < self._mask_yaw_until:
+            commanded_yaw = actual_yaw
         if self._needs_rebaseline:
             # First sensing pass after a suspension: clear stale detector state so the
             # settled pose seeds a fresh zero-deviation baseline (no self-trigger).

@@ -437,13 +437,14 @@ class _ScriptedPoseTransport:
 
 
 def test_in_flight_move_suppresses_sensing_no_pat() -> None:
-    """While an unknown-size move is in flight at startup, PatHook does not sense.
+    """While an unknown-size move is in flight at startup, both axes are masked.
 
     On the very first tick the hook has no previous commanded pose to diff against,
-    so an in-flight move's size is unknown and it is ridden out to the published
-    horizon: the head-pose read is skipped entirely, so a mid-transit pose (which
-    reads like a deep press) never reaches the detector and no pat fires. This is
-    the core bug: transit lag must never be mistaken for a hand.
+    so an in-flight move's size is unknown and both axes are masked (fed as
+    released) to the published horizon: a mid-transit pose (which reads like a deep
+    press) never reaches the detector as deviation and no pat fires. This is the
+    core bug: transit lag must never be mistaken for a hand. The head pose is still
+    read each tick — masking replaces skipping, so detection is never starved.
     """
     busy = {"until": 100.0}  # a move in flight from before the hook's first tick
     queue: MotionQueue = MotionQueue()
@@ -453,13 +454,13 @@ def test_in_flight_move_suppresses_sensing_no_pat() -> None:
 
     now = 0.0
     for i in range(40):
-        # A hand-like alternating deep press — would fire if it were ever sensed.
+        # A hand-like alternating deep press — would fire if it were ever unmasked.
         transport.pose = (-20.0, 0.0) if i % 2 == 0 else (0.0, 0.0)
         hook(transport, queue, now)
         now += 0.1
 
     assert hook.events == 0, "no pat may fire while a commanded move is in flight"
-    assert transport.pose_calls == 0, "head_pose must not be read while a move is in flight"
+    assert transport.pose_calls == 40, "the pose is read every tick (masked, not skipped)"
     assert not queue.pending(), "no pat gesture should be enqueued during a commanded move"
 
 
@@ -555,9 +556,10 @@ def test_server_run_publishes_busy_and_gates_pathook() -> None:
 
     A producer emits one long LARGE move (a 30° pitch jump); while it is in flight the
     loop's actual pose lags the commanded target (transit). The PatHook, wired with the
-    loop's published ``busy`` horizon, observes the commanded jump and must NOT sense
-    during that transit — proving the busy publish + horizon seam close the false-fire
-    loop through the real ``server.run`` seam.
+    loop's published ``busy`` horizon, observes the commanded pitch jump and masks the
+    pitch axis for the transit — the lag never reads as a press — proving the busy
+    publish + horizon seam close the false-fire loop through the real ``server.run``
+    seam.
     """
     busy = {"until": 0.0}
     queue: MotionQueue = MotionQueue()
@@ -603,9 +605,10 @@ def test_server_run_publishes_busy_and_gates_pathook() -> None:
         busy=busy,
     )
     assert hook.events == 0, "no pat may fire while the loop's move is in flight"
-    # Tick 1 senses (nothing dispatched yet); from tick 2 the move is in flight and the
-    # published busy horizon gates every further head-pose read.
-    assert transport.pose_calls <= 1, "head_pose must not be read once the move is in flight"
+    # The pose is read every tick (masking, not skipping); the pitch mask starts on
+    # tick 2 (when the commanded jump is first observed), so at most tick 1's single
+    # unmasked deep read reaches the detector — below min_presses, so never a pat.
+    assert transport.pose_calls >= 2, "the pose keeps being read during the transit"
 
 
 def test_press_detected_through_continuous_small_idle_moves() -> None:
@@ -644,13 +647,14 @@ def test_press_detected_through_continuous_small_idle_moves() -> None:
     assert transport.pose_calls > 0, "small in-flight moves must not suppress sensing"
 
 
-def test_sensing_resumes_after_large_move_horizon_despite_continuing_busy() -> None:
-    """A look/turn suspends sensing only until ITS horizon — later holds don't extend it.
+def test_pitch_scratch_detects_through_yaw_look_transit() -> None:
+    """Per-axis masking: a yaw look masks only yaw — a pitch scratch fires mid-transit.
 
-    Sequence mirrors the live journal: steady at 0°, a 13° look (large jump) with a
-    ~1.7 s horizon, then holds at 13° dispatched back-to-back (busy stays in the
-    future indefinitely). Sensing must be suspended for the look's transit only, then
-    resume (with a re-baseline) during the holds — where a genuine press then fires.
+    Sequence mirrors the live journal's active wander (large yaw drifts nearly
+    back-to-back, which starved a whole-move gate for minutes). During a 13° yaw
+    look's transit the yaw axis is masked — its lag (which would read as a side_pat)
+    is fed as released and never fires — but the pitch axis keeps sensing, so a
+    genuine head scratch DURING the look still detects.
     """
     busy = {"until": 0.0}
     queue: MotionQueue = MotionQueue()
@@ -658,40 +662,42 @@ def test_sensing_resumes_after_large_move_horizon_despite_continuing_busy() -> N
     hook = PatHook(queue, detector=detector, busy_horizon=lambda: busy["until"])
     transport = _ScriptedPoseTransport()
 
-    # Phase 1: steady at neutral, settled (nothing in flight) — sensing runs.
+    # Phase 1: steady at neutral, settled (nothing in flight) — sensing runs clean.
     now = 0.0
     for _ in range(3):
         transport.pose = (0.0, 0.0)
         hook(transport, queue, now, {"pitch": 0.0, "yaw": 0.0})
         now += 0.1
-    calls_steady = transport.pose_calls
-    assert calls_steady == 3
-
-    # Phase 2: the look dispatches — commanded jumps to 13° (large), horizon now+1.7.
-    look_horizon = now + 1.7
-    busy["until"] = look_horizon
-    while now < look_horizon:
-        transport.pose = (-6.0, 13.0)  # mid-transit lag: would read as a press
-        hook(transport, queue, now, {"pitch": 0.0, "yaw": 13.0})
-        now += 0.1
-    assert transport.pose_calls == calls_steady, "the look's transit must not be sensed"
     assert hook.events == 0
 
-    # Phase 3: holds at 13° keep a move in flight forever (busy horizon always ahead),
-    # but the look's own horizon has passed — sensing resumes through the holds, and a
-    # genuine press (deep pitch deviation against the held 13° yaw pose) fires.
+    # Phase 2: the look dispatches — commanded yaw jumps to 13° (large), horizon
+    # now+1.7. The yaw transit lag alone (actual trailing the target by up to 13°,
+    # far beyond the side_pat threshold) must NOT fire while masked.
+    look_horizon = now + 1.7
+    busy["until"] = look_horizon
+    for _ in range(4):
+        transport.pose = (0.0, 4.0)  # yaw mid-transit; pitch untouched
+        hook(transport, queue, now, {"pitch": 0.0, "yaw": 13.0})
+        now += 0.1
+    assert hook.events == 0, "yaw transit lag must not fire a side_pat while masked"
+
+    # Phase 3: still INSIDE the look's transit, a hand scratches — deep alternating
+    # pitch deviation. The pitch axis is unmasked (the look was yaw-only), so the
+    # scratch fires even though a large move is in flight and busy stays ahead.
     fired = False
-    for i in range(16):
-        busy["until"] = now + 2.4  # each hold re-published, perpetually in the future
-        transport.pose = (-20.0, 13.0) if i % 2 == 0 else (0.0, 13.0)
+    for i in range(8):
+        yaw_actual = 6.0 + i  # still travelling toward 13°
+        pitch = -20.0 if i % 2 == 0 else 0.0
+        transport.pose = (pitch, min(yaw_actual, 13.0))
         hook(transport, queue, now, {"pitch": 0.0, "yaw": 13.0})
         if hook.events >= 1:
             fired = True
             break
-        now += 0.4
+        now += 0.2
 
-    assert transport.pose_calls > calls_steady, "sensing must resume once the look settled"
-    assert fired, "a real press during hold-busy idling must still fire"
+    assert fired, "a pitch scratch during a yaw look's transit must still fire"
+    labels = [a.label for a in queue.pending()]
+    assert any(label.startswith("pat_scratch") for label in labels), labels
 
 
 # ---------------------------------------------------------------------------
