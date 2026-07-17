@@ -447,9 +447,31 @@ capability to feed a sensor-driven behavior a live reading, but ships none today
   (`all` keeps the passive base layer).
 - `reachy-mini-cli behavior status` — active behaviors, per-channel ownership,
   and engine/daemon state.
+- `reachy-mini-cli behavior reload` — reload `rules.toml` in the running
+  engine, applied between ticks (see "Rules" below).
 - `reachy-mini-cli behavior engine start|stop|status|run` — manage the 50 Hz
   engine process (start/stop in the background, or `run` in the foreground).
 - `reachy-mini-cli behavior overview` — the verb summary.
+
+## Rules
+
+`behavior engine run` optionally drives the engine from a declarative
+`rules.toml` file (default: `<state dir>/behavior/rules.toml`) — `[[react]]` /
+`[[inhibit]]` rules over the live sense snapshot, plus named `[modes.<name>]`
+parameter sets. It is loaded once at boot:
+
+- a MISSING file is fine — "no rules configured yet", the engine runs on
+  `feel-alive` alone;
+- a PRESENT but malformed file is REJECTED without crashing the process — the
+  engine falls back to bare base presence (`feel-alive` only, no rule seam)
+  and logs the rejection (naming every reason) as a
+  `[SENSE stage=rule source=rules event=boot]` line — an operator's typo never
+  takes the robot's presence down, let alone loops a service restart.
+
+`reachy-mini-cli behavior reload` asks the running engine to re-read
+`rules.toml` at a deterministic point between ticks, with the same last-good
+retention: a rejected reload keeps whatever rules were already running and
+reports why; an accepted reload swaps in immediately, with no restart.
 
 {transports}
 
@@ -470,6 +492,7 @@ capability to feed a sensor-driven behavior a live reading, but ships none today
         --channels antennas body_yaw                     # sway + seize the body yaw
     reachy-mini-cli behavior status --json
     reachy-mini-cli behavior stop all
+    reachy-mini-cli behavior reload                      # picks up an edited rules.toml
     reachy-mini-cli behavior engine stop                 # eases robot to neutral
 """.replace(_TRANSPORTS_SLOT, _TRANSPORTS)
 
@@ -1173,6 +1196,7 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("behavior", "run"): _BEHAVIOR,
     ("behavior", "stop"): _BEHAVIOR,
     ("behavior", "status"): _BEHAVIOR,
+    ("behavior", "reload"): _BEHAVIOR,
     ("behavior", "engine"): _BEHAVIOR,
     ("behavior", "engine", "overview"): _BEHAVIOR,
     ("behavior", "engine", "start"): _BEHAVIOR,
