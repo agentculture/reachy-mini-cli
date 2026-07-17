@@ -909,3 +909,128 @@ def test_no_pat_cli_does_not_lean(monkeypatch) -> None:
     # head_pose is never even read when the hook is absent.
     assert transport.pose_calls == 0, "--no-pat must not read head_pose at all"
     assert ps.is_active() is False
+
+
+# ---------------------------------------------------------------------------
+# (t3) PatHook feeds the pat cue to cognition — one per reaction cycle
+#
+# EventBuffer.feed_pat(kind, level) already exists (reachy/speech/events.py); this
+# gives PatHook an optional duck-typed ``buffer`` seam so every detection ALSO
+# feeds a cue to cognition, fault-isolated so a raising buffer can never break the
+# reflex, and naturally capped to one cue per reaction cycle by the same window
+# suppression that already caps detections.
+# ---------------------------------------------------------------------------
+
+
+class _FakeBuffer:
+    """A minimal duck-typed cognition buffer recording ``feed_pat`` calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def feed_pat(self, kind: str, level: str) -> None:
+        self.calls.append((kind, level))
+
+
+class _RaisingBuffer:
+    """A buffer whose ``feed_pat`` always raises — must never break the reflex."""
+
+    def feed_pat(self, kind: str, level: str) -> None:
+        raise RuntimeError("boom")
+
+
+def test_pathook_feeds_buffer_once_on_detection() -> None:
+    """A detection feeds exactly one cue (correct kind + level); the reflex still fires."""
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    buffer = _FakeBuffer()
+    hook = PatHook(queue, detector=detector, buffer=buffer)
+    transport = _ConstantPressTransport()
+
+    for i in range(8):
+        t = 0.4 * i
+        hook(transport, queue, t)
+        if hook.events >= 1:
+            break
+
+    assert hook.events == 1
+    # _ConstantPressTransport presses pitch only → touch_type "scratch"; first
+    # detection is always "level1".
+    assert buffer.calls == [("scratch", "level1")], buffer.calls
+    labels = [a.label for a in queue.pending()]
+    assert any("lean" in label for label in labels), labels
+    assert any(label.startswith("pat_") for label in labels), labels
+    assert ps.is_active() is True
+
+
+def test_pathook_without_buffer_behaves_unchanged() -> None:
+    """No ``buffer`` injected (the default): no cue path, reflex identical to today."""
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector)  # buffer defaults to None
+    transport = _ConstantPressTransport()
+
+    for i in range(8):
+        t = 0.4 * i
+        hook(transport, queue, t)  # must not raise / AttributeError with no buffer
+        if hook.events >= 1:
+            break
+
+    assert hook.events == 1
+    labels = [a.label for a in queue.pending()]
+    assert any("lean" in label for label in labels), labels
+    assert any(label.startswith("pat_") for label in labels), labels
+    assert ps.is_active() is True
+
+
+def test_pathook_buffer_raise_does_not_break_reflex() -> None:
+    """A buffer whose ``feed_pat`` raises must not prevent the reflex or the window."""
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector, buffer=_RaisingBuffer())
+    transport = _ConstantPressTransport()
+
+    for i in range(8):
+        t = 0.4 * i
+        hook(transport, queue, t)  # the RuntimeError must never escape this call
+        if hook.events >= 1:
+            break
+
+    assert hook.events == 1, "a raising buffer must not prevent the detection/reflex"
+    labels = [a.label for a in queue.pending()]
+    assert any("lean" in label for label in labels), labels
+    assert any(label.startswith("pat_") for label in labels), labels
+    assert ps.is_active() is True, "the reaction window/flag must still open despite the raise"
+
+
+def test_pathook_feeds_at_most_one_cue_per_reaction_cycle() -> None:
+    """A continuous stroke yields at most one cue per reaction cycle — never more.
+
+    Drive :class:`PatHook` through several fire → window → resume cycles with a
+    fake buffer injected. The reaction-window suppression that already limits
+    detections to one per cycle must carry through to the cue feed: the number of
+    ``feed_pat`` calls never exceeds ``hook.events`` at any point during the run,
+    and after several cycles the two counts are exactly equal (one cue per cycle,
+    never more) — proven across N reaction cycles, not just one.
+    """
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    buffer = _FakeBuffer()
+    hook = PatHook(queue, detector=detector, buffer=buffer)
+    transport = _ConstantPressTransport()
+
+    target_cycles = 3
+    t = 0.0
+    max_t = 60.0  # generous ceiling — several reaction windows (~3.5s each) fit easily
+    while hook.events < target_cycles and t < max_t:
+        hook(transport, queue, t)
+        # Never more cues than detections, at every single tick along the way.
+        assert len(buffer.calls) <= hook.events, (buffer.calls, hook.events)
+        t += 0.1
+
+    assert hook.events >= target_cycles, "expected multiple reaction cycles to fire"
+    assert len(buffer.calls) == hook.events, "exactly one cue per reaction cycle, never more"
+    assert all(
+        kind in {"scratch", "side_pat"} and level in {"level1", "level2"}
+        for kind, level in buffer.calls
+    ), buffer.calls
