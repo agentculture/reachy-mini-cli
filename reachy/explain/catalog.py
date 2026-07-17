@@ -878,6 +878,16 @@ Feel knobs (each defaults to a tuned value; unset keeps it):
   voice — sentences render to a note melody in Reachy's own identity signature,
   no TTS service needed (tune with `REACHY_HARMONIC_IDENTITY` /
   `REACHY_HARMONIC_ARTICULATION`). The startup banner names the active engine.
+- `--cognition {marker,agent}` — (requires `--live`; a bare `--cognition` without
+  `--live` is a clean exit-1 error) which cognition engine drives the folded
+  thinking (default `marker`; override with `REACHY_COGNITION`). `marker` is the
+  established `*emoji*`/`"speech"` marker path; `agent` swaps in the tool-use engine
+  that acts through `speak` / `harmonics` / `apply_pose` LLM tool calls behind the
+  same folded seam — no new process, no second media session. In `agent` mode BOTH
+  the `tts` and `harmonic` voices are always available as tools (the agent picks per
+  utterance), so `--voice-engine` there is inert — it keeps controlling only the
+  `marker` engine. The engagement gate (turn/answer only on addressed speech) is
+  identical for both engines. The startup banner names the active mode.
 
 ## Transport
 
