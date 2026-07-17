@@ -851,7 +851,12 @@ def _build_live_hooks(
         clock = _time.monotonic
 
     sleep_hook = SleepHook(provider)
-    vision_hook = VisionHook(queue=queue, transport=transport)
+    # ``buffer`` is the SAME shared cognition EventBuffer already threaded into
+    # pat_hook / the think/agent engine / (under --transcribe) the TranscribeHook —
+    # see this function's own docstring. A motion/light decision then feeds
+    # cognition directly too (coalesced; see reachy.motion.listen_vision's module
+    # docstring), the same way a detected pat already does.
+    vision_hook = VisionHook(queue=queue, transport=transport, buffer=buffer)
 
     # The shared cognition buffer (built by the caller, before pat_hook, and handed
     # in as ``buffer``) + self-mute window live at composition level, so pat_hook

@@ -56,6 +56,7 @@ from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.motion.listen_pat import PatHook
 from reachy.motion.listen_think import ThinkHook
 from reachy.motion.listen_transcribe import TranscribeHook
+from reachy.motion.listen_vision import VisionHook
 from reachy.speech.agent_turn import AgentTurnEngine
 from reachy.speech.llm import TurnResult
 from reachy.speech.voice import VoiceEngine
@@ -892,3 +893,100 @@ def test_bare_listen_run_pathook_has_no_buffer(monkeypatch) -> None:
     assert rc == 0
     assert "buffer" in captured, "PatHook must have been constructed"
     assert captured["buffer"] is None
+
+
+# ---------------------------------------------------------------------------
+# 6. VisionHook shares the live cognition EventBuffer too (t7 / issue #32)
+#
+# PatHook already proved (suite 5, above) that the composition layer threads
+# ONE shared EventBuffer into PatHook + the folded ThinkHook/agent engine (and,
+# under --transcribe, TranscribeHook). This suite proves VisionHook is wired
+# into the SAME buffer under --live — an object-identity check, mirroring suite
+# 5's pattern exactly, just for the fourth folded sense hook.
+# ---------------------------------------------------------------------------
+
+
+def _spy_vision_hook_buffer(monkeypatch) -> dict:
+    """Capture the ``buffer`` kwarg every constructed :class:`VisionHook` receives."""
+    captured: dict = {}
+    real_init = VisionHook.__init__
+
+    def _init(self, **kw):
+        captured["buffer"] = kw.get("buffer")
+        return real_init(self, **kw)
+
+    monkeypatch.setattr(VisionHook, "__init__", _init)
+    return captured
+
+
+def test_live_agent_visionhook_buffer_identical_to_pathook_and_agent_engine(
+    monkeypatch,
+) -> None:
+    """``--live --cognition agent``: VisionHook shares the SAME buffer as PatHook/ThinkHook.
+
+    The crux (mirrors t4's PatHook proof): the EventBuffer object handed to
+    VisionHook is IDENTICAL (is-identity) to the one the agent engine consumes
+    (via the folded ThinkHook) and the one PatHook feeds.
+    """
+    vision_captured = _spy_vision_hook_buffer(monkeypatch)
+    pat_captured = _spy_pat_hook_buffer(monkeypatch)
+    think_captured: dict = {}
+    real_think_init = ThinkHook.__init__
+
+    def _think_init(self, provider, **kw):
+        think_captured["buffer"] = kw.get("buffer")
+        return real_think_init(self, provider, **kw)
+
+    monkeypatch.setattr(ThinkHook, "__init__", _think_init)
+
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(
+        monkeypatch, _live_argv("--cognition", "agent"), transport=transport
+    )
+    assert rc == 0
+
+    shared = pat_captured.get("buffer")
+    assert shared is not None, "PatHook must receive a shared buffer under --live"
+    assert think_captured.get("buffer") is shared
+    assert (
+        vision_captured.get("buffer") is shared
+    ), "VisionHook must receive the SAME shared buffer PatHook/ThinkHook consume"
+
+
+def test_live_marker_visionhook_buffer_identical_to_cognition_engine(monkeypatch) -> None:
+    """Regression: the default (marker) ``--live`` engine shares the buffer with VisionHook too."""
+    vision_captured = _spy_vision_hook_buffer(monkeypatch)
+    think_captured: dict = {}
+    real_think_init = ThinkHook.__init__
+
+    def _think_init(self, provider, **kw):
+        think_captured["buffer"] = kw.get("buffer")
+        return real_think_init(self, provider, **kw)
+
+    monkeypatch.setattr(ThinkHook, "__init__", _think_init)
+
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(monkeypatch, _live_argv(), transport=transport)
+    assert rc == 0
+
+    shared = think_captured.get("buffer")
+    assert shared is not None, "the marker engine must receive a shared buffer under --live"
+    assert vision_captured.get("buffer") is shared
+
+
+def test_bare_listen_run_visionhook_is_never_built(monkeypatch) -> None:
+    """A non-live ``listen run`` builds NO VisionHook at all (unchanged).
+
+    Vision only folds into the loop under ``--live`` (:func:`_build_live_hooks`);
+    the bare loop never constructs one, so there is nothing to share a buffer with.
+    """
+    vision_captured = _spy_vision_hook_buffer(monkeypatch)
+    transport = _LiveSdkTransport()
+
+    rc, _out, _err = _run_capture(
+        monkeypatch,
+        ["listen", "run", "--json", "--transport", "sdk", "--deadband", "0", "--max-ticks", "3"],
+        transport=transport,
+    )
+    assert rc == 0
+    assert vision_captured == {}, "a non-live run must never construct a VisionHook"
