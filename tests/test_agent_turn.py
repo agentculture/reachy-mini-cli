@@ -38,7 +38,7 @@ from reachy.speech.agent_turn import (
     DEFAULT_AGENT_SYSTEM_PROMPT,
     AgentTurnEngine,
 )
-from reachy.speech.events import EventBuffer
+from reachy.speech.events import EventBuffer, SenseCue
 from reachy.speech.llm import ToolCall, TurnResult
 
 # ---------------------------------------------------------------------------
@@ -130,6 +130,22 @@ def _err_content(msg: str = "boom") -> str:
 
 def _last_is_tool(messages) -> bool:
     return bool(messages) and messages[-1].get("role") == "tool"
+
+
+class _FakeCueBuffer:
+    """Minimal ``_BufferLike`` fake: a fixed list of cues, drained once by snapshot().
+
+    Used to exercise the engine with a cue kind (e.g. touch) that has no producer
+    on ``EventBuffer`` yet, without depending on a sibling task's in-flight
+    ``feed_pat``-style API.
+    """
+
+    def __init__(self, cues: list[SenseCue]) -> None:
+        self._cues = cues
+
+    def snapshot(self) -> list[SenseCue]:
+        cues, self._cues = self._cues, []
+        return cues
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +632,33 @@ def test_default_system_prompt_is_a_module_constant():
     assert "Reachy" in DEFAULT_AGENT_SYSTEM_PROMPT
     # It names the tool-only contract so ops can see (and tune) the guidance.
     assert "tool" in DEFAULT_AGENT_SYSTEM_PROMPT.lower()
+
+
+def test_default_system_prompt_names_touch_as_a_perception():
+    """A sibling task feeds pat/touch cues into the buffer — the prompt must give
+    the model a frame for them (e.g. "touch" or "petted"/"patted")."""
+    lowered = DEFAULT_AGENT_SYSTEM_PROMPT.lower()
+    assert "touch" in lowered or "petted" in lowered or "patted" in lowered
+
+
+# ---------------------------------------------------------------------------
+# Touch/pat perception (t5)
+# ---------------------------------------------------------------------------
+
+
+def test_pat_only_cue_triggers_an_agent_turn():
+    """A lone touch cue (no words, no DoA) is enough to fire a turn, and the cue
+    text reaches the LLM as part of the user perception message."""
+    reg = FakeRegistry()
+    cue_text = "felt a gentle scratch on the head"
+    buf = _FakeCueBuffer([SenseCue(text=cue_text, timestamp=0.0)])
+    turn = ScriptedTurn(lambda m: TurnResult(content="aww", tool_calls=[], finish_reason="stop"))
+    engine = AgentTurnEngine(buffer=buf, registry=reg, turn_fn=turn)
+
+    assert engine.run_turn() is True
+    assert len(turn.calls) == 1
+    user_messages = [m for m in turn.calls[0] if m.get("role") == "user"]
+    assert any(cue_text in m.get("content", "") for m in user_messages)
 
 
 if __name__ == "__main__":  # pragma: no cover
