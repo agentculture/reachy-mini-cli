@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import fields as _dc_fields
 
 import numpy as np
 import pytest
 
-from reachy.motion.listen_transcribe import TranscribeHook
+from reachy.motion.listen_transcribe import TranscribeHook, TranscribeTuning
 from reachy.motion.queue import MotionQueue
 from reachy.motion.sense_sample import SenseSample
 from reachy.speech.name_match import is_name_match
@@ -45,6 +46,17 @@ from tests.fixtures.engagement_transcripts import (
     NAMED,
     TranscriptLine,
 )
+
+#: Field names of TranscribeTuning — used to split tuning kwargs from seam kwargs
+#: at the test helpers below (S107 split: the constructor now takes one grouped
+#: ``tuning=`` object instead of nine individual numeric parameters).
+_TUNING_FIELDS = {f.name for f in _dc_fields(TranscribeTuning)}
+
+
+def _pop_tuning(kwargs: dict) -> TranscribeTuning:
+    """Pop any TranscribeTuning-field keys out of *kwargs* and build a TranscribeTuning."""
+    return TranscribeTuning(**{k: kwargs.pop(k) for k in list(kwargs) if k in _TUNING_FIELDS})
+
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -128,7 +140,10 @@ def _make_hook(**kwargs):
     buffer = kwargs.pop("buffer", None) or _RecordingBuffer()
     transcriber = kwargs.pop("transcriber", None) or _FakeTranscriber()
     kwargs.setdefault("min_utterance_s", 0.0)
-    hook = TranscribeHook(lambda: None, buffer=buffer, transcriber=transcriber, **kwargs)
+    tuning = _pop_tuning(kwargs)
+    hook = TranscribeHook(
+        lambda: None, buffer=buffer, transcriber=transcriber, tuning=tuning, **kwargs
+    )
     return hook, buffer, transcriber
 
 
@@ -138,7 +153,10 @@ def _make_driven_hook(*, transcriber=None, buffer=None, **kwargs):
     holder: dict = {"s": None}
     buffer = buffer or _RecordingBuffer()
     transcriber = transcriber or _FakeTranscriber()
-    hook = TranscribeHook(lambda: holder["s"], buffer=buffer, transcriber=transcriber, **kwargs)
+    tuning = _pop_tuning(kwargs)
+    hook = TranscribeHook(
+        lambda: holder["s"], buffer=buffer, transcriber=transcriber, tuning=tuning, **kwargs
+    )
     return hook, buffer, transcriber, holder
 
 
