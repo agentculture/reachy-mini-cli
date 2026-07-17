@@ -643,3 +643,21 @@ def test_synthesize_openai_route_model_override(monkeypatch: pytest.MonkeyPatch)
 
     payload = _json.loads(captured[0].data.decode("utf-8"))
     assert payload["model"] == "custom/tts-model"
+
+
+def test_synthesize_openai_route_no_auth_when_api_key_is_empty_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REACHY_OPENAI_API_KEY='EMPTY' means no auth header (same convention as llm.py)."""
+    captured: list[urllib.request.Request] = []
+
+    def _capture(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(_fake_pcm(40_000))
+
+    monkeypatch.setattr("urllib.request.urlopen", _capture)
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "EMPTY")
+
+    synthesize("Hi there.", tts_url="http://gateway:8001", route="openai")
+
+    assert "Authorization" not in captured[0].headers
