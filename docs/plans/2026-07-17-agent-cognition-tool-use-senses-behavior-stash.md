@@ -82,6 +82,14 @@ slug: `agent-cognition-tool-use-senses-behavior-stash` · status: `exported` · 
   - say's import-boundary test stays green; full 'pytest -n auto' green; 'teken cli doctor . --strict' green
   - the operating guide documents the voice-only usage story, the before/after states as shipped, and the two on-robot demos (addressed utterance -> tool-use turn; stash in one session -> semantic fetch in a later one)
 
+### t10 — Muse verification + agent-model move option (deviation d1)
+
+- depends on: t8, t9
+- acceptance:
+  - the gateway-gated tool round-trip integration test runs against BOTH cortex and muse (parametrized over model IDs; muse = nvidia/Gemma-4-31B-IT-NVFP4): tool_calls returned, tool-result flow completes, final text arrives; each model's case skips independently when unavailable
+  - the round trip records wall-clock turn latency per model and asserts a generous usability bound for muse through the thor proxy (document the measured numbers in the test docstring or report)
+  - docs/operating-reachy.md's cortex-switch section becomes a model-choice section: cortex (local, default fallback) vs muse (proxied from thor, now tool-capable; audio-in still absent per lobes-cli#139), with the exact REACHY_OPENAI_MODEL_ID values and the note that the switch is pure environment.d config
+
 ## Risks
 
 - [unknown_nonblocking] gateway /v1/audio/speech response shape (bare PCM vs WAV vs compressed) is unverified — cheap probe before t2 lands decides the decode path
