@@ -28,26 +28,41 @@ Its only audio input is ``sample.audio`` from the injected
 already pulled this tick. When the provider returns ``None`` (no fresh sample) the
 tick is a silent no-op.
 
+Pre-roll ring buffer + measured onset (leading words are not lost)
+------------------------------------------------------------------
+The SDK speech flag is polled at ~5 Hz and lags the audio, so the leading words of
+every utterance arrive on ticks where ``sample.speech`` is still False. To keep
+them, the hook feeds ``sample.audio`` into a rolling ~``ring_seconds`` ring buffer
+on **every** (non-muted) tick — *before* the speech-flag gate — trimmed by TOTAL
+samples with a cheap per-tick append (the only concat is one snapshot on the rising
+edge). On the flag's rising edge the utterance is seeded from the ring at the
+**measured** onset (an RMS scan of the buffered audio in 10 ms windows, cited from
+reachy_nova's ``SpeechEventDetector``) minus ``pre_roll`` (default 2.0 s, clamped to
+the ring start). Subsequent speech ticks append their chunk; the ring is cleared
+with each flushed / discarded utterance so stale audio never bleeds into the next
+lead-in. This design fixes the "first words lost" bug where accumulation started
+only once the flag flipped.
+
 The transcribe gate (cheap-first, mute-aware)
 ---------------------------------------------
-A tick transcribes **only** when all three hold:
-
-* ``sample.speech`` is True (there is speech to recognise this tick), and
-* ``sample.audio is not None`` (there is a raw chunk to send), and
-* the tick is **outside the self-mute window** — i.e. ``t >= mute_until()``.
-
-The self-mute gate is checked *before* :meth:`Transcriber.transcribe` is ever
-called, so while (and just after) the robot speaks, its own voice through the
-shared USB audio device is dropped on the floor and **no STT POST happens** — the
-robot never transcribes itself. ``t`` (the tick's clock, exactly as
-:mod:`reachy.motion.listen_sleep` uses it) is the current time; ``mute_until()``
+The self-mute window is checked *before* anything is captured: while ``t <
+mute_until()`` the current utterance AND the ring are discarded, so while (and just
+after) the robot speaks, its own voice through the shared USB audio device is never
+buffered, never pre-rolled, and never transcribed. ``t`` (the tick's clock, exactly
+as :mod:`reachy.motion.listen_sleep` uses it) is the current time; ``mute_until()``
 returns the monotonic deadline the speak path stamps (default ``0.0`` = never
-muted). The cheap boolean checks come first so an ineligible tick costs nothing.
+muted).
 
-When eligible, the chunk is handed to :meth:`Transcriber.transcribe`, which itself
-accumulates a rolling window, throttles its POSTs, and never raises — returning a
-non-empty transcript string or ``None``. A non-empty transcript is fed to the
-cognition buffer; a ``None`` / empty transcript feeds nothing.
+Endpointing then accumulates the whole utterance and transcribes it in **one**
+:meth:`Transcriber.transcribe_once` POST on a ``silence_hold_s`` pause (or at
+``max_utterance_s``), so the STT sees a full sentence, pre-roll included. Sub-
+``min_utterance_s`` blips are dropped — the gate measures the *speech* samples only,
+so the pre-roll lead-in can never pad a blip past the floor. A non-empty transcript
+that clears the engagement gate is fed to the cognition buffer; a ``None`` / empty
+transcript, or an un-addressed utterance, feeds nothing.
+
+Each capture / onset, and each min-utterance / self-mute discard, emits one
+parseable ``[SENSE]`` line via :mod:`reachy.senselog` (logger ``reachy.sense``).
 
 Error isolation (a hook must never kill the loop)
 -------------------------------------------------
@@ -70,10 +85,12 @@ import logging
 import math
 import os
 import re
+import uuid
 from typing import Callable
 
 import numpy as np
 
+from reachy import senselog
 from reachy.motion.queue import MotionQueue
 from reachy.motion.sense_sample import SampleProvider, SenseSample
 from reachy.speech.engagement import Decision, decide_engagement
@@ -90,6 +107,16 @@ _HISTORY_MAXLEN = 6
 
 #: Words counted for the coherence gate (letters + intra-word apostrophes).
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+
+#: Pre-roll ring + measured onset defaults (cited from reachy_nova's
+#: ``speech_events.SpeechEventDetector``). The mic audio here is float32 PCM
+#: already normalised to [-1, 1] (``get_audio_sample`` yields floats, and the RMS
+#: loudness detector reads them directly), so nova's 0.02 float-PCM silence
+#: threshold applies verbatim — no int16 rescale.
+_ONSET_WINDOW_SECONDS = 0.01  # 10 ms analysis window for the RMS onset scan
+_DEFAULT_SILENCE_THRESHOLD = 0.02  # RMS over a 10 ms window (float PCM)
+_DEFAULT_RING_SECONDS = 10.0  # rolling pre-roll buffer horizon
+_DEFAULT_PRE_ROLL_SECONDS = 2.0  # lead-in kept before the measured onset
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +204,10 @@ class TranscribeHook:
         silence_hold_s: float = 0.7,
         max_utterance_s: float = 15.0,
         min_utterance_s: float = 0.3,
+        ring_seconds: float = _DEFAULT_RING_SECONDS,
+        pre_roll_s: float = _DEFAULT_PRE_ROLL_SECONDS,
+        onset_threshold: float = _DEFAULT_SILENCE_THRESHOLD,
+        onset_window_s: float = _ONSET_WINDOW_SECONDS,
         min_words: int = 3,
         engage_window_s: float = 20.0,
         names: tuple[str, ...] = ("reachy", "robot"),
@@ -203,9 +234,32 @@ class TranscribeHook:
         #: Chunks of the current utterance (cleared on flush / mute / reset).
         self._utt: list[np.ndarray] = []
         self._utt_samples = 0
+        #: Samples that arrived on speech-flagged ticks only (EXCLUDES pre-roll) —
+        #: the quantity the min-utterance gate measures, so a pre-roll lead-in never
+        #: pads a blip past the floor (the gate's original semantics are preserved).
+        self._utt_speech_samples = 0
         self._utt_started_t: float | None = None
         self._last_speech_t: float | None = None
         self._utt_direction: str | None = None
+        #: Short id shared by this utterance's capture / onset / drop [SENSE] lines.
+        self._event_id: str | None = None
+
+        # --- Pre-roll ring buffer + measured onset (cited from reachy_nova's
+        #     speech_events.SpeechEventDetector). A rolling ~ring_seconds buffer is
+        #     fed EVERY tick from the raw chunk, BEFORE the (lagging, ~5 Hz) speech
+        #     flag. On the flag's rising edge the onset is MEASURED (an RMS scan of
+        #     the buffered audio in onset_window_s windows) and the utterance is
+        #     seeded from onset - pre_roll (clamped to the ring start), so the
+        #     leading words the flag missed are kept. Trimmed by TOTAL samples with a
+        #     cheap per-tick append — the only concat is one snapshot on the rising
+        #     edge, never per tick. ---
+        self._ring_max = int(max(0.0, ring_seconds) * self._rate)
+        self._pre_roll_samples = int(max(0.0, pre_roll_s) * self._rate)
+        self._onset_threshold = float(onset_threshold)
+        self._onset_window = max(1, int(onset_window_s * self._rate))
+        self._ring: list[np.ndarray] = []
+        self._ring_samples = 0
+        self._ring_total = 0
 
         # --- Engagement gate: only respond to clear sentences that are addressed
         #     to the robot (its name) or continue an ongoing conversation. ---
@@ -275,31 +329,49 @@ class TranscribeHook:
     # ------------------------------------------------------------------
 
     def _maybe_transcribe(self, sample: SenseSample, t: float) -> None:
-        """Accumulate a whole utterance, then transcribe + gate it on a pause.
+        """Feed the pre-roll ring, then accumulate + transcribe + gate an utterance.
 
-        Endpointing: while the sample carries speech (and we are outside the
-        self-mute window) the raw chunk is appended to the current utterance. When
-        speech stops for ``silence_hold_s`` — or the utterance grows past
-        ``max_utterance_s`` — the *whole* buffer is transcribed in one POST (so the
-        STT sees a full sentence, not a 1.5 s slice) and run through the engagement
-        gate before being fed to cognition.
+        Pre-roll ring: the raw chunk is pushed to a rolling ~ring_seconds buffer on
+        EVERY (non-muted) tick — BEFORE the lagging speech-flag gate — so the leading
+        words that arrive while ``sample.speech`` is still False are still buffered
+        when the flag rises.
+
+        Endpointing: on the speech-flag rising edge the utterance is seeded from the
+        ring at the *measured* onset minus ``pre_roll`` (see :meth:`_begin_utterance`);
+        subsequent speech ticks append their chunk. When speech stops for
+        ``silence_hold_s`` — or the utterance grows past ``max_utterance_s`` — the
+        *whole* buffer is transcribed in one POST (so the STT sees a full sentence,
+        pre-roll included) and run through the engagement gate before being fed to
+        cognition.
 
         The self-mute window is checked first: while (and just after) the robot
-        speaks, the current utterance is discarded and nothing is accumulated — the
-        robot must never transcribe its own voice.
+        speaks, the current utterance AND the pre-roll ring are discarded and nothing
+        is captured — the robot must never transcribe (or pre-roll) its own voice.
         """
         if t < self._mute_until():
-            # Robot is speaking — drop any partial utterance; never capture its voice.
+            # Robot is speaking — drop any partial utterance + the pre-roll ring; the
+            # robot must never transcribe (or pre-roll) its own voice.
+            if self._utt:
+                senselog.drop("capture", "speech", self._event_id or "?", "self-mute")
             self._reset_utt()
             return
+
+        # Feed the rolling pre-roll ring EVERY tick from the raw chunk, BEFORE the
+        # (lagging) speech-flag gate below — so leading words captured before the flag
+        # flips are still buffered when the rising edge measures onset.
+        if sample.audio is not None:
+            self._push_ring(sample.audio)
 
         if sample.speech and sample.audio is not None:
             chunk = np.asarray(sample.audio, dtype=np.float32).reshape(-1)
             if self._utt_samples == 0:
-                self._utt_started_t = t
-                self._utt_direction = self._direction_of(sample)
-            self._utt.append(chunk)
-            self._utt_samples += len(chunk)
+                # Rising edge: seed the utterance with the measured-onset pre-roll
+                # (which already includes this chunk — pushed to the ring above).
+                self._begin_utterance(sample, t, int(chunk.size))
+            else:
+                self._utt.append(chunk)
+                self._utt_samples += int(chunk.size)
+                self._utt_speech_samples += int(chunk.size)
             self._last_speech_t = t
             started = self._utt_started_t
             if started is not None and (t - started) >= self._max_utterance_s:
@@ -316,11 +388,15 @@ class TranscribeHook:
 
     def _flush(self, t: float) -> None:
         """Transcribe the buffered utterance, gate it, and feed it if it qualifies."""
-        samples, direction = self._utt_samples, self._utt_direction
+        speech_samples, direction = self._utt_speech_samples, self._utt_direction
         utt = self._utt
+        event_id = self._event_id or "?"
         self._reset_utt()
-        if samples < self._min_utt_samples or not utt:
-            return  # too short to be a real utterance (a blip, not speech)
+        if speech_samples < self._min_utt_samples or not utt:
+            # Too short to be a real utterance (a blip, not speech). The gate measures
+            # SPEECH samples, so the pre-roll lead-in can never pad a blip past it.
+            senselog.drop("capture", "speech", event_id, "min-utterance")
+            return
         audio = np.concatenate(utt)
         text = self._transcriber.transcribe_once(audio)  # type: ignore[attr-defined]
         if not text:
@@ -430,13 +506,111 @@ class TranscribeHook:
         except Exception:  # noqa: BLE001 — a bad angle must never drop the words
             return None
 
+    def _begin_utterance(self, sample: SenseSample, t: float, speech_samples: int) -> None:
+        """Seed a new utterance with measured-onset pre-roll from the ring buffer.
+
+        Called on the speech-flag rising edge. The triggering chunk is already in the
+        ring (pushed at the top of the tick), so the seeded pre-roll slice includes it
+        — the caller must NOT append it again. The onset is *measured* (an RMS scan of
+        the buffered audio, :meth:`_measure_onset`), and the utterance starts at
+        ``onset - pre_roll`` clamped to the ring start, so the leading words the
+        lagging speech flag missed are kept. Emits the ``capture`` + ``onset`` [SENSE]
+        lines for this utterance.
+
+        ``speech_samples`` is the triggering chunk's length — the *speech* audio the
+        min-utterance gate counts (pre-roll excluded).
+        """
+        self._utt_started_t = t
+        self._utt_direction = self._direction_of(sample)
+        self._utt_speech_samples = int(speech_samples)
+        self._event_id = uuid.uuid4().hex[:8]
+
+        snapshot = self._concat_ring()  # one concat, rising edge only (never per tick)
+        buffer_start = self._ring_total - self._ring_samples
+        onset_offset = self._measure_onset(snapshot)
+        onset_absolute = buffer_start + onset_offset
+        clip_start = max(buffer_start, onset_absolute - self._pre_roll_samples)
+        clip_offset = clip_start - buffer_start
+        preroll = snapshot[clip_offset:]
+        self._utt = [preroll] if preroll.size else []
+        self._utt_samples = int(preroll.size)
+
+        pre_roll_s = (onset_absolute - clip_start) / self._rate
+        senselog.stage(
+            "capture",
+            "speech",
+            self._event_id,
+            f"utterance start pre_roll={pre_roll_s:.2f}s buffered={self._ring_samples}",
+        )
+        senselog.stage(
+            "onset",
+            "speech",
+            self._event_id,
+            f"offset={onset_offset} samples ({onset_offset / self._rate:.3f}s)",
+        )
+
+    def _push_ring(self, audio: np.ndarray) -> None:
+        """Append a mic chunk to the rolling pre-roll ring (cheap; trimmed by samples).
+
+        A per-tick append with no concat; the oldest chunk is dropped once the buffer
+        would exceed ``ring_seconds`` of TOTAL samples (keeping at least one chunk),
+        mirroring reachy_nova's ``SpeechEventDetector._push``.
+        """
+        chunk = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if chunk.size == 0:
+            return
+        self._ring.append(chunk)
+        self._ring_samples += int(chunk.size)
+        self._ring_total += int(chunk.size)
+        while len(self._ring) > 1 and self._ring_samples - self._ring[0].size >= self._ring_max:
+            self._ring_samples -= int(self._ring.pop(0).size)
+
+    def _concat_ring(self) -> np.ndarray:
+        """Concatenate the ring's chunks into one float32 snapshot (rising edge only)."""
+        if not self._ring:
+            return np.zeros(0, dtype=np.float32)
+        if len(self._ring) == 1:
+            return self._ring[0]
+        return np.concatenate(self._ring)
+
+    def _measure_onset(self, snapshot: np.ndarray) -> int:
+        """First ``onset_window`` offset whose RMS clears the silence threshold, else 0.
+
+        A MEASUREMENT over the buffered audio (cited from reachy_nova's
+        ``SpeechEventDetector._measure_onset``) — not an assumed fixed offset — so the
+        emitted clip's lead-in tracks where energy actually rises. Falls back to 0 (the
+        ring start) when nothing clears the threshold, so pre-roll still applies
+        conservatively.
+        """
+        win = self._onset_window
+        n = int(snapshot.size)
+        for start in range(0, n, win):
+            window = snapshot[start : start + win]
+            if window.size == 0:
+                continue
+            rms = float(np.sqrt(np.mean(np.square(window))))
+            if rms >= self._onset_threshold:
+                return start
+        return 0
+
     def _reset_utt(self) -> None:
-        """Clear the current utterance accumulator."""
+        """Clear the current utterance accumulator AND the pre-roll ring buffer.
+
+        The ring is cleared with the utterance so the next utterance's measured-onset
+        pre-roll only scans audio captured *after* this one ended (or after the robot
+        stopped speaking) — a previous utterance's (or the robot's own) words never
+        bleed into the next utterance's lead-in.
+        """
         self._utt = []
         self._utt_samples = 0
+        self._utt_speech_samples = 0
         self._utt_started_t = None
         self._last_speech_t = None
         self._utt_direction = None
+        self._event_id = None
+        self._ring = []
+        self._ring_samples = 0
+        self._ring_total = 0
 
     def close(self) -> None:
         """No-op cleanup, present for the hook contract (safe + idempotent).

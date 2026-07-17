@@ -30,6 +30,8 @@ Coverage (mirrors the acceptance criteria):
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from reachy.motion.listen_transcribe import TranscribeHook
@@ -501,3 +503,201 @@ def test_sample_rate_threads_into_default_transcriber() -> None:
         lambda: None, buffer=_RecordingBuffer(), transcriber=explicit, sample_rate=48000
     )
     assert won._transcriber is explicit
+
+
+# ---------------------------------------------------------------------------
+# 7. Pre-roll ring buffer + measured onset (t3)
+# ---------------------------------------------------------------------------
+
+
+def _sense_lines(caplog) -> str:
+    """Join every ``reachy.sense`` [SENSE] log line captured by ``caplog``."""
+    return "\n".join(r.getMessage() for r in caplog.records if r.name == "reachy.sense")
+
+
+def test_preroll_includes_pre_flag_samples() -> None:
+    """The measured-onset pre-roll prepends audio captured BEFORE the speech flag.
+
+    The SDK speech flag is polled at ~5 Hz and lags, so the leading words of an
+    utterance arrive on ticks where ``sample.speech`` is still False. With the
+    rolling ring buffer + measured onset, those pre-flag chunks are still buffered
+    when the flag rises and are prepended to the transcribed clip — the leading
+    words are no longer lost (the bug this task fixes).
+    """
+    rate = 1000
+    transcriber = _FakeTranscriber(results=["reachy hello there"])
+    buffer = _RecordingBuffer()
+    holder: dict = {"s": None}
+    hook = TranscribeHook(
+        lambda: holder["s"],
+        buffer=buffer,
+        transcriber=transcriber,
+        sample_rate=rate,
+        min_utterance_s=0.0,
+        pre_roll_s=2.0,
+    )
+
+    pre = np.full(100, 0.3, dtype=np.float32)  # leading words, speech flag still False
+    speech = np.full(100, 0.5, dtype=np.float32)  # the flag finally flips here
+
+    # Three PRE-FLAG ticks: audio present + energetic, but speech flag has NOT flipped.
+    for ti in (0.0, 0.1, 0.2):
+        holder["s"] = SenseSample(rms=0.3, doa=10.0, speech=False, ts=ti, audio=pre)
+        hook(object(), MotionQueue(), ti, {"pitch": 0.0, "yaw": 0.0})
+    assert transcriber.once_calls == [], "nothing is transcribed before the flag rises"
+
+    # Speech flag rises: the rising edge measures onset and seeds the pre-roll.
+    holder["s"] = SenseSample(rms=0.5, doa=10.0, speech=True, ts=0.3, audio=speech)
+    hook(object(), MotionQueue(), 0.3, {"pitch": 0.0, "yaw": 0.0})
+
+    # Pause (> silence_hold) → flush the whole utterance (pre-roll + speech) in one POST.
+    holder["s"] = SenseSample(rms=0.0, doa=10.0, speech=False, ts=1.5, audio=None)
+    hook(object(), MotionQueue(), 1.5, {"pitch": 0.0, "yaw": 0.0})
+
+    assert len(transcriber.once_calls) == 1, "the pause flushes exactly one POST"
+    clip = transcriber.once_calls[0]
+    # 3 pre-flag chunks (300 samples) + the speech chunk (100 samples) = 400 samples.
+    assert clip.size == 400, "the emitted clip MUST include the pre-flag samples"
+    assert np.allclose(clip[:300], 0.3), "the clip starts with the pre-flag lead-in"
+    assert np.allclose(clip[300:], 0.5), "and ends with the flagged-speech audio"
+    assert buffer.transcripts == ["reachy hello there"]
+
+
+def test_ring_buffer_fed_every_tick_before_speech_flag() -> None:
+    """The ring is fed on non-speech ticks too (before the speech-flag gate)."""
+    rate = 1000
+    hook = TranscribeHook(lambda: None, buffer=_RecordingBuffer(), sample_rate=rate)
+    # Feed straight into the tick path with speech=False — the ring must still grow.
+    sample = SenseSample(rms=0.1, doa=None, speech=False, ts=0.0, audio=np.full(100, 0.1, "f4"))
+    hook._maybe_transcribe(sample, 0.0)
+    hook._maybe_transcribe(sample, 0.1)
+    assert hook._ring_samples == 200, "non-speech ticks with audio still feed the ring"
+
+
+def test_ring_buffer_trimmed_by_total_samples_not_chunk_count() -> None:
+    """The pre-roll ring is bounded by TOTAL samples (~ring_seconds), not chunk count."""
+    rate = 1000
+    hook = TranscribeHook(
+        lambda: None, buffer=_RecordingBuffer(), sample_rate=rate, ring_seconds=1.0
+    )  # 1000-sample cap
+    for _ in range(30):  # 30 * 100 = 3000 samples, far over the cap
+        hook._push_ring(np.full(100, 0.1, dtype=np.float32))
+    assert hook._ring_samples == 1000, "the ring is trimmed to ~ring_seconds of samples"
+    assert hook._ring_total == 3000, "the absolute sample counter keeps counting"
+
+
+def test_onset_measured_skips_leading_silence() -> None:
+    """Onset is MEASURED by an RMS scan (10ms windows), not an assumed fixed offset."""
+    rate = 1000
+    hook = TranscribeHook(
+        lambda: None, buffer=_RecordingBuffer(), sample_rate=rate, onset_threshold=0.02
+    )
+    snapshot = np.concatenate(
+        [np.zeros(200, dtype=np.float32), np.full(100, 0.3, dtype=np.float32)]
+    )
+    # The first 10ms (10-sample) window clearing 0.02 RMS begins at sample 200.
+    assert hook._measure_onset(snapshot) == 200
+    # All-silence → falls back to 0 (pre-roll still applies conservatively).
+    assert hook._measure_onset(np.zeros(300, dtype=np.float32)) == 0
+
+
+def test_preroll_clamped_to_ring_start() -> None:
+    """When pre_roll exceeds the buffered audio, the clip clamps to the ring start."""
+    rate = 1000
+    transcriber = _FakeTranscriber(results=["reachy hi there"])
+    holder: dict = {"s": None}
+    hook = TranscribeHook(
+        lambda: holder["s"],
+        buffer=_RecordingBuffer(),
+        transcriber=transcriber,
+        sample_rate=rate,
+        min_utterance_s=0.0,
+        pre_roll_s=5.0,  # 5000 samples — far more than the buffered audio
+    )
+    chunk = np.full(100, 0.3, dtype=np.float32)
+    holder["s"] = SenseSample(rms=0.3, doa=10.0, speech=True, ts=0.0, audio=chunk)
+    hook(object(), MotionQueue(), 0.0, {"pitch": 0.0, "yaw": 0.0})
+    holder["s"] = SenseSample(rms=0.0, doa=10.0, speech=False, ts=1.0, audio=None)
+    hook(object(), MotionQueue(), 1.0, {"pitch": 0.0, "yaw": 0.0})
+    assert transcriber.once_calls[0].size == 100, "clip clamps to what is buffered"
+
+
+def test_preroll_does_not_pad_a_blip_past_the_min_gate() -> None:
+    """Pre-roll must NOT let a sub-min-duration blip clear the min-utterance gate.
+
+    The min-utterance gate measures the *speech* samples (excludes pre-roll), so a
+    short burst of speech is still dropped even when preceded by ambient audio that
+    the ring captured — the gate's original semantics are preserved.
+    """
+    rate = 16000
+    transcriber = _FakeTranscriber(results=["reachy hello there"])
+    holder: dict = {"s": None}
+    hook = TranscribeHook(
+        lambda: holder["s"],
+        buffer=_RecordingBuffer(),
+        transcriber=transcriber,
+        sample_rate=rate,
+        min_utterance_s=0.3,  # 4800 samples
+    )
+    # 5 pre-flag ambient ticks (energetic) build a big ring, then a tiny speech blip.
+    for ti in (0.0, 0.05, 0.1, 0.15, 0.2):
+        holder["s"] = SenseSample(rms=0.3, doa=10.0, speech=False, ts=ti, audio=_audio(2000))
+        hook(object(), MotionQueue(), ti, {"pitch": 0.0, "yaw": 0.0})
+    holder["s"] = SenseSample(rms=0.3, doa=10.0, speech=True, ts=0.25, audio=_audio(1000))
+    hook(object(), MotionQueue(), 0.25, {"pitch": 0.0, "yaw": 0.0})
+    holder["s"] = SenseSample(rms=0.0, doa=10.0, speech=False, ts=1.5, audio=None)
+    hook(object(), MotionQueue(), 1.5, {"pitch": 0.0, "yaw": 0.0})
+    assert transcriber.once_calls == [], "only 1000 speech samples (< 4800) → dropped"
+
+
+def test_capture_and_onset_senselog_lines(caplog) -> None:
+    """A rising edge emits [SENSE] stage=capture (pre-roll + buffered) + stage=onset."""
+    transcriber = _FakeTranscriber(results=["reachy hello there"])
+    hook, buffer, _t, holder = _make_driven_hook(transcriber=transcriber)
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        _utterance(hook, holder)
+    text = _sense_lines(caplog)
+    assert "stage=capture" in text
+    assert "pre_roll=" in text
+    assert "buffered=" in text
+    assert "stage=onset" in text
+    assert "offset=" in text
+
+
+def test_min_utterance_drop_emits_senselog_drop(caplog) -> None:
+    """A sub-min-duration blip is dropped via ``senselog.drop`` (greppable reason)."""
+    transcriber = _FakeTranscriber(results=["reachy hello there"])
+    holder: dict = {"s": None}
+    hook, _b, _t = _make_hook(lambda: holder["s"], transcriber=transcriber, sample_rate=16000)
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        holder["s"] = SenseSample(rms=0.1, doa=10.0, speech=True, ts=0.0, audio=_audio(1000))
+        hook(object(), MotionQueue(), 0.0, {"pitch": 0.0, "yaw": 0.0})
+        holder["s"] = SenseSample(rms=0.0, doa=10.0, speech=False, ts=1.0, audio=None)
+        hook(object(), MotionQueue(), 1.0, {"pitch": 0.0, "yaw": 0.0})
+    assert "dropped reason=min-utterance" in _sense_lines(caplog)
+    assert transcriber.once_calls == []
+
+
+def test_self_mute_discard_emits_senselog_drop(caplog) -> None:
+    """A muted tick mid-utterance discards the partial via ``senselog.drop``."""
+    transcriber = _FakeTranscriber(results=["reachy hi"])
+    mute = {"until": 0.0}
+    holder: dict = {"s": None}
+    hook, buffer, _t = _make_hook(
+        lambda: holder["s"],
+        transcriber=transcriber,
+        sample_rate=16000,
+        mute_until=lambda: mute["until"],
+        min_utterance_s=0.0,
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        # Accumulate a partial utterance (not muted yet).
+        holder["s"] = SenseSample(rms=0.1, doa=10.0, speech=True, ts=0.0, audio=_audio())
+        hook(object(), MotionQueue(), 0.0, {"pitch": 0.0, "yaw": 0.0})
+        # Robot starts speaking → the next tick falls inside the self-mute window.
+        mute["until"] = 100.0
+        holder["s"] = SenseSample(rms=0.5, doa=10.0, speech=True, ts=0.1, audio=_audio())
+        hook(object(), MotionQueue(), 0.1, {"pitch": 0.0, "yaw": 0.0})
+    assert "dropped reason=self-mute" in _sense_lines(caplog)
+    assert transcriber.once_calls == [], "a muted mid-utterance discard never transcribes"
+    assert buffer.transcripts == []
