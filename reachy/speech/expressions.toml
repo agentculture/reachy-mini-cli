@@ -132,3 +132,15 @@ head_yaw      =  0.0
 antenna_right = -25.0
 antenna_left  = -25.0
 body_yaw      =  0.0
+
+# 😊  Content / pleased — head lifts with a warm tilt, antennas ease forward.
+["😊"]
+head_x        =  0.0
+head_y        =  0.0
+head_z        =  4.0
+head_roll     =  6.0
+head_pitch    =  3.0
+head_yaw      =  0.0
+antenna_right =  22.0
+antenna_left  =  22.0
+body_yaw      =  0.0
