@@ -12,6 +12,8 @@ No daemon and no ``reachy_mini`` SDK are needed:
 from __future__ import annotations
 
 import json
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -192,7 +194,10 @@ def test_import_camera_uses_real_surface_and_acquires(monkeypatch) -> None:  # t
             self.acquired += 1
             self.media_released = False
 
-    monkeypatch.setattr("reachy_mini.ReachyMini", _FakeReachyMini)
+    # setitem (not setattr on the real module) so this passes on a bare
+    # ``uv sync`` too — CI has no [sdk] extra, importing reachy_mini would fail.
+    fake_module = types.SimpleNamespace(ReachyMini=_FakeReachyMini)
+    monkeypatch.setitem(sys.modules, "reachy_mini", fake_module)
 
     mini, media = SdkTransport._import_camera()
 
