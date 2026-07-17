@@ -30,10 +30,13 @@ from reachy.behavior import control, library, supervisor
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.model import CHANNELS, StopClass
+from reachy.behavior.rule_engine import TickBus
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
+from reachy.cli._export import add_runtime_export_args, build_runtime_export_consumer
 from reachy.cli._output import emit_diagnostic, emit_result
+from reachy.export.runtime import SenseSnapshotDriver
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
 
 _JSON_HELP = "Emit structured JSON."
@@ -302,8 +305,19 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
                 f"{' + base layer' if config.base_layer else ''}; Ctrl-C to stop"
             )
 
+    # Runtime-events export sink (None unless --export -); see
+    # reachy.cli._export.build_runtime_export_consumer. SEPARATE contract from the
+    # think/listen cognition feed (decision c27) — carries no thinking/message/
+    # emotion blocks, only perception/rule/intent/motion runtime events.
+    runtime_consumer = build_runtime_export_consumer(args)
+    tick_seam = None
+    if runtime_consumer is not None:
+        tick_seam = TickBus(drivers=[SenseSnapshotDriver()], consumers=[runtime_consumer])
+
     def _emit(event: dict) -> None:
-        if json_mode:
+        # Suppress the per-tick JSON summary while exporting so stdout carries
+        # ONLY the runtime-event JSONL feed (stdout purity).
+        if json_mode and runtime_consumer is None:
             emit_result(event, json_mode=True)
 
     ticks = engine_run(
@@ -313,8 +327,11 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         emit=_emit,
         max_ticks=args.max_ticks,
         control=spool,
+        tick_seam=tick_seam,
     )
-    if not json_mode:
+    if runtime_consumer is not None:
+        emit_diagnostic(f"[behavior] engine stopped after {ticks} tick(s) (export: stdout)")
+    elif not json_mode:
         emit_diagnostic(f"[behavior] engine stopped after {ticks} tick(s)")
     return 0
 
@@ -449,6 +466,7 @@ def _register_engine(noun_sub: argparse._SubParsersAction) -> None:
         dest="max_ticks",
         help="Stop after this many ticks (default: run until signalled).",
     )
+    add_runtime_export_args(run)
     add_robot_args(run)
     run.set_defaults(func=cmd_engine_run)
 

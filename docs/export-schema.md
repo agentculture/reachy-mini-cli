@@ -1,9 +1,18 @@
 # Reachy Mini CLI — Export Feed Schema
 
 This document is the **authoritative contract** for external consumers of the
-`reachy-mini-cli` export feed (e.g. a reTerminal renderer, a logging pipeline,
+`reachy-mini-cli` export feeds (e.g. a reTerminal renderer, a logging pipeline,
 or any downstream tool). You need only this document — no Python import from
 the package is required to implement a compatible reader.
+
+There are **two, separate** feeds. This first half of the document covers the
+**cognition feed** (`thinking` / `message` / `emotion`, produced by `think run
+--export -` and `listen run --live --export -`). The **runtime feed**
+(`sense` / `rule` / `intent` / `motion`, produced by `behavior engine run
+--export -`) has its own section below —
+[Runtime Event Feed (`behavior engine run --export -`)](#runtime-event-feed-behavior-engine-run---export--).
+The two are never mixed on one stream: a cognition-feed consumer never sees a
+runtime block, and vice versa.
 
 ## Wire Format
 
@@ -112,3 +121,164 @@ for raw_line in sys.stdin:
   appear **both** inside `thinking.text` and as a separate `"message"` block. Do
   not assume `thinking.text` and the set of `"message"` blocks for the same turn
   are disjoint.
+
+## Runtime Event Feed (`behavior engine run --export -`)
+
+This is a **separate wire contract** from the cognition feed above. It carries
+the deterministic `behavior` engine's OWN events — perception, rule decisions,
+sustained intents, and motion admissions — produced by the 50 Hz
+`reachy.behavior.engine` loop and its rule evaluator
+(`reachy.behavior.rule_engine`), independent of any LLM.
+
+**Decision c27** (the `symbolic-runtime-70` design): when an external agent
+attaches to the running engine (a later feature), it publishes its OWN
+cognition feed through the family documented above (`thinking` / `message` /
+`emotion`) — it does **not** write into this feed, and this feed never carries
+a cognition block. The two feeds are how a human, a script, and an attached AI
+agent can all observe the SAME robot from two different, non-overlapping
+angles: "what did the deterministic runtime do" versus "what is the agent
+thinking."
+
+This separation is also what makes a rules-only run's **zero-token property**
+directly verifiable: no block type in this schema can represent an LLM call
+(there is no `thinking`/`message`/`emotion` type here at all), so asserting
+that every line's `t` is one of `sense` / `rule` / `intent` / `motion` is a
+complete proof that the run made zero LLM calls — no log-grepping required.
+
+### Wire Format
+
+Same NDJSON shape as the cognition feed: one compact JSON object per line,
+written to stdout, `t` and `ts` always first. Every object additionally
+carries `tick` — the engine's 1-based tick counter at publish time — so a
+consumer can correlate a `rule` decision with the `sense` snapshot that
+triggered it.
+
+| Key    | Type   | Description                                          |
+|--------|--------|-------------------------------------------------------|
+| `t`    | string | Block type: `"sense"`, `"rule"`, `"intent"`, or `"motion"` |
+| `ts`   | float  | Unix timestamp in fractional seconds                  |
+| `tick` | int    | The engine's 1-based tick counter                     |
+
+### Block Types
+
+#### `"sense"` — perception snapshot
+
+Published whenever the engine's perception snapshot changes (always once, on
+the first tick, to establish a baseline) — not every tick, so a steady 50 Hz
+loop does not flood the feed with an identical reading every 20 ms.
+
+| Key                | Type            | Description                                        |
+|--------------------|-----------------|------------------------------------------------------|
+| `t`                | `"sense"`       | Block-type discriminator                             |
+| `ts`, `tick`       | float, int      | As above                                              |
+| `doa`              | float or `null` | Sound direction of arrival, radians (`null` = no reading) |
+| `speech`           | bool            | Whether speech was detected this reading              |
+| `rms`              | float or `null` | Mic loudness (`null` = not sampled)                   |
+| `pat`              | array or `null` | `[kind, level]` from a head-pat detection, or `null`  |
+| `face`             | string or `null`| A recognised face's name, or `null`                   |
+| `frame_available`  | bool            | Whether a camera frame was available to peek           |
+
+Example line:
+
+```json
+{"t":"sense","ts":1718362800.0,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false}
+```
+
+#### `"rule"` — a rule engine decision
+
+A passthrough of every `reachy.behavior.rule_engine` fire/suppress decision —
+the same events the `[SENSE stage=rule ...]` log lines report, in structured
+form.
+
+| Key       | Type              | Description                                                    |
+|-----------|-------------------|------------------------------------------------------------------|
+| `t`       | `"rule"`          | Block-type discriminator                                         |
+| `ts`, `tick` | float, int     | As above                                                          |
+| `action`  | `"fire"` or `"suppress"` | Whether the rule fired or was suppressed this tick        |
+| `rule`    | string            | The rule's `id`                                                  |
+| `kind`    | `"react"` or `"inhibit"` | Which rule kind fired                                      |
+| `field`   | string            | The sense field the rule's predicate tests (e.g. `"speech"`)     |
+| `op`      | string            | The predicate's comparator (e.g. `"is_true"`, `"gt"`)             |
+| `reason`  | string            | `"fired"` on a fire; `"cooldown"` / `"rearming"` / `"inhibited"` / `"already-active"` on a suppress |
+| `behavior`| string or `null`  | The admitted behavior name (react fire only; `null` otherwise)    |
+| `disable` | array of string   | Evicted behavior names (inhibit fire only; `[]` otherwise)        |
+
+Example lines:
+
+```json
+{"t":"rule","ts":1718362800.3,"tick":15,"action":"fire","rule":"hear","kind":"react","field":"speech","op":"is_true","reason":"fired","behavior":"nod","disable":[]}
+{"t":"rule","ts":1718362800.5,"tick":25,"action":"suppress","rule":"hear","kind":"react","field":"speech","op":"is_true","reason":"cooldown","behavior":null,"disable":[]}
+```
+
+#### `"intent"` — a sustained symbolic goal
+
+Emitted when a symbolic goal is declared, updated, or cleared through the
+intent-tools spool (schema defined now; no producer is wired yet — a later
+task builds the intent tools).
+
+| Key       | Type                              | Description                        |
+|-----------|------------------------------------|-------------------------------------|
+| `t`       | `"intent"`                         | Block-type discriminator            |
+| `ts`, `tick` | float, int                      | As above                            |
+| `action`  | `"declare"` / `"update"` / `"clear"` | What happened to the intent       |
+| `name`    | string                              | The intent's name                   |
+| `payload` | object                              | Declarative data the intent tool attached |
+
+Example line:
+
+```json
+{"t":"intent","ts":1718362801.0,"tick":50,"action":"declare","name":"stay-alert","payload":{"mode":"focus"}}
+```
+
+#### `"motion"` — a behavior admission/eviction or goto
+
+Emitted for the engine's active-set churn (schema defined now; no producer is
+wired yet — a later task builds the goto lane).
+
+| Key        | Type                            | Description                          |
+|------------|-----------------------------------|---------------------------------------|
+| `t`        | `"motion"`                        | Block-type discriminator              |
+| `ts`, `tick` | float, int                      | As above                              |
+| `action`   | `"admit"` / `"evict"` / `"goto"`  | What happened                         |
+| `behavior` | string or `null`                  | The affected behavior name            |
+| `channels` | array of string                   | Claimed/released channels             |
+| `detail`   | object                            | Action-specific extras (e.g. a goto's target pose) |
+
+Example line:
+
+```json
+{"t":"motion","ts":1718362801.2,"tick":52,"action":"admit","behavior":"nod","channels":["head"],"detail":{}}
+```
+
+### Reading the Runtime Feed
+
+```python
+import json, sys
+
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+    obj = json.loads(line)
+    t, ts, tick = obj["t"], obj["ts"], obj["tick"]
+    if t == "sense":
+        print(f"[{ts:.1f} tick={tick}] SENSE doa={obj['doa']} speech={obj['speech']}")
+    elif t == "rule":
+        print(f"[{ts:.1f} tick={tick}] RULE {obj['action']} {obj['rule']} ({obj['reason']})")
+    elif t == "intent":
+        print(f"[{ts:.1f} tick={tick}] INTENT {obj['action']} {obj['name']}")
+    elif t == "motion":
+        print(f"[{ts:.1f} tick={tick}] MOTION {obj['action']} {obj['behavior']}")
+```
+
+### Runtime Feed Notes
+
+- All JSON objects use compact separators (no spaces around `,` or `:`).
+- `--export-blocks` on `behavior engine run` selects among `sense`, `rule`,
+  `intent`, `motion` — the cognition feed's `thinking` / `message` / `emotion`
+  names are **not valid here** and are rejected as an unknown block type.
+- Consumers should treat unknown `t` values as forward-compatible extensions
+  and skip them gracefully — the same rule as the cognition feed.
+- **No LLM-shaped block exists in this schema.** A rules-driven run's zero-token
+  property can be verified directly from the feed: capture it and assert every
+  line's `t` is one of `sense` / `rule` / `intent` / `motion`.
