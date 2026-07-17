@@ -434,7 +434,13 @@ def cmd_listen_overview(args: argparse.Namespace) -> int:
 # --- run (foreground loop) ------------------------------------------------
 
 
-def _build_pat_hook(args: argparse.Namespace, transport: object, queue) -> PatHook | None:
+def _build_pat_hook(
+    args: argparse.Namespace,
+    transport: object,
+    queue,
+    *,
+    motion_busy: Callable[[float], bool] | None = None,
+) -> PatHook | None:
     """A :class:`PatHook` bound to the loop's queue, or ``None`` when pat is off.
 
     Pat detection is only meaningful on the SDK transport (``head_pose`` is an
@@ -443,6 +449,10 @@ def _build_pat_hook(args: argparse.Namespace, transport: object, queue) -> PatHo
     hook reads the head pose back each tick *inside* the loop that owns the single
     SDK client, so the read-backs are fast enough to detect a pat — a separate
     ``pat`` process would be throttled by SDK contention.
+
+    ``motion_busy`` is the ``(t) -> bool`` probe wired to the loop's published
+    ``busy`` horizon (see :func:`_run_sdk_loop`); it lets the hook skip sensing
+    while a commanded move is in flight so transit lag is never mistaken for a pat.
     """
     if not getattr(args, "pat", True):
         return None
@@ -454,7 +464,7 @@ def _build_pat_hook(args: argparse.Namespace, transport: object, queue) -> PatHo
     if getattr(args, "min_presses", None) is not None:
         kw["min_presses"] = args.min_presses
     detector = PatDetector(**kw) if kw else None
-    return PatHook(queue, detector=detector)
+    return PatHook(queue, detector=detector, motion_busy=motion_busy)
 
 
 def _build_think_hook(
@@ -1088,7 +1098,11 @@ def _run_sdk_loop(
     if getattr(args, "snap_floor", None) is not None:
         snap_kwargs["min_rms"] = args.snap_floor
     queue = MotionQueue()
-    pat_hook = _build_pat_hook(args, transport, queue)
+    # The loop publishes its busy_until horizon here each tick; the PatHook's probe
+    # reads it to skip sensing while a commanded move is in flight (transit lag is not
+    # a hand). Shared object: run_loop writes it, the probe closure below reads it.
+    busy: dict[str, float] = {"until": 0.0}
+    pat_hook = _build_pat_hook(args, transport, queue, motion_busy=lambda t: t < busy["until"])
     holder = SampleHolder()
     with transport.media_session() as session:  # type: ignore[attr-defined]
         # Per-tick pose / move / frame reads ride the ONE open client (issue #51).
@@ -1149,6 +1163,7 @@ def _run_sdk_loop(
                 ),
                 queue=queue,
                 max_ticks=args.max_ticks,
+                busy=busy,
             )
         finally:
             close = getattr(on_tick, "close", None)
