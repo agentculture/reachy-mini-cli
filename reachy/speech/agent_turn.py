@@ -380,12 +380,12 @@ class AgentTurnEngine:
                         "audio-optional live path so speech degrades gracefully"
                     ),
                 )
-            self._note_audio_failure()
+            self._note_audio_failure(error_text=_error_text(message))
         else:
             self._audio_fail_streak = 0
         conversation.append(message)
 
-    def _note_audio_failure(self) -> None:
+    def _note_audio_failure(self, *, error_text: str = "") -> None:
         """Record one audio-dispatch failure (log once, latch off after the streak).
 
         Mirrors :meth:`CognitionEngine._note_audio_failure`: logs on the first
@@ -396,10 +396,15 @@ class AgentTurnEngine:
         """
         self._audio_fail_streak += 1
         if self._audio_fail_streak == 1:
-            logger.warning(
-                "agent audio sink failed; continuing without speech (audio is optional)",
-                exc_info=True,
-            )
+            if error_text:
+                logger.warning(
+                    "agent audio sink failed (%s); continuing without speech (audio is optional)",
+                    error_text,
+                )
+            else:
+                logger.warning(
+                    "agent audio sink failed; continuing without speech (audio is optional)",
+                )
         if not self._audio_muted and self._audio_fail_streak >= self._audio_mute_threshold:
             self._audio_muted = True
             logger.warning(
