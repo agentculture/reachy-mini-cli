@@ -51,6 +51,7 @@ from reachy.behavior.model import CHANNELS, StopClass
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
+from reachy.behavior.tick_metrics import TickMetrics, budget_from_hz
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
@@ -589,6 +590,9 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         tick_seam = TickBus(drivers=drivers, consumers=[runtime_consumer])
     else:
         tick_seam = rules_driver
+    if tick_seam is not None:
+        # Budget = one tick period; a breach surfaces as a [SENSE ... event=overrun] line (c22).
+        tick_seam = TickMetrics(tick_seam, budget_s=budget_from_hz(config.compose_hz))
 
     def _emit(event: dict) -> None:
         # Suppress the per-tick JSON summary while exporting so stdout carries
