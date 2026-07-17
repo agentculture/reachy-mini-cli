@@ -247,8 +247,16 @@ def _resolve_openai_model(override: str | None) -> str:
 
 
 def _resolve_api_key() -> str | None:
-    """Return the Bearer token for the ``openai`` route (``REACHY_OPENAI_API_KEY``, or ``None``)."""
-    return os.environ.get("REACHY_OPENAI_API_KEY") or None
+    """Return the Bearer token for the ``openai`` route (``REACHY_OPENAI_API_KEY``, or ``None``).
+
+    The literal sentinel ``"EMPTY"`` is treated as "no key" (matching
+    :mod:`reachy.speech.llm`'s convention) so a placeholder value never leaks
+    ``Authorization: Bearer EMPTY`` into the request.
+    """
+    key = os.environ.get("REACHY_OPENAI_API_KEY")
+    if key == "EMPTY":
+        return None
+    return key or None
 
 
 def _extract_pcm(raw: bytes) -> bytes:

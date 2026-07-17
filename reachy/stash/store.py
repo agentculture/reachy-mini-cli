@@ -164,8 +164,20 @@ class StashStore:
         query_norm = float(np.linalg.norm(query_vec))
 
         scored: list[ScoredRecord] = []
+        _dim_mismatch_warned = False
         for record, vector in entries:
             vec = np.asarray(vector, dtype=float)
+            if vec.shape != query_vec.shape:
+                if not _dim_mismatch_warned:
+                    log.warning(
+                        "[stash] skipping record %r: embedding dimension %d != query "
+                        "dimension %d (possible index/model mismatch)",
+                        record.name,
+                        vec.shape[0],
+                        query_vec.shape[0],
+                    )
+                    _dim_mismatch_warned = True
+                continue
             vec_norm = float(np.linalg.norm(vec))
             if query_norm <= _NORM_EPSILON or vec_norm <= _NORM_EPSILON:
                 score = 0.0

@@ -196,5 +196,60 @@ def test_index_file_with_one_unreadable_record_drops_only_that_record(tmp_path):
     assert store.all()[0].name == "no-shake"
 
 
+# ---------------------------------------------------------------------------
+# Dimension mismatch — index/model mismatch degrades gracefully
+# ---------------------------------------------------------------------------
+
+
+def test_search_skips_records_with_different_embedding_dimension(tmp_path):
+    """When a stored embedding has a different dimension than the query's,
+    search() skips that record (no ValueError) and returns compatible hits.
+    """
+
+    class _DimEmbedder:
+        """Returns 3-D for 'query', 2-D for 'old-model'."""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def __call__(self, text: str) -> list[float]:
+            self.calls.append(text)
+            if "query" in text:
+                return [1.0, 0.0, 0.0]  # 3-D query
+            return [1.0, 0.0]  # 2-D (old model)
+
+    embed = _DimEmbedder()
+    store = StashStore(path=tmp_path / "stash" / "index.json", embed=embed)
+
+    # Manually write an index with a 2-D embedding (simulating old-model record)
+    import json as _json
+
+    path = store.path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = {
+        "version": 1,
+        "records": [
+            {
+                "record": StashRecord.from_dict(_A).to_dict(),
+                "embedding": [1.0, 0.0],  # 2-D — mismatched
+            },
+            {
+                "record": StashRecord.from_dict(_B).to_dict(),
+                "embedding": [0.0, 1.0, 0.0],  # 3-D — compatible
+            },
+        ],
+    }
+    path.write_text(_json.dumps(body), encoding="utf-8")
+
+    # Force reload
+    store._entries = None
+
+    # search() must NOT raise — it skips the 2-D record and scores the 3-D one.
+    results = store.search("query", k=5)
+    # Only the compatible record is returned.
+    assert len(results) == 1
+    assert results[0].record.name == "no-shake"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
