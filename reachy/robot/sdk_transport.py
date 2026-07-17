@@ -200,16 +200,23 @@ class MediaSession:
         )
         return {"status": "ok", "transport": "sdk", "action": "goto"}
 
-    def get_frame(self) -> "np.ndarray":
-        """Capture one camera frame through the one open client (no per-frame session open).
+    def _ensure_camera(self) -> None:
+        """Resolve the camera once (lazily) off the held client, honoring acquire_media.
 
-        Resolves the local camera once (lazily) off the held ``ReachyMini`` and
-        reuses it — unlike ``SdkTransport.get_frame``, which builds a fresh client
-        per frame and never closes it.
+        Uses only the real 1.9.x surface. If the daemon's media was released for
+        direct device access (``media_released`` truthy), ``acquire_media()`` is
+        called once to bring the media manager's camera pipeline back — the SDK
+        re-creates the manager on acquire, so the cached ``media`` handle is
+        refreshed. Availability is ``media.camera is not None``; a genuinely
+        absent camera raises a clean :class:`CliError` (exit 2).
         """
         if not self._camera_resolved:
-            available = bool(self._mini.is_local_camera_available())
-            self._camera = self._mini.media_manager.camera if available else None
+            if getattr(self._mini, "media_released", False):
+                acquire = getattr(self._mini, "acquire_media", None)
+                if acquire is not None:
+                    acquire()
+                    self._media = self._mini.media  # acquire re-creates the manager
+            self._camera = getattr(self._media, "camera", None)
             self._camera_resolved = True
         if self._camera is None:
             raise CliError(
@@ -220,7 +227,20 @@ class MediaSession:
                     "(local camera frames need connection_mode 'localhost_only')"
                 ),
             )
-        return self._camera.get_frame()
+
+    def get_frame(self) -> "np.ndarray | None":
+        """Capture one camera frame through the one open client (no per-frame session open).
+
+        Reads through the real 1.9.x surface: ``media.camera`` gates availability
+        (resolved once, lazily, off the held ``ReachyMini``) and
+        ``media.get_frame()`` returns the BGR ndarray — or ``None`` when no frame
+        is ready this instant, which the caller (grabber / producer) skips. When
+        there is genuinely no camera, raises a clean :class:`CliError` (exit 2),
+        never a traceback. Unlike ``SdkTransport.get_frame``, this reuses the one
+        open client instead of building a fresh one per frame (issue #51).
+        """
+        self._ensure_camera()
+        return self._media.get_frame()
 
 
 class _SdkSink:
@@ -293,19 +313,25 @@ class SdkTransport(Transport):
     # --- camera ----------------------------------------------------------
     @staticmethod
     def _import_camera():  # type: ignore[no-untyped-def]
-        """Lazily resolve the local camera handle: ``(available, camera)``.
+        """Open a ``ReachyMini`` and return ``(mini, media)`` for a frame read.
 
         Kept tiny and ``@staticmethod`` so a test can inject a FAKE via
         ``monkeypatch.setattr(SdkTransport, "_import_camera", ...)`` — exactly the
         seam ``_import`` uses for the rest of the SDK surface — without installing
         ``reachy_mini``.
 
-        PARKED ASSUMPTION about the SDK camera API (mirrors the audio path's
-        ``mini.media.get_DoA()`` style): a local camera is exposed through the
-        media manager — ``is_local_camera_available()`` gates it, and the handle
-        lives at ``media_manager.camera`` (frames via ``camera.get_frame()``,
-        connection_mode == 'localhost_only'). Isolated here so a wrong guess is a
-        one-line fix, not a scatter across methods.
+        Uses only the REAL 1.9.x surface (introspected live): ``mini.media`` is
+        the ``MediaManager`` — ``media.camera`` gates availability and
+        ``media.get_frame()`` returns frames. If the daemon's media was released
+        for direct device access (``media_released`` truthy), ``acquire_media()``
+        re-acquires it so the camera pipeline (LOCAL IPC / WebRTC) is live again;
+        it is idempotent (a no-op when already acquired). There is NO
+        camera-availability probe method on ``ReachyMini`` and NO
+        ``media_manager.camera`` contract — those were guessed APIs that do not
+        exist; availability is simply ``media.camera is not None``.
+
+        ``mini`` is returned alongside ``media`` so the caller holds the client
+        alive for the duration of the read (``ReachyMini`` disconnects on GC).
         """
         try:
             from reachy_mini import ReachyMini
@@ -319,29 +345,41 @@ class SdkTransport(Transport):
                 ),
             ) from err
         mini = ReachyMini()
-        available = bool(mini.is_local_camera_available())
-        camera = mini.media_manager.camera if available else None
-        return available, camera
+        if getattr(mini, "media_released", False):
+            acquire = getattr(mini, "acquire_media", None)
+            if acquire is not None:
+                acquire()
+        return mini, mini.media
 
-    def get_frame(self) -> "np.ndarray":
+    def get_frame(self) -> "np.ndarray | None":
         """Capture one frame from the local camera as a ``numpy.ndarray`` (H x W x 3).
 
         Frames are a *local-profile* capability (issue #22): the daemon HTTP API
         serves camera metadata only, so this exists on the ``sdk`` flavor alone.
-        Raises :class:`CliError` (exit 2) when the SDK is missing or the local
-        camera is unavailable — never a traceback.
+        Availability is ``media.camera is not None``; ``media.get_frame()`` returns
+        the frame, or ``None`` when no frame is ready this instant (the caller
+        skips it). Raises :class:`CliError` (exit 2) when the SDK is missing or
+        there is genuinely no camera — never a traceback.
+
+        This opens a fresh client per frame (the acknowledged one-shot ``sdk`` path,
+        issue #51); the live loop rides :meth:`MediaSession.get_frame` on the one
+        held client instead.
         """
-        available, camera = self._import_camera()
-        if not available or camera is None:
-            raise CliError(
-                code=EXIT_ENV_ERROR,
-                message="no local camera is available on this Reachy Mini",
-                remediation=(
-                    "check the camera is connected and run on the robot itself "
-                    "(local camera frames need connection_mode 'localhost_only')"
-                ),
-            )
-        return camera.get_frame()
+        mini, media = self._import_camera()
+        try:
+            camera = getattr(media, "camera", None)
+            if camera is None:
+                raise CliError(
+                    code=EXIT_ENV_ERROR,
+                    message="no local camera is available on this Reachy Mini",
+                    remediation=(
+                        "check the camera is connected and run on the robot itself "
+                        "(local camera frames need connection_mode 'localhost_only')"
+                    ),
+                )
+            return media.get_frame()
+        finally:
+            del mini  # drop the per-call client only after the frame is read
 
     def robot_state(self) -> object:
         reachy_mini_cls, _ = self._import()

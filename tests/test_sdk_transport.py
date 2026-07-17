@@ -19,15 +19,34 @@ from reachy.robot.sdk_transport import MediaSession, SdkTransport
 
 
 class _FakeMedia:
-    """Minimal stand-in for ``ReachyMini.media``."""
+    """Minimal stand-in for ``ReachyMini.media`` (the real 1.9.x ``MediaManager``).
 
-    def __init__(self, *, doa_return=None, audio_return=None, samplerate=16000, channels=1) -> None:
+    Mirrors the real surface the transport now uses: ``camera`` (a handle or
+    ``None`` when no camera is initialised) and ``get_frame()`` (the BGR ndarray,
+    or ``None`` when no frame is ready this instant — exactly what
+    ``MediaManager.get_frame`` returns).
+    """
+
+    def __init__(
+        self,
+        *,
+        doa_return=None,
+        audio_return=None,
+        samplerate=16000,
+        channels=1,
+        camera_available=True,
+        frame=None,
+    ) -> None:
         self._doa_return = doa_return
         self._audio_return = audio_return
         self._samplerate = samplerate
         self._channels = channels
         self.recording_started = False
         self.recording_stopped = False
+        # A truthy sentinel stands in for the GStreamerCamera handle; ``None``
+        # models "no camera initialised" (NO_MEDIA / no hardware).
+        self.camera: object | None = object() if camera_available else None
+        self._frame = frame
 
     def start_recording(self) -> None:
         self.recording_started = True
@@ -47,40 +66,51 @@ class _FakeMedia:
     def get_input_channels(self) -> int:
         return self._channels
 
-
-class _FakeCamera:
-    def __init__(self, frame) -> None:  # type: ignore[no-untyped-def]
-        self._frame = frame
-
     def get_frame(self):
+        """Return the frame, or ``None`` when no camera (matches MediaManager)."""
+        if self.camera is None:
+            return None
         return self._frame
 
 
-class _FakeMediaManager:
-    def __init__(self, frame) -> None:  # type: ignore[no-untyped-def]
-        self.camera = _FakeCamera(frame)
-
-
 class _FakeMini:
-    """Minimal stand-in for a ``ReachyMini`` instance returned by context manager."""
+    """Minimal stand-in for a ``ReachyMini`` instance returned by context manager.
+
+    Models the real 1.9.x media-ownership surface: ``media`` (the MediaManager),
+    ``media_released`` / ``acquire_media()`` (daemon media hand-off; ``acquire``
+    re-creates the manager, matching ``ReachyMini.acquire_media``). It exposes
+    NEITHER the removed ``is_local_camera_available()`` method nor a
+    ``media_manager.camera`` attribute — the guessed APIs the transport used to
+    reference.
+    """
 
     def __init__(
-        self, *, camera_available=True, frame=None, head_pose=None, **media_kwargs
+        self, *, head_pose=None, media_released=False, **media_kwargs
     ) -> None:  # type: ignore[no-untyped-def]
-        self.media = _FakeMedia(**media_kwargs)
+        self._media_kwargs = media_kwargs
+        # Faithful to the SDK: while media is released the manager has no camera
+        # (NO_MEDIA); acquire_media() re-creates it with the camera restored.
+        if media_released:
+            self.media = _FakeMedia(camera_available=False)
+        else:
+            self.media = _FakeMedia(**media_kwargs)
         self.gotos: list[dict] = []  # type: ignore[type-arg]
         self._head_pose = np.eye(4) if head_pose is None else head_pose
-        self._camera_available = camera_available
-        self.media_manager = _FakeMediaManager(frame)
+        self.media_released = media_released
+        self.acquired = 0
+
+    def acquire_media(self) -> None:
+        self.acquired += 1
+        self.media_released = False
+        # The SDK re-creates the media manager on acquire; a stale cached handle
+        # must be refreshed by the caller (the transport does).
+        self.media = _FakeMedia(**self._media_kwargs)
 
     def get_current_head_pose(self):
         return self._head_pose
 
     def goto_target(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
         self.gotos.append(kwargs)
-
-    def is_local_camera_available(self) -> bool:
-        return self._camera_available
 
     def __enter__(self):
         return self
@@ -305,7 +335,7 @@ def test_media_session_move_goto_streams_through_held_client(monkeypatch) -> Non
 
 
 def test_media_session_get_frame_uses_held_camera(monkeypatch) -> None:
-    """get_frame() returns the held client's camera frame (no new session)."""
+    """get_frame() returns the held client's media.get_frame() (no new session)."""
     fake_cls = _FakeMiniCls(frame="FRAME")
     _patch_import(monkeypatch, fake_cls)
 
@@ -314,15 +344,49 @@ def test_media_session_get_frame_uses_held_camera(monkeypatch) -> None:
 
 
 def test_media_session_get_frame_raises_when_no_camera(monkeypatch) -> None:
-    """get_frame() raises a clean CliError when the local camera is unavailable."""
-    from reachy.cli._errors import CliError
+    """get_frame() raises a clean CliError(exit-2) when media.camera is None."""
+    from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 
     fake_cls = _FakeMiniCls(camera_available=False)
     _patch_import(monkeypatch, fake_cls)
 
     with SdkTransport().media_session() as session:
-        with pytest.raises(CliError):
+        with pytest.raises(CliError) as excinfo:
             session.get_frame()
+
+    assert excinfo.value.code == EXIT_ENV_ERROR
+    assert "camera" in excinfo.value.message.lower()
+
+
+def test_media_session_get_frame_none_when_no_frame_ready(monkeypatch) -> None:
+    """A camera present but no frame ready (media.get_frame() -> None) degrades to None.
+
+    This is the documented "no frame this instant" path: the transport does NOT
+    raise; it returns None and the caller (grabber / producer) skips the tick.
+    """
+    fake_cls = _FakeMiniCls(camera_available=True, frame=None)
+    _patch_import(monkeypatch, fake_cls)
+
+    with SdkTransport().media_session() as session:
+        assert session.get_frame() is None
+
+
+def test_media_session_get_frame_acquires_released_media(monkeypatch) -> None:
+    """When the daemon's media is released, get_frame() calls acquire_media() once.
+
+    Honors ``acquire_media`` where the SDK requires it (real 1.9.x surface): a
+    released media manager has no camera, so the transport re-acquires it, then
+    refreshes its cached handle and serves the frame.
+    """
+    fake_cls = _FakeMiniCls(media_released=True, frame="FRAME")
+    _patch_import(monkeypatch, fake_cls)
+
+    with SdkTransport().media_session() as session:
+        result = session.get_frame()
+
+    assert result == "FRAME"
+    assert fake_cls.last.acquired == 1
+    assert fake_cls.last.media_released is False
 
 
 def test_per_tick_reads_open_exactly_one_client(monkeypatch) -> None:

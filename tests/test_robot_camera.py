@@ -95,25 +95,37 @@ def test_http_get_frame_is_env_error_with_extra_hint() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FakeCamera:
-    """Minimal stand-in for the SDK's local camera handle."""
+class _FakeMediaHandle:
+    """Stand-in for the real 1.9.x ``ReachyMini.media`` (a ``MediaManager``).
 
-    def __init__(self, frame) -> None:  # type: ignore[no-untyped-def]
+    Exposes only the surface the transport now uses: ``camera`` (a handle or
+    ``None``) and ``get_frame()`` (the ndarray, or ``None`` when no frame is ready
+    — matching ``MediaManager.get_frame``).
+    """
+
+    def __init__(self, *, frame=None, available=True) -> None:  # type: ignore[no-untyped-def]
+        self.camera: object | None = object() if available else None
         self._frame = frame
 
     def get_frame(self):
+        if self.camera is None:
+            return None
         return self._frame
 
 
 def _patch_camera(monkeypatch, *, frame=None, available=True) -> None:
-    """Make ``SdkTransport._import_camera`` return a fake (available, camera) pair.
+    """Make ``SdkTransport._import_camera`` return a fake ``(mini, media)`` pair.
 
     Mirrors the ``_patch_import`` seam in test_sdk_transport.py — the FAKE is
-    injected so the real (uninstalled) ``reachy_mini`` is never imported.
+    injected so the real (uninstalled) ``reachy_mini`` is never imported. The
+    returned ``media`` is a stand-in for ``ReachyMini.media`` (the MediaManager),
+    exposing only the real surface: ``media.camera`` + ``media.get_frame()``.
     """
+    media = _FakeMediaHandle(frame=frame, available=available)
+    mini = object()  # only held to keep the client alive during the read
 
     def _fake_import_camera():
-        return available, _FakeCamera(frame)
+        return mini, media
 
     monkeypatch.setattr(SdkTransport, "_import_camera", staticmethod(_fake_import_camera))
 
@@ -133,7 +145,7 @@ def test_sdk_get_frame_returns_ndarray(monkeypatch) -> None:  # type: ignore[no-
 
 
 def test_sdk_get_frame_unavailable_is_env_error(monkeypatch) -> None:  # type: ignore
-    """When the local camera is unavailable, get_frame() raises CliError(code=2)."""
+    """When media.camera is None, get_frame() raises CliError(code=2)."""
     _patch_camera(monkeypatch, frame=None, available=False)
 
     with pytest.raises(CliError) as excinfo:
@@ -142,3 +154,78 @@ def test_sdk_get_frame_unavailable_is_env_error(monkeypatch) -> None:  # type: i
     err = excinfo.value
     assert err.code == EXIT_ENV_ERROR
     assert "camera" in err.message.lower()
+
+
+def test_sdk_get_frame_none_when_no_frame_ready(monkeypatch) -> None:  # type: ignore
+    """A camera present but no frame ready (media.get_frame() -> None) returns None.
+
+    The documented degrade path: the transport does not raise; the caller skips.
+    """
+    _patch_camera(monkeypatch, frame=None, available=True)
+
+    assert SdkTransport().get_frame() is None
+
+
+def test_import_camera_uses_real_surface_and_acquires(monkeypatch) -> None:  # type: ignore
+    """The REAL ``_import_camera`` body: imports ReachyMini, acquires released media.
+
+    Exercises the actual seam (not a monkeypatched replacement) with a FAKE
+    ``reachy_mini.ReachyMini`` swapped in via ``monkeypatch.setattr`` — safe, no
+    hardware, since the fake is never a real robot client. Proves it returns
+    ``(mini, media)`` and honors ``acquire_media`` when ``media_released`` is set.
+    """
+
+    class _FakeMediaMgr:
+        def __init__(self) -> None:
+            self.camera = object()
+
+        def get_frame(self):
+            return "FRAME"
+
+    class _FakeReachyMini:
+        def __init__(self) -> None:
+            self.media_released = True
+            self.acquired = 0
+            self.media = _FakeMediaMgr()
+
+        def acquire_media(self) -> None:
+            self.acquired += 1
+            self.media_released = False
+
+    monkeypatch.setattr("reachy_mini.ReachyMini", _FakeReachyMini)
+
+    mini, media = SdkTransport._import_camera()
+
+    assert isinstance(mini, _FakeReachyMini)
+    assert mini.acquired == 1  # released media was re-acquired
+    assert media is mini.media
+    assert media.get_frame() == "FRAME"
+
+
+def test_no_removed_camera_api_referenced_in_shipping_code() -> None:
+    """The removed guessed API must not be *used* in shipping code.
+
+    ``is_local_camera_available`` is NOT a ``ReachyMini`` method — the transport
+    used to guess it existed. Scans every ``*.py`` under the shipping trees
+    (``reachy/`` production package + ``scripts/``) so a regression that
+    reintroduces the guessed name fails loudly. Test files are intentionally out
+    of scope: they *describe* the removed API (fakes, assertion messages, this
+    very check) without ever calling it.
+    """
+    import pathlib
+
+    # Assemble the needle from parts so this guard file is not itself a match.
+    needle = "is_local_camera" + "_available"
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for base in ("reachy", "scripts"):
+        base_dir = repo_root / base
+        if not base_dir.exists():
+            continue
+        for path in base_dir.rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
+            if needle in path.read_text(encoding="utf-8"):
+                offenders.append(str(path.relative_to(repo_root)))
+
+    assert not offenders, f"removed API {needle!r} still referenced in shipping code: {offenders}"
