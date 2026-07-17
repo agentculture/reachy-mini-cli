@@ -27,6 +27,7 @@ Acceptance criteria (task t6)
 from __future__ import annotations
 
 import json
+import logging
 import threading
 
 import pytest
@@ -40,6 +41,17 @@ from reachy.speech.agent_turn import (
 )
 from reachy.speech.events import EventBuffer, SenseCue
 from reachy.speech.llm import ToolCall, TurnResult
+
+# ---------------------------------------------------------------------------
+# [SENSE] instrumentation (task t4)
+# ---------------------------------------------------------------------------
+
+_SENSE_LOGGER_NAME = "reachy.sense"
+
+
+def _sense_records(caplog) -> list:
+    return [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
+
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -659,6 +671,82 @@ def test_pat_only_cue_triggers_an_agent_turn():
     assert len(turn.calls) == 1
     user_messages = [m for m in turn.calls[0] if m.get("role") == "user"]
     assert any(cue_text in m.get("content", "") for m in user_messages)
+
+
+# ---------------------------------------------------------------------------
+# [SENSE] instrumentation (task t4)
+# ---------------------------------------------------------------------------
+
+
+def test_run_turn_logs_a_sense_turn_line_with_cue_count(caplog):
+    """A turn that fires logs exactly one [SENSE stage=turn] line naming the cue count."""
+    reg = FakeRegistry()
+    turn = ScriptedTurn(lambda m: TurnResult(content="ok", tool_calls=[], finish_reason="stop"))
+    engine = AgentTurnEngine(buffer=_buf_with_cue(), registry=reg, turn_fn=turn)
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        assert engine.run_turn() is True
+
+    records = _sense_records(caplog)
+    turn_records = [r for r in records if "stage=turn" in r.getMessage()]
+    assert len(turn_records) == 1
+    assert "cue_count=1" in turn_records[0].getMessage()
+
+
+def test_run_turn_no_cues_logs_no_sense_turn_line(caplog):
+    """An empty-buffer no-op turn never fires the stage=turn line."""
+    reg = FakeRegistry()
+    turn = ScriptedTurn(lambda m: TurnResult(content="x", tool_calls=[], finish_reason="stop"))
+    engine = AgentTurnEngine(buffer=EventBuffer(clock=_const_clock()), registry=reg, turn_fn=turn)
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        assert engine.run_turn() is False
+
+    assert _sense_records(caplog) == []
+
+
+def test_audio_optional_failure_logs_a_sense_drop_line(caplog):
+    """The first absorbed speak failure of a streak emits a greppable [SENSE] drop
+    line, additive to the existing warning log (not a replacement)."""
+    reg = FakeRegistry(results={"speak": _err_content()})
+    engine = AgentTurnEngine(
+        buffer=_buf_with_cue(),
+        registry=reg,
+        turn_fn=ScriptedTurn(_one_speak_turn),
+        audio_optional=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        engine.run_turn()
+
+    records = _sense_records(caplog)
+    drop_records = [r for r in records if "dropped reason=audio-muted" in r.getMessage()]
+    assert len(drop_records) == 1
+    assert drop_records[0].getMessage().startswith("[SENSE stage=action")
+
+
+def test_audio_latch_logs_a_second_sense_drop_line_when_muted(caplog):
+    """Reaching the mute threshold fires its own drop line, in addition to the
+    first-failure drop line — one per existing warning call site."""
+    reg = FakeRegistry(results={"speak": _err_content()})
+    buf = _buf_with_cue()
+    engine = AgentTurnEngine(
+        buffer=buf,
+        registry=reg,
+        turn_fn=ScriptedTurn(_one_speak_turn),
+        audio_optional=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        # DEFAULT_AUDIO_MUTE_THRESHOLD == 2: turn1 -> first-failure drop, turn2 ->
+        # mute-threshold drop. Two turns, two drop lines total.
+        for _ in range(2):
+            engine.run_turn()
+            _refill(buf)
+
+    records = _sense_records(caplog)
+    drop_records = [r for r in records if "dropped reason=audio-muted" in r.getMessage()]
+    assert len(drop_records) == 2
 
 
 if __name__ == "__main__":  # pragma: no cover

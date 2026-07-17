@@ -50,16 +50,21 @@ The pose seam is injected as a plain callable, so this module does not even
 import :mod:`reachy.motion`.  :mod:`reachy.speech.expressions` (the catalog
 loader) IS imported — it is a peer data module (TOML in, dataclasses out, no
 LLM/event/motion dependency of its own), used only to read the emoji key set
-that ``apply_pose`` advertises to the model.
+that ``apply_pose`` advertises to the model. :mod:`reachy.senselog` IS also
+imported — a stdlib-only logging helper (no LLM/event/motion dependency of its
+own) used to emit a ``[SENSE stage=action]`` line per :meth:`ToolRegistry.dispatch`
+call, and a ``drop(..., reason="tool-error")`` line for an error tool-result.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
+from reachy import senselog
 from reachy.speech.expressions import Catalog
 from reachy.speech.playback import play_audio
 from reachy.speech.voice import VoiceEngine, resolve_voice_engine
@@ -367,20 +372,32 @@ class ToolRegistry:
         arguments, or a handler exception each become an *error* tool-result
         (``content`` is ``{"error": "..."}``), so the engine's tool loop keeps
         running on a bad tool call.
+
+        Every call emits one ``[SENSE stage=action source=<name>]`` line (the
+        ``source`` names the tool, per :mod:`reachy.senselog`'s ``stage()``
+        contract); an error tool-result additionally emits a
+        ``drop(..., reason="tool-error")`` line, so a bad tool call is as
+        greppable as a good one.
         """
+        event_id = tool_call_id or uuid.uuid4().hex[:8]
+        senselog.stage("action", name, event_id, "tool call dispatched")
+
         tool = self._tools.get(name)
         if tool is None:
+            senselog.drop("action", name, event_id, "tool-error")
             return self._error(tool_call_id, f"unknown tool: {name!r}")
 
         try:
             arguments = _parse_arguments(arguments_json)
         except (ValueError, TypeError) as exc:
+            senselog.drop("action", name, event_id, "tool-error")
             return self._error(tool_call_id, f"malformed arguments for {name!r}: {exc}")
 
         try:
             content = tool.handler(arguments)
         except Exception as exc:  # noqa: BLE001 — a bad tool call must never kill the loop
             log.warning("[tools] handler for %r raised: %s", name, exc)
+            senselog.drop("action", name, event_id, "tool-error")
             return self._error(tool_call_id, f"{name!r} failed: {exc}")
 
         return _tool_message(tool_call_id, content)

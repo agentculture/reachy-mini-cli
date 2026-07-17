@@ -15,6 +15,7 @@ in ``test_think.py`` (an unreachable TTS → exit 2), so it is re-asserted here 
 
 from __future__ import annotations
 
+import logging
 import threading
 
 import pytest
@@ -24,6 +25,16 @@ from reachy.export.events import MessageEvent, ThinkingEvent
 from reachy.export.exporter import ExportHook
 from reachy.speech.cognition import CognitionEngine
 from reachy.speech.events import EventBuffer
+
+# ---------------------------------------------------------------------------
+# [SENSE] instrumentation (task t4)
+# ---------------------------------------------------------------------------
+
+_SENSE_LOGGER_NAME = "reachy.sense"
+
+
+def _sense_records(caplog) -> list:
+    return [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
 
 
 def _const_clock(value: float = 0.0):
@@ -156,3 +167,52 @@ def test_audio_latches_off_after_threshold_consecutive_failures():
         _refill(buf)
 
     assert synth.calls == 2  # capped at the mute threshold
+
+
+# ---------------------------------------------------------------------------
+# [SENSE] instrumentation (task t4) — the audio-optional latch paths gain a
+# greppable drop() line beside their existing warnings.
+# ---------------------------------------------------------------------------
+
+
+def test_audio_optional_failure_logs_a_sense_drop_line(caplog):
+    """The first absorbed synth failure of a streak emits a [SENSE] drop line."""
+    engine = CognitionEngine(
+        buffer=_buf_with_cue(),
+        stream_sentences=_one_quote_stream,
+        synthesize=_CountingFailSynth(),
+        play_audio=lambda *a, **k: None,
+        audio_optional=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        engine.run_turn()
+
+    records = [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
+    drop_records = [r for r in records if "dropped reason=audio-muted" in r.getMessage()]
+    assert len(drop_records) == 1
+    assert drop_records[0].getMessage().startswith("[SENSE stage=action")
+
+
+def test_audio_latch_logs_a_second_sense_drop_line_when_muted(caplog):
+    """Reaching the mute threshold fires its own drop line beside the first-failure one."""
+    synth = _CountingFailSynth()
+    buf = _buf_with_cue()
+    engine = CognitionEngine(
+        buffer=buf,
+        stream_sentences=_one_quote_stream,
+        synthesize=synth,
+        play_audio=lambda *a, **k: None,
+        audio_optional=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        # DEFAULT_AUDIO_MUTE_THRESHOLD == 2: turn1 -> first-failure drop, turn2 ->
+        # mute-threshold drop. Two turns, two drop lines total.
+        for _ in range(2):
+            engine.run_turn()
+            _refill(buf)
+
+    records = [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
+    drop_records = [r for r in records if "dropped reason=audio-muted" in r.getMessage()]
+    assert len(drop_records) == 2

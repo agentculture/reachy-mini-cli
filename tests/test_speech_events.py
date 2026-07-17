@@ -6,7 +6,9 @@ implementation.  Run with:  uv run pytest tests/test_speech_events.py -q
 
 from __future__ import annotations
 
+import logging
 import math
+import re
 import threading
 import time
 from typing import List
@@ -14,6 +16,21 @@ from typing import List
 import pytest
 
 from reachy.speech.events import EventBuffer, SenseCue
+
+# ---------------------------------------------------------------------------
+# [SENSE] cue instrumentation (task t4) — shared with tests/test_senselog.py
+# ---------------------------------------------------------------------------
+
+_SENSE_LOGGER_NAME = "reachy.sense"
+_SENSE_LINE_RE = re.compile(
+    r"^\[SENSE stage=(?P<stage>\S+) source=(?P<source>\S+) event=(?P<event>\S+)\] "
+    r"(?P<detail>.*)$"
+)
+
+
+def _sense_records(caplog) -> list:
+    return [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -491,3 +508,122 @@ class TestFeedPat:
         buf.feed_pat("scratch", "level1")
         cues = buf.snapshot()
         assert cues[0].timestamp == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# [SENSE] cue instrumentation (task t4)
+#
+# Every feed_* call that actually appends a cue emits exactly one parseable
+# [SENSE stage=cue source=<feed kind> event=<id>] <cue text> line on the
+# dedicated "reachy.sense" logger. A feed that produces NO cue because of a
+# threshold stays silent — that is a deliberate no-op, not a drop.
+# ---------------------------------------------------------------------------
+
+
+class TestSenseLogCueInstrumentation:
+    def test_feed_doa_speech_cue_logs_one_sense_line(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_doa(angle_rad=0.0, rms=0.1, is_speech=True)
+
+        records = _sense_records(caplog)
+        assert len(records) == 1
+        match = _SENSE_LINE_RE.match(records[0].getMessage())
+        assert match is not None
+        assert match.group("stage") == "cue"
+        assert match.group("source") == "doa"
+        assert "speech from the left" in match.group("detail")
+
+    def test_feed_doa_loud_sound_cue_logs_one_sense_line(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_doa(angle_rad=0.3, rms=0.5, is_speech=False)
+
+        records = _sense_records(caplog)
+        assert len(records) == 1
+        assert "loud sound" in records[0].getMessage()
+
+    def test_feed_doa_below_threshold_stays_silent(self, caplog):
+        """Ambient (quiet, non-speech) noise produces no cue and no [SENSE] line."""
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_doa(angle_rad=0.0, rms=0.001, is_speech=False)
+
+        assert _sense_records(caplog) == []
+
+    def test_feed_doa_no_angle_stays_silent(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_doa(angle_rad=None, rms=0.9, is_speech=True)
+
+        assert _sense_records(caplog) == []
+
+    def test_feed_vision_motion_cue_logs_one_sense_line(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_vision(motion_direction=-0.7, brightness_delta=0.0)
+
+        records = _sense_records(caplog)
+        assert len(records) == 1
+        match = _SENSE_LINE_RE.match(records[0].getMessage())
+        assert match is not None
+        assert match.group("stage") == "cue"
+        assert match.group("source") == "vision"
+        assert "motion" in match.group("detail")
+
+    def test_feed_vision_two_cues_logs_two_sense_lines(self, caplog):
+        """motion + a significant brightness change in one feed -> two [SENSE] lines."""
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_vision(motion_direction=-0.5, brightness_delta=20.0)
+
+        records = _sense_records(caplog)
+        assert len(records) == 2
+        assert all(r.getMessage().startswith("[SENSE stage=cue source=vision") for r in records)
+
+    def test_feed_vision_below_threshold_stays_silent(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_vision(motion_direction=None, brightness_delta=1.0)
+
+        assert _sense_records(caplog) == []
+
+    def test_feed_transcript_logs_one_sense_line_with_cue_text(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_transcript("hello world")
+
+        records = _sense_records(caplog)
+        assert len(records) == 1
+        match = _SENSE_LINE_RE.match(records[0].getMessage())
+        assert match is not None
+        assert match.group("stage") == "cue"
+        assert match.group("source") == "transcript"
+        assert "hello world" in match.group("detail")
+
+    def test_feed_transcript_empty_stays_silent(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_transcript("   ")
+
+        assert _sense_records(caplog) == []
+
+    def test_feed_pat_logs_one_sense_line_with_cue_text(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_pat("scratch", "level2")
+
+        records = _sense_records(caplog)
+        assert len(records) == 1
+        match = _SENSE_LINE_RE.match(records[0].getMessage())
+        assert match is not None
+        assert match.group("stage") == "cue"
+        assert match.group("source") == "pat"
+        assert "firm scratch" in match.group("detail")
+
+    def test_feed_pat_unknown_kind_stays_silent(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_pat("tickle", "level1")
+
+        assert _sense_records(caplog) == []
