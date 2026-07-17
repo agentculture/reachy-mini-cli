@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-07-18
+
+### Added
+
+- Symbolic runtime (issue #70): declarative rules.toml (react/inhibit/modes with per-rule cooldown_s + hysteresis, data-only no-exec validation) evaluated on the behavior engine tick via a single injected event seam (TickContext/TickBus)
+- behavior rules / rules check / rules overview verbs, behavior reload (live between-ticks hot-swap with last-good semantics), and an additively extended behavior status (rules health + live agent intents)
+- Boot-resilient rules load: a malformed rules.toml degrades to base presence with a [SENSE stage=rule] rejection naming every reason — never a Restart=on-failure crash loop
+- Goto lane: one-shot minjerk gotos as time-bounded stoppable contributions under per-channel arbitration, with a MotionQueue-shaped adapter and pinned no-resume preemption semantics
+- Intent system: run_behavior / declare_goal / set_mode / set_inhibition as atomic spool commands sustained tick-over-tick by an IntentDriver on the engine bus, with agent-facing JSON-schema tools
+- Runtime events JSONL feed (behavior engine run --export -): sense/rule/intent/motion blocks — a separate wire contract from the cognition feed (decision c27), documented in docs/export-schema.md
+- agent noun: an external attach client that reads the runtime feed, acts through the intent spool, and publishes its own thinking/message/emotion feed (decisions c11/c27) — publish-only speech tools, no second SDK owner
+- reachy-runtime.service boot unit (AI-agnostic ExecStart) + three-way single-presence exclusion across demo|live|runtime
+- Offline CI lane (pytest -m offline): boot/breathe/orient/pat/sleep-wake/rules proven with every service endpoint unreachable under a socket guard, plus a dep-freeze check
+- Tick-budget observability: TickMetrics seam wrapper counting overruns with a [SENSE ... event=overrun] line (0 overruns across 8500+ real 50 Hz ticks in live testing)
+- Live perception + logging in behavior engine run: a DoaPoller feeds doa/speech rules from the daemon route, and install_logging makes [SENSE stage=rule] lines visible
+- Operating guide chapter: the symbolic runtime — three client walkthroughs (human/script/agent), the two-feed contract, and the zero-token verification recipe
+- Battery-free state surface (joints + pose via the SDK seam) with a repo-wide no-battery guard test (challenge finding c21: SDK 1.9 has no battery API)
+
+### Changed
+
+- Sense snapshot extended with rms/pat_event/face/frame_available fields + non-consuming provider seams (peek semantics)
+- behavior/control.py spool generalized to namespaced spools with an extensible command-kind registry
+
 ## [0.34.1] - 2026-07-17
 
 ### Fixed
