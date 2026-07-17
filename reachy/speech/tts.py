@@ -1,18 +1,50 @@
-"""TTS synth client for Chatterbox HTTP `/v1/audio/synthesize`.
+"""TTS synth client — Chatterbox `/v1/audio/synthesize` or the lobes gateway's
+OpenAI-style `/v1/audio/speech`.
 
-Sends cleaned text to the endpoint via synchronous ``urllib.request`` (stdlib
-only — no httpx / requests) and returns raw PCM16 bytes. The body is a JSON
-object ``{"text": …, "voice": …}`` and the server replies with bare PCM16 mono
-@ 24 kHz (``Content-Type: audio/pcm``) — the contract of model-gear's Chatterbox
-TTS sidecar, which replaced the earlier Magpie NIM. ``_extract_pcm`` still
-unwraps a RIFF/WAVE container so a WAV-returning server keeps working.
+Sends cleaned text to one of two HTTP routes via synchronous ``urllib.request``
+(stdlib only — no httpx / requests) and returns raw PCM16 bytes:
+
+* ``"chatterbox"`` (default) — POSTs ``{"text": …, "voice": …}`` to
+  ``{REACHY_TTS_URL}/v1/audio/synthesize``. The contract of model-gear's
+  Chatterbox TTS sidecar (which replaced the earlier Magpie NIM).
+* ``"openai"`` — POSTs an OpenAI-shaped ``{"model": …, "input": …, "voice": …}``
+  body to ``{REACHY_OPENAI_URL_BASE}/v1/audio/speech`` — the same lobes gateway
+  process that serves LLM chat completions (:mod:`reachy.speech.llm`), one more
+  route on it rather than a separate service. Auth is a Bearer token from
+  ``REACHY_OPENAI_API_KEY`` (the same env var ``llm.py`` uses) sent only when set.
+
+**Live-verified response shape (2026-07-17 probe against the lobes gateway,
+``tts`` role = ResembleAI/chatterbox, gateway :8001)**: with no
+``response_format`` in the request body, ``POST /v1/audio/speech`` replies
+``200`` with ``Content-Type: audio/wav`` — a full RIFF/WAVE container, PCM16
+mono @ **24 kHz** (matches ``DEFAULT_SAMPLE_RATE`` below). Passing
+``"response_format": "pcm"`` instead returns ``Content-Type: audio/pcm`` — bare
+PCM16 with no header, same rate. Requesting the route with no ``Authorization``
+header returns ``401``. This module does not send ``response_format`` (so the
+gateway's WAV default applies) and relies on ``_extract_pcm`` — already needed
+for a WAV-returning Chatterbox — to unwrap either shape uniformly; a bare-PCM
+response passes through unchanged either way.
 
 Configuration (environment variables):
-    ``REACHY_TTS_URL``   — base URL of the TTS server (default ``http://localhost:9000``).
+    ``REACHY_TTS_ROUTE`` — ``"chatterbox"`` (default) or ``"openai"``, selects
+                            which route ``synthesize()`` targets.
+    ``REACHY_TTS_URL``   — base URL of the Chatterbox server (default
+                            ``http://localhost:9000``); also usable as an
+                            explicit ``tts_url=`` override for either route.
     ``REACHY_TTS_VOICE`` — voice id sent in the JSON body. Unset → ``null``, i.e.
-                           Chatterbox's single built-in default voice.
+                           the server's single built-in default voice.
+    ``REACHY_TTS_MODEL`` — model id sent in the OpenAI-shaped ``openai`` route
+                            payload (default ``"ResembleAI/chatterbox"``,
+                            matching the gateway's live ``tts`` role capability).
+    ``REACHY_OPENAI_URL_BASE`` — gateway base URL for the ``openai`` route
+                            (default ``http://localhost:8000``, mirroring
+                            :mod:`reachy.speech.llm`'s default).
+    ``REACHY_OPENAI_API_KEY`` — Bearer token for the ``openai`` route. Omitted
+                            (no ``Authorization`` header) when unset.
 
-Function-argument overrides take precedence over env vars.
+Function-argument overrides (``tts_url=``, ``voice=``, ``route=``, ``model=``)
+take precedence over env vars. When ``route`` is not selected at all (no env,
+no kwarg), behavior is byte-identical to the pre-gateway Chatterbox-only client.
 
 Cited from: autonomous-intelligence/realtime-api/src/realtime_api/tts_client.py
   (text-cleaning regexes and split algorithm; ported from async httpx to sync urllib).
@@ -29,7 +61,7 @@ import urllib.error
 import urllib.request
 import wave
 
-from reachy.cli._errors import EXIT_ENV_ERROR, CliError
+from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 
 log = logging.getLogger(__name__)
 
@@ -43,8 +75,30 @@ DEFAULT_TTS_URL = "http://localhost:9000"
 # server defines named voices.
 DEFAULT_VOICE: str | None = None
 # Chatterbox returns PCM16 mono @ 24 kHz; the playback stage must use the same rate.
+# Live-verified (2026-07-17): the gateway's OpenAI-style /v1/audio/speech route
+# returns the same PCM16 @ 24 kHz, so one playback rate serves both routes.
 DEFAULT_SAMPLE_RATE = 24000
 DEFAULT_TIMEOUT = 30.0
+
+# ---------------------------------------------------------------------------
+# Gateway OpenAI-style route (/v1/audio/speech) — env names + defaults
+# ---------------------------------------------------------------------------
+
+# Route selection: "chatterbox" (today's /v1/audio/synthesize leg, default) or
+# "openai" (the lobes gateway's OpenAI-shaped /v1/audio/speech leg).
+_ROUTE_CHATTERBOX = "chatterbox"
+_ROUTE_OPENAI = "openai"
+_VALID_ROUTES = (_ROUTE_CHATTERBOX, _ROUTE_OPENAI)
+DEFAULT_TTS_ROUTE = _ROUTE_CHATTERBOX
+
+# The gateway shares its base URL + Bearer auth with the LLM client
+# (reachy.speech.llm.LlmConfig's REACHY_OPENAI_URL_BASE / REACHY_OPENAI_API_KEY)
+# by convention — /v1/audio/speech is one more route on the same lobes gateway
+# process, not a separate service. Default mirrors llm.py's own default.
+DEFAULT_GATEWAY_URL = "http://localhost:8000"
+# Matches the gateway's live "tts" role capability (model-gear ResembleAI/chatterbox
+# backend), confirmed via the 2026-07-17 /capabilities probe.
+DEFAULT_OPENAI_TTS_MODEL = "ResembleAI/chatterbox"
 
 # Max *cleaned* characters per TTS request (TTS model sequence limit).
 # ~660 clean chars is the empirically safe ceiling; we use 600 for headroom.
@@ -164,6 +218,39 @@ def _resolve_voice(override: str | None) -> str | None:
     return override or os.environ.get("REACHY_TTS_VOICE") or DEFAULT_VOICE
 
 
+def _resolve_route(override: str | None) -> str:
+    """Return the TTS route: explicit arg > ``REACHY_TTS_ROUTE`` env > ``"chatterbox"``.
+
+    Raises:
+        :class:`~reachy.cli._errors.CliError` (code 1) when the resolved name
+        isn't a registered route.
+    """
+    resolved = (override or os.environ.get("REACHY_TTS_ROUTE") or DEFAULT_TTS_ROUTE).strip().lower()
+    if resolved not in _VALID_ROUTES:
+        valid = ", ".join(_VALID_ROUTES)
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"unknown TTS route: {resolved!r}",
+            remediation=f"set REACHY_TTS_ROUTE (or pass route=) to one of: {valid}",
+        )
+    return resolved
+
+
+def _resolve_gateway_url(override: str | None) -> str:
+    """Return the gateway base URL for the ``openai`` route: explicit arg > env > default."""
+    return (override or os.environ.get("REACHY_OPENAI_URL_BASE") or DEFAULT_GATEWAY_URL).rstrip("/")
+
+
+def _resolve_openai_model(override: str | None) -> str:
+    """Return the model id for the ``openai`` route's payload: explicit arg > env > default."""
+    return override or os.environ.get("REACHY_TTS_MODEL") or DEFAULT_OPENAI_TTS_MODEL
+
+
+def _resolve_api_key() -> str | None:
+    """Return the Bearer token for the ``openai`` route (``REACHY_OPENAI_API_KEY``, or ``None``)."""
+    return os.environ.get("REACHY_OPENAI_API_KEY") or None
+
+
 def _extract_pcm(raw: bytes) -> bytes:
     """Return bare PCM16 samples from *raw*.
 
@@ -205,6 +292,10 @@ def _post_synth(
     endpoint_url: str,
     voice: str | None,
     timeout: float,
+    *,
+    route: str = _ROUTE_CHATTERBOX,
+    model: str | None = None,
+    api_key: str | None = None,
 ) -> bytes:
     """Synthesize *clean*, retrying when the server returns truncated audio.
 
@@ -215,7 +306,9 @@ def _post_synth(
     """
     best = b""
     for attempt in range(_SYNTH_ATTEMPTS):
-        pcm = _synth_once(clean, endpoint_url, voice, timeout)
+        pcm = _synth_once(
+            clean, endpoint_url, voice, timeout, route=route, model=model, api_key=api_key
+        )
         if len(pcm) > len(best):
             best = pcm
         if not _is_truncated(clean, pcm):
@@ -235,21 +328,37 @@ def _synth_once(
     endpoint_url: str,
     voice: str | None,
     timeout: float,
+    *,
+    route: str = _ROUTE_CHATTERBOX,
+    model: str | None = None,
+    api_key: str | None = None,
 ) -> bytes:
     """POST *clean* text to *endpoint_url* and return raw PCM bytes (one attempt).
 
-    The body is JSON ``{"text": …, "voice": …}`` (Chatterbox's contract); a
-    ``None`` voice serialises to ``null``, selecting the server's default voice.
-    Raises :class:`~reachy.cli._errors.CliError` (code 2) on any network or
-    HTTP-level failure — no raw exception ever escapes this function.
+    On the ``"chatterbox"`` route the body is JSON ``{"text": …, "voice": …}``
+    (Chatterbox's contract). On the ``"openai"`` route the body is the
+    OpenAI-shaped ``{"model": …, "input": …, "voice": …}`` and, when *api_key*
+    is set, an ``Authorization: Bearer <api_key>`` header is added — the lobes
+    gateway's ``/v1/audio/speech`` contract (live-verified 2026-07-17: WAV
+    response, PCM16 @ 24 kHz, ``401`` without the header). Either way a
+    ``None`` voice serialises to ``null``, selecting the server's default
+    voice. Raises :class:`~reachy.cli._errors.CliError` (code 2) on any
+    network or HTTP-level failure — no raw exception ever escapes this
+    function.
     """
-    body = json.dumps({"text": clean, "voice": voice}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if route == _ROUTE_OPENAI:
+        body = json.dumps({"model": model, "input": clean, "voice": voice}).encode("utf-8")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    else:
+        body = json.dumps({"text": clean, "voice": voice}).encode("utf-8")
 
     req = urllib.request.Request(  # nosec B310 — URL is caller-controlled config, not user input
         url=endpoint_url,
         data=body,
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
 
     try:
@@ -307,8 +416,10 @@ def synthesize(
     tts_url: str | None = None,
     voice: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    route: str | None = None,
+    model: str | None = None,
 ) -> bytes:
-    """Synthesize *text* via the Chatterbox TTS endpoint, returning PCM16 bytes.
+    """Synthesize *text* via Chatterbox or the lobes gateway, returning PCM16 bytes.
 
     The text is cleaned (markdown/emoji stripped, whitespace normalized) and
     split into chunks that stay within the model's sequence-length limit before
@@ -316,9 +427,16 @@ def synthesize(
 
     Args:
         text:     Raw text to synthesize (may contain markdown, emoji, etc.).
-        tts_url:  Override base URL (overrides ``REACHY_TTS_URL`` env var).
+        tts_url:  Override base URL (overrides ``REACHY_TTS_URL`` for the
+                  ``"chatterbox"`` route, or ``REACHY_OPENAI_URL_BASE`` for the
+                  ``"openai"`` route).
         voice:    Override voice identifier (overrides ``REACHY_TTS_VOICE`` env var).
         timeout:  Per-request socket timeout in seconds (default 30).
+        route:    ``"chatterbox"`` (default) or ``"openai"`` — overrides
+                  ``REACHY_TTS_ROUTE``. Selecting neither (no arg, no env)
+                  keeps today's Chatterbox-only behavior byte-identical.
+        model:    Model id sent in the ``"openai"`` route's payload (overrides
+                  ``REACHY_TTS_MODEL``); ignored on the ``"chatterbox"`` route.
 
     Returns:
         Raw PCM16 bytes at ``DEFAULT_SAMPLE_RATE`` Hz, or ``b""`` if the cleaned
@@ -326,11 +444,23 @@ def synthesize(
 
     Raises:
         :class:`~reachy.cli._errors.CliError` (code 2) when the TTS server is
-        unreachable or returns an HTTP error.  No other exception type escapes.
+        unreachable or returns an HTTP error; (code 1) when *route* (or
+        ``REACHY_TTS_ROUTE``) names an unregistered route. No other exception
+        type escapes.
     """
-    base_url = _resolve_tts_url(tts_url)
+    resolved_route = _resolve_route(route)
     resolved_voice = _resolve_voice(voice)
-    endpoint = f"{base_url}/v1/audio/synthesize"
+
+    if resolved_route == _ROUTE_OPENAI:
+        base_url = _resolve_gateway_url(tts_url)
+        endpoint = f"{base_url}/v1/audio/speech"
+        resolved_model = _resolve_openai_model(model)
+        api_key = _resolve_api_key()
+    else:
+        base_url = _resolve_tts_url(tts_url)
+        endpoint = f"{base_url}/v1/audio/synthesize"
+        resolved_model = None
+        api_key = None
 
     clean = clean_for_tts(text)
     if not clean:
@@ -344,7 +474,15 @@ def synthesize(
     parts: list[bytes] = []
     for i, chunk in enumerate(chunks):
         log.debug("[tts] chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
-        pcm = _post_synth(chunk, endpoint, resolved_voice, timeout)
+        pcm = _post_synth(
+            chunk,
+            endpoint,
+            resolved_voice,
+            timeout,
+            route=resolved_route,
+            model=resolved_model,
+            api_key=api_key,
+        )
         if pcm:
             parts.append(pcm)
 
