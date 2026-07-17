@@ -2,15 +2,25 @@
 
 Behaviors are otherwise *pure* functions of behavior-local time; this module is
 the one live-input seam. A :class:`Sense` is the latest sensor snapshot the engine
-hands every behavior each tick (today: just sound direction). The
-:class:`DoaPoller` reads the daemon's ``/api/state/doa`` route at a *low* rate (a
-few Hz — DoA updates slowly) and tolerates the unit having no working mic, where
-the route answers ``500`` or JSON ``null``: any failure simply caches
-:data:`EMPTY_SENSE`, so a sound-reactive behavior reads "no reading" and yields
-rather than crashing.
+hands every behavior each tick (today: sound direction plus loudness/pat/face/
+frame-availability cues). The :class:`DoaPoller` reads the daemon's
+``/api/state/doa`` route at a *low* rate (a few Hz — DoA updates slowly) and
+tolerates the unit having no working mic, where the route answers ``500`` or JSON
+``null``: any failure simply caches :data:`EMPTY_SENSE`, so a sound-reactive
+behavior reads "no reading" and yields rather than crashing.
+
+:class:`SenseProviders` + :func:`read_perception` are the seam for the other
+cues: a small, duck-typed bundle of injected zero-arg PEEK callables (never
+consuming reads) that a future engine composition can wire to the same shared
+per-tick sources the folded ``listen`` hooks already use (``PatHook``,
+``VisionHook``, ``FaceHook`` — see ``reachy/motion/listen_*.py``), so multiple
+consumers reading the same tick's sample never race or steal from one another.
+Not wired into :mod:`reachy.behavior.engine` yet — this module only defines the
+snapshot shape and the provider contract.
 
 Stdlib only, and it imports neither the transport nor the model package (it
-duck-types the transport's ``doa`` method) so it stays a dependency-free leaf.
+duck-types the transport's ``doa`` method, and every provider callable) so it
+stays a dependency-free leaf.
 """
 
 from __future__ import annotations
@@ -36,10 +46,36 @@ class Sense:
     ``pi/2``=front, ``pi``=right), or ``None`` when there is no usable reading
     (no mic, daemon error, or no sound). ``speech_detected`` is the daemon's
     speech-vs-any-sound flag for the same reading.
+
+    ``rms``, ``pat_event``, ``face``, and ``frame_available`` extend the
+    snapshot with the folded-hook cues (mirroring ``listen``'s ``PatHook`` /
+    ``VisionHook`` / ``FaceHook``) so a future sensor-driven behavior can read
+    them the same way it reads ``doa_angle`` today. Each has a "no reading"
+    default so every existing bare or doa-only ``Sense(...)`` call site keeps
+    constructing a valid, fully-populated snapshot with no code change:
+
+    - ``rms`` — mic loudness for the tick (the same loudness cue
+      ``reachy.motion.listen.ListenProducer``'s ``SnapDetector`` reads), or
+      ``None`` when not sampled.
+    - ``pat_event`` — ``(touch_type, level)`` from a folded ``PatHook``
+      detection this tick (mirrors
+      ``EventBuffer.feed_pat(kind, level)``'s argument shape), or ``None``
+      when there was no pat this tick.
+    - ``face`` — the name of a recognised, named face this tick (mirrors
+      ``EventBuffer.feed_face(name)``), or ``None`` (no match, an unnamed
+      face, or not sampled).
+    - ``frame_available`` — whether a camera frame was available to peek this
+      tick. A signal only — never the frame itself, so this module never
+      needs to name a frame's concrete type (numpy/cv2) and stays a
+      dependency-free leaf. Defaults ``False``.
     """
 
     doa_angle: float | None = None
     speech_detected: bool = False
+    rms: float | None = None
+    pat_event: tuple[str, str] | None = None
+    face: str | None = None
+    frame_available: bool = False
 
 
 # The "no reading" snapshot — what behaviors get when nothing senses, the poll
@@ -102,6 +138,95 @@ class DoaPoller:
             except Exception:  # noqa: BLE001
                 self._last = EMPTY_SENSE
         return self._last
+
+
+#: A provider is a zero-arg callable returning its field's latest reading — a
+#: PEEK of a shared per-tick source, never a consuming read. This is the same
+#: "peek, not take" contract as
+#: ``reachy.motion.listen_vision.VisionHook.latest_frame`` (a non-consuming
+#: peek at the vision grabber's held frame) versus that hook's own consuming
+#: ``take()`` — so two independent consumers of the SAME provider (e.g. a
+#: behavior and a cognition sink) see the SAME tick's value, and a provider
+#: never needs — or opens — a second media session or camera grabber of its
+#: own; it just reads whatever the ONE upstream loop already captured this
+#: tick. Providers are duck-typed exactly like :class:`DoaPoller`'s ``read``
+#: callable: this module only names the shape and never imports a concrete
+#: source (no ``reachy_mini``, no ``cv2``) — it stays a dependency-free leaf.
+RmsProvider = Callable[[], float | None]
+PatEventProvider = Callable[[], tuple[str, str] | None]
+FaceProvider = Callable[[], str | None]
+FrameAvailableProvider = Callable[[], bool]
+
+
+@dataclass(frozen=True)
+class SenseProviders:
+    """Bundle of injected, non-consuming perception taps.
+
+    Each field is an optional zero-arg provider callable (see the
+    ``*Provider`` type aliases above) that the engine composition layer
+    supplies once per process — a real provider peeks a shared per-tick
+    holder/sample (mirroring how ``VisionHook.latest_frame`` peeks its
+    grabber's frame holder rather than consuming it), so multiple consumers
+    reading the SAME tick's sample never race or steal from one another.
+    ``None`` in any field means "no provider wired"; :func:`read_perception`
+    fills that field with :class:`Sense`'s own default. Frozen and stdlib-only
+    — this module never imports the concrete sources (``reachy_mini``,
+    ``cv2``, ...) that back real providers, keeping it a dependency-free leaf.
+    """
+
+    rms: RmsProvider | None = None
+    pat_event: PatEventProvider | None = None
+    face: FaceProvider | None = None
+    frame_available: FrameAvailableProvider | None = None
+
+
+#: A :class:`SenseProviders` with every field unset — "no providers wired".
+#: Plays the same role for providers that :data:`EMPTY_SENSE` plays for
+#: readings: ``read_perception(NO_PROVIDERS)`` always returns a snapshot with
+#: every extension field at its safe default.
+NO_PROVIDERS = SenseProviders()
+
+
+def _peek(provider, default):
+    """Call *provider* if present, tolerating any failure -> *default*.
+
+    Mirrors :class:`DoaPoller`'s failure handling: a raising or missing
+    provider must never crash the compose loop — it just means "no reading"
+    for that field this tick.
+    """
+    if provider is None:
+        return default
+    try:
+        return provider()
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def read_perception(
+    providers: SenseProviders = NO_PROVIDERS,
+    *,
+    base: Sense = EMPTY_SENSE,
+) -> Sense:
+    """Compose a full :class:`Sense` snapshot from *base* plus *providers*.
+
+    *base* supplies ``doa_angle``/``speech_detected`` (typically a
+    :class:`DoaPoller`'s latest reading, or :data:`EMPTY_SENSE` when there is
+    none); each configured provider in *providers* is peeked — never consumed
+    — for the remaining fields. A missing or raising provider degrades to
+    that field's safe default (mirroring :class:`DoaPoller`'s own failure
+    handling), so a partially-wired provider set can never crash the tick.
+    Calling this more than once for the same tick (e.g. once per consumer)
+    reads each provider again; a well-behaved ("peek") provider returns the
+    identical value every time.
+    """
+    return Sense(
+        doa_angle=base.doa_angle,
+        speech_detected=base.speech_detected,
+        rms=_peek(providers.rms, None),
+        pat_event=_peek(providers.pat_event, None),
+        face=_peek(providers.face, None),
+        frame_available=bool(_peek(providers.frame_available, False)),
+    )
 
 
 def doa_angle_to_yaw(angle: float, gain: float) -> float:
