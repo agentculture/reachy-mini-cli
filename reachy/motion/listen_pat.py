@@ -115,7 +115,14 @@ WARMUP_SECONDS: float = 3.0
 #: more residual deviation than a bench setup. A real scratch measures ~20°, so
 #: the margin stays enormous. Override per-run via ``--press-threshold``.
 LIVE_PRESS_THRESHOLD_DEG: float = 2.5
-LIVE_YAW_PRESS_THRESHOLD_DEG: float = 3.5
+LIVE_YAW_PRESS_THRESHOLD_DEG: float = 6.0
+
+#: Post-horizon landing grace (seconds): the live SDK's blocking goto returns at
+#: ~plan duration with the head still ≈20 % short on large swings (measured ~5°
+#: at return on 25° yaw moves), closing over the next half-second. The expectation
+#: profile is stretched by this margin so the physical close-out reads as transit,
+#: not as an external press.
+LANDING_GRACE_SECONDS: float = 0.8
 
 
 def minjerk_progress(tau: float) -> float:
@@ -298,7 +305,10 @@ class PatHook:
             self._move_start = prev
             self._move_target = current
             self._move_t0 = t
-            self._move_end = self._busy_horizon()
+            # Stretch the expectation past the published horizon: the blocking
+            # goto returns with the head still closing the last stretch of large
+            # swings (see LANDING_GRACE_SECONDS) — that close-out is transit too.
+            self._move_end = self._busy_horizon() + LANDING_GRACE_SECONDS
             # Tick-level ground truth for the phantom hunt (info-level): what the
             # hook observed at each dispatch, incl. the horizon it was handed.
             logger.info(
