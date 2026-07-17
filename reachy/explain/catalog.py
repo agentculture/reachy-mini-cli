@@ -1093,37 +1093,46 @@ _SERVICE = """\
 # reachy-mini-cli service
 
 Make the robot boot-persistent in **exactly one** presence mode. The robot has a
-single presence at a time (the single-SDK-owner model): either the idle
-`demo-mode` loop or the folded live sense loop (`listen run --live`) — never both.
-This noun installs systemd `--user` units so that one chosen presence survives a
-reboot and auto-restarts on crash, and enabling one mode always disables the
-sibling (the single-presence-owner invariant).
+single presence at a time (the single-SDK-owner model): the idle `demo-mode`
+loop, the folded live sense loop (`listen run --live`), or the AI-agnostic
+symbolic runtime (`behavior engine run`) — never more than one. This noun
+installs systemd `--user` units so that one chosen presence survives a reboot
+and auto-restarts on crash, and enabling one mode always disables BOTH siblings
+(the single-presence-owner invariant).
 
 Like `daemon`, `service` does **not** drive the robot through a transport — it
 talks to **systemd** (`systemctl --user`), so there is no `--transport` flag.
 
-## Three units
+## Four units
 
 - `reachy-daemon.service` — the local `reachy-mini-daemon` process. A boot
-  dependency: both presence units `Requires=` / `After=` it, so the daemon comes
+  dependency: every presence unit `Requires=` / `After=` it, so the daemon comes
   up first. `disable` leaves the daemon enabled deliberately (other clients of
   the robot depend on it).
 - `reachy-demo-mode.service` — the idle `demo-mode run` presence loop.
 - `reachy-live.service` — the folded live loop (`listen run --live --transcribe
   --voice-engine harmonic`): hearing + pat + think + vision + sleep in one
   process, speaking with the offline harmonic voice by default.
+- `reachy-runtime.service` — the AI-agnostic symbolic runtime (`behavior engine
+  run`, the boot default per decision c19): the deterministic 50 Hz engine loads
+  `rules.toml`, ticks, and sustains declared intents with zero external AI
+  services required. Its `ExecStart` carries no LLM flag and no
+  `REACHY_OPENAI_*` reference; an agent attaches to the running loop externally
+  afterwards through the `agent` noun, with no unit edit and no loop restart.
 
 ## Verbs
 
 - `reachy-mini-cli service enable demo` — boot-persist the idle demo-mode
-  presence; disables the live sibling.
+  presence; disables the live and runtime siblings.
 - `reachy-mini-cli service enable live` — boot-persist the folded live sense
-  loop; disables the demo sibling.
+  loop; disables the demo and runtime siblings.
+- `reachy-mini-cli service enable runtime` — boot-persist the AI-agnostic
+  symbolic runtime; disables the demo and live siblings.
 - `reachy-mini-cli service disable` — disable whichever presence unit is enabled
   (the daemon is left enabled, reported as `daemon=left-enabled`).
 - `reachy-mini-cli service status` — which presence mode is enabled (or none) +
   per-unit `is-enabled` / `is-active` + daemon health.
-- `reachy-mini-cli service install` — write all three unit files +
+- `reachy-mini-cli service install` — write all four unit files +
   `daemon-reload`, WITHOUT enabling anything (a separate `enable` chooses the
   mode).
 - `reachy-mini-cli service uninstall` — remove the unit files + `daemon-reload`.
@@ -1147,8 +1156,9 @@ machine-reboot check is therefore a manual on-robot step.
 ## Usage
 
     reachy-mini-cli service install                  # write the units, enable nothing
-    reachy-mini-cli service enable live              # boot-persist the live loop
-    reachy-mini-cli service enable demo              # switch to idle demo (disables live)
+    reachy-mini-cli service enable runtime           # boot-persist the AI-agnostic runtime
+    reachy-mini-cli service enable live              # switch to the folded live loop
+    reachy-mini-cli service enable demo              # switch to idle demo
     reachy-mini-cli service status --json            # enabled mode + daemon health
     reachy-mini-cli service disable                  # stop the presence (daemon stays up)
     reachy-mini-cli service uninstall                # remove the units

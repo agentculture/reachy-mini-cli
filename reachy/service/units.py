@@ -1,10 +1,11 @@
 """Pure systemd ``--user`` unit-file text generation for the presence stack.
 
-This module renders the unit text for the three units that make the robot a
-boot-surviving, self-healing presence: the local ``reachy-mini-daemon`` and the
-two mutually-exclusive presence loops (idle ``demo-mode`` and the folded-live
-``listen run --live``). It is **pure**: every function returns a ``str`` and has
-no side effects — no ``systemctl``, no file writes, no process launches. The
+This module renders the unit text for the four units that make the robot a
+boot-surviving, self-healing presence: the local ``reachy-mini-daemon`` and
+three mutually-exclusive presence loops — idle ``demo-mode``, the folded-live
+``listen run --live``, and the AI-agnostic symbolic runtime
+(``behavior engine run``). It is **pure**: every function returns a ``str`` and
+has no side effects — no ``systemctl``, no file writes, no process launches. The
 installer half (writing + enabling these) lives in sibling modules; this one only
 *describes* the units so the text is trivially testable field-by-field.
 
@@ -15,9 +16,16 @@ and an ``ExecStart`` that re-invokes the running interpreter against the
 ``-m reachy …`` module entry (PATH-independent).
 
 Canonical unit names are exported as module constants
-(:data:`DAEMON_UNIT` / :data:`DEMO_UNIT` / :data:`LIVE_UNIT`) — a cross-task
-contract: anything that installs / enables / orders these units imports the
-names from here rather than re-spelling the strings.
+(:data:`DAEMON_UNIT` / :data:`DEMO_UNIT` / :data:`LIVE_UNIT` / :data:`RUNTIME_UNIT`)
+— a cross-task contract: anything that installs / enables / orders these units
+imports the names from here rather than re-spelling the strings.
+
+The runtime unit (:data:`RUNTIME_UNIT`) is the boot default per decision c19
+(issue #70): the deterministic ``behavior engine run`` loop owns presence with
+zero external AI services, and an agent attaches externally afterwards (see the
+``agent`` noun) — its ``ExecStart`` carries no LLM flag and no
+``REACHY_OPENAI_*`` reference, by design, so a box with no reachable model
+endpoint still boots to full presence.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ DAEMON_BINARY = "reachy-mini-daemon"
 DAEMON_UNIT = "reachy-daemon.service"
 DEMO_UNIT = "reachy-demo-mode.service"
 LIVE_UNIT = "reachy-live.service"
+RUNTIME_UNIT = "reachy-runtime.service"
 
 
 def _unit_arg(value: str) -> str:
@@ -113,6 +122,22 @@ def live_exec_start(python: str | None = None) -> str:
     )
 
 
+def runtime_exec_start(python: str | None = None) -> str:
+    """ExecStart for the runtime presence unit: ``<python> -m reachy behavior engine run``.
+
+    This is the AI-agnostic symbolic runtime (decision c19, issue #70): the
+    deterministic 50 Hz ``behavior`` engine loads ``rules.toml`` at boot, ticks,
+    evaluates its rules, and sustains declared intents entirely on its own — no
+    LLM call, no ``REACHY_OPENAI_*`` endpoint, no ``--export``/cognition flag of
+    any kind. An AI agent may attach to this running loop afterwards through its
+    seams (the ``agent`` noun: the runtime's event feed in, the intent spool
+    out) with **no unit edit and no loop restart** — cognition is an external,
+    optional client of the runtime, never wired into its ``ExecStart``.
+    """
+    py = python or _default_python()
+    return f"{_unit_arg(py)} -m reachy behavior engine run"
+
+
 # --------------------------------------------------------------------------- #
 # Full unit texts.
 # --------------------------------------------------------------------------- #
@@ -127,9 +152,9 @@ def _render(
 ) -> str:
     """Assemble one ``--user`` unit from its parts (shared skeleton).
 
-    All three units share ``Type=simple`` + ``Restart=on-failure`` +
-    ``RestartSec=5`` + ``WantedBy=default.target``. Presence units additionally
-    ``Requires=`` and order ``After=`` the daemon unit so the daemon is up first.
+    All units share ``Type=simple`` + ``Restart=on-failure`` + ``RestartSec=5``
+    + ``WantedBy=default.target``. Presence units additionally ``Requires=`` and
+    order ``After=`` the daemon unit so the daemon is up first.
     """
     after = "network-online.target"
     if after_daemon:
@@ -177,6 +202,21 @@ def live_unit_text(python: str | None = None) -> str:
     return _render(
         description="Reachy Mini live presence (hearing + pat, folded live loop)",
         exec_start=live_exec_start(python),
+        requires=DAEMON_UNIT,
+        after_daemon=True,
+    )
+
+
+def runtime_unit_text(python: str | None = None) -> str:
+    """Render ``reachy-runtime.service`` — the AI-agnostic symbolic runtime presence.
+
+    Boot default per c19: the deterministic ``behavior engine run`` loop (rules,
+    reflexes, sustained intents) with zero external AI services required; an
+    agent attaches externally afterwards, never wired into this unit.
+    """
+    return _render(
+        description="Reachy Mini symbolic runtime (AI-agnostic rules + reflex presence)",
+        exec_start=runtime_exec_start(python),
         requires=DAEMON_UNIT,
         after_daemon=True,
     )
