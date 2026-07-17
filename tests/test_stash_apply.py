@@ -278,8 +278,9 @@ def test_apply_record_works_against_a_real_motion_queue() -> None:
 
 
 def test_apply_record_rejects_a_non_record_input() -> None:
+    queue = _FakeQueue()
     with pytest.raises(CliError):
-        apply_record(object(), _FakeQueue())  # type: ignore[arg-type]
+        apply_record(object(), queue)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

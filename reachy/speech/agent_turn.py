@@ -507,6 +507,10 @@ def _muted_tool_message(tool_call_id: str | None) -> dict:
     }
 
 
+#: Fallback error text when an error tool-result carries no readable message.
+_UNKNOWN_ERROR = "unknown error"
+
+
 def _is_error_result(message: dict) -> bool:
     """Whether a dispatch tool-result carries an ``{"error": …}`` content payload."""
     content = message.get("content")
@@ -514,7 +518,7 @@ def _is_error_result(message: dict) -> bool:
         return False
     try:
         payload = json.loads(content)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):  # JSONDecodeError is a ValueError
         return False
     return isinstance(payload, dict) and "error" in payload
 
@@ -523,8 +527,8 @@ def _error_text(message: dict) -> str:
     """Extract the error string from an error tool-result (best-effort)."""
     try:
         payload = json.loads(message.get("content") or "")
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return "unknown error"
+    except (TypeError, ValueError):  # JSONDecodeError is a ValueError
+        return _UNKNOWN_ERROR
     if isinstance(payload, dict):
-        return str(payload.get("error", "unknown error"))
-    return "unknown error"
+        return str(payload.get("error", _UNKNOWN_ERROR))
+    return _UNKNOWN_ERROR

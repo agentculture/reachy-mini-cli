@@ -568,32 +568,49 @@ def stream_turn(
         for chunk in _iter_sse_chunks(resp):
             if is_cancelled():
                 break
-            try:
-                choice = chunk["choices"][0]
-            except (KeyError, IndexError, TypeError):
-                continue
-            reason = choice.get("finish_reason")
+            reason = _fold_turn_chunk(chunk, content_parts, accumulators, order, on_content)
             if reason:
                 finish_reason = reason
-            delta = choice.get("delta") or {}
-            content = delta.get("content")
-            if content:
-                content_parts.append(content)
-                if on_content is not None:
-                    on_content(content)
-            for tc in delta.get("tool_calls") or []:
-                index = tc.get("index", 0)
-                acc = accumulators.get(index)
-                if acc is None:
-                    acc = accumulators[index] = _ToolCallAccumulator()
-                    order.append(index)
-                acc.add(tc)
 
     return TurnResult(
         content="".join(content_parts),
         tool_calls=[accumulators[i].finalize() for i in order],
         finish_reason=finish_reason,
     )
+
+
+def _fold_turn_chunk(
+    chunk: dict,
+    content_parts: list[str],
+    accumulators: dict[int, "_ToolCallAccumulator"],
+    order: list[int],
+    on_content: Callable[[str], None] | None,
+) -> str | None:
+    """Fold one parsed SSE chunk into the turn state; return its ``finish_reason``.
+
+    Content deltas are appended to ``content_parts`` (and handed to ``on_content``
+    when set); ``tool_calls`` deltas are folded into their per-``index``
+    accumulator, first-seen order preserved in ``order``. A chunk with no usable
+    ``choices`` entry is a silent no-op (returns ``None``).
+    """
+    try:
+        choice = chunk["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    delta = choice.get("delta") or {}
+    content = delta.get("content")
+    if content:
+        content_parts.append(content)
+        if on_content is not None:
+            on_content(content)
+    for tc in delta.get("tool_calls") or []:
+        index = tc.get("index", 0)
+        acc = accumulators.get(index)
+        if acc is None:
+            acc = accumulators[index] = _ToolCallAccumulator()
+            order.append(index)
+        acc.add(tc)
+    return choice.get("finish_reason")
 
 
 class _ToolCallAccumulator:

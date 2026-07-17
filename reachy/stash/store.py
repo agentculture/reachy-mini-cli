@@ -40,6 +40,13 @@ EmbedFn = Callable[[str], list]
 _INDEX_FILENAME = "index.json"
 _INDEX_VERSION = 1
 
+#: Below this magnitude a vector is treated as "effectively zero" for cosine
+#: similarity purposes. Avoids both an exact-float equality check (S1244) and a
+#: division by a denormal/near-zero norm that would blow the score up instead
+#: of degrading it to 0.0 — real (unit-scale) embeddings never come this close
+#: to zero, so this cannot change behavior for real embeddings.
+_NORM_EPSILON = 1e-12
+
 
 @dataclass(frozen=True)
 class ScoredRecord:
@@ -160,7 +167,7 @@ class StashStore:
         for record, vector in entries:
             vec = np.asarray(vector, dtype=float)
             vec_norm = float(np.linalg.norm(vec))
-            if query_norm == 0.0 or vec_norm == 0.0:
+            if query_norm <= _NORM_EPSILON or vec_norm <= _NORM_EPSILON:
                 score = 0.0
             else:
                 score = float(np.dot(query_vec, vec) / (query_norm * vec_norm))

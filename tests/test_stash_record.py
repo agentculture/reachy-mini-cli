@@ -76,8 +76,9 @@ def test_to_dict_is_plain_json_serializable():
 
 
 def test_unknown_top_level_field_is_rejected():
+    data = _record(source="def foo(): pass")
     with pytest.raises(CliError, match="code"):
-        StashRecord.from_dict(_record(source="def foo(): pass"))
+        StashRecord.from_dict(data)
 
 
 def test_missing_required_field_is_rejected():
@@ -102,24 +103,28 @@ def test_callable_top_level_field_is_rejected():
 
 
 def test_unknown_generator_is_rejected():
+    data = _record(generator="does-not-exist-in-library")
     with pytest.raises(CliError, match="generator"):
-        StashRecord.from_dict(_record(generator="does-not-exist-in-library"))
+        StashRecord.from_dict(data)
 
 
 def test_unknown_channel_is_rejected():
+    data = _record(channels=["head", "laser-eyes"])
     with pytest.raises(CliError, match="channel"):
-        StashRecord.from_dict(_record(channels=["head", "laser-eyes"]))
+        StashRecord.from_dict(data)
 
 
 def test_unknown_stop_class_is_rejected():
+    data = _record(stop_class="unstoppable-ish")
     with pytest.raises(CliError, match="stop"):
-        StashRecord.from_dict(_record(stop_class="unstoppable-ish"))
+        StashRecord.from_dict(data)
 
 
 def test_invalid_lifetime_is_rejected():
     # not looping and no duration -> Lifetime.errors() flags it
+    data = _record(lifetime={"looping": False, "duration": None})
     with pytest.raises(CliError, match="lifetime"):
-        StashRecord.from_dict(_record(lifetime={"looping": False, "duration": None}))
+        StashRecord.from_dict(data)
 
 
 def test_param_with_extra_field_is_rejected():
@@ -144,13 +149,15 @@ def test_param_default_must_be_numeric_not_bool():
 
 
 def test_non_string_name_is_rejected():
+    data = _record(name=123)
     with pytest.raises(CliError):
-        StashRecord.from_dict(_record(name=123))
+        StashRecord.from_dict(data)
 
 
 def test_empty_explanation_is_rejected():
+    data = _record(explanation="   ")
     with pytest.raises(CliError, match="explanation"):
-        StashRecord.from_dict(_record(explanation="   "))
+        StashRecord.from_dict(data)
 
 
 def test_non_mapping_record_is_rejected():
@@ -160,8 +167,9 @@ def test_non_mapping_record_is_rejected():
 
 def test_channels_must_be_a_list_not_a_string():
     # A bare string is iterable char-by-char — must not silently "work".
+    data = _record(channels="head")
     with pytest.raises(CliError):
-        StashRecord.from_dict(_record(channels="head"))
+        StashRecord.from_dict(data)
 
 
 if __name__ == "__main__":  # pragma: no cover

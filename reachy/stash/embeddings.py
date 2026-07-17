@@ -119,7 +119,7 @@ def embed_text(
             code=EXIT_ENV_ERROR,
             message=f"cannot reach embeddings endpoint at {cfg.base_url}: {err}",
             remediation=(
-                "start the lobes gateway or set REACHY_OPENAI_URL_BASE to a " "reachable endpoint"
+                "start the lobes gateway or set REACHY_OPENAI_URL_BASE to a reachable endpoint"
             ),
         ) from err
 
