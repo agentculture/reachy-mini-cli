@@ -131,7 +131,9 @@ sustained intents, and motion admissions — produced by the 50 Hz
 (`reachy.behavior.rule_engine`), independent of any LLM.
 
 **Decision c27** (the `symbolic-runtime-70` design): when an external agent
-attaches to the running engine (a later feature), it publishes its OWN
+attaches to the running engine (`reachy-mini-cli agent attach` — see
+[`docs/operating-reachy.md`'s symbolic-runtime
+chapter](operating-reachy.md#the-symbolic-runtime)), it publishes its OWN
 cognition feed through the family documented above (`thinking` / `message` /
 `emotion`) — it does **not** write into this feed, and this feed never carries
 a cognition block. The two feeds are how a human, a script, and an attached AI
@@ -213,8 +215,21 @@ Example lines:
 #### `"intent"` — a sustained symbolic goal
 
 Emitted when a symbolic goal is declared, updated, or cleared through the
-intent-tools spool (schema defined now; no producer is wired yet — a later
-task builds the intent tools).
+intent-tools spool.
+
+**Producer status:** the intent-tools spool
+(`reachy/speech/intent_tools.py`, the four tools `reachy-mini-cli agent
+attach` carries) and its engine-side consumer
+(`reachy.behavior.intents.IntentDriver`) are both built and independently
+tested (`tests/test_speech_intent_tools.py`, `tests/test_behavior_intents.py`),
+but two things are still open before a live `behavior engine run --export -`
+process actually emits this block: (1) `IntentDriver` is not yet composed into
+`behavior engine run`'s tick bus — `reachy/cli/_commands/behavior.py`'s
+`cmd_engine_run` composes the rules evaluator and a sense-snapshot publisher
+only; and (2) `IntentDriver` currently publishes its own `intent.applied` /
+`intent.blocked` `ctx.emit` event types rather than the `intent.declare` /
+`intent.update` / `intent.clear` shape `to_runtime_event()` maps below, so
+reconciling the two vocabularies is follow-up work even once (1) lands.
 
 | Key       | Type                              | Description                        |
 |-----------|------------------------------------|-------------------------------------|
@@ -232,8 +247,16 @@ Example line:
 
 #### `"motion"` — a behavior admission/eviction or goto
 
-Emitted for the engine's active-set churn (schema defined now; no producer is
-wired yet — a later task builds the goto lane).
+Emitted for the engine's active-set churn.
+
+**Producer status:** the goto lane (`reachy.behavior.goto_lane.GotoLane`) is
+built and independently tested (`tests/test_behavior_goto_lane.py`), and
+publishes `ctx.emit` events for its own lifecycle
+(`goto.admitted` / `goto.done` / `goto.cancelled`), but it is not yet composed
+into `behavior engine run`'s tick bus, and those raw event-type strings do not
+yet match the `motion.admit` / `motion.evict` / `motion.goto` shape
+`to_runtime_event()` maps below — reconciling the two is follow-up work, the
+same as the `"intent"` block above.
 
 | Key        | Type                            | Description                          |
 |------------|-----------------------------------|---------------------------------------|
