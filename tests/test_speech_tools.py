@@ -34,6 +34,7 @@ import pytest
 
 import reachy.speech.tools as tools_mod
 from reachy.motion.expression import ExpressionProducer
+from reachy.speech.expressions import Catalog
 from reachy.speech.harmonic import HARMONIC_SAMPLE_RATE
 from reachy.speech.tools import ToolRegistry, function_tool
 from reachy.speech.tts import DEFAULT_SAMPLE_RATE as TTS_SAMPLE_RATE
@@ -104,6 +105,81 @@ def test_speak_and_apply_pose_declare_expected_json_schema_params() -> None:
     assert by_name["harmonics"]["properties"]["text"]["type"] == "string"
     assert by_name["apply_pose"]["properties"]["emoji"]["type"] == "string"
     assert by_name["apply_pose"]["required"] == ["emoji"]
+
+
+# ---------------------------------------------------------------------------
+# Task t6: apply_pose advertises the catalog (enum) + rejects unknown keys
+# ---------------------------------------------------------------------------
+
+
+def test_apply_pose_emoji_property_publishes_the_full_catalog_as_a_sorted_enum() -> None:
+    """The default registry (no explicit ``catalog_keys``) advertises the SAME
+    key set as the shipped expression catalog, sorted for determinism."""
+    reg = ToolRegistry()
+    catalog = Catalog()
+    by_name = {d["function"]["name"]: d["function"]["parameters"] for d in reg.tools()}
+    assert by_name["apply_pose"]["properties"]["emoji"]["enum"] == sorted(catalog.keys())
+
+
+def test_apply_pose_description_no_longer_lists_only_three_hardcoded_examples() -> None:
+    """Guard the intent of the change: the description must not hard-name only
+    the old 3-emoji example set — it should point at the enum instead."""
+    reg = ToolRegistry()
+    by_name = {d["function"]["name"]: d["function"]["description"] for d in reg.tools()}
+    description = by_name["apply_pose"]
+    assert "enum" in description.lower()
+    assert "🤔, 😮, 🎉" not in description
+
+
+def test_extra_toml_key_reaches_the_published_schema_with_no_code_change(tmp_path) -> None:
+    """A registry built from a temp TOML with an EXTRA key (beyond the shipped
+    catalog) advertises that key too — proving the enum is data-driven, not a
+    hardcoded list that would need a code change to grow."""
+    toml_path = tmp_path / "expressions.toml"
+    toml_path.write_text(
+        '[neutral]\nhead_x = 0.0\n\n["🤔"]\nhead_pitch = 6.0\n\n["🛸"]\nhead_pitch = 3.0\n'
+    )
+    catalog = Catalog(str(toml_path))
+    reg = ToolRegistry(catalog_keys=catalog.keys())
+    by_name = {d["function"]["name"]: d["function"]["parameters"] for d in reg.tools()}
+    enum = by_name["apply_pose"]["properties"]["emoji"]["enum"]
+    assert enum == sorted(catalog.keys())
+    assert "🛸" in enum  # the extra key, present with no code change
+
+
+def test_apply_pose_unknown_emoji_is_rejected_and_never_calls_express() -> None:
+    """An emoji absent from the catalog is REJECTED (an error tool-result naming
+    the valid keys) and the express seam must NEVER be invoked for it — this
+    replaces the old silent-neutral-fallback behavior."""
+    queue = _RecordingQueue()
+    producer = ExpressionProducer(queue=queue)
+    catalog = Catalog()
+
+    reg = ToolRegistry(express=producer.express)
+    result = reg.dispatch("apply_pose", json.dumps({"emoji": "✨"}), tool_call_id="n")
+
+    assert result["role"] == "tool"
+    payload = json.loads(result["content"])
+    assert "error" in payload
+    for key in catalog.keys():
+        assert key in payload["error"]
+    # The express seam was never called for the unknown key — nothing enqueued.
+    assert queue.submitted == []
+
+
+def test_apply_pose_valid_catalog_emoji_still_calls_express_and_returns_ok() -> None:
+    """Existing behavior for a valid catalog emoji is unchanged: express IS
+    called and the tool-result reports success."""
+    queue = _RecordingQueue()
+    producer = ExpressionProducer(queue=queue)
+
+    reg = ToolRegistry(express=producer.express)
+    result = reg.dispatch("apply_pose", json.dumps({"emoji": "🤔"}), tool_call_id="p")
+
+    assert result["role"] == "tool"
+    payload = json.loads(result["content"])
+    assert payload == {"status": "ok", "emoji": "🤔"}
+    assert len(queue.submitted) == 1
 
 
 def test_dispatch_returns_openai_tool_result_message() -> None:
@@ -198,15 +274,19 @@ def test_apply_pose_enqueues_identical_action_as_marker_path() -> None:
     assert queue.submitted[1] == ref_action
 
 
-def test_apply_pose_unknown_emoji_still_enqueues_neutral_fallback() -> None:
+def test_apply_pose_unknown_emoji_no_longer_silently_falls_back_to_neutral() -> None:
+    """Superseded behavior (t6): an unknown emoji used to silently no-op to the
+    neutral pose.  It is now REJECTED before express is ever called — see
+    ``test_apply_pose_unknown_emoji_is_rejected_and_never_calls_express`` above
+    for the current contract."""
     queue = _RecordingQueue()
     producer = ExpressionProducer(queue=queue)
-    ref_neutral = producer.express("✨")  # sparkles: absent from the starter catalog
 
     reg = ToolRegistry(express=producer.express)
     reg.dispatch("apply_pose", json.dumps({"emoji": "✨"}), tool_call_id="n")
 
-    assert queue.submitted[1] == ref_neutral
+    # No neutral-fallback action was enqueued — express was never reached.
+    assert queue.submitted == []
 
 
 # ---------------------------------------------------------------------------

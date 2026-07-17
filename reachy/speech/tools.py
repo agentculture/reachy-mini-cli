@@ -47,7 +47,10 @@ This module intentionally imports neither :mod:`reachy.speech.llm` nor
 :mod:`reachy.speech.cognition`.  The tool *definitions* are produced here; the
 *decision* to call them (the LLM tool loop) lives in the cognition/agent engine.
 The pose seam is injected as a plain callable, so this module does not even
-import :mod:`reachy.motion`.
+import :mod:`reachy.motion`.  :mod:`reachy.speech.expressions` (the catalog
+loader) IS imported — it is a peer data module (TOML in, dataclasses out, no
+LLM/event/motion dependency of its own), used only to read the emoji key set
+that ``apply_pose`` advertises to the model.
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
+from reachy.speech.expressions import Catalog
 from reachy.speech.playback import play_audio
 from reachy.speech.voice import VoiceEngine, resolve_voice_engine
 
@@ -158,13 +162,19 @@ def _make_voice_handler(engine: VoiceEngine, play: PlaySeam) -> Handler:
     return handler
 
 
-def _make_pose_handler(express: ExpressSeam | None) -> Handler:
+def _make_pose_handler(express: ExpressSeam | None, catalog_keys: frozenset[str]) -> Handler:
     """An apply_pose handler: enqueue one calm expression for a catalog emoji.
 
     ``express`` is the injected :meth:`ExpressionProducer.express` seam, so the
     action enqueued is byte-for-byte the one the ``*emoji*`` marker path
     produces.  When no express seam was injected the tool degrades cleanly (a
-    handler-level error, caught by :meth:`ToolRegistry.dispatch`)."""
+    handler-level error, caught by :meth:`ToolRegistry.dispatch`).
+
+    ``catalog_keys`` is validated **before** ``express`` is ever called: an
+    emoji outside the set raises ``ValueError`` naming the valid keys, so the
+    model gets an actionable error tool-result (see
+    :meth:`ToolRegistry.dispatch`) instead of a silent neutral-pose no-op — and
+    the express seam is never invoked for a bad guess."""
 
     def handler(arguments: dict) -> str:
         if express is None:
@@ -174,6 +184,9 @@ def _make_pose_handler(express: ExpressSeam | None) -> Handler:
         emoji = arguments.get("emoji")
         if not isinstance(emoji, str) or not emoji:
             raise ValueError("a non-empty 'emoji' string is required")
+        if emoji not in catalog_keys:
+            valid = ", ".join(sorted(catalog_keys))
+            raise ValueError(f"unknown emoji {emoji!r}; valid catalog keys: {valid}")
         express(emoji)
         return json.dumps({"status": "ok", "emoji": emoji})
 
@@ -216,24 +229,31 @@ def _harmonics_tool(engine: VoiceEngine, play: PlaySeam) -> Tool:
     )
 
 
-def _apply_pose_tool(express: ExpressSeam | None) -> Tool:
+def _apply_pose_tool(express: ExpressSeam | None, catalog_keys: Iterable[str]) -> Tool:
+    keys = sorted(catalog_keys)
     return function_tool(
         name=APPLY_POSE,
         description=(
-            "Apply a body expression by catalog emoji (e.g. 🤔, 😮, 🎉). Enqueues "
-            "one calm one-shot pose move; an unknown emoji falls back to neutral."
+            "Apply a body expression by catalog emoji. Enqueues one calm one-shot "
+            "pose move — the 'emoji' parameter's enum lists the FULL catalog (the "
+            "complete set of valid keys); an emoji outside that enum is REJECTED "
+            "with an error naming the valid keys, it does not fall back to neutral."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "emoji": {
                     "type": "string",
-                    "description": "A catalog emoji key (unknown emoji fall back to neutral).",
+                    "enum": keys,
+                    "description": (
+                        "A catalog emoji key. Must be one of the values listed in "
+                        "'enum' — an unrecognized key is rejected with an error."
+                    ),
                 }
             },
             "required": ["emoji"],
         },
-        handler=_make_pose_handler(express),
+        handler=_make_pose_handler(express, frozenset(keys)),
     )
 
 
@@ -260,6 +280,15 @@ class ToolRegistry:
     play:
         The playback seam — ``play(pcm, *, samplerate=...)``.  Default:
         :func:`reachy.speech.playback.play_audio`.
+    catalog_keys:
+        The emoji key set ``apply_pose`` advertises (published as the
+        ``emoji`` parameter's JSON-schema ``"enum"``) and validates calls
+        against.  When ``None`` (the default), loaded from the shipped
+        expression catalog via :class:`reachy.speech.expressions.Catalog`
+        — the same TOML :mod:`reachy.motion.expression` reads, so a new
+        catalog entry reaches the model with no code change.  Pass an
+        explicit iterable (e.g. from a :class:`Catalog` built over a custom
+        path) to advertise a different key set, such as in a test.
     extra_tools:
         Additional :class:`Tool` objects to register at construction — proving a
         new capability needs only one definition + handler.
@@ -272,18 +301,21 @@ class ToolRegistry:
         speak_engine: VoiceEngine | None = None,
         harmonic_engine: VoiceEngine | None = None,
         play: PlaySeam | None = None,
+        catalog_keys: Iterable[str] | None = None,
         extra_tools: Iterable[Tool] = (),
     ) -> None:
         speak_engine = speak_engine or resolve_voice_engine("tts")
         harmonic_engine = harmonic_engine or resolve_voice_engine("harmonic")
         play = play or play_audio
+        if catalog_keys is None:
+            catalog_keys = Catalog().keys()
 
         # Insertion order defines the published tools-array order.
         self._tools: dict[str, Tool] = {}
         for tool in (
             _speak_tool(speak_engine, play),
             _harmonics_tool(harmonic_engine, play),
-            _apply_pose_tool(express),
+            _apply_pose_tool(express, catalog_keys),
         ):
             self._tools[tool.name] = tool
         for tool in extra_tools:
