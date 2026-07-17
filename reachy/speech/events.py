@@ -34,6 +34,13 @@ Four feed methods accept values that callers read from hardware/daemons:
   tool).  Produces cues like ``"noticed: a person waving at the desk"``.  An
   empty/whitespace description yields no cue.
 
+* :meth:`EventBuffer.feed_forge` — a forge self-extension lifecycle event from
+  :class:`~reachy.forge.activate.ForgeActivator` (e.g. a newly learned skill).
+  The text is passed through verbatim, e.g. ``"learned a new skill:
+  wave-hello"`` — unlike :meth:`feed_scene` this is not a scene observation,
+  so no ``"noticed: "`` prefix is added.  An empty/whitespace text yields no
+  cue.
+
 Design constraints
 ------------------
 * **Pure in-process** — no I/O, no hardware access, no new dependencies.
@@ -415,6 +422,30 @@ class EventBuffer:
 
         self._append(f"noticed: {str(text).strip()}", source="scene")
 
+    def feed_forge(self, text: str) -> None:
+        """Translate one forge self-extension event into zero or one cue and append it.
+
+        Parameters
+        ----------
+        text:
+            The forge lifecycle cue text, e.g. ``"learned a new skill:
+            wave-hello"``, produced by
+            :class:`~reachy.forge.activate.ForgeActivator` on a successful skill
+            activation.  Stripped of surrounding whitespace.
+
+        Cue rules
+        ---------
+        * Non-empty *text* → the stripped text, passed through **verbatim** — a
+          forge event is already a complete human-readable sentence, so (unlike
+          :meth:`feed_scene`) no prefix is added.
+        * ``None`` / empty / whitespace-only → no cue (defensive default, never
+          raises).
+        """
+        if not text or not str(text).strip():
+            return
+
+        self._append(str(text).strip(), source="forge")
+
     # ------------------------------------------------------------------
     # Snapshot
     # ------------------------------------------------------------------
@@ -446,7 +477,8 @@ class EventBuffer:
         """Append a new cue under the lock and emit its [SENSE stage=cue] line.
 
         ``source`` names the feed kind that produced this cue (``"doa"``,
-        ``"vision"``, ``"transcript"``, ``"pat"``, ``"face"``, ``"scene"``) —
+        ``"vision"``, ``"transcript"``, ``"pat"``, ``"face"``, ``"scene"``,
+        ``"forge"``) —
         every ``feed_*`` call that actually appends a cue routes through here, so
         every cue is logged exactly once. A ``feed_*`` call that produces *no* cue because of a
         threshold never reaches this method — it stays silent, not a drop (see the

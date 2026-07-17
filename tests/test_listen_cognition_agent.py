@@ -54,6 +54,7 @@ import reachy.motion.sleep_signal as ss
 import reachy.speech.cognition_signal as cs
 from reachy.cli import main
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
+from reachy.forge import ForgeActivator
 from reachy.motion.listen_face import FaceHook
 from reachy.motion.listen_pat import PatHook
 from reachy.motion.listen_scene import SceneHook
@@ -1276,3 +1277,46 @@ def test_live_agent_startup_reloads_active_forged_skills(monkeypatch, tmp_path) 
     engine = captured.get("engine")
     assert engine is not None, "the agent engine must be built"
     assert "wave-hello" in engine._registry.names(), "an active forged skill must reload at boot"
+
+
+def test_forge_activation_announces_via_feed_forge_not_feed_scene(monkeypatch) -> None:
+    """The forge auto-activation announce seam must be a forge-labeled cue, not a scene cue.
+
+    Regression test for a Qodo review finding: ``_activate_forge`` wired the announce
+    callable to ``EventBuffer.feed_scene``, so a self-extension event like "learned a new
+    skill: wave-hello" rendered as ``"noticed: learned a new skill: wave-hello"`` with
+    ``[SENSE source=scene]`` — a forge lifecycle event mislabeled as a VLM scene
+    observation. It must render verbatim via ``feed_forge`` with ``source=forge``.
+    """
+    _patch_registry(monkeypatch)
+    transport = _LiveSdkTransport()
+
+    captured: dict = {}
+    real_init = ForgeActivator.__init__
+
+    def _spy_init(self, *, announce=None, **kw):
+        captured["announce"] = announce
+        return real_init(self, announce=announce, **kw)
+
+    monkeypatch.setattr(ForgeActivator, "__init__", _spy_init)
+
+    rc, _out, _err = _run_capture(
+        monkeypatch, _live_argv("--cognition", "agent"), transport=transport
+    )
+    assert rc == 0
+
+    announce = captured.get("announce")
+    assert announce is not None, "forge activation must be wired with an announce callable"
+    assert getattr(announce, "__name__", None) == "feed_forge", (
+        "the announce seam must be EventBuffer.feed_forge, not feed_scene "
+        "(a forge activation is not a scene observation)"
+    )
+
+    # Exercise the seam directly and confirm the cue lands verbatim, not scene-prefixed.
+    buf = announce.__self__
+    buf.snapshot()  # drain anything the boot run already produced
+    announce("learned a new skill: wave-hello")
+    cues = buf.snapshot()
+    assert len(cues) == 1
+    assert cues[0].text == "learned a new skill: wave-hello"
+    assert not cues[0].text.startswith("noticed:")
