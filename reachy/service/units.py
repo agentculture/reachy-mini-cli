@@ -89,20 +89,28 @@ def demo_exec_start(python: str | None = None, config_file: str | None = None) -
 
 
 def live_exec_start(python: str | None = None) -> str:
-    """ExecStart for the live presence unit: the folded live loop.
+    """ExecStart for the live presence unit: the folded live loop, agent-cognition by default.
 
-    ``listen run --live --transcribe --voice-engine harmonic`` runs the folded
-    live loop (hearing + pat + think + vision + sleep in one loop) with STT
-    transcription on, so the deployed boot presence reasons about the *words*
-    spoken near it (not just direction), and speaks through the harmonic voice
-    engine. Both ``--transcribe`` and ``--voice-engine harmonic`` stay off at
-    the CLI default (``--voice-engine`` defaults to ``tts``); the unit opts in
-    to both so the on-robot presence runs the full hear-words behavior with the
-    harmonic voice. The flags are implemented elsewhere — this only renders the
-    string.
+    ``listen run --live --transcribe --cognition agent --voice-engine harmonic`` runs
+    the folded live loop (hearing + pat + think + vision + sleep in one loop) with STT
+    transcription on and cognition driven by the tool-use ``AgentTurnEngine`` (acting
+    through ``speak`` / ``harmonics`` / ``apply_pose`` tool calls rather than the
+    ``*emoji*``/``"speech"`` marker convention). ``--voice-engine harmonic`` is passed
+    too — inert for ``agent`` mode itself (both the ``tts`` and ``harmonic`` voices are
+    always registered as tools there), but it is what the ``marker`` engine would use if
+    the unit's ``ExecStart`` were ever edited back to ``--cognition marker``. All three
+    — ``--transcribe``, ``--cognition agent``, and ``--voice-engine harmonic`` — stay
+    off/at their CLI default (``--cognition`` defaults to ``"marker"``,
+    ``--voice-engine`` to ``"tts"``) unless explicitly passed; the unit opts in to all
+    three so the on-robot presence hears words, reasons through the tool-use agent, and
+    has an offline voice available, out of the box. The flags are implemented
+    elsewhere — this only renders the string.
     """
     py = python or _default_python()
-    return f"{_unit_arg(py)} -m reachy listen run --live --transcribe --voice-engine harmonic"
+    return (
+        f"{_unit_arg(py)} -m reachy listen run --live --transcribe "
+        "--cognition agent --voice-engine harmonic"
+    )
 
 
 # --------------------------------------------------------------------------- #

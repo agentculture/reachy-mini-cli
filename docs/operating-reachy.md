@@ -232,7 +232,7 @@ the robot, so `service` lets you persist only one mode at a time.
 | Mode | What boots | Best for |
 |---|---|---|
 | `demo` | `reachy-mini-cli demo-mode run` — the idle feel-alive loop | A robot that just looks present (breathing, glances, sway) |
-| `live` | `reachy-mini-cli listen run --live --transcribe --voice-engine harmonic` — the folded live sense loop | A robot that hears, sees, thinks, sleeps, feels pats, and speaks with its own offline voice |
+| `live` | `reachy-mini-cli listen run --live --transcribe --cognition agent --voice-engine harmonic` — the folded live sense loop | A robot that hears, sees, thinks (via tool-use agent cognition), sleeps, feels pats, and speaks with its own offline voice |
 
 The `live` mode is the [folded live loop](#senses-one-sdk-media-owner-at-a-time):
 **one** process running every live sense (hearing + pat + think + vision +
@@ -266,19 +266,22 @@ reachy-mini-cli service uninstall        # remove the unit files
   systemd **without enabling anything**, so you can stage the units and choose the
   mode separately; `enable {demo|live}` is the all-in-one (write + enable + disable
   the sibling). Every verb supports `--json`.
-- **`live` boots into the harmonic voice.** The rendered `live` unit's
-  `ExecStart` is `listen run --live --transcribe --voice-engine harmonic` (see
-  [The harmonic voice](#the-harmonic-voice)) — a deliberate choice so the
-  robot has its own voice at boot, independent of whether the TTS service is
-  reachable. Because `--voice-engine harmonic` is an explicit flag baked into
-  the unit, setting `REACHY_VOICE_ENGINE=tts` as a unit environment override
-  does **not** revert it — an explicit flag always beats the env var. To run
-  the boot presence on TTS instead, override the unit's `ExecStart` with
-  `systemctl --user edit reachy-live.service` (clear it with a bare
-  `ExecStart=` line, then set a new one ending `--voice-engine tts`) and
-  `systemctl --user restart reachy-live.service`; or skip the boot service
-  and run `reachy-mini-cli listen run --live --transcribe --voice-engine tts`
-  in the foreground instead.
+- **`live` boots into the tool-use agent, voiced harmonically.** The rendered
+  `live` unit's `ExecStart` is `listen run --live --transcribe --cognition agent
+  --voice-engine harmonic` (see [Agent cognition](#agent-cognition--tool-use-live-mode)
+  and [The harmonic voice](#the-harmonic-voice)) — a deliberate choice so the
+  robot reasons through tool calls and has its own voice at boot, independent of
+  whether the TTS service is reachable. Because `--cognition agent` and
+  `--voice-engine harmonic` are explicit flags baked into the unit, setting
+  `REACHY_COGNITION=marker` / `REACHY_VOICE_ENGINE=tts` as a unit environment
+  override does **not** revert them — an explicit flag always beats the env var.
+  To run the boot presence on the marker engine and/or TTS instead, override the
+  unit's `ExecStart` with `systemctl --user edit reachy-live.service` (clear it
+  with a bare `ExecStart=` line, then set a new one ending `--cognition marker
+  --voice-engine tts`, or whichever combination you want) and `systemctl --user
+  restart reachy-live.service`; or skip the boot service and run
+  `reachy-mini-cli listen run --live --transcribe --cognition marker
+  --voice-engine tts` in the foreground instead.
 
 > **Reboot at machine power-on needs linger.** A `systemctl --user` service
 > normally starts at **first login**, not at machine boot. For a headless robot
@@ -376,6 +379,7 @@ vars override the built-in default.
 | `REACHY_TTS_URL` | `http://localhost:9000` | Magpie-style TTS HTTP endpoint | `speech/tts.py` (`say`, `think`) |
 | `REACHY_TTS_VOICE` | `Magpie-Multilingual.EN-US.Mia.Calm` | TTS voice identifier | `speech/tts.py` |
 | `REACHY_VOICE_ENGINE` | `tts` | Speech backend for `say`/`think`/`listen --live`: `tts` or `harmonic` | `speech/voice.py` |
+| `REACHY_COGNITION` | `marker` | Folded live cognition engine for `listen --live`: `marker` or `agent` | `cli/_commands/listen.py` |
 | `REACHY_HARMONIC_IDENTITY` | `reachy` | Harmonic voice identity signature (root pitch + instrument) | `speech/harmonic.py` |
 | `REACHY_HARMONIC_ARTICULATION` | `smooth` | Harmonic rendering style: `discrete` / `speechy` / `smooth` / `alien` | `speech/harmonic.py` |
 | `REACHY_OPENAI_URL_BASE` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `think` (legacy: `REACHY_LLM_BASE_URL`) | `speech/llm.py` |
@@ -385,6 +389,132 @@ vars override the built-in default.
 | `REACHY_STT_PHRASE` | `hey reachy` | Wake phrase matched against the STT transcript | `sleep/wakeword.py` |
 | `REACHY_STT_LANGUAGE` | `en` | STT language hint | `sleep/wakeword.py` |
 | `REACHY_STT_TIMEOUT` | `2.0` (seconds) | Per-request STT socket timeout (kept short so a wake check never stalls the loop) | `sleep/wakeword.py` |
+
+### Agent cognition — tool-use live mode
+
+`listen run --live`'s folded cognition can run one of two engines, picked by
+`--cognition {marker,agent}` (env `REACHY_COGNITION`, default `marker`;
+`--live`-only — a bare `--cognition` is a clean exit-1 error):
+
+- **`marker`** (default, unchanged) — the established `*emoji*`/`"speech"`
+  convention: the LLM's free-text reply is parsed for markers and spoken /
+  expressed accordingly.
+- **`agent`** — the LLM acts through explicit tool calls instead of text
+  parsing. Three tools are published to the model as an OpenAI `tools=` array:
+  `speak` (the TTS voice), `harmonics` (the offline melodic voice), and
+  `apply_pose` (a catalog-emoji body expression). Each `tool_calls` response is
+  executed and fed back as a tool result until the model returns plain text with
+  no more calls. Both engines ride the exact same folded `ThinkHook` seam,
+  `EventBuffer`, and export sinks as `marker` — swapping the flag adds no new
+  process and no second media session. `--voice-engine` is inert under `agent`:
+  both the TTS and harmonic voices are always registered as separate tools, so
+  the model picks per utterance rather than the process picking one engine for
+  the whole run.
+
+**The deployed `live` boot unit defaults to `agent`.** `reachy-mini-cli service
+enable live` boots `listen run --live --transcribe --cognition agent
+--voice-engine harmonic` — hearing words, reasoning via tool calls, and having a
+voice are all on out of the box (see
+[Boot persistence](#boot-persistence--one-presence-per-reboot)).
+
+**Voice-only usage story** — how an address near the robot becomes a reply,
+end to end:
+
+1. You say *"Reachy, …"* near the robot. The mic array's per-tick audio is
+   transcribed once the utterance pauses (`--transcribe`'s `TranscribeHook`).
+2. The transcript passes the [layered engagement
+   gate](#senses-one-sdk-media-owner-at-a-time): a fuzzy name match on
+   "reachy"/"robot" (and common mishearings) engages immediately; anything else
+   goes through a single LLM classifier judging "is this addressed to me?" —
+   ambient chatter is dropped before it ever reaches cognition.
+3. An ENGAGE verdict does two things at once: the [3-tier motion
+   ladder](#senses-one-sdk-media-owner-at-a-time) fires a deliberate head/body
+   turn toward the speaker, and the transcript is appended to the shared
+   `EventBuffer` both cognition engines read from.
+4. The next agent turn (running on its own background worker, so it never
+   blocks the motion loop) snapshots the buffer, calls the LLM with the
+   `speak`/`harmonics`/`apply_pose` tools, and executes whatever the model
+   calls — a spoken reply, a melodic harmonic phrase, a body pose, or several
+   of these in one turn (see [Cortex role switch](#cortex-role-switch--agent-tool-use)
+   below for which model role this targets).
+5. Idle presence never stops: the motion loop keeps breathing/glancing
+   throughout, and the antenna-lean/turn/pat reactions from the other folded
+   senses keep running alongside the agent's replies.
+
+Try it: `reachy-mini-cli service enable live` (boots the agent-mode unit), then
+say *"Reachy, hello!"* near the robot and listen for a reply — or iterate faster
+in the foreground first:
+
+```bash
+reachy-mini-cli listen run --live --transcribe --cognition agent --voice-engine harmonic
+# say "Reachy, ..." near the robot — expect a spoken/harmonic reply and/or a
+# pose, while idle presence (breathing, glances) continues underneath
+```
+
+**The behavior stash** (`reachy/stash/` — not yet a CLI noun or an agent tool) is
+a persistent, semantically searchable store of body behaviors for the agent to
+fetch and adapt later. A stash record is **declarative data only, never code**:
+it names an existing generator template from `reachy.behavior.library.LIBRARY`, a
+typed parameter set, the channels it claims, a stop-class, a lifetime, and a
+natural-language `explanation` — the text embedded (via the lobes gateway
+`/v1/embeddings` route) for semantic search. Anything smelling of code (an extra
+field, a non-JSON value, an unknown generator) is refused with a clean error. The
+index (records + embedding vectors) persists as one JSON file under
+`<state_dir>/stash/index.json` (the same state-dir family as the daemon PID file
+and the `think_active`/`sleep_active` flags).
+
+Stash round-trip demo — add a record in one session, semantically fetch and apply
+it in a later one, using the package's Python API directly (no stash CLI verb
+exists yet):
+
+```bash
+# Session 1 — stash a record (embeds via the gateway, persists to disk)
+python3 -c '
+from reachy.stash.record import StashRecord
+from reachy.stash.store import StashStore
+
+record = StashRecord.from_dict({
+    "name": "pondering-tilt",
+    "explanation": "ease into a thoughtful tilted gaze while pondering a sound",
+    "generator": "thoughtful",
+    "params": {
+        "pitch": {"default": 8.0, "unit": "deg", "help": "upward/forward tilt"},
+        "yaw": {"default": 10.0, "unit": "deg", "help": "gaze-aside angle"},
+        "roll": {"default": 5.0, "unit": "deg", "help": "head roll"},
+        "rise": {"default": 0.6, "unit": "s", "help": "ease-in time"},
+    },
+    "channels": ["head"],
+    "stop_class": "stoppable",
+    "lifetime": {"looping": False, "duration": 3.0},
+})
+StashStore().add(record)
+print("stashed:", record.name)
+'
+```
+
+```bash
+# Session 2 (later, a fresh process) — semantic fetch + apply
+python3 -c '
+from reachy.stash.store import StashStore
+from reachy.stash.apply import apply_record
+from reachy.motion.queue import MotionQueue
+
+hit = StashStore().search("a gentle thoughtful head tilt", k=1)[0]
+print("fetched:", hit.record.name, "score:", hit.score)
+
+queue = MotionQueue()
+actions = apply_record(hit, queue)
+print(len(actions), "keyframes enqueued")
+'
+```
+
+The second process never saw the first's in-memory record — it only reads the
+persisted `<state_dir>/stash/index.json` and re-embeds the query text for the
+cosine search, which is the round trip this demo verifies. On the running robot,
+`apply_record` would instead take the live loop's own `MotionQueue` (the one
+`ExpressionProducer` already drives) so the fetched gesture plays on the robot;
+a throwaway `MotionQueue()` above is enough to verify fetch → plan → enqueue
+without disturbing a running loop.
 
 ### Cortex role switch — agent tool-use
 
@@ -496,7 +626,9 @@ transcribing its own voice, and an unreachable STT degrades to "no words" withou
 stalling the loop. It is *not* a dialogue/turn-taking assistant and *not* the
 wake-word path — words are one more perception. The deployed `live` boot unit runs
 with `--transcribe` on, so the on-robot presence hears words by default; STT stays
-external (no on-box model bundled).
+external (no on-box model bundled). It also defaults to the tool-use
+`--cognition agent` engine over the fetched words — see
+[Agent cognition](#agent-cognition--tool-use-live-mode) above.
 
 The engagement gate that decides which utterances reach cognition is **layered,
 cheapest-first**: (1) a **fuzzy name fast-path** recognises "reachy"/"robot" and
