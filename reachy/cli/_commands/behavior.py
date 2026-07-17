@@ -14,9 +14,13 @@ the dedicated ``reachy listen`` loop, which drives the daemon's smooth minjerk
 
 * ``behavior list`` — the built-in behavior catalog (no robot needed).
 * ``behavior run`` / ``stop`` / ``status`` — drive the running engine (auto-starts
-  it) through the command spool.
+  it) through the command spool. ``status`` additively reports rules-file health
+  (path + counts) and, once the engine has published one, the live agent-intents
+  view (goal/inhibitions/mode) from ``state.json``.
 * ``behavior reload`` — reload ``rules.toml`` in the running engine, applied
   between ticks (see ``reachy.behavior.reload_driver``).
+* ``behavior rules`` / ``rules check`` — render / lint ``rules.toml`` without
+  touching a running engine (pure file read via ``reachy.behavior.rules``).
 * ``behavior engine start|stop|status|run`` — manage the 50 Hz engine process.
 
 The engine streams immediate ``set_target`` poses, so it owns motion exclusively
@@ -34,9 +38,13 @@ corrected file into the already-running engine without a restart.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+from typing import Callable
 
 from reachy import senselog
-from reachy.behavior import control, library, reload_driver, supervisor
+from reachy.behavior import control, library, reload_driver
+from reachy.behavior import rules as rules_mod
+from reachy.behavior import supervisor
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.model import CHANNELS, StopClass
@@ -45,7 +53,7 @@ from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
-from reachy.cli._errors import EXIT_USER_ERROR, CliError
+from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from reachy.cli._export import add_runtime_export_args, build_runtime_export_consumer
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.runtime import SenseSnapshotDriver
@@ -58,8 +66,11 @@ _VERBS = [
     "behavior list — the built-in behavior catalog (names, channels, class, params)",
     "behavior run <name> — push a behavior onto the running engine (auto-starts it)",
     "behavior stop <id|name|all> — stop a running behavior (all = keep the idle base)",
-    "behavior status — active behaviors + per-channel ownership + engine/daemon state",
+    "behavior status — active behaviors + per-channel ownership + engine/daemon state "
+    "+ rules health + agent intents (when published)",
     "behavior reload — reload rules.toml in the running engine, applied between ticks",
+    "behavior rules — render the loaded rules.toml (react/inhibit rules, modes)",
+    "behavior rules check — validate rules.toml (a linter; exit 0 unless unreadable)",
     "behavior engine start — start the 50 Hz engine in the background",
     "behavior engine stop — stop the engine (eases the robot to neutral)",
     "behavior engine status — engine process + daemon reachability",
@@ -218,6 +229,34 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rules_status() -> dict[str, object]:
+    """Rules-file health for ``behavior status`` — never raises.
+
+    Uses :class:`~reachy.behavior.rules.RulesLoader`, whose ``reload()`` already
+    degrades a missing/malformed file to "keep the last-good config, record why"
+    rather than raising (see ``reachy.behavior.rules``) — so this can never take
+    ``behavior status`` down, even with a broken ``rules.toml`` on disk. The
+    outer ``try`` is one more defensive layer against anything genuinely
+    unexpected (e.g. the state dir itself being unwritable).
+    """
+    try:
+        loader = RulesLoader()
+        loader.reload()
+    except Exception as err:  # noqa: BLE001 - status must never crash on rules
+        return {"path": None, "exists": False, "ok": False, "error": str(err)}
+    info: dict[str, object] = {
+        "path": str(loader.path),
+        "exists": loader.path.is_file(),
+        "ok": loader.last_error is None,
+        "react": len(loader.current.react),
+        "inhibit": len(loader.current.inhibit),
+        "modes": len(loader.current.modes),
+    }
+    if loader.last_error is not None:
+        info["error"] = loader.last_error
+    return info
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     json_mode = bool(getattr(args, "json", False))
     engine_state = supervisor.status(base_url=args.base_url, timeout=args.timeout)
@@ -233,6 +272,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         data["compose_hz"] = published.get("compose_hz")
         if "doa" in published:
             data["doa"] = published["doa"]
+        if "intents" in published:
+            data["intents"] = published["intents"]
+    data["rules"] = _rules_status()
     emit_payload(data, json_mode=json_mode)
     return 0
 
@@ -257,6 +299,162 @@ def cmd_reload(args: argparse.Namespace) -> int:
         }
     emit_payload(result, json_mode=json_mode, empty="(submitted)")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# rules sub-noun — render / lint rules.toml (no running engine needed)        #
+# --------------------------------------------------------------------------- #
+
+_RULES_VERBS = [
+    "rules / rules list — render the loaded rules.toml (react/inhibit rules, modes)",
+    "rules check — validate rules.toml; always exits 0 unless the file is unreadable",
+    "rules overview — this summary",
+]
+
+
+def _predicate_payload(pred: rules_mod.Predicate) -> dict[str, object]:
+    return {"field": pred.field, "op": pred.op, "value": pred.value}
+
+
+def _rule_payload(rule: rules_mod.Rule) -> dict[str, object]:
+    data: dict[str, object] = {
+        "id": rule.id,
+        "when": _predicate_payload(rule.when),
+        "cooldown_s": rule.cooldown_s,
+        "hysteresis": rule.hysteresis,
+    }
+    if rule.kind == rules_mod.KIND_REACT:
+        data["run"] = rule.behavior
+        data["params"] = dict(rule.params)
+    else:
+        data["disable"] = sorted(rule.disable)
+    return data
+
+
+def _rules_config_payload(config: rules_mod.RulesConfig, *, path: Path, exists: bool) -> dict:
+    payload: dict[str, object] = {
+        "path": str(path),
+        "exists": exists,
+        "active_mode": config.active_mode,
+        "react": [_rule_payload(r) for r in config.react],
+        "inhibit": [_rule_payload(r) for r in config.inhibit],
+        "modes": {name: dict(mode.params) for name, mode in config.modes.items()},
+    }
+    if not exists:
+        payload["note"] = "no rules file yet — nothing configured"
+    return payload
+
+
+def cmd_rules_list(args: argparse.Namespace) -> int:
+    """Render the loaded ``rules.toml`` — react/inhibit rules, modes, active_mode.
+
+    A MISSING file is not an error ("no rules configured yet"): mirrors
+    ``reachy.behavior.rules.load_rules``. A PRESENT but malformed file raises
+    the very same ``CliError`` ``load_rules`` already raises — a clean exit-1
+    naming every reason — because this verb is a straight read, not a lint (see
+    ``rules check`` for the always-exit-0 linter).
+    """
+    json_mode = bool(getattr(args, "json", False))
+    path = rules_mod.default_rules_path()
+    exists = path.is_file()
+    config = rules_mod.load_rules(path)  # raises CliError (exit 1) on a malformed file
+    payload = _rules_config_payload(config, path=path, exists=exists)
+    emit_payload(payload, json_mode=json_mode)
+    return 0
+
+
+def _rules_check_payload(
+    path: Path, *, reader: Callable[[Path], str] | None = None
+) -> dict[str, object]:
+    """Validate *path*; returns ``{ok, path, exists, reasons, counts}`` — a report.
+
+    Mirrors ``think expressions check``'s exit-0-warnings idiom: a malformed or
+    missing rules file is a CONTENT problem, not an I/O failure — missing
+    resolves ``ok=True`` ("nothing configured yet"), malformed resolves
+    ``ok=False`` with ``reasons`` naming every problem
+    (``reachy.behavior.rules.load_rules`` already collects them into one
+    message) — never an exception. Only a genuine read failure on an EXISTING
+    path (permissions, a vanished mount, ...) raises ``CliError(EXIT_ENV_ERROR)``
+    — this is a linter, not a gate, so content issues never abort the command,
+    but the file being physically unreadable is an environment fact, not a
+    content one.
+
+    ``reader`` is an injection seam for tests (default: ``Path.read_text``) so
+    an I/O failure can be simulated deterministically with no OS-level
+    permission juggling.
+    """
+    read = reader if reader is not None else (lambda p: p.read_text(encoding="utf-8"))
+    exists = path.is_file()
+    if exists:
+        try:
+            read(path)
+        except OSError as err:
+            raise CliError(
+                code=EXIT_ENV_ERROR,
+                message=f"rules file {path} could not be read: {err}",
+                remediation="check file permissions",
+            ) from err
+    try:
+        config = rules_mod.load_rules(path)
+    except CliError as err:
+        return {"ok": False, "path": str(path), "exists": exists, "reasons": [err.message]}
+    return {
+        "ok": True,
+        "path": str(path),
+        "exists": exists,
+        "reasons": [],
+        "counts": {
+            "react": len(config.react),
+            "inhibit": len(config.inhibit),
+            "modes": len(config.modes),
+        },
+    }
+
+
+def cmd_rules_check(args: argparse.Namespace) -> int:
+    """Lint ``rules.toml``: a malformed file reports ``ok=False`` but still exits 0
+    (a warning, not a gate — mirrors ``think expressions check``). Only an actual
+    I/O failure on an existing path is a clean exit-2 (via ``CliError``, handled
+    by ``_dispatch``).
+    """
+    json_mode = bool(getattr(args, "json", False))
+    payload = _rules_check_payload(rules_mod.default_rules_path())
+    emit_payload(payload, json_mode=json_mode)
+    return 0
+
+
+def cmd_rules_overview(args: argparse.Namespace) -> int:
+    emit_overview(
+        "reachy-mini-cli behavior rules",
+        [
+            {
+                "title": "What",
+                "items": [
+                    "The declarative rules.toml file the engine's rule seam evaluates "
+                    "(react/inhibit rules + modes) — see 'behavior reload' to hot-swap "
+                    "it into a running engine.",
+                    "These verbs read the file directly — no running engine needed.",
+                ],
+            },
+            {"title": "Verbs", "items": list(_RULES_VERBS)},
+            {
+                "title": "Conventions",
+                "items": [
+                    "every command supports --json",
+                    "a missing rules file is not an error — 'no rules configured yet'",
+                    "'rules check' is a linter: a malformed file reports ok=false but "
+                    "still exits 0; only an unreadable path is a clean exit-2",
+                ],
+            },
+        ],
+        json_mode=bool(getattr(args, "json", False)),
+    )
+    return 0
+
+
+def _rules_no_verb(args: argparse.Namespace) -> int:
+    # Bare `behavior rules` renders the loaded config (mirrors `think expressions`).
+    return cmd_rules_list(args)
 
 
 # --------------------------------------------------------------------------- #
@@ -535,6 +733,34 @@ def _register_reload(noun_sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=cmd_reload)
 
 
+def _register_rules(noun_sub: argparse._SubParsersAction) -> None:
+    """The ``behavior rules`` sub-noun: render + validate ``rules.toml``.
+
+    A noun with action-verbs must also expose ``overview`` (rubric requirement);
+    bare ``rules`` (no sub-verb) lists the loaded config, mirroring ``think
+    expressions``' bare-defaults-to-list idiom. ``parser_class`` propagates so
+    nested parse errors keep the structured error contract.
+    """
+    r = noun_sub.add_parser(
+        "rules", help="Render/validate rules.toml (see 'behavior rules overview')."
+    )
+    r.add_argument("--json", action="store_true", help=_JSON_HELP)
+    r.set_defaults(func=_rules_no_verb, json=False)
+    r_sub = r.add_subparsers(dest="rules_command", parser_class=type(r))
+
+    ov = r_sub.add_parser("overview", help="Describe the rules sub-noun.")
+    ov.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ov.set_defaults(func=cmd_rules_overview)
+
+    ls = r_sub.add_parser("list", help="Render the loaded rules.toml.")
+    ls.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ls.set_defaults(func=cmd_rules_list)
+
+    ck = r_sub.add_parser("check", help="Validate rules.toml (always exits 0 on a content issue).")
+    ck.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ck.set_defaults(func=cmd_rules_check)
+
+
 def _register_engine(noun_sub: argparse._SubParsersAction) -> None:
     eng = noun_sub.add_parser("engine", help="Manage the 50 Hz engine process.")
     eng.add_argument("--json", action="store_true", help=_JSON_HELP)
@@ -603,4 +829,5 @@ def register(sub: argparse._SubParsersAction) -> None:
     _register_stop(noun_sub)
     _register_status(noun_sub)
     _register_reload(noun_sub)
+    _register_rules(noun_sub)
     _register_engine(noun_sub)
