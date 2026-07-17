@@ -723,7 +723,7 @@ def _activate_forge(
     on ``forge/staged`` + boot reload of ``active/``), and a
     :class:`~reachy.forge.ForgeClient` whose ``publish`` IS the activator. Finally arms the
     late-bound dispatch seam by appending the client to ``holder``. The announce seam is the
-    shared cognition buffer's :meth:`~reachy.speech.events.EventBuffer.feed_scene` — kept a
+    shared cognition buffer's :meth:`~reachy.speech.events.EventBuffer.feed_forge` — kept a
     plain callable, so the forge modules never import the event bus. A failure disables only
     the forge tool; cognition keeps running.
     """
@@ -745,7 +745,7 @@ def _activate_forge(
             play=play,
             express=express,
         )
-        announce = getattr(buffer, "feed_scene", None)
+        announce = getattr(buffer, "feed_forge", None)
         activator = ForgeActivator(register=_register, ctx=ctx, announce=announce)
         # Boot reload: any active/<name> forged skill re-registers now (idempotent).
         activator.reload_active()

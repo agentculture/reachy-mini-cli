@@ -611,6 +611,64 @@ class TestFeedScene:
 
 
 # ---------------------------------------------------------------------------
+# feed_forge — forge self-extension announce cue (Qodo finding: was
+# mislabeled as a scene cue via feed_scene)
+# ---------------------------------------------------------------------------
+
+
+class TestFeedForge:
+    """feed_forge(text) -> the text verbatim, as a forge-sourced cue (no prefix)."""
+
+    def test_forge_text_appends_verbatim_cue(self):
+        buf = _make_buffer()
+        buf.feed_forge("learned a new skill: wave-hello")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "learned a new skill: wave-hello"
+
+    def test_forge_text_is_not_prefixed_like_a_scene_cue(self):
+        """The forge cue must never read as 'noticed: ...' (that would be feed_scene)."""
+        buf = _make_buffer()
+        buf.feed_forge("learned a new skill: wave-hello")
+        cues = buf.snapshot()
+        assert not cues[0].text.startswith("noticed:")
+
+    def test_forge_text_is_stripped(self):
+        buf = _make_buffer()
+        buf.feed_forge("  learned a new skill: wave-hello  ")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "learned a new skill: wave-hello"
+
+    def test_empty_text_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_forge("")
+        assert buf.snapshot() == []
+
+    def test_whitespace_only_text_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_forge("   ")
+        assert buf.snapshot() == []
+
+    def test_none_text_does_not_raise(self):
+        buf = _make_buffer()
+        buf.feed_forge(None)  # type: ignore[arg-type]
+        assert buf.snapshot() == []
+
+    def test_forge_cue_has_timestamp_from_injected_clock(self):
+        tick = [0.0]
+
+        def clock():
+            tick[0] += 1.0
+            return tick[0]
+
+        buf = _make_buffer(clock=clock)
+        buf.feed_forge("learned a new skill: wave-hello")
+        cues = buf.snapshot()
+        assert cues[0].timestamp == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
 # [SENSE] cue instrumentation (task t4)
 #
 # Every feed_* call that actually appends a cue emits exactly one parseable
@@ -765,5 +823,26 @@ class TestSenseLogCueInstrumentation:
         buf = _make_buffer()
         with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
             buf.feed_scene("   ")
+
+        assert _sense_records(caplog) == []
+
+    def test_feed_forge_logs_one_sense_line_with_source_forge(self, caplog):
+        """Regression test (Qodo finding): a forge cue must log source=forge, not source=scene."""
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_forge("learned a new skill: wave-hello")
+
+        records = _sense_records(caplog)
+        assert len(records) == 1
+        match = _SENSE_LINE_RE.match(records[0].getMessage())
+        assert match is not None
+        assert match.group("stage") == "cue"
+        assert match.group("source") == "forge"
+        assert "learned a new skill: wave-hello" in match.group("detail")
+
+    def test_feed_forge_empty_stays_silent(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_forge("   ")
 
         assert _sense_records(caplog) == []
