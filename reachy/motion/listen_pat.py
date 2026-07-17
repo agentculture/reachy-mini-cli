@@ -299,6 +299,16 @@ class PatHook:
             self._move_target = current
             self._move_t0 = t
             self._move_end = self._busy_horizon()
+            # Tick-level ground truth for the phantom hunt (info-level): what the
+            # hook observed at each dispatch, incl. the horizon it was handed.
+            logger.info(
+                "dispatch observed: t=%.2f cmd %s->%s horizon=%.2f (+%.2fs)",
+                t,
+                prev,
+                current,
+                self._move_end,
+                self._move_end - t,
+            )
             if (
                 abs(current["pitch"] - prev["pitch"]) > LARGE_MOVE_THRESHOLD_DEG
                 or abs(current["yaw"] - prev["yaw"]) > LARGE_MOVE_THRESHOLD_DEG
