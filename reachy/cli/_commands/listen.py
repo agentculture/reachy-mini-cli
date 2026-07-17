@@ -578,6 +578,7 @@ def _build_agent_think_hook(
     buffer: object | None = None,
     play_audio: object | None = None,
     feed_doa_cues: bool = True,
+    describe_scene: Callable[[], str] | None = None,
 ) -> ThinkHook | None:
     """A :class:`ThinkHook` driving the tool-use agent engine, or ``None``.
 
@@ -604,9 +605,13 @@ def _build_agent_think_hook(
     the shared cognition :class:`~reachy.speech.events.EventBuffer` (so a folded
     TranscribeHook feeds the SAME buffer the engine consumes); ``feed_doa_cues`` is
     threaded to the ThinkHook exactly as the marker path does (``False`` under
-    ``--transcribe`` — words-only cognition). Construction is guarded: if the agent
-    stack can't be assembled (e.g. no LLM env) we log once and return ``None`` so
-    ``--live`` still runs the other senses.
+    ``--transcribe`` — words-only cognition). ``describe_scene`` is the optional
+    on-demand scene-describe seam (see :func:`_build_describe_scene_seam`): when given
+    it is wired into the :class:`~reachy.speech.tools.ToolRegistry` so the agent gains
+    a ``describe_scene`` tool over the SAME describe path the periodic SceneHook uses;
+    ``None`` (no cv2 / bare install) simply omits the tool. Construction is guarded: if
+    the agent stack can't be assembled (e.g. no LLM env) we log once and return ``None``
+    so ``--live`` still runs the other senses.
     """
     try:
         # Imported lazily (like _build_think_hook) so a bare live run doesn't pull the
@@ -630,6 +635,11 @@ def _build_agent_think_hook(
             # The SAME self-mute-stamping wrapper the marker engine + TranscribeHook
             # share, so a tool-spoken clip mutes the hook exactly like marker speech.
             registry_kwargs["play"] = play_audio
+        if describe_scene is not None:
+            # The on-demand describe_scene tool — the same describe path the periodic
+            # SceneHook uses, over the shared VisionHook frame source. Omitted (tool
+            # not advertised) when cv2 is absent.
+            registry_kwargs["describe_scene"] = describe_scene
         registry = ToolRegistry(**registry_kwargs)
         engine = AgentTurnEngine(
             buffer=buf,
@@ -810,6 +820,87 @@ def _build_face_hook(
     return FaceHook(**kwargs)
 
 
+def _build_scene_hook(
+    vision_hook: object,
+    buffer: object | None,
+    *,
+    clock: Callable[[], float] | None = None,
+) -> object | None:
+    """Build a SceneHook sharing VisionHook's frame source, or ``None`` when unavailable.
+
+    Periodic VLM scene description needs the ``[vision]`` extra (opencv, for the JPEG
+    encode). When cv2 is not importable — CI's bare install, the HTTP remote profile —
+    the hook is skipped with a single logged warning rather than crashing the loop (the
+    same lazy-extra degrade the other sense engines use). When available it builds a
+    :class:`~reachy.motion.listen_scene.SceneHook` (default describe seam:
+    :func:`reachy.vision.scene.describe_frame`) wired to (a) the SHARED cognition
+    ``buffer`` (so a described scene reaches cognition via the same buffer PatHook /
+    the think engine consume) and (b) the SHARED frame source
+    ``vision_hook.latest_frame`` — the non-consuming peek at VisionHook's ONE grabber,
+    so scene description never opens a second camera grabber.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("cv2") is None:
+        logger.warning(
+            "listen --live: scene description needs the [vision] extra (opencv); "
+            "skipping SceneHook (install: pip install 'reachy-mini-cli[vision]')"
+        )
+        return None
+    try:
+        from reachy.motion.listen_scene import SceneHook
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "listen --live: scene description unavailable; skipping SceneHook", exc_info=True
+        )
+        return None
+
+    kwargs: dict[str, object] = {
+        "frame_provider": vision_hook.latest_frame,  # type: ignore[attr-defined]
+        "buffer": buffer,
+    }
+    if clock is not None:
+        kwargs["clock"] = clock
+    return SceneHook(**kwargs)
+
+
+def _build_describe_scene_seam(vision_hook: object) -> Callable[[], str] | None:
+    """A zero-arg ``describe_scene() -> str`` seam over the shared frame source, or ``None``.
+
+    The on-demand counterpart of :func:`_build_scene_hook`'s periodic path: it captures
+    the SAME :func:`reachy.vision.scene.describe_frame` and the SAME non-consuming
+    VisionHook frame peek, so the ``describe_scene`` agent tool and the periodic
+    SceneHook are two consumers of one describe path (no second grabber, no second
+    implementation). Returns ``None`` when the ``[vision]`` extra is absent (the tool is
+    then simply not advertised — see :func:`_build_agent_think_hook`). The returned
+    callable grabs the latest shared frame each call; with no frame it returns a plain
+    sentinel string (a valid, honest description the agent can read), and a
+    :class:`~reachy.vision.scene.SceneError` from an unreachable VLM propagates to the
+    tool dispatch's error handling.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("cv2") is None:
+        return None
+    try:
+        from reachy.vision.scene import describe_frame
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "listen --live: describe_scene tool unavailable; not advertising it", exc_info=True
+        )
+        return None
+
+    frame_provider = vision_hook.latest_frame  # type: ignore[attr-defined]
+
+    def _describe() -> str:
+        frame = frame_provider()
+        if frame is None:
+            return "[no camera frame available]"
+        return describe_frame(frame)
+
+    return _describe
+
+
 def _build_live_hooks(
     transport: object,
     queue: MotionQueue,
@@ -910,6 +1001,12 @@ def _build_live_hooks(
     # the SAME shared cognition buffer. Skipped (logged) when the [vision] extra is
     # not importable, so a bare install / CI never crashes on a missing cv2.
     face_hook = _build_face_hook(vision_hook, buffer, clock=clock)
+    # Periodic scene description rides that SAME ONE grabber too (frame_provider=
+    # vision_hook.latest_frame) and feeds the SAME shared cognition buffer. The
+    # on-demand describe_scene agent tool captures the SAME describe path over the SAME
+    # frame source (one shared describe path). Both are skipped when cv2 is absent.
+    scene_hook = _build_scene_hook(vision_hook, buffer, clock=clock)
+    describe_scene_seam = _build_describe_scene_seam(vision_hook)
 
     # The shared cognition buffer (built by the caller, before pat_hook, and handed
     # in as ``buffer``) + self-mute window live at composition level, so pat_hook
@@ -952,6 +1049,7 @@ def _build_live_hooks(
             buffer=think_buffer,
             play_audio=think_play_audio,
             feed_doa_cues=not transcribe,
+            describe_scene=describe_scene_seam,
         )
     else:
         think_hook = _build_think_hook(
@@ -985,6 +1083,10 @@ def _build_live_hooks(
     # ``*_active`` flags arbitrate. Omitted when the [vision] extra is unavailable.
     if face_hook is not None:
         ordered.append(face_hook)
+    # Periodic scene description rides last as well (it competes for nothing the flags
+    # arbitrate; its describe worker is off the tick thread). Omitted when cv2 is absent.
+    if scene_hook is not None:
+        ordered.append(scene_hook)
     return ordered
 
 

@@ -561,6 +561,56 @@ class TestFeedFace:
 
 
 # ---------------------------------------------------------------------------
+# feed_scene (task t10)
+# ---------------------------------------------------------------------------
+
+
+class TestFeedScene:
+    """feed_scene(text) -> a 'noticed: <text>' cue for a VLM scene description."""
+
+    def test_scene_text_appends_noticed_cue(self):
+        buf = _make_buffer()
+        buf.feed_scene("a person waving at the desk")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "noticed: a person waving at the desk"
+
+    def test_scene_text_is_stripped(self):
+        buf = _make_buffer()
+        buf.feed_scene("  a red mug  ")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "noticed: a red mug"
+
+    def test_empty_text_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_scene("")
+        assert buf.snapshot() == []
+
+    def test_whitespace_only_text_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_scene("   ")
+        assert buf.snapshot() == []
+
+    def test_none_text_does_not_raise(self):
+        buf = _make_buffer()
+        buf.feed_scene(None)  # type: ignore[arg-type]
+        assert buf.snapshot() == []
+
+    def test_scene_cue_has_timestamp_from_injected_clock(self):
+        tick = [0.0]
+
+        def clock():
+            tick[0] += 1.0
+            return tick[0]
+
+        buf = _make_buffer(clock=clock)
+        buf.feed_scene("a lamp turned on")
+        cues = buf.snapshot()
+        assert cues[0].timestamp == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
 # [SENSE] cue instrumentation (task t4)
 #
 # Every feed_* call that actually appends a cue emits exactly one parseable
@@ -695,5 +745,25 @@ class TestSenseLogCueInstrumentation:
         buf = _make_buffer()
         with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
             buf.feed_face("")
+
+        assert _sense_records(caplog) == []
+
+    def test_feed_scene_logs_one_sense_line_with_source_scene(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_scene("a person at a whiteboard")
+
+        records = _sense_records(caplog)
+        assert len(records) == 1
+        match = _SENSE_LINE_RE.match(records[0].getMessage())
+        assert match is not None
+        assert match.group("stage") == "cue"
+        assert match.group("source") == "scene"
+        assert "noticed: a person at a whiteboard" in match.group("detail")
+
+    def test_feed_scene_empty_stays_silent(self, caplog):
+        buf = _make_buffer()
+        with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+            buf.feed_scene("   ")
 
         assert _sense_records(caplog) == []

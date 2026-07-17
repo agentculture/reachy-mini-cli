@@ -352,6 +352,68 @@ def test_register_after_construction_also_works() -> None:
 
 
 # ---------------------------------------------------------------------------
+# describe_scene tool (task t10) — an INJECTED zero-arg seam, listed only when given
+# ---------------------------------------------------------------------------
+
+
+def test_describe_scene_is_not_advertised_without_a_seam() -> None:
+    """No ``describe_scene`` seam -> the tool is not listed at all (unlike apply_pose,
+    which is always listed but degrades)."""
+    reg = ToolRegistry()
+    names = [d["function"]["name"] for d in reg.tools()]
+    assert "describe_scene" not in names
+    assert reg.names() == ["speak", "harmonics", "apply_pose"]
+
+
+def test_describe_scene_registered_when_seam_provided() -> None:
+    reg = ToolRegistry(describe_scene=lambda: "a person waving")
+    names = [d["function"]["name"] for d in reg.tools()]
+    assert "describe_scene" in names
+    # It is an OpenAI function-tool with a (no-arg) object parameter schema.
+    by_name = {d["function"]["name"]: d["function"] for d in reg.tools()}
+    fn = by_name["describe_scene"]
+    assert fn["parameters"]["type"] == "object"
+    assert isinstance(fn["description"], str) and fn["description"]
+
+
+def test_describe_scene_dispatch_returns_the_description() -> None:
+    reg = ToolRegistry(describe_scene=lambda: "a person waving at the desk")
+    result = reg.dispatch("describe_scene", "{}", tool_call_id="d")
+    assert result["role"] == "tool"
+    assert result["tool_call_id"] == "d"
+    # The description reaches the agent verbatim in the tool-result content.
+    assert "a person waving at the desk" in result["content"]
+
+
+def test_describe_scene_seam_is_an_injected_zero_arg_callable() -> None:
+    calls: list[int] = []
+
+    def _seam() -> str:
+        calls.append(1)
+        return "a lamp on a table"
+
+    reg = ToolRegistry(describe_scene=_seam)
+    reg.dispatch("describe_scene", "{}", tool_call_id="d")
+    assert calls == [1]  # the seam was invoked once, with no arguments
+
+
+def test_describe_scene_empty_result_is_an_error_result() -> None:
+    reg = ToolRegistry(describe_scene=lambda: "   ")
+    result = reg.dispatch("describe_scene", "{}", tool_call_id="d")
+    assert "error" in json.loads(result["content"])
+
+
+def test_describe_scene_seam_raise_becomes_an_error_result() -> None:
+    def _boom() -> str:
+        raise RuntimeError("vlm-unreachable")
+
+    reg = ToolRegistry(describe_scene=_boom)
+    result = reg.dispatch("describe_scene", "{}", tool_call_id="d")
+    assert result["role"] == "tool"
+    assert "error" in json.loads(result["content"])
+
+
+# ---------------------------------------------------------------------------
 # Degrade contract — dispatch never raises out
 # ---------------------------------------------------------------------------
 
@@ -536,6 +598,15 @@ def test_tools_module_does_not_import_motion_directly() -> None:
     for name in _imported_modules(tools_mod):
         assert "reachy.motion" not in name, f"tools.py must not import motion ({name!r})"
     assert "motion" not in tools_mod.__dict__
+
+
+def test_tools_module_does_not_import_vision_directly() -> None:
+    """CRITICAL BOUNDARY (task t10): the ``describe_scene`` seam is an injected
+    zero-arg callable — tools.py must not import reachy.vision (which would pull cv2
+    into the tool layer)."""
+    for name in _imported_modules(tools_mod):
+        assert "reachy.vision" not in name, f"tools.py must not import vision ({name!r})"
+    assert "vision" not in tools_mod.__dict__
 
 
 def test_tools_module_imports_senselog_directly() -> None:
