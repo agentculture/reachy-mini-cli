@@ -838,6 +838,9 @@ def test_live_agent_pat_cue_feeds_shared_buffer_without_engagement_gate(monkeypa
             return True
 
     monkeypatch.setattr("reachy.speech.engagement.EngagementClassifier", _CountingClassifier)
+    # The cold-start warmup is a live-deployment concern (EMA sag learning over
+    # real seconds); this bounded fast-spin run exercises the cue wiring.
+    monkeypatch.setattr("reachy.cli._commands.listen.WARMUP_SECONDS", 0.0)
 
     real_init = AgentTurnEngine.__init__
     captured: dict = {}

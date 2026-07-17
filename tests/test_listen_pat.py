@@ -476,15 +476,16 @@ def test_first_pass_after_reaction_window_rebaselines() -> None:
     queue: MotionQueue = MotionQueue()
     detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
 
-    # Count detector re-baselines (reset calls) via an instance-level spy.
+    # Count press-state clears (the suspension re-baseline) via an instance spy.
+    # NOTE: this is clear_presses, not reset — the EMA baselines must survive.
     resets = {"n": 0}
-    orig_reset = detector.reset
+    orig_clear = detector.clear_presses
 
-    def _counting_reset() -> None:
+    def _counting_clear() -> None:
         resets["n"] += 1
-        orig_reset()
+        orig_clear()
 
-    detector.reset = _counting_reset  # type: ignore[method-assign]
+    detector.clear_presses = _counting_clear  # type: ignore[method-assign]
 
     hook = PatHook(queue, detector=detector)
     transport = _ScriptedPoseTransport()
@@ -949,6 +950,9 @@ def _run_listen_cli(monkeypatch, transport, *, max_ticks, extra_args=None):
     """Run ``reachy listen run --json`` against *transport*; return (rc, actions)."""
     monkeypatch.setattr("reachy.cli._commands.listen.get_transport", lambda _: transport)
     monkeypatch.setattr("time.sleep", lambda *_: None)
+    # The cold-start warmup is a live-deployment concern (EMA sag learning over
+    # real seconds); these bounded fast-spin runs exercise detection mechanics.
+    monkeypatch.setattr("reachy.cli._commands.listen.WARMUP_SECONDS", 0.0)
 
     argv = [
         "listen",

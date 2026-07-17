@@ -104,6 +104,19 @@ _NEUTRAL_HEAD: dict[str, float] = {"pitch": 0.0, "yaw": 0.0}
 #: dispatches don't reset, so pats on a calmly-breathing robot detect instantly.
 LARGE_MOVE_THRESHOLD_DEG: float = 1.0
 
+#: Cold-start warmup (seconds): once per process the EMA baselines must learn the
+#: resting gravity/calibration sag (a live head rests several degrees off its
+#: commanded neutral) — events fired while they are still learning are discarded.
+WARMUP_SECONDS: float = 3.0
+
+#: Live-fold detector sensitivity ("we can't have it that sensitive" — operator,
+#: 2026-07-17): the folded hook defaults to firmer press thresholds than the
+#: standalone ``pat`` noun, because the live loop's own motion + gravity leave
+#: more residual deviation than a bench setup. A real scratch measures ~20°, so
+#: the margin stays enormous. Override per-run via ``--press-threshold``.
+LIVE_PRESS_THRESHOLD_DEG: float = 2.5
+LIVE_YAW_PRESS_THRESHOLD_DEG: float = 3.5
+
 
 def minjerk_progress(tau: float) -> float:
     """The minimum-jerk position profile ``s(τ) = 10τ³ − 15τ⁴ + 6τ⁵`` on [0, 1].
@@ -173,6 +186,7 @@ class PatHook:
         detector: PatDetector | None = None,
         busy_horizon: Callable[[], float] | None = None,
         buffer: object | None = None,
+        warmup: float = 0.0,
     ) -> None:
         self.queue = queue
         self.detector = detector if detector is not None else PatDetector()
@@ -195,9 +209,17 @@ class PatHook:
         self._reacting_until = 0.0
         #: Whether the ``pat_active`` flag is currently raised by this hook.
         self._flag_up = False
-        #: Set whenever sensing is suspended (reaction window or motion-in-flight); the
-        #: next sensing pass re-baselines the detector so the settled pose reads zero.
+        #: Set whenever sensing is suspended (reaction window / unknown move); the
+        #: next sensing pass clears press accumulation so edges never pair across
+        #: the suspension. The detector's EMA baselines are NEVER cleared — they
+        #: hold the learned gravity/calibration sag (see PatDetector.clear_presses).
         self._needs_rebaseline = False
+        #: Cold-start warmup duration (seconds; 0 disables). The live composition
+        #: passes WARMUP_SECONDS so the EMA baselines learn the resting sag before
+        #: events count; direct/bench constructions default to no warmup.
+        self._warmup = warmup
+        #: End of the cold-start warmup, stamped on the first sensed tick.
+        self._warmup_until: float | None = None
         #: Count of pats detected this run (for diagnostics / tests).
         self.events = 0
 
@@ -283,9 +305,10 @@ class PatHook:
             ):
                 # A large move is starting: press edges counted before it must not
                 # pair with edges counted after — dispatch-boundary deviations are
-                # artifacts of the commanded/actual handoff, not a hand. Reset the
-                # accumulation; a real press re-earns its edges within a second.
-                self.detector.reset()
+                # artifacts of the commanded/actual handoff, not a hand. Clear the
+                # accumulation (KEEPING the learned gravity/sag baselines); a real
+                # press re-earns its edges within a second.
+                self.detector.clear_presses()
 
     def _expected_head(self, now: float, cmd: dict[str, float]) -> tuple[float, float]:
         """Where the head *should* be at ``now``: the tracked move's minjerk pose.
@@ -334,13 +357,24 @@ class PatHook:
         except CliError:
             actual_pitch, actual_yaw = commanded_pitch, commanded_yaw
         if self._needs_rebaseline:
-            # First sensing pass after a suspension: clear stale detector state so the
-            # settled pose seeds a fresh zero-deviation baseline (no self-trigger).
-            self.detector.reset()
+            # First sensing pass after a suspension: clear stale press state so edges
+            # never pair across it — but KEEP the EMA baselines (the learned gravity
+            # sag); wiping them made the sag read as a fresh press until re-learned,
+            # which was the phantom chains' true fuel.
+            self.detector.clear_presses()
             self._needs_rebaseline = False
         event = self.detector.update(
             commanded_pitch, actual_pitch, commanded_yaw, actual_yaw, now=now
         )
+        if self._warmup_until is None:
+            # First sensed tick of the process: the EMA baselines start at zero and
+            # need a few seconds to learn the resting gravity/calibration sag. Keep
+            # feeding the detector (that IS the learning) but discard any event.
+            self._warmup_until = now + self._warmup
+        if now < self._warmup_until:
+            if event is not None:
+                self.detector.clear_presses()
+            return
         if event is None:
             return
         level, touch_type = event
@@ -370,7 +404,7 @@ class PatHook:
                 self._buffer.feed_pat(touch_type, level)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001 — a raising buffer must never break the reflex
                 logger.warning("PatHook buffer feed raised; cue dropped", exc_info=True)
-        self.detector.reset()
+        self.detector.clear_presses()
         pat_signal.write()
         self._flag_up = True
         self._reacting_until = now + reaction_duration(level)

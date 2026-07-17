@@ -296,11 +296,9 @@ class PatDetector:
 
     def reset(self) -> None:
         """Reset all detector state to initial values."""
+        self.clear_presses()
         self.deviation_history.clear()
         self.yaw_deviation_history.clear()
-        self.press_times.clear()
-        self._in_press = False
-        self._yaw_in_press = False
         self._baseline_offset = 0.0
         self._yaw_baseline_offset = 0.0
         self._current_touch_type = "scratch"
@@ -309,6 +307,21 @@ class PatDetector:
         self._level2_threshold = 0.0
         self._last_press_time = 0.0
         self.last_pat_time = 0.0
+
+    def clear_presses(self) -> None:
+        """Clear press accumulation and edge state — but KEEP the learned baselines.
+
+        The EMA baselines cancel steady-state bias (gravity sag, servo/calibration
+        offset — a live head rests several degrees off its commanded neutral).
+        Wiping them with a full :meth:`reset` makes that bias read as a fresh press
+        until the slow EMA re-learns, which is exactly how the folded ``listen``
+        hook's phantom-pat chains were re-seeding. Callers that only need to stop
+        press edges pairing across a suspension (a reaction window, a large move's
+        dispatch) call this instead, so the bias stays cancelled.
+        """
+        self.press_times.clear()
+        self._in_press = False
+        self._yaw_in_press = False
 
     # ------------------------------------------------------------------
     # Dunder

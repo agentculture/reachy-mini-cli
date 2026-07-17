@@ -39,7 +39,12 @@ from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.motion import supervisor
 from reachy.motion.listen import ListenParams, ListenProducer, SampleHolder
 from reachy.motion.listen_hooks import HookChain
-from reachy.motion.listen_pat import PatHook
+from reachy.motion.listen_pat import (
+    LIVE_PRESS_THRESHOLD_DEG,
+    LIVE_YAW_PRESS_THRESHOLD_DEG,
+    WARMUP_SECONDS,
+    PatHook,
+)
 from reachy.motion.listen_sleep import SleepHook
 from reachy.motion.listen_think import ThinkHook
 from reachy.motion.listen_transcribe import TranscribeHook
@@ -473,13 +478,25 @@ def _build_pat_hook(
         return None
     if not hasattr(transport, "head_pose"):
         return None
-    kw: dict[str, float] = {}
+    # Folded-live sensitivity defaults are FIRMER than the standalone pat noun's
+    # (gravity sag + the loop's own motion leave more residual deviation than a
+    # bench run; a real scratch is ~20°, so margin stays huge). Explicit
+    # --press-threshold / --min-presses still override.
+    kw: dict[str, float] = {
+        "press_threshold": LIVE_PRESS_THRESHOLD_DEG,
+        "yaw_press_threshold": LIVE_YAW_PRESS_THRESHOLD_DEG,
+    }
     if getattr(args, "press_threshold", None) is not None:
         kw["press_threshold"] = args.press_threshold
     if getattr(args, "min_presses", None) is not None:
         kw["min_presses"] = args.min_presses
-    detector = PatDetector(**kw) if kw else None
-    return PatHook(queue, detector=detector, busy_horizon=busy_horizon, buffer=buffer)
+    return PatHook(
+        queue,
+        detector=PatDetector(**kw),
+        busy_horizon=busy_horizon,
+        buffer=buffer,
+        warmup=WARMUP_SECONDS,
+    )
 
 
 def _build_think_hook(
