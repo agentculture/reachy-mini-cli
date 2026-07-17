@@ -424,3 +424,70 @@ class TestFeedTranscript:
         messages = build_messages("system prompt", cues)
         user_msg = messages[1]["content"]
         assert "the robot is alive" in user_msg
+
+
+# ---------------------------------------------------------------------------
+# feed_pat
+# ---------------------------------------------------------------------------
+
+
+class TestFeedPat:
+    """feed_pat(kind, level) -> correct touch cues."""
+
+    def test_scratch_level2_is_firm(self):
+        buf = _make_buffer()
+        buf.feed_pat("scratch", "level2")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "felt a firm scratch on the head"
+
+    def test_side_pat_level1_is_gentle(self):
+        buf = _make_buffer()
+        buf.feed_pat("side_pat", "level1")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "felt a gentle sideways nudge on the head"
+
+    def test_scratch_level1_is_gentle(self):
+        buf = _make_buffer()
+        buf.feed_pat("scratch", "level1")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "felt a gentle scratch on the head"
+
+    def test_side_pat_level2_is_firm(self):
+        buf = _make_buffer()
+        buf.feed_pat("side_pat", "level2")
+        cues = buf.snapshot()
+        assert len(cues) == 1
+        assert cues[0].text == "felt a firm sideways nudge on the head"
+
+    def test_unknown_kind_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_pat("tickle", "level1")
+        cues = buf.snapshot()
+        assert len(cues) == 0
+
+    def test_unknown_level_appends_no_cue(self):
+        buf = _make_buffer()
+        buf.feed_pat("scratch", "level3")
+        cues = buf.snapshot()
+        assert len(cues) == 0
+
+    def test_unknown_kind_and_level_does_not_raise(self):
+        buf = _make_buffer()
+        buf.feed_pat("nonsense", "nonsense")
+        cues = buf.snapshot()
+        assert len(cues) == 0
+
+    def test_pat_cue_has_timestamp_from_injected_clock(self):
+        tick = [0.0]
+
+        def clock():
+            tick[0] += 1.0
+            return tick[0]
+
+        buf = _make_buffer(clock=clock)
+        buf.feed_pat("scratch", "level1")
+        cues = buf.snapshot()
+        assert cues[0].timestamp == pytest.approx(1.0)

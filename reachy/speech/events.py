@@ -7,7 +7,7 @@ It turns already-read sensory sample values
 into timestamped :class:`SenseCue` strings held in a rolling, thread-safe buffer
 that the think engine can snapshot at any time.
 
-Two feed methods accept values that callers read from hardware/daemons:
+Four feed methods accept values that callers read from hardware/daemons:
 
 * :meth:`EventBuffer.feed_doa` — Direction-of-Arrival angle (radians), RMS
   loudness, and speech-detected flag from the mic array.  Produces cues like
@@ -16,6 +16,14 @@ Two feed methods accept values that callers read from hardware/daemons:
 * :meth:`EventBuffer.feed_vision` — motion centroid direction and brightness
   delta from the camera.  Produces cues like ``"motion on the right"``,
   ``"the light brightened"``, ``"the light dimmed"``.
+
+* :meth:`EventBuffer.feed_transcript` — already-transcribed spoken words (and
+  optionally the direction they came from).  Produces cues like
+  ``'heard someone say: "hello"'``.
+
+* :meth:`EventBuffer.feed_pat` — a detected proprioceptive touch event (kind
+  and intensity level) from :class:`~reachy.motion.pat.PatDetector`.  Produces
+  cues like ``"felt a gentle scratch on the head"``.
 
 Design constraints
 ------------------
@@ -76,6 +84,20 @@ _BRIGHTNESS_THRESHOLD: float = 8.0
 
 # Default rolling-window size.
 _DEFAULT_MAXLEN: int = 256
+
+# Touch: kind -> the noun phrase used in the cue text.  Keys match the
+# touch-type strings PatDetector emits (reachy/motion/pat.py).
+_PAT_KIND_PHRASE: dict[str, str] = {
+    "scratch": "scratch",
+    "side_pat": "sideways nudge",
+}
+
+# Touch: level -> the intensity adjective used in the cue text.  Keys match
+# the level strings PatDetector emits (reachy/motion/pat.py).
+_PAT_LEVEL_INTENSITY: dict[str, str] = {
+    "level1": "gentle",
+    "level2": "firm",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +324,39 @@ class EventBuffer:
             self._append(f'heard someone say (from the {direction}): "{stripped}"')
         else:
             self._append(f'heard someone say: "{stripped}"')
+
+    def feed_pat(self, kind: str, level: str) -> None:
+        """Translate one detected touch event into zero or one cue and append it.
+
+        Parameters
+        ----------
+        kind:
+            The touch type reported by :class:`~reachy.motion.pat.PatDetector`:
+            ``"scratch"`` (pitch-dominated, head pushed down) or ``"side_pat"``
+            (yaw-dominated, head nudged sideways).
+        level:
+            The touch intensity reported by ``PatDetector``: ``"level1"``
+            (first detection) or ``"level2"`` (sustained hold).
+
+        Cue rules
+        ---------
+        * ``kind="scratch"``, ``level="level1"`` → ``"felt a gentle scratch on
+          the head"``
+        * ``kind="scratch"``, ``level="level2"`` → ``"felt a firm scratch on
+          the head"``
+        * ``kind="side_pat"``, ``level="level1"`` → ``"felt a gentle sideways
+          nudge on the head"``
+        * ``kind="side_pat"``, ``level="level2"`` → ``"felt a firm sideways
+          nudge on the head"``
+        * Any other *kind* or *level* → no cue (defensive default; never
+          raises).
+        """
+        phrase = _PAT_KIND_PHRASE.get(kind)
+        intensity = _PAT_LEVEL_INTENSITY.get(level)
+        if phrase is None or intensity is None:
+            return
+
+        self._append(f"felt a {intensity} {phrase} on the head")
 
     # ------------------------------------------------------------------
     # Snapshot
