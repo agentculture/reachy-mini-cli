@@ -101,6 +101,19 @@ you touch the CLI.
 - **Output split:** `_output.py` enforces results→stdout, errors+diagnostics→
   stderr, **never mixed**, in both text and JSON modes. Every verb takes
   `--json`.
+- **Sense-stage logging** (`reachy/senselog.py` + `reachy/cli/_logging.py`): a
+  parallel, opt-in observability layer, separate from the `--json`/text output
+  contract above. `senselog.stage`/`senselog.drop` emit a fixed, grep-able
+  `[SENSE stage=<stage> source=<source> event=<event>] <detail>` line on the
+  dedicated `reachy.sense` logger; a drop always names its reason (`self-mute`,
+  `min-utterance`, `cooldown`, `vlm-unreachable`, `audio-muted`, `tool-error`, a
+  forge validator's joined rejection reasons, …) — never a silent no-op.
+  `_logging.install_logging` attaches exactly ONE `stderr` `StreamHandler` to
+  the `"reachy"` logger (the common ancestor every `reachy.*` module logger
+  propagates to) at `listen`/`think`/`sleep run` entry, level from
+  `--log-level` (`add_log_level_arg`) or `REACHY_LOG_LEVEL` (default `INFO`); a
+  repeated call reuses the same handler (no duplicate lines). Stderr-only by
+  construction, so `--export -`'s stdout stays pure JSONL.
 - **`explain` catalog** (`reachy/explain/`): markdown keyed by command-path
   tuples in `catalog.py`'s `ENTRIES`. `test_every_catalog_path_resolves`
   verifies each catalog entry resolves — but nothing fails if you add a verb
@@ -123,9 +136,14 @@ contributor summary:
   runs against one in-process `ReachyMini` client. `SdkTransport.media_session()`
   opens against the *one* `ReachyMini` media subsystem and is single-consumer
   (`reachy/robot/sdk_transport.py`, `MediaSession`). `listen` / `think` / `sleep`
-  each open a media session; `vision` reads camera frames (`get_frame()` →
-  `media_manager.camera`) and `pat` reads `head_pose()` — both through that same
-  one SDK client.
+  each open a media session; `vision` reads camera frames (`get_frame()` gated
+  by `media.camera is not None` — the real SDK ≥1.9 surface; the old
+  `media_manager.camera`/`is_local_camera_available()` guess never existed) and
+  `pat` reads `head_pose()` — both through that same one SDK client. On the
+  pinned SDK (`reachy-mini>=1.9.0,<1.10`), those camera frames arrive over
+  **the daemon's local IPC endpoint** (`GStreamerCamera`, the LOCAL media
+  backend) — the daemon always owns the physical camera, so it must be running
+  for `vision` (and the folded face/scene hooks, below) to see anything.
 - **One head (motion).** Every move flows through one serial `MotionQueue`
   (`reachy/motion/queue.py`), drained one move at a time.
 
@@ -217,23 +235,33 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
   `EventBuffer.feed_pat` (touch reaches cognition — one cue per reaction cycle,
   fault-isolated so a raising buffer never breaks the reflex). See
   [the single-SDK-owner model](#the-single-sdk-owner-model-contributor-note).
-- **`--live` — all four senses in one loop:** `listen run --live` folds `think`,
-  `vision`, and `sleep` *into* `listen`'s loop alongside the `PatHook`, so every
-  live sense rides the **one** SDK media session and the **one** `MotionQueue` in
-  **one** process — the same single-SDK-owner argument that motivated #43, applied
-  to every sense. The folded hooks are `reachy/motion/listen_{think,vision,sleep}.py`,
+- **`--live` — every live sense in one loop:** `listen run --live` folds `think`,
+  `vision`, `sleep`, face recognition, and periodic scene description *into*
+  `listen`'s loop alongside the `PatHook`, so every live sense rides the **one**
+  SDK media session and the **one** `MotionQueue` in **one** process — the same
+  single-SDK-owner argument that motivated #43, applied to every sense. The
+  folded hooks are `reachy/motion/listen_{think,vision,sleep,face,scene}.py`,
   composed by `reachy/motion/listen_hooks.py` `HookChain` — a single `on_tick`
   callable that fans the seam out across the hook list (per-tick `try/except`
   isolation + per-hook `close`). The audio hooks (`think`, `sleep`) do **not** open
   a second `media_session()`; they read the loop's own per-tick reading through the
   shared `reachy/motion/sense_sample.py` `SenseSample` provider (a per-tick tap on
-  the value the loop already pulls). Hooks run in descending idle-interrupt priority
-  `sleep > pat > think` (vision rides last; it competes for nothing the flags
-  arbitrate). Off by default (`sdk` only) — bare `listen run` is unchanged. This is
-  the loop the `live` boot-presence service runs (see the `service` noun below).
-  Which engine drives the folded `ThinkHook` — the marker path or the tool-use
-  agent — is `--cognition`'s job (see its own bullet below); `--live` itself is
-  unopinionated about that choice.
+  the value the loop already pulls). `listen_face.py` `FaceHook` and
+  `listen_scene.py` `SceneHook` likewise open **no second camera grabber**: both
+  take a `frame_provider` bound to `VisionHook.latest_frame` — a non-consuming
+  peek at `VisionHook`'s own background grabber's latest frame (as opposed to
+  `VisionHook`'s own `take()`, which consumes it) — so up to three consumers
+  (vision, face, scene) share the ONE frame source with no second thread hammering
+  `get_frame()`. Hooks run in descending idle-interrupt priority `sleep > pat >
+  think` (vision rides last — it competes for nothing the flags arbitrate — with
+  face then scene riding after it, sharing its frame grabber). `face`/`scene` also
+  need the `[vision]` extra (opencv); absent, each is skipped with a single logged
+  warning rather than crashing the loop (see the `[vision]` extra note in Hard
+  constraints). Off by default (`sdk` only) — bare `listen run` is unchanged. This
+  is the loop the `live` boot-presence service runs (see the `service` noun
+  below). Which engine drives the folded `ThinkHook` — the marker path or the
+  tool-use agent — is `--cognition`'s job (see its own bullet below); `--live`
+  itself is unopinionated about that choice.
 - **`--live --export -` — stream what the robot is thinking:** `--live` exposes the
   same `--export`/`--export-blocks` JSONL feed as `think run --export` (built by the
   shared `reachy/cli/_export.py` `build_export_hook`, so the two feeds can't drift).
@@ -639,6 +667,70 @@ or agent tool yet — today it is driven via its Python API (`StashRecord`,
   `MotionQueue` — the same queue family `ExpressionProducer` drives, not the 50 Hz
   `behavior` engine process.
 
+### `reachy/forge/` package — qwen3 self-extension (wired under `--cognition agent`)
+
+Runtime self-extension: an agent turn can hand a natural-language goal to a
+coder model and, if what comes back passes a static safety gate, the robot
+gains a new callable tool with no restart. Ported (cite-don't-import) from
+`reachy_nova`'s `skill_forge.py` + `forge_validator.py`, split four ways so
+dispatch, the safety gate, the disk/event lifecycle, and the activation policy
+are independently testable (`docs/operating-reachy.md`'s "The forge loop" has
+the operator-facing walkthrough):
+
+- `reachy/forge/client.py` `ForgeClient` — `dispatch(goal, context, improve)`
+  runs on a background thread: POSTs an OpenAI-compatible chat-completions
+  request to `FORGE_BASE_URL`/`FORGE_MODEL`/`FORGE_API_KEY` (default: the
+  lobes gateway cortex route, `http://localhost:8001/v1`, model `qwen3`),
+  parses the two fenced blocks the prompt demands (```SKILL.md``` +
+  ```executor.py```), and stages them. Every failure (unreachable endpoint,
+  timeout, unparseable reply, a missing fence, a bad name, a failed stage, an
+  unavailable validator) resolves to a loud rejection — never an exception on
+  the caller's thread, never a hang.
+- `reachy/forge/validator.py` `validate` — the fail-closed gate: **AST-only**,
+  never imports or executes the generated code. Rejects anything outside an
+  import allow-list (`numpy`/`math`/`time`/`typing`/`dataclasses`), a
+  forbidden-name list (`exec`/`eval`/`os`/`subprocess`/…), dunder attribute
+  access, a `ctx.<attr>` outside the sanctioned surface (default `{speak,
+  harmonics, express, state_get, state_update}`, injectable), and a 200-line
+  cap; requires a top-level `execute(params, ctx)`.
+- `reachy/forge/lifecycle.py` — the disk + event layer:
+  `<state_dir>/forge/staged/<name>/` → validated but not yet live;
+  `<state_dir>/forge/staged/.rejected/<name>/` → where `reject()` quarantines
+  a failed artifact (always logs the reason(s) first, never raises);
+  `<state_dir>/forge/active/<name>/` → where `activate()` moves a staged
+  skill. `stage()` is the ONLY path that emits `forge/staged`, and only ever
+  called *after* validation passes.
+- `reachy/forge/activate.py` — the runtime half deciding *when* a staged skill
+  goes live: **validator-gated auto-activation, no human gate** (a confirmed
+  product decision, matching nova). `ForgeActivator.publish` (the
+  `ForgeClient`'s `PublishFn`) emits a `[SENSE stage=forge]` line for every
+  `forge/*` transition and, on `forge/staged`, re-validates, imports the
+  executor via `importlib.util.spec_from_file_location` (never registered in
+  `sys.modules`, so one forged skill can never shadow another), wraps it in a
+  crash-catching handler, and hot-registers it into the LIVE `ToolRegistry`
+  via an injected `register` callback — callable on the **next turn**, no
+  restart, because `AgentTurnEngine` reads `registry.tools()` fresh every
+  round (contrast nova, whose Nova-Sonic session pins its tool config and
+  needs one). `ForgedSkillContext` is the restricted `ctx` a forged `execute`
+  receives: exactly `speak`/`harmonics`/`express`/`state_get`/`state_update`,
+  each a thin defensive delegation to the SAME seams the built-in
+  `speak`/`harmonics`/`apply_pose` tools use — no engine, no buffer, no
+  transport reachable. `reload_active()` re-registers everything under
+  `active/` at boot.
+
+**Import boundary.** Like `reachy/stash/`, the forge stack is wired in at
+composition, never imported by the modules it extends: `reachy/speech/tools.py`
+and `reachy/speech/agent_turn.py` never import `reachy.forge` (asserted by
+`tests/test_speech_tools.py` / `tests/test_agent_turn.py`) — the `forge`
+dispatch seam and the `register`/`announce` callbacks are plain injected
+callables. Composition (`reachy/cli/_commands/listen.py`'s `_activate_forge`)
+builds the `ForgedSkillContext` over the same `speak_engine`/`harmonic_engine`/
+`play`/`express` seams the built-in tools use, and wires `ForgeActivator.publish`
+as `ForgeClient`'s `publish`. The `forge` tool is only advertised under
+`--cognition agent` (it is part of the `ToolRegistry` the agent engine builds);
+`--cognition marker` has no forge tool. A missing/broken forge stack disables
+only the tool — cognition keeps running.
+
 ## Hard constraints
 
 - **Base runtime dependencies — SDK-first, but installable.** Two packages are
@@ -668,7 +760,14 @@ or agent tool yet — today it is driven via its Python API (`StashRecord`,
   GPU-accelerated features — it does NOT bundle an on-box STT model (heavy STT is
   externally managed behind the HTTP STT service, `REACHY_STT_URL`). Both are
   lazy-loaded and the Tier 1 wake (speech/snap) never requires them — a bare
-  `pip install reachy-mini-cli` still gets full Tier 1 wake functionality.
+  `pip install reachy-mini-cli` still gets full Tier 1 wake functionality. The
+  `[vision]` extra (`opencv-python-headless`) follows the same pattern for face
+  recognition + scene description (`reachy/vision/face.py`, `reachy/vision/scene.py`'s
+  JPEG-encode leg): lazy-imported, absent by default, and a missing extra
+  degrades each folded hook (`FaceHook`/`SceneHook`) to a single logged warning
+  instead of a crash — `pip install 'reachy-mini-cli[vision]'` to enable them.
+  The pixel-only `vision` noun (motion/light orienting) needs no extra —
+  numpy-only, unaffected.
 - **Python ≥ 3.12** (uses `X | None`, `tomllib`, etc.).
 - **Every PR bumps the version**, even docs/config/CI-only changes — the
   `version-check` CI job blocks the merge otherwise (it compares
