@@ -435,8 +435,9 @@ end to end:
    blocks the motion loop) snapshots the buffer, calls the LLM with the
    `speak`/`harmonics`/`apply_pose` tools, and executes whatever the model
    calls — a spoken reply, a melodic harmonic phrase, a body pose, or several
-   of these in one turn (see [Cortex role switch](#cortex-role-switch--agent-tool-use)
-   below for which model role this targets).
+   of these in one turn (see [Agent model
+   choice](#agent-model-choice--cortex-or-muse) below for which model role this
+   targets).
 5. Idle presence never stops: the motion loop keeps breathing/glancing
    throughout, and the antenna-lean/turn/pat reactions from the other folded
    senses keep running alongside the agent's replies.
@@ -516,10 +517,10 @@ cosine search, which is the round trip this demo verifies. On the running robot,
 a throwaway `MotionQueue()` above is enough to verify fetch → plan → enqueue
 without disturbing a running loop.
 
-### Cortex role switch — agent tool-use
+### Agent model choice — cortex or muse
 
-The LLM endpoint behind `REACHY_OPENAI_*` is a **lobes** gateway that serves more
-than one model **role** at the same base URL — only `REACHY_OPENAI_MODEL_ID`
+The LLM endpoint behind `REACHY_OPENAI_*` is a **lobes** gateway that serves
+several model **roles** at the same base URL — only `REACHY_OPENAI_MODEL_ID`
 picks the role; `REACHY_OPENAI_URL_BASE` does not change. The box's boot config
 lives in one file:
 
@@ -527,32 +528,55 @@ lives in one file:
 ~/.config/environment.d/10-reachy-llm.conf
 ```
 
-Today that file pins the **`senses`** role for day-to-day live cognition — a
-Gemma model (`coolthor/gemma-4-12B-it-NVFP4A16`, proxied to a peer box) tuned for
-reacting to raw perception. **Agent tool-use** (an LLM turn that calls `speak` /
-`harmonics` / `apply_pose` as tools instead of the `*emoji*`/`"speech"` marker
-convention) targets the **`cortex`** role instead — the model verified to emit
-`tool_calls` reliably, with tool-call parsing handled server-side by the
-`qwen3_coder` parser:
+Day-to-day live cognition (the `*emoji*`/`"speech"` marker convention `think` /
+`say` / marker-mode `listen --live` use) is currently pinned to the **`senses`**
+role — a Gemma model (`coolthor/gemma-4-12B-it-NVFP4A16`, proxied to a peer box)
+tuned for reacting to raw perception; that pin is unaffected by anything below.
+
+**Agent tool-use** (an LLM turn that calls `speak` / `harmonics` / `apply_pose`
+as tools instead of the marker convention — `--cognition agent`) has two
+verified model choices instead:
+
+- **`cortex`** (`sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`) — served locally by
+  the gateway, no proxy hop. The **default / verified fallback**: reliably
+  returns `tool_calls` (parsed server-side by the `qwen3_coder` parser) and
+  reliably follows up with real assistant text once tool results are appended.
+- **`muse`** (`nvidia/Gemma-4-31B-IT-NVFP4`) — proxied to peer `thor`. As of
+  agentculture/lobes-cli#139's partial fix it is also tool-capable (verified
+  2026-07-17: a chat round trip returns `finish_reason=tool_calls`), so it is a
+  genuine second option for agent tool-use. Its audio-in leg is still absent
+  server-side (`400` "no audio tower", tracked in the same issue) — irrelevant
+  to agent tool-use, which is a chat-only round trip (text sense cues in, tool
+  calls out); only a future audio-native use of muse would need that issue
+  resolved.
 
 ```bash
 REACHY_OPENAI_URL_BASE=http://localhost:8001                         # unchanged — same gateway
-REACHY_OPENAI_MODEL_ID=sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP       # cortex role
+REACHY_OPENAI_MODEL_ID=sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP       # cortex — default/fallback
+# or:
+REACHY_OPENAI_MODEL_ID=nvidia/Gemma-4-31B-IT-NVFP4                    # muse — proxied from thor
 ```
 
-Edit `10-reachy-llm.conf`'s `REACHY_OPENAI_MODEL_ID` line to switch roles (a
+Edit `10-reachy-llm.conf`'s `REACHY_OPENAI_MODEL_ID` line to switch (a
 `loginctl` re-login or a reboot picks up `environment.d` changes); the URL base
-line does not need to change either direction. Whichever role is active, the
-client always sends `chat_template_kwargs: {"enable_thinking": false}` on every
+line does not need to change either direction. **Switching is pure
+environment.d config — no code change.** Whichever role is active, the client
+always sends `chat_template_kwargs: {"enable_thinking": false}` on every
 request (`speech/llm.py`'s `_build_request`) — thinking-mode output is never
-requested from either model.
+requested from any role.
 
-**This switch only matters for agent-cognition live mode.** `think` / `say` keep
-using whatever role `REACHY_OPENAI_MODEL_ID` currently names — their marker-based
-(`*emoji*`/`"speech"`) cognition works against either role and has no opinion on
-which one is configured. Nothing about `think`'s or `say`'s defaults changes when
-you flip the role; only the agent tool-use path cares that `cortex` is the one
-verified for `tool_calls`.
+**This choice only matters for agent tool-use.** `think` / `say` / marker-mode
+`listen --live` keep using whatever role `REACHY_OPENAI_MODEL_ID` currently
+names (`senses` today) — their marker-based cognition works against any role
+and has no opinion on which one is configured. Nothing about `think`'s or
+`say`'s defaults changes when you switch; only the agent tool-use path cares
+which role is verified for `tool_calls`.
+
+`tests/test_agent_turn_cortex_integration.py`'s gateway-gated integration test
+runs the identical tool round trip against both `cortex` and `muse` live
+(parametrized; each case skips independently when its model is unreachable) —
+see that module's docstring for the live-verified behaviour difference between
+the two at `temperature=0.0`.
 
 ---
 
