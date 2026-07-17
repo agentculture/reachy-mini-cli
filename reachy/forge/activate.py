@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import threading
 import uuid
 from collections.abc import Callable, MutableMapping
 from pathlib import Path
@@ -58,6 +59,11 @@ from reachy.forge import lifecycle
 from reachy.forge.validator import validate as _default_validate
 
 logger = logging.getLogger(__name__)
+
+#: Default wall-clock bound (seconds) a forged ``execute`` gets before
+#: :func:`wrap_executor` gives up on it and returns a timeout tool-result. Injectable
+#: per-call (``wrap_executor(..., timeout=...)``) — see its docstring.
+DEFAULT_EXECUTE_TIMEOUT = 10.0
 
 #: ``register(name, description, parameters, handler)`` — the composition-provided hot
 #: registration callback. Composition adapts it to ``ToolRegistry.register`` +
@@ -195,21 +201,59 @@ def import_forged_execute(executor_path: Path, name: str) -> Callable | None:
     return execute_fn
 
 
-def wrap_executor(execute_fn: Callable, ctx: object, name: str) -> Callable[[dict], str]:
-    """Wrap a forged ``execute(params, ctx)`` in a crash-catching tool handler.
+def wrap_executor(
+    execute_fn: Callable,
+    ctx: object,
+    name: str,
+    *,
+    timeout: float = DEFAULT_EXECUTE_TIMEOUT,
+) -> Callable[[dict], str]:
+    """Wrap a forged ``execute(params, ctx)`` in a crash-catching, timeout-bounded
+    tool handler.
 
     The returned handler matches :data:`reachy.speech.tools.Handler` (``(arguments) ->
     content str``): it calls ``execute_fn(arguments, ctx)`` and returns its result
     stringified, or — if ``execute`` raises — a bracketed error string. It NEVER raises,
     so a buggy forged skill degrades to an error tool-result instead of killing the loop.
+
+    RELIABILITY CONTRACT: forged code only ever passed *static* analysis
+    (:mod:`reachy.forge.validator`), never a human review, and ``time`` is an ALLOWED
+    import — so a runaway ``execute`` (``time.sleep(1e9)``, ``while True: pass``) must
+    never wedge the caller's cognition turn loop forever. ``execute_fn`` therefore runs on
+    a **daemon** worker thread with a bounded ``timeout`` (default
+    :data:`DEFAULT_EXECUTE_TIMEOUT`, injectable per-call for tests/tuning): if the thread
+    hasn't finished within ``timeout`` seconds, the handler returns immediately with an
+    error tool-result and logs loudly (a warning plus ``senselog.drop
+    reason=skill-timeout``). The leaked, still-running worker thread is a daemon, so it
+    never blocks process shutdown; any late result or exception it eventually produces is
+    simply discarded.
     """
 
     def handler(arguments: dict) -> str:
-        try:
-            result = execute_fn(arguments or {}, ctx)
-        except Exception as err:  # noqa: BLE001 - forged code must never crash the loop
+        outcome: dict = {}
+
+        def _run() -> None:
+            try:
+                outcome["result"] = execute_fn(arguments or {}, ctx)
+            except Exception as err:  # noqa: BLE001 - forged code must never crash the loop
+                outcome["error"] = err
+
+        worker = threading.Thread(target=_run, name=f"forge-exec-{name}", daemon=True)
+        worker.start()
+        worker.join(timeout)
+
+        if worker.is_alive():
+            logger.warning("forged skill %r timed out after %ss", name, timeout)
+            event_id = uuid.uuid4().hex[:8]
+            senselog.drop("forge", name, event_id, "skill-timeout")
+            return f"[Skill error: timed out after {timeout:g}s]"
+
+        if "error" in outcome:
+            err = outcome["error"]
             logger.warning("forged skill %r raised: %s", name, err)
             return f"[forged skill {name!r} error: {err}]"
+
+        result = outcome.get("result")
         if result is None:
             return f"[forged skill {name!r} ran]"
         return str(result)
@@ -453,6 +497,7 @@ __all__ = [
     "read_skill_description",
     "build_ctx_seams",
     "DEFAULT_FORGED_PARAMS",
+    "DEFAULT_EXECUTE_TIMEOUT",
     "RegisterFn",
     "AnnounceFn",
     "ValidatorFn",

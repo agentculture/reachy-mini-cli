@@ -148,6 +148,38 @@ def test_dedicated_forge_key_wins_over_fallback(state, monkeypatch):
     assert headers["Authorization"] == "Bearer forge-key"
 
 
+def test_forge_api_key_empty_literal_is_treated_as_no_key(state, monkeypatch):
+    """The repo-wide convention (reachy/speech/llm.py) treats the literal "EMPTY" as
+    no-auth for local OpenAI-compatible servers — ForgeClient must match it."""
+    monkeypatch.setenv("FORGE_API_KEY", "EMPTY")
+    pub = _Recorder()
+    transport = _FakeTransport(response=_reply(_GOOD_CONTENT))
+    _run(ForgeClient(pub, validator=lambda d: (True, []), transport=transport), "g")
+    _url, _payload, headers, _timeout = transport.calls[0]
+    assert "Authorization" not in headers
+
+
+def test_reachy_openai_api_key_empty_literal_is_treated_as_no_key(state, monkeypatch):
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "EMPTY")
+    pub = _Recorder()
+    transport = _FakeTransport(response=_reply(_GOOD_CONTENT))
+    _run(ForgeClient(pub, validator=lambda d: (True, []), transport=transport), "g")
+    _url, _payload, headers, _timeout = transport.calls[0]
+    assert "Authorization" not in headers
+
+
+def test_forge_api_key_empty_falls_through_to_reachy_openai_key(state, monkeypatch):
+    """ "EMPTY" on the dedicated key is not a real override — the shared gateway key
+    (when it's a real value) still authenticates the request."""
+    monkeypatch.setenv("FORGE_API_KEY", "EMPTY")
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "gateway-key")
+    pub = _Recorder()
+    transport = _FakeTransport(response=_reply(_GOOD_CONTENT))
+    _run(ForgeClient(pub, validator=lambda d: (True, []), transport=transport), "g")
+    _url, _payload, headers, _timeout = transport.calls[0]
+    assert headers["Authorization"] == "Bearer gateway-key"
+
+
 def test_env_overrides_url_model_and_apikey(state, monkeypatch):
     monkeypatch.setenv("FORGE_BASE_URL", "http://coder:9999/v1/")
     monkeypatch.setenv("FORGE_MODEL", "coder-model")

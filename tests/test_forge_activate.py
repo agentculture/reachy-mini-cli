@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 import sys
 import textwrap
+import threading
+import time
 
 import pytest
 
@@ -200,6 +202,62 @@ def test_wrap_executor_catches_a_raising_execute_and_returns_error_string():
     out = handler({})  # must NOT raise
     assert isinstance(out, str)
     assert "demo" in out and "kaboom" in out
+
+
+# ---------------------------------------------------------------------------
+# wrap_executor — bounded timeout (Qodo finding: a forged execute() runs
+# synchronously with no timeout; ``time`` is an ALLOWED import, so
+# ``time.sleep(1e9)`` or ``while True`` wedges the caller's turn loop forever).
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_executor_returns_within_bound_while_executor_is_still_blocked():
+    started = threading.Event()
+    blocker = threading.Event()
+
+    def execute(params, ctx):
+        started.set()
+        blocker.wait()  # never set by the test — simulates a runaway forged skill
+        return "should never surface"
+
+    handler = act.wrap_executor(execute, object(), "wedged", timeout=0.2)
+
+    t0 = time.monotonic()
+    out = handler({})
+    elapsed = time.monotonic() - t0
+
+    assert started.wait(2.0), "the executor never even started"
+    assert elapsed < 1.5, f"handler blocked for {elapsed}s — timeout was not enforced"
+    assert isinstance(out, str)
+    assert "timed out" in out
+    assert "0.2" in out
+
+    blocker.set()  # release the leaked daemon thread so it can exit cleanly
+
+
+def test_wrap_executor_timeout_logs_a_senselog_drop(caplog):
+    blocker = threading.Event()
+
+    def execute(params, ctx):
+        blocker.wait()
+
+    handler = act.wrap_executor(execute, object(), "wedged", timeout=0.1)
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        handler({})
+
+    assert "dropped reason=skill-timeout" in caplog.text
+    blocker.set()
+
+
+def test_wrap_executor_timeout_is_injectable_and_default_is_generous():
+    """A fast executor completes normally under the (generous) default timeout."""
+
+    def execute(params, ctx):
+        return "fast"
+
+    handler = act.wrap_executor(execute, object(), "quick")
+    out = handler({})
+    assert "fast" in out
 
 
 # ---------------------------------------------------------------------------

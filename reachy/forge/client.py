@@ -67,6 +67,12 @@ PROMPT_TEMPLATE = (
 _SANITIZE_RE = re.compile(r"[^a-z0-9-]+")
 _DASH_COLLAPSE_RE = re.compile(r"-+")
 
+#: The literal value local OpenAI-compatible servers use to mean "no auth" — the
+#: repo-wide convention (:mod:`reachy.speech.llm`); the forge auth resolution below
+#: matches it so ``FORGE_API_KEY=EMPTY`` / ``REACHY_OPENAI_API_KEY=EMPTY`` never send a
+#: ``Authorization: Bearer EMPTY`` header.
+_NO_KEY_SENTINEL = "EMPTY"
+
 #: ``validate(skill_dir) -> (ok, reasons)`` — a 1-arg validator seam.
 ValidatorFn = Callable[[Path], "tuple[bool, list[str]]"]
 #: ``factory() -> ValidatorFn | None`` — lazily resolves the default validator.
@@ -88,6 +94,26 @@ def _default_transport(url: str, payload: dict, headers: dict[str, str], timeout
     with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
         body = response.read().decode("utf-8")
     return json.loads(body)
+
+
+def _resolve_forge_api_key() -> str | None:
+    """Resolve the forge auth key, honouring the repo-wide "EMPTY" == no-auth
+    convention (:mod:`reachy.speech.llm`) for BOTH the dedicated ``FORGE_API_KEY`` and
+    the shared ``REACHY_OPENAI_API_KEY`` fallback.
+
+    ``FORGE_API_KEY`` wins when it is set to a real (non-"EMPTY") value — "one gateway,
+    one key, unless a dedicated key overrides it" (see the module docstring). A
+    ``FORGE_API_KEY`` of exactly ``"EMPTY"`` is not a real override, so resolution falls
+    through to ``REACHY_OPENAI_API_KEY``; if that is unset or also ``"EMPTY"``, the
+    request goes out with no ``Authorization`` header at all, matching the local
+    OpenAI-compatible-server convention instead of literally sending
+    ``Bearer EMPTY``.
+    """
+    for env_name in ("FORGE_API_KEY", "REACHY_OPENAI_API_KEY"):
+        value = os.environ.get(env_name)
+        if value and value != _NO_KEY_SENTINEL:
+            return value
+    return None
 
 
 def _default_validator_factory() -> ValidatorFn | None:
@@ -290,8 +316,9 @@ class ForgeClient:
         model = os.environ.get("FORGE_MODEL") or DEFAULT_FORGE_MODEL
         # One gateway, one key: the coder endpoint shares the lobes gateway
         # with cognition, so the LLM key authenticates forge too unless a
-        # dedicated FORGE_API_KEY overrides it.
-        api_key = os.environ.get("FORGE_API_KEY") or os.environ.get("REACHY_OPENAI_API_KEY")
+        # dedicated FORGE_API_KEY overrides it. The literal "EMPTY" means no
+        # key on either variable (matches reachy.speech.llm's convention).
+        api_key = _resolve_forge_api_key()
 
         url = base_url.rstrip("/") + "/chat/completions"
         headers = {"Content-Type": "application/json"}

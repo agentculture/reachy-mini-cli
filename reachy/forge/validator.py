@@ -75,6 +75,7 @@ FORBIDDEN_NAMES = {
     "ctypes",
     "pickle",
     "marshal",
+    "__builtins__",
 }
 
 #: Builtin callables plain enough to allow in generated code.
@@ -176,7 +177,7 @@ def _walk(tree: ast.AST, allowed_ctx: set[str]) -> list[str]:
         elif isinstance(node, ast.Attribute):
             _check_attribute(node, reasons, allowed_ctx)
         elif isinstance(node, ast.Call):
-            _check_call(node, reasons, local_funcs, import_aliases)
+            _check_call(node, reasons, local_funcs, import_aliases, allowed_ctx)
 
     return reasons
 
@@ -210,16 +211,53 @@ def _check_attribute(node: ast.Attribute, reasons: list[str], allowed_ctx: set[s
 
 
 def _check_call(
-    node: ast.Call, reasons: list[str], local_funcs: set[str], import_aliases: set[str]
+    node: ast.Call,
+    reasons: list[str],
+    local_funcs: set[str],
+    import_aliases: set[str],
+    allowed_ctx: set[str],
 ) -> None:
+    """Fail-closed call-target check.
+
+    A call is sanctioned ONLY when its callee is exactly one of:
+
+    (a) a plain ``ast.Name`` that resolves against the allow-lists (safe builtin,
+        local function, or an allowed-import alias);
+    (b) a ``ctx.<attr>`` attribute call where ``<attr>`` is on the sanctioned surface; or
+    (c) an attribute call on an ALLOWED import (e.g. ``math.sin(...)``,
+        ``time.monotonic()``, ``numpy.array(...)``).
+
+    Anything else — a call through a subscript (``d["k"]()``), a lambda/call result
+    (``(lambda: ...)()``), or a chained attribute off a base that is neither ``ctx`` nor
+    an allowed import — is REJECTED outright. Previously this function returned silently
+    for any callee that wasn't a plain ``ast.Name``, which let calls through attributes
+    and subscripts slip past the allow-list entirely (e.g.
+    ``__builtins__["__import__"]("os")``).
+    """
     func = node.func
-    if not isinstance(func, ast.Name):
+
+    if isinstance(func, ast.Name):
+        name = func.id
+        allowed = name in SAFE_BUILTIN_CALLS or name in local_funcs or name in import_aliases
+        # FORBIDDEN_NAMES is already flagged via the Name branch — don't double-report.
+        if not allowed and name not in FORBIDDEN_NAMES:
+            reasons.append(
+                f"call to '{name}' is outside the sanctioned surface (line {node.lineno})"
+            )
         return
-    name = func.id
-    allowed = name in SAFE_BUILTIN_CALLS or name in local_funcs or name in import_aliases
-    # FORBIDDEN_NAMES is already flagged via the Name branch — don't double-report.
-    if not allowed and name not in FORBIDDEN_NAMES:
-        reasons.append(f"call to '{name}' is outside the sanctioned surface (line {node.lineno})")
+
+    if isinstance(func, ast.Attribute):
+        base = _attribute_base(func)
+        if base == "ctx" and func.attr in allowed_ctx:
+            return
+        if base is not None and base in import_aliases:
+            return
+        target = f"{base}.{func.attr}" if base is not None else f"<expr>.{func.attr}"
+        reasons.append(f"call to '{target}' is outside the sanctioned surface (line {node.lineno})")
+        return
+
+    # Any other call-target shape (subscript, lambda, call-result, ...): fail closed.
+    reasons.append(f"call target is not a sanctioned name or attribute call (line {node.lineno})")
 
 
 def _attribute_base(node: ast.Attribute) -> str | None:
