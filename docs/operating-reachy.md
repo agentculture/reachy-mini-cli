@@ -386,6 +386,44 @@ vars override the built-in default.
 | `REACHY_STT_LANGUAGE` | `en` | STT language hint | `sleep/wakeword.py` |
 | `REACHY_STT_TIMEOUT` | `2.0` (seconds) | Per-request STT socket timeout (kept short so a wake check never stalls the loop) | `sleep/wakeword.py` |
 
+### Cortex role switch — agent tool-use
+
+The LLM endpoint behind `REACHY_OPENAI_*` is a **lobes** gateway that serves more
+than one model **role** at the same base URL — only `REACHY_OPENAI_MODEL_ID`
+picks the role; `REACHY_OPENAI_URL_BASE` does not change. The box's boot config
+lives in one file:
+
+```text
+~/.config/environment.d/10-reachy-llm.conf
+```
+
+Today that file pins the **`senses`** role for day-to-day live cognition — a
+Gemma model (`coolthor/gemma-4-12B-it-NVFP4A16`, proxied to a peer box) tuned for
+reacting to raw perception. **Agent tool-use** (an LLM turn that calls `speak` /
+`harmonics` / `apply_pose` as tools instead of the `*emoji*`/`"speech"` marker
+convention) targets the **`cortex`** role instead — the model verified to emit
+`tool_calls` reliably, with tool-call parsing handled server-side by the
+`qwen3_coder` parser:
+
+```bash
+REACHY_OPENAI_URL_BASE=http://localhost:8001                         # unchanged — same gateway
+REACHY_OPENAI_MODEL_ID=sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP       # cortex role
+```
+
+Edit `10-reachy-llm.conf`'s `REACHY_OPENAI_MODEL_ID` line to switch roles (a
+`loginctl` re-login or a reboot picks up `environment.d` changes); the URL base
+line does not need to change either direction. Whichever role is active, the
+client always sends `chat_template_kwargs: {"enable_thinking": false}` on every
+request (`speech/llm.py`'s `_build_request`) — thinking-mode output is never
+requested from either model.
+
+**This switch only matters for agent-cognition live mode.** `think` / `say` keep
+using whatever role `REACHY_OPENAI_MODEL_ID` currently names — their marker-based
+(`*emoji*`/`"speech"`) cognition works against either role and has no opinion on
+which one is configured. Nothing about `think`'s or `say`'s defaults changes when
+you flip the role; only the agent tool-use path cares that `cortex` is the one
+verified for `tool_calls`.
+
 ---
 
 ## Troubleshooting
