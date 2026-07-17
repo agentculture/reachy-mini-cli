@@ -35,6 +35,7 @@ from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.cli._export import add_export_args, build_export_hook
+from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.motion import supervisor
 from reachy.motion.listen import ListenParams, ListenProducer, SampleHolder
@@ -1410,6 +1411,7 @@ def _orienting_banner(
 
 
 def cmd_listen_run(args: argparse.Namespace) -> int:
+    install_logging(getattr(args, "log_level", None))
     json_mode = bool(getattr(args, "json", False))
     # Export sink (None unless `--export -`) and the --transcribe opt-in. Both are
     # validated *before* get_transport so a bad combo (e.g. --transcribe without
@@ -1537,6 +1539,7 @@ def _register_run(noun_sub: argparse._SubParsersAction) -> None:
     _add_voice_engine_arg(run)
     _add_cognition_arg(run)
     add_export_args(run)
+    add_log_level_arg(run)
     run.add_argument(
         "--max-ticks",
         type=int,
