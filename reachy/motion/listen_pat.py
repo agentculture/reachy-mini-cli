@@ -28,7 +28,10 @@ seam. On every tick it:
   the whole reaction), and opens a **reaction window** of
   :func:`~reachy.motion.pat_reaction.reaction_duration` seconds during which it
   keeps the flag up and **stops sensing** — so the robot's own deliberate lean is
-  never mistaken for a fresh pat.
+  never mistaken for a fresh pat, and
+* optionally feeds the same detection to cognition — one cue per reaction cycle —
+  via an injected duck-typed ``buffer`` (see :class:`PatHook`'s ``buffer``
+  parameter and :meth:`~reachy.speech.events.EventBuffer.feed_pat`).
 
 **Motion-in-flight gating (the false-fire fix).** ``commanded_head`` is the
 *target* of the last dispatched ``goto``, but a minjerk move takes >1 s in
@@ -61,6 +64,7 @@ so the hook inherits the loop's determinism with no extra clock seam.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 from reachy.cli._errors import CliError
@@ -68,6 +72,8 @@ from reachy.motion import pat_signal
 from reachy.motion.pat import PatDetector
 from reachy.motion.pat_reaction import PatReaction, reaction_duration
 from reachy.motion.queue import MotionQueue
+
+logger = logging.getLogger(__name__)
 
 #: The pre-first-action commanded head pose ``listen`` rests at before it has
 #: dispatched any move. The loop hands the *actual* last-dispatched head pose to
@@ -102,6 +108,20 @@ class PatHook:
         Wire it to the loop's published ``busy_until`` horizon (see
         :func:`reachy.motion.server.run`'s ``busy`` argument). ``None`` (the default,
         used by the direct-seam unit tests) senses every tick as before.
+    buffer:
+        An optional duck-typed cognition sink exposing ``feed_pat(kind, level)``
+        (the shape of :meth:`~reachy.speech.events.EventBuffer.feed_pat`) — kept
+        loose rather than typed as ``EventBuffer`` so this module does not need to
+        import ``reachy.speech.events`` (mirrors how ``transport`` above is typed
+        as ``object``). On every detection the hook calls
+        ``buffer.feed_pat(touch_type, level)`` **once**, right alongside the
+        reflex — the same reaction-window suppression that already limits
+        detections to one per cycle naturally caps the cue to one per cycle too.
+        The feed is fault-isolated: a raising buffer is logged and swallowed (see
+        :meth:`_sense_and_maybe_react`), so a broken cognition sink can never stop
+        the lean from being enqueued or the ``pat_active`` window from opening.
+        ``None`` (the default) keeps this hook byte-identical to before — no cue,
+        no buffer call, no behavior change.
     """
 
     def __init__(
@@ -110,12 +130,15 @@ class PatHook:
         *,
         detector: PatDetector | None = None,
         motion_busy: Callable[[float], bool] | None = None,
+        buffer: object | None = None,
     ) -> None:
         self.queue = queue
         self.detector = detector if detector is not None else PatDetector()
         self.reaction = PatReaction(queue=queue)
         #: Optional probe: given the loop time, ``True`` while a commanded move is in flight.
         self._motion_busy = motion_busy
+        #: Optional duck-typed cognition sink: ``feed_pat(kind, level) -> None``.
+        self._buffer = buffer
         #: Wall-clock (loop-clock) time until which sensing is paused and the flag held.
         self._reacting_until = 0.0
         #: Whether the ``pat_active`` flag is currently raised by this hook.
@@ -178,7 +201,11 @@ class PatHook:
         commanded``) and ``listen``'s own idle/orient motion never false-fires. When
         a re-baseline is armed (this is the first sensing pass after a suspension)
         the detector is reset first, so the freshly-read settled pose seeds a clean
-        zero-deviation baseline. On an event it enqueues the lean, resets the
+        zero-deviation baseline. On an event it enqueues the lean (the reflex,
+        unconditional), then — if a ``buffer`` was injected — feeds the same
+        ``(touch_type, level)`` as a cue via ``buffer.feed_pat``, wrapped in its own
+        ``try/except`` so a raising buffer degrades to "no cue" and never prevents
+        the reflex or the reaction window that follows. Finally it resets the
         detector, raises the ``pat_active`` flag, and opens the reaction window.
         """
         commanded_pitch = float(commanded_head.get("pitch", 0.0))
@@ -199,6 +226,11 @@ class PatHook:
             return
         level, touch_type = event
         self.reaction.react(touch_type, level)
+        if self._buffer is not None:
+            try:
+                self._buffer.feed_pat(touch_type, level)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 — a raising buffer must never break the reflex
+                logger.warning("PatHook buffer feed raised; cue dropped", exc_info=True)
         self.detector.reset()
         pat_signal.write()
         self._flag_up = True
