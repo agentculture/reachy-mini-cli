@@ -118,3 +118,6 @@ skips = ["B101", "B404", "B603"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "offline: success-list paths (boot, breathe, orient-to-sound, pat, sleep/wake, rules) run with every service endpoint pointed at an unreachable address and real network calls blocked; see tests/conftest.py's _offline_guard fixture.",
+]

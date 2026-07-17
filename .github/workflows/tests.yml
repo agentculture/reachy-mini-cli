@@ -37,6 +37,21 @@ jobs:
         env:
           SONAR_HOST_URL: https://sonarcloud.io
 
+  offline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+
+      - run: uv python install 3.12
+
+      - run: uv sync
+
+      - run: uv run pytest -m offline -q
+
   lint:
     runs-on: ubuntu-latest
     permissions:
