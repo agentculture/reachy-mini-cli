@@ -887,6 +887,532 @@ FORGE_BASE_URL=http://localhost:8001/v1 FORGE_MODEL=qwen3 \
 
 ---
 
+## The symbolic runtime
+
+Every noun covered so far either needs a human at the keyboard or an LLM
+endpoint to feel alive. The **symbolic runtime** is the third option: a
+deterministic, rules-driven presence that runs the robot with **zero LLM
+calls** — and that an external AI agent can *attach to* rather than replace.
+It is built from three pieces already in this repo: the `behavior` engine (the
+50 Hz tick loop), a declarative `rules.toml` (react/inhibit rules + modes),
+and the `agent` noun (an external attach client acting through an intents
+spool). This chapter walks all three end to end, for the three kinds of
+client that read this repo: a **human** at the shell, a **script** driving
+`--json` + exit codes, and an **AI agent** attached over the runtime's own
+event feed.
+
+### What it is — the deterministic, AI-agnostic presence
+
+`reachy-mini-cli behavior engine run` (see the `behavior` noun above) already
+drives a persistent 50 Hz loop: every tick it drains a command spool, decides
+one **owner per channel** (`head` / `antennas` / `body_yaw`) by the
+passive/stoppable/unstoppable/stopping contention model (`reachy-mini-cli
+explain behavior` has the full class-priority table), composes a complete
+pose, and streams it. `feel-alive` seeds the loop as a passive base layer, so
+an idle robot keeps breathing on any channel nothing else claims.
+
+The **tick seam** (`reachy.behavior.engine.TickContext`, handed to
+`engine.run(tick_seam=...)`) is the one integration point every rider shares —
+the rules evaluator, the intents driver, the goto lane, and the export feed
+all hook in here without the engine importing any of them. Each tick a rider
+gets: `ctx.now`/`ctx.tick` (the injected clock + counter), `ctx.sense` (this
+tick's perception snapshot), `ctx.ownership` (who currently owns each
+channel), `ctx.emit(event)` (publish a structured event — the same events the
+runtime feed below serializes), and `ctx.admit(behavior)` /
+`ctx.evict(name)` (add/remove from the active set). `TickBus` composes
+several riders (drivers that act, consumers that observe) onto that one seam;
+`reachy.behavior.rule_engine.compose_rule_seam` is the constructor `behavior
+engine run` uses to wire a loaded `RulesConfig` in.
+
+Two more things worth naming:
+
+- **Arbitration** (`reachy.behavior.arbitration.arbitrate`) runs every tick,
+  independent of rules: given the live behaviors in admission order, it picks
+  one owner per channel by `(class priority, recency)`. Rules don't bypass
+  this — a react rule's admitted behavior still has to win arbitration like
+  anything else; an `unstoppable` incumbent still beats it.
+- **The heartbeat** is the engine's own periodic `state.json` publish — every
+  tick the active set changes, or otherwise every `compose_hz / 2` ticks
+  (roughly twice a second at the default 50 Hz) — which is what
+  `reachy-mini-cli behavior status` reads. It is a *publish* cadence, not a
+  perception cadence: the tick loop itself still runs at the full
+  `--compose-hz`.
+
+None of this needs a network call or an LLM. `RulesConfig`, the rule
+evaluator, and the arbitration core are pure, stdlib-only functions of
+(rules, perception, clock) — that is the whole basis for the [zero-token
+rationale](#the-zero-token-rationale) below. An AI agent is optional and
+external: `reachy-mini-cli agent attach` (the `agent` noun) reads the
+runtime's own event feed and acts through the SAME command spool
+`behavior run`/`stop` already use (a separate, namespaced corner of it — see
+[the agent walkthrough](#agent--attach-over-the-runtime-feed-and-the-intent-spool)
+below) — it never edits a unit file, never restarts the loop, and never opens
+the robot's SDK itself. Detaching the agent changes nothing about the loop:
+ticks and rules keep running either way.
+
+### The rules.toml walkthrough
+
+`behavior engine run` optionally loads a declarative rules file **once at
+boot** — `reachy.behavior.rules.load_rules` / `RulesConfig.from_dict` is the
+single validation gate (mirrors `reachy.stash.record.StashRecord.from_dict`):
+every field is checked against a fixed declarative schema, and anything
+smelling of code (an unknown field, a non-JSON value, an unknown
+behavior/mode name) is refused with a specific, actionable message — there is
+no `fn`/`code`/`exec` escape hatch anywhere in this file format.
+
+**Where it lives:** `<state_dir>/behavior/rules.toml` —
+`reachy.behavior.rules.default_rules_path()`, i.e.
+`$XDG_STATE_HOME/reachy/behavior/rules.toml` (`~/.local/state/reachy/behavior/rules.toml`
+by default, or under `$REACHY_STATE_DIR` if set). A MISSING file is not an
+error: it resolves to an empty, inert config ("no rules configured yet") and
+the engine runs on `feel-alive` alone.
+
+**A complete example** — react rules keyed on speech, on loudness, and on
+"quiet since boot"; one inhibit rule; and two named modes (the sense fields
+are exactly `doa`/`speech`/`rms`/`pat`/`face` — the live perception surface;
+there is deliberately no battery/power field anywhere in this schema, because
+the robot's state surface is joints + pose only):
+
+```toml
+active_mode = "calm"
+
+[[react]]
+id = "orient-to-speech"
+when = { field = "speech", op = "is_true" }
+run = "gaze-hold"
+params = { yaw = 20.0, pitch = 5.0 }
+cooldown_s = 3.0
+hysteresis = 0.5
+
+[[react]]
+id = "loud-nod"
+when = { field = "rms", op = "gt", value = 0.05 }
+run = "nod"
+
+[[react]]
+id = "wake-sway"
+when = { field = "doa", op = "absent_for", value = 0 }
+run = "antenna-sway"
+cooldown_s = 30.0
+
+[[inhibit]]
+id = "quiet-while-patted"
+when = { field = "pat", op = "is_true" }
+disable = ["feel-alive", "antenna-sway"]
+cooldown_s = 2.0
+
+[modes.calm]
+energy = 0.5
+
+[modes.playful]
+energy = 1.5
+```
+
+Every rule (react or inhibit) carries `cooldown_s` (minimum seconds between
+two firings, default 5.0) and `hysteresis` (an anti-flap re-arm guard: after a
+rule fires, its predicate must read `False` continuously for at least
+`hysteresis` seconds before it may fire again; `0.0` means cooldown alone
+governs). A predicate's `op` is one of the ordered comparators
+(`lt`/`gt`/`ge`/`le`, numeric `value` required), equality (`eq`/`ne`, any
+scalar `value`), boolean presence (`is_true`/`is_false`, no `value`), or
+`absent_for` (a non-negative seconds `value`: "this field has read
+absent/`None` continuously for at least this long"). `[modes.<name>]` is a
+flat, purely declarative `name -> number` bag; `active_mode` selects which one
+applies (defining modes with no `active_mode` set, or naming an undefined
+mode, are both schema errors).
+
+**Reload semantics.** `reachy-mini-cli behavior reload` drops a command into a
+*separate* reload spool (`reload_dir()`, distinct from the engine's main
+`add`/`stop` command spool — `engine.py` itself is never taught a new op) that
+the running engine's `ReloadDriver` drains at a deterministic point **between
+ticks**, never mid-composition. `RulesLoader.reload()` keeps the **last-good**
+config on any failure: a candidate that fails to parse or validate never
+clobbers a previously-good running config — it only records why the candidate
+was rejected. A successful reload swaps in immediately, with no restart, and
+reports `{"ok": true, "path": ..., "react": <n>, "inhibit": <m>}`.
+
+**Boot resilience.** A PRESENT but malformed rules file at boot is rejected
+*without crashing the process*: the engine falls back to bare base presence
+(`feel-alive` only, no rule seam at all) and logs exactly one
+`[SENSE stage=rule source=rules event=boot] dropped reason=...` line (via
+`reachy.senselog`) naming every problem the validator found, plus a
+WARNING-level line from the loader itself. Verified directly — pointing
+`behavior engine run` at a rules file that names an unknown behavior prints,
+with no logging configuration at all:
+
+```text
+rules reload: keeping last-good config for <state_dir>/behavior/rules.toml (react[0].run: unknown behavior 'not-a-real-behavior')
+[behavior] engine live: 50 Hz via http + base layer (rules rejected — base presence only); Ctrl-C to stop
+```
+
+The process keeps running (exit 0 on a clean stop) — an operator's typo in
+`rules.toml` can never trip a systemd `Restart=on-failure` crash loop. The
+underlying `[SENSE stage=rule source=rules event=boot]` line is genuinely
+emitted (it is what the WARNING line above summarizes for a human), but at
+INFO level; unlike `listen run`/`think run`/`sleep run`, `behavior engine run`
+does not yet call `reachy.cli._logging.install_logging` at entry, so that
+INFO line has no attached handler and stays invisible on stderr by default
+today — the WARNING-level summary above is what you actually see without
+configuring logging yourself.
+
+> **Status — which predicates actually fire live today.** The rule evaluator
+> itself is fully built and tested against every `SENSE_FIELDS` predicate
+> (`reachy.behavior.rule_engine`, exercised directly with an injected sense
+> source in `tests/test_behavior_rule_engine.py` and
+> `tests/test_offline_lane.py::test_rules_file_changes_robot_behavior_in_a_bounded_run`).
+> But the shipped `reachy-mini-cli behavior engine run` command
+> (`reachy/cli/_commands/behavior.py::cmd_engine_run`) does not yet pass a
+> live sense source into the engine loop — no DoA poller, no RMS/pat/face
+> reader — the same way `listen`/`think`/`sleep` wire one for themselves. So
+> today `ctx.sense` inside a running `behavior engine run` process stays at
+> its "no reading" default every tick, and only an `absent_for` predicate
+> (true from tick one, since the field has never had a reading) is
+> practically triggerable — exactly the `wake-sway` rule above, and exactly
+> what the [zero-token verification recipe](#the-zero-token-rationale) below
+> exercises. `speech`/`rms`/`pat`/`face` predicates validate, render, and
+> reload cleanly today; wiring them to react to the *live* robot is the next
+> composition step, not yet part of this wave.
+
+### Human — behavior verbs end to end
+
+```bash
+reachy-mini-cli daemon start                              # something for the engine to drive
+
+# find + populate the rules file the engine will load at boot (the example above)
+RULES_PATH=$(reachy-mini-cli behavior rules --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])')
+mkdir -p "$(dirname "$RULES_PATH")"
+cat > "$RULES_PATH" <<'EOF'
+active_mode = "calm"
+
+[[react]]
+id = "orient-to-speech"
+when = { field = "speech", op = "is_true" }
+run = "gaze-hold"
+params = { yaw = 20.0, pitch = 5.0 }
+cooldown_s = 3.0
+hysteresis = 0.5
+
+[[react]]
+id = "loud-nod"
+when = { field = "rms", op = "gt", value = 0.05 }
+run = "nod"
+
+[[react]]
+id = "wake-sway"
+when = { field = "doa", op = "absent_for", value = 0 }
+run = "antenna-sway"
+cooldown_s = 30.0
+
+[[inhibit]]
+id = "quiet-while-patted"
+when = { field = "pat", op = "is_true" }
+disable = ["feel-alive", "antenna-sway"]
+cooldown_s = 2.0
+
+[modes.calm]
+energy = 0.5
+
+[modes.playful]
+energy = 1.5
+EOF
+
+reachy-mini-cli behavior rules check                       # lint it (never a hard error on content)
+reachy-mini-cli behavior rules                              # render the loaded react/inhibit/modes
+
+reachy-mini-cli behavior engine start                       # bring the 50 Hz loop up (background)
+reachy-mini-cli behavior status                              # active behaviors + ownership + rules health
+
+# edit the file (e.g. bump loud-nod's threshold), then push it into the
+# ALREADY-RUNNING engine — no restart:
+reachy-mini-cli behavior reload
+
+reachy-mini-cli behavior run gaze-hold --set yaw=15 --once   # a one-off, alongside the rules
+reachy-mini-cli behavior stop all                            # stop everything but the idle base
+reachy-mini-cli behavior engine stop                          # eases the robot to neutral
+```
+
+`behavior status`'s `rules` block reports the file's health without touching
+a running engine (`{"path", "exists", "ok", "react", "inhibit", "modes"}`, and
+`"error"` when the last load was rejected) — an operator can always tell
+whether the presence they're watching is running with rules or on bare
+`feel-alive`.
+
+### Script — `--json`, exit codes, and the runtime feed
+
+A script cares about two things beyond what the human sees above: a
+machine-readable result on every verb, and a way to *observe* the runtime
+without polling. Both are already wired.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+reachy-mini-cli daemon start --json >/dev/null
+
+# rules check never fails on a CONTENT problem (only an unreadable path is a
+# hard exit-2) — read its "ok" field explicitly instead of trusting $?.
+ok=$(reachy-mini-cli behavior rules check --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["ok"])')
+if [ "$ok" != "True" ]; then
+  echo "rules.toml rejected — see 'reachy-mini-cli behavior rules check' for reasons" >&2
+  exit 1
+fi
+
+# an ACTUAL user error does exit non-zero, with a JSON {code,message,remediation}
+# object on stderr (never stdout — results and errors never mix). Capture $? right
+# after the command, not inside a '! cmd; then' branch (that would report the
+# NEGATED status instead):
+set +e
+reachy-mini-cli behavior run not-a-real-behavior --json 2>err.json
+code=$?
+set -e
+echo "exit=$code"; cat err.json
+# exit=1
+# {"code": 1, "message": "unknown behavior 'not-a-real-behavior'", "remediation": "list them with 'reachy behavior list' (have: feel-alive, gaze-hold, nod, shake, speak, thoughtful, antenna-sway, body-turn-hold)"}
+
+# bring the engine up in the FOREGROUND, tapping its own runtime feed to a file
+# ('engine start' is the tracked background form and has no --export; only the
+# foreground 'engine run' streams the feed).
+reachy-mini-cli behavior engine run --export - > runtime.jsonl &
+engine_pid=$!
+sleep 1   # let tick 1 land
+
+# drive the SAME running engine through the spool — pass --no-ensure-engine,
+# since this process was started directly (no supervisor PID file) rather than
+# via 'behavior engine start', which is what auto-start normally checks for.
+reachy-mini-cli behavior run gaze-hold --set yaw=15 --once --no-ensure-engine --json
+reachy-mini-cli behavior status --json
+
+kill "$engine_pid"; wait "$engine_pid" 2>/dev/null || true
+```
+
+A captured `runtime.jsonl` line looks like this (one compact JSON object per
+line, `t`/`ts`/`tick` always first — see
+[the wire format](export-schema.md#wire-format-1)):
+
+```json
+{"t":"rule","ts":1752345678.9,"tick":1,"action":"fire","rule":"wake-sway","kind":"react","field":"doa","op":"absent_for","reason":"fired","behavior":"antenna-sway","disable":[]}
+{"t":"sense","ts":1752345678.9,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false}
+```
+
+### Agent — attach over the runtime feed and the intent spool
+
+`reachy-mini-cli agent attach` is the external AI-agent client. It never
+spawns the runtime and never opens the robot's SDK — it only reads the
+runtime's own event feed and writes into the intents spool the same way
+`behavior run`/`stop` write into the main one:
+
+```bash
+reachy-mini-cli behavior engine run --export - > runtime.jsonl &   # the runtime (terminal 1)
+reachy-mini-cli agent attach --feed runtime.jsonl --export -       # the agent  (terminal 2)
+```
+
+Three seams, all real and independently useful:
+
+- **INPUT** — `--feed <path|->` tails the runtime's JSONL feed (a
+  `sense`/`rule`/`intent`/`motion` line). Each event is mapped to a short
+  first-person perception cue (`"speech from the left"`,
+  `"a behavior rule fired (wake-sway): now doing antenna-sway"`,
+  `"felt a gentle scratch on the head"`, ...) and buffered for the agent's
+  next turn — the same cue vocabulary the folded `listen --live` cognition
+  path already uses.
+- **COGNITION** — a tool-use engine (`AgentTurnEngine`) wired with the **four
+  intent tools** (`reachy.speech.intent_tools.register_intent_tools`):
+  `run_behavior` (one-time admission), `declare_goal` (a STANDING goal the
+  engine keeps re-admitting every tick with no further call),
+  `set_mode` (swap the active rules mode), and `set_inhibition` (block a set
+  of behaviors from admission). Each call is validated against the real
+  behavior/mode catalog *before* anything is written (an unknown name comes
+  back as an error tool-result naming the valid keys), then submitted as an
+  atomic, durable command into the intents spool
+  (`<state_dir>/behavior/intents/commands/`) and awaited up to
+  `--await-timeout` seconds (default 1.0) for the engine's confirmation. The
+  built-in `speak`/`harmonics`/`apply_pose` tools are present too, but wired
+  **publish-only** — they still emit `message`/`emotion` blocks to the
+  agent's own feed, but never touch the robot, matching the single-SDK-owner
+  rule that the *runtime* loop is the only thing that owns the robot.
+- **OUTPUT** — `--export -` / `--export-blocks` publish the agent's **own**
+  `thinking`/`message`/`emotion` feed, through the exact same exporter
+  `think run --export -` uses (see [the two-feed
+  contract](#the-two-feed-contract) below).
+
+```bash
+reachy-mini-cli agent attach \
+  --feed runtime.jsonl \
+  --await-timeout 1.0 \
+  --max-turns 5 --max-events 200 \
+  --export -
+```
+
+(`--spool-dir DIR` overrides the intents-spool root, mainly for test
+isolation — the default already resolves to the same state dir every other
+bookkeeping file lives under, so a normal attach needs no override.)
+
+> **Status — closing the loop into live admission.** The intent-tool call and
+> the spool write are real today: `run_behavior`/`declare_goal`/`set_mode`/
+> `set_inhibition` each atomically write a durable command and wait for a
+> confirmation. What is **not yet wired** is a live drainer: applying an
+> intent to a *running* engine needs `reachy.behavior.intents.IntentDriver`
+> composed into that engine's tick seam (exactly the pattern
+> `tests/test_agent.py`'s criterion-3 tests and `tests/test_behavior_intents.py`
+> exercise directly, composing it via
+> `compose_rule_seam(config, drivers=(IntentDriver(...),))`), and the shipped
+> `reachy-mini-cli behavior engine run` does not add `IntentDriver` to its own
+> `TickBus` yet (it composes the rules evaluator and a sense-snapshot
+> publisher only — see `reachy/cli/_commands/behavior.py::cmd_engine_run`).
+> So, run against today's `behavior engine run`, an intent tool call
+> round-trips cleanly but degrades to
+> `{"ok": null, "submitted": "<id>", "note": "engine did not confirm in time — is the behavior engine running?"}`
+> rather than an applied result — a graceful, well-defined outcome (never a
+> crash or a hang), not a silent no-op. The walkthrough above is genuinely
+> end-to-end runnable for FEED → CUE → TOOL CALL → SPOOL WRITE → the agent's
+> own cognition feed; closing the last hop (the running engine actually
+> admitting the behavior) is composition work the intents module and its
+> tests already prove out, just not yet threaded through this CLI command.
+
+### The two-feed contract
+
+Two separate, non-overlapping JSONL contracts describe the SAME robot from
+two angles, and they are never mixed on one stream (full wire format:
+[`docs/export-schema.md`](export-schema.md)):
+
+```mermaid
+graph LR
+    TICK["behavior engine run<br/>(50 Hz tick: rules + arbitration)"]
+    TICK -->|"--export -"| RFEED["runtime feed<br/>sense / rule / intent / motion<br/>(no cognition block — ever)"]
+
+    RFEED --> HUMAN["Human<br/>behavior status / rules / reload"]
+    RFEED --> SCRIPT["Script<br/>--json + exit codes"]
+    RFEED --> AGENT["Agent<br/>reachy agent attach"]
+
+    AGENT -->|"run_behavior, declare_goal,<br/>set_mode, set_inhibition"| SPOOL["intents spool"]
+    AGENT -->|"--export -"| CFEED["agent's own cognition feed<br/>thinking / message / emotion"]
+```
+
+- **The runtime feed** (`behavior engine run --export -`) is the
+  deterministic loop's OWN events: [perception snapshots
+  (`sense`)](export-schema.md#sense--perception-snapshot), [rule
+  fire/suppress decisions
+  (`rule`)](export-schema.md#rule--a-rule-engine-decision), [sustained
+  intents (`intent`)](export-schema.md#intent--a-sustained-symbolic-goal),
+  and [motion admissions/evictions
+  (`motion`)](export-schema.md#motion--a-behavior-admissioneviction-or-goto).
+  **No block type in this schema can represent an LLM call** — there is no
+  `thinking`/`message`/`emotion` type here at all.
+- **The cognition feed** (`think run --export -`, `listen run --live
+  --export -`, and — new here — `agent attach --export -`) is an LLM turn's
+  own `thinking`/`message`/`emotion` stream (full contract:
+  [Block Types](export-schema.md#block-types)). An attached agent publishes
+  its cognition through **this** family, never the runtime one — it does not
+  write into the runtime feed, and the runtime feed never carries a cognition
+  block (this is the `symbolic-runtime-70` spec's decision c27, and it is
+  also what makes the [zero-token rationale](#the-zero-token-rationale)
+  below directly provable from the wire format rather than from log-reading).
+
+A human, a script, and an attached AI agent can therefore all observe the
+same robot at the same time, from two angles that never collide: "what did
+the deterministic runtime do" (the runtime feed) versus "what is the agent
+thinking" (the cognition feed) — see also [`docs/export-schema.md`'s Runtime
+Event Feed
+section](export-schema.md#runtime-event-feed-behavior-engine-run---export--)
+for the field-by-field contract every consumer (this repo's `agent` noun, or
+a wholly external one) can build against with no Python import required.
+
+### External AI legs stay optional plug-ins
+
+Nothing in the symbolic runtime needs a network call. `behavior`, `rules`,
+`reload`, and the rule evaluator are pure stdlib (`tomllib` + dataclasses);
+the `agent` noun's runtime-feed reading and intent-tool spool writes are pure
+stdlib too — only its COGNITION step (the LLM turn) reaches out. The
+lobes/model-gear legs this repo *also* knows how to reach — the LLM
+(`REACHY_OPENAI_*`, for `think`/agent cognition), TTS (`REACHY_TTS_URL`, for
+`say`/`think`/agent `speak`), STT (`REACHY_STT_URL`, wake-word/transcription),
+scene embeddings, the VLM (`REACHY_VISION_MODEL_ID`), and the `forge`
+self-extension loop (`FORGE_BASE_URL`) — all remain available, but nothing in
+the *runtime* depends on any of them. They are optional plug-ins an attached
+agent reaches for when it wants to speak or reason, layered *on top of* a
+presence that already works without them.
+
+This is proven, not asserted: `tests/test_offline_lane.py` is a dedicated
+"success list" that exercises **boot** (`behavior engine run` composing with
+a rules file), **breathe** (the `feel-alive` base layer), **orient-to-sound**
+(`ListenProducer`), **pat** (detect → react), **sleep/wake**, and **rules**
+(a rule flipping channel ownership) end to end with **every** service
+endpoint pointed at an unreachable address:
+
+```bash
+uv run pytest -m offline -v
+```
+
+The module's own `_offline_guard` fixture (`tests/conftest.py`) additionally
+patches `socket.create_connection`/`socket.socket().connect` to hard-fail with
+`AssertionError: offline lane: network call attempted` for the duration of any
+`@pytest.mark.offline` test — so a hidden network dependency introduced later
+in one of these paths is a loud CI failure, never a silent pass or a hang.
+
+### The zero-token rationale
+
+Sustained presence — the robot breathing, orienting, reacting to a rule —
+spends **zero LLM tokens** as long as it is running on the deterministic
+runtime alone. Only an agent-initiated turn (an attached `agent attach`
+process actually calling the LLM to reason about what it perceived) spends
+any. This is a structural property of the wire format, not a behavioral
+promise that could quietly regress: [the runtime feed's schema has no
+block type that can represent an LLM call](#the-two-feed-contract) — so
+"this run made zero LLM calls" is provable by inspecting the feed's `t`
+values alone, with no log-grepping and no trust required in what the process
+"claims" to be doing.
+
+**Verification recipe** — run the engine with a rules file, capture its
+runtime feed, and prove both halves at once (no LLM calls made, and the rules
+did something):
+
+```bash
+reachy-mini-cli daemon start
+RULES_PATH=$(reachy-mini-cli behavior rules --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])')
+mkdir -p "$(dirname "$RULES_PATH")"
+cat > "$RULES_PATH" <<'EOF'
+[[react]]
+id = "wake-sway"
+when = { field = "doa", op = "absent_for", value = 0 }
+run = "antenna-sway"
+cooldown_s = 30.0
+EOF
+
+reachy-mini-cli behavior engine run --export - --max-ticks 50 > runtime.jsonl
+```
+
+```bash
+python3 -c '
+import json
+types = set()
+with open("runtime.jsonl") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        types.add(json.loads(line)["t"])
+assert types <= {"sense", "rule", "intent", "motion"}, f"an LLM-shaped block leaked in: {types}"
+assert "rule" in types, "the rules file never fired"
+print("zero-token proof holds — block types seen:", sorted(types))
+'
+```
+
+The exported feed is the always-available proof precisely because it needs no
+logging configuration: `reachy.senselog` also emits one INFO-level
+`[SENSE stage=rule ...]` line per fire/suppress decision, the same
+grep-able grammar `listen`/`think`/`sleep run` use, but — see the [boot
+resilience](#the-rulestoml-walkthrough) note above — `behavior engine run`
+does not yet wire a logging handler at entry the way those three do, so that
+INFO line is not visible on stderr without the caller configuring Python
+logging itself. The runtime feed's type-set check above has no such
+dependency: it is the CLI's actual documented output, always there, and
+already sufficient on its own. The moment an attached agent calls the LLM to
+decide what to say, that (and only that) is where tokens start being spent —
+a `thinking` block lands on the agent's *own* cognition feed, never on the
+runtime feed the rules-only proof above just checked.
+
+---
+
 ## Troubleshooting
 
 The CLI never leaks a Python traceback — every failure is a structured
@@ -1051,6 +1577,17 @@ so you can tell which voice a running loop uses without reading unit files.
 See [Boot persistence — one presence per reboot](#boot-persistence--one-presence-per-reboot)
 for the operator workflow.
 
+### Symbolic runtime (agent attach)
+
+| Noun | Does | Sense in | Motion out | Transport |
+|---|---|---|---|---|
+| `agent` | attach an external AI agent over the runtime's event feed; acts through the four intent tools (`run_behavior`/`declare_goal`/`set_mode`/`set_inhibition`) via the intents spool; publishes its own cognition feed | the `behavior engine run --export -` feed (`--feed`) | intent-spool commands, not the robot directly | none (feeds + intent spool, not the robot) |
+
+`behavior` (above, under [Idle presence](#idle-presence)) is the deterministic
+50 Hz engine `agent` attaches to. See [The symbolic
+runtime](#the-symbolic-runtime) for the rules.toml schema, the three
+end-to-end client walkthroughs, and the zero-token rationale.
+
 ### Agent-first introspection (no robot needed)
 
 `whoami`, `quickstart`, `learn`, `explain <path>`, `overview`, `doctor`, `cli` —
@@ -1060,6 +1597,13 @@ robot attached.
 ---
 
 ## Export feed & the external renderer
+
+This section covers the **cognition feed** — an LLM turn's own
+`thinking`/`message`/`emotion` stream. There is a second, separate feed: the
+deterministic **runtime feed** (`sense`/`rule`/`intent`/`motion`, produced by
+`behavior engine run --export -`, no LLM block type at all) — see [The
+symbolic runtime](#the-symbolic-runtime)'s [two-feed
+contract](#the-two-feed-contract) for how the two relate and never mix.
 
 `think run --export -` streams a live **newline-delimited JSON** (NDJSON) feed
 to stdout — one object per line, each with a block-type discriminator `t`
@@ -1095,6 +1639,12 @@ log strings end-to-end on real hardware — is tracked as a separate follow-up
 (it intentionally does not block the docs).
 
 - Implementation map for contributors: [`CLAUDE.md`](../CLAUDE.md)
+- [The symbolic runtime](#the-symbolic-runtime) — the deterministic,
+  zero-LLM-token presence (`behavior` + `rules.toml` + `agent attach`); its
+  [Status callouts](#agent--attach-over-the-runtime-feed-and-the-intent-spool)
+  track the two composition gaps left open by this wave: `behavior engine
+  run` does not yet wire a live sense source or the intents-spool drainer
+  (`IntentDriver`) into its tick bus
 - Per-noun flag reference: `reachy-mini-cli explain <noun>`
 - Export wire format: [`docs/export-schema.md`](export-schema.md)
 - SDK-transport rationale: [`docs/adr-0001-sdk-transport-extra.md`](adr-0001-sdk-transport-extra.md)
