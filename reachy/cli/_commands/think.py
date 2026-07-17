@@ -323,9 +323,9 @@ def _make_sdk_feed(transport: object, buffer: EventBuffer) -> Callable[[], None]
         sample = session.get_audio_sample()
         rms = float(np.sqrt(np.mean(sample**2))) if sample is not None else 0.0
         _feed_doa(buffer, sense, rms)
-        # Vision cues (camera motion + light) are not fed here yet — tracked in
-        # issue #32. The engine already consumes any cues the buffer holds, so
-        # wiring buffer.feed_vision() later is additive (see reachy.vision.*).
+        # Vision cues are fed by the folded VisionHook under `listen --live`
+        # (buffer.feed_vision, issue #32) — standalone `think run` remains
+        # audio-only by design; the engine consumes any cues the buffer holds.
 
     def _close() -> None:
         if cm is not None:

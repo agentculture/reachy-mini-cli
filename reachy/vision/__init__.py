@@ -22,7 +22,7 @@ face recognition, ported from ``reachy_nova``:
   against a temporary (TTL) and a permanent (persisted) tier of embeddings.
   Pure ``numpy`` + stdlib; importable and testable with no ``cv2`` present.
 
-Wiring these into the live ``listen --live`` loop (a ``FaceHook``, the
-``feed_face`` cue, and an enrollment seam) is a separate, later task — this
-package only ships the engine + store.
+The live ``listen --live`` wiring rides on top: ``reachy/motion/listen_face.py``
+``FaceHook`` feeds the ``feed_face`` cue from the shared frame provider, and
+``scripts/face_enroll.py`` is the operator enrollment seam.
 """
