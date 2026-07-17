@@ -244,7 +244,10 @@ class ForgeClient:
     def _run_inner(self, goal: str, context: dict, improve: str | None) -> None:
         base_url = os.environ.get("FORGE_BASE_URL") or DEFAULT_FORGE_BASE_URL
         model = os.environ.get("FORGE_MODEL") or DEFAULT_FORGE_MODEL
-        api_key = os.environ.get("FORGE_API_KEY")
+        # One gateway, one key: the coder endpoint shares the lobes gateway
+        # with cognition, so the LLM key authenticates forge too unless a
+        # dedicated FORGE_API_KEY overrides it.
+        api_key = os.environ.get("FORGE_API_KEY") or os.environ.get("REACHY_OPENAI_API_KEY")
 
         url = base_url.rstrip("/") + "/chat/completions"
         headers = {"Content-Type": "application/json"}

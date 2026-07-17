@@ -68,6 +68,7 @@ def state(tmp_path, monkeypatch):
     monkeypatch.delenv("FORGE_BASE_URL", raising=False)
     monkeypatch.delenv("FORGE_MODEL", raising=False)
     monkeypatch.delenv("FORGE_API_KEY", raising=False)
+    monkeypatch.delenv("REACHY_OPENAI_API_KEY", raising=False)
     return tmp_path
 
 
@@ -126,6 +127,25 @@ def test_posts_to_default_lobes_gateway_url_and_qwen3(state):
     assert url == "http://localhost:8001/v1/chat/completions"
     assert payload["model"] == "qwen3"
     assert "Authorization" not in headers
+
+
+def test_apikey_falls_back_to_reachy_openai_key(state, monkeypatch):
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "gateway-key")
+    pub = _Recorder()
+    transport = _FakeTransport(response=_reply(_GOOD_CONTENT))
+    _run(ForgeClient(pub, validator=lambda d: (True, []), transport=transport), "g")
+    _url, _payload, headers, _timeout = transport.calls[0]
+    assert headers["Authorization"] == "Bearer gateway-key"
+
+
+def test_dedicated_forge_key_wins_over_fallback(state, monkeypatch):
+    monkeypatch.setenv("REACHY_OPENAI_API_KEY", "gateway-key")
+    monkeypatch.setenv("FORGE_API_KEY", "forge-key")
+    pub = _Recorder()
+    transport = _FakeTransport(response=_reply(_GOOD_CONTENT))
+    _run(ForgeClient(pub, validator=lambda d: (True, []), transport=transport), "g")
+    _url, _payload, headers, _timeout = transport.calls[0]
+    assert headers["Authorization"] == "Bearer forge-key"
 
 
 def test_env_overrides_url_model_and_apikey(state, monkeypatch):
