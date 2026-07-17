@@ -440,6 +440,7 @@ def _build_pat_hook(
     queue,
     *,
     motion_busy: Callable[[float], bool] | None = None,
+    buffer: object | None = None,
 ) -> PatHook | None:
     """A :class:`PatHook` bound to the loop's queue, or ``None`` when pat is off.
 
@@ -453,6 +454,16 @@ def _build_pat_hook(
     ``motion_busy`` is the ``(t) -> bool`` probe wired to the loop's published
     ``busy`` horizon (see :func:`_run_sdk_loop`); it lets the hook skip sensing
     while a commanded move is in flight so transit lag is never mistaken for a pat.
+
+    ``buffer`` lets the ``--live`` composition pass the SAME shared cognition
+    :class:`~reachy.speech.events.EventBuffer` the folded ThinkHook/agent engine
+    consumes (built up front in :func:`_run_sdk_loop`, before this hook, so the one
+    object exists in time — see the ``--live`` wiring there). A detected pat then
+    feeds cognition directly via :meth:`~reachy.speech.events.EventBuffer.feed_pat`,
+    bypassing the ``--transcribe`` engagement gate entirely (that gate only judges
+    transcribed WORDS, see ``reachy/speech/engagement.py``). ``None`` (the default,
+    always the case outside ``--live``, where no cognition buffer exists) keeps the
+    hook byte-identical to before this feature.
     """
     if not getattr(args, "pat", True):
         return None
@@ -464,7 +475,7 @@ def _build_pat_hook(
     if getattr(args, "min_presses", None) is not None:
         kw["min_presses"] = args.min_presses
     detector = PatDetector(**kw) if kw else None
-    return PatHook(queue, detector=detector, motion_busy=motion_busy)
+    return PatHook(queue, detector=detector, motion_busy=motion_busy, buffer=buffer)
 
 
 def _build_think_hook(
@@ -742,6 +753,7 @@ def _build_live_hooks(
     producer: object | None = None,
     voice_engine: VoiceEngine | None = None,
     cognition: str = DEFAULT_COGNITION,
+    buffer: object | None = None,
 ) -> list[object]:
     """Build the ``--live`` sense hooks in ``sleep > pat > think`` priority order.
 
@@ -755,11 +767,23 @@ def _build_live_hooks(
     ``on_tick``. ``export`` (an :class:`~reachy.export.exporter.ExportHook` or
     ``None``) is threaded into the think hook's engine to stream the cognition feed.
 
+    ``buffer`` is the shared cognition :class:`~reachy.speech.events.EventBuffer`
+    the caller (:func:`_run_sdk_loop`) builds up front, BEFORE constructing
+    ``pat_hook`` — so the SAME object is already threaded into ``pat_hook`` (via
+    :func:`_build_pat_hook`) by the time it reaches here. Passed straight through
+    as ``buffer=`` to :func:`_build_think_hook` / :func:`_build_agent_think_hook`
+    (whose own ``buf = buffer if buffer is not None else EventBuffer()`` fallback
+    means a caller that omits it, e.g. a direct unit-test call, still gets a fresh
+    buffer — just not one shared with ``pat_hook``). The result: a detected pat and
+    a folded cognition turn draw from the one buffer, so pat cues reach cognition
+    directly — no ``--transcribe``, no engagement gate (see ``buffer``'s own note
+    on :func:`_build_pat_hook`).
+
     ``transcribe`` (the ``--transcribe`` opt-in) additionally composes a
     :class:`~reachy.motion.listen_transcribe.TranscribeHook` that transcribes the
     loop's shared per-tick audio and feeds the recognised **words** into the SAME
-    :class:`~reachy.speech.events.EventBuffer` the cognition engine consumes — so the
-    composition layer creates one buffer here and wires it into both the engine (via
+    :class:`~reachy.speech.events.EventBuffer` the cognition engine (and, per above,
+    ``pat_hook``) consumes — wired into both the engine (via
     :func:`_build_think_hook`) and the transcribe hook. It also creates the shared
     self-mute window: a ``play_audio`` wrapper stamps ``mute["until"]`` after every
     spoken clip and the transcribe hook's ``mute_until`` reads it, so the robot never
@@ -807,10 +831,11 @@ def _build_live_hooks(
     sleep_hook = SleepHook(provider)
     vision_hook = VisionHook(queue=queue, transport=transport)
 
-    # The shared cognition buffer + self-mute window live here, at composition level,
-    # so the optional TranscribeHook feeds the SAME buffer the engine consumes and
-    # reads the SAME mute window the playback wrapper stamps.
-    think_buffer: object | None = None
+    # The shared cognition buffer (built by the caller, before pat_hook, and handed
+    # in as ``buffer``) + self-mute window live at composition level, so pat_hook
+    # and the optional TranscribeHook both feed the SAME buffer the engine consumes,
+    # and the transcribe hook reads the SAME mute window the playback wrapper stamps.
+    think_buffer: object | None = buffer
     mute = {"until": 0.0}
     # Only the non-default ("harmonic") engine gets an explicit samplerate override —
     # the default "tts" engine's rate already matches _make_self_mute_play_audio's own
@@ -827,8 +852,11 @@ def _build_live_hooks(
         mute, clock, playback_transport="http", samplerate=voice_samplerate
     )
 
-    if transcribe:
-        think_buffer = _make_transcribe_buffer()
+    if transcribe and think_buffer is None:
+        # A caller that supplied ``buffer`` (the real --live path) already has one;
+        # this only fires for a direct call (e.g. a unit test) that asked for
+        # ``transcribe`` without pre-building a buffer — matches prior behaviour.
+        think_buffer = _make_shared_cognition_buffer()
 
     # Under --transcribe, cognition is driven by transcribed WORDS only: the ThinkHook
     # stops pushing raw DoA/RMS sound cues, so the robot doesn't react to its own TTS
@@ -876,18 +904,22 @@ def _build_live_hooks(
     return ordered
 
 
-def _make_transcribe_buffer() -> object | None:
-    """The shared ``--transcribe`` cognition buffer, or ``None`` if unavailable.
+def _make_shared_cognition_buffer() -> object | None:
+    """The shared ``--live`` cognition :class:`~reachy.speech.events.EventBuffer`.
 
-    Built up front, at composition level, so it can be wired into both the
-    engine (via :func:`_build_think_hook`) and the TranscribeHook.
+    ``None`` if the module is unavailable. Built up front, at composition level
+    (:func:`_run_sdk_loop`, and — for a caller that skips that step — as a fallback
+    inside :func:`_build_live_hooks`), so the ONE object can be wired into
+    ``pat_hook`` (:func:`_build_pat_hook`), the think/agent engine
+    (:func:`_build_think_hook` / :func:`_build_agent_think_hook`), and — under
+    ``--transcribe`` — the TranscribeHook.
     """
     try:
         from reachy.speech.events import EventBuffer
 
         return EventBuffer()
     except Exception:  # noqa: BLE001
-        logger.warning("listen --live --transcribe: EventBuffer unavailable", exc_info=True)
+        logger.warning("listen --live: shared EventBuffer unavailable", exc_info=True)
         return None
 
 
@@ -1091,6 +1123,14 @@ def _run_sdk_loop(
     :func:`_resolve_cognition`) selects the folded engine behind the ThinkHook seam
     (``"marker"`` default, ``"agent"`` for the tool-use engine); it is likewise a
     live-only choice.
+
+    Under ``--live`` the shared cognition :class:`~reachy.speech.events.EventBuffer`
+    is built here, BEFORE ``pat_hook`` (:func:`_build_pat_hook` needs it at
+    construction time), and handed to both ``pat_hook`` and :func:`_build_live_hooks`
+    (which threads it on into the think/agent engine and, under ``--transcribe``,
+    the TranscribeHook) — so a detected pat lands in the exact buffer cognition
+    consumes, no engagement gate involved. Outside ``--live`` no buffer is built and
+    ``pat_hook`` is constructed exactly as before (``buffer=None``).
     """
     snap_kwargs: dict[str, float] = {}
     if getattr(args, "snap_ratio", None) is not None:
@@ -1102,7 +1142,18 @@ def _run_sdk_loop(
     # reads it to skip sensing while a commanded move is in flight (transit lag is not
     # a hand). Shared object: run_loop writes it, the probe closure below reads it.
     busy: dict[str, float] = {"until": 0.0}
-    pat_hook = _build_pat_hook(args, transport, queue, motion_busy=lambda t: t < busy["until"])
+    live = getattr(args, "live", False)
+    # Built BEFORE pat_hook (below) so the SAME buffer object can be threaded into
+    # it — see this function's docstring and _build_pat_hook's ``buffer`` note.
+    # Non-live never builds one: pat_hook there stays buffer=None, unchanged.
+    cognition_buffer = _make_shared_cognition_buffer() if live else None
+    pat_hook = _build_pat_hook(
+        args,
+        transport,
+        queue,
+        motion_busy=lambda t: t < busy["until"],
+        buffer=cognition_buffer,
+    )
     holder = SampleHolder()
     with transport.media_session() as session:  # type: ignore[attr-defined]
         # Per-tick pose / move / frame reads ride the ONE open client (issue #51).
@@ -1133,7 +1184,7 @@ def _run_sdk_loop(
         # loop's per-tick reading into the shared-sample holder the audio hooks read.
         # The default keeps the established single-PatHook on_tick and the bare
         # sense/audio taps byte-for-byte (no chain, no holder tap, no extra read).
-        if getattr(args, "live", False):
+        if live:
             sense_tap, audio_tap = _build_sample_tap(
                 holder, poller, _audio, audio_rms, transcribe=transcribe
             )
@@ -1148,6 +1199,7 @@ def _run_sdk_loop(
                 producer=producer,
                 voice_engine=voice_engine,
                 cognition=cognition,
+                buffer=cognition_buffer,
             )
             on_tick: object = HookChain(hooks_list)
         else:

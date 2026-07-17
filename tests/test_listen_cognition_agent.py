@@ -53,6 +53,7 @@ import reachy.motion.sleep_signal as ss
 import reachy.speech.cognition_signal as cs
 from reachy.cli import main
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
+from reachy.motion.listen_pat import PatHook
 from reachy.motion.listen_think import ThinkHook
 from reachy.motion.listen_transcribe import TranscribeHook
 from reachy.speech.agent_turn import AgentTurnEngine
@@ -697,3 +698,194 @@ def test_live_banner_marker_default_has_no_agent_note(monkeypatch) -> None:
     rc, _out, err = _run_capture(monkeypatch, _live_argv(), transport=transport)
     assert rc == 0
     assert "cognition: agent" not in err
+
+
+# ---------------------------------------------------------------------------
+# 5. PatHook shares the live cognition EventBuffer (t4)
+#
+# t3 already gave PatHook an optional duck-typed ``buffer`` seam
+# (reachy/motion/listen_pat.py) that feeds ``buffer.feed_pat(kind, level)`` on
+# every detection. This suite proves the *composition* layer
+# (_run_sdk_loop / _build_live_hooks / _build_pat_hook in
+# reachy/cli/_commands/listen.py) threads the SAME shared EventBuffer the folded
+# ThinkHook/agent engine (and, under --transcribe, the TranscribeHook) consumes
+# into the PatHook too — so a pat cue reaches cognition directly, bypassing the
+# --transcribe engagement gate entirely (that gate, reachy/speech/engagement.py,
+# only judges transcribed WORDS and is built solely inside
+# _compose_transcribe_hook, never on the pat path).
+# ---------------------------------------------------------------------------
+
+
+class _PatPressSession(_Session):
+    """A live session whose head_pose reports a sustained deep downward press.
+
+    The live loop reads ``head_pose`` through the session-bound transport proxy
+    (``_SessionBoundTransport``), which prefers the open session's ``head_pose``
+    over the outer transport's — AND under ``--live``, ``SleepHook``'s own
+    pat-wake probe (``reachy/motion/listen_sleep.py``) polls ``head_pose`` every
+    tick too, alongside ``PatHook``'s own read. A *constant* deviation (never
+    released) still produces exactly ONE press edge no matter how many readers
+    share this session or how their reads interleave — unlike an
+    alternating/scripted press (see ``tests/test_listen_pat.py``'s
+    ``_ConstantPressTransport``, which relies on being the ONLY reader), which
+    depends on call parity and silently breaks once a second reader is added.
+    The test pairs this with ``--min-presses 1`` so that single edge suffices.
+    """
+
+    def head_pose(self) -> tuple[float, float]:
+        return (-20.0, 0.0)
+
+
+class _PatPressTransport(_LiveSdkTransport):
+    """A live sdk transport whose open session fires a real pat detection."""
+
+    def __init__(self):
+        super().__init__()
+        self._session = _PatPressSession()
+
+
+def _spy_pat_hook_buffer(monkeypatch) -> dict:
+    """Capture the ``buffer`` kwarg every constructed :class:`PatHook` receives."""
+    captured: dict = {}
+    real_init = PatHook.__init__
+
+    def _init(self, queue, **kw):
+        captured["buffer"] = kw.get("buffer")
+        return real_init(self, queue, **kw)
+
+    monkeypatch.setattr(PatHook, "__init__", _init)
+    return captured
+
+
+def test_live_agent_pathook_buffer_identical_to_agent_engine_and_transcribe_hook(
+    monkeypatch,
+) -> None:
+    """``--live --cognition agent --transcribe``: PatHook/ThinkHook/TranscribeHook share ONE buffer.
+
+    The crux of t4: the EventBuffer object handed to the PatHook is IDENTICAL
+    (is-identity) to the one the agent engine consumes (via the folded ThinkHook)
+    and the one the TranscribeHook feeds.
+    """
+    pat_captured = _spy_pat_hook_buffer(monkeypatch)
+    think_captured: dict = {}
+    transcribe_captured: dict = {}
+    real_think_init = ThinkHook.__init__
+    real_tr_init = TranscribeHook.__init__
+
+    def _think_init(self, provider, **kw):
+        think_captured["buffer"] = kw.get("buffer")
+        return real_think_init(self, provider, **kw)
+
+    def _tr_init(self, provider, **kw):
+        transcribe_captured["buffer"] = kw.get("buffer")
+        return real_tr_init(self, provider, **kw)
+
+    monkeypatch.setattr(ThinkHook, "__init__", _think_init)
+    monkeypatch.setattr(TranscribeHook, "__init__", _tr_init)
+
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(
+        monkeypatch, _live_argv("--cognition", "agent", "--transcribe"), transport=transport
+    )
+    assert rc == 0
+
+    shared = pat_captured.get("buffer")
+    assert shared is not None, "PatHook must receive a shared buffer under --live"
+    assert (
+        think_captured.get("buffer") is shared
+    ), "the agent engine (behind ThinkHook) must consume the SAME buffer PatHook feeds"
+    assert (
+        transcribe_captured.get("buffer") is shared
+    ), "the TranscribeHook must feed the SAME buffer too"
+
+
+def test_live_marker_pathook_buffer_identical_to_cognition_engine(monkeypatch) -> None:
+    """Regression: the default (marker) ``--live`` engine shares the buffer too."""
+    pat_captured = _spy_pat_hook_buffer(monkeypatch)
+    think_captured: dict = {}
+    real_think_init = ThinkHook.__init__
+
+    def _think_init(self, provider, **kw):
+        think_captured["buffer"] = kw.get("buffer")
+        return real_think_init(self, provider, **kw)
+
+    monkeypatch.setattr(ThinkHook, "__init__", _think_init)
+
+    transport = _LiveSdkTransport()
+    rc, _out, _err = _run_capture(monkeypatch, _live_argv(), transport=transport)
+    assert rc == 0
+
+    shared = pat_captured.get("buffer")
+    assert shared is not None, "PatHook must receive a shared buffer under --live (marker too)"
+    assert think_captured.get("buffer") is shared
+
+
+def test_live_agent_pat_cue_feeds_shared_buffer_without_engagement_gate(monkeypatch) -> None:
+    """A real pat detection lands in the SAME buffer the agent engine consumes.
+
+    No ``--transcribe`` here at all: proves pat cues reach cognition directly,
+    with the ``--transcribe`` engagement gate (the LLM addressed-vs-ambient
+    classifier) never even touched — ``EngagementClassifier`` is only ever built
+    from ``_compose_transcribe_hook``, which only runs under ``--transcribe``.
+    """
+    classifier_builds = {"n": 0}
+
+    class _CountingClassifier:
+        def __init__(self, *a, **k):
+            classifier_builds["n"] += 1
+
+        def judge(self, text, context) -> bool:
+            return True
+
+    monkeypatch.setattr("reachy.speech.engagement.EngagementClassifier", _CountingClassifier)
+
+    real_init = AgentTurnEngine.__init__
+    captured: dict = {}
+    pat_calls: list = []
+
+    def _spy(self, **kw):
+        real_init(self, **kw)
+        captured["engine"] = self
+        buf = self.buffer
+        real_feed_pat = buf.feed_pat
+
+        def _rec(kind, level):
+            pat_calls.append((kind, level))
+            return real_feed_pat(kind, level)
+
+        buf.feed_pat = _rec  # instance-level shadow, mirrors _record_agent_feeds
+
+    monkeypatch.setattr(AgentTurnEngine, "__init__", _spy)
+
+    transport = _PatPressTransport()
+    rc, _out, _err = _run_capture(
+        monkeypatch,
+        _live_argv("--cognition", "agent", "--min-presses", "1", "--max-ticks", "5"),
+        transport=transport,
+    )
+    assert rc == 0
+
+    assert captured.get("engine") is not None, "the agent engine must have been built"
+    assert pat_calls, "a detected pat must feed the shared buffer the agent engine consumes"
+    assert all(kind in {"scratch", "side_pat"} for kind, _level in pat_calls), pat_calls
+    assert (
+        classifier_builds["n"] == 0
+    ), "the pat path must never build the --transcribe engagement classifier"
+
+
+def test_bare_listen_run_pathook_has_no_buffer(monkeypatch) -> None:
+    """A non-live ``listen run`` still builds PatHook with ``buffer=None`` (unchanged).
+
+    No cognition stack exists outside ``--live``, so there is nothing to share.
+    """
+    captured = _spy_pat_hook_buffer(monkeypatch)
+    transport = _LiveSdkTransport()
+
+    rc, _out, _err = _run_capture(
+        monkeypatch,
+        ["listen", "run", "--json", "--transport", "sdk", "--deadband", "0", "--max-ticks", "3"],
+        transport=transport,
+    )
+    assert rc == 0
+    assert "buffer" in captured, "PatHook must have been constructed"
+    assert captured["buffer"] is None
