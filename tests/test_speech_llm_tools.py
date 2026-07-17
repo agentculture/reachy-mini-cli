@@ -199,9 +199,7 @@ def test_build_request_tool_choice_absent_when_none():
 def test_complete_serializes_tools(monkeypatch):
     body = _non_streaming_body(content="ok")
     captured = _stub_urlopen(monkeypatch, body)
-    llm.complete(
-        [{"role": "user", "content": "hi"}], tools=[_APPLY_POSE_TOOL], tool_choice="auto"
-    )
+    llm.complete([{"role": "user", "content": "hi"}], tools=[_APPLY_POSE_TOOL], tool_choice="auto")
     sent = json.loads(captured["req"].data)
     assert sent["tools"] == [_APPLY_POSE_TOOL]
     assert sent["tool_choice"] == "auto"
@@ -293,15 +291,9 @@ def test_stream_turn_multiple_tool_calls_assembled_by_index(monkeypatch):
 def test_stream_turn_content_only_matches_old_behavior(monkeypatch):
     """A content-only stream yields the same text and no tool calls."""
     seen: list[str] = []
-    body = (
-        _content_chunk("Hello ")
-        + _content_chunk("world.", finish_reason="stop")
-        + _DONE
-    )
+    body = _content_chunk("Hello ") + _content_chunk("world.", finish_reason="stop") + _DONE
     _stub_urlopen(monkeypatch, body)
-    result = llm.stream_turn(
-        [{"role": "user", "content": "hi"}], on_content=seen.append
-    )
+    result = llm.stream_turn([{"role": "user", "content": "hi"}], on_content=seen.append)
     assert result.content == "Hello world."
     assert result.tool_calls == []
     assert result.finish_reason == "stop"
@@ -311,10 +303,7 @@ def test_stream_turn_content_only_matches_old_behavior(monkeypatch):
 
 def test_stream_turn_finalizes_tool_calls_on_done_without_finish_reason(monkeypatch):
     """A stream that ends at [DONE] without an explicit finish_reason still assembles."""
-    body = (
-        _tool_chunk(0, call_id="c0", name="apply_pose", arguments='{"emoji": "🙂"}')
-        + _DONE
-    )
+    body = _tool_chunk(0, call_id="c0", name="apply_pose", arguments='{"emoji": "🙂"}') + _DONE
     _stub_urlopen(monkeypatch, body)
     result = llm.stream_turn([{"role": "user", "content": "hi"}], tools=[_APPLY_POSE_TOOL])
     assert len(result.tool_calls) == 1
@@ -374,10 +363,7 @@ def test_iter_sse_deltas_content_only_unchanged(monkeypatch):
 
 def test_stream_chat_completion_ignores_tool_call_deltas(monkeypatch):
     """The content-only reader silently skips tool_call chunks (no crash, no text)."""
-    body = (
-        _tool_chunk(0, call_id="c0", name="apply_pose", arguments='{"emoji": "🙂"}')
-        + _DONE
-    )
+    body = _tool_chunk(0, call_id="c0", name="apply_pose", arguments='{"emoji": "🙂"}') + _DONE
     _stub_urlopen(monkeypatch, body)
     deltas = list(llm.stream_chat_completion([{"role": "user", "content": "hi"}]))
     assert deltas == []

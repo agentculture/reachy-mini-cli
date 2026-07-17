@@ -114,7 +114,7 @@ def test_integration_complete_turn_returns_tool_calls():
 
 def test_integration_stream_turn_tool_calls_lenient():
     """Lenient (risk r2): assert streamed tool_call assembly, else skip with the finding."""
-    cfg = _gateway_or_skip()
+    _gateway_or_skip()  # skip cleanly when the gateway is unreachable / unconfigured
     result = llm.stream_turn(
         _PROMPT,
         model=_CORTEX_MODEL,

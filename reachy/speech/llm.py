@@ -26,8 +26,8 @@ import os
 import re
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 
@@ -117,6 +117,44 @@ class LlmConfig:
                 else _env_pref("REACHY_OPENAI_API_KEY", "REACHY_LLM_API_KEY", None)
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Tool-calling result types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolCall:
+    """One assembled OpenAI tool call.
+
+    ``arguments`` is the *parsed* JSON object (a ``dict``); ``arguments_json``
+    keeps the raw accumulated argument string so a caller can inspect/re-serialize
+    it (and so a malformed-JSON fragment degrades to an empty ``arguments`` dict
+    without losing the raw text). ``id`` is the server-assigned call id used to
+    correlate the tool-result message on the next turn.
+    """
+
+    id: str
+    name: str
+    arguments: dict = field(default_factory=dict)
+    arguments_json: str = ""
+
+
+@dataclass
+class TurnResult:
+    """The outcome of one completion turn.
+
+    ``content`` is the assistant text (concatenated across streamed deltas or read
+    straight from a non-streaming message). ``tool_calls`` is the list of assembled
+    :class:`ToolCall`s in the order they were emitted. ``finish_reason`` is the
+    terminal reason the server reported (e.g. ``"stop"`` or ``"tool_calls"``), or
+    ``None`` if the stream ended without one.
+    """
+
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    finish_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +288,8 @@ def _build_request(
     temperature: float,
     max_tokens: int | None,
     stream: bool = True,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
 ) -> urllib.request.Request:
     url = cfg.base_url.rstrip("/") + "/v1/chat/completions"
     payload: dict = {
@@ -261,6 +301,12 @@ def _build_request(
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    # Tools are opt-in: when ``tools`` is absent the payload is byte-identical to
+    # the content-only client, so every existing (non-tool) request is unchanged.
+    if tools is not None:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
 
     # Match the Accept header to the response shape we actually parse: SSE for the
     # streaming caller, plain JSON for the non-streaming ``complete()``. Some
@@ -279,31 +325,16 @@ def _build_request(
     return urllib.request.Request(url, data=data, headers=headers, method="POST")
 
 
-def stream_chat_completion(
-    messages: list[dict],
-    *,
-    model: str | None = None,
-    temperature: float = 0.8,
-    max_tokens: int | None = None,
-    base_url: str | None = None,
-    api_key: str | None = None,
-    timeout: float = _DEFAULT_TIMEOUT,
-) -> Iterator[str]:
-    """Stream a chat completion, yielding text content deltas as they arrive.
+def _open_checked(cfg: LlmConfig, req: urllib.request.Request, timeout: float):
+    """Open *req*, translating any transport / HTTP failure into a ``CliError``.
 
-    Uses the standard OpenAI SSE streaming format. The response is iterated
-    line-by-line so each ``data:`` delta is parsed and yielded the moment it
-    comes off the socket — nothing is buffered to completion first.
-
-    Raises :class:`CliError` (exit code 2, environment) with a remediation hint
-    if the endpoint is unreachable or returns a non-2xx status — never a
-    Python traceback.
+    Returns the raw ``urlopen`` context manager (the caller still enters it and
+    checks the status via :func:`_check_status`). Shared by every network leg so
+    the exit-2 error contract is identical across the streaming and tool paths —
+    never a raw traceback.
     """
-    cfg = LlmConfig.resolve(base_url=base_url, model=model, api_key=api_key)
-    req = _build_request(cfg, messages, temperature=temperature, max_tokens=max_tokens)
-
     try:
-        resp_cm = urllib.request.urlopen(req, timeout=timeout)  # nosec B310
+        return urllib.request.urlopen(req, timeout=timeout)  # nosec B310
     except urllib.error.HTTPError as err:
         raise CliError(
             code=EXIT_ENV_ERROR,
@@ -323,15 +354,58 @@ def stream_chat_completion(
             ),
         ) from err
 
-    with resp_cm as resp:
-        status = getattr(resp, "status", None) or resp.getcode()
-        if not (200 <= int(status) < 300):
-            raise CliError(
-                code=EXIT_ENV_ERROR,
-                message=f"LLM endpoint returned HTTP {status} ({cfg.base_url})",
-                remediation="check the LLM server logs and your model/credentials",
-            )
 
+def _check_status(resp, cfg: LlmConfig) -> None:  # noqa: ANN001
+    """Raise a ``CliError`` (exit-2) if the entered response is not a 2xx."""
+    status = getattr(resp, "status", None) or resp.getcode()
+    if not (200 <= int(status) < 300):
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"LLM endpoint returned HTTP {status} ({cfg.base_url})",
+            remediation="check the LLM server logs and your model/credentials",
+        )
+
+
+def stream_chat_completion(
+    messages: list[dict],
+    *,
+    model: str | None = None,
+    temperature: float = 0.8,
+    max_tokens: int | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
+) -> Iterator[str]:
+    """Stream a chat completion, yielding text content deltas as they arrive.
+
+    Uses the standard OpenAI SSE streaming format. The response is iterated
+    line-by-line so each ``data:`` delta is parsed and yielded the moment it
+    comes off the socket — nothing is buffered to completion first.
+
+    This is the **content-only** reader: any ``tool_calls`` deltas in the stream
+    are silently skipped (it yields text). Pass ``tools=`` to serialize a tools
+    array into the request payload; to actually assemble the streamed tool calls
+    use :func:`stream_turn` instead.
+
+    Raises :class:`CliError` (exit code 2, environment) with a remediation hint
+    if the endpoint is unreachable or returns a non-2xx status — never a
+    Python traceback.
+    """
+    cfg = LlmConfig.resolve(base_url=base_url, model=model, api_key=api_key)
+    req = _build_request(
+        cfg,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
+
+    resp_cm = _open_checked(cfg, req, timeout)
+    with resp_cm as resp:
+        _check_status(resp, cfg)
         # Iterate the raw byte response one line at a time and decode each line
         # as it arrives — ``readline`` pulls only the next line off the wire, so
         # deltas are parsed incrementally rather than buffered to completion.
@@ -347,6 +421,8 @@ def complete(
     base_url: str | None = None,
     api_key: str | None = None,
     timeout: float = _DEFAULT_COMPLETE_TIMEOUT,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
 ) -> str:
     """Issue a single non-streaming chat completion and return the full text.
 
@@ -369,7 +445,13 @@ def complete(
     """
     cfg = LlmConfig.resolve(base_url=base_url, model=model, api_key=api_key)
     req = _build_request(
-        cfg, messages, temperature=temperature, max_tokens=max_tokens, stream=False
+        cfg,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=False,
+        tools=tools,
+        tool_choice=tool_choice,
     )
 
     resp_cm = urllib.request.urlopen(req, timeout=timeout)  # nosec B310
@@ -380,13 +462,211 @@ def complete(
     return body["choices"][0]["message"]["content"]
 
 
-def _iter_sse_deltas(resp) -> Iterator[str]:  # noqa: ANN001
-    """Parse an SSE byte stream line-by-line, yielding content deltas.
+def complete_turn(
+    messages: list[dict],
+    *,
+    model: str | None = None,
+    temperature: float = 0.8,
+    max_tokens: int | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    timeout: float = _DEFAULT_COMPLETE_TIMEOUT,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
+) -> TurnResult:
+    """Issue a single non-streaming completion and return the full turn.
+
+    Unlike :func:`complete` (which returns only the assistant text), this reads
+    the whole message — ``content``, any ``tool_calls`` (with parsed JSON
+    arguments), and the terminal ``finish_reason`` — into a :class:`TurnResult`.
+    It is the non-streaming leg of the tool-use loop: pass ``tools=`` and
+    ``tool_choice=`` and inspect ``result.tool_calls`` / ``result.finish_reason``.
+
+    Config resolution honours the same ``REACHY_OPENAI_*`` / ``REACHY_LLM_*``
+    precedence as the rest of the module. Transport / HTTP failures raise a
+    :class:`CliError` (exit code 2, environment) with a remediation hint — never
+    a Python traceback (matching the streaming error contract, and unlike
+    :func:`complete` which deliberately propagates for its classifier caller).
+    """
+    cfg = LlmConfig.resolve(base_url=base_url, model=model, api_key=api_key)
+    req = _build_request(
+        cfg,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=False,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
+
+    resp_cm = _open_checked(cfg, req, timeout)
+    with resp_cm as resp:
+        _check_status(resp, cfg)
+        raw = resp.read()
+
+    body = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    choice = body["choices"][0]
+    message = choice.get("message") or {}
+    return TurnResult(
+        content=message.get("content") or "",
+        tool_calls=_parse_message_tool_calls(message),
+        finish_reason=choice.get("finish_reason"),
+    )
+
+
+def stream_turn(
+    messages: list[dict],
+    *,
+    model: str | None = None,
+    temperature: float = 0.8,
+    max_tokens: int | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
+    on_content: Callable[[str], None] | None = None,
+    cancel=None,
+) -> TurnResult:
+    """Stream a completion, assembling content **and** tool calls into a turn.
+
+    This is the tool-aware streaming leg. Content deltas are handed to the
+    optional ``on_content`` callback the moment they arrive off the socket — so a
+    caller can start speaking the first sentence while the model is still
+    generating — and are also concatenated into ``TurnResult.content``. Streamed
+    ``tool_calls`` deltas are assembled by ``index`` (id + name land early, the
+    ``arguments`` string arrives split across later chunks) and finalized with
+    parsed JSON arguments when the stream ends (on ``finish_reason`` or ``[DONE]``).
+
+    ``cancel`` is an optional zero-arg predicate (or an object with ``is_set``);
+    when it signals truthy, streaming stops after the current chunk and the turn
+    assembled so far is returned.
+
+    Transport / HTTP failures raise a :class:`CliError` (exit code 2) with a
+    remediation hint — never a Python traceback.
+    """
+    cfg = LlmConfig.resolve(base_url=base_url, model=model, api_key=api_key)
+    req = _build_request(
+        cfg,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
+    is_cancelled = _coerce_cancel(cancel)
+
+    content_parts: list[str] = []
+    accumulators: dict[int, _ToolCallAccumulator] = {}
+    order: list[int] = []
+    finish_reason: str | None = None
+
+    resp_cm = _open_checked(cfg, req, timeout)
+    with resp_cm as resp:
+        _check_status(resp, cfg)
+        for chunk in _iter_sse_chunks(resp):
+            if is_cancelled():
+                break
+            try:
+                choice = chunk["choices"][0]
+            except (KeyError, IndexError, TypeError):
+                continue
+            reason = choice.get("finish_reason")
+            if reason:
+                finish_reason = reason
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if content:
+                content_parts.append(content)
+                if on_content is not None:
+                    on_content(content)
+            for tc in delta.get("tool_calls") or []:
+                index = tc.get("index", 0)
+                acc = accumulators.get(index)
+                if acc is None:
+                    acc = accumulators[index] = _ToolCallAccumulator()
+                    order.append(index)
+                acc.add(tc)
+
+    return TurnResult(
+        content="".join(content_parts),
+        tool_calls=[accumulators[i].finalize() for i in order],
+        finish_reason=finish_reason,
+    )
+
+
+class _ToolCallAccumulator:
+    """Assembles one streamed tool call from its incremental delta fragments.
+
+    OpenAI/vLLM stream a tool call as a sequence of ``tool_calls[i]`` deltas
+    sharing an ``index``: the id + function name arrive in the first fragment, and
+    the ``function.arguments`` JSON string is dripped across the following ones.
+    This accumulates each part and parses the argument string once, at finalize.
+    """
+
+    def __init__(self) -> None:
+        self.id = ""
+        self.name = ""
+        self.arguments = ""
+
+    def add(self, delta_tc: dict) -> None:
+        if delta_tc.get("id"):
+            self.id = delta_tc["id"]
+        fn = delta_tc.get("function") or {}
+        if fn.get("name"):
+            self.name += fn["name"]
+        args = fn.get("arguments")
+        if args:
+            self.arguments += args
+
+    def finalize(self) -> ToolCall:
+        parsed: dict = {}
+        raw = self.arguments
+        if raw.strip():
+            try:
+                loaded = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                loaded = None
+            if isinstance(loaded, dict):
+                parsed = loaded
+        return ToolCall(id=self.id, name=self.name, arguments=parsed, arguments_json=raw)
+
+
+def _parse_message_tool_calls(message: dict) -> list[ToolCall]:
+    """Parse a non-streaming ``message.tool_calls`` array into :class:`ToolCall`s."""
+    calls: list[ToolCall] = []
+    for tc in message.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        raw = fn.get("arguments")
+        raw = raw if isinstance(raw, str) else ""
+        parsed: dict = {}
+        if raw.strip():
+            try:
+                loaded = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                loaded = None
+            if isinstance(loaded, dict):
+                parsed = loaded
+        calls.append(
+            ToolCall(
+                id=tc.get("id") or "",
+                name=fn.get("name") or "",
+                arguments=parsed,
+                arguments_json=raw,
+            )
+        )
+    return calls
+
+
+def _iter_sse_chunks(resp) -> Iterator[dict]:  # noqa: ANN001
+    """Parse an SSE byte stream line-by-line, yielding each decoded chunk dict.
 
     Honors the OpenAI contract: lines beginning ``data: ``; the ``[DONE]``
-    sentinel terminates the stream; malformed JSON / missing keys are skipped.
-    Reads raw bytes and decodes per line so it works against any file-like
-    response (the real ``http.client.HTTPResponse`` and test doubles alike).
+    sentinel terminates the stream; malformed JSON is skipped. Reads raw bytes
+    and decodes per line so it works against any file-like response (the real
+    ``http.client.HTTPResponse`` and test doubles alike) and stays lazy — one
+    ``readline`` pulls only the next line off the wire.
     """
     while True:
         raw = resp.readline()
@@ -400,10 +680,24 @@ def _iter_sse_deltas(resp) -> Iterator[str]:  # noqa: ANN001
         if data == "[DONE]":
             break
         try:
-            chunk = json.loads(data)
+            yield json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+
+def _iter_sse_deltas(resp) -> Iterator[str]:  # noqa: ANN001
+    """Parse an SSE byte stream, yielding text content deltas.
+
+    Thin content-only view over :func:`_iter_sse_chunks`: extracts
+    ``choices[0].delta.content`` from each chunk and skips any chunk whose shape
+    is unexpected (missing keys, ``tool_calls``-only deltas). Behaviour is
+    unchanged from the original inline parser.
+    """
+    for chunk in _iter_sse_chunks(resp):
+        try:
             delta = chunk["choices"][0].get("delta", {})
             content = delta.get("content")
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        except (KeyError, IndexError, TypeError):
             continue
         if content:
             yield content
