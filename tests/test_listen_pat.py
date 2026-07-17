@@ -941,6 +941,56 @@ def test_on_tick_receives_last_dispatched_commanded_head() -> None:
     assert commanded_seen[-1] == {"pitch": 4.0, "yaw": 12.0}
 
 
+def test_headless_actions_do_not_flap_commanded_head() -> None:
+    """Antenna-only actions leave the commanded head where the last head move put it.
+
+    THE phantom-pat root cause: head-less actions (Tier-1 antenna leans, dispatched
+    near-continuously) used to stamp commanded_head back to (0, 0), flapping the
+    commanded state target<->zero on every antenna dispatch. Expectation-based pat
+    sensing read each flap as a huge instant move and false-fired on the transit
+    that "move" implied. A held head must stay commanded where it was.
+    """
+    tr = _RecTransport()
+    commanded_seen: list[dict] = []
+
+    class _LookThenAntennas:
+        """One head move, then a stream of antenna-only leans (head=None)."""
+
+        def __init__(self):
+            self.n = 0
+
+        def update(self, t, sense, **_kwargs):
+            self.n += 1
+            if self.n == 1:
+                return MotionAction(label="look", head={"pitch": 0.0, "yaw": -20.0}, duration=0.1)
+            if self.n <= 6:
+                return MotionAction(label="antenna lean", antennas=(10.0, -5.0), duration=0.05)
+            return None
+
+    def _hook(transport, queue, t, commanded_head):
+        commanded_seen.append(dict(commanded_head))
+
+    run(
+        tr,
+        _LookThenAntennas(),
+        now=_Clock(0.05),
+        sleep=lambda *_: None,
+        tick=0.05,
+        settle=0.0,
+        max_ticks=40,
+        hooks=LoopHooks(on_tick=_hook),
+    )
+    # After the look is dispatched, EVERY later tick — through all the antenna-only
+    # dispatches — must still report the held head pose, never a (0, 0) flap.
+    after_look = [c for c in commanded_seen if c != {"pitch": 0.0, "yaw": 0.0}]
+    assert after_look, "the look must be observed at all"
+    assert all(c == {"pitch": 0.0, "yaw": -20.0} for c in after_look)
+    assert commanded_seen[-1] == {
+        "pitch": 0.0,
+        "yaw": -20.0,
+    }, "antenna-only dispatches flapped the commanded head back to neutral"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end through the CLI: listen run --json with a fake sdk transport
 # ---------------------------------------------------------------------------

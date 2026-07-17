@@ -75,9 +75,12 @@ def _dispatch_next(transport, q: MotionQueue, t: float, settle: float, st: "_Dri
     head — so a gesture a concurrent producer thread coalesced in mid-dispatch is
     never popped in its place (see :meth:`MotionQueue.pop_if`).
 
-    On acceptance the dispatched action's head pitch/yaw are stamped onto
-    ``st.commanded_head`` (axes the action omits default to ``0.0``) so the
-    ``on_tick`` hook can be handed the pose the loop actually commanded.
+    On acceptance, an action that commands the head has its pitch/yaw stamped
+    onto ``st.commanded_head`` (axes its head dict omits default to ``0.0``) so
+    the ``on_tick`` hook can be handed the pose the loop actually commanded.
+    Head-less actions (antenna-only, body-only) leave ``st.commanded_head``
+    untouched — a held head stays commanded where it was; stamping (0, 0) for
+    them flapped the commanded state and was the phantom-pat root cause.
     """
     nxt = q.peek()
     if nxt is None:  # emptied by another thread between the len() check and here
@@ -90,8 +93,18 @@ def _dispatch_next(transport, q: MotionQueue, t: float, settle: float, st: "_Dri
         interpolation=nxt.interpolation,
     )
     q.pop_if(nxt)  # accepted — remove it, unless a newer gesture took the head
-    head = nxt.head or {}
-    st.commanded_head = {"pitch": float(head.get("pitch", 0.0)), "yaw": float(head.get("yaw", 0.0))}
+    if nxt.head is not None:
+        # Only actions that actually command the head update the commanded pose.
+        # Head-less actions (antenna-only leans, body-only turns) previously
+        # stamped it back to (0, 0), flapping the commanded state target<->zero on
+        # every Tier-1 antenna dispatch — which the PatHook's expectation sensing
+        # read as huge instant "moves" and false-fired on (the phantom-pat root
+        # cause). A held head stays commanded where it was.
+        head = nxt.head
+        st.commanded_head = {
+            "pitch": float(head.get("pitch", 0.0)),
+            "yaw": float(head.get("yaw", 0.0)),
+        }
     if st.on_action is not None:
         st.on_action(nxt)
     return t + nxt.duration + settle
