@@ -216,6 +216,13 @@ class PatHook:
         float}`` head pose the loop last dispatched (defaults to neutral before
         the loop has commanded any move).
         """
+        cmd = commanded_head or _NEUTRAL_HEAD
+        # Dispatch tracking runs on EVERY tick, including inside the reaction window —
+        # the reaction's own lean/nuzzle/settle moves and the idle-resume move must
+        # keep the previous-commanded / tracked-move state fresh, or the first
+        # post-window expectation interpolates from a stale start and its bogus
+        # deviation re-seeds a phantom reaction chain.
+        self._note_dispatch(cmd, t)
         if t < self._reacting_until:
             # Executing our own reaction lean — hold the flag, do not sense, and mark
             # that the detector must re-baseline once sensing resumes.
@@ -224,8 +231,6 @@ class PatHook:
         if self._flag_up:
             pat_signal.clear()
             self._flag_up = False
-        cmd = commanded_head or _NEUTRAL_HEAD
-        self._note_dispatch(cmd, t)
         if t < self._unknown_move_until:
             # A move dispatched before our first tick is in flight and we do not know
             # where it started — ride it out, then re-baseline.
@@ -319,6 +324,26 @@ class PatHook:
         if event is None:
             return
         level, touch_type = event
+        # Detection autopsy (info-level; silent unless logging is configured): the
+        # full expectation state at fire time, so a phantom detection in a live
+        # journal explains itself instead of needing a reproduction.
+        logger.info(
+            "pat fire: %s/%s t=%.2f expected=(%.2f,%.2f) actual=(%.2f,%.2f) "
+            "raw_cmd=(%.2f,%.2f) move=%s->%s t0=%.2f end=%.2f",
+            touch_type,
+            level,
+            now,
+            commanded_pitch,
+            commanded_yaw,
+            actual_pitch,
+            actual_yaw,
+            float(commanded_head.get("pitch", 0.0)),
+            float(commanded_head.get("yaw", 0.0)),
+            self._move_start,
+            self._move_target,
+            self._move_t0,
+            self._move_end,
+        )
         self.reaction.react(touch_type, level)
         if self._buffer is not None:
             try:

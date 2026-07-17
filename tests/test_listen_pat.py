@@ -704,6 +704,63 @@ def test_pitch_scratch_detects_through_yaw_look_transit() -> None:
     assert any(label.startswith("pat_scratch") for label in labels), labels
 
 
+def test_dispatch_tracking_continues_through_reaction_window() -> None:
+    """The reaction's own moves are tracked while sensing is paused — no phantom chain.
+
+    Live failure mode: during the reaction window the hook paused BOTH sensing and
+    dispatch tracking, so the reaction's lean/nuzzle/settle and the idle-resume move
+    left the previous-commanded state stale; the first post-window expectation then
+    interpolated from a wrong start, and its bogus deviation re-seeded a fresh
+    phantom reaction — a self-sustaining chain (six back-to-back cycles in the
+    14:38 journal). Tracking must stay fresh through the window, and a head that
+    tracks its plan after the window must not re-fire.
+    """
+    busy = {"until": 0.0}
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector, busy_horizon=lambda: busy["until"])
+    transport = _ScriptedPoseTransport()
+
+    # Phase 1: a genuine press on a settled head fires the first (real) detection.
+    now = 0.0
+    for i in range(8):
+        transport.pose = (-20.0, 0.0) if i % 2 == 0 else (0.0, 0.0)
+        hook(transport, queue, now, {"pitch": 0.0, "yaw": 0.0})
+        if hook.events >= 1:
+            break
+        now += 0.4
+    assert hook.events == 1
+    window_end = hook._reacting_until
+
+    # Phase 2 (inside the window): the reaction lean dispatches — commanded pitch
+    # jumps to 12°. Sensing is paused, but the dispatch MUST still be tracked.
+    now += 0.1
+    lean_t = now
+    busy["until"] = lean_t + 1.2
+    hook(transport, queue, now, {"pitch": 12.0, "yaw": 0.0})
+    assert hook._move_target == {"pitch": 12.0, "yaw": 0.0}, "tracking froze in the window"
+    assert hook._move_t0 == lean_t
+
+    # Later in the window: the settle returns toward baseline, then idle resumes
+    # with a yaw look — each tracked as it happens.
+    now += 1.3
+    busy["until"] = now + 1.5
+    hook(transport, queue, now, {"pitch": 0.0, "yaw": 0.0})
+    now = max(now + 1.6, window_end + 0.05)
+    look_cmd = {"pitch": 0.0, "yaw": 15.0}
+    busy["until"] = now + 1.7
+    transport.pose = (0.0, 0.0)  # dispatch tick: still at the start pose
+    hook(transport, queue, now, look_cmd)
+
+    # Phase 3 (window over): the head TRACKS the resume look's expected profile.
+    # With fresh tracking, deviation reads ~0 and no phantom fires.
+    for _ in range(12):
+        now += 0.2
+        transport.pose = hook._expected_head(now, look_cmd)
+        hook(transport, queue, now, look_cmd)
+    assert hook.events == 1, "a tracked resume move must not re-seed a phantom reaction"
+
+
 # ---------------------------------------------------------------------------
 # 4. server.run with on_tick=None is byte-identical to before
 # ---------------------------------------------------------------------------
