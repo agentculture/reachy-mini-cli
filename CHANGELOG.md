@@ -10,9 +10,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Event-based senses pipeline: pre-roll ring buffer + measured onset in TranscribeHook — utterances now include up to 2 s of audio from before the speech flag flips (leading words no longer lost)
-- [SENSE stage=<stage> source=<source> event=<event>] structured sense-stage logging (reachy/senselog.py) across capture/onset/cue/turn/action, with loud dropped reason=<reason> lines — plus a real logging handler: --log-level / REACHY_LOG_LEVEL (default INFO) on listen/think/sleep run (reachy/cli/_logging.py)
+- `[SENSE stage=<stage> source=<source> event=<event>]` structured sense-stage logging (reachy/senselog.py) across capture/onset/cue/turn/action, with loud `dropped reason=<reason>` lines — plus a real logging handler: --log-level / REACHY_LOG_LEVEL (default INFO) on listen/think/sleep run (reachy/cli/_logging.py)
 - Vision events reach cognition: VisionHook feeds EventBuffer.feed_vision with per-episode coalescing (issue #32)
-- Basic face recognition behind the NEW [vision] extra (opencv-python-headless): YuNet + SFace engine (reachy/vision/face.py), FaceStore temp/permanent tiers, folded FaceHook feeding saw-<name> cues (30 s re-announce cooldown), scripts/face_enroll.py
+- Basic face recognition behind the NEW [vision] extra (opencv-python-headless): YuNet + SFace engine (reachy/vision/face.py), FaceStore temp/permanent tiers, folded FaceHook feeding `saw <name>` cues (30 s re-announce cooldown), scripts/face_enroll.py
 - Scene description: reachy/vision/scene.py describe path (Gemma4 via REACHY_VISION_MODEL_ID), periodic SceneHook (default 30 s) + on-demand describe_scene agent tool
 - qwen3 forge — runtime self-extension: forge agent tool -> FORGE_BASE_URL coder endpoint -> AST-only fail-closed validator -> validator-gated auto-activation, hot-registered and callable on the next turn; staged/rejected artifacts under state_dir()/forge (reachy/forge/)
 - Single-session composition proof suite (tests/test_live_single_session.py): one media session, one shared frame grabber, one EventBuffer across all sense hooks
