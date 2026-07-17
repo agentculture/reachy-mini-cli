@@ -414,6 +414,75 @@ def test_describe_scene_seam_raise_becomes_an_error_result() -> None:
 
 
 # ---------------------------------------------------------------------------
+# forge tool (task t13) — an INJECTED dispatch seam, listed only when given
+# ---------------------------------------------------------------------------
+
+
+def test_forge_is_not_advertised_without_a_seam() -> None:
+    """No ``forge`` seam -> the tool is not listed (like describe_scene, opt-in)."""
+    reg = ToolRegistry()
+    assert "forge" not in reg.names()
+
+
+def test_forge_registered_when_seam_provided() -> None:
+    reg = ToolRegistry(forge=lambda goal, improve=None: None)
+    assert "forge" in reg.names()
+    by_name = {d["function"]["name"]: d["function"] for d in reg.tools()}
+    fn = by_name["forge"]
+    assert fn["parameters"]["properties"]["goal"]["type"] == "string"
+    assert fn["parameters"]["required"] == ["goal"]
+    # improve is an OPTIONAL string param (not required)
+    assert "improve" in fn["parameters"]["properties"]
+    assert "improve" not in fn["parameters"]["required"]
+
+
+def test_forge_dispatch_returns_immediately_with_a_status_string_and_calls_the_seam() -> None:
+    calls: list[tuple] = []
+
+    def _seam(goal, improve=None):
+        calls.append((goal, improve))
+        return "a-thread-object"  # the seam returns immediately (background dispatch)
+
+    reg = ToolRegistry(forge=_seam)
+    result = reg.dispatch("forge", json.dumps({"goal": "wave at people"}), tool_call_id="f")
+    assert result["role"] == "tool"
+    assert result["tool_call_id"] == "f"
+    # a status string naming the goal + the announce-when-ready promise
+    assert "forging" in result["content"]
+    assert "wave at people" in result["content"]
+    assert "announced" in result["content"]
+    # the injected dispatch seam was invoked once, goal + (None) improve
+    assert calls == [("wave at people", None)]
+
+
+def test_forge_dispatch_forwards_the_optional_improve_argument() -> None:
+    calls: list[tuple] = []
+    reg = ToolRegistry(forge=lambda goal, improve=None: calls.append((goal, improve)))
+    reg.dispatch(
+        "forge",
+        json.dumps({"goal": "wave better", "improve": "wave-hello"}),
+        tool_call_id="f",
+    )
+    assert calls == [("wave better", "wave-hello")]
+
+
+def test_forge_dispatch_missing_goal_is_an_error_result_without_calling_seam() -> None:
+    calls: list = []
+    reg = ToolRegistry(forge=lambda goal, improve=None: calls.append(goal))
+    result = reg.dispatch("forge", json.dumps({"improve": "x"}), tool_call_id="f")
+    assert "error" in json.loads(result["content"])
+    assert calls == [], "a missing goal must not reach the dispatch seam"
+
+
+def test_forge_seam_does_not_block_the_dispatch_call() -> None:
+    """The handler must return promptly — it hands off to the background seam and returns."""
+    reg = ToolRegistry(forge=lambda goal, improve=None: None)
+    # If the handler blocked on the forge round-trip this would hang; it must not.
+    result = reg.dispatch("forge", json.dumps({"goal": "spin"}), tool_call_id="f")
+    assert result["role"] == "tool"
+
+
+# ---------------------------------------------------------------------------
 # Degrade contract — dispatch never raises out
 # ---------------------------------------------------------------------------
 
@@ -607,6 +676,32 @@ def test_tools_module_does_not_import_vision_directly() -> None:
     for name in _imported_modules(tools_mod):
         assert "reachy.vision" not in name, f"tools.py must not import vision ({name!r})"
     assert "vision" not in tools_mod.__dict__
+
+
+def test_tools_module_does_not_import_forge_directly() -> None:
+    """CRITICAL BOUNDARY (task t13): the ``forge`` seam is an injected dispatch callable —
+    tools.py must NOT import reachy.forge (the forge callable arrives injected)."""
+    for name in _imported_modules(tools_mod):
+        assert "reachy.forge" not in name, f"tools.py must not import forge ({name!r})"
+    assert "forge" not in tools_mod.__dict__
+
+
+def test_importing_tools_does_not_pull_forge_into_sys_modules() -> None:
+    """A fresh interpreter importing reachy.speech.tools must not transitively import
+    reachy.forge (the forge dispatch seam is injected at composition, never imported here)."""
+    code = (
+        "import sys, reachy.speech.tools;"
+        "assert 'reachy.forge' not in sys.modules, 'forge leaked';"
+        "print('ok')"
+    )
+    proc = subprocess.run(  # nosec B603 — fixed args, sys.executable, no shell
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "ok"
 
 
 def test_tools_module_imports_senselog_directly() -> None:

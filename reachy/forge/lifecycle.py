@@ -22,9 +22,9 @@ Two guarantees the client depends on:
   emitting ``forge/rejected``, and it never raises (a failed folder move or a raising
   publish callback is caught and logged, not propagated).
 
-Activation WIRING (deciding when to move a staged skill live, hot-registering the tool)
-is a later task (t13); this module only provides the move + the event
-(:func:`activate`).
+Activation WIRING (deciding *when* to move a staged skill live, hot-registering the tool,
+the restricted ``ctx``) lives in :mod:`reachy.forge.activate`; this module only provides
+the move + the event (:func:`activate`).
 """
 
 from __future__ import annotations

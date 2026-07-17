@@ -87,12 +87,17 @@ ExpressSeam = Callable[[str], object]
 #: A scene-describe seam: ``describe_scene() -> str`` (see
 #: ``reachy.vision.scene.describe_frame`` captured over the shared frame source).
 DescribeSceneSeam = Callable[[], str]
+#: A forge dispatch seam: ``forge(goal, improve=None)`` — kicks off a background skill
+#: forge round-trip and returns immediately (see ``reachy.forge.client.ForgeClient.dispatch``,
+#: wired at composition). This module never imports ``reachy.forge`` — the callable is injected.
+ForgeSeam = Callable[..., object]
 
 # Canonical v1 tool names.
 SPEAK = "speak"
 HARMONICS = "harmonics"
 APPLY_POSE = "apply_pose"
 DESCRIBE_SCENE = "describe_scene"
+FORGE = "forge"
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +213,28 @@ def _make_pose_handler(express: ExpressSeam | None, catalog_keys: frozenset[str]
     return handler
 
 
+def _make_forge_handler(forge: ForgeSeam) -> Handler:
+    """A forge handler: hand a natural-language *goal* to the injected dispatch seam.
+
+    The seam (``reachy.forge.client.ForgeClient.dispatch``, wired at composition) runs the
+    coder-model round-trip on a background thread and returns immediately, so this handler
+    **never blocks the turn** — it validates the arguments, fires the seam, and returns a
+    status string. The forged skill is generated, validated, auto-activated, and announced
+    back to the agent asynchronously (a folded ``forge/activated`` cue), never inline."""
+
+    def handler(arguments: dict) -> str:
+        goal = arguments.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            raise ValueError("a non-empty 'goal' string is required")
+        improve = arguments.get("improve")
+        if improve is not None and not isinstance(improve, str):
+            raise ValueError("'improve' must be a string naming an existing skill when provided")
+        forge(goal, improve)
+        return f"forging '{goal}' — it will be announced when ready"
+
+    return handler
+
+
 def _make_describe_scene_handler(describe: DescribeSceneSeam) -> Handler:
     """A describe_scene handler: call the injected zero-arg seam, return its text.
 
@@ -292,6 +319,38 @@ def _apply_pose_tool(express: ExpressSeam | None, catalog_keys: Iterable[str]) -
     )
 
 
+def _forge_tool(forge: ForgeSeam) -> Tool:
+    return function_tool(
+        name=FORGE,
+        description=(
+            "Forge a NEW skill you do not yet have. Describe the behavior you want in "
+            "plain language ('goal'); optionally pass 'improve' with the name of an "
+            "existing forged skill to refine it instead. Returns IMMEDIATELY — the skill "
+            "is generated, safety-validated, and auto-activated in the background, then "
+            "announced to you as a new tool when it is ready. Use this only when no "
+            "existing tool can do what the moment genuinely calls for."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "What the new skill should do, in natural language.",
+                },
+                "improve": {
+                    "type": "string",
+                    "description": (
+                        "Optional: the name of an existing forged skill to refine "
+                        "instead of creating a new one."
+                    ),
+                },
+            },
+            "required": ["goal"],
+        },
+        handler=_make_forge_handler(forge),
+    )
+
+
 def _describe_scene_tool(describe: DescribeSceneSeam) -> Tool:
     return function_tool(
         name=DESCRIBE_SCENE,
@@ -345,6 +404,13 @@ class ToolRegistry:
         ``None`` (the default) the tool is **not** advertised at all (unlike
         ``apply_pose``, which is always listed but degrades). Injected — never
         imported — so this module keeps its no-:mod:`reachy.vision` boundary.
+    forge:
+        The forge dispatch seam — ``forge(goal, improve=None)`` (see
+        :meth:`reachy.forge.client.ForgeClient.dispatch`, wired at composition). When
+        given, the ``forge`` tool is registered and advertised; when ``None`` (the
+        default) the tool is **not** listed at all (like ``describe_scene``, opt-in).
+        Injected — never imported — so this module keeps its no-:mod:`reachy.forge`
+        boundary; the forge callable arrives at composition.
     extra_tools:
         Additional :class:`Tool` objects to register at construction — proving a
         new capability needs only one definition + handler.
@@ -359,6 +425,7 @@ class ToolRegistry:
         play: PlaySeam | None = None,
         catalog_keys: Iterable[str] | None = None,
         describe_scene: DescribeSceneSeam | None = None,
+        forge: ForgeSeam | None = None,
         extra_tools: Iterable[Tool] = (),
     ) -> None:
         speak_engine = speak_engine or resolve_voice_engine("tts")
@@ -381,6 +448,12 @@ class ToolRegistry:
         if describe_scene is not None:
             scene_tool = _describe_scene_tool(describe_scene)
             self._tools[scene_tool.name] = scene_tool
+        # forge is opt-in too: only advertised when composition injects the dispatch seam
+        # (absent -> the tool is not listed, so the agent is never offered a self-extension
+        # path it cannot actually drive).
+        if forge is not None:
+            forge_tool = _forge_tool(forge)
+            self._tools[forge_tool.name] = forge_tool
         for tool in extra_tools:
             self.register(tool)
 

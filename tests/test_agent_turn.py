@@ -749,5 +749,52 @@ def test_audio_latch_logs_a_second_sense_drop_line_when_muted(caplog):
     assert len(drop_records) == 2
 
 
+# ---------------------------------------------------------------------------
+# Hot registration — the tool list is rebuilt per turn (task t13 restart-note)
+# ---------------------------------------------------------------------------
+
+
+def test_hot_registered_tool_is_callable_on_the_next_turn():
+    """t13 restart-note finding: the engine reads ``registry.tools()`` FRESH on every
+    round of every turn (agent_turn.py, ``_run_agent_turn``), so a tool hot-registered
+    into the LIVE registry between turns is published on the very next turn — no
+    per-session snapshot, no restart, no deferred-until-restart line needed."""
+    reg = FakeRegistry()
+    turn = ScriptedTurn(lambda m: TurnResult(content="ok", tool_calls=[], finish_reason="stop"))
+    engine = AgentTurnEngine(buffer=_buf_with_cue(), registry=reg, turn_fn=turn)
+
+    engine.run_turn()
+    tools_turn1 = [d["function"]["name"] for d in turn.kwargs[-1]["tools"]]
+    assert "wave-hello" not in tools_turn1
+
+    # Hot-register a new tool into the LIVE registry (exactly what forge activation does).
+    reg._defs.append({"type": "function", "function": {"name": "wave-hello", "parameters": {}}})
+
+    _refill(engine.buffer)
+    engine.run_turn()
+    tools_turn2 = [d["function"]["name"] for d in turn.kwargs[-1]["tools"]]
+    assert "wave-hello" in tools_turn2, "a tool registered between turns must be callable next turn"
+
+
+def test_agent_turn_module_does_not_import_forge():
+    """CRITICAL BOUNDARY (task t13): agent_turn.py must not import reachy.forge — the
+    forge dispatch/activation seams arrive injected at composition, never imported here."""
+    import ast
+    import inspect
+
+    import reachy.speech.agent_turn as agent_mod
+
+    tree = ast.parse(inspect.getsource(agent_mod))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name)
+    for name in names:
+        assert "reachy.forge" not in name, f"agent_turn.py must not import forge ({name!r})"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

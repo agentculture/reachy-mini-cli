@@ -1220,3 +1220,56 @@ def test_live_agent_registry_receives_a_describe_scene_seam(monkeypatch) -> None
 
     describe_scene = _FakeRegistry.last_kwargs.get("describe_scene")
     assert callable(describe_scene), "agent registry must receive a describe_scene seam"
+
+
+# ---------------------------------------------------------------------------
+# 9. forge tool + validator-gated auto-activation + startup reload (t13)
+# ---------------------------------------------------------------------------
+
+
+def test_live_agent_registry_receives_a_forge_seam(monkeypatch) -> None:
+    """``--live --cognition agent``: the tool registry gets an injected forge dispatch seam."""
+    _patch_registry(monkeypatch)
+    transport = _LiveSdkTransport()
+
+    rc, _out, _err = _run_capture(
+        monkeypatch, _live_argv("--cognition", "agent"), transport=transport
+    )
+    assert rc == 0
+
+    forge = _FakeRegistry.last_kwargs.get("forge")
+    assert callable(forge), "agent registry must receive a forge dispatch seam"
+
+
+def test_bare_marker_cognition_registry_has_no_forge_seam(monkeypatch) -> None:
+    """The forge seam is only wired for the tool-use agent engine, never the marker path."""
+    _patch_registry(monkeypatch)
+    transport = _LiveSdkTransport()
+
+    # marker is the default cognition — the agent registry is never built, so the
+    # _FakeRegistry (patched over the agent path) is never constructed with a forge seam.
+    rc, _out, _err = _run_capture(monkeypatch, _live_argv(), transport=transport)
+    assert rc == 0
+    assert "forge" not in _FakeRegistry.last_kwargs
+
+
+def test_live_agent_startup_reloads_active_forged_skills(monkeypatch, tmp_path) -> None:
+    """Active forged skills are hot-registered into the live registry at composition (boot)."""
+    active = tmp_path / "forge" / "active" / "wave-hello"
+    active.mkdir(parents=True)
+    (active / "SKILL.md").write_text(
+        "---\nname: wave-hello\ndescription: Wave hello to a person.\n---\nbody\n"
+    )
+    (active / "executor.py").write_text("def execute(params, ctx):\n    return 'waved'\n")
+
+    _fed, captured = _record_agent_feeds(monkeypatch)
+    transport = _LiveSdkTransport()
+
+    rc, _out, _err = _run_capture(
+        monkeypatch, _live_argv("--cognition", "agent"), transport=transport
+    )
+    assert rc == 0
+
+    engine = captured.get("engine")
+    assert engine is not None, "the agent engine must be built"
+    assert "wave-hello" in engine._registry.names(), "an active forged skill must reload at boot"
