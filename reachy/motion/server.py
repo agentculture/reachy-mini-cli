@@ -142,8 +142,9 @@ def _drive(
     When ``busy`` is a dict, the loop publishes ``busy["until"] = st.busy_until``
     before each ``on_tick`` — the wall-clock horizon (dispatch + duration + settle)
     the current move is in flight until. A folded hook (``listen``'s ``PatHook``)
-    reads it via a ``(t) -> t < busy["until"]`` probe to skip sensing while the head
-    is mid-move, so a move's transit lag is never mistaken for an external press.
+    reads it via a ``() -> busy["until"]`` seam when it observes a large commanded
+    jump, riding out that move's transit unsensed so its lag is never mistaken for
+    an external press (small idle moves are sensed straight through).
     """
     st = _DriveState(on_action=hooks.on_action)
     while not stop["flag"]:

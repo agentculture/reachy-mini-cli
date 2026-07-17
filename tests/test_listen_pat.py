@@ -399,15 +399,21 @@ def test_pathook_close_clears_flag_even_mid_reaction() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3b. (t1 fix) motion-in-flight gating + re-baseline kill the false-fire loop
+# 3b. (t1 fix) large-move gating + re-baseline kill the false-fire loop —
+#     WITHOUT starving detection under the always-alive idle cadence
 #
 # A minjerk goto takes >1 s in transit; during it the actual pose lags the
 # commanded target by construction, so the OLD hook read that lag as an external
 # press and false-fired (147 phantom pats in 51 min, nobody touching the robot).
-# The fix: a ``motion_busy`` probe pauses sensing while a commanded move is in
-# flight, and the first sensing pass after any suspension re-baselines the
-# detector so the settled pose reads as zero deviation (no self-sustaining loop).
-# A genuine press on a *steady* head must still fire at today's thresholds.
+# But a binary any-move gate over-corrects: the idle layer keeps a (small) move
+# in flight ~90 % of wall time, so "skip sensing whenever busy" silently killed
+# real pats on the live robot (a scratch produced nothing). The fix is
+# amplitude-aware: only a commanded jump > LARGE_MOVE_THRESHOLD_DEG suspends
+# sensing, and only until THAT move's published busy horizon; holds and
+# sub-degree breaths are sensed straight through. The first sensing pass after
+# any suspension re-baselines the detector so the settled pose reads as zero
+# deviation (no self-sustaining loop). A genuine press on a steady-or-idling
+# head must still fire at today's thresholds.
 # ---------------------------------------------------------------------------
 
 
@@ -431,17 +437,18 @@ class _ScriptedPoseTransport:
 
 
 def test_in_flight_move_suppresses_sensing_no_pat() -> None:
-    """While a commanded move is in flight, PatHook does not sense — no false pat.
+    """While an unknown-size move is in flight at startup, PatHook does not sense.
 
-    The motion-busy probe reports "a move is in flight" for the whole run; the hook
-    must skip the head-pose read entirely, so a mid-transit pose (which reads like a
-    deep press) never reaches the detector and no pat fires. This is the core bug:
-    transit lag must never be mistaken for a hand.
+    On the very first tick the hook has no previous commanded pose to diff against,
+    so an in-flight move's size is unknown and it is ridden out to the published
+    horizon: the head-pose read is skipped entirely, so a mid-transit pose (which
+    reads like a deep press) never reaches the detector and no pat fires. This is
+    the core bug: transit lag must never be mistaken for a hand.
     """
-    busy = {"until": 100.0}  # always in flight
+    busy = {"until": 100.0}  # a move in flight from before the hook's first tick
     queue: MotionQueue = MotionQueue()
     detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
-    hook = PatHook(queue, detector=detector, motion_busy=lambda t: t < busy["until"])
+    hook = PatHook(queue, detector=detector, busy_horizon=lambda: busy["until"])
     transport = _ScriptedPoseTransport()
 
     now = 0.0
@@ -513,8 +520,8 @@ def test_first_pass_after_reaction_window_rebaselines() -> None:
 def test_genuine_press_on_steady_head_still_detects_at_default_thresholds() -> None:
     """A hand press on a steady (not-in-flight) head still fires a pat — today's thresholds.
 
-    The motion-busy probe reports "not in flight" (the robot holds a steady commanded
-    pose), so the hook senses every tick and a genuine external press still crosses the
+    The published horizon is in the past (the robot holds a steady commanded pose),
+    so the hook senses every tick and a genuine external press still crosses the
     DEFAULT detector thresholds (only the level2 jitter is pinned for determinism). The
     fix suppresses self-motion, never a real pat on a settled head.
     """
@@ -523,7 +530,7 @@ def test_genuine_press_on_steady_head_still_detects_at_default_thresholds() -> N
     # Default thresholds (min_presses=2, press_threshold=1.2, pat_cooldown=2.0) — only
     # the level2 jitter is pinned so the test is deterministic.
     detector = PatDetector(level2_threshold_fn=lambda: 6.0)
-    hook = PatHook(queue, detector=detector, motion_busy=lambda t: t < busy["until"])
+    hook = PatHook(queue, detector=detector, busy_horizon=lambda: busy["until"])
     transport = _ScriptedPoseTransport()
 
     commanded = {"pitch": 0.0, "yaw": 0.0}
@@ -546,15 +553,16 @@ def test_genuine_press_on_steady_head_still_detects_at_default_thresholds() -> N
 def test_server_run_publishes_busy_and_gates_pathook() -> None:
     """server.run publishes its busy horizon so a folded PatHook skips transit end-to-end.
 
-    A producer emits one long move; while it is in flight the loop's actual pose lags the
-    commanded target (transit). The PatHook, wired with a probe reading the loop's
-    published ``busy`` horizon, must NOT sense during that transit — proving the busy
-    publish + probe close the false-fire loop through the real ``server.run`` seam.
+    A producer emits one long LARGE move (a 30° pitch jump); while it is in flight the
+    loop's actual pose lags the commanded target (transit). The PatHook, wired with the
+    loop's published ``busy`` horizon, observes the commanded jump and must NOT sense
+    during that transit — proving the busy publish + horizon seam close the false-fire
+    loop through the real ``server.run`` seam.
     """
     busy = {"until": 0.0}
     queue: MotionQueue = MotionQueue()
     detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
-    hook = PatHook(queue, detector=detector, motion_busy=lambda t: t < busy["until"])
+    hook = PatHook(queue, detector=detector, busy_horizon=lambda: busy["until"])
 
     class _TransitTransport:
         name = "sdk"
@@ -598,6 +606,92 @@ def test_server_run_publishes_busy_and_gates_pathook() -> None:
     # Tick 1 senses (nothing dispatched yet); from tick 2 the move is in flight and the
     # published busy horizon gates every further head-pose read.
     assert transport.pose_calls <= 1, "head_pose must not be read once the move is in flight"
+
+
+def test_press_detected_through_continuous_small_idle_moves() -> None:
+    """THE live regression: a real press must detect while small idle moves run non-stop.
+
+    The always-alive idle layer dispatches back-to-back holds/sub-degree breaths, so a
+    (small) move is in flight ~90 % of wall time. The binary any-move gate starved the
+    detector completely — a real head scratch on the live robot produced nothing. With
+    amplitude-aware gating, small commanded jitter (jump <= LARGE_MOVE_THRESHOLD_DEG)
+    never suspends sensing, so the press still fires even though the published busy
+    horizon is perpetually in the future.
+    """
+    busy = {"until": 0.0}  # nothing in flight on the very first tick (as at live start)
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector, busy_horizon=lambda: busy["until"])
+    transport = _ScriptedPoseTransport()
+
+    now = 0.0
+    fired = False
+    for i in range(16):
+        # From tick 2 on, a small idle move is ALWAYS in flight (live cadence).
+        busy["until"] = now + 2.4
+        # Sub-threshold commanded breathing jitter (jump 0.8 deg <= threshold 1.0).
+        commanded = {"pitch": 0.8 if i % 2 else 0.0, "yaw": 0.0}
+        # The hand: alternating deep press; on release the untouched head TRACKS its
+        # commanded pose (deviation ~0), as on the real robot.
+        transport.pose = (-20.0, 0.0) if i % 2 == 0 else (commanded["pitch"], 0.0)
+        hook(transport, queue, now, commanded)
+        if hook.events >= 1:
+            fired = True
+            break
+        now += 0.4
+
+    assert fired, "a real press must still detect under the always-alive idle cadence"
+    assert transport.pose_calls > 0, "small in-flight moves must not suppress sensing"
+
+
+def test_sensing_resumes_after_large_move_horizon_despite_continuing_busy() -> None:
+    """A look/turn suspends sensing only until ITS horizon — later holds don't extend it.
+
+    Sequence mirrors the live journal: steady at 0°, a 13° look (large jump) with a
+    ~1.7 s horizon, then holds at 13° dispatched back-to-back (busy stays in the
+    future indefinitely). Sensing must be suspended for the look's transit only, then
+    resume (with a re-baseline) during the holds — where a genuine press then fires.
+    """
+    busy = {"until": 0.0}
+    queue: MotionQueue = MotionQueue()
+    detector = PatDetector(min_presses=2, pat_cooldown=0.0, level2_threshold_fn=lambda: 6.0)
+    hook = PatHook(queue, detector=detector, busy_horizon=lambda: busy["until"])
+    transport = _ScriptedPoseTransport()
+
+    # Phase 1: steady at neutral, settled (nothing in flight) — sensing runs.
+    now = 0.0
+    for _ in range(3):
+        transport.pose = (0.0, 0.0)
+        hook(transport, queue, now, {"pitch": 0.0, "yaw": 0.0})
+        now += 0.1
+    calls_steady = transport.pose_calls
+    assert calls_steady == 3
+
+    # Phase 2: the look dispatches — commanded jumps to 13° (large), horizon now+1.7.
+    look_horizon = now + 1.7
+    busy["until"] = look_horizon
+    while now < look_horizon:
+        transport.pose = (-6.0, 13.0)  # mid-transit lag: would read as a press
+        hook(transport, queue, now, {"pitch": 0.0, "yaw": 13.0})
+        now += 0.1
+    assert transport.pose_calls == calls_steady, "the look's transit must not be sensed"
+    assert hook.events == 0
+
+    # Phase 3: holds at 13° keep a move in flight forever (busy horizon always ahead),
+    # but the look's own horizon has passed — sensing resumes through the holds, and a
+    # genuine press (deep pitch deviation against the held 13° yaw pose) fires.
+    fired = False
+    for i in range(16):
+        busy["until"] = now + 2.4  # each hold re-published, perpetually in the future
+        transport.pose = (-20.0, 13.0) if i % 2 == 0 else (0.0, 13.0)
+        hook(transport, queue, now, {"pitch": 0.0, "yaw": 13.0})
+        if hook.events >= 1:
+            fired = True
+            break
+        now += 0.4
+
+    assert transport.pose_calls > calls_steady, "sensing must resume once the look settled"
+    assert fired, "a real press during hold-busy idling must still fire"
 
 
 # ---------------------------------------------------------------------------

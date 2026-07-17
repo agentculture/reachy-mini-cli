@@ -439,7 +439,7 @@ def _build_pat_hook(
     transport: object,
     queue,
     *,
-    motion_busy: Callable[[float], bool] | None = None,
+    busy_horizon: Callable[[], float] | None = None,
     buffer: object | None = None,
 ) -> PatHook | None:
     """A :class:`PatHook` bound to the loop's queue, or ``None`` when pat is off.
@@ -451,9 +451,13 @@ def _build_pat_hook(
     SDK client, so the read-backs are fast enough to detect a pat — a separate
     ``pat`` process would be throttled by SDK contention.
 
-    ``motion_busy`` is the ``(t) -> bool`` probe wired to the loop's published
-    ``busy`` horizon (see :func:`_run_sdk_loop`); it lets the hook skip sensing
-    while a commanded move is in flight so transit lag is never mistaken for a pat.
+    ``busy_horizon`` is the ``() -> float`` seam returning the loop's published
+    ``busy["until"]`` (see :func:`_run_sdk_loop`); the hook suspends sensing until
+    that horizon only when it observes a *large* commanded jump (see
+    :data:`reachy.motion.listen_pat.LARGE_MOVE_THRESHOLD_DEG`), so a look/turn's
+    transit lag is never mistaken for a pat while the always-alive idle cadence
+    (holds + sub-degree breaths, in flight ~90 % of wall time) is sensed straight
+    through — a binary any-move gate starved detection entirely on the live robot.
 
     ``buffer`` lets the ``--live`` composition pass the SAME shared cognition
     :class:`~reachy.speech.events.EventBuffer` the folded ThinkHook/agent engine
@@ -475,7 +479,7 @@ def _build_pat_hook(
     if getattr(args, "min_presses", None) is not None:
         kw["min_presses"] = args.min_presses
     detector = PatDetector(**kw) if kw else None
-    return PatHook(queue, detector=detector, motion_busy=motion_busy, buffer=buffer)
+    return PatHook(queue, detector=detector, busy_horizon=busy_horizon, buffer=buffer)
 
 
 def _build_think_hook(
@@ -1138,9 +1142,9 @@ def _run_sdk_loop(
     if getattr(args, "snap_floor", None) is not None:
         snap_kwargs["min_rms"] = args.snap_floor
     queue = MotionQueue()
-    # The loop publishes its busy_until horizon here each tick; the PatHook's probe
-    # reads it to skip sensing while a commanded move is in flight (transit lag is not
-    # a hand). Shared object: run_loop writes it, the probe closure below reads it.
+    # The loop publishes its busy_until horizon here each tick; the PatHook reads it
+    # (only on large commanded jumps) to ride out a look/turn's transit unsensed.
+    # Shared object: run_loop writes it, the horizon closure below reads it.
     busy: dict[str, float] = {"until": 0.0}
     live = getattr(args, "live", False)
     # Built BEFORE pat_hook (below) so the SAME buffer object can be threaded into
@@ -1151,7 +1155,7 @@ def _run_sdk_loop(
         args,
         transport,
         queue,
-        motion_busy=lambda t: t < busy["until"],
+        busy_horizon=lambda: busy["until"],
         buffer=cognition_buffer,
     )
     holder = SampleHolder()
