@@ -64,7 +64,6 @@ PROMPT_TEMPLATE = (
     "blocks."
 )
 
-_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)\n?```", re.DOTALL)
 _NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
 _SANITIZE_RE = re.compile(r"[^a-z0-9-]+")
 _DASH_COLLAPSE_RE = re.compile(r"-+")
@@ -116,6 +115,46 @@ def _build_messages(goal: str, context: dict, improve: str | None) -> list[dict]
     ]
 
 
+def _iter_fences(content: str):
+    """Yield ``(label, body)`` for every fenced code block in *content*.
+
+    A deterministic, linear string scan over three-backtick fences — no regex, so no
+    backtracking risk (this replaces a lazy-dot regex on live, untrusted network
+    replies: SonarCloud S8786, super-linear worst case on adversarial input). It
+    reproduces the fence grammar the previous regex implemented: a fence opens at a
+    literal triple-backtick, its label runs up to the first newline or backtick, and
+    the body runs up to the next triple-backtick occurrence, with exactly one
+    immediately-preceding newline (if present) excluded from the body — matching the
+    old pattern's optional trailing ``\\n`` before the close fence.
+    """
+    pos = 0
+    length = len(content)
+    while True:
+        start = content.find("```", pos)
+        if start == -1:
+            return
+        header_start = start + 3
+        idx = header_start
+        while idx < length and content[idx] not in "`\n":
+            idx += 1
+        if idx >= length or content[idx] != "\n":
+            # No bare newline closes the label before EOF/backtick — this start
+            # position can't open a fence; retry one character to the right.
+            pos = start + 1
+            continue
+        label = content[header_start:idx]
+        body_start = idx + 1
+        close = content.find("```", body_start)
+        if close == -1:
+            pos = start + 1
+            continue
+        body_end = close
+        if body_end > body_start and content[body_end - 1] == "\n":
+            body_end -= 1
+        yield label, content[body_start:body_end]
+        pos = close + 3
+
+
 def _extract_fences(content: str) -> dict[str, str]:
     """Defensively pull the SKILL.md and executor.py fenced blocks out of a reply.
 
@@ -128,21 +167,21 @@ def _extract_fences(content: str) -> dict[str, str]:
     found: dict[str, str] = {}
     unlabeled: list[str] = []
 
-    for label, body in _FENCE_RE.findall(content):
+    for label, body in _iter_fences(content):
         label_lower = label.strip().lower()
-        if "skill.md" in label_lower:
-            found.setdefault("SKILL.md", body)
-        elif "executor.py" in label_lower:
-            found.setdefault("executor.py", body)
+        if lifecycle.SKILL_FILENAME.lower() in label_lower:
+            found.setdefault(lifecycle.SKILL_FILENAME, body)
+        elif lifecycle.EXECUTOR_FILENAME.lower() in label_lower:
+            found.setdefault(lifecycle.EXECUTOR_FILENAME, body)
         else:
             unlabeled.append(body)
 
     for body in unlabeled:
         stripped = body.strip()
-        if "SKILL.md" not in found and stripped.startswith("---"):
-            found["SKILL.md"] = body
-        elif "executor.py" not in found and "def execute(" in body:
-            found["executor.py"] = body
+        if lifecycle.SKILL_FILENAME not in found and stripped.startswith("---"):
+            found[lifecycle.SKILL_FILENAME] = body
+        elif lifecycle.EXECUTOR_FILENAME not in found and "def execute(" in body:
+            found[lifecycle.EXECUTOR_FILENAME] = body
 
     return found
 
@@ -259,11 +298,11 @@ class ForgeClient:
         if response is None:
             return
 
-        content = self._content_or_reject(url, response)
+        content = self._content_or_reject(response)
         if content is None:
             return
 
-        skill_md, executor_py = self._fences_or_reject(url, content)
+        skill_md, executor_py = self._fences_or_reject(content)
         if skill_md is None or executor_py is None:
             return
 
@@ -289,17 +328,17 @@ class ForgeClient:
             self._reject(None, [f"endpoint unreachable: {err}"])
         return None
 
-    def _content_or_reject(self, url: str, response: dict):
+    def _content_or_reject(self, response: dict):
         try:
             return response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
             self._reject(None, ["unparseable reply"])
             return None
 
-    def _fences_or_reject(self, url: str, content: str):
+    def _fences_or_reject(self, content: str):
         fences = _extract_fences(content)
-        skill_md = fences.get("SKILL.md")
-        executor_py = fences.get("executor.py")
+        skill_md = fences.get(lifecycle.SKILL_FILENAME)
+        executor_py = fences.get(lifecycle.EXECUTOR_FILENAME)
         if not skill_md or not skill_md.strip():
             self._reject(None, ["missing or empty SKILL.md fence"])
             return None, None

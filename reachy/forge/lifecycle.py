@@ -47,6 +47,12 @@ EVENT_REJECTED = "forge/rejected"
 
 _REJECTED_DIRNAME = ".rejected"
 
+#: Canonical filenames for a forged skill's two staged artifacts. This is the single
+#: source of truth for the package — every sibling forge module imports these rather
+#: than repeating the literals (SonarCloud S1192: duplicated string literals).
+SKILL_FILENAME = "SKILL.md"
+EXECUTOR_FILENAME = "executor.py"
+
 
 def default_staging_root() -> Path:
     """``<state_dir>/forge/staged`` — where freshly forged skills are written."""
@@ -73,8 +79,8 @@ def write_artifacts(
     root = staging_root if staging_root is not None else default_staging_root()
     skill_dir = root / name
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text(skill_md)
-    (skill_dir / "executor.py").write_text(executor_py)
+    (skill_dir / SKILL_FILENAME).write_text(skill_md)
+    (skill_dir / EXECUTOR_FILENAME).write_text(executor_py)
     return skill_dir
 
 

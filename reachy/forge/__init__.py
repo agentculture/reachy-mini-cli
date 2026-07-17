@@ -45,6 +45,8 @@ from reachy.forge.lifecycle import (
     EVENT_ACTIVATED,
     EVENT_REJECTED,
     EVENT_STAGED,
+    EXECUTOR_FILENAME,
+    SKILL_FILENAME,
     default_active_root,
     default_staging_root,
     reject,
@@ -86,4 +88,6 @@ __all__ = [
     "EVENT_STAGED",
     "EVENT_ACTIVATED",
     "EVENT_REJECTED",
+    "SKILL_FILENAME",
+    "EXECUTOR_FILENAME",
 ]
