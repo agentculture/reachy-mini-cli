@@ -138,8 +138,9 @@ def test_a_goto_with_no_channel_target_is_refused_and_never_submitted() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(duration=1.0)
     with pytest.raises(CliError) as exc:
-        handler(_command(duration=1.0), _CTX)
+        handler(cmd, _CTX)
 
     assert "at least one channel" in exc.value.message
     assert lane.submitted == []
@@ -166,8 +167,9 @@ def test_out_of_range_head_axis_is_refused_naming_axis_and_limit(
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(head=head_payload)
     with pytest.raises(CliError) as exc:
-        handler(_command(head=head_payload), _CTX)
+        handler(cmd, _CTX)
 
     assert bad_axis in exc.value.message
     assert str(limit) in exc.value.message
@@ -179,8 +181,9 @@ def test_out_of_range_antenna_is_refused_naming_axis_and_limit() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(antennas=[ANTENNA_LIMIT_DEG + 1.0, 0.0])
     with pytest.raises(CliError) as exc:
-        handler(_command(antennas=[ANTENNA_LIMIT_DEG + 1.0, 0.0]), _CTX)
+        handler(cmd, _CTX)
 
     assert "antennas.right" in exc.value.message
     assert str(ANTENNA_LIMIT_DEG) in exc.value.message
@@ -191,8 +194,9 @@ def test_out_of_range_body_yaw_is_refused_naming_axis_and_limit() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(body_yaw=BODY_YAW_LIMIT_DEG + 0.5)
     with pytest.raises(CliError) as exc:
-        handler(_command(body_yaw=BODY_YAW_LIMIT_DEG + 0.5), _CTX)
+        handler(cmd, _CTX)
 
     assert "body_yaw" in exc.value.message
     assert str(BODY_YAW_LIMIT_DEG) in exc.value.message
@@ -205,8 +209,9 @@ def test_a_wild_target_from_a_buggy_agent_is_never_submitted() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(head={"yaw": 99999.0}, duration=1.0)
     with pytest.raises(CliError):
-        handler(_command(head={"yaw": 99999.0}, duration=1.0), _CTX)
+        handler(cmd, _CTX)
 
     assert lane.submitted == []
 
@@ -220,8 +225,9 @@ def test_unknown_top_level_field_is_refused_and_never_submitted() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(body_yaw=1.0, speed=99.0)
     with pytest.raises(CliError) as exc:
-        handler(_command(body_yaw=1.0, speed=99.0), _CTX)
+        handler(cmd, _CTX)
 
     assert "speed" in exc.value.message
     assert lane.submitted == []
@@ -242,8 +248,9 @@ def test_unknown_head_axis_is_refused_and_never_submitted() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(head={"elbow": 1.0})
     with pytest.raises(CliError) as exc:
-        handler(_command(head={"elbow": 1.0}), _CTX)
+        handler(cmd, _CTX)
 
     assert "elbow" in exc.value.message
     assert lane.submitted == []
@@ -258,8 +265,9 @@ def test_non_positive_duration_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(body_yaw=1.0, duration=0.0)
     with pytest.raises(CliError) as exc:
-        handler(_command(body_yaw=1.0, duration=0.0), _CTX)
+        handler(cmd, _CTX)
 
     assert "duration" in exc.value.message
     assert lane.submitted == []
@@ -269,8 +277,9 @@ def test_negative_duration_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(body_yaw=1.0, duration=-2.0)
     with pytest.raises(CliError):
-        handler(_command(body_yaw=1.0, duration=-2.0), _CTX)
+        handler(cmd, _CTX)
 
     assert lane.submitted == []
 
@@ -279,8 +288,9 @@ def test_absurd_duration_beyond_ten_seconds_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(body_yaw=1.0, duration=MAX_DURATION_S + 0.1)
     with pytest.raises(CliError) as exc:
-        handler(_command(body_yaw=1.0, duration=MAX_DURATION_S + 0.1), _CTX)
+        handler(cmd, _CTX)
 
     assert "duration" in exc.value.message
     assert str(MAX_DURATION_S) in exc.value.message
@@ -306,8 +316,9 @@ def test_bool_value_for_body_yaw_is_refused_not_treated_as_zero_or_one() -> None
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(body_yaw=True)
     with pytest.raises(CliError) as exc:
-        handler(_command(body_yaw=True), _CTX)
+        handler(cmd, _CTX)
 
     assert "body_yaw" in exc.value.message
     assert lane.submitted == []
@@ -317,8 +328,9 @@ def test_bool_value_for_duration_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(body_yaw=1.0, duration=True)
     with pytest.raises(CliError):
-        handler(_command(body_yaw=1.0, duration=True), _CTX)
+        handler(cmd, _CTX)
 
     assert lane.submitted == []
 
@@ -327,8 +339,9 @@ def test_string_value_for_head_axis_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(head={"yaw": "12"})
     with pytest.raises(CliError) as exc:
-        handler(_command(head={"yaw": "12"}), _CTX)
+        handler(cmd, _CTX)
 
     assert "head.yaw" in exc.value.message
     assert lane.submitted == []
@@ -338,8 +351,9 @@ def test_non_list_antennas_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(antennas="not-a-pair")
     with pytest.raises(CliError) as exc:
-        handler(_command(antennas="not-a-pair"), _CTX)
+        handler(cmd, _CTX)
 
     assert "antennas" in exc.value.message
     assert lane.submitted == []
@@ -349,8 +363,9 @@ def test_wrong_length_antennas_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(antennas=[1.0, 2.0, 3.0])
     with pytest.raises(CliError) as exc:
-        handler(_command(antennas=[1.0, 2.0, 3.0]), _CTX)
+        handler(cmd, _CTX)
 
     assert "antennas" in exc.value.message
     assert lane.submitted == []
@@ -360,8 +375,9 @@ def test_non_dict_head_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(head=[1.0, 2.0])
     with pytest.raises(CliError) as exc:
-        handler(_command(head=[1.0, 2.0]), _CTX)
+        handler(cmd, _CTX)
 
     assert "head" in exc.value.message
     assert lane.submitted == []
@@ -371,8 +387,9 @@ def test_non_string_interpolation_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(body_yaw=1.0, interpolation=7)
     with pytest.raises(CliError) as exc:
-        handler(_command(body_yaw=1.0, interpolation=7), _CTX)
+        handler(cmd, _CTX)
 
     assert "interpolation" in exc.value.message
     assert lane.submitted == []
@@ -382,8 +399,9 @@ def test_non_string_label_is_refused() -> None:
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(body_yaw=1.0, label=7)
     with pytest.raises(CliError) as exc:
-        handler(_command(body_yaw=1.0, label=7), _CTX)
+        handler(cmd, _CTX)
 
     assert "label" in exc.value.message
     assert lane.submitted == []
@@ -403,8 +421,9 @@ def test_handler_raises_cli_error_matching_kind_registry_catch_contract() -> Non
     lane = _RecordingLane()
     handler = make_goto_handler(lane)
 
+    cmd = _command(duration=1.0)
     with pytest.raises(CliError) as exc:
-        handler(_command(duration=1.0), _CTX)
+        handler(cmd, _CTX)
 
     assert isinstance(exc.value, CliError)
     assert exc.value.message
