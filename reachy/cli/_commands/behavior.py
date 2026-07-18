@@ -47,12 +47,16 @@ from reachy.behavior import rules as rules_mod
 from reachy.behavior import supervisor
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
+from reachy.behavior.goto_intent import GOTO, make_goto_handler
+from reachy.behavior.goto_lane import GotoLane
 from reachy.behavior.intents import IntentDriver
 from reachy.behavior.model import CHANNELS, StopClass
+from reachy.behavior.pat_sense import PatSenseDriver
+from reachy.behavior.pose_feed import LastPoseHolder
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
-from reachy.behavior.sense import DoaPoller, read_doa
+from reachy.behavior.sense import DoaPoller, SenseProviders, read_doa, read_perception
 from reachy.behavior.tick_metrics import TickMetrics, budget_from_hz
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
@@ -61,7 +65,9 @@ from reachy.cli._export import add_runtime_export_args, build_runtime_export_con
 from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.runtime import SenseSnapshotDriver
+from reachy.motion.pat import PatDetector
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
+from reachy.robot.state_reader import HeldStateReader
 
 _JSON_HELP = "Emit structured JSON."
 _EMPTY_SUBMITTED = "(submitted)"
@@ -567,29 +573,116 @@ def cmd_engine_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer):
-    """Build ``behavior engine run``'s sense reader + tick seam.
+def _make_state_reader() -> HeldStateReader:
+    """Build the held, media-free SDK pose reader — a test-injection seam.
 
-    Live perception is the daemon's DoA route through this transport (DoaPoller
-    throttles + swallows failures; a mic-less box reads EMPTY_SENSE). The act-in
-    seam is the IntentDriver — agents/scripts submit intents through the spool and
-    the driver sustains them tick over tick, mode intents reaching the LIVE rule
-    engine. Everything rides ONE TickBus (+ sense snapshots when exporting),
-    wrapped in TickMetrics so a tick-budget breach surfaces as a
-    ``[SENSE ... event=overrun]`` line (c22).
+    Isolated as a module-level factory so a composition test can inject a fake
+    reader (recording ``read``/``close``) via ``monkeypatch.setattr`` without a
+    real SDK. In production it returns a bare
+    :class:`~reachy.robot.state_reader.HeldStateReader`, which itself degrades to
+    a permanently-``None`` reader (one logged warning, then no reading) when the
+    ``[sdk]`` extra is absent — which is why :func:`_compose_run_seam` composes
+    the pat stack UNCONDITIONALLY rather than gating on an SDK-import probe.
     """
-    sense_reader = DoaPoller(lambda: read_doa(transport))
+    return HeldStateReader()
+
+
+def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer):
+    """Build ``behavior engine run``'s sense reader + tick seam + held pose reader.
+
+    Composes every merged runtime sense/act piece onto the engine's ONE per-tick
+    seam and returns ``(sense_reader, tick_seam, reader)``. Everything rides ONE
+    :class:`TickBus` wrapped in :class:`TickMetrics`, so a tick-budget breach
+    surfaces as a ``[SENSE ... event=overrun]`` line (c22).
+
+    Perception (``sense_reader``)
+    -----------------------------
+    Each tick's :class:`~reachy.behavior.sense.Sense` is
+    ``read_perception(SenseProviders(pat_event=...), base=doa_poller(t))``: the
+    :class:`~reachy.behavior.sense.DoaPoller` supplies the throttled DoA/speech
+    leg (its own low-rate polling + failure-swallowing preserved), while the pat
+    cue is a non-consuming PEEK of the pat driver's one-tick latch — so the DoA
+    leg keeps its cadence and the pat leg costs only a latch read per call. A
+    mic-less box reads EMPTY_SENSE for the DoA leg exactly as before.
+
+    Degrade contract (no ``[sdk]`` extra)
+    -------------------------------------
+    The SDK sense stack (:class:`HeldStateReader` + :class:`PatDetector` +
+    :class:`PatSenseDriver` + :class:`LastPoseHolder`) is ALWAYS composed: every
+    piece is import-safe without ``reachy_mini``, and :class:`HeldStateReader`
+    degrades internally to permanently-``None`` when the extra is absent (one
+    logged warning, then no reading). So on a bare box the engine behaves exactly
+    as before EXCEPT for a few inert drivers — the pat driver reads ``None`` every
+    tick (no pat events, no errors), the holder harmlessly stashes each pose, and
+    an empty goto lane is a per-tick no-op — i.e. DoA-only sense, no pat, no
+    exceptions. The goto path itself needs no SDK, so it still works.
+
+    Act-in seams (the ONE TickBus, in driver order)
+    -----------------------------------------------
+    ``[rules_driver, intent_driver, pat_driver, holder, goto_lane]`` (with a
+    :class:`SenseSnapshotDriver` appended when exporting):
+
+    * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
+      decisions (admit/evict, drain the intent + goto command spools). The GOTO
+      kind handler runs inside the intent driver's drain and enqueues onto the
+      goto lane. The intent driver builds its OWN registry with the four intent
+      kinds, then the GOTO kind is registered into THAT SAME registry, so all
+      five kinds share one registry: the merged
+      :class:`~reachy.behavior.intents.IntentDriver` only auto-registers its four
+      defaults when it builds the registry itself, so GOTO is added afterward
+      rather than pre-loaded into an injected (would-be-empty-of-defaults)
+      registry.
+    * ``pat_driver`` — reads THIS tick's ``ctx.pose`` (commanded head) and the
+      injected reader (actual head) DIRECTLY (never via the holder), advances the
+      detector, and latches a pat for the NEXT tick's sense read. It mutates no
+      shared engine state and only latches, so its position among the readers is
+      immaterial to correctness; it sits after the symbolic drivers by
+      convention.
+    * ``holder`` BEFORE ``goto_lane`` — the holder stashes this tick's streamed
+      ``ctx.pose``; the goto lane's ``start_pose_provider`` peeks that stash when
+      it admits a goto. Running the holder first means a goto admitted THIS tick
+      (from a command the intent driver just drained) seeds its minjerk start from
+      this tick's freshest pose instead of last tick's stale one.
+    * ``SenseSnapshotDriver`` last (export only) — publishes the tick's perception
+      snapshot on change; it reads the fixed ``ctx.sense`` so its position is
+      immaterial, appended last so the sense block trails the decisions.
+
+    The returned ``reader`` is the held SDK client the caller MUST ``close()`` at
+    shutdown (an unclosed ``no_media`` client hangs the process at interpreter
+    exit — see :mod:`reachy.robot.state_reader`).
+    """
+    doa_poller = DoaPoller(lambda: read_doa(transport))
+
+    # The SDK sense stack — always composed; every piece is import-safe without
+    # reachy_mini and the reader degrades internally (see the docstring).
+    reader = _make_state_reader()
+    pat_driver = PatSenseDriver(reader=reader.read, detector=PatDetector())
+    holder = LastPoseHolder()
+    providers = SenseProviders(pat_event=pat_driver.as_provider())
+
+    def sense_reader(t):
+        # DoA (throttled by the poller) as the base; the pat cue is peeked
+        # non-consuming from the pat driver's one-tick latch.
+        return read_perception(providers, base=doa_poller(t))
+
+    goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
     intent_driver = IntentDriver(
         mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
         known_modes=rules_driver.known_modes if rules_driver is not None else None,
     )
-    drivers = [d for d in (rules_driver, intent_driver) if d is not None]
+    # Register the GOTO kind into the intent driver's OWN registry (which already
+    # carries the four intent defaults) so all five kinds share one registry.
+    intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
+
+    drivers = [
+        d for d in (rules_driver, intent_driver, pat_driver, holder, goto_lane) if d is not None
+    ]
     consumers = []
     if runtime_consumer is not None:
         drivers.append(SenseSnapshotDriver())
         consumers.append(runtime_consumer)
     bus = TickBus(drivers=drivers, consumers=consumers)
-    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))
+    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), reader
 
 
 def cmd_engine_run(args: argparse.Namespace) -> int:
@@ -615,7 +708,9 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     # think/listen cognition feed (decision c27) — carries no thinking/message/
     # emotion blocks, only perception/rule/intent/motion runtime events.
     runtime_consumer = build_runtime_export_consumer(args)
-    sense_reader, tick_seam = _compose_run_seam(transport, config, rules_driver, runtime_consumer)
+    sense_reader, tick_seam, reader = _compose_run_seam(
+        transport, config, rules_driver, runtime_consumer
+    )
 
     def _emit(event: dict) -> None:
         # Suppress the per-tick JSON summary while exporting so stdout carries
@@ -623,16 +718,23 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         if json_mode and runtime_consumer is None:
             emit_result(event, json_mode=True)
 
-    ticks = engine_run(
-        transport,
-        config,
-        on_start=_on_start,
-        emit=_emit,
-        max_ticks=args.max_ticks,
-        control=spool,
-        sense=sense_reader,
-        tick_seam=tick_seam,
-    )
+    try:
+        ticks = engine_run(
+            transport,
+            config,
+            on_start=_on_start,
+            emit=_emit,
+            max_ticks=args.max_ticks,
+            control=spool,
+            sense=sense_reader,
+            tick_seam=tick_seam,
+        )
+    finally:
+        # Release the held media-free SDK pose reader on EVERY exit path. REQUIRED
+        # for a clean stop: an unclosed no_media ReachyMini client hangs the
+        # process at interpreter exit (see reachy.robot.state_reader), which would
+        # wedge a SIGTERM. close() is idempotent and never raises.
+        reader.close()
     if runtime_consumer is not None:
         emit_diagnostic(f"[behavior] engine stopped after {ticks} tick(s) (export: stdout)")
     elif not json_mode:
