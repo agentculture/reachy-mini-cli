@@ -1,15 +1,16 @@
 """Single-presence-owner service manager for the boot-survival presence stack.
 
 The robot has exactly **one** presence at a time (the single-SDK-owner model in
-``CLAUDE.md``): either the idle ``demo-mode`` loop or the folded ``listen --live``
-loop may own the head, never both. This manager makes that invariant true across
+``CLAUDE.md``): the idle ``demo-mode`` loop, the folded ``listen --live`` loop,
+or the AI-agnostic symbolic runtime (``behavior engine run``, decision c19) may
+own the head, never more than one. This manager makes that invariant true across
 reboots via systemd ``--user`` units: ``enable(mode)`` installs + enables the
-daemon and the *chosen* presence unit and **always disables the sibling**, so any
-sequence of enables leaves at most one presence unit enabled.
+daemon and the *chosen* presence unit and **always disables BOTH siblings**, so
+any sequence of enables leaves at most one presence unit enabled.
 
 It generalizes the pattern already proven in
 :mod:`reachy.demo_service` (write unit text → ``daemon-reload`` → ``enable --now``
-/ ``disable --now``) to three coordinated units — the daemon plus the two
+/ ``disable --now``) to four coordinated units — the daemon plus the three
 mutually-exclusive presence units — and reuses the *pure* unit-text renderers and
 canonical names from :mod:`reachy.service.units` verbatim (it never re-derives a
 unit name or re-renders text).
@@ -24,7 +25,7 @@ without touching real systemd or the real ``~/.config/systemd/user``:
 * ``daemon_health`` — a ``() -> bool`` daemon liveness probe (defaults to the
   real :func:`reachy.daemon.is_robot_live`).
 
-The daemon unit is enabled for **both** modes — the presence units ``Requires=``
+The daemon unit is enabled for **every** mode — the presence units ``Requires=``
 / ``After=`` it (see :mod:`reachy.service.units`). ``disable()`` stops the enabled
 presence unit only and **leaves the daemon enabled** — that decision is explicit
 (reported as ``daemon="left-enabled"``) rather than silent, because tearing the
@@ -41,20 +42,30 @@ from reachy.service.units import (
     DAEMON_UNIT,
     DEMO_UNIT,
     LIVE_UNIT,
+    RUNTIME_UNIT,
     daemon_unit_text,
     demo_unit_text,
     live_unit_text,
+    runtime_unit_text,
 )
 
-# mode name -> (presence unit name, sibling unit name, unit-text renderer)
+# mode name -> (presence unit name, sibling unit names, unit-text renderer).
+# Sibling order is deterministic (catalog order, self excluded) so the FIRST
+# sibling is stable across calls — kept as ``disabled_sibling`` in enable()'s
+# result for backward compatibility, alongside the full ``disabled_siblings``.
 _PRESENCE = {
-    "demo": (DEMO_UNIT, LIVE_UNIT, demo_unit_text),
-    "live": (LIVE_UNIT, DEMO_UNIT, live_unit_text),
+    "demo": (DEMO_UNIT, (LIVE_UNIT, RUNTIME_UNIT), demo_unit_text),
+    "live": (LIVE_UNIT, (DEMO_UNIT, RUNTIME_UNIT), live_unit_text),
+    "runtime": (RUNTIME_UNIT, (DEMO_UNIT, LIVE_UNIT), runtime_unit_text),
 }
 _MODES = tuple(_PRESENCE)
 
 # Map a presence unit name back to its mode, for status() read-back.
-_UNIT_TO_MODE = {DEMO_UNIT: "demo", LIVE_UNIT: "live"}
+_UNIT_TO_MODE = {DEMO_UNIT: "demo", LIVE_UNIT: "live", RUNTIME_UNIT: "runtime"}
+
+# All presence units, in catalog order — every non-daemon unit the manager
+# coordinates as mutually exclusive.
+_PRESENCE_UNITS = (DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT)
 
 
 def _default_unit_dir() -> Path:
@@ -139,11 +150,12 @@ class ServiceManager:
     def enable(self, mode: str) -> dict[str, object]:
         """Enable exactly one presence mode (the daemon + that presence unit).
 
-        Writes the daemon and chosen presence unit text, reloads the user
-        manager, ``enable --now`` the daemon and chosen presence, and
-        ``disable --now`` the sibling presence (idempotent — fine if it was
-        already disabled). The sibling disable is what keeps the single-owner
-        invariant true after any sequence of ``enable`` calls.
+        Writes the daemon and ALL presence unit text, reloads the user manager,
+        ``enable --now`` the daemon and chosen presence, and ``disable --now``
+        EVERY sibling presence (idempotent — fine if one was already disabled).
+        Disabling every sibling is what keeps the three-way single-owner
+        invariant true after any sequence of ``enable`` calls (demo/live/runtime
+        — at most one enabled, ever).
         """
         if mode not in _PRESENCE:
             raise CliError(
@@ -151,12 +163,13 @@ class ServiceManager:
                 message=f"unknown presence mode: {mode!r}",
                 remediation=f"choose one of: {', '.join(_MODES)}",
             )
-        presence_unit, sibling_unit, _ = _PRESENCE[mode]
+        presence_unit, sibling_units, _ = _PRESENCE[mode]
 
-        # 1. Write the daemon + BOTH presence unit files (t1's renderers). Writing
-        #    the sibling too means step 4's `disable --now <sibling>` always targets
-        #    an installed unit — a first-time enable has no sibling on disk yet, and
-        #    `systemctl disable` on a missing unit fails and would abort the enable.
+        # 1. Write the daemon + ALL presence unit files (t1/t10's renderers).
+        #    Writing every sibling too means step 4's `disable --now <sibling>`
+        #    always targets an installed unit — a first-time enable has no
+        #    sibling on disk yet, and `systemctl disable` on a missing unit
+        #    fails and would abort the enable.
         daemon_path = self._write_unit(DAEMON_UNIT, daemon_unit_text())
         written = {
             unit: self._write_unit(unit, render_fn())
@@ -171,15 +184,19 @@ class ServiceManager:
         self._require(["enable", "--now", DAEMON_UNIT], f"enable {DAEMON_UNIT}")
         self._require(["enable", "--now", presence_unit], f"enable {presence_unit}")
 
-        # 4. Disable + stop the sibling presence — the single-owner invariant.
+        # 4. Disable + stop EVERY sibling presence — the single-owner invariant.
         #    Idempotent: disabling an already-disabled unit is a no-op success.
-        self._require(["disable", "--now", sibling_unit], f"disable {sibling_unit}")
+        for sibling_unit in sibling_units:
+            self._require(["disable", "--now", sibling_unit], f"disable {sibling_unit}")
 
         return {
             "status": "enabled",
             "mode": mode,
             "presence_unit": presence_unit,
-            "disabled_sibling": sibling_unit,
+            # Kept singular for backward compatibility (the FIRST sibling, in
+            # stable catalog order); disabled_siblings carries the full set.
+            "disabled_sibling": sibling_units[0],
+            "disabled_siblings": list(sibling_units),
             "unit_paths": {
                 DAEMON_UNIT: str(daemon_path),
                 presence_unit: str(presence_path),
@@ -203,13 +220,13 @@ class ServiceManager:
     def status(self) -> dict[str, object]:
         """Report the single enabled presence mode (or none) + daemon health.
 
-        Queries ``is-enabled`` / ``is-active`` for the daemon and both presence
-        units through the injected runner (no mutation), folds the injected
-        daemon-health probe, and returns a structured dict. ``mode`` is the one
-        enabled presence mode or ``None``.
+        Queries ``is-enabled`` / ``is-active`` for the daemon and all three
+        presence units through the injected runner (no mutation), folds the
+        injected daemon-health probe, and returns a structured dict. ``mode`` is
+        the one enabled presence mode or ``None``.
         """
         units: dict[str, dict[str, str]] = {}
-        for unit in (DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT):
+        for unit in (DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT):
             units[unit] = {
                 "enabled": self._query("is-enabled", unit),
                 "active": self._query("is-active", unit),
@@ -229,11 +246,11 @@ class ServiceManager:
     ) -> Optional[str]:
         """Return the one enabled presence unit name, or None.
 
-        If two were somehow both reported enabled (a corrupt external state),
-        prefer the first in catalog order — the next ``enable`` will repair the
-        invariant by disabling the sibling.
+        If more than one were somehow reported enabled (a corrupt external
+        state), prefer the first in catalog order — the next ``enable`` will
+        repair the invariant by disabling every sibling.
         """
-        for unit in (DEMO_UNIT, LIVE_UNIT):
+        for unit in _PRESENCE_UNITS:
             if units is not None:
                 value = units[unit]["enabled"]
             else:

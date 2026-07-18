@@ -78,6 +78,11 @@ class JsonlExporter:
         selection: A :class:`~reachy.export.blocks.Selection` describing which
             block types to forward.  Events whose ``t`` attribute is not in the
             selection are dropped silently before any I/O is attempted.
+        serialize: The event -> JSON-line function.  Defaults to
+            :func:`~reachy.export.events.to_jsonl` (the cognition feed's
+            serializer).  Pass :func:`reachy.export.runtime.runtime_to_jsonl` to
+            reuse this same disconnect-safe sink for the SEPARATE runtime-event
+            feed instead of duplicating the broken-pipe/self-disable logic.
 
     Example::
 
@@ -85,9 +90,16 @@ class JsonlExporter:
         exporter.emit(MessageEvent(text="hello", ts=time.time()))
     """
 
-    def __init__(self, stream: IO[str], selection: Selection) -> None:
+    def __init__(
+        self,
+        stream: IO[str],
+        selection: Selection,
+        *,
+        serialize: Callable[[object], str] = to_jsonl,
+    ) -> None:
         self._stream = stream
         self._selection = selection
+        self._serialize = serialize
         self._broken = False
 
     # ------------------------------------------------------------------
@@ -114,7 +126,7 @@ class JsonlExporter:
         if not self._selection.allows(event.t):
             return
 
-        line = to_jsonl(event) + "\n"
+        line = self._serialize(event) + "\n"
         try:
             self._stream.write(line)
             self._stream.flush()

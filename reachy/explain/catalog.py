@@ -446,10 +446,41 @@ capability to feed a sensor-driven behavior a live reading, but ships none today
 - `reachy-mini-cli behavior stop <id|name|all>` — stop a running behavior
   (`all` keeps the passive base layer).
 - `reachy-mini-cli behavior status` — active behaviors, per-channel ownership,
-  and engine/daemon state.
+  engine/daemon state, rules-file health (path + counts), and — once the
+  engine has published one — the live agent-intents view (goal/inhibitions/
+  mode; see "Rules" below).
+- `reachy-mini-cli behavior reload` — reload `rules.toml` in the running
+  engine, applied between ticks (see "Rules" below).
+- `reachy-mini-cli behavior rules` (alias `rules list`) — render the loaded
+  `rules.toml` (react/inhibit rules, modes, active mode). A missing file is
+  not an error; a malformed one is a clean exit-1 naming every reason. Reads
+  the file directly — no running engine needed.
+- `reachy-mini-cli behavior rules check` — validate `rules.toml` as a linter:
+  a malformed file reports `ok=false` with reasons but still exits 0; only an
+  unreadable path (permissions, a vanished mount, ...) is a clean exit-2.
 - `reachy-mini-cli behavior engine start|stop|status|run` — manage the 50 Hz
   engine process (start/stop in the background, or `run` in the foreground).
 - `reachy-mini-cli behavior overview` — the verb summary.
+
+## Rules
+
+`behavior engine run` optionally drives the engine from a declarative
+`rules.toml` file (default: `<state dir>/behavior/rules.toml`) — `[[react]]` /
+`[[inhibit]]` rules over the live sense snapshot, plus named `[modes.<name>]`
+parameter sets. It is loaded once at boot:
+
+- a MISSING file is fine — "no rules configured yet", the engine runs on
+  `feel-alive` alone;
+- a PRESENT but malformed file is REJECTED without crashing the process — the
+  engine falls back to bare base presence (`feel-alive` only, no rule seam)
+  and logs the rejection (naming every reason) as a
+  `[SENSE stage=rule source=rules event=boot]` line — an operator's typo never
+  takes the robot's presence down, let alone loops a service restart.
+
+`reachy-mini-cli behavior reload` asks the running engine to re-read
+`rules.toml` at a deterministic point between ticks, with the same last-good
+retention: a rejected reload keeps whatever rules were already running and
+reports why; an accepted reload swaps in immediately, with no restart.
 
 {transports}
 
@@ -470,6 +501,7 @@ capability to feed a sensor-driven behavior a live reading, but ships none today
         --channels antennas body_yaw                     # sway + seize the body yaw
     reachy-mini-cli behavior status --json
     reachy-mini-cli behavior stop all
+    reachy-mini-cli behavior reload                      # picks up an edited rules.toml
     reachy-mini-cli behavior engine stop                 # eases robot to neutral
 """.replace(_TRANSPORTS_SLOT, _TRANSPORTS)
 
@@ -1061,37 +1093,46 @@ _SERVICE = """\
 # reachy-mini-cli service
 
 Make the robot boot-persistent in **exactly one** presence mode. The robot has a
-single presence at a time (the single-SDK-owner model): either the idle
-`demo-mode` loop or the folded live sense loop (`listen run --live`) — never both.
-This noun installs systemd `--user` units so that one chosen presence survives a
-reboot and auto-restarts on crash, and enabling one mode always disables the
-sibling (the single-presence-owner invariant).
+single presence at a time (the single-SDK-owner model): the idle `demo-mode`
+loop, the folded live sense loop (`listen run --live`), or the AI-agnostic
+symbolic runtime (`behavior engine run`) — never more than one. This noun
+installs systemd `--user` units so that one chosen presence survives a reboot
+and auto-restarts on crash, and enabling one mode always disables BOTH siblings
+(the single-presence-owner invariant).
 
 Like `daemon`, `service` does **not** drive the robot through a transport — it
 talks to **systemd** (`systemctl --user`), so there is no `--transport` flag.
 
-## Three units
+## Four units
 
 - `reachy-daemon.service` — the local `reachy-mini-daemon` process. A boot
-  dependency: both presence units `Requires=` / `After=` it, so the daemon comes
+  dependency: every presence unit `Requires=` / `After=` it, so the daemon comes
   up first. `disable` leaves the daemon enabled deliberately (other clients of
   the robot depend on it).
 - `reachy-demo-mode.service` — the idle `demo-mode run` presence loop.
 - `reachy-live.service` — the folded live loop (`listen run --live --transcribe
   --voice-engine harmonic`): hearing + pat + think + vision + sleep in one
   process, speaking with the offline harmonic voice by default.
+- `reachy-runtime.service` — the AI-agnostic symbolic runtime (`behavior engine
+  run`, the boot default per decision c19): the deterministic 50 Hz engine loads
+  `rules.toml`, ticks, and sustains declared intents with zero external AI
+  services required. Its `ExecStart` carries no LLM flag and no
+  `REACHY_OPENAI_*` reference; an agent attaches to the running loop externally
+  afterwards through the `agent` noun, with no unit edit and no loop restart.
 
 ## Verbs
 
 - `reachy-mini-cli service enable demo` — boot-persist the idle demo-mode
-  presence; disables the live sibling.
+  presence; disables the live and runtime siblings.
 - `reachy-mini-cli service enable live` — boot-persist the folded live sense
-  loop; disables the demo sibling.
+  loop; disables the demo and runtime siblings.
+- `reachy-mini-cli service enable runtime` — boot-persist the AI-agnostic
+  symbolic runtime; disables the demo and live siblings.
 - `reachy-mini-cli service disable` — disable whichever presence unit is enabled
   (the daemon is left enabled, reported as `daemon=left-enabled`).
 - `reachy-mini-cli service status` — which presence mode is enabled (or none) +
   per-unit `is-enabled` / `is-active` + daemon health.
-- `reachy-mini-cli service install` — write all three unit files +
+- `reachy-mini-cli service install` — write all four unit files +
   `daemon-reload`, WITHOUT enabling anything (a separate `enable` chooses the
   mode).
 - `reachy-mini-cli service uninstall` — remove the unit files + `daemon-reload`.
@@ -1115,11 +1156,63 @@ machine-reboot check is therefore a manual on-robot step.
 ## Usage
 
     reachy-mini-cli service install                  # write the units, enable nothing
-    reachy-mini-cli service enable live              # boot-persist the live loop
-    reachy-mini-cli service enable demo              # switch to idle demo (disables live)
+    reachy-mini-cli service enable runtime           # boot-persist the AI-agnostic runtime
+    reachy-mini-cli service enable live              # switch to the folded live loop
+    reachy-mini-cli service enable demo              # switch to idle demo
     reachy-mini-cli service status --json            # enabled mode + daemon health
     reachy-mini-cli service disable                  # stop the presence (daemon stays up)
     reachy-mini-cli service uninstall                # remove the units
+"""
+
+
+_AGENT = """\
+# reachy-mini-cli agent
+
+Attach an **external AI agent** over the symbolic runtime's seams. The
+deterministic 50 Hz loop (`behavior engine run`) is AI-agnostic (decision c11):
+it ticks, evaluates its rules, and sustains intents entirely on its own. This
+noun is the agent client — a *separate process* that attaches from outside, with
+**no unit edit and no loop restart**, and never opens the robot's SDK.
+
+Three composition seams:
+
+- **INPUT** — `--feed <path|->`: read the runtime's own event feed
+  (`sense`/`rule`/`intent`/`motion` JSONL, produced by `behavior engine run
+  --export -`) from a path (stream/FIFO/file) or `-` for stdin. This client never
+  spawns the runtime; it only reads the feed the runtime writes. Each event maps
+  to a short first-person perception cue for the agent's turn.
+- **COGNITION** — a tool-use engine whose actions are **atomic intent-spool
+  writes** (`run_behavior` / `declare_goal` / `set_mode` / `set_inhibition`) the
+  running engine drains each tick. The agent moves the robot *through the runtime*
+  rather than around it. The built-in `speak`/`harmonics`/`apply_pose` tools are
+  present too but publish-only — they feed the cognition feed's
+  `message`/`emotion` blocks without the external client touching the robot.
+- **OUTPUT** — `--export -` / `--export-blocks`: the agent publishes its OWN
+  `thinking`/`message`/`emotion` feed through the SAME exporter `think`/`listen`
+  use (decision c27: the runtime feed carries no cognition block). See
+  `docs/export-schema.md`.
+
+Like `daemon` / `service`, `agent` does not use a `--transport` — it talks to
+feeds + the intent spool, not the robot.
+
+## Verbs
+
+- `reachy-mini-cli agent attach` — read the runtime feed, act via the intent
+  spool, publish the agent's own cognition feed. Flags: `--feed <path|->`,
+  `--spool-dir DIR` (default: the shared state dir), `--await-timeout SECONDS`,
+  `--max-turns N`, `--max-events N`, `--export -` / `--export-blocks`, `--json`.
+- `reachy-mini-cli agent overview` — this summary.
+
+## Usage
+
+    reachy-mini-cli behavior engine run --export - > /tmp/runtime.feed &   # the runtime
+    reachy-mini-cli agent attach --feed /tmp/runtime.feed --export -       # the agent
+
+## Exit codes
+
+- `0` success
+- `1` user-input error
+- `2` environment error (unreadable feed)
 """
 
 
@@ -1173,6 +1266,11 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("behavior", "run"): _BEHAVIOR,
     ("behavior", "stop"): _BEHAVIOR,
     ("behavior", "status"): _BEHAVIOR,
+    ("behavior", "reload"): _BEHAVIOR,
+    ("behavior", "rules"): _BEHAVIOR,
+    ("behavior", "rules", "list"): _BEHAVIOR,
+    ("behavior", "rules", "check"): _BEHAVIOR,
+    ("behavior", "rules", "overview"): _BEHAVIOR,
     ("behavior", "engine"): _BEHAVIOR,
     ("behavior", "engine", "overview"): _BEHAVIOR,
     ("behavior", "engine", "start"): _BEHAVIOR,
@@ -1228,4 +1326,7 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("service", "status"): _SERVICE,
     ("service", "install"): _SERVICE,
     ("service", "uninstall"): _SERVICE,
+    ("agent",): _AGENT,
+    ("agent", "overview"): _AGENT,
+    ("agent", "attach"): _AGENT,
 }

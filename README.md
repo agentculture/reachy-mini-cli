@@ -80,6 +80,7 @@ The full operating guide is **[`docs/operating-reachy.md`](docs/operating-reachy
 - [The single-SDK-owner model](docs/operating-reachy.md#the-single-sdk-owner-model) — the conflict matrix + how to compose behaviors
 - [Transports — `sdk` vs `http`](docs/operating-reachy.md#transports--sdk-vs-http)
 - [Boot persistence](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot) — make one presence (`demo`/`live`) survive a reboot via `service`
+- [The symbolic runtime](docs/operating-reachy.md#the-symbolic-runtime) — a deterministic, zero-LLM-token presence (`behavior` + `rules.toml`) an AI agent can attach to (`reachy-mini-cli agent attach`) instead of replace
 - [Verify it's working](docs/operating-reachy.md#verify-its-working)
 - [The `~/.asoundrc` mic-array gotcha](docs/operating-reachy.md#the-asoundrc-mic-array-gotcha) — the most common silent failure
 - [Environment variables](docs/operating-reachy.md#environment-variables) — every `REACHY_*` var in one table
