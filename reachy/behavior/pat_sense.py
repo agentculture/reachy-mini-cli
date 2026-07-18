@@ -345,7 +345,8 @@ class PatSenseDriver:
         self._latch = None
         try:
             self._process(ctx)
-        except Exception:  # noqa: BLE001 (a sense tap must never crash the loop)
+        # A sense tap must never crash the loop.
+        except Exception:  # noqa: BLE001
             logger.warning("PatSenseDriver tick raised; pat cue dropped", exc_info=True)
 
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
@@ -559,7 +560,8 @@ class PatSenseDriver:
         """Call the injected reader, degrading a raise/``None`` to no reading."""
         try:
             reading = self._reader()
-        except Exception:  # noqa: BLE001 (a raising reader degrades, never propagates)
+        # A raising reader degrades, never propagates.
+        except Exception:  # noqa: BLE001
             logger.debug("PatSenseDriver reader raised; treating as no reading", exc_info=True)
             return None
         if reading is None:

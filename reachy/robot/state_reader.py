@@ -96,7 +96,7 @@ class HeldStateReader:
         self._next_attempt_t: float | None = None
 
     # ------------------------------------------------------------------
-    # import seam
+    # the injectable import seam
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -141,7 +141,8 @@ class HeldStateReader:
             return None
         try:
             pose = self._client.get_current_head_pose()  # type: ignore[attr-defined]
-        except Exception as err:  # noqa: BLE001 — a read fault must degrade, not raise
+        # A read fault must degrade, not raise.
+        except Exception as err:  # noqa: BLE001
             self._drop_client(reason=f"read failed ({err})")
             return None
         return _euler_pitch_yaw(pose)
@@ -181,11 +182,12 @@ class HeldStateReader:
 
         try:
             self._client = reachy_mini_cls(media_backend="no_media")
-        except Exception as err:  # noqa: BLE001 — construction fault must degrade, not raise
+        # A construction fault must degrade, not raise.
+        except Exception as err:  # noqa: BLE001
             self._next_attempt_t = now + self._retry_backoff
             logger.warning("HeldStateReader: construction failed (%s); will retry", err)
             self._log_transition(
-                f"retrying: construction failed ({err}); next attempt in " f"{self._retry_backoff}s"
+                f"retrying: construction failed ({err}); next attempt in {self._retry_backoff}s"
             )
             return
 
