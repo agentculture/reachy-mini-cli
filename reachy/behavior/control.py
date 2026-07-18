@@ -83,10 +83,23 @@ def _checked_namespace(namespace: str) -> str:
     return namespace
 
 
+def _confined(base: Path, candidate: Path) -> Path:
+    """Containment check: *candidate* must stay under *base* (symlinks resolved).
+
+    Defense in depth behind :func:`_checked_namespace` — the returned path is the
+    resolved one, provably inside the behavior dir.
+    """
+    base_real = os.path.realpath(base)
+    cand_real = os.path.realpath(candidate)
+    if os.path.commonpath([base_real, cand_real]) != base_real:
+        raise ValueError(f"spool path escapes the behavior dir: {candidate}")
+    return Path(cand_real)
+
+
 def commands_dir(namespace: str = "", *, root: Path | None = None) -> Path:
     base = behavior_dir(root)
     ns = _checked_namespace(namespace)
-    d = (base / ns / "commands") if ns else (base / "commands")
+    d = _confined(base, (base / ns / "commands") if ns else (base / "commands"))
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -94,7 +107,7 @@ def commands_dir(namespace: str = "", *, root: Path | None = None) -> Path:
 def results_dir(namespace: str = "", *, root: Path | None = None) -> Path:
     base = behavior_dir(root)
     ns = _checked_namespace(namespace)
-    d = (base / ns / "results") if ns else (base / "results")
+    d = _confined(base, (base / ns / "results") if ns else (base / "results"))
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -102,7 +115,7 @@ def results_dir(namespace: str = "", *, root: Path | None = None) -> Path:
 def state_file(namespace: str = "", *, root: Path | None = None) -> Path:
     base = behavior_dir(root)
     ns = _checked_namespace(namespace)
-    return (base / ns / "state.json") if ns else (base / "state.json")
+    return _confined(base, (base / ns / "state.json") if ns else (base / "state.json"))
 
 
 def _atomic_write(path: Path, text: str) -> None:
