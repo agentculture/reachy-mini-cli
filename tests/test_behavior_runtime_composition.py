@@ -155,15 +155,17 @@ def test_pat_sense_flows_into_the_feed_via_the_composed_stack(_isolated, monkeyp
     scenario deterministically (a pitch-dominated ``scratch``)."""
     script = [(-3.0, 0.0), (0.0, 0.0), (-3.0, 0.0)] + [(0.0, 0.0)] * 8
     reader = _ScriptedReader(script)
-    monkeypatch.setenv("REACHY_PAT_SENSE", "1")  # the stack is opt-in (issue #79)
+    monkeypatch.setenv("REACHY_PAT_SENSE", "1")  # explicit; ON by default since #80
     monkeypatch.setattr("reachy.cli._commands.behavior._make_state_reader", lambda: reader)
-    # The composed driver's boot warmup (DEFAULT_WARMUP_S) mutes real-clock
-    # seconds; this 8-tick run spans microseconds, so disable it test-side.
+    # The composed driver's boot warmup and stillness gate are both real-clock
+    # windows (15 s and 0.5 s); this 8-tick run spans 0.4 s of injected clock, so
+    # neutralise both test-side — each has its own dedicated coverage elsewhere
+    # (tests/test_behavior_pat_sense{,_hardware}.py).
     from reachy.behavior.pat_sense import PatSenseDriver as _RealDriver
 
     monkeypatch.setattr(
         "reachy.cli._commands.behavior.PatSenseDriver",
-        lambda **kw: _RealDriver(**{**kw, "warmup_s": 0.0}),
+        lambda **kw: _RealDriver(**{**kw, "warmup_s": 0.0, "still_hold_s": 0.0}),
     )
 
     rc = main(["behavior", "engine", "run", "--no-base-layer", "--max-ticks", "8", "--export", "-"])

@@ -221,7 +221,20 @@ except for an always-`None` pat field.
   false-fire fix): while a non-base behavior (a rule-admitted gesture, a
   goto) owns the head channel, detection suspends and re-baselines on
   resume, so the engine's own commanded motion can never read as a phantom
-  pat.
+  pat. **Stillness-gated** (#80, the constraint that actually makes the sense
+  work): detection runs only after the COMMANDED pose has been constant for
+  `still_hold_s` (0.5 s). Hands-on calibration measured the real plant in four
+  recordings — still/wandering x untouched/petted, all six DOF — and found the
+  separation between a pat and the noise floor is **12-20x with the head still**
+  but **0.7-2.0x while it wanders**, on every axis including the ones
+  `feel-alive` never commands (roll/x/y get dragged ~11x noisier by mechanical
+  coupling). The residual is servo hunting, not lag: it is uncorrelated with
+  commanded velocity, a fitted 40-tap FIR plant model removes only 1.1x of it,
+  and it collapses to a 0.07-0.11 deg floor the moment the command stops moving.
+  So the ghost class (#79) is closed structurally — a moving robot declines to
+  guess — and the thresholds are back to sensitive values (press 0.5 deg) rather
+  than the blind 2.0 deg that shipped dormant. The recordings live in
+  `tests/data/pat_*.csv` and back `tests/test_behavior_pat_sense_hardware.py`.
 - **`reachy/behavior/pose_feed.py` `LastPoseHolder`** — a `TickBus` driver
   stashing each tick's `ctx.pose` (now carried on `TickContext`) so a later
   rider can read "the robot's current pose" without re-deriving it from

@@ -1102,13 +1102,22 @@ Key operator facts:
   push with `behavior reload`, never hardcoded. The deployed
   pat-acknowledge rule (pat → `thoughtful`, cooldown 6 s) lights up the moment
   the sense feeds — no rules file change needed.
-- **The sense itself is OPT-IN for now** (`REACHY_PAT_SENSE=1` on the runtime
-  unit; issue #79). Live calibration found the base layer's gaze wander leaves
-  commanded-vs-actual residuals up to ~3.3° on the real plant — above any
-  threshold a genuine pat could still clear — so detection ships dormant
-  until a hands-on tuning pass with real pat data. The full chain (held
-  media-free SDK reader, conditioning, rules, feed) is live-verified;
-  enabling is one environment variable on the unit.
+- **The robot must be holding still to feel you.** This is physics, not a
+  setting: a hands-on calibration session (issue #80) recorded the real plant
+  untouched and petted, in both conditions. With the head **held still** the
+  measured separation between "petted" and "untouched" is **12-20x on every
+  axis** — the noise floor is 0.07-0.11°, a pat is 0.85-1.90°. With the head
+  **wandering** it collapses to **0.7-2.0x**: the servos hunt while tracking a
+  moving target and manufacture 3-4° of deviation that no threshold can tell
+  from a hand. So the sense **gates on commanded stillness** — it senses only
+  after the commanded pose has been constant for half a second. A wandering
+  robot reports no pats rather than guessing; a still one feels them reliably.
+- **What that means in practice.** Pet the robot while it is settled and it
+  responds. If you want it reliably pettable, give it a still moment: inhibit
+  `feel-alive` (an `[[inhibit]]` rule), or use a mode that holds a pose. Live
+  verification of exactly this: 10 detections and 6 rule-fired gestures during
+  ~15 s of natural scratching on a still head, then **zero** false detections
+  over a 3-minute hands-off soak in the same configuration.
 - **Detection is ownership-gated.** While a rule-fired gesture or a `goto` owns
   the head channel, the detector suspends and re-baselines, so the robot's own
   motion can never read as a phantom pat (the false-fire oscillation class

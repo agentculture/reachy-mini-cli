@@ -215,8 +215,36 @@ DEFAULT_HP_TAU = 0.8
 #: discriminator. Cost, stated plainly: very gentle pats (<~2 deg deflection)
 #: are missed; the hands-on tuning pass (issue #79 follow-up) refines with real
 #: pat data. Injected detectors (tests, listen-era callers) are unaffected.
-DEFAULT_PRESS_THRESHOLD = 2.0
-DEFAULT_RELEASE_THRESHOLD = 0.8
+DEFAULT_PRESS_THRESHOLD = 0.5
+DEFAULT_RELEASE_THRESHOLD = 0.2
+
+#: The STILLNESS GATE (issue #80). Detection runs only while the COMMANDED head
+#: pose has been constant for :data:`DEFAULT_STILL_HOLD_S` seconds, judged with a
+#: :data:`DEFAULT_STILL_EPS` tolerance per axis. Measured on the real robot (four
+#: 30-50 s recordings, untouched vs petted, all six DOF):
+#:
+#:   head HELD STILL : untouched residual p99 0.07-0.11 deg, petting p90 0.85-1.90
+#:                     -> 12-20x separation on EVERY axis; the shipped detector
+#:                        scores 0 false fires / 30 s and 8-10 detections / 50 s
+#:                        at any threshold from 0.3 to 2.0.
+#:   head WANDERING  : untouched residual p99 3.3-4.0 deg, petting p90 2.4-3.1
+#:                     -> 0.7-2.0x separation; pats are NOT separable by amplitude
+#:                        on any axis, including the uncommanded ones (roll/x/y get
+#:                        dragged ~11x noisier by mechanical coupling).
+#:
+#: The plant is quiet only when it is not tracking a moving target (servo hunting,
+#: not lag — a fitted 40-tap FIR plant model bought just 1.1x, and the residual is
+#: uncorrelated with commanded velocity). So stillness is a PRECONDITION for the
+#: sense, not a tuning knob: gating on it makes ghost fires structurally impossible
+#: while leaving a still robot fully pettable.
+#: Tolerance for "the commanded pose did not change" (degrees, per tick, per
+#: axis). A genuinely still command is EXACTLY constant, so this only needs to
+#: absorb float noise — it must stay well under the per-tick change of the idle
+#: wander (~0.03-0.06 deg/tick at 50 Hz), or the gate creeps open at the wander's
+#: turning points where velocity momentarily crosses zero while the plant is
+#: still ringing from the preceding swing.
+DEFAULT_STILL_EPS = 0.01
+DEFAULT_STILL_HOLD_S = 0.5  # commanded must be quiet this long before sensing
 
 #: Nominal tick period (seconds) used for the filter step when ``ctx.now`` is
 #: unavailable — the engine's 50 Hz default.
@@ -284,6 +312,8 @@ class PatSenseDriver:
         lag_tau: float = DEFAULT_LAG_TAU,
         hp_tau: float = DEFAULT_HP_TAU,
         warmup_s: float = DEFAULT_WARMUP_S,
+        still_eps: float = DEFAULT_STILL_EPS,
+        still_hold_s: float = DEFAULT_STILL_HOLD_S,
     ) -> None:
         self._reader = reader
         self.detector = (
@@ -306,6 +336,13 @@ class PatSenseDriver:
         #: settled post-gesture offset can never read as a step).
         self._dev_lp: tuple[float, float] | None = (0.0, 0.0)
         self._hp_last_now: float | None = None
+        #: Stillness gate (issue #80): commanded-change tolerance and the quiet
+        #: hold required before sensing resumes. ``still_hold_s <= 0`` disables.
+        self._still_eps = max(0.0, float(still_eps))
+        self._still_hold_s = max(0.0, float(still_hold_s))
+        #: Last commanded (pitch, yaw) and the clock reading when it last moved.
+        self._last_cmd: tuple[float, float] | None = None
+        self._last_motion_t: float | None = None
         #: Post-(re)baseline event-mute window (s); ``0`` disables (see d1 fix).
         self._warmup_s = max(0.0, float(warmup_s))
         #: Mute latching until this clock reading (armed at first update + on
@@ -381,6 +418,14 @@ class PatSenseDriver:
         if commanded is None:
             return  # a missing/malformed ctx.pose -> skip this tick
 
+        # --- stillness gate (#80) --------------------------------------
+        # The plant is only quiet while it is NOT tracking a moving target, so
+        # sensing is confined to commanded-still windows. This makes the wander
+        # ghost class structurally impossible rather than threshold-managed.
+        if not self._commanded_still(commanded, self._now(ctx)):
+            self._suspended = True
+            return
+
         # --- actual pose (proprioception) ------------------------------
         actual = self._read_actual()
         if actual is None:
@@ -447,6 +492,31 @@ class PatSenseDriver:
         lp_yaw = self._dev_lp[1] + k * (dev_yaw - self._dev_lp[1])
         self._dev_lp = (lp_pitch, lp_yaw)
         return (dev_pitch - lp_pitch, dev_yaw - lp_yaw)
+
+    def _commanded_still(self, commanded: tuple[float, float], now: float | None) -> bool:
+        """Whether the COMMANDED pose has been constant long enough to sense.
+
+        Any per-axis change beyond ``still_eps`` restamps the motion clock; the
+        gate opens only once ``still_hold_s`` has elapsed with no such change.
+        Disabled (always open) when ``still_hold_s <= 0``. With no clock the gate
+        stays open — the ownership gate and conditioning still apply.
+        """
+        if self._still_hold_s <= 0.0:
+            return True
+        prev = self._last_cmd
+        self._last_cmd = commanded
+        if now is None:
+            return True
+        if (
+            prev is None
+            or max(abs(commanded[0] - prev[0]), abs(commanded[1] - prev[1])) > self._still_eps
+        ):
+            self._last_motion_t = now
+            return False
+        if self._last_motion_t is None:
+            self._last_motion_t = now
+            return False
+        return (now - self._last_motion_t) >= self._still_hold_s
 
     def _arm_warmup(self, now: float | None) -> None:
         """Mute event latching for ``warmup_s`` from *now* (no-op when disabled)."""

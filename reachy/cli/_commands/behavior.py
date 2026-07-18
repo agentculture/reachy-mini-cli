@@ -663,13 +663,21 @@ _UNCONFIRMED_NOTE = "engine did not confirm in time — is 'behavior engine' run
 
 
 def _pat_sense_enabled() -> bool:
-    """Whether the opt-in pat sense stack composes (``REACHY_PAT_SENSE`` truthy).
+    """Whether the pat sense stack composes. Default ON (issue #80).
 
-    Default OFF (issue #79): the sense's detection thresholds cannot yet
-    separate a real pat from the base layer's wander on the measured plant;
-    the full chain ships dormant until the hands-on calibration pass.
+    Shipped dormant in 0.36.0 (issue #79) because no threshold separated a real
+    pat from the idle wander. The hands-on calibration session settled why: the
+    plant is quiet ONLY while it is not tracking a moving target, so the sense
+    now gates on commanded stillness (see :mod:`reachy.behavior.pat_sense`) and
+    the ghost class is structurally impossible rather than threshold-managed.
+    ``REACHY_PAT_SENSE=0`` still opts out.
     """
-    return os.environ.get("REACHY_PAT_SENSE", "").strip().lower() in {"1", "true", "yes", "on"}
+    return os.environ.get("REACHY_PAT_SENSE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _make_state_reader() -> HeldStateReader:
