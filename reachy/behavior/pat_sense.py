@@ -144,8 +144,42 @@ tracking-lag deviation cancels; a real pat — an *external* force the command
 stream knows nothing about — still produces a fast actual-vs-filtered spike
 and fires exactly as before. The filter seeds at the first commanded sample
 (so a static commanded pose behaves identically to the unfiltered driver from
-tick one) and re-seeds on every suspended→resumed edge alongside the detector
-re-baseline. ``lag_tau=0`` disables the filter (raw passthrough).
+tick one) and re-seeds on every detection-gap edge alongside the detector
+re-baseline — the ownership suspended→resumed edge and the stillness
+blocked→unblocked edge alike (see "Stillness gate churn fix" below).
+``lag_tau=0`` disables the filter (raw passthrough).
+
+--------------------------------------------------------------------------
+Stillness gate churn fix — two flags, one re-baseline (PR #83, Qodo #3)
+--------------------------------------------------------------------------
+The ownership gate (above) and the stillness gate (#80, below) are
+independent conditions — one tracks WHO drives the head, the other tracks
+WHETHER the commanded pose is currently moving — so they are tracked by two
+separate flags, :attr:`PatSenseDriver._suspended` and
+:attr:`PatSenseDriver._stillness_blocked`, each owning exactly one
+suspended/blocked → resumed/unblocked EDGE.
+
+The first stillness-gate implementation (#80) reused ``_suspended`` for both
+concepts. That was wrong in a way the tests didn't catch because the
+*output* stayed correct: under continuous idle wander (the ordinary case)
+the stillness gate is closed almost every tick, so ``_process`` set
+``_suspended = True`` on every blocked tick; on the *very next* tick the
+ownership resume block (which only checks "was ``_suspended`` true") saw
+that flag set and ran its full re-baseline — ``clear_presses()``, filter
+reseed, clock reseed — even though ownership had never changed. That
+re-baseline then immediately set ``_suspended = True`` again via the
+stillness check. Net effect: the ownership resume path, meant to fire *once*
+per genuine suspension, ran on *every* tick of ordinary wander at 50 Hz —
+avoidable per-tick work, and a state machine where a real ownership edge was
+indistinguishable from this routine thrash.
+
+The fix keeps ``_suspended`` exclusive to the ownership gate and gives the
+stillness gate its own ``_stillness_blocked`` flag with its own edge-detected
+resume block. Both edges call the same :meth:`PatSenseDriver._rebaseline_after_gap`
+helper (``clear_presses`` + filter/high-pass/clock reseed, baselines kept)
+because both represent the identical situation from the detector's point of
+view — a run of ticks where :meth:`PatDetector.update` was never called; see
+that method's own docstring for the full reasoning.
 
 --------------------------------------------------------------------------
 Degradation
@@ -360,6 +394,17 @@ class PatSenseDriver:
         #: True while a non-base behavior owns the head (detection suspended); the
         #: suspended -> resumed edge triggers a detector re-baseline (see #66 gate).
         self._suspended = False
+        #: True while the commanded pose is not yet still long enough to sense
+        #: (the stillness gate, #80). Deliberately a SEPARATE flag from
+        #: ``_suspended``: ownership and stillness open/close on independent
+        #: conditions, and under ordinary continuous wander this flag flips
+        #: open/closed every tick while ownership never changes at all —
+        #: collapsing the two into one flag made the ownership resume block
+        #: run on every such tick instead of once per real edge (the churn
+        #: fixed by PR #83 / Qodo #3; see the module docstring). The blocked
+        #: -> unblocked edge triggers the SAME re-baseline as the ownership
+        #: edge, via :meth:`_rebaseline_after_gap`.
+        self._stillness_blocked = False
         #: Count of pats latched this run (diagnostics / tests).
         self.events = 0
 
@@ -396,21 +441,14 @@ class PatSenseDriver:
             self._suspended = True
             return
         if self._suspended:
-            # First tick back on the base layer: clear press pairing/edge state
-            # but KEEP the learned EMA baselines — pat.py's clear_presses()
-            # docstring warns that a full reset() here re-seeds phantom-pat
-            # chains (the unlearned frame offset + wander reads as presses until
-            # the slow EMA reconverges — observed live as the post-gesture ghost
-            # fires in d1's second iteration). Also re-seed the lag filter: its
-            # state is stale from before the gesture.
-            self.detector.clear_presses()
-            self._filtered = None
-            self._dev_lp = None
-            # Clock states too, so the first post-resume filter step uses the
-            # nominal dt instead of a stale pre-suspension timestamp (colleague
-            # review finding — clamped and harmless, but predictable is better).
-            self._last_now = None
-            self._hp_last_now = None
+            # First tick back on the base layer (a genuine ownership edge —
+            # this branch only runs once per suspension; see the module
+            # docstring's "Stillness gate churn fix" for why that is now
+            # guaranteed). Re-baseline: clear press pairing/edge state, keep
+            # the learned EMA baselines, re-seed the lag filter + high-pass +
+            # their clocks. See :meth:`_rebaseline_after_gap` for the full
+            # reasoning (shared verbatim with the stillness edge below).
+            self._rebaseline_after_gap()
             self._suspended = False
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
@@ -422,9 +460,24 @@ class PatSenseDriver:
         # The plant is only quiet while it is NOT tracking a moving target, so
         # sensing is confined to commanded-still windows. This makes the wander
         # ghost class structurally impossible rather than threshold-managed.
+        #
+        # `_stillness_blocked` is tracked SEPARATELY from `_suspended` (PR #83,
+        # Qodo #3): reusing `_suspended` here made the ownership resume block
+        # above run every tick during ordinary wander (the gate closes and
+        # reopens every tick while ownership never changes) instead of once per
+        # real ownership edge. See the module docstring for the full story.
         if not self._commanded_still(commanded, self._now(ctx)):
-            self._suspended = True
+            self._stillness_blocked = True
             return
+        if self._stillness_blocked:
+            # First tick back on a still commanded pose (a genuine
+            # blocked -> unblocked edge). `detector.update()` was never called
+            # for the whole blocked stretch (this method returned above, every
+            # tick), so from the detector's point of view this is the same
+            # situation as the ownership edge: re-baseline once, via the same
+            # helper, for the same reasons.
+            self._rebaseline_after_gap()
+            self._stillness_blocked = False
 
         # --- actual pose (proprioception) ------------------------------
         actual = self._read_actual()
@@ -464,6 +517,57 @@ class PatSenseDriver:
         level, touch_type = event
         self._latch = (touch_type, level)
         self.events += 1
+
+    def _rebaseline_after_gap(self) -> None:
+        """Re-baseline after a detection gap — shared by BOTH resume edges.
+
+        The ownership suspended → resumed edge and the stillness blocked →
+        unblocked edge look different from the outside (one is about who
+        drives the head, the other about whether the commanded pose is
+        moving) but they are the identical situation from the detector's
+        point of view: a run of ticks — long or short — during which
+        :meth:`PatDetector.update` was never called, because :meth:`_process`
+        returned early on every one of them. Whatever the detector's
+        press/edge state and the driver's own filters were doing at the
+        moment the gap opened is now stale relative to whatever comes next,
+        so both edges perform the same reset:
+
+        * :meth:`PatDetector.clear_presses` — drop press pairing/edge state
+          so it can never pair across the gap, but KEEP the learned EMA
+          baselines. This is deliberate and load-bearing (not a mistake to
+          "improve" into a full :meth:`PatDetector.reset`): a hand can be
+          mid-press at the exact tick a gap opens on EITHER edge — a gesture
+          can grab the head mid-pat, and a pat happens on ACTUAL while the
+          stillness gate reacts only to COMMANDED motion, so the two are
+          uncorrelated and a pat straddling a stillness-gate close/open is
+          equally possible. ``pat.py``'s ``clear_presses`` docstring explains
+          why ``reset`` must not be used here: wiping the baselines makes the
+          learned frame offset read as a fresh press until the slow EMA
+          (~6.7 s time constant) reconverges — the exact post-gesture ghost
+          chain issue #79 hit live.
+        * ``_filtered = None`` / ``_dev_lp = None`` — re-seed the lag filter
+          and the deviation high-pass at the very next sample instead of
+          slewing toward it from a stale value. Both integrate their input
+          over time, and a gap can span a large commanded-pose excursion (a
+          gesture, or several seconds of idle wander), so resuming without a
+          reseed would replay a spurious step transient into the very
+          detector the #79 lag-compensation fix exists to protect.
+        * ``_last_now = None`` / ``_hp_last_now = None`` — keep the ``dt``
+          clocks consistent with the filter/high-pass state they time: left
+          stale, the first post-gap step would compute ``dt`` against a
+          pre-gap timestamp (clamped to 0.2 s and therefore harmless, but
+          not predictable — a colleague review finding on the original
+          ownership edge, carried over here for the identical reason).
+
+        Boot warmup (:data:`DEFAULT_WARMUP_S`) is deliberately NOT re-armed
+        here, on either edge: it is a one-time convergence window for the
+        EMA baselines, which this method never touches.
+        """
+        self.detector.clear_presses()
+        self._filtered = None
+        self._dev_lp = None
+        self._last_now = None
+        self._hp_last_now = None
 
     def _highpassed(
         self, dev_pitch: float, dev_yaw: float, now: float | None

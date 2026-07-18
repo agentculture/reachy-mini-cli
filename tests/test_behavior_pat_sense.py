@@ -540,3 +540,121 @@ def test_real_pat_right_after_resume_fires_no_deadzone() -> None:
     _drive(driver, reader, (0.0, 0.0), T0 + 0.2)  # resume: clear_presses only
     _scratch_sequence(driver, reader, T0 + 0.3)
     assert driver.events == 1
+
+
+# --------------------------------------------------------------------------- #
+# Stillness gate vs ownership gate — separate flags (Qodo #3 on PR #83)       #
+# --------------------------------------------------------------------------- #
+#
+# The stillness gate (#80) and the ownership gate (#66) are independent
+# conditions tracked by two separate flags, `_suspended` (ownership) and
+# `_stillness_blocked` (stillness). Before this fix both gates shared
+# `_suspended`, so under ordinary continuous wander -- where the stillness
+# gate closes and reopens every tick while ownership never changes -- the
+# ownership resume block (`clear_presses()` + a full filter/high-pass/clock
+# reseed) ran on EVERY tick of the moving stretch instead of firing once per
+# genuine suspended -> resumed edge. These tests spy on
+# `PatDetector.clear_presses` (the resume block's signature call) to pin the
+# call COUNT, not just the resulting events -- the churn was invisible to the
+# existing event-count assertions because the resets were idempotent.
+
+
+class _CountingDetector(PatDetector):
+    """A :class:`PatDetector` that counts ``clear_presses()`` calls.
+
+    Standing in for a spy: the resume/re-baseline block's one distinctive,
+    side-effecting call is ``clear_presses()`` (see
+    ``PatSenseDriver._rebaseline_after_gap``), so counting it pins exactly how
+    many times that block ran without needing to reach into driver internals.
+    """
+
+    def __init__(self, **kw) -> None:
+        kw.setdefault("level2_threshold_fn", lambda: 1_000.0)
+        super().__init__(**kw)
+        self.clear_presses_calls = 0
+
+    def clear_presses(self) -> None:
+        self.clear_presses_calls += 1
+        super().clear_presses()
+
+
+def test_continuous_wander_does_not_rerun_ownership_resume_every_tick() -> None:
+    """The churn this fix removes: continuous commanded motion, ownership held
+    constant on the base layer the whole time, must NOT re-run the ownership
+    resume path every tick.
+
+    The stillness gate stays CLOSED for the entire run (each tick's commanded
+    pitch moves well past ``still_eps``), so the sense never detects at all --
+    but ownership never changes either, so there is no genuine ownership edge
+    anywhere in this trace. Before the fix, reusing `_suspended` for the
+    stillness gate meant the resume block (and its `clear_presses()` call)
+    fired on every tick but the first of the moving stretch, even though
+    ownership was rock steady on `BASE_OWNER` throughout. FAILS before the
+    fix (many calls), PASSES after (zero -- no edge ever occurred)."""
+    reader = _Reader()
+    detector = _CountingDetector()
+    # Default stillness gate (still_hold_s=DEFAULT_STILL_HOLD_S): ON.
+    driver = PatSenseDriver(reader=reader, detector=detector, warmup_s=0.0)
+
+    now = T0
+    for i in range(200):
+        _drive(driver, reader, (0.0, 0.0), now, owner=BASE_OWNER, pitch=0.05 * i)
+        now += DT
+
+    assert detector.clear_presses_calls == 0
+    # The reader is never even consulted while the stillness gate is closed
+    # (the driver returns before reaching the actual-pose read) -- a second,
+    # independent signal that no per-tick "resume and sense" work ran.
+    assert reader.calls == 0
+
+
+def test_stillness_unblock_rebaselines_exactly_once() -> None:
+    """The genuine stillness blocked -> unblocked edge still fires its own
+    one-time re-baseline, symmetric with the ownership edge but through the
+    SEPARATE `_stillness_blocked` flag (so it never touches `_suspended`)."""
+    reader = _Reader()
+    detector = _CountingDetector()
+    driver = PatSenseDriver(
+        reader=reader, still_hold_s=0.5, still_eps=0.01, detector=detector, warmup_s=0.0
+    )
+
+    now = T0
+    # Move the commanded pose every tick: the gate stays closed, never opens.
+    for i in range(20):
+        _drive(driver, reader, (0.0, 0.0), now, owner=BASE_OWNER, pitch=0.05 * i)
+        now += DT
+    assert detector.clear_presses_calls == 0  # never opened yet -> no resume
+
+    # Now hold the commanded pose perfectly still for longer than
+    # still_hold_s: the gate opens exactly once, and the resume block must
+    # fire exactly once -- not zero (the edge is real), not many (no churn).
+    held_pitch = 0.05 * 19
+    for _ in range(40):  # 40 * DT(0.1) = 4.0 s, comfortably past still_hold_s
+        now += DT
+        _drive(driver, reader, (0.0, 0.0), now, owner=BASE_OWNER, pitch=held_pitch)
+    assert detector.clear_presses_calls == 1
+
+
+def test_ownership_resume_still_rebaselines_exactly_once() -> None:
+    """A genuine ownership suspended -> resumed edge must still perform its
+    one-time re-baseline -- separating the stillness gate from `_suspended`
+    must not silently drop the case it was originally built to handle (#66).
+    The stillness gate is disabled here (``still_hold_s=0.0``) so only the
+    ownership edge is under test."""
+    reader = _Reader()
+    detector = _CountingDetector()
+    driver = PatSenseDriver(reader=reader, still_hold_s=0.0, detector=detector, warmup_s=0.0)
+
+    # A gesture owns the head for a few ticks: suspended, no resume yet.
+    for i in range(5):
+        _drive(driver, reader, (0.0, 0.0), T0 + i * DT, owner=GESTURE_OWNER)
+    assert detector.clear_presses_calls == 0
+
+    # Ownership returns to base: exactly one resume tick.
+    _drive(driver, reader, (0.0, 0.0), T0 + 5 * DT, owner=BASE_OWNER)
+    assert detector.clear_presses_calls == 1
+
+    # Staying on base afterwards must not re-run it.
+    for i in range(6, 20):
+        _drive(driver, reader, (0.0, 0.0), T0 + i * DT, owner=BASE_OWNER)
+    assert detector.clear_presses_calls == 1
