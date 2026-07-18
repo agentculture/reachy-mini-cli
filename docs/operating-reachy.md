@@ -1067,6 +1067,71 @@ fire/suppress line — is visible on stderr by default.
 > (`reachy.behavior.sense.SenseProviders`) are the designed attach point when
 > that composition lands.
 
+### The pat sense
+
+The boot presence (`reachy-runtime.service`, the 50 Hz behavior engine) now
+**feels pats**. There is no touch sensor: the engine compares the head pose it
+**commanded** this tick against the **actual** pose read back through a held,
+media-free SDK client (`reachy/robot/state_reader.py`), feeds the deviation to
+the same `PatDetector` the listen loop used (scratch = downward pitch press,
+side_pat = sideways yaw nudge, two levels), and publishes the detection as the
+`pat` sense field rules can test:
+
+```toml
+when = { field = "pat", op = "is_true" }
+```
+
+Key operator facts:
+
+- **Reactions to pat are rules in `rules.toml`.** They are data you edit and
+  push with `behavior reload`, never hardcoded. The deployed
+  pat-acknowledge rule (pat → `thoughtful`, cooldown 6 s) starts working with
+  zero config the moment this build is deployed — no rules file change needed.
+- **Detection is ownership-gated.** While a rule-fired gesture or a `goto` owns
+  the head channel, the detector suspends and re-baselines, so the robot's own
+  motion can never read as a phantom pat (the false-fire oscillation class
+  from the listen era).
+- **The SDK read client is lazy and self-healing.** If the daemon is down at
+  boot, the pat sense simply stays unfed and comes alive within a few seconds
+  of daemon health — no restart needed.
+- **It degrades cleanly.** Without the `[sdk]` extra the runtime runs exactly
+  as before, DoA-only.
+
+### Bounded reactions: no more permanent holds
+
+Background incident: a react rule `speech → nod` once admitted the looping
+`nod` behavior with library defaults, and the head oscillated until manually
+stopped. That class of failure is now structurally impossible.
+
+**React rules.** A rule targeting a looping-default library entry
+(`nod`, `shake`, `speak`, `antenna-sway`, `feel-alive`) **must** carry
+`duration_s = <seconds>`. A rules file without it is refused at load/reload
+with a clear error naming the rule and the fix. Bounded one-shot targets
+(`gaze-hold` 5 s, `thoughtful` 3 s, `body-turn-hold` 5 s) need nothing — they
+already have a fixed lifetime.
+
+```toml
+[[react]]
+id = "speech-nod"
+when = { field = "speech", op = "is_true" }
+run = "nod"
+duration_s = 8
+cooldown_s = 3.0
+```
+
+**Agent intents.** The same guard covers agent-submitted `run_behavior` intents
+through the spool: a payload naming a looping-default entry without an
+explicit bounded lifetime (`"duration": N`) is refused with an error result.
+Standing `declare_goal` intents are intentionally exempt — they are the
+documented indefinite-intent surface.
+
+```json
+{"type": "run_behavior", "behavior": "nod", "duration": 8}
+```
+
+A bounded looping admission (e.g. `duration_s = 8` on `nod`) loops for 8
+seconds then releases its channel automatically.
+
 ### Human — behavior verbs end to end
 
 ```bash
