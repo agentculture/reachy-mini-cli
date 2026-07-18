@@ -80,14 +80,17 @@ falls to a steady neutral pose, which is exactly the quiet state a pat is
 detectable against.
 
 On the FIRST tick after ownership returns to base — the suspended -> resumed
-edge — the driver calls :meth:`PatDetector.reset` before feeding any fresh
-sample, re-baselining the detector so the just-settled pose seeds a clean
-zero-deviation baseline instead of the gesture's stale press state. A steady
-deviation that persists across the resume (e.g. the head still parked a couple
-of degrees off from the ended gesture) cannot fire spuriously: a *sustained*
-offset registers at most ONE press edge (the detector needs a release then a
-re-press to count a second), so it never reaches ``min_presses`` — only a
-genuine, oscillating pat re-accumulates enough edges to fire.
+edge — the driver calls :meth:`PatDetector.clear_presses` before feeding any
+fresh sample: press pairing/edge state from before the gesture is dropped so
+edges can never pair across the suspension, while the EMA baselines — the
+*learned* commanded-vs-actual frame offset — are KEPT. This is
+``clear_presses``'s documented purpose; a full :meth:`PatDetector.reset` here
+would wipe the baselines and make the offset read as fresh presses until the
+slow EMA re-learns (~13 s) — the post-gesture ghost-fire chain both the folded
+``listen`` hook and this driver's first live deployment hit (d1, issue #79).
+The initial convergence at boot is instead covered by a one-time warmup mute
+(:data:`DEFAULT_WARMUP_S`): the detector updates normally (that is the
+learning) but events are not latched until the window passes.
 
 --------------------------------------------------------------------------
 r1 — frame / unit mapping (commanded vs actual)
@@ -199,6 +202,17 @@ DEFAULT_LAG_TAU = 0.3
 #: unavailable — the engine's 50 Hz default.
 _NOMINAL_DT = 0.02
 
+#: BOOT-ONLY warmup (seconds) during which detected events are MUTED while the
+#: detector's EMA baseline first converges. The EMA (``baseline_alpha`` 0.003
+#: at 50 Hz) has a ~6.7 s time constant; learning the several-degree
+#: commanded-vs-actual frame offset down past the release threshold takes ~2x
+#: that, and until then offset + wander edges read as presses — the fire at
+#: boot observed live (d1, issue #79). The detector keeps UPDATING through
+#: warmup (that update IS the convergence); only latching is muted. Resume
+#: edges do NOT re-arm this: they call ``clear_presses()``, which keeps the
+#: learned baselines, so there is no post-gesture deadzone.
+DEFAULT_WARMUP_S = 15.0
+
 
 def _is_base_owner(owner_id: str | None) -> bool:
     """Whether ``owner_id`` names the engine's seeded base layer (``feel-alive``).
@@ -248,11 +262,19 @@ class PatSenseDriver:
         reader: PoseReader,
         detector: PatDetector | None = None,
         lag_tau: float = DEFAULT_LAG_TAU,
+        warmup_s: float = DEFAULT_WARMUP_S,
     ) -> None:
         self._reader = reader
         self.detector = detector if detector is not None else PatDetector()
         #: Commanded-pose low-pass time constant (s); ``0`` = raw passthrough.
         self._lag_tau = max(0.0, float(lag_tau))
+        #: Post-(re)baseline event-mute window (s); ``0`` disables (see d1 fix).
+        self._warmup_s = max(0.0, float(warmup_s))
+        #: Mute latching until this clock reading (armed at first update + on
+        #: every resume re-baseline); ``None`` = not armed / warmup disabled.
+        self._warmup_until: float | None = None
+        #: True until the first detector update arms the initial warmup.
+        self._first_update = True
         #: The filter state: low-passed commanded ``(pitch, yaw)``, or ``None``
         #: before the first sample / after a resume re-seed (see d1 fix).
         self._filtered: tuple[float, float] | None = None
@@ -298,10 +320,14 @@ class PatSenseDriver:
             self._suspended = True
             return
         if self._suspended:
-            # First tick back on the base layer: re-baseline so the settled pose
-            # seeds a clean zero-deviation baseline (never a stale phantom press),
-            # and re-seed the lag filter (the gesture invalidated its state).
-            self.detector.reset()
+            # First tick back on the base layer: clear press pairing/edge state
+            # but KEEP the learned EMA baselines — pat.py's clear_presses()
+            # docstring warns that a full reset() here re-seeds phantom-pat
+            # chains (the unlearned frame offset + wander reads as presses until
+            # the slow EMA reconverges — observed live as the post-gesture ghost
+            # fires in d1's second iteration). Also re-seed the lag filter: its
+            # state is stale from before the gesture.
+            self.detector.clear_presses()
             self._filtered = None
             self._suspended = False
 
@@ -316,6 +342,11 @@ class PatSenseDriver:
             return  # reader disconnected / absent / raised -> no reading
 
         now = self._now(ctx)
+        if self._first_update:
+            # Boot: the EMA baseline starts at zero and has not yet learned the
+            # commanded-vs-actual frame offset — mute latching while it converges.
+            self._first_update = False
+            self._arm_warmup(now)
         commanded_pitch, commanded_yaw = self._lag_filtered(commanded, now)
         actual_pitch, actual_yaw = actual
         event = self.detector.update(
@@ -327,11 +358,32 @@ class PatSenseDriver:
         )
         if event is None:
             return
+        if self._in_warmup(now):
+            # The detector keeps updating through warmup (that IS the baseline
+            # convergence) — only the event is dropped, never silently: name it.
+            logger.debug("pat event dropped: warmup (baseline converging)")
+            return
         # PatDetector yields ``(level, touch_type)``; Sense.pat_event is
         # ``(touch_type, level)`` (matching EventBuffer.feed_pat(kind, level)).
         level, touch_type = event
         self._latch = (touch_type, level)
         self.events += 1
+
+    def _arm_warmup(self, now: float | None) -> None:
+        """Mute event latching for ``warmup_s`` from *now* (no-op when disabled)."""
+        if self._warmup_s > 0.0 and now is not None:
+            self._warmup_until = now + self._warmup_s
+
+    def _in_warmup(self, now: float | None) -> bool:
+        """Whether the post-(re)baseline mute window is still open."""
+        if self._warmup_until is None:
+            return False
+        if now is None:
+            return True  # armed but clockless: stay muted rather than ghost-fire
+        if now >= self._warmup_until:
+            self._warmup_until = None
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Lag compensation (the d1 live fix — see the module docstring)
