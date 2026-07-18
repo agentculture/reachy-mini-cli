@@ -49,7 +49,7 @@ from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
-from reachy.behavior.intents import IntentDriver
+from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
 from reachy.behavior.model import CHANNELS, StopClass
 from reachy.behavior.pat_sense import PatSenseDriver
 from reachy.behavior.pose_feed import LastPoseHolder
@@ -66,13 +66,18 @@ from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.runtime import SenseSnapshotDriver
 from reachy.motion.pat import PatDetector
-from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
+from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, INTERPOLATIONS
 from reachy.robot.state_reader import HeldStateReader
 
 _JSON_HELP = "Emit structured JSON."
 _EMPTY_SUBMITTED = "(submitted)"
 _AWAIT_TIMEOUT_HELP = "Seconds to wait for the engine to confirm (default: 1.0)."
 _CLASSES = tuple(c.value for c in StopClass)
+
+#: The six head axes a goto may target, in the order ``goto_intent.HEAD_AXES`` /
+#: ``move goto``'s own ``_HEAD_KEYS`` use — flag names match the GotoSpec payload's
+#: head-axis keys exactly, so ``behavior goto``'s payload needs no translation.
+_HEAD_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
 
 _VERBS = [
     "behavior list — the built-in behavior catalog (names, channels, class, params)",
@@ -81,6 +86,8 @@ _VERBS = [
     "behavior status — active behaviors + per-channel ownership + engine/daemon state "
     "+ rules health + agent intents (when published)",
     "behavior reload — reload rules.toml in the running engine, applied between ticks",
+    "behavior goto — submit a goto (head/antennas/body-yaw) through the intents "
+    "spool, the same path a live agent uses",
     "behavior rules — render the loaded rules.toml (react/inhibit rules, modes)",
     "behavior rules check — validate rules.toml (a linter; exit 0 unless unreadable)",
     "behavior engine start — start the 50 Hz engine in the background",
@@ -309,6 +316,83 @@ def cmd_reload(args: argparse.Namespace) -> int:
             "submitted": cmd_id,
             "note": "engine did not confirm in time — is 'behavior engine' running?",
         }
+    emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# goto — submit a goto through the SAME intents spool an agent tool uses      #
+# --------------------------------------------------------------------------- #
+
+
+def _goto_payload(args: argparse.Namespace) -> dict[str, object]:
+    """Build the GOTO command's fields from only the channel flags the operator gave.
+
+    Mirrors ``move goto``'s flag-to-payload shape (``reachy/cli/_commands/move.py``)
+    but stops at the payload dict — this verb submits into the spool instead of
+    calling a transport directly. The "at least one channel" check is done HERE,
+    synchronously, so a bare ``behavior goto`` (no channel flags) fails fast with a
+    clean exit-1 even when no engine is running to hand back the kind's own
+    (otherwise equivalent) rejection — see ``goto_intent.make_goto_handler``, whose
+    handler performs the exact same check on the payload once it reaches the spool
+    (a malicious/buggy non-CLI spool writer still hits that backstop).
+    """
+    head: dict[str, float] | None = None
+    if any(getattr(args, key) is not None for key in _HEAD_KEYS):
+        head = {key: getattr(args, key) for key in _HEAD_KEYS if getattr(args, key) is not None}
+    antennas = tuple(args.antennas) if args.antennas is not None else None
+    body_yaw = args.body_yaw
+    if head is None and antennas is None and body_yaw is None:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="goto: a goto must target at least one channel (head axis, antennas, "
+            "or body-yaw)",
+            remediation="pass at least one of --x/--y/--z/--roll/--pitch/--yaw/"
+            "--antennas/--body-yaw",
+        )
+    payload: dict[str, object] = {"duration": args.duration, "interpolation": args.interpolation}
+    if head is not None:
+        payload["head"] = head
+    if antennas is not None:
+        payload["antennas"] = list(antennas)
+    if body_yaw is not None:
+        payload["body_yaw"] = body_yaw
+    if args.label is not None:
+        payload["label"] = args.label
+    return payload
+
+
+def cmd_goto(args: argparse.Namespace) -> int:
+    """Submit a GOTO command into the intents spool — exactly what a live agent's
+    ``run_behavior``/... tools do (``reachy.speech.intent_tools._submit_and_await``),
+    so this verb exercises the identical submission path.
+
+    The submit is async: the engine applies it on its next drain, not this call. If
+    an engine confirms in time, its outcome is reported verbatim — including a
+    LIVE rejection from ``goto_intent``'s own validation (e.g. an out-of-range
+    axis), which is surfaced here as a ``CliError`` (exit 1) rather than a
+    silently-`ok:false` JSON blob, so a confirmed-bad goto reads the same as any
+    other CLI validation error. If nothing confirms in time this degrades to a
+    ``submitted``/unconfirmed report (exit 0) — the command is still on disk, so a
+    later-started engine still applies it; this verb never pretends to know an
+    outcome the spool hasn't reported.
+    """
+    json_mode = bool(getattr(args, "json", False))
+    payload = _goto_payload(args)
+    cmd_id = control.submit(GOTO, namespace=INTENT_NAMESPACE, **payload)
+    result = control.await_result(cmd_id, namespace=INTENT_NAMESPACE, timeout=args.await_timeout)
+    if result is None:
+        result = {
+            "ok": None,
+            "submitted": cmd_id,
+            "note": "engine did not confirm in time — is 'behavior engine' running?",
+        }
+    elif result.get("ok") is False:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=str(result.get("error") or "goto: rejected by the engine"),
+            remediation="adjust the goto payload and resubmit",
+        )
     emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
     return 0
 
@@ -863,6 +947,55 @@ def _register_reload(noun_sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=cmd_reload)
 
 
+def _register_goto(noun_sub: argparse._SubParsersAction) -> None:
+    p = noun_sub.add_parser(
+        "goto", help="Submit a goto (head/antennas/body-yaw) through the intents spool."
+    )
+    p.add_argument("--x", type=float, default=None, help="Head X offset in mm.")
+    p.add_argument("--y", type=float, default=None, help="Head Y offset in mm.")
+    p.add_argument("--z", type=float, default=None, help="Head Z offset in mm.")
+    p.add_argument("--roll", type=float, default=None, help="Head roll in degrees.")
+    p.add_argument("--pitch", type=float, default=None, help="Head pitch in degrees.")
+    p.add_argument("--yaw", type=float, default=None, help="Head yaw in degrees.")
+    p.add_argument(
+        "--antennas",
+        type=float,
+        nargs=2,
+        metavar=("RIGHT", "LEFT"),
+        default=None,
+        help="Antenna angles in degrees (right, left).",
+    )
+    p.add_argument(
+        "--body-yaw",
+        type=float,
+        default=None,
+        dest="body_yaw",
+        help="Body yaw in degrees.",
+    )
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=1.0,
+        help="Movement duration in seconds (default: 1.0; the kind refuses over 10s).",
+    )
+    p.add_argument(
+        "--interpolation",
+        choices=INTERPOLATIONS,
+        default="minjerk",
+        help="Interpolation curve (default: minjerk).",
+    )
+    p.add_argument("--label", default=None, help="Optional label for the goto (default: 'goto').")
+    p.add_argument(
+        "--await-timeout",
+        type=float,
+        default=1.0,
+        dest="await_timeout",
+        help=_AWAIT_TIMEOUT_HELP,
+    )
+    p.add_argument("--json", action="store_true", help=_JSON_HELP)
+    p.set_defaults(func=cmd_goto)
+
+
 def _register_rules(noun_sub: argparse._SubParsersAction) -> None:
     """The ``behavior rules`` sub-noun: render + validate ``rules.toml``.
 
@@ -960,5 +1093,6 @@ def register(sub: argparse._SubParsersAction) -> None:
     _register_stop(noun_sub)
     _register_status(noun_sub)
     _register_reload(noun_sub)
+    _register_goto(noun_sub)
     _register_rules(noun_sub)
     _register_engine(noun_sub)

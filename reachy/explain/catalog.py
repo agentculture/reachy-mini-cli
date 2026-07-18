@@ -451,6 +451,11 @@ capability to feed a sensor-driven behavior a live reading, but ships none today
   mode; see "Rules" below).
 - `reachy-mini-cli behavior reload` — reload `rules.toml` in the running
   engine, applied between ticks (see "Rules" below).
+- `reachy-mini-cli behavior goto [--x ..] [--y ..] [--z ..] [--roll ..]
+  [--pitch ..] [--yaw ..] [--antennas RIGHT LEFT] [--body-yaw ..]
+  [--duration N] [--interpolation {minjerk,linear,ease,cartoon}] [--label ..]`
+  — submit a goto through the intents spool (see "Goto" below). Only the
+  channels you pass end up in the payload; naming none is refused.
 - `reachy-mini-cli behavior rules` (alias `rules list`) — render the loaded
   `rules.toml` (react/inhibit rules, modes, active mode). A missing file is
   not an error; a malformed one is a clean exit-1 naming every reason. Reads
@@ -482,6 +487,35 @@ parameter sets. It is loaded once at boot:
 retention: a rejected reload keeps whatever rules were already running and
 reports why; an accepted reload swaps in immediately, with no restart.
 
+## Goto
+
+`reachy-mini-cli behavior goto` drives the same smooth minjerk `goto` planner
+`move goto` uses, but as a **one-shot behavior arbitrated by the engine**
+instead of a direct daemon call — so it composes cleanly with everything else
+running on the 50 Hz loop instead of fighting it for a channel. It submits
+into the **intents spool** (`reachy.behavior.control`, namespace `intents`) —
+the exact command path a live tool-use agent's `run_behavior` /
+`declare_goal` / ... actions already write into — so this verb exercises
+precisely what an agent exercises, nothing bespoke.
+
+The submit is **async**: the engine applies the goto on its next drain, not
+during the CLI call. `behavior goto` waits up to `--await-timeout` (default
+1.0s) for the engine to confirm:
+
+- confirmed **admitted** — reports the goto's id, claimed channels, and
+  duration;
+- confirmed **rejected** — the engine's own validation (`reachy.behavior.
+  goto_intent`) refuses out-of-range axes, an unknown field, a runaway
+  duration (> 10s), or a goto naming no channel at all — **refuses, never
+  clamps** — surfaced here as a clean exit-1, same as any other CLI
+  validation error;
+- **no confirmation in time** — reports `submitted: <cmd id>` and degrades
+  gracefully (exit 0): the command is still on disk, so a later-started
+  engine still applies it.
+
+A bare `behavior goto` (no channel flags at all) fails fast client-side,
+before ever touching the spool.
+
 {transports}
 
 ## Notes
@@ -502,6 +536,7 @@ reports why; an accepted reload swaps in immediately, with no restart.
     reachy-mini-cli behavior status --json
     reachy-mini-cli behavior stop all
     reachy-mini-cli behavior reload                      # picks up an edited rules.toml
+    reachy-mini-cli behavior goto --yaw 10 --duration 2 --json
     reachy-mini-cli behavior engine stop                 # eases robot to neutral
 """.replace(_TRANSPORTS_SLOT, _TRANSPORTS)
 
@@ -1267,6 +1302,7 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("behavior", "stop"): _BEHAVIOR,
     ("behavior", "status"): _BEHAVIOR,
     ("behavior", "reload"): _BEHAVIOR,
+    ("behavior", "goto"): _BEHAVIOR,
     ("behavior", "rules"): _BEHAVIOR,
     ("behavior", "rules", "list"): _BEHAVIOR,
     ("behavior", "rules", "check"): _BEHAVIOR,
