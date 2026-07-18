@@ -85,7 +85,15 @@ def test_speech_rule_fires_through_the_cli_composition(_isolated, capsys, caplog
 def test_intent_spool_resolves_ok_inside_the_run(_isolated) -> None:
     from reachy.behavior.intents import INTENT_NAMESPACE
 
-    cmd_id = control.submit("run_behavior", namespace=INTENT_NAMESPACE, name="nod")
+    # nod is a looping-default entry (looping=True, duration=None) — an explicit
+    # bounded duration is required so run_behavior doesn't refuse an unbounded
+    # admission (see reachy/behavior/intents.py _validated_lifetime).
+    cmd_id = control.submit(
+        "run_behavior",
+        namespace=INTENT_NAMESPACE,
+        name="nod",
+        lifetime={"duration": 5},
+    )
     rc = main(["behavior", "engine", "run", "--max-ticks", "8", "--json"])
     assert rc == 0
     result = control.await_result(cmd_id, namespace=INTENT_NAMESPACE, timeout=0.0)
