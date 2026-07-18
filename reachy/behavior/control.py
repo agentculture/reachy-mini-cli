@@ -96,41 +96,36 @@ def _checked_namespace(namespace: str) -> str:
     return "".join(rebuilt)
 
 
-def _confined(base: Path, candidate: Path) -> Path:
-    """Containment check: *candidate* must stay under *base*.
+def _spool_path(leaf: str, namespace: str, root: Path | None) -> Path:
+    """Build ``<behavior_dir>[/<namespace>]/<leaf>``, refusing any escape.
 
-    Defense in depth behind :func:`_checked_namespace`, in the normpath +
-    startswith shape SonarCloud's S2083 rule recognizes as a path-traversal
-    sanitizer: the normalized candidate must sit inside the normalized base or
-    the path is refused.
+    The containment guard is inline with the join — the normpath + startswith
+    shape SonarCloud's S2083 rule documents as the path-traversal sanitizer —
+    as defense in depth behind :func:`_checked_namespace`.
     """
-    base_str = os.path.normpath(str(base))
-    cand_str = os.path.normpath(str(candidate))
-    if cand_str != base_str and not cand_str.startswith(base_str + os.sep):
-        raise ValueError(f"spool path escapes the behavior dir: {candidate}")
+    base_str = os.path.normpath(str(behavior_dir(root)))
+    ns = _checked_namespace(namespace)
+    parts = (base_str, ns, leaf) if ns else (base_str, leaf)
+    cand_str = os.path.normpath(os.path.join(*parts))
+    if not cand_str.startswith(base_str + os.sep):
+        raise ValueError(f"spool path escapes the behavior dir: {cand_str}")
     return Path(cand_str)
 
 
 def commands_dir(namespace: str = "", *, root: Path | None = None) -> Path:
-    base = behavior_dir(root)
-    ns = _checked_namespace(namespace)
-    d = _confined(base, (base / ns / "commands") if ns else (base / "commands"))
+    d = _spool_path("commands", namespace, root)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def results_dir(namespace: str = "", *, root: Path | None = None) -> Path:
-    base = behavior_dir(root)
-    ns = _checked_namespace(namespace)
-    d = _confined(base, (base / ns / "results") if ns else (base / "results"))
+    d = _spool_path("results", namespace, root)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def state_file(namespace: str = "", *, root: Path | None = None) -> Path:
-    base = behavior_dir(root)
-    ns = _checked_namespace(namespace)
-    return _confined(base, (base / ns / "state.json") if ns else (base / "state.json"))
+    return _spool_path("state.json", namespace, root)
 
 
 def _atomic_write(path: Path, text: str) -> None:
