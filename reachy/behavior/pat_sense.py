@@ -117,6 +117,34 @@ the live folded hook warms up before counting events). A static offset is
 absorbed; no explicit re-framing is applied.
 
 --------------------------------------------------------------------------
+Lag compensation — the d1 live fix (issue #79)
+--------------------------------------------------------------------------
+The first live deployment falsified an assumption the ownership gate rested
+on: that the base layer's own motion is too small/slow to matter. It is not —
+``feel-alive`` commands gaze wander of ±7° pitch / ±12° yaw (measured actual
+pitch span on the robot: ~13°), and the servos track the streamed pose with a
+transport+plant lag ``L``, so ``actual(t) ≈ commanded(t − L)``. Comparing
+same-tick commanded vs actual therefore shows a deviation of roughly
+``L × d(commanded)/dt`` throughout every wander swing — sustained for seconds,
+comfortably past the detector's 1.2° press thresholds, while the detector's
+deliberately slow EMA (≈6.7 s at 50 Hz) absorbs only the mean, not the
+oscillation. Result: continuous phantom ``scratch``/``side_pat`` fires with
+nobody touching the robot (deviation ledger d1).
+
+The fix models the plant: the driver feeds the detector a **first-order
+low-passed commanded pose** — ``filtered += dt/(lag_tau+dt) ×
+(commanded − filtered)`` — instead of the raw same-tick commanded value.
+``lag_tau`` (seconds, default :data:`DEFAULT_LAG_TAU`) approximates the lag of
+the real head chasing the streamed target: for *continuous* commanded motion
+the filtered commanded now moves like the physical head does, so the
+tracking-lag deviation cancels; a real pat — an *external* force the command
+stream knows nothing about — still produces a fast actual-vs-filtered spike
+and fires exactly as before. The filter seeds at the first commanded sample
+(so a static commanded pose behaves identically to the unfiltered driver from
+tick one) and re-seeds on every suspended→resumed edge alongside the detector
+re-baseline. ``lag_tau=0`` disables the filter (raw passthrough).
+
+--------------------------------------------------------------------------
 Degradation
 --------------------------------------------------------------------------
 Every failure degrades to "no reading" and never raises out of the driver or
@@ -158,6 +186,18 @@ PoseReader = Callable[[], "tuple[float, float] | None"]
 
 #: The pat-event peek the provider hands back: ``(touch_type, level)`` or ``None``.
 PatEvent = "tuple[str, str] | None"
+
+#: Default commanded-pose low-pass time constant (seconds) — the lag-compensation
+#: filter's ``tau`` (see "Lag compensation" in the module docstring). Approximates
+#: the daemon+servo lag of the real head chasing the 50 Hz streamed target;
+#: measured live: wander-induced phantom deviations vanish at ~0.3 s while a real
+#: pat's external impulse (much faster than tau) still spikes through. ``0``
+#: disables the filter.
+DEFAULT_LAG_TAU = 0.3
+
+#: Nominal tick period (seconds) used for the filter step when ``ctx.now`` is
+#: unavailable — the engine's 50 Hz default.
+_NOMINAL_DT = 0.02
 
 
 def _is_base_owner(owner_id: str | None) -> bool:
@@ -207,9 +247,17 @@ class PatSenseDriver:
         *,
         reader: PoseReader,
         detector: PatDetector | None = None,
+        lag_tau: float = DEFAULT_LAG_TAU,
     ) -> None:
         self._reader = reader
         self.detector = detector if detector is not None else PatDetector()
+        #: Commanded-pose low-pass time constant (s); ``0`` = raw passthrough.
+        self._lag_tau = max(0.0, float(lag_tau))
+        #: The filter state: low-passed commanded ``(pitch, yaw)``, or ``None``
+        #: before the first sample / after a resume re-seed (see d1 fix).
+        self._filtered: tuple[float, float] | None = None
+        #: The previous tick's clock reading, for the filter's ``dt``.
+        self._last_now: float | None = None
         #: The one-tick latch: ``(touch_type, level)`` or ``None`` (see r2).
         self._latch: tuple[str, str] | None = None
         #: True while a non-base behavior owns the head (detection suspended); the
@@ -251,8 +299,10 @@ class PatSenseDriver:
             return
         if self._suspended:
             # First tick back on the base layer: re-baseline so the settled pose
-            # seeds a clean zero-deviation baseline (never a stale phantom press).
+            # seeds a clean zero-deviation baseline (never a stale phantom press),
+            # and re-seed the lag filter (the gesture invalidated its state).
             self.detector.reset()
+            self._filtered = None
             self._suspended = False
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
@@ -265,9 +315,9 @@ class PatSenseDriver:
         if actual is None:
             return  # reader disconnected / absent / raised -> no reading
 
-        commanded_pitch, commanded_yaw = commanded
-        actual_pitch, actual_yaw = actual
         now = self._now(ctx)
+        commanded_pitch, commanded_yaw = self._lag_filtered(commanded, now)
+        actual_pitch, actual_yaw = actual
         event = self.detector.update(
             commanded_pitch,
             actual_pitch,
@@ -282,6 +332,39 @@ class PatSenseDriver:
         level, touch_type = event
         self._latch = (touch_type, level)
         self.events += 1
+
+    # ------------------------------------------------------------------
+    # Lag compensation (the d1 live fix — see the module docstring)
+    # ------------------------------------------------------------------
+
+    def _lag_filtered(
+        self, commanded: tuple[float, float], now: float | None
+    ) -> tuple[float, float]:
+        """Low-pass *commanded* toward where the physical head plausibly is.
+
+        First-order filter ``filtered += dt/(tau+dt) × (commanded − filtered)``,
+        seeded at the first commanded sample (a static commanded pose is
+        therefore passed through unchanged from the first tick). ``dt`` comes
+        from consecutive ``ctx.now`` readings, clamped to ``[0, 0.2]`` s so a
+        clock hiccup cannot snap the filter; a missing clock uses the nominal
+        50 Hz period. ``lag_tau == 0`` short-circuits to raw passthrough.
+        """
+        if self._lag_tau <= 0.0:
+            return commanded
+        if now is not None and self._last_now is not None:
+            dt = min(max(now - self._last_now, 0.0), 0.2)
+        else:
+            dt = _NOMINAL_DT
+        if now is not None:
+            self._last_now = now
+        if self._filtered is None:
+            self._filtered = commanded
+            return commanded
+        k = dt / (self._lag_tau + dt)
+        f_pitch = self._filtered[0] + k * (commanded[0] - self._filtered[0])
+        f_yaw = self._filtered[1] + k * (commanded[1] - self._filtered[1])
+        self._filtered = (f_pitch, f_yaw)
+        return self._filtered
 
     # ------------------------------------------------------------------
     # Provider seam

@@ -25,6 +25,7 @@ Deterministic throughout: an injected :class:`PatDetector` (fixed
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -328,3 +329,78 @@ def test_malformed_reading_shape_degrades() -> None:
 def test_default_detector_when_none_injected() -> None:
     driver = PatSenseDriver(reader=_Reader())
     assert isinstance(driver.detector, PatDetector)
+
+
+# --------------------------------------------------------------------------- #
+# Lag compensation — the d1 live fix (issue #79)                              #
+# --------------------------------------------------------------------------- #
+#
+# On the real robot the base layer's own gaze wander (±7°/±12°) plus servo/
+# transport lag made same-tick commanded-vs-actual read as sustained phantom
+# presses (deviation ≈ lag × d(commanded)/dt ≫ the 1.2° thresholds). The fix
+# low-passes the COMMANDED pose (tau ≈ plant lag) before the detector. These
+# tests reproduce the mechanism deterministically: a sinusoidal commanded sway
+# whose lagged actual fires the unfiltered driver but not the filtered one,
+# while a real pat (an external impulse on ACTUAL, which the filter never
+# touches) still fires through the wander.
+
+
+def _sway(t: float) -> tuple[float, float]:
+    """A wander-shaped commanded pose: 4° pitch sway at a 2.5 s period."""
+    return (4.0 * math.sin(2.0 * math.pi * t / 2.5), 0.0)
+
+
+_PLANT_LAG = 0.3  # seconds — actual(t) = commanded(t - _PLANT_LAG)
+_TICK = 0.02  # the engine's 50 Hz period
+
+
+def _run_wander(
+    driver: PatSenseDriver, reader: _Reader, *, seconds: float, pat_at: float | None = None
+) -> None:
+    """Drive ``seconds`` of 50 Hz wander; optionally superimpose a pat on ACTUAL.
+
+    The pat is two 0.3 s presses of −3° pitch separated by a 0.3 s release,
+    starting at ``pat_at`` — an external force the command stream knows nothing
+    about, exactly like a hand.
+    """
+    ticks = int(seconds / _TICK)
+    for i in range(ticks):
+        t = T0 + i * _TICK
+        cp, cy = _sway(t)
+        ap, ay = _sway(t - _PLANT_LAG)
+        if pat_at is not None:
+            dt_pat = t - pat_at
+            if (0.0 <= dt_pat < 0.3) or (0.6 <= dt_pat < 0.9):
+                ap -= 3.0
+        _drive(driver, reader, (ap, ay), t, pitch=cp, yaw=cy)
+
+
+def test_wandering_commanded_with_plant_lag_never_fires() -> None:
+    """The live d1 scenario: continuous wander + plant lag -> ZERO pat events."""
+    reader = _Reader()
+    driver = PatSenseDriver(reader=reader, detector=_fixed_detector())
+    _run_wander(driver, reader, seconds=30.0)
+    assert driver.events == 0
+    assert driver.peek() is None
+
+
+def test_wander_with_lag_fires_without_the_filter() -> None:
+    """Regression guard: lag_tau=0 (raw passthrough) reproduces the false fires.
+
+    Documents that the low-pass is the thing standing between the base layer's
+    wander and phantom pats — if this starts failing, the sway/lag calibration
+    no longer models the defect and the suite has lost its d1 coverage.
+    """
+    reader = _Reader()
+    driver = PatSenseDriver(reader=reader, detector=_fixed_detector(), lag_tau=0.0)
+    _run_wander(driver, reader, seconds=30.0)
+    assert driver.events > 0
+
+
+def test_real_pat_during_wander_still_fires() -> None:
+    """A hand's impulse rides ACTUAL (unfiltered) -> detection survives the fix."""
+    reader = _Reader()
+    driver = PatSenseDriver(reader=reader, detector=_fixed_detector())
+    # Warm the filter + baseline on pure wander first, then pat mid-wander.
+    _run_wander(driver, reader, seconds=10.0, pat_at=T0 + 6.0)
+    assert driver.events >= 1
