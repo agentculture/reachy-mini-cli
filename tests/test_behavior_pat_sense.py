@@ -658,3 +658,76 @@ def test_ownership_resume_still_rebaselines_exactly_once() -> None:
     for i in range(6, 20):
         _drive(driver, reader, (0.0, 0.0), T0 + i * DT, owner=BASE_OWNER)
     assert detector.clear_presses_calls == 1
+
+
+# --------------------------------------------------------------------------- #
+# Gate-transition coverage (colleague review, PR #83)                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_gesture_ending_at_the_same_commanded_pose_re_arms_the_stillness_hold() -> None:
+    """A gesture must not hand straight back to a WIDE-OPEN stillness gate.
+
+    ``_commanded_still`` is never reached while a non-base owner holds the head,
+    so the gate's timing state freezes at its pre-gesture values. When a gesture
+    ends by returning the head to EXACTLY the pose it started from — what
+    happens whenever there is no base layer — nothing registers as commanded
+    motion, and a stale ``_last_motion_t`` would satisfy the hold instantly,
+    sensing straight into the plant's ring-down from the gesture. The resume
+    re-arms the hold, so the first post-gesture ticks stay gated.
+    """
+    reader = _Reader()
+    driver = PatSenseDriver(reader=reader, detector=_fixed_detector(), warmup_s=0.0)
+
+    # Earn an open gate on a steady commanded pose.
+    for i in range(12):
+        _drive(driver, reader, (0.0, 0.0), T0 + i * DT)
+    assert driver._stillness_blocked is False, "gate should be open before the gesture"
+
+    # A gesture owns the head for a while, then hands back at the SAME pose.
+    for i in range(10):
+        _drive(driver, reader, (0.0, 0.0), T0 + (12 + i) * DT, owner=GESTURE_OWNER)
+    resume_t = T0 + 22 * DT
+
+    # First tick back on base: the hold must be re-armed, not inherited.
+    _drive(driver, reader, (0.0, 0.0), resume_t)
+    assert driver._stillness_blocked is True, "stale timing let the gate open instantly"
+
+    # A pat landing inside the re-armed hold is correctly ignored...
+    _scratch_sequence(driver, reader, resume_t + DT)
+    assert driver.events == 0
+
+    # ...and once the hold is genuinely earned again, detection resumes.
+    for i in range(8):
+        _drive(driver, reader, (0.0, 0.0), resume_t + (4 + i) * DT)
+    _scratch_sequence(driver, reader, resume_t + 12 * DT)
+    assert driver.events == 1
+
+
+def test_wander_then_still_then_pat_is_detected() -> None:
+    """The full live sequence: the head wanders, settles, and is then petted.
+
+    Neither the hardware replays nor the unit tests previously exercised a gate
+    TRANSITION end to end, which is exactly where stale filter or timing state
+    would surface (colleague review finding).
+    """
+    reader = _Reader()
+    driver = PatSenseDriver(reader=reader, detector=_fixed_detector(), warmup_s=0.0)
+
+    # Wander: commanded moves every tick, gate stays shut, nothing detected.
+    for i in range(60):
+        t = T0 + i * 0.02
+        cmd = 4.0 * math.sin(2.0 * math.pi * t / 2.5)
+        _drive(driver, reader, (cmd * 1.2, 0.0), t, pitch=cmd)
+    assert driver.events == 0
+    assert driver._stillness_blocked is True
+
+    # Settle: commanded holds constant long enough to earn the gate.
+    settle = T0 + 60 * 0.02
+    for i in range(40):
+        _drive(driver, reader, (0.0, 0.0), settle + i * 0.02)
+    assert driver._stillness_blocked is False
+
+    # Petted while still -> detected.
+    _scratch_sequence(driver, reader, settle + 40 * 0.02)
+    assert driver.events == 1

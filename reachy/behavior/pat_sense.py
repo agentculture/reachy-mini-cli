@@ -449,6 +449,10 @@ class PatSenseDriver:
             # their clocks. See :meth:`_rebaseline_after_gap` for the full
             # reasoning (shared verbatim with the stillness edge below).
             self._rebaseline_after_gap()
+            # Ownership-edge ONLY: the stillness gate's timing froze when the
+            # gesture took the head, so make it re-earn its quiet window rather
+            # than inherit a stale stamp (colleague review, PR #83).
+            self._rearm_stillness_hold()
             self._suspended = False
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
@@ -518,6 +522,14 @@ class PatSenseDriver:
         self._latch = (touch_type, level)
         self.events += 1
 
+    def _rearm_stillness_hold(self) -> None:
+        """Force the stillness gate to re-earn its quiet window (ownership edge only).
+
+        See :meth:`_rebaseline_after_gap` for why this is ownership-specific.
+        """
+        self._last_cmd = None
+        self._last_motion_t = None
+
     def _rebaseline_after_gap(self) -> None:
         """Re-baseline after a detection gap — shared by BOTH resume edges.
 
@@ -532,6 +544,24 @@ class PatSenseDriver:
         moment the gap opened is now stale relative to whatever comes next,
         so both edges perform the same reset:
 
+        The stillness gate's own timing state (``_last_cmd`` /
+        ``_last_motion_t``) is deliberately NOT reset here — it belongs to the
+        OWNERSHIP edge only, and :meth:`_rearm_stillness_hold` does it there.
+        Clearing it on the stillness edge would be self-defeating: that timing
+        is precisely what just earned the open gate, so wiping it re-closes the
+        gate on the very next tick, thrashing between one open tick and another
+        full ``still_hold_s`` wait.
+
+        Why the ownership edge needs it (colleague review, PR #83):
+        ``_commanded_still`` is
+        never reached while a gesture owns the head, so without a reset a
+        gesture that ends by returning the head to EXACTLY its pre-gesture
+        commanded pose (what happens whenever the base layer is absent, e.g.
+        ``--no-base-layer``) registers no commanded change at all, leaving
+        ``_last_motion_t`` pointing seconds into the past — and the gate
+        would open on the very first post-gesture tick, sensing straight into
+        the plant's ring-down from the gesture — the ghost class re-entering
+        through the back door.
         * :meth:`PatDetector.clear_presses` — drop press pairing/edge state
           so it can never pair across the gap, but KEEP the learned EMA
           baselines. This is deliberate and load-bearing (not a mistake to
