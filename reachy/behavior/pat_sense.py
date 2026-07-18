@@ -369,6 +369,11 @@ class PatSenseDriver:
             self.detector.clear_presses()
             self._filtered = None
             self._dev_lp = None
+            # Clock states too, so the first post-resume filter step uses the
+            # nominal dt instead of a stale pre-suspension timestamp (colleague
+            # review finding — clamped and harmless, but predictable is better).
+            self._last_now = None
+            self._hp_last_now = None
             self._suspended = False
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
