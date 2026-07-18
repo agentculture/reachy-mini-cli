@@ -586,6 +586,7 @@ def test_module_imports_stdlib_and_reachy_only():
     allowed = {
         "__future__",
         "logging",
+        "math",
         "tomllib",
         "collections",
         "dataclasses",
@@ -842,3 +843,21 @@ def test_refusal_applies_identically_via_rules_loader_reload(tmp_path):
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_nan_and_inf_duration_s_are_refused() -> None:
+    """Non-finite duration_s would produce a never-expiring 'bounded' lifetime."""
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(CliError):
+            RulesConfig.from_dict(
+                {
+                    "react": [
+                        {
+                            "id": "r1",
+                            "when": {"field": "pat", "op": "is_true"},
+                            "run": "nod",
+                            "duration_s": bad,
+                        }
+                    ]
+                }
+            )

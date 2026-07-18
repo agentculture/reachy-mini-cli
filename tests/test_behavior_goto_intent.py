@@ -479,3 +479,18 @@ def test_importing_goto_intent_does_not_pull_control_or_intents_into_sys_modules
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_nan_and_inf_values_are_refused() -> None:
+    """Non-finite numbers pass every comparison check — they must be refused
+    explicitly (review finding: a NaN duration would never expire)."""
+    lane = _RecordingLane()
+    handler = make_goto_handler(lane)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        cmd = _command(body_yaw=bad, duration=1.0)
+        with pytest.raises(CliError):
+            handler(cmd, _CTX)
+        cmd = _command(body_yaw=1.0, duration=bad)
+        with pytest.raises(CliError):
+            handler(cmd, _CTX)
+    assert lane.submitted == []

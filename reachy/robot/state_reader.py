@@ -213,8 +213,11 @@ class HeldStateReader:
                 continue
             try:
                 method()
-            except Exception:  # noqa: BLE001 — teardown must never raise
+            except Exception:  # noqa: BLE001
+                # Teardown must never raise — and a raising close() should not
+                # stop us trying disconnect() as the fallback (review finding).
                 logger.warning("HeldStateReader: %s() raised during release", method_name)
+                continue
             break
 
     def _log_transition(self, detail: str) -> None:

@@ -21,6 +21,7 @@ the daemon's metres/radians at the transport boundary, exactly once.
 from __future__ import annotations
 
 import enum
+import math
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -89,7 +90,9 @@ class Lifetime:
     def errors(self) -> list[str]:
         """Human-readable validity problems (empty == valid)."""
         problems: list[str] = []
-        if self.duration is not None and self.duration <= 0:
+        if self.duration is not None and not math.isfinite(self.duration):
+            problems.append("duration must be a finite number")
+        if self.duration is not None and math.isfinite(self.duration) and self.duration <= 0:
             problems.append("duration must be > 0")
         if not self.looping and self.duration is None:
             problems.append("a one-shot behavior needs a duration")

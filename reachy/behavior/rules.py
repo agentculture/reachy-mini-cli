@@ -76,6 +76,7 @@ the (separate, dependent) rules evaluator.
 from __future__ import annotations
 
 import logging
+import math
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -197,7 +198,7 @@ def _validate_positive_float(raw: object, *, name: str, path: str) -> float | No
     """
     if raw is None:
         return None
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
         raise _error(f"{path}.{name} must be a number (got {raw!r})")
     value = float(raw)
     if value <= 0:

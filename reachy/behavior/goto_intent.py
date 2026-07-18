@@ -73,6 +73,7 @@ handler in this codebase raises) — neither is control.py or intents.py.
 
 from __future__ import annotations
 
+import math
 from typing import Callable
 
 from reachy.behavior.goto_lane import GotoSpec
@@ -168,7 +169,7 @@ def _reject(message: str, remediation: str = "") -> None:
 
 def _as_number(value: object, label: str) -> float:
     """Coerce ``value`` to ``float``, refusing bools and any non-numeric type."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         _reject(f"{label} must be a number (got {value!r})")
     return float(value)  # type: ignore[arg-type]  # _reject always raises above
 
