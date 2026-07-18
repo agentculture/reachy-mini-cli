@@ -270,6 +270,31 @@ def test_multiple_drivers_ride_one_seam_via_a_fanning_callable() -> None:
     assert a == [1, 2, 3] and b == [1, 2, 3]
 
 
+# --------------------------------------------------------------------------- #
+# TickContext.pose — the composed pose streamed THIS tick (additive field)    #
+# --------------------------------------------------------------------------- #
+
+
+def test_tick_context_carries_the_composed_pose() -> None:
+    captured = []
+    _run(tick_seam=captured.append, max_ticks=2)
+    for ctx in captured:
+        assert set(ctx.pose) == {"head", "antennas", "body_yaw"}
+        assert set(ctx.pose["head"]) == {"x", "y", "z", "roll", "pitch", "yaw"}
+        assert isinstance(ctx.pose["antennas"], tuple) and len(ctx.pose["antennas"]) == 2
+        assert isinstance(ctx.pose["body_yaw"], float)
+
+
+def test_tick_context_pose_matches_the_streamed_pose() -> None:
+    captured = []
+    tr, _ticks = _run(tick_seam=captured.append, max_ticks=3)
+    # The seam's ctx.pose for each tick is exactly what was streamed that tick
+    # (index 0 of tr.sink.poses is the preflight neutral pose, so tick N maps
+    # to poses[N]).
+    for i, ctx in enumerate(captured, start=1):
+        assert ctx.pose == tr.sink.poses[i]
+
+
 def test_admit_behavior_matches_add_outcome_shape() -> None:
     """The seam's admit path (Engine.admit_behavior) returns add's outcome dict."""
     eng = Engine()
