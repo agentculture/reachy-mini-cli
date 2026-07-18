@@ -294,8 +294,8 @@ def _rule_event(event: dict, *, action: str) -> RuleEvent:
         reason=str(event.get("reason", "")),
         behavior=event.get("behavior"),
         disable=list(disable),
-        ts=float(event.get("ts", 0.0)),
-        tick=int(event.get("tick", 0)),
+        ts=_safe_float(event.get("ts")),
+        tick=_safe_int(event.get("tick")),
     )
 
 
@@ -308,8 +308,8 @@ def _sense_event(event: dict) -> SenseEvent:
         pat=list(pat) if pat is not None else None,
         face=event.get("face"),
         frame_available=bool(event.get("frame_available", False)),
-        ts=float(event.get("ts", 0.0)),
-        tick=int(event.get("tick", 0)),
+        ts=_safe_float(event.get("ts")),
+        tick=_safe_int(event.get("tick")),
     )
 
 
@@ -318,9 +318,25 @@ def _intent_event(event: dict, *, action: str) -> IntentEvent:
         action=action,
         name=str(event.get("name", "")),
         payload=dict(event.get("payload") or {}),
-        ts=float(event.get("ts", 0.0)),
-        tick=int(event.get("tick", 0)),
+        ts=_safe_float(event.get("ts")),
+        tick=_safe_int(event.get("tick")),
     )
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    """Coerce to float, or *default* — ``to_runtime_event`` promises never to raise."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    """Coerce to int, or *default* — ``to_runtime_event`` promises never to raise."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 def _intent_status_event(event: dict, *, action: str) -> IntentEvent:
@@ -330,8 +346,8 @@ def _intent_status_event(event: dict, *, action: str) -> IntentEvent:
         action=action,
         name=str(event.get("kind") or event.get("goal") or ""),
         payload=payload,
-        ts=float(event.get("ts", 0.0)),
-        tick=int(event.get("tick", 0)),
+        ts=_safe_float(event.get("ts")),
+        tick=_safe_int(event.get("tick")),
     )
 
 
@@ -346,8 +362,8 @@ def _goto_event(event: dict, *, phase: str) -> MotionEvent:
         behavior=event.get("label") or event.get("id"),
         channels=list(event.get("channels") or []),
         detail=detail,
-        ts=float(event.get("ts", 0.0)),
-        tick=int(event.get("tick", 0)),
+        ts=_safe_float(event.get("ts")),
+        tick=_safe_int(event.get("tick")),
     )
 
 
@@ -357,8 +373,8 @@ def _motion_event(event: dict, *, action: str) -> MotionEvent:
         behavior=event.get("behavior"),
         channels=list(event.get("channels") or []),
         detail=dict(event.get("detail") or {}),
-        ts=float(event.get("ts", 0.0)),
-        tick=int(event.get("tick", 0)),
+        ts=_safe_float(event.get("ts")),
+        tick=_safe_int(event.get("tick")),
     )
 
 

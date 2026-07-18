@@ -119,5 +119,8 @@ skips = ["B101", "B404", "B603"]
 testpaths = ["tests"]
 addopts = "-ra"
 markers = [
-    "offline: success-list paths (boot, breathe, orient-to-sound, pat, sleep/wake, rules) run with every service endpoint pointed at an unreachable address and real network calls blocked; see tests/conftest.py's _offline_guard fixture.",
+    # Success-list paths (boot, breathe, orient-to-sound, pat, sleep/wake, rules)
+    # with every service endpoint unreachable and real network calls blocked;
+    # see tests/conftest.py's _offline_guard fixture.
+    "offline: zero-service lane; endpoints unreachable, socket connects blocked",
 ]

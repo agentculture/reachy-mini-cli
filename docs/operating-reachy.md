@@ -1267,7 +1267,7 @@ graph LR
 
     RFEED --> HUMAN["Human<br/>behavior status / rules / reload"]
     RFEED --> SCRIPT["Script<br/>--json + exit codes"]
-    RFEED --> AGENT["Agent<br/>reachy agent attach"]
+    RFEED --> AGENT["Agent<br/>reachy-mini-cli agent attach"]
 
     AGENT -->|"run_behavior, declare_goal,<br/>set_mode, set_inhibition"| SPOOL["intents spool"]
     AGENT -->|"--export -"| CFEED["agent's own cognition feed<br/>thinking / message / emotion"]

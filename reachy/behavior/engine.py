@@ -445,11 +445,14 @@ def _drive(
         changed = changed or bool(tick["expired"])
         consecutive = _stream_tick(sink, tick["pose"], consecutive, config.max_errors)
         ticks += 1
-        if tick_seam is not None:
-            _invoke_seam(tick_seam, seam_emit, engine, t, ticks, snapshot, tick)
+        # Publish the engine's state snapshot BEFORE the seam runs: a seam rider
+        # that augments state.json (the IntentDriver's "intents" view) is then the
+        # tick's FINAL writer, so its additions are never clobbered by this write.
         if control is not None and (changed or ticks - last_state_tick >= timing.heartbeat):
             control.write_state(engine.state(t, config))
             last_state_tick = ticks
+        if tick_seam is not None:
+            _invoke_seam(tick_seam, seam_emit, engine, t, ticks, snapshot, tick)
         if emit is not None:
             emit({"tick": ticks, "ownership": tick["ownership"]})
         if max_ticks is not None and ticks >= max_ticks:
