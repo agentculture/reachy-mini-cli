@@ -70,6 +70,7 @@ id = "hear-speech"
 when = { field = "speech", op = "is_true" }
 run = "nod"
 cooldown_s = 0.0
+duration_s = 30.0
 """
 
 

@@ -371,7 +371,16 @@ class RuleEngine:
         return True
 
     def _build(self, rule: Rule):
-        """Realise a react rule via the vetted library.build path (mode-swapped)."""
+        """Realise a react rule via the vetted library.build path (mode-swapped).
+
+        The admitted :class:`~reachy.behavior.model.Lifetime` uses
+        ``rule.duration_s`` as its ``duration`` when the rule carries one,
+        overriding the target entry's own default; otherwise it falls back to
+        the library defaults — which :meth:`reachy.behavior.rules.RulesConfig.from_dict`
+        now guarantees are bounded for any react rule's target (a looping entry
+        with no ``default_duration`` cannot pass validation without a
+        ``duration_s`` of its own), so this is never an unbounded admission.
+        """
         entry = self._lib.LIBRARY[rule.behavior]
         params = entry.default_params()
         for key, value in self._active_mode_params().items():
@@ -380,7 +389,10 @@ class RuleEngine:
         params.update(rule.params)  # rule overrides win over the active mode
         self._seq += 1
         behavior_id = f"{self._prefix}:{rule.id}:{self._seq}"
-        lifetime = Lifetime(looping=entry.looping, duration=entry.default_duration)
+        if rule.duration_s is not None:
+            lifetime = Lifetime(looping=entry.looping, duration=rule.duration_s)
+        else:
+            lifetime = Lifetime(looping=entry.looping, duration=entry.default_duration)
         return self._lib.build(rule.behavior, params, entry.default_class, lifetime, behavior_id)
 
     def _active_mode_params(self) -> dict[str, float]:

@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from reachy.behavior import engine as E
+from reachy.behavior import library as behavior_library
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.rule_engine import RuleEngine, TickBus, compose_rule_seam
 from reachy.behavior.rules import RulesConfig
@@ -94,13 +95,19 @@ def _react(rule_id, field_name, op, run, *, value=None, cooldown_s=5.0, hysteres
     when = {"field": field_name, "op": op}
     if value is not None:
         when["value"] = value
-    return {
+    rule = {
         "id": rule_id,
         "when": when,
         "run": run,
         "cooldown_s": cooldown_s,
         "hysteresis": hysteresis,
     }
+    entry = behavior_library.LIBRARY.get(run)
+    if entry is not None and entry.looping and entry.default_duration is None:
+        # As of t4, an unbounded-looping target needs its own duration_s or
+        # RulesConfig.from_dict refuses the rule fail-closed.
+        rule["duration_s"] = 30.0
+    return rule
 
 
 # --------------------------------------------------------------------------- #
