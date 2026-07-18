@@ -294,13 +294,16 @@ def test_full_round_trip_tool_submit_then_driver_applies(tmp_path) -> None:
     # Submit + immediately drain manually to simulate the engine loop answering
     # within the await window (the tool's own polling just re-reads the result
     # file, so draining once before the timeout expires is enough).
+    # shake is a looping-default entry (looping=True, duration=None) — an
+    # explicit bounded duration is required so run_behavior doesn't refuse an
+    # unbounded admission (see reachy/behavior/intents.py _validated_lifetime).
     cmd_id = control_mod.submit(
         "run_behavior",
         namespace=INTENT_NAMESPACE,
         root=tmp_path,
         name="shake",
         params={},
-        lifetime=None,
+        lifetime={"duration": 5},
     )
     driver.on_tick(ctx)
     confirmed = control_mod.await_result(

@@ -85,6 +85,14 @@ class TickContext:
       perception every tick, not only while a ``wants_sense`` behavior is
       active). :data:`~reachy.behavior.sense.EMPTY_SENSE` when no ``sense``
       source was supplied.
+    * ``pose`` — the complete pose THIS tick streamed to the robot, populated
+      AFTER streaming: ``{"head": {...6 axes...}, "antennas": (right, left),
+      "body_yaw": float}`` — the exact dict :meth:`Engine.compose_tick` composed
+      and :func:`_send_target` already sent to the transport this tick (same
+      object, not a copy). A rider that needs "where is the robot right now"
+      (e.g. a goto's start-pose continuity, see
+      :mod:`reachy.behavior.pose_feed`) reads it here instead of re-deriving
+      ownership/contributions itself.
     * ``ownership`` — the ``{channel: owner_id | None}`` resolved this tick.
     * ``emit`` — ``emit(event: dict) -> None``: publish a structured event; it
       fans out to whatever event consumers the ``tick_seam`` registered (a
@@ -106,6 +114,7 @@ class TickContext:
     now: float
     tick: int
     sense: Sense
+    pose: dict
     ownership: dict
     emit: Callable[[dict], None]
     admit: Callable[[Behavior], dict]
@@ -408,6 +417,7 @@ def _invoke_seam(tick_seam, seam_emit, engine: Engine, t: float, ticks: int, sna
             now=t,
             tick=ticks,
             sense=snapshot,
+            pose=tick["pose"],
             ownership=tick["ownership"],
             emit=seam_emit,
             admit=lambda beh, _t=t: engine.admit_behavior(beh, _t),

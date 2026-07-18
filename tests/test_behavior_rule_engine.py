@@ -27,9 +27,10 @@ from dataclasses import dataclass, field
 import pytest
 
 from reachy.behavior import engine as E
+from reachy.behavior import library as behavior_library
 from reachy.behavior import rule_engine as R
 from reachy.behavior.engine import Engine, EngineConfig
-from reachy.behavior.model import StopClass
+from reachy.behavior.model import Lifetime, StopClass
 from reachy.behavior.rule_engine import RuleEngine, TickBus, compose_rule_seam
 from reachy.behavior.rules import RulesConfig
 from reachy.behavior.sense import EMPTY_SENSE, Sense
@@ -98,7 +99,30 @@ def _sense_lines(caplog):
     return [r.getMessage() for r in caplog.records if r.name == SENSE_LOGGER]
 
 
-def _react(rule_id, field, op, run, *, value=None, cooldown_s=5.0, hysteresis=0.0, params=None):
+#: A generous stand-in duration for tests that use an unbounded-looping target
+#: (e.g. "nod") incidentally — as of t4 the schema fail-closed refuses such a
+#: react rule with no duration_s of its own, so every helper-built rule below
+#: auto-supplies this UNLESS the caller passes its own duration_s (or
+#: explicitly passes duration_s=None to opt out and let from_dict raise, for
+#: tests that exercise the refusal itself). It is deliberately far larger than
+#: any bounded engine run these tests drive, so it never actually expires.
+_AUTO_DURATION_S = 60.0
+
+_NO_DURATION = object()  # sentinel: caller explicitly wants no duration_s at all
+
+
+def _react(
+    rule_id,
+    field,
+    op,
+    run,
+    *,
+    value=None,
+    cooldown_s=5.0,
+    hysteresis=0.0,
+    params=None,
+    duration_s=_NO_DURATION,
+):
     when = {"field": field, "op": op}
     if value is not None:
         when["value"] = value
@@ -111,6 +135,14 @@ def _react(rule_id, field, op, run, *, value=None, cooldown_s=5.0, hysteresis=0.
     }
     if params:
         rule["params"] = params
+    if duration_s is _NO_DURATION:
+        entry = behavior_library.LIBRARY.get(run)
+        if entry is not None and entry.looping and entry.default_duration is None:
+            duration_s = _AUTO_DURATION_S
+        else:
+            duration_s = None
+    if duration_s is not None:
+        rule["duration_s"] = duration_s
     return rule
 
 
@@ -591,6 +623,88 @@ def test_react_stop_class_and_lifetime_come_from_library_entry() -> None:
     beh = ctx.admits[0]
     assert beh.stop_class is StopClass.STOPPABLE  # gaze-hold's default class
     assert beh.lifetime.duration == 5.0  # gaze-hold's default duration
+
+
+# --------------------------------------------------------------------------- #
+# t4 — react duration_s bounds the admitted Lifetime via _build               #
+# --------------------------------------------------------------------------- #
+
+
+def test_duration_s_bounds_lifetime_of_an_admitted_looping_behavior() -> None:
+    """A react rule with duration_s=N on a looping (unbounded-default) target
+    admits Lifetime(looping=True, duration=N) — the incident this task fixes:
+    a bare 'speech -> nod' rule used to admit Lifetime(looping=True,
+    duration=None), holding the head channel forever."""
+    cfg = RulesConfig.from_dict(
+        {"react": [_react("hear", "speech", "is_true", "nod", duration_s=12.5)]}
+    )
+    re = RuleEngine(cfg)
+    ctx = _drive_ticks(re, [Sense(speech_detected=True)])
+    beh = ctx.admits[0]
+    assert beh.name == "nod"
+    assert beh.lifetime == Lifetime(looping=True, duration=12.5)
+
+
+@pytest.mark.parametrize("target", ["feel-alive", "nod", "shake", "speak", "antenna-sway"])
+def test_duration_s_bounds_lifetime_for_every_unbounded_looping_entry(target) -> None:
+    cfg = RulesConfig.from_dict(
+        {"react": [_react("hear", "speech", "is_true", target, duration_s=7.0)]}
+    )
+    re = RuleEngine(cfg)
+    ctx = _drive_ticks(re, [Sense(speech_detected=True)])
+    beh = ctx.admits[0]
+    assert beh.lifetime == Lifetime(looping=True, duration=7.0)
+
+
+def test_no_duration_s_falls_back_to_library_default_for_a_bounded_target() -> None:
+    """Unchanged behavior for a target whose library default is already bounded
+    (gaze-hold: looping=False, default_duration=5.0) — no duration_s needed."""
+    cfg = RulesConfig.from_dict({"react": [_react("hear", "speech", "is_true", "gaze-hold")]})
+    re = RuleEngine(cfg)
+    ctx = _drive_ticks(re, [Sense(speech_detected=True)])
+    beh = ctx.admits[0]
+    assert beh.lifetime == Lifetime(looping=False, duration=5.0)
+
+
+def test_duration_s_le_zero_is_refused_at_schema_validation() -> None:
+    """duration_s <= 0 never reaches the engine: from_dict refuses it up front."""
+    data = {"react": [_react("hear", "speech", "is_true", "nod", duration_s=0)]}
+    with pytest.raises(CliError, match="duration_s"):
+        RulesConfig.from_dict(data)
+
+
+def test_duration_s_negative_is_refused_at_schema_validation() -> None:
+    data = {"react": [_react("hear", "speech", "is_true", "nod", duration_s=-3.0)]}
+    with pytest.raises(CliError, match="duration_s"):
+        RulesConfig.from_dict(data)
+
+
+def test_duration_s_non_numeric_is_refused_at_schema_validation() -> None:
+    data = {"react": [_react("hear", "speech", "is_true", "nod", duration_s="forever")]}
+    with pytest.raises(CliError, match="duration_s"):
+        RulesConfig.from_dict(data)
+
+
+def test_react_rule_with_no_duration_s_on_unbounded_looping_target_is_refused() -> None:
+    """The fail-closed refusal itself (rules.py's job) — reachable straight
+    through RulesConfig.from_dict, naming the rule id, the target entry, and
+    the remedy. This is the exact shape of the live incident: 'speech -> nod'
+    with no duration_s."""
+    data = {
+        "react": [
+            {
+                "id": "speech-to-nod",
+                "when": {"field": "speech", "op": "is_true"},
+                "run": "nod",
+            }
+        ]
+    }
+    with pytest.raises(CliError) as exc:
+        RulesConfig.from_dict(data)
+    message = str(exc.value)
+    assert "speech-to-nod" in message
+    assert "nod" in message
+    assert "duration_s" in message
 
 
 def test_a_raising_rule_build_never_escapes_on_tick(monkeypatch) -> None:

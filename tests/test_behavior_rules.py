@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from reachy.behavior import library as behavior_library
 from reachy.behavior import rules as rules_mod
 from reachy.behavior.rules import (
     COMPARATORS,
@@ -53,6 +54,7 @@ hysteresis = 0.5
 id = "loud-nod"
 when = { field = "rms", op = "gt", value = 0.05 }
 run = "nod"
+duration_s = 4.0
 
 [[inhibit]]
 id = "quiet-while-thinking"
@@ -125,7 +127,7 @@ def test_equality_op_predicate_accepts_string_value():
             {
                 "id": "greet-ada",
                 "when": {"field": "face", "op": "eq", "value": "Ada"},
-                "run": "nod",
+                "run": "gaze-hold",
             }
         ]
     }
@@ -411,7 +413,7 @@ def test_equality_op_with_dict_value_is_rejected():
 
 def test_duplicate_rule_id_across_react_and_inhibit_is_rejected():
     data = {
-        "react": [{"id": "dup", "when": {"field": "speech", "op": "is_true"}, "run": "nod"}],
+        "react": [{"id": "dup", "when": {"field": "speech", "op": "is_true"}, "run": "gaze-hold"}],
         "inhibit": [
             {
                 "id": "dup",
@@ -584,6 +586,7 @@ def test_module_imports_stdlib_and_reachy_only():
     allowed = {
         "__future__",
         "logging",
+        "math",
         "tomllib",
         "collections",
         "dataclasses",
@@ -612,8 +615,249 @@ def test_rule_dataclass_has_declared_shape():
         "behavior",
         "params",
         "disable",
+        "duration_s",
     }
+
+
+# ---------------------------------------------------------------------------
+# t4 — react-only duration_s: validation + fail-closed unbounded-looping refusal
+# ---------------------------------------------------------------------------
+
+#: Library entries that loop with no default_duration — an admitted rule
+#: targeting one of these MUST carry its own duration_s (fail-closed).
+_UNBOUNDED_LOOPING_ENTRIES = ("feel-alive", "nod", "shake", "speak", "antenna-sway")
+
+#: Library entries that are bounded one-shots — never need duration_s.
+_BOUNDED_ONE_SHOT_ENTRIES = ("gaze-hold", "thoughtful", "body-turn-hold")
+
+
+def test_unbounded_looping_entries_are_actually_looping_with_no_default_duration():
+    # Guards the fixture data above against library.py drifting out from under it.
+    for name in _UNBOUNDED_LOOPING_ENTRIES:
+        entry = behavior_library.LIBRARY[name]
+        assert entry.looping is True
+        assert entry.default_duration is None
+
+
+def test_bounded_one_shot_entries_are_not_unbounded_looping():
+    for name in _BOUNDED_ONE_SHOT_ENTRIES:
+        entry = behavior_library.LIBRARY[name]
+        assert not (entry.looping and entry.default_duration is None)
+
+
+def test_duration_s_defaults_to_none_when_omitted_on_a_bounded_target():
+    cfg = RulesConfig.from_dict(VALID)
+    rule = next(r for r in cfg.react if r.id == "orient-to-speech")  # targets gaze-hold
+    assert rule.duration_s is None
+
+
+def test_duration_s_is_populated_when_present():
+    cfg = RulesConfig.from_dict(VALID)
+    rule = next(r for r in cfg.react if r.id == "loud-nod")  # targets nod, carries duration_s
+    assert rule.duration_s == 4.0
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, -0.001])
+def test_duration_s_non_positive_is_rejected(bad):
+    data = {
+        "react": [
+            {
+                "id": "x",
+                "when": {"field": "speech", "op": "is_true"},
+                "run": "nod",
+                "duration_s": bad,
+            }
+        ]
+    }
+    with pytest.raises(CliError, match="duration_s"):
+        RulesConfig.from_dict(data)
+
+
+def test_duration_s_non_numeric_is_rejected():
+    data = {
+        "react": [
+            {
+                "id": "x",
+                "when": {"field": "speech", "op": "is_true"},
+                "run": "nod",
+                "duration_s": "forever",
+            }
+        ]
+    }
+    with pytest.raises(CliError, match="duration_s"):
+        RulesConfig.from_dict(data)
+
+
+def test_duration_s_boolean_is_rejected_not_treated_as_numeric():
+    data = {
+        "react": [
+            {
+                "id": "x",
+                "when": {"field": "speech", "op": "is_true"},
+                "run": "nod",
+                "duration_s": True,
+            }
+        ]
+    }
+    with pytest.raises(CliError, match="duration_s"):
+        RulesConfig.from_dict(data)
+
+
+def test_duration_s_on_inhibit_rule_is_rejected_as_unexpected_field():
+    data = {
+        "inhibit": [
+            {
+                "id": "x",
+                "when": {"field": "speech", "op": "is_true"},
+                "disable": ["nod"],
+                "duration_s": 5.0,
+            }
+        ]
+    }
+    with pytest.raises(CliError, match="duration_s"):
+        RulesConfig.from_dict(data)
+
+
+@pytest.mark.parametrize("target", _UNBOUNDED_LOOPING_ENTRIES)
+def test_react_rule_targeting_unbounded_looping_entry_without_duration_s_is_refused(target):
+    data = {
+        "react": [
+            {
+                "id": "loops-forever",
+                "when": {"field": "speech", "op": "is_true"},
+                "run": target,
+            }
+        ]
+    }
+    with pytest.raises(CliError) as exc:
+        RulesConfig.from_dict(data)
+    message = str(exc.value)
+    # Names the rule id, the target entry, and the remedy.
+    assert "loops-forever" in message
+    assert target in message
+    assert "duration_s" in message
+
+
+@pytest.mark.parametrize("target", _UNBOUNDED_LOOPING_ENTRIES)
+def test_react_rule_targeting_unbounded_looping_entry_with_duration_s_is_accepted(target):
+    data = {
+        "react": [
+            {
+                "id": "bounded-now",
+                "when": {"field": "speech", "op": "is_true"},
+                "run": target,
+                "duration_s": 3.0,
+            }
+        ]
+    }
+    cfg = RulesConfig.from_dict(data)
+    assert cfg.react[0].duration_s == 3.0
+    assert cfg.react[0].behavior == target
+
+
+@pytest.mark.parametrize("target", _BOUNDED_ONE_SHOT_ENTRIES)
+def test_react_rule_targeting_bounded_one_shot_entry_needs_no_duration_s(target):
+    data = {
+        "react": [
+            {
+                "id": "already-bounded",
+                "when": {"field": "speech", "op": "is_true"},
+                "run": target,
+            }
+        ]
+    }
+    cfg = RulesConfig.from_dict(data)  # must not raise
+    assert cfg.react[0].duration_s is None
+
+
+def test_load_rules_deployed_box_fixture_with_bounded_target_still_loads_unchanged(tmp_path):
+    """Verbatim deployed rules.toml (bounded 'thoughtful' target, 3s default) — no
+    duration_s needed, must load exactly as it did before this change."""
+    text = (
+        "[[react]]\n"
+        'id = "pat-acknowledge"\n'
+        'when = { field = "pat", op = "is_true" }\n'
+        'run = "thoughtful"\n'
+        "cooldown_s = 6.0\n"
+    )
+    path = tmp_path / "rules.toml"
+    path.write_text(text, encoding="utf-8")
+    cfg = load_rules(path)
+    assert len(cfg.react) == 1
+    rule = cfg.react[0]
+    assert rule.id == "pat-acknowledge"
+    assert rule.behavior == "thoughtful"
+    assert rule.cooldown_s == 6.0
+    assert rule.duration_s is None
+
+
+def test_from_dict_deployed_box_fixture_with_bounded_target_still_loads_unchanged():
+    """Same fixture, straight through from_dict (boot + reload share this gate)."""
+    data = _dict_from_toml(
+        "[[react]]\n"
+        'id = "pat-acknowledge"\n'
+        'when = { field = "pat", op = "is_true" }\n'
+        'run = "thoughtful"\n'
+        "cooldown_s = 6.0\n"
+    )
+    cfg = RulesConfig.from_dict(data)
+    assert len(cfg.react) == 1
+    assert cfg.react[0].behavior == "thoughtful"
+    assert cfg.react[0].duration_s is None
+
+
+def test_refusal_applies_identically_via_load_rules_on_disk(tmp_path):
+    """Boot (load_rules) and reload (RulesLoader) share the from_dict gate."""
+    path = tmp_path / "rules.toml"
+    path.write_text(
+        "[[react]]\n"
+        'id = "unsafe-nod"\n'
+        'when = { field = "speech", op = "is_true" }\n'
+        'run = "nod"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(CliError) as exc:
+        load_rules(path)
+    message = str(exc.value)
+    assert "unsafe-nod" in message
+    assert "nod" in message
+    assert "duration_s" in message
+
+
+def test_refusal_applies_identically_via_rules_loader_reload(tmp_path):
+    path = tmp_path / "rules.toml"
+    path.write_text(
+        "[[react]]\n"
+        'id = "unsafe-nod"\n'
+        'when = { field = "speech", op = "is_true" }\n'
+        'run = "nod"\n',
+        encoding="utf-8",
+    )
+    loader = RulesLoader(path)
+    cfg = loader.reload()  # never raises — keeps last-good (empty) config
+    assert cfg == RulesConfig()
+    assert loader.last_error is not None
+    assert "unsafe-nod" in loader.last_error
+    assert "duration_s" in loader.last_error
 
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_nan_and_inf_duration_s_are_refused() -> None:
+    """Non-finite duration_s would produce a never-expiring 'bounded' lifetime."""
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(CliError):
+            RulesConfig.from_dict(
+                {
+                    "react": [
+                        {
+                            "id": "r1",
+                            "when": {"field": "pat", "op": "is_true"},
+                            "run": "nod",
+                            "duration_s": bad,
+                        }
+                    ]
+                }
+            )

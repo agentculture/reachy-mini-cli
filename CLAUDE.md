@@ -173,7 +173,7 @@ transport. Deep notes for the non-trivial nouns follow in
 | `daemon` | `_commands/daemon.py` | `reachy/daemon.py` (process mgmt, `is_robot_live`) | none |
 | `device`/`app`/`move` | `_commands/{device,app,move}.py` | `reachy/robot/*` transports | `http` default |
 | `demo-mode` | `_commands/demo_mode.py` | `reachy/alive.py`, `reachy/motion/idle.py`, `demo_config.py`, `demo_service.py` | `sdk`/`http` |
-| `behavior` | `_commands/behavior.py` | 50 Hz engine, per-channel contention | `sdk`/`http` |
+| `behavior` | `_commands/behavior.py` | 50 Hz engine (`behavior/engine.py`) + rules/intents (`rules.py`/`rule_engine.py`/`intents.py`/`control.py`); composes proprioceptive pat sense (`pat_sense.py` + `robot/state_reader.py`) and a fail-closed live `goto` (`goto_intent.py` + `goto_lane.py`, seeded via `pose_feed.py`) onto the same tick seam | `sdk`/`http` |
 | `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43); `--live`: `listen_hooks.py` `HookChain` + `sense_sample.py` + `listen_{think,vision,sleep}.py` + `speech/voice.py` (`--voice-engine`, `--live` only) + `speech/agent_turn.py` `AgentTurnEngine` + `speech/tools.py` `ToolRegistry` (`--cognition agent`, `--live` only); `motion/supervisor.py` | `sdk` default |
 | `vision` | `_commands/vision.py` | pixel motion/light detectors, serial MotionQueue | `sdk` default |
 | `say` | `_commands/say.py` | `reachy/speech/{tts,harmonic,voice,playback}.py` | `sdk` default |
@@ -197,6 +197,70 @@ daemon *binary* comes from the `[daemon]` extra. Its `overview` is hand-built (n
 `CliError` pointing at the `[daemon]` install. `is_robot_live()` (also in
 `reachy/daemon.py`) provides SDK-based daemon liveness that stays correct across a
 daemon restart (fixes issue #21).
+
+### `behavior` noun — pat sense, bounded lifetimes, and a live `goto`
+
+`reachy/cli/_commands/behavior.py::_compose_run_seam` composes every runtime
+sense/act piece onto the engine's ONE `TickBus`: `[rules_driver,
+intent_driver, pat_driver, holder, goto_lane]` (plus a `SenseSnapshotDriver`
+when exporting). Every piece below is import-safe without `reachy_mini` and
+composed UNCONDITIONALLY — a bare box (no `[sdk]` extra) runs unchanged
+except for an always-`None` pat field.
+
+- **Pat sense** — `reachy/robot/state_reader.py` `HeldStateReader` holds ONE
+  `ReachyMini(media_backend='no_media')` client for the process lifetime
+  (construct-on-first-read, explicit idempotent `close()` — an unclosed
+  `no_media` client hangs the process at interpreter exit) and reads the
+  ACTUAL head pose back at tick rate with flat fd usage — a fresh client per
+  read (what `SdkTransport.head_pose` does) is unusable at this rate.
+  `reachy/behavior/pat_sense.py` `PatSenseDriver` runs at the END of each
+  tick: commanded pose from `ctx.pose`, actual pose from the reader, both fed
+  to the same `reachy.motion.pat.PatDetector` `listen`'s `PatHook` uses, and
+  the result LATCHED (one-tick, cleared before every tick) for the next
+  tick's single sense read. **Ownership-gated** (generalizes the #66
+  false-fire fix): while a non-base behavior (a rule-admitted gesture, a
+  goto) owns the head channel, detection suspends and re-baselines on
+  resume, so the engine's own commanded motion can never read as a phantom
+  pat.
+- **`reachy/behavior/pose_feed.py` `LastPoseHolder`** — a `TickBus` driver
+  stashing each tick's `ctx.pose` (now carried on `TickContext`) so a later
+  rider can read "the robot's current pose" without re-deriving it from
+  ownership + contributions. `as_start_pose_provider()` adapts that stash
+  into `GotoLane`'s `start_pose_provider`, so a goto interpolates from the
+  LIVE pose instead of snapping to neutral at `t=0`.
+- **`reachy/behavior/goto_intent.py`** — the `goto` `KindRegistry` handler:
+  fail-closed validation (unknown field / out-of-range axis / non-numeric
+  value / runaway duration is REFUSED, never clamped) turns a payload into a
+  `GotoSpec` and calls `GotoLane.submit`. Per-axis bounds are module
+  constants cited against precedent; duration is capped at `MAX_DURATION_S =
+  10.0`s. Registered into the intent driver's OWN `KindRegistry` at
+  composition, never into `control.py`/`intents.py` (see the module's
+  "Import boundary" docstring), so `behavior goto` (the CLI front,
+  `_commands/behavior.py`) and an agent's equivalent call share one
+  admission path.
+
+**The bounded-lifetime invariant — enforced on BOTH admission surfaces.** A
+background incident (a react rule admitting looping `nod` with library
+defaults; the head oscillated until manually stopped) motivated refusing any
+UNBOUNDED admission, fail-closed:
+
+- **React rules** (`rules.py` `RulesConfig.from_dict` + `rule_engine.py`
+  `RuleEngine._build`) — an optional, validated `duration_s: float > 0`. A
+  rule targeting a looping-default entry (`nod`/`shake`/`speak`/
+  `antenna-sway`/`feel-alive`) with no `duration_s` is refused at
+  load/reload, naming the rule id and the fix; `_build` uses `duration_s` as
+  the admitted `Lifetime`'s duration when present.
+- **`run_behavior` intents** (`intents.py` `_validated_lifetime`) — the SAME
+  defect class on the agent-facing surface: a resulting `looping=True,
+  duration=None` lifetime — explicit or silent from a looping-default
+  entry's own defaults — is refused. `declare_goal`'s STANDING, indefinite
+  lifetime is intentionally exempt (the documented indefinite-intent
+  surface).
+
+See [the operating guide's pat sense](docs/operating-reachy.md#the-pat-sense)
+and [bounded reactions](docs/operating-reachy.md#bounded-reactions-no-more-permanent-holds)
+sections for the operator-facing walkthrough and the deployed `rules.toml`
+example.
 
 ### `listen` noun — two-tier `ListenProducer` (SDK-first)
 
@@ -767,7 +831,12 @@ only the tool — cognition keeps running.
   degrades each folded hook (`FaceHook`/`SceneHook`) to a single logged warning
   instead of a crash — `pip install 'reachy-mini-cli[vision]'` to enable them.
   The pixel-only `vision` noun (motion/light orienting) needs no extra —
-  numpy-only, unaffected.
+  numpy-only, unaffected. The `behavior` engine's pat-sense pose reader
+  (`reachy/robot/state_reader.py` `HeldStateReader`) adds no new dependency
+  either: it lazy-imports `reachy_mini` and degrades to a permanently-`None`
+  reader (one logged warning) when `[sdk]` is absent, so `_compose_run_seam`
+  composes the pat stack unconditionally rather than gating on an SDK-import
+  probe.
 - **Python ≥ 3.12** (uses `X | None`, `tomllib`, etc.).
 - **Every PR bumps the version**, even docs/config/CI-only changes — the
   `version-check` CI job blocks the merge otherwise (it compares

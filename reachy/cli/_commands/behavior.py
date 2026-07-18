@@ -38,6 +38,7 @@ corrected file into the already-running engine without a restart.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -47,12 +48,16 @@ from reachy.behavior import rules as rules_mod
 from reachy.behavior import supervisor
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
-from reachy.behavior.intents import IntentDriver
+from reachy.behavior.goto_intent import GOTO, make_goto_handler
+from reachy.behavior.goto_lane import GotoLane
+from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
 from reachy.behavior.model import CHANNELS, StopClass
+from reachy.behavior.pat_sense import PatSenseDriver
+from reachy.behavior.pose_feed import LastPoseHolder
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
-from reachy.behavior.sense import DoaPoller, read_doa
+from reachy.behavior.sense import DoaPoller, SenseProviders, read_doa, read_perception
 from reachy.behavior.tick_metrics import TickMetrics, budget_from_hz
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
@@ -61,12 +66,18 @@ from reachy.cli._export import add_runtime_export_args, build_runtime_export_con
 from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.runtime import SenseSnapshotDriver
-from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
+from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, INTERPOLATIONS
+from reachy.robot.state_reader import HeldStateReader
 
 _JSON_HELP = "Emit structured JSON."
 _EMPTY_SUBMITTED = "(submitted)"
 _AWAIT_TIMEOUT_HELP = "Seconds to wait for the engine to confirm (default: 1.0)."
 _CLASSES = tuple(c.value for c in StopClass)
+
+#: The six head axes a goto may target, in the order ``goto_intent.HEAD_AXES`` /
+#: ``move goto``'s own ``_HEAD_KEYS`` use — flag names match the GotoSpec payload's
+#: head-axis keys exactly, so ``behavior goto``'s payload needs no translation.
+_HEAD_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
 
 _VERBS = [
     "behavior list — the built-in behavior catalog (names, channels, class, params)",
@@ -75,6 +86,8 @@ _VERBS = [
     "behavior status — active behaviors + per-channel ownership + engine/daemon state "
     "+ rules health + agent intents (when published)",
     "behavior reload — reload rules.toml in the running engine, applied between ticks",
+    "behavior goto — submit a goto (head/antennas/body-yaw) through the intents "
+    "spool, the same path a live agent uses",
     "behavior rules — render the loaded rules.toml (react/inhibit rules, modes)",
     "behavior rules check — validate rules.toml (a linter; exit 0 unless unreadable)",
     "behavior engine start — start the 50 Hz engine in the background",
@@ -219,7 +232,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         result = {
             "ok": False,
             "submitted": cmd_id,
-            "note": "engine did not confirm in time — is 'behavior engine' running?",
+            "note": _UNCONFIRMED_NOTE,
         }
     emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
     return 0
@@ -301,8 +314,85 @@ def cmd_reload(args: argparse.Namespace) -> int:
         result = {
             "ok": False,
             "submitted": cmd_id,
-            "note": "engine did not confirm in time — is 'behavior engine' running?",
+            "note": _UNCONFIRMED_NOTE,
         }
+    emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# goto — submit a goto through the SAME intents spool an agent tool uses      #
+# --------------------------------------------------------------------------- #
+
+
+def _goto_payload(args: argparse.Namespace) -> dict[str, object]:
+    """Build the GOTO command's fields from only the channel flags the operator gave.
+
+    Mirrors ``move goto``'s flag-to-payload shape (``reachy/cli/_commands/move.py``)
+    but stops at the payload dict — this verb submits into the spool instead of
+    calling a transport directly. The "at least one channel" check is done HERE,
+    synchronously, so a bare ``behavior goto`` (no channel flags) fails fast with a
+    clean exit-1 even when no engine is running to hand back the kind's own
+    (otherwise equivalent) rejection — see ``goto_intent.make_goto_handler``, whose
+    handler performs the exact same check on the payload once it reaches the spool
+    (a malicious/buggy non-CLI spool writer still hits that backstop).
+    """
+    head: dict[str, float] | None = None
+    if any(getattr(args, key) is not None for key in _HEAD_KEYS):
+        head = {key: getattr(args, key) for key in _HEAD_KEYS if getattr(args, key) is not None}
+    antennas = tuple(args.antennas) if args.antennas is not None else None
+    body_yaw = args.body_yaw
+    if head is None and antennas is None and body_yaw is None:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="goto: a goto must target at least one channel (head axis, antennas, "
+            "or body-yaw)",
+            remediation="pass at least one of --x/--y/--z/--roll/--pitch/--yaw/"
+            "--antennas/--body-yaw",
+        )
+    payload: dict[str, object] = {"duration": args.duration, "interpolation": args.interpolation}
+    if head is not None:
+        payload["head"] = head
+    if antennas is not None:
+        payload["antennas"] = list(antennas)
+    if body_yaw is not None:
+        payload["body_yaw"] = body_yaw
+    if args.label is not None:
+        payload["label"] = args.label
+    return payload
+
+
+def cmd_goto(args: argparse.Namespace) -> int:
+    """Submit a GOTO command into the intents spool — exactly what a live agent's
+    ``run_behavior``/... tools do (``reachy.speech.intent_tools._submit_and_await``),
+    so this verb exercises the identical submission path.
+
+    The submit is async: the engine applies it on its next drain, not this call. If
+    an engine confirms in time, its outcome is reported verbatim — including a
+    LIVE rejection from ``goto_intent``'s own validation (e.g. an out-of-range
+    axis), which is surfaced here as a ``CliError`` (exit 1) rather than a
+    silently-`ok:false` JSON blob, so a confirmed-bad goto reads the same as any
+    other CLI validation error. If nothing confirms in time this degrades to a
+    ``submitted``/unconfirmed report (exit 0) — the command is still on disk, so a
+    later-started engine still applies it; this verb never pretends to know an
+    outcome the spool hasn't reported.
+    """
+    json_mode = bool(getattr(args, "json", False))
+    payload = _goto_payload(args)
+    cmd_id = control.submit(GOTO, namespace=INTENT_NAMESPACE, **payload)
+    result = control.await_result(cmd_id, namespace=INTENT_NAMESPACE, timeout=args.await_timeout)
+    if result is None:
+        result = {
+            "ok": None,
+            "submitted": cmd_id,
+            "note": _UNCONFIRMED_NOTE,
+        }
+    elif result.get("ok") is False:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=str(result.get("error") or "goto: rejected by the engine"),
+            remediation="adjust the goto payload and resubmit",
+        )
     emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
     return 0
 
@@ -567,29 +657,141 @@ def cmd_engine_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer):
-    """Build ``behavior engine run``'s sense reader + tick seam.
+#: The submit-verbs' shared degrade note when no live engine confirms in time
+#: (the command persists on disk for a later-started engine).
+_UNCONFIRMED_NOTE = "engine did not confirm in time — is 'behavior engine' running?"
 
-    Live perception is the daemon's DoA route through this transport (DoaPoller
-    throttles + swallows failures; a mic-less box reads EMPTY_SENSE). The act-in
-    seam is the IntentDriver — agents/scripts submit intents through the spool and
-    the driver sustains them tick over tick, mode intents reaching the LIVE rule
-    engine. Everything rides ONE TickBus (+ sense snapshots when exporting),
-    wrapped in TickMetrics so a tick-budget breach surfaces as a
-    ``[SENSE ... event=overrun]`` line (c22).
+
+def _pat_sense_enabled() -> bool:
+    """Whether the opt-in pat sense stack composes (``REACHY_PAT_SENSE`` truthy).
+
+    Default OFF (issue #79): the sense's detection thresholds cannot yet
+    separate a real pat from the base layer's wander on the measured plant;
+    the full chain ships dormant until the hands-on calibration pass.
     """
-    sense_reader = DoaPoller(lambda: read_doa(transport))
+    return os.environ.get("REACHY_PAT_SENSE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _make_state_reader() -> HeldStateReader:
+    """Build the held, media-free SDK pose reader — a test-injection seam.
+
+    Isolated as a module-level factory so a composition test can inject a fake
+    reader (recording ``read``/``close``) via ``monkeypatch.setattr`` without a
+    real SDK. In production it returns a bare
+    :class:`~reachy.robot.state_reader.HeldStateReader`, which itself degrades to
+    a permanently-``None`` reader (one logged warning, then no reading) when the
+    ``[sdk]`` extra is absent — which is why :func:`_compose_run_seam` composes
+    the pat stack UNCONDITIONALLY rather than gating on an SDK-import probe.
+    """
+    return HeldStateReader()
+
+
+def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer):
+    """Build ``behavior engine run``'s sense reader + tick seam + held pose reader.
+
+    Composes every merged runtime sense/act piece onto the engine's ONE per-tick
+    seam and returns ``(sense_reader, tick_seam, reader)``. Everything rides ONE
+    :class:`TickBus` wrapped in :class:`TickMetrics`, so a tick-budget breach
+    surfaces as a ``[SENSE ... event=overrun]`` line (c22).
+
+    Perception (``sense_reader``)
+    -----------------------------
+    Each tick's :class:`~reachy.behavior.sense.Sense` is
+    ``read_perception(SenseProviders(pat_event=...), base=doa_poller(t))``: the
+    :class:`~reachy.behavior.sense.DoaPoller` supplies the throttled DoA/speech
+    leg (its own low-rate polling + failure-swallowing preserved), while the pat
+    cue is a non-consuming PEEK of the pat driver's one-tick latch — so the DoA
+    leg keeps its cadence and the pat leg costs only a latch read per call. A
+    mic-less box reads EMPTY_SENSE for the DoA leg exactly as before.
+
+    Degrade contract (no ``[sdk]`` extra)
+    -------------------------------------
+    The SDK sense stack (:class:`HeldStateReader` + :class:`PatDetector` +
+    :class:`PatSenseDriver` + :class:`LastPoseHolder`) is ALWAYS composed: every
+    piece is import-safe without ``reachy_mini``, and :class:`HeldStateReader`
+    degrades internally to permanently-``None`` when the extra is absent (one
+    logged warning, then no reading). So on a bare box the engine behaves exactly
+    as before EXCEPT for a few inert drivers — the pat driver reads ``None`` every
+    tick (no pat events, no errors), the holder harmlessly stashes each pose, and
+    an empty goto lane is a per-tick no-op — i.e. DoA-only sense, no pat, no
+    exceptions. The goto path itself needs no SDK, so it still works.
+
+    Act-in seams (the ONE TickBus, in driver order)
+    -----------------------------------------------
+    ``[rules_driver, intent_driver, pat_driver, holder, goto_lane]`` (with a
+    :class:`SenseSnapshotDriver` appended when exporting):
+
+    * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
+      decisions (admit/evict, drain the intent + goto command spools). The GOTO
+      kind handler runs inside the intent driver's drain and enqueues onto the
+      goto lane. The intent driver builds its OWN registry with the four intent
+      kinds, then the GOTO kind is registered into THAT SAME registry, so all
+      five kinds share one registry: the merged
+      :class:`~reachy.behavior.intents.IntentDriver` only auto-registers its four
+      defaults when it builds the registry itself, so GOTO is added afterward
+      rather than pre-loaded into an injected (would-be-empty-of-defaults)
+      registry.
+    * ``pat_driver`` — reads THIS tick's ``ctx.pose`` (commanded head) and the
+      injected reader (actual head) DIRECTLY (never via the holder), advances the
+      detector, and latches a pat for the NEXT tick's sense read. It mutates no
+      shared engine state and only latches, so its position among the readers is
+      immaterial to correctness; it sits after the symbolic drivers by
+      convention.
+    * ``holder`` BEFORE ``goto_lane`` — the holder stashes this tick's streamed
+      ``ctx.pose``; the goto lane's ``start_pose_provider`` peeks that stash when
+      it admits a goto. Running the holder first means a goto admitted THIS tick
+      (from a command the intent driver just drained) seeds its minjerk start from
+      this tick's freshest pose instead of last tick's stale one.
+    * ``SenseSnapshotDriver`` last (export only) — publishes the tick's perception
+      snapshot on change; it reads the fixed ``ctx.sense`` so its position is
+      immaterial, appended last so the sense block trails the decisions.
+
+    The returned ``reader`` is the held SDK client the caller MUST ``close()`` at
+    shutdown (an unclosed ``no_media`` client hangs the process at interpreter
+    exit — see :mod:`reachy.robot.state_reader`).
+    """
+    doa_poller = DoaPoller(lambda: read_doa(transport))
+
+    # The pat sense stack — OPT-IN via REACHY_PAT_SENSE=1 (issue #79): on the
+    # measured plant, feel-alive's gaze wander leaves conditioned residuals up
+    # to ~3.3 deg — above any threshold a real pat could still clear — so the
+    # sense ships dormant pending the hands-on calibration pass (real pat data,
+    # possibly a calmer sensing mode). Every other piece of the chain (reader,
+    # driver, conditioning, rules, feed) is live-verified; enabling is one env
+    # var, no restart of anything but the unit.
+    reader = None
+    pat_driver = None
+    if _pat_sense_enabled():
+        reader = _make_state_reader()
+        pat_driver = PatSenseDriver(reader=reader.read)  # tuned default detector (#79)
+    holder = LastPoseHolder()
+    providers = SenseProviders(
+        pat_event=pat_driver.as_provider() if pat_driver is not None else None
+    )
+
+    def sense_reader(t):
+        # DoA (throttled by the poller) as the base; the pat cue (when the
+        # opt-in stack is composed) is peeked from the driver's one-tick latch.
+        return read_perception(providers, base=doa_poller(t))
+
+    goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
     intent_driver = IntentDriver(
         mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
         known_modes=rules_driver.known_modes if rules_driver is not None else None,
     )
-    drivers = [d for d in (rules_driver, intent_driver) if d is not None]
+    # Register the GOTO kind into the intent driver's OWN registry (which already
+    # carries the four intent defaults) so all five kinds share one registry.
+    intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
+
+    drivers = [
+        d for d in (rules_driver, intent_driver, pat_driver, holder, goto_lane) if d is not None
+    ]
     consumers = []
     if runtime_consumer is not None:
         drivers.append(SenseSnapshotDriver())
         consumers.append(runtime_consumer)
     bus = TickBus(drivers=drivers, consumers=consumers)
-    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))
+    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), reader
 
 
 def cmd_engine_run(args: argparse.Namespace) -> int:
@@ -615,7 +817,9 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     # think/listen cognition feed (decision c27) — carries no thinking/message/
     # emotion blocks, only perception/rule/intent/motion runtime events.
     runtime_consumer = build_runtime_export_consumer(args)
-    sense_reader, tick_seam = _compose_run_seam(transport, config, rules_driver, runtime_consumer)
+    sense_reader, tick_seam, reader = _compose_run_seam(
+        transport, config, rules_driver, runtime_consumer
+    )
 
     def _emit(event: dict) -> None:
         # Suppress the per-tick JSON summary while exporting so stdout carries
@@ -623,16 +827,25 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         if json_mode and runtime_consumer is None:
             emit_result(event, json_mode=True)
 
-    ticks = engine_run(
-        transport,
-        config,
-        on_start=_on_start,
-        emit=_emit,
-        max_ticks=args.max_ticks,
-        control=spool,
-        sense=sense_reader,
-        tick_seam=tick_seam,
-    )
+    try:
+        ticks = engine_run(
+            transport,
+            config,
+            on_start=_on_start,
+            emit=_emit,
+            max_ticks=args.max_ticks,
+            control=spool,
+            sense=sense_reader,
+            tick_seam=tick_seam,
+        )
+    finally:
+        # Release the held media-free SDK pose reader on EVERY exit path. REQUIRED
+        # for a clean stop: an unclosed no_media ReachyMini client hangs the
+        # process at interpreter exit (see reachy.robot.state_reader), which would
+        # wedge a SIGTERM. close() is idempotent and never raises. None when the
+        # opt-in pat stack is not composed (REACHY_PAT_SENSE unset, issue #79).
+        if reader is not None:
+            reader.close()
     if runtime_consumer is not None:
         emit_diagnostic(f"[behavior] engine stopped after {ticks} tick(s) (export: stdout)")
     elif not json_mode:
@@ -761,6 +974,55 @@ def _register_reload(noun_sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=cmd_reload)
 
 
+def _register_goto(noun_sub: argparse._SubParsersAction) -> None:
+    p = noun_sub.add_parser(
+        "goto", help="Submit a goto (head/antennas/body-yaw) through the intents spool."
+    )
+    p.add_argument("--x", type=float, default=None, help="Head X offset in mm.")
+    p.add_argument("--y", type=float, default=None, help="Head Y offset in mm.")
+    p.add_argument("--z", type=float, default=None, help="Head Z offset in mm.")
+    p.add_argument("--roll", type=float, default=None, help="Head roll in degrees.")
+    p.add_argument("--pitch", type=float, default=None, help="Head pitch in degrees.")
+    p.add_argument("--yaw", type=float, default=None, help="Head yaw in degrees.")
+    p.add_argument(
+        "--antennas",
+        type=float,
+        nargs=2,
+        metavar=("RIGHT", "LEFT"),
+        default=None,
+        help="Antenna angles in degrees (right, left).",
+    )
+    p.add_argument(
+        "--body-yaw",
+        type=float,
+        default=None,
+        dest="body_yaw",
+        help="Body yaw in degrees.",
+    )
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=1.0,
+        help="Movement duration in seconds (default: 1.0; the kind refuses over 10s).",
+    )
+    p.add_argument(
+        "--interpolation",
+        choices=INTERPOLATIONS,
+        default="minjerk",
+        help="Interpolation curve (default: minjerk).",
+    )
+    p.add_argument("--label", default=None, help="Optional label for the goto (default: 'goto').")
+    p.add_argument(
+        "--await-timeout",
+        type=float,
+        default=1.0,
+        dest="await_timeout",
+        help=_AWAIT_TIMEOUT_HELP,
+    )
+    p.add_argument("--json", action="store_true", help=_JSON_HELP)
+    p.set_defaults(func=cmd_goto)
+
+
 def _register_rules(noun_sub: argparse._SubParsersAction) -> None:
     """The ``behavior rules`` sub-noun: render + validate ``rules.toml``.
 
@@ -858,5 +1120,6 @@ def register(sub: argparse._SubParsersAction) -> None:
     _register_stop(noun_sub)
     _register_status(noun_sub)
     _register_reload(noun_sub)
+    _register_goto(noun_sub)
     _register_rules(noun_sub)
     _register_engine(noun_sub)

@@ -102,13 +102,19 @@ class _Clock:
 
 
 def _react_rule(rule_id: str, field: str, op: str, run: str, *, cooldown_s: float = 0.0) -> dict:
-    return {
+    rule: dict = {
         "id": rule_id,
         "when": {"field": field, "op": op},
         "run": run,
         "cooldown_s": cooldown_s,
         "hysteresis": 0.0,
     }
+    entry = library.LIBRARY.get(run)
+    if entry is not None and entry.looping and entry.default_duration is None:
+        # As of t4, an unbounded-looping target needs its own duration_s or
+        # RulesConfig.from_dict refuses the rule fail-closed.
+        rule["duration_s"] = 30.0
+    return rule
 
 
 # --------------------------------------------------------------------------- #
@@ -148,6 +154,7 @@ id = "wake-nod"
 when = { field = "doa", op = "absent_for", value = 0 }
 run = "nod"
 cooldown_s = 0
+duration_s = 30.0
 """
 
 

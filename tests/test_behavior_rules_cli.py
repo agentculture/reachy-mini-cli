@@ -36,6 +36,7 @@ id = "r1"
 when = { field = "doa", op = "absent_for", value = 0 }
 run = "nod"
 cooldown_s = 0
+duration_s = 30.0
 
 [[inhibit]]
 id = "i1"

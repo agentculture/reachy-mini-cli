@@ -104,6 +104,18 @@ graph TD
    self-conflicts. Two independent motion drivers still *fight over the same
    head*.
 
+> **A third access pattern that does NOT compete for the media session.** The
+> `behavior` engine's [pat sense](#the-pat-sense) reads the ACTUAL head pose
+> back through a SEPARATE, held `ReachyMini(media_backend='no_media')` client
+> (`reachy/robot/state_reader.py`'s `HeldStateReader`) dedicated to state
+> reads. It never calls `media_session()` and never touches the mic or
+> camera, so it does not contend for the single-consumer media session
+> `listen`/`think`/`sleep`/`vision` share — the media session stays free for
+> whichever of those actually needs it. It is still one more live SDK
+> connection, so the "one `sdk` media owner per robot" rule of thumb below
+> still governs motion/media composition; this is narrowly about what the
+> state-read client does and does not contend for.
+
 ### What this means: the conflict matrix
 
 Because both resources are single-owner, **you cannot run two `sdk`-sense nouns
@@ -1059,13 +1071,128 @@ fire/suppress line — is visible on stderr by default.
 > live sense source: a `DoaPoller` over this transport's daemon DoA route, so
 > `doa` and `speech` predicates react to the real robot (proven end-to-end in
 > `tests/test_behavior_engine_composition.py`), and `absent_for` works from
-> tick one. The `rms`/`pat`/`face` fields have **no live provider in this
-> standalone process** — those readings come from the SDK media session the
-> `listen --live` loop owns, and the single-SDK-owner model keeps them there
-> for now. Rules naming them validate, render, and reload cleanly, but only
-> fire where a provider feeds the field; the provider seams
+> tick one. `pat` is live too now (see [the pat sense](#the-pat-sense)
+> below): a held, media-free SDK client reads the actual head pose back every
+> tick and feeds `Sense.pat_event` directly in this standalone process — no
+> `listen --live` needed. The `rms`/`face` fields still have **no live
+> provider in this standalone process** — those readings come from the SDK
+> media session the `listen --live` loop owns, and the single-SDK-owner model
+> keeps them there for now. Rules naming them validate, render, and reload
+> cleanly, but only fire where a provider feeds the field; the provider seams
 > (`reachy.behavior.sense.SenseProviders`) are the designed attach point when
 > that composition lands.
+
+### The pat sense
+
+The boot presence (`reachy-runtime.service`, the 50 Hz behavior engine) now
+**feels pats**. There is no touch sensor: the engine compares the head pose it
+**commanded** this tick against the **actual** pose read back through a held,
+media-free SDK client (`reachy/robot/state_reader.py`), feeds the deviation to
+the same `PatDetector` the listen loop used (scratch = downward pitch press,
+side_pat = sideways yaw nudge, two levels), and publishes the detection as the
+`pat` sense field rules can test:
+
+```toml
+when = { field = "pat", op = "is_true" }
+```
+
+Key operator facts:
+
+- **Reactions to pat are rules in `rules.toml`.** They are data you edit and
+  push with `behavior reload`, never hardcoded. The deployed
+  pat-acknowledge rule (pat → `thoughtful`, cooldown 6 s) lights up the moment
+  the sense feeds — no rules file change needed.
+- **The sense itself is OPT-IN for now** (`REACHY_PAT_SENSE=1` on the runtime
+  unit; issue #79). Live calibration found the base layer's gaze wander leaves
+  commanded-vs-actual residuals up to ~3.3° on the real plant — above any
+  threshold a genuine pat could still clear — so detection ships dormant
+  until a hands-on tuning pass with real pat data. The full chain (held
+  media-free SDK reader, conditioning, rules, feed) is live-verified;
+  enabling is one environment variable on the unit.
+- **Detection is ownership-gated.** While a rule-fired gesture or a `goto` owns
+  the head channel, the detector suspends and re-baselines, so the robot's own
+  motion can never read as a phantom pat (the false-fire oscillation class
+  from the listen era).
+- **The SDK read client is lazy and self-healing.** If the daemon is down at
+  boot, the pat sense simply stays unfed and comes alive within a few seconds
+  of daemon health — no restart needed.
+- **It degrades cleanly.** Without the `[sdk]` extra the runtime runs exactly
+  as before, DoA-only.
+
+### Bounded reactions: no more permanent holds
+
+Background incident: a react rule `speech → nod` once admitted the looping
+`nod` behavior with library defaults, and the head oscillated until manually
+stopped. That class of failure is now structurally impossible.
+
+**React rules.** A rule targeting a looping-default library entry
+(`nod`, `shake`, `speak`, `antenna-sway`, `feel-alive`) **must** carry
+`duration_s = <seconds>`. A rules file without it is refused at load/reload
+with a clear error naming the rule and the fix. Bounded one-shot targets
+(`gaze-hold` 5 s, `thoughtful` 3 s, `body-turn-hold` 5 s) need nothing — they
+already have a fixed lifetime.
+
+```toml
+[[react]]
+id = "speech-nod"
+when = { field = "speech", op = "is_true" }
+run = "nod"
+duration_s = 8
+cooldown_s = 3.0
+```
+
+**Agent intents.** The same guard covers agent-submitted `run_behavior` intents
+through the spool: a payload naming a looping-default entry without an
+explicit bounded lifetime (`"duration": N`) is refused with an error result.
+Standing `declare_goal` intents are intentionally exempt — they are the
+documented indefinite-intent surface.
+
+```json
+{"type": "run_behavior", "behavior": "nod", "duration": 8}
+```
+
+A bounded looping admission (e.g. `duration_s = 8` on `nod`) loops for 8
+seconds then releases its channel automatically.
+
+### The `goto` verb — a spool-submitted, engine-arbitrated move
+
+`reachy-mini-cli behavior goto` drives the same smooth minjerk `goto`
+planner `move goto` uses, but as a **one-shot behavior the engine
+arbitrates** instead of a direct daemon call — it composes cleanly with
+rules and anything else running instead of fighting them for a channel:
+
+```bash
+reachy-mini-cli behavior goto --yaw 10 --pitch -5 --duration 2 --label look-left
+```
+
+Only the channel flags you pass end up in the payload
+(`--x`/`--y`/`--z`/`--roll`/`--pitch`/`--yaw` for the head,
+`--antennas RIGHT LEFT`, `--body-yaw`) — a bare `behavior goto` naming none
+of them is refused client-side, before ever touching the spool.
+`--duration` defaults to 1 s and is capped at 10 s; `--interpolation`
+defaults to `minjerk` (also `linear`/`ease`/`cartoon`).
+
+**Submit → confirm/degrade** — the same async contract every `behavior`
+verb that talks to the running engine uses: the CLI writes the goto into
+the **intents spool**, the exact path a live tool-use agent's
+`run_behavior` would write into, and waits up to `--await-timeout` (default
+1.0 s) for the engine's next tick to confirm:
+
+- **admitted** — reports the goto's id, the channels it claimed, and its
+  duration;
+- **rejected** — the engine's own fail-closed validation (`reachy.behavior.
+  goto_intent`) refuses an out-of-range axis, an unknown field, a runaway
+  duration, or a goto naming no channel at all — **refuses, never clamps**,
+  so a wild value is a bug to surface, not silently correct — reported as a
+  clean exit-1, the same as any other CLI validation error;
+- **no confirmation in time** — reports `submitted: <id>` and exits 0; the
+  command is still on disk, so a later-started engine still applies it.
+
+A submitted goto interpolates from the robot's LIVE composed pose (whatever
+channel some other behavior already holds off-neutral), not from neutral —
+the engine now carries its own composed pose on the tick seam
+(`reachy.behavior.pose_feed.LastPoseHolder`), so the goto's minjerk start
+point is always live instead of snapping to zero at `t=0`.
 
 ### Human — behavior verbs end to end
 
@@ -1627,9 +1754,11 @@ log strings end-to-end on real hardware — is tracked as a separate follow-up
 - [The symbolic runtime](#the-symbolic-runtime) — the deterministic,
   zero-LLM-token presence (`behavior` + `rules.toml` + `agent attach`); its
   [Status callouts](#agent--attach-over-the-runtime-feed-and-the-intent-spool)
-  record what fires live: DoA/speech sense and the intents-spool drainer are
-  wired into `behavior engine run`'s tick bus; `rms`/`pat`/`face` providers
-  and a live goto submission path remain follow-up composition
+  record what fires live: DoA/speech sense, [the pat sense](#the-pat-sense),
+  the intents-spool drainer, and [a live goto submission
+  path](#the-goto-verb--a-spool-submitted-engine-arbitrated-move) are all
+  wired into `behavior engine run`'s tick bus; `rms`/`face` providers remain
+  follow-up composition
 - Per-noun flag reference: `reachy-mini-cli explain <noun>`
 - Export wire format: [`docs/export-schema.md`](export-schema.md)
 - SDK-transport rationale: [`docs/adr-0001-sdk-transport-extra.md`](adr-0001-sdk-transport-extra.md)
