@@ -20,6 +20,14 @@ a string of code: ``field`` is one of :data:`SENSE_FIELDS`
 (``doa``/``speech``/``rms``/``pat``/``face``) and ``op`` is one of
 :data:`COMPARATORS`.
 
+A REACT rule may additionally carry ``duration_s`` (a validated ``> 0`` number,
+react-only — inhibit rules have no lifetime to bound). When present it caps the
+admitted behavior's :class:`~reachy.behavior.model.Lifetime` at ``duration_s``
+seconds regardless of the target library entry's own default, so a looping
+behavior admitted by a rule stops on its own after ``duration_s`` seconds
+instead of running until something else evicts it (see
+:meth:`reachy.behavior.rule_engine.RuleEngine._build`).
+
 :meth:`RulesConfig.from_dict` is the single validation gate, mirroring
 :meth:`reachy.stash.record.StashRecord.from_dict`. It refuses:
 
@@ -35,6 +43,12 @@ a string of code: ``field`` is one of :data:`SENSE_FIELDS`
 * an unknown predicate ``field``/``op``, a boolean-op predicate carrying a
   ``value``, or a numeric-op predicate missing/mistyping one;
 * a negative ``cooldown_s``/``hysteresis``, or a duplicate rule ``id``;
+* a react rule's ``duration_s`` that is not a positive number (``<= 0``,
+  non-numeric, or a ``bool``);
+* a react rule that targets a library entry which is looping with no
+  ``default_duration`` (an unbounded-looping default) and carries no
+  ``duration_s`` of its own — refused FAIL-CLOSED so an admitted behavior can
+  never hold a channel forever without an explicit, deliberate opt-in;
 * an ``active_mode`` that does not name a defined mode, or defined modes with
   no ``active_mode`` selected.
 
@@ -105,7 +119,7 @@ DEFAULT_HYSTERESIS = 0.0
 
 _PREDICATE_FIELDS = frozenset({"field", "op", "value"})
 _TOP_LEVEL_FIELDS = frozenset({"active_mode", "react", "inhibit", "modes"})
-_REACT_FIELDS = frozenset({"id", "when", "run", "params", "cooldown_s", "hysteresis"})
+_REACT_FIELDS = frozenset({"id", "when", "run", "params", "cooldown_s", "hysteresis", "duration_s"})
 _INHIBIT_FIELDS = frozenset({"id", "when", "disable", "cooldown_s", "hysteresis"})
 _REACT_REQUIRED = frozenset({"id", "when", "run"})
 _INHIBIT_REQUIRED = frozenset({"id", "when", "disable"})
@@ -173,6 +187,24 @@ def _validate_nonneg_float(raw: object, *, name: str, path: str, default: float)
     return value
 
 
+def _validate_positive_float(raw: object, *, name: str, path: str) -> float | None:
+    """Validate an optional strictly-positive number: ``None`` when absent.
+
+    Mirrors :func:`_validate_nonneg_float`'s posture (reject non-numeric and
+    ``bool``), but for a field with no meaningful default — ``duration_s`` is
+    either omitted entirely or a real positive number of seconds; ``0`` or
+    negative makes no sense as a duration.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise _error(f"{path}.{name} must be a number (got {raw!r})")
+    value = float(raw)
+    if value <= 0:
+        raise _error(f"{path}.{name} must be > 0 (got {value!r})")
+    return value
+
+
 # --------------------------------------------------------------------------- #
 # Dataclasses                                                                 #
 # --------------------------------------------------------------------------- #
@@ -227,6 +259,13 @@ class Rule:
     :attr:`hysteresis` (the anti-flap margin around a threshold the evaluator
     uses; validated ``>= 0``). This module only carries the validated numbers —
     *acting* on cooldown/hysteresis timing is the evaluator's job.
+
+    :attr:`duration_s` is REACT-ONLY (always ``None`` on an INHIBIT rule): an
+    optional, validated ``> 0`` number of seconds bounding the admitted
+    behavior's lifetime, overriding the target library entry's own default
+    duration. See :meth:`RulesConfig.from_dict`'s fail-closed refusal of a
+    react rule that targets an unbounded-looping entry with no
+    :attr:`duration_s`.
     """
 
     id: str
@@ -237,6 +276,7 @@ class Rule:
     behavior: str | None = None
     params: dict[str, float] = field(default_factory=dict)
     disable: frozenset[str] = field(default_factory=frozenset)
+    duration_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -433,6 +473,15 @@ def _validate_react_rule(raw: object, *, index: int) -> Rule:
     hysteresis = _validate_nonneg_float(
         raw.get("hysteresis"), name="hysteresis", path=path, default=DEFAULT_HYSTERESIS
     )
+    duration_s = _validate_positive_float(raw.get("duration_s"), name="duration_s", path=path)
+
+    if duration_s is None and entry.looping and entry.default_duration is None:
+        raise _error(
+            f"{path} (id={rule_id!r}) runs {behavior_name!r}, which loops with no default "
+            "duration (unbounded looping default) and carries no duration_s — admitting it "
+            "would let it hold its channel forever",
+            remediation=f"add duration_s = <seconds> to react rule {rule_id!r}",
+        )
 
     return Rule(
         id=rule_id,
@@ -443,6 +492,7 @@ def _validate_react_rule(raw: object, *, index: int) -> Rule:
         behavior=behavior_name,
         params=params,
         disable=frozenset(),
+        duration_s=duration_s,
     )
 
 
