@@ -232,7 +232,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         result = {
             "ok": False,
             "submitted": cmd_id,
-            "note": "engine did not confirm in time — is 'behavior engine' running?",
+            "note": _UNCONFIRMED_NOTE,
         }
     emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
     return 0
@@ -314,7 +314,7 @@ def cmd_reload(args: argparse.Namespace) -> int:
         result = {
             "ok": False,
             "submitted": cmd_id,
-            "note": "engine did not confirm in time — is 'behavior engine' running?",
+            "note": _UNCONFIRMED_NOTE,
         }
     emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
     return 0
@@ -385,7 +385,7 @@ def cmd_goto(args: argparse.Namespace) -> int:
         result = {
             "ok": None,
             "submitted": cmd_id,
-            "note": "engine did not confirm in time — is 'behavior engine' running?",
+            "note": _UNCONFIRMED_NOTE,
         }
     elif result.get("ok") is False:
         raise CliError(
@@ -655,6 +655,11 @@ def cmd_engine_status(args: argparse.Namespace) -> int:
     data = supervisor.status(base_url=args.base_url, timeout=args.timeout)
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
+
+
+#: The submit-verbs' shared degrade note when no live engine confirms in time
+#: (the command persists on disk for a later-started engine).
+_UNCONFIRMED_NOTE = "engine did not confirm in time — is 'behavior engine' running?"
 
 
 def _pat_sense_enabled() -> bool:
