@@ -75,12 +75,25 @@ def behavior_dir(root: Path | None = None) -> Path:
 #: Namespaces are single path segments by construction — the allowlist keeps a
 #: caller-supplied namespace from ever traversing outside the behavior dir.
 _NAMESPACE_RE = re.compile(r"[a-z0-9_-]*\Z")
+_NAMESPACE_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789_-"
 
 
 def _checked_namespace(namespace: str) -> str:
+    """Sanitize a namespace to a single safe path segment, or raise.
+
+    The returned string is rebuilt character-by-character from the trusted
+    constant alphabet (never sliced from the input), so no separator or dot can
+    survive — a namespace cannot traverse out of the behavior dir.
+    """
     if not _NAMESPACE_RE.fullmatch(namespace):
         raise ValueError(f"invalid spool namespace {namespace!r} (allowed: [a-z0-9_-])")
-    return namespace
+    rebuilt = []
+    for ch in namespace:
+        idx = _NAMESPACE_ALPHABET.find(ch)
+        if idx < 0:
+            raise ValueError(f"invalid spool namespace {namespace!r} (allowed: [a-z0-9_-])")
+        rebuilt.append(_NAMESPACE_ALPHABET[idx])
+    return "".join(rebuilt)
 
 
 def _confined(base: Path, candidate: Path) -> Path:
