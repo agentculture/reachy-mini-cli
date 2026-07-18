@@ -160,9 +160,10 @@ def test_overrun_is_measured_even_when_inner_raises(caplog) -> None:
         raise RuntimeError("seam boom")
 
     metrics = TickMetrics(boom, budget_s=0.02, duration_clock=clock)
+    ctx = _ctx(1)
     with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
         with pytest.raises(RuntimeError):
-            metrics(_ctx(1))
+            metrics(ctx)
 
     assert metrics.overruns == 1
     assert any("event=overrun" in ln for ln in _sense_lines(caplog))

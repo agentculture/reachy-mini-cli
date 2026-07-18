@@ -12,6 +12,7 @@ provider scaffolding only; every existing ``Sense``/``DoaPoller`` call site (see
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 
 import pytest
@@ -72,7 +73,7 @@ def test_sense_accepts_new_fields_explicitly() -> None:
 
 def test_sense_is_still_frozen() -> None:
     s = Sense()
-    with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
+    with pytest.raises(dataclasses.FrozenInstanceError):
         s.rms = 1.0  # type: ignore[misc]
 
 

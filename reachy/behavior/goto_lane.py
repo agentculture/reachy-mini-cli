@@ -222,24 +222,33 @@ def _goto_fn(spec: GotoSpec, start: Contribution) -> Callable[[float, dict, obje
 
     def fn(t_local: float, _params: dict, _sense: object) -> Contribution:
         s = _progress(interp, t_local / dur if dur > 0 else 1.0)
-        head = None
-        if spec.head is not None:
-            base = s_head if s_head is not None else neutral_head()
-            head = {k: _lerp(base.get(k, 0.0), spec.head.get(k, 0.0), s) for k in _HEAD_KEYS}
-        antennas = None
-        if spec.antennas is not None:
-            base_ant = s_ant if s_ant is not None else (0.0, 0.0)
-            antennas = (
-                _lerp(base_ant[0], spec.antennas[0], s),
-                _lerp(base_ant[1], spec.antennas[1], s),
-            )
-        body_yaw = None
-        if spec.body_yaw is not None:
-            base_body = s_body if s_body is not None else 0.0
-            body_yaw = _lerp(base_body, spec.body_yaw, s)
-        return Contribution(head=head, antennas=antennas, body_yaw=body_yaw)
+        return Contribution(
+            head=_head_at(spec.head, s_head, s),
+            antennas=_antennas_at(spec.antennas, s_ant, s),
+            body_yaw=_body_yaw_at(spec.body_yaw, s_body, s),
+        )
 
     return fn
+
+
+def _head_at(target: dict | None, start: dict | None, s: float) -> dict | None:
+    if target is None:
+        return None
+    base = start if start is not None else neutral_head()
+    return {k: _lerp(base.get(k, 0.0), target.get(k, 0.0), s) for k in _HEAD_KEYS}
+
+
+def _antennas_at(target, start, s: float):
+    if target is None:
+        return None
+    base = start if start is not None else (0.0, 0.0)
+    return (_lerp(base[0], target[0], s), _lerp(base[1], target[1], s))
+
+
+def _body_yaw_at(target: float | None, start: float | None, s: float) -> float | None:
+    if target is None:
+        return None
+    return _lerp(start if start is not None else 0.0, target, s)
 
 
 def build_goto_behavior(

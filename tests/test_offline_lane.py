@@ -130,8 +130,12 @@ def test_offline_guard_points_every_service_env_var_unreachable() -> None:
 def test_offline_guard_blocks_a_real_socket_connect() -> None:
     with pytest.raises(AssertionError, match="offline lane: network call attempted"):
         socket.create_connection(("127.0.0.1", 1), timeout=0.1)
-    with pytest.raises(AssertionError, match="offline lane: network call attempted"):
-        socket.socket().connect(("127.0.0.1", 1))
+    sock = socket.socket()
+    try:
+        with pytest.raises(AssertionError, match="offline lane: network call attempted"):
+            sock.connect(("127.0.0.1", 1))
+    finally:
+        sock.close()
 
 
 # --------------------------------------------------------------------------- #

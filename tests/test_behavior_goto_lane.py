@@ -148,10 +148,12 @@ def test_goto_behavior_honours_an_injected_start_pose() -> None:
 
 
 def test_build_goto_rejects_no_channels_and_bad_duration() -> None:
+    no_channels = GotoSpec(duration=1.0)
     with pytest.raises(ValueError):
-        build_goto_behavior(GotoSpec(duration=1.0), "x")  # claims nothing
+        build_goto_behavior(no_channels, "x")  # claims nothing
+    zero_duration = GotoSpec(head={"pitch": 1.0}, duration=0.0)
     with pytest.raises(ValueError):
-        build_goto_behavior(GotoSpec(head={"pitch": 1.0}, duration=0.0), "x")  # duration <= 0
+        build_goto_behavior(zero_duration, "x")  # duration <= 0
 
 
 # --------------------------------------------------------------------------- #

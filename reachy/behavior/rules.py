@@ -331,6 +331,12 @@ def _validate_predicate(raw: object, *, path: str) -> Predicate:
             remediation=f"use one of: {', '.join(sorted(COMPARATORS))}",
         )
 
+    value = _validate_predicate_value(raw, op=op, path=path)
+    return Predicate(field=field_name, op=op, value=value)
+
+
+def _validate_predicate_value(raw: Mapping, *, op: str, path: str) -> object:
+    """Normalize + validate the ``value`` field against *op*'s comparator class."""
     has_value = "value" in raw
     value = raw.get("value")
 
@@ -340,8 +346,8 @@ def _validate_predicate(raw: object, *, path: str) -> Predicate:
                 f"{path}.when: op {op!r} takes no 'value' (got {value!r})",
                 remediation="remove 'value' for is_true/is_false predicates",
             )
-        value = None
-    elif op in _ORDERED_OPS or op in _DURATION_OPS:
+        return None
+    if op in _ORDERED_OPS or op in _DURATION_OPS:
         if not has_value or isinstance(value, bool) or not isinstance(value, (int, float)):
             raise _error(
                 f"{path}.when: op {op!r} requires a numeric 'value' (got {value!r})",
@@ -349,14 +355,13 @@ def _validate_predicate(raw: object, *, path: str) -> Predicate:
             )
         if value < 0:
             raise _error(f"{path}.when: 'value' for op {op!r} must be >= 0 (got {value!r})")
-        value = float(value)
-    else:  # equality ops
-        if not has_value:
-            raise _error(f"{path}.when: op {op!r} requires a 'value' field")
-        if isinstance(value, (dict, list)):
-            raise _error(f"{path}.when.value must be a scalar for op {op!r} (got {value!r})")
-
-    return Predicate(field=field_name, op=op, value=value)
+        return float(value)
+    # equality ops
+    if not has_value:
+        raise _error(f"{path}.when: op {op!r} requires a 'value' field")
+    if isinstance(value, (dict, list)):
+        raise _error(f"{path}.when.value must be a scalar for op {op!r} (got {value!r})")
+    return value
 
 
 def _validate_behavior_name(name: object, *, path: str) -> str:

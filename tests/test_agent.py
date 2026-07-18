@@ -284,8 +284,9 @@ def test_open_feed_reads_a_file(tmp_path):
 
 
 def test_open_feed_missing_path_is_a_clean_env_error():
+    lines = _open_feed("/no/such/feed.jsonl")  # generator — nothing raised yet
     with pytest.raises(CliError) as exc:
-        list(_open_feed("/no/such/feed.jsonl"))
+        list(lines)
     assert exc.value.code == EXIT_ENV_ERROR
     assert "cannot open runtime feed" in exc.value.message
 

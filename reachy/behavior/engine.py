@@ -395,6 +395,28 @@ def _read_sense(engine: Engine, sense, t: float, *, force: bool = False) -> Sens
     return sense(t)
 
 
+def _resolve_seam_emit(tick_seam) -> Callable[[dict], None]:
+    """The seam's ``emit`` fan-out, resolved once per run (no-op without one)."""
+    candidate = getattr(tick_seam, "emit", None) if tick_seam is not None else None
+    return candidate if callable(candidate) else _noop_emit
+
+
+def _invoke_seam(tick_seam, seam_emit, engine: Engine, t: float, ticks: int, snapshot, tick):
+    """Call the tick seam with this tick's :class:`TickContext`."""
+    tick_seam(
+        TickContext(
+            now=t,
+            tick=ticks,
+            sense=snapshot,
+            ownership=tick["ownership"],
+            emit=seam_emit,
+            admit=lambda beh, _t=t: engine.admit_behavior(beh, _t),
+            evict=engine.stop,
+            active_names=lambda: {ab.behavior.name for ab in engine.active},
+        )
+    )
+
+
 def _drive(
     engine: Engine,
     sink: TargetSink,
@@ -414,11 +436,7 @@ def _drive(
     ticks = 0
     consecutive = 0
     last_state_tick = -timing.heartbeat
-    seam_emit = _noop_emit
-    if tick_seam is not None:
-        candidate = getattr(tick_seam, "emit", None)
-        if callable(candidate):
-            seam_emit = candidate
+    seam_emit = _resolve_seam_emit(tick_seam)
     while not stop["flag"]:
         t = now()
         changed = _apply_commands(engine, control, t)
@@ -428,18 +446,7 @@ def _drive(
         consecutive = _stream_tick(sink, tick["pose"], consecutive, config.max_errors)
         ticks += 1
         if tick_seam is not None:
-            tick_seam(
-                TickContext(
-                    now=t,
-                    tick=ticks,
-                    sense=snapshot,
-                    ownership=tick["ownership"],
-                    emit=seam_emit,
-                    admit=lambda beh, _t=t: engine.admit_behavior(beh, _t),
-                    evict=engine.stop,
-                    active_names=lambda: {ab.behavior.name for ab in engine.active},
-                )
-            )
+            _invoke_seam(tick_seam, seam_emit, engine, t, ticks, snapshot, tick)
         if control is not None and (changed or ticks - last_state_tick >= timing.heartbeat):
             control.write_state(engine.state(t, config))
             last_state_tick = ticks

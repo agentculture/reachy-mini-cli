@@ -64,6 +64,8 @@ from reachy.export.runtime import SenseSnapshotDriver
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
 
 _JSON_HELP = "Emit structured JSON."
+_EMPTY_SUBMITTED = "(submitted)"
+_AWAIT_TIMEOUT_HELP = "Seconds to wait for the engine to confirm (default: 1.0)."
 _CLASSES = tuple(c.value for c in StopClass)
 
 _VERBS = [
@@ -219,7 +221,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "submitted": cmd_id,
             "note": "engine did not confirm in time — is 'behavior engine' running?",
         }
-    emit_payload(result, json_mode=json_mode, empty="(submitted)")
+    emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
     return 0
 
 
@@ -229,7 +231,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     result = control.await_result(cmd_id, timeout=args.await_timeout)
     if result is None:
         result = {"ok": False, "submitted": cmd_id, "note": "engine did not confirm in time"}
-    emit_payload(result, json_mode=json_mode, empty="(submitted)")
+    emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
     return 0
 
 
@@ -301,7 +303,7 @@ def cmd_reload(args: argparse.Namespace) -> int:
             "submitted": cmd_id,
             "note": "engine did not confirm in time — is 'behavior engine' running?",
         }
-    emit_payload(result, json_mode=json_mode, empty="(submitted)")
+    emit_payload(result, json_mode=json_mode, empty=_EMPTY_SUBMITTED)
     return 0
 
 
@@ -565,6 +567,31 @@ def cmd_engine_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer):
+    """Build ``behavior engine run``'s sense reader + tick seam.
+
+    Live perception is the daemon's DoA route through this transport (DoaPoller
+    throttles + swallows failures; a mic-less box reads EMPTY_SENSE). The act-in
+    seam is the IntentDriver — agents/scripts submit intents through the spool and
+    the driver sustains them tick over tick, mode intents reaching the LIVE rule
+    engine. Everything rides ONE TickBus (+ sense snapshots when exporting),
+    wrapped in TickMetrics so a tick-budget breach surfaces as a
+    ``[SENSE ... event=overrun]`` line (c22).
+    """
+    sense_reader = DoaPoller(lambda: read_doa(transport))
+    intent_driver = IntentDriver(
+        mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
+        known_modes=rules_driver.known_modes if rules_driver is not None else None,
+    )
+    drivers = [d for d in (rules_driver, intent_driver) if d is not None]
+    consumers = []
+    if runtime_consumer is not None:
+        drivers.append(SenseSnapshotDriver())
+        consumers.append(runtime_consumer)
+    bus = TickBus(drivers=drivers, consumers=consumers)
+    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))
+
+
 def cmd_engine_run(args: argparse.Namespace) -> int:
     install_logging(getattr(args, "log_level", None))
     json_mode = bool(getattr(args, "json", False))
@@ -588,24 +615,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     # think/listen cognition feed (decision c27) — carries no thinking/message/
     # emotion blocks, only perception/rule/intent/motion runtime events.
     runtime_consumer = build_runtime_export_consumer(args)
-    # Live perception for the rules: the daemon's DoA route through this transport
-    # (DoaPoller throttles + swallows failures; a mic-less box reads EMPTY_SENSE).
-    sense_reader = DoaPoller(lambda: read_doa(transport))
-    # The act-in seam: agents/scripts submit intents through the spool; the driver
-    # sustains them tick over tick. Mode intents reach the LIVE rule engine.
-    intent_driver = IntentDriver(
-        mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
-        known_modes=rules_driver.known_modes if rules_driver is not None else None,
-    )
-    drivers = [d for d in (rules_driver, intent_driver) if d is not None]
-    consumers = []
-    if runtime_consumer is not None:
-        drivers.append(SenseSnapshotDriver())
-        consumers.append(runtime_consumer)
-    # One seam, every rider: rules + intents (+ sense snapshots when exporting).
-    tick_seam = TickBus(drivers=drivers, consumers=consumers)
-    # Budget = one tick period; a breach surfaces as a [SENSE ... event=overrun] line (c22).
-    tick_seam = TickMetrics(tick_seam, budget_s=budget_from_hz(config.compose_hz))
+    sense_reader, tick_seam = _compose_run_seam(transport, config, rules_driver, runtime_consumer)
 
     def _emit(event: dict) -> None:
         # Suppress the per-tick JSON summary while exporting so stdout carries
@@ -707,7 +717,7 @@ def _register_run(noun_sub: argparse._SubParsersAction) -> None:
         type=float,
         default=1.0,
         dest="await_timeout",
-        help="Seconds to wait for the engine to confirm (default: 1.0).",
+        help=_AWAIT_TIMEOUT_HELP,
     )
     _add_engine_tuning(p)  # forwarded to an auto-start
     add_robot_args(p)
@@ -722,7 +732,7 @@ def _register_stop(noun_sub: argparse._SubParsersAction) -> None:
         type=float,
         default=1.0,
         dest="await_timeout",
-        help="Seconds to wait for the engine to confirm (default: 1.0).",
+        help=_AWAIT_TIMEOUT_HELP,
     )
     p.add_argument("--json", action="store_true", help=_JSON_HELP)
     p.set_defaults(func=cmd_stop)
@@ -745,7 +755,7 @@ def _register_reload(noun_sub: argparse._SubParsersAction) -> None:
         type=float,
         default=1.0,
         dest="await_timeout",
-        help="Seconds to wait for the engine to confirm (default: 1.0).",
+        help=_AWAIT_TIMEOUT_HELP,
     )
     p.add_argument("--json", action="store_true", help=_JSON_HELP)
     p.set_defaults(func=cmd_reload)

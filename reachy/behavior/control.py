@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -71,23 +72,37 @@ def behavior_dir(root: Path | None = None) -> Path:
     return d
 
 
+#: Namespaces are single path segments by construction — the allowlist keeps a
+#: caller-supplied namespace from ever traversing outside the behavior dir.
+_NAMESPACE_RE = re.compile(r"[a-z0-9_-]*\Z")
+
+
+def _checked_namespace(namespace: str) -> str:
+    if not _NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError(f"invalid spool namespace {namespace!r} (allowed: [a-z0-9_-])")
+    return namespace
+
+
 def commands_dir(namespace: str = "", *, root: Path | None = None) -> Path:
     base = behavior_dir(root)
-    d = (base / namespace / "commands") if namespace else (base / "commands")
+    ns = _checked_namespace(namespace)
+    d = (base / ns / "commands") if ns else (base / "commands")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def results_dir(namespace: str = "", *, root: Path | None = None) -> Path:
     base = behavior_dir(root)
-    d = (base / namespace / "results") if namespace else (base / "results")
+    ns = _checked_namespace(namespace)
+    d = (base / ns / "results") if ns else (base / "results")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def state_file(namespace: str = "", *, root: Path | None = None) -> Path:
     base = behavior_dir(root)
-    return (base / namespace / "state.json") if namespace else (base / "state.json")
+    ns = _checked_namespace(namespace)
+    return (base / ns / "state.json") if ns else (base / "state.json")
 
 
 def _atomic_write(path: Path, text: str) -> None:
