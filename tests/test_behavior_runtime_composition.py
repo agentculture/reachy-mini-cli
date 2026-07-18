@@ -308,3 +308,44 @@ def test_reader_close_invoked_even_when_engine_loop_raises(_isolated, monkeypatc
     # this test pins the finally-block teardown, not the exit code.
     assert rc != 0
     assert reader.closed, "reader.close() must run even when the engine loop raises"
+
+
+# --------------------------------------------------------------------------- #
+# 6. REACHY_PAT_SENSE parsing — absent vs empty vs falsey vs truthy (Qodo #4)  #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(None, True, id="absent"),
+        pytest.param("", False, id="empty"),
+        pytest.param("   ", False, id="blank-whitespace"),
+        pytest.param("0", False, id="zero"),
+        pytest.param("false", False, id="false"),
+        pytest.param("no", False, id="no"),
+        pytest.param("OFF", False, id="OFF-case-insensitive"),
+        pytest.param("  off  ", False, id="off-with-whitespace"),
+        pytest.param("1", True, id="one"),
+        pytest.param("true", True, id="true"),
+        pytest.param("yes", True, id="yes"),
+        pytest.param("on", True, id="on"),
+        pytest.param("banana", True, id="arbitrary-string"),
+    ],
+)
+def test_pat_sense_enabled_env_parsing(monkeypatch, raw, expected):
+    """``REACHY_PAT_SENSE`` absent -> ON (default since issue #80); an explicit but
+    empty/blank value -> OFF rather than silently falling through to the default
+    (Qodo review finding #4 on PR #83 — the old denylist check let
+    ``REACHY_PAT_SENSE=`` slip past every falsey token and enable the sense); any
+    other explicit falsey token (``0``/``false``/``no``/``off``, case/whitespace
+    insensitive) -> OFF; anything else (``1``/``true``/``yes``/``on``, or any other
+    non-blank string) -> ON."""
+    from reachy.cli._commands.behavior import _pat_sense_enabled
+
+    if raw is None:
+        monkeypatch.delenv("REACHY_PAT_SENSE", raising=False)
+    else:
+        monkeypatch.setenv("REACHY_PAT_SENSE", raw)
+
+    assert _pat_sense_enabled() is expected

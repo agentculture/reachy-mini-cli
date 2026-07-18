@@ -662,22 +662,40 @@ def cmd_engine_status(args: argparse.Namespace) -> int:
 _UNCONFIRMED_NOTE = "engine did not confirm in time — is 'behavior engine' running?"
 
 
+#: Explicit ``REACHY_PAT_SENSE`` tokens read as "opt out" (case/whitespace
+#: insensitive) — see :func:`_pat_sense_enabled`.
+_PAT_SENSE_FALSEY = frozenset({"0", "false", "no", "off"})
+
+
 def _pat_sense_enabled() -> bool:
     """Whether the pat sense stack composes. Default ON (issue #80).
+
+    ``REACHY_PAT_SENSE`` is read as a four-way value, not a plain denylist:
+
+    * ABSENT -> enabled (the shipped default since issue #80).
+    * an explicit falsey token (``0``/``false``/``no``/``off``, case/whitespace
+      insensitive) -> disabled.
+    * set but empty or blank (``REACHY_PAT_SENSE=`` or all-whitespace) ->
+      disabled. A denylist alone would miss this: "" is not in the falsey set,
+      so it would silently fall through to the default-on path even though an
+      operator setting a var to nothing almost always means "unset this", not
+      "turn it on" (Qodo review finding #4 on PR #83).
+    * anything else (``1``/``true``/``yes``/``on``, or any other non-blank
+      string) -> enabled.
 
     Shipped dormant in 0.36.0 (issue #79) because no threshold separated a real
     pat from the idle wander. The hands-on calibration session settled why: the
     plant is quiet ONLY while it is not tracking a moving target, so the sense
     now gates on commanded stillness (see :mod:`reachy.behavior.pat_sense`) and
     the ghost class is structurally impossible rather than threshold-managed.
-    ``REACHY_PAT_SENSE=0`` still opts out.
     """
-    return os.environ.get("REACHY_PAT_SENSE", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+    raw = os.environ.get("REACHY_PAT_SENSE")
+    if raw is None:
+        return True
+    value = raw.strip().lower()
+    if not value:
+        return False
+    return value not in _PAT_SENSE_FALSEY
 
 
 def _make_state_reader() -> HeldStateReader:
