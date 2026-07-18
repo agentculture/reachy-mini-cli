@@ -38,6 +38,7 @@ corrected file into the already-running engine without a restart.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -656,6 +657,16 @@ def cmd_engine_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pat_sense_enabled() -> bool:
+    """Whether the opt-in pat sense stack composes (``REACHY_PAT_SENSE`` truthy).
+
+    Default OFF (issue #79): the sense's detection thresholds cannot yet
+    separate a real pat from the base layer's wander on the measured plant;
+    the full chain ships dormant until the hands-on calibration pass.
+    """
+    return os.environ.get("REACHY_PAT_SENSE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _make_state_reader() -> HeldStateReader:
     """Build the held, media-free SDK pose reader — a test-injection seam.
 
@@ -736,16 +747,26 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     """
     doa_poller = DoaPoller(lambda: read_doa(transport))
 
-    # The SDK sense stack — always composed; every piece is import-safe without
-    # reachy_mini and the reader degrades internally (see the docstring).
-    reader = _make_state_reader()
-    pat_driver = PatSenseDriver(reader=reader.read)  # tuned default detector (#79)
+    # The pat sense stack — OPT-IN via REACHY_PAT_SENSE=1 (issue #79): on the
+    # measured plant, feel-alive's gaze wander leaves conditioned residuals up
+    # to ~3.3 deg — above any threshold a real pat could still clear — so the
+    # sense ships dormant pending the hands-on calibration pass (real pat data,
+    # possibly a calmer sensing mode). Every other piece of the chain (reader,
+    # driver, conditioning, rules, feed) is live-verified; enabling is one env
+    # var, no restart of anything but the unit.
+    reader = None
+    pat_driver = None
+    if _pat_sense_enabled():
+        reader = _make_state_reader()
+        pat_driver = PatSenseDriver(reader=reader.read)  # tuned default detector (#79)
     holder = LastPoseHolder()
-    providers = SenseProviders(pat_event=pat_driver.as_provider())
+    providers = SenseProviders(
+        pat_event=pat_driver.as_provider() if pat_driver is not None else None
+    )
 
     def sense_reader(t):
-        # DoA (throttled by the poller) as the base; the pat cue is peeked
-        # non-consuming from the pat driver's one-tick latch.
+        # DoA (throttled by the poller) as the base; the pat cue (when the
+        # opt-in stack is composed) is peeked from the driver's one-tick latch.
         return read_perception(providers, base=doa_poller(t))
 
     goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
@@ -816,8 +837,10 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         # Release the held media-free SDK pose reader on EVERY exit path. REQUIRED
         # for a clean stop: an unclosed no_media ReachyMini client hangs the
         # process at interpreter exit (see reachy.robot.state_reader), which would
-        # wedge a SIGTERM. close() is idempotent and never raises.
-        reader.close()
+        # wedge a SIGTERM. close() is idempotent and never raises. None when the
+        # opt-in pat stack is not composed (REACHY_PAT_SENSE unset, issue #79).
+        if reader is not None:
+            reader.close()
     if runtime_consumer is not None:
         emit_diagnostic(f"[behavior] engine stopped after {ticks} tick(s) (export: stdout)")
     elif not json_mode:

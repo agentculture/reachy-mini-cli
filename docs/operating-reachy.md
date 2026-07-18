@@ -1100,8 +1100,15 @@ Key operator facts:
 
 - **Reactions to pat are rules in `rules.toml`.** They are data you edit and
   push with `behavior reload`, never hardcoded. The deployed
-  pat-acknowledge rule (pat → `thoughtful`, cooldown 6 s) starts working with
-  zero config the moment this build is deployed — no rules file change needed.
+  pat-acknowledge rule (pat → `thoughtful`, cooldown 6 s) lights up the moment
+  the sense feeds — no rules file change needed.
+- **The sense itself is OPT-IN for now** (`REACHY_PAT_SENSE=1` on the runtime
+  unit; issue #79). Live calibration found the base layer's gaze wander leaves
+  commanded-vs-actual residuals up to ~3.3° on the real plant — above any
+  threshold a genuine pat could still clear — so detection ships dormant
+  until a hands-on tuning pass with real pat data. The full chain (held
+  media-free SDK reader, conditioning, rules, feed) is live-verified;
+  enabling is one environment variable on the unit.
 - **Detection is ownership-gated.** While a rule-fired gesture or a `goto` owns
   the head channel, the detector suspends and re-baselines, so the robot's own
   motion can never read as a phantom pat (the false-fire oscillation class

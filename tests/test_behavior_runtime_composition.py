@@ -155,6 +155,7 @@ def test_pat_sense_flows_into_the_feed_via_the_composed_stack(_isolated, monkeyp
     scenario deterministically (a pitch-dominated ``scratch``)."""
     script = [(-3.0, 0.0), (0.0, 0.0), (-3.0, 0.0)] + [(0.0, 0.0)] * 8
     reader = _ScriptedReader(script)
+    monkeypatch.setenv("REACHY_PAT_SENSE", "1")  # the stack is opt-in (issue #79)
     monkeypatch.setattr("reachy.cli._commands.behavior._make_state_reader", lambda: reader)
     # The composed driver's boot warmup (DEFAULT_WARMUP_S) mutes real-clock
     # seconds; this 8-tick run spans microseconds, so disable it test-side.
@@ -215,7 +216,8 @@ def test_goto_command_reaches_the_lane_and_emits_admitted_and_done(_isolated, mo
             tick_seam=tick_seam,
         )
     finally:
-        reader.close()
+        if reader is not None:  # None when the opt-in pat stack is off
+            reader.close()
 
     raw_types = [e.get("type") for e in events if isinstance(e, dict)]
     assert "goto.admitted" in raw_types, f"goto never admitted through the lane (types={raw_types})"
@@ -281,6 +283,7 @@ def test_composition_module_does_not_import_speech_llm_or_touch_media_session():
 
 def test_reader_close_invoked_on_engine_stop(_isolated, monkeypatch):
     reader = _ScriptedReader([(0.0, 0.0)])
+    monkeypatch.setenv("REACHY_PAT_SENSE", "1")
     monkeypatch.setattr("reachy.cli._commands.behavior._make_state_reader", lambda: reader)
 
     rc = main(["behavior", "engine", "run", "--max-ticks", "3", "--json"])
@@ -290,6 +293,7 @@ def test_reader_close_invoked_on_engine_stop(_isolated, monkeypatch):
 
 def test_reader_close_invoked_even_when_engine_loop_raises(_isolated, monkeypatch):
     reader = _ScriptedReader([(0.0, 0.0)])
+    monkeypatch.setenv("REACHY_PAT_SENSE", "1")
     monkeypatch.setattr("reachy.cli._commands.behavior._make_state_reader", lambda: reader)
 
     def _boom(*a, **k):
