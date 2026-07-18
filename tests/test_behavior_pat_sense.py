@@ -229,10 +229,15 @@ def test_rebaseline_on_resume_and_persistent_deviation_does_not_fire() -> None:
         assert driver.peek() is None, f"steady deviation fired spuriously at step {i}"
     assert driver.events == 0
 
-    # ...but detection is not permanently broken: a fresh oscillation (release +
-    # re-press) fires normally after the re-baseline.
-    _drive(driver, reader, (0.0, 0.0), T0 + 7 * DT, owner=BASE_OWNER)
-    _drive(driver, reader, (-3.0, 0.0), T0 + 8 * DT, owner=BASE_OWNER)
+    # ...but detection is not permanently broken. Under the deviation high-pass
+    # the persistent hold contributes NO press edge (it is exactly the signal
+    # the wander rejection removes) and the high-pass state has adapted to the
+    # held level — so first let the hand release and the head settle (the
+    # high-pass re-centres within ~2x its 0.3 s tau), then a fresh pat fires.
+    for i in range(6):
+        _drive(driver, reader, (0.0, 0.0), T0 + (7 + i) * DT, owner=BASE_OWNER)
+    assert driver.events == 0
+    _scratch_sequence(driver, reader, T0 + 13 * DT, owner=BASE_OWNER)
     assert driver.peek() == ("scratch", "level1")
     assert driver.events == 1
 
@@ -352,7 +357,8 @@ def _sway(t: float) -> tuple[float, float]:
     return (4.0 * math.sin(2.0 * math.pi * t / 2.5), 0.0)
 
 
-_PLANT_LAG = 0.3  # seconds — actual(t) = commanded(t - _PLANT_LAG)
+_PLANT_LAG = 0.3  # seconds — actual(t) = commanded(t - _PLANT_LAG) * _PLANT_GAIN
+_PLANT_GAIN = 1.2  # the measured overshoot: the plant tracks 1.1-1.2x the command
 _TICK = 0.02  # the engine's 50 Hz period
 
 
@@ -369,7 +375,8 @@ def _run_wander(
     for i in range(ticks):
         t = T0 + i * _TICK
         cp, cy = _sway(t)
-        ap, ay = _sway(t - _PLANT_LAG)
+        lp, ly = _sway(t - _PLANT_LAG)
+        ap, ay = lp * _PLANT_GAIN, ly * _PLANT_GAIN
         if pat_at is not None:
             dt_pat = t - pat_at
             if (0.0 <= dt_pat < 0.3) or (0.6 <= dt_pat < 0.9):
@@ -394,7 +401,9 @@ def test_wander_with_lag_fires_without_the_filter() -> None:
     no longer models the defect and the suite has lost its d1 coverage.
     """
     reader = _Reader()
-    driver = PatSenseDriver(reader=reader, detector=_fixed_detector(), lag_tau=0.0, warmup_s=0.0)
+    driver = PatSenseDriver(
+        reader=reader, detector=_fixed_detector(), lag_tau=0.0, hp_tau=0.0, warmup_s=0.0
+    )
     _run_wander(driver, reader, seconds=30.0)
     assert driver.events > 0
 

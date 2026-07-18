@@ -198,6 +198,16 @@ PatEvent = "tuple[str, str] | None"
 #: disables the filter.
 DEFAULT_LAG_TAU = 0.3
 
+#: Deviation high-pass time constant (seconds) — the wander-rejection filter.
+#: Measured on the robot (1500-tick commanded-vs-actual recording): the plant
+#: tracks with ~0.28 s lag AND ~1.1-1.2x overshoot, so even lag-compensated
+#: deviation keeps a slow residual in the wander band that peaks past the
+#: detector's 1.2 deg thresholds. The bands are spectrally disjoint — feel-alive
+#: wander is 0.02-0.25 Hz, a hand's presses 1-3 Hz — so subtracting the
+#: deviation's own ~0.3 s low-pass removes offset + gain/lag residual almost
+#: entirely (~90% in the gaze band) while a pat passes nearly untouched.
+DEFAULT_HP_TAU = 0.3
+
 #: Nominal tick period (seconds) used for the filter step when ``ctx.now`` is
 #: unavailable — the engine's 50 Hz default.
 _NOMINAL_DT = 0.02
@@ -262,12 +272,21 @@ class PatSenseDriver:
         reader: PoseReader,
         detector: PatDetector | None = None,
         lag_tau: float = DEFAULT_LAG_TAU,
+        hp_tau: float = DEFAULT_HP_TAU,
         warmup_s: float = DEFAULT_WARMUP_S,
     ) -> None:
         self._reader = reader
         self.detector = detector if detector is not None else PatDetector()
         #: Commanded-pose low-pass time constant (s); ``0`` = raw passthrough.
         self._lag_tau = max(0.0, float(lag_tau))
+        #: Deviation high-pass time constant (s); ``0`` = raw deviation through.
+        self._hp_tau = max(0.0, float(hp_tau))
+        #: The high-pass state: low-passed deviation ``(pitch, yaw)``. Starts at
+        #: zero — the boot warmup covers its convergence onto the real offset —
+        #: and goes ``None`` on a resume re-seed (seed at the next sample, so a
+        #: settled post-gesture offset can never read as a step).
+        self._dev_lp: tuple[float, float] | None = (0.0, 0.0)
+        self._hp_last_now: float | None = None
         #: Post-(re)baseline event-mute window (s); ``0`` disables (see d1 fix).
         self._warmup_s = max(0.0, float(warmup_s))
         #: Mute latching until this clock reading (armed at first update + on
@@ -329,6 +348,7 @@ class PatSenseDriver:
             # state is stale from before the gesture.
             self.detector.clear_presses()
             self._filtered = None
+            self._dev_lp = None
             self._suspended = False
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
@@ -343,17 +363,23 @@ class PatSenseDriver:
 
         now = self._now(ctx)
         if self._first_update:
-            # Boot: the EMA baseline starts at zero and has not yet learned the
-            # commanded-vs-actual frame offset — mute latching while it converges.
+            # Boot: the deviation conditioning below needs ~3x its time constants
+            # to converge before events mean anything — mute latching meanwhile.
             self._first_update = False
             self._arm_warmup(now)
         commanded_pitch, commanded_yaw = self._lag_filtered(commanded, now)
         actual_pitch, actual_yaw = actual
+        # Deviation conditioning (see "Lag compensation + wander rejection"):
+        # high-pass the lag-compensated deviation so the wander band (offset,
+        # slow gain/lag residual) vanishes while a pat's fast presses pass.
+        dev_pitch, dev_yaw = self._highpassed(
+            actual_pitch - commanded_pitch, actual_yaw - commanded_yaw, now
+        )
         event = self.detector.update(
-            commanded_pitch,
-            actual_pitch,
-            commanded_yaw,
-            actual_yaw,
+            0.0,
+            dev_pitch,
+            0.0,
+            dev_yaw,
             now=now,
         )
         if event is None:
@@ -368,6 +394,34 @@ class PatSenseDriver:
         level, touch_type = event
         self._latch = (touch_type, level)
         self.events += 1
+
+    def _highpassed(
+        self, dev_pitch: float, dev_yaw: float, now: float | None
+    ) -> tuple[float, float]:
+        """High-pass the per-axis deviation: subtract its own first-order low-pass.
+
+        The slow low-pass tracks everything in the wander band — the frame
+        offset, gravity sag, the plant's gain error and residual lag — so what
+        remains is the fast band a hand's presses live in. ``hp_tau == 0``
+        disables (raw deviation through). Seeds at the first sample (hp = 0)
+        and re-seeds after a resume (the gesture invalidated the state).
+        """
+        if self._hp_tau <= 0.0:
+            return (dev_pitch, dev_yaw)
+        if now is not None and self._hp_last_now is not None:
+            dt = min(max(now - self._hp_last_now, 0.0), 0.2)
+        else:
+            dt = _NOMINAL_DT
+        if now is not None:
+            self._hp_last_now = now
+        if self._dev_lp is None:  # resume re-seed: adopt the settled deviation
+            self._dev_lp = (dev_pitch, dev_yaw)
+            return (0.0, 0.0)
+        k = dt / (self._hp_tau + dt)
+        lp_pitch = self._dev_lp[0] + k * (dev_pitch - self._dev_lp[0])
+        lp_yaw = self._dev_lp[1] + k * (dev_yaw - self._dev_lp[1])
+        self._dev_lp = (lp_pitch, lp_yaw)
+        return (dev_pitch - lp_pitch, dev_yaw - lp_yaw)
 
     def _arm_warmup(self, now: float | None) -> None:
         """Mute event latching for ``warmup_s`` from *now* (no-op when disabled)."""
