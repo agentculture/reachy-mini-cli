@@ -155,15 +155,17 @@ def test_pat_sense_flows_into_the_feed_via_the_composed_stack(_isolated, monkeyp
     scenario deterministically (a pitch-dominated ``scratch``)."""
     script = [(-3.0, 0.0), (0.0, 0.0), (-3.0, 0.0)] + [(0.0, 0.0)] * 8
     reader = _ScriptedReader(script)
-    monkeypatch.setenv("REACHY_PAT_SENSE", "1")  # the stack is opt-in (issue #79)
+    monkeypatch.setenv("REACHY_PAT_SENSE", "1")  # explicit; ON by default since #80
     monkeypatch.setattr("reachy.cli._commands.behavior._make_state_reader", lambda: reader)
-    # The composed driver's boot warmup (DEFAULT_WARMUP_S) mutes real-clock
-    # seconds; this 8-tick run spans microseconds, so disable it test-side.
+    # The composed driver's boot warmup and stillness gate are both real-clock
+    # windows (15 s and 0.5 s); this 8-tick run spans 0.4 s of injected clock, so
+    # neutralise both test-side — each has its own dedicated coverage elsewhere
+    # (tests/test_behavior_pat_sense{,_hardware}.py).
     from reachy.behavior.pat_sense import PatSenseDriver as _RealDriver
 
     monkeypatch.setattr(
         "reachy.cli._commands.behavior.PatSenseDriver",
-        lambda **kw: _RealDriver(**{**kw, "warmup_s": 0.0}),
+        lambda **kw: _RealDriver(**{**kw, "warmup_s": 0.0, "still_hold_s": 0.0}),
     )
 
     rc = main(["behavior", "engine", "run", "--no-base-layer", "--max-ticks", "8", "--export", "-"])
@@ -306,3 +308,44 @@ def test_reader_close_invoked_even_when_engine_loop_raises(_isolated, monkeypatc
     # this test pins the finally-block teardown, not the exit code.
     assert rc != 0
     assert reader.closed, "reader.close() must run even when the engine loop raises"
+
+
+# --------------------------------------------------------------------------- #
+# 6. REACHY_PAT_SENSE parsing — absent vs empty vs falsey vs truthy (Qodo #4)  #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(None, True, id="absent"),
+        pytest.param("", False, id="empty"),
+        pytest.param("   ", False, id="blank-whitespace"),
+        pytest.param("0", False, id="zero"),
+        pytest.param("false", False, id="false"),
+        pytest.param("no", False, id="no"),
+        pytest.param("OFF", False, id="OFF-case-insensitive"),
+        pytest.param("  off  ", False, id="off-with-whitespace"),
+        pytest.param("1", True, id="one"),
+        pytest.param("true", True, id="true"),
+        pytest.param("yes", True, id="yes"),
+        pytest.param("on", True, id="on"),
+        pytest.param("banana", True, id="arbitrary-string"),
+    ],
+)
+def test_pat_sense_enabled_env_parsing(monkeypatch, raw, expected):
+    """``REACHY_PAT_SENSE`` absent -> ON (default since issue #80); an explicit but
+    empty/blank value -> OFF rather than silently falling through to the default
+    (Qodo review finding #4 on PR #83 — the old denylist check let
+    ``REACHY_PAT_SENSE=`` slip past every falsey token and enable the sense); any
+    other explicit falsey token (``0``/``false``/``no``/``off``, case/whitespace
+    insensitive) -> OFF; anything else (``1``/``true``/``yes``/``on``, or any other
+    non-blank string) -> ON."""
+    from reachy.cli._commands.behavior import _pat_sense_enabled
+
+    if raw is None:
+        monkeypatch.delenv("REACHY_PAT_SENSE", raising=False)
+    else:
+        monkeypatch.setenv("REACHY_PAT_SENSE", raw)
+
+    assert _pat_sense_enabled() is expected

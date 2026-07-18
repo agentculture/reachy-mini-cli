@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-07-18
+
+### Changed
+
+- **The pat sense works, and ships enabled** (#80). Hands-on calibration on the
+  real robot settled the physics that kept it dormant in 0.36.0 (#79): the plant
+  is quiet only while it is NOT tracking a moving target. Four recordings
+  (still/wandering x untouched/petted, all six DOF) measured **12-20x**
+  pat-vs-noise separation with the head held still versus **0.7-2.0x** while it
+  wanders — on every axis, including the ones `feel-alive` never commands. The
+  residual is servo hunting, not lag: uncorrelated with commanded velocity, and a
+  fitted 40-tap FIR plant model removes only 1.1x of it.
+- **Stillness gate** (`reachy/behavior/pat_sense.py`): detection runs only after
+  the commanded pose has been constant for 0.5 s, so the ghost class is closed
+  structurally rather than by threshold tuning. A moving robot reports no pats
+  instead of guessing; a still one feels them reliably.
+- Detection thresholds returned to sensitive, data-tuned values (press 0.5 deg,
+  release 0.2 deg) from the blind 2.0/0.8 that shipped dormant.
+- `REACHY_PAT_SENSE` now defaults ON; set it to `0` to opt out.
+
+### Added
+
+- `tests/test_behavior_pat_sense_hardware.py` + `tests/data/pat_*.csv` — the four
+  robot recordings as regression fixtures, pinning both the no-ghost guarantee and
+  the detection guarantee against measured plant behaviour.
+
 ## [0.36.0] - 2026-07-18
 
 ### Added
