@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] - 2026-07-18
+
+### Added
+
+- Proprioceptive pat sense in the runtime process (issue #75): a held, media-free SDK pose reader (reachy/robot/state_reader.py HeldStateReader) plus an ownership-gated PatSenseDriver (reachy/behavior/pat_sense.py) feed Sense.pat_event on every behavior engine run tick, no listen --live needed - the deployed pat-acknowledge rule fires with zero config change
+- reachy/behavior/pose_feed.py LastPoseHolder: a TickContext.pose seam so seam riders (the pat driver, the goto lane's start-pose provider) read the engine's own composed pose instead of guessing from ownership + contributions
+- Live goto path (issue #77): reachy/behavior/goto_intent.py's fail-closed goto command kind registers into the intent driver's KindRegistry; GotoLane composes into behavior engine run's tick bus with live start-pose continuity; new behavior goto CLI verb submits through the same intents spool a live tool-use agent uses
+- Bounded-lifetime invariant enforced on both admission surfaces (issue #76): react rules gain a validated duration_s with fail-closed refusal of a looping-default target (nod/shake/speak/antenna-sway/feel-alive) carrying no bound; run_behavior intents refuse any resulting unbounded lifetime the same way (declare_goal's standing intent stays intentionally exempt)
+- docs/design/runtime-feed-export.md: design note for exporting the runtime feed to the reTerminal panel post-#70 flip (issue #78) - design only, implementation deferred to its own think/challenge pass
+
+### Changed
+
+- docs/operating-reachy.md: single-SDK-owner model notes the held state-read client never touches the media session (state reads only, media session stays free); the rules.toml walkthrough's live-predicates status corrected now that pat is live in the standalone runtime process; new goto verb walkthrough (flags, submit-confirm/degrade contract, example); Status & follow-ups updated
+- CLAUDE.md: enriched behavior noun catalog row + new noun-internals section documenting the pat sense provider chain, the bounded-lifetime invariant on both surfaces, and the goto path
+- docs/export-schema.md: the runtime feed's motion block Producer status is now live for gotos (wire format unchanged)
+
 ## [0.35.0] - 2026-07-18
 
 ### Added

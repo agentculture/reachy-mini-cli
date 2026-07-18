@@ -247,14 +247,19 @@ Example line:
 
 Emitted for the engine's active-set churn.
 
-**Producer status:** partially live. The goto lane
+**Producer status:** live. The goto lane
 (`reachy.behavior.goto_lane.GotoLane`) is built and tested
-(`tests/test_behavior_goto_lane.py`), and its lifecycle emissions
-(`goto.admitted` / `goto.done` / `goto.cancelled`) map into this block as
-`action: "goto"` with `detail.phase` carrying the lifecycle phase — but the
-lane itself is not composed into `behavior engine run`'s tick bus yet: it is
-the adapter surface for MotionQueue-family callers, and wiring a live goto
-submission path into the runtime process is follow-up composition work.
+(`tests/test_behavior_goto_lane.py`) and is composed into `behavior engine
+run`'s tick bus (`reachy/cli/_commands/behavior.py::_compose_run_seam`),
+seeded with a live start-pose provider
+(`reachy.behavior.pose_feed.LastPoseHolder`) so a goto interpolates from the
+robot's current composed pose instead of snapping to neutral. Its lifecycle
+emissions (`goto.admitted` / `goto.done` / `goto.cancelled`) map into this
+block as `action: "goto"` with `detail.phase` carrying the lifecycle phase. A
+goto reaches the lane either through the `behavior goto` CLI verb or through
+any client (e.g. a live tool-use agent) submitting a `goto`-kind command into
+the intents spool — both paths run through the same fail-closed validator
+(`reachy.behavior.goto_intent`).
 
 | Key        | Type                            | Description                          |
 |------------|-----------------------------------|---------------------------------------|
