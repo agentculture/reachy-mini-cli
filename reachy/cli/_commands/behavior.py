@@ -65,7 +65,6 @@ from reachy.cli._export import add_runtime_export_args, build_runtime_export_con
 from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.runtime import SenseSnapshotDriver
-from reachy.motion.pat import PatDetector
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, INTERPOLATIONS
 from reachy.robot.state_reader import HeldStateReader
 
@@ -740,7 +739,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     # The SDK sense stack — always composed; every piece is import-safe without
     # reachy_mini and the reader degrades internally (see the docstring).
     reader = _make_state_reader()
-    pat_driver = PatSenseDriver(reader=reader.read, detector=PatDetector())
+    pat_driver = PatSenseDriver(reader=reader.read)  # tuned default detector (#79)
     holder = LastPoseHolder()
     providers = SenseProviders(pat_event=pat_driver.as_provider())
 

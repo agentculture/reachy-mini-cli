@@ -380,14 +380,26 @@ def _run_wander(
         if pat_at is not None:
             dt_pat = t - pat_at
             if (0.0 <= dt_pat < 0.3) or (0.6 <= dt_pat < 0.9):
-                ap -= 3.0
+                # a FIRM pat: tuned thresholds trade gentle-pat sensitivity for wander immunity
+                ap -= 4.0
         _drive(driver, reader, (ap, ay), t, pitch=cp, yaw=cy)
 
 
+def _tuned_detector() -> PatDetector:
+    """The runtime-tuned thresholds the live composition runs (fixed level2 fn)."""
+    return _fixed_detector(
+        press_threshold=2.0,
+        release_threshold=0.8,
+        yaw_press_threshold=2.0,
+        yaw_release_threshold=0.8,
+    )
+
+
 def test_wandering_commanded_with_plant_lag_never_fires() -> None:
-    """The live d1 scenario: continuous wander + plant lag -> ZERO pat events."""
+    """The live d1 scenario: continuous wander + plant lag + overshoot ->
+    ZERO pat events under the tuned live configuration."""
     reader = _Reader()
-    driver = PatSenseDriver(reader=reader, detector=_fixed_detector(), warmup_s=0.0)
+    driver = PatSenseDriver(reader=reader, detector=_tuned_detector(), warmup_s=0.0)
     _run_wander(driver, reader, seconds=30.0)
     assert driver.events == 0
     assert driver.peek() is None
@@ -411,7 +423,7 @@ def test_wander_with_lag_fires_without_the_filter() -> None:
 def test_real_pat_during_wander_still_fires() -> None:
     """A hand's impulse rides ACTUAL (unfiltered) -> detection survives the fix."""
     reader = _Reader()
-    driver = PatSenseDriver(reader=reader, detector=_fixed_detector(), warmup_s=0.0)
+    driver = PatSenseDriver(reader=reader, detector=_tuned_detector(), warmup_s=0.0)
     # Warm the filter + baseline on pure wander first, then pat mid-wander.
     _run_wander(driver, reader, seconds=10.0, pat_at=T0 + 6.0)
     assert driver.events >= 1

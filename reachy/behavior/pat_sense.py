@@ -198,15 +198,25 @@ PatEvent = "tuple[str, str] | None"
 #: disables the filter.
 DEFAULT_LAG_TAU = 0.3
 
-#: Deviation high-pass time constant (seconds) — the wander-rejection filter.
-#: Measured on the robot (1500-tick commanded-vs-actual recording): the plant
-#: tracks with ~0.28 s lag AND ~1.1-1.2x overshoot, so even lag-compensated
-#: deviation keeps a slow residual in the wander band that peaks past the
-#: detector's 1.2 deg thresholds. The bands are spectrally disjoint — feel-alive
-#: wander is 0.02-0.25 Hz, a hand's presses 1-3 Hz — so subtracting the
-#: deviation's own ~0.3 s low-pass removes offset + gain/lag residual almost
-#: entirely (~90% in the gaze band) while a pat passes nearly untouched.
-DEFAULT_HP_TAU = 0.3
+#: Deviation high-pass time constant (seconds). Removes the offset/sag and the
+#: slow wander residual from the deviation; chosen — together with the tuned
+#: thresholds below — by an offline replay grid over a 2250-tick
+#: commanded-vs-actual recording from the real robot (see issue #79): the
+#: viable band was hp_tau 0.5-0.8 x press 1.8-2.2, and (0.8, 2.0) sits centred
+#: in it (zero ghost fires on the recording, 6/6 synthetic pats detected).
+DEFAULT_HP_TAU = 0.8
+
+#: Runtime-tuned press/release thresholds (degrees) for the driver's DEFAULT
+#: detector. The stock PatDetector thresholds (1.2/0.5) were tuned for listen's
+#: STATIC commanded pose; under the runtime's continuous feel-alive wander the
+#: measured plant (~0.28 s lag, 1.1-1.2x underdamped overshoot) leaves 100-400 ms
+#: conditioned-residual transients up to ~1.8 deg — overshoot RINGING at wander
+#: reversals, spectrally inside the pat band, so amplitude is the remaining
+#: discriminator. Cost, stated plainly: very gentle pats (<~2 deg deflection)
+#: are missed; the hands-on tuning pass (issue #79 follow-up) refines with real
+#: pat data. Injected detectors (tests, listen-era callers) are unaffected.
+DEFAULT_PRESS_THRESHOLD = 2.0
+DEFAULT_RELEASE_THRESHOLD = 0.8
 
 #: Nominal tick period (seconds) used for the filter step when ``ctx.now`` is
 #: unavailable — the engine's 50 Hz default.
@@ -276,7 +286,16 @@ class PatSenseDriver:
         warmup_s: float = DEFAULT_WARMUP_S,
     ) -> None:
         self._reader = reader
-        self.detector = detector if detector is not None else PatDetector()
+        self.detector = (
+            detector
+            if detector is not None
+            else PatDetector(
+                press_threshold=DEFAULT_PRESS_THRESHOLD,
+                release_threshold=DEFAULT_RELEASE_THRESHOLD,
+                yaw_press_threshold=DEFAULT_PRESS_THRESHOLD,
+                yaw_release_threshold=DEFAULT_RELEASE_THRESHOLD,
+            )
+        )
         #: Commanded-pose low-pass time constant (s); ``0`` = raw passthrough.
         self._lag_tau = max(0.0, float(lag_tau))
         #: Deviation high-pass time constant (s); ``0`` = raw deviation through.
