@@ -57,7 +57,14 @@ Standing goal semantics
 ------------------------
 * ``run_behavior`` — a ONE-TIME admission using the given (or the library
   entry's default) lifetime. The driver never re-admits it — it is "sustained
-  per its lifetime" only, exactly like a plain ``behavior run``.
+  per its lifetime" only, exactly like a plain ``behavior run``. The RESULTING
+  lifetime must be BOUNDED: ``looping=True`` with ``duration=None`` — whether
+  from an explicit payload or silently from a looping-default library entry's
+  own defaults (``nod``, ``shake``, ``speak``, ``antenna-sway``, ``feel-alive``)
+  — is refused with a ``CliError`` naming the entry and the fix (pass an
+  explicit ``duration``, or choose a bounded behavior), so a one-time admission
+  can never hold its channel(s) forever with no standing-intent record to undo
+  it. See :func:`_validated_lifetime`.
 * ``declare_goal`` — a STANDING admission: the driver remembers the (name,
   params) pair and, every tick, re-admits it (``looping=True, duration=None`` —
   indefinite) whenever it is missing from ``ctx.active_names()`` and not
@@ -145,6 +152,23 @@ def _validated_params(entry, overrides: dict | None) -> dict[str, float]:
 
 
 def _validated_lifetime(entry, raw: dict | None) -> Lifetime:
+    """Build the ``run_behavior`` lifetime, refusing an UNBOUNDED result.
+
+    ``looping=True`` with ``duration=None`` never expires on its own — the same
+    shape :meth:`IntentDriver._admit_goal` uses ON PURPOSE for a standing
+    ``declare_goal`` (see the module docstring's "Standing goal semantics").
+    But a *one-time* ``run_behavior`` admission has no standing-intent record to
+    replace/clear it later, so that same shape would hold the entry's channel(s)
+    FOREVER with no way for the agent to reason about when it ends — and it can
+    arrive from nothing more than a missing lifetime payload on a looping-default
+    library entry (``nod``, ``shake``, ``speak``, ``antenna-sway``, ``feel-alive``
+    — see :mod:`reachy.behavior.library`). So the unbounded shape is refused
+    REGARDLESS of whether it came from an explicit payload (``{"looping": true}``
+    with no ``duration``) or silently from the entry's own defaults (no lifetime
+    payload at all) — the *resulting* shape is what is checked, not its origin.
+    A bounded result — ``looping=False`` with a positive duration, or
+    ``looping=True`` WITH a positive duration — is admitted exactly as before.
+    """
     raw = raw or {}
     looping = raw.get("looping", entry.looping)
     duration = raw.get("duration", entry.default_duration)
@@ -155,6 +179,17 @@ def _validated_lifetime(entry, raw: dict | None) -> Lifetime:
             code=EXIT_USER_ERROR,
             message=f"{entry.name}: invalid lifetime: {'; '.join(problems)}",
             remediation="duration must be > 0",
+        )
+    if lifetime.looping and lifetime.duration is None:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"{entry.name}: run_behavior refuses an unbounded lifetime "
+                "(looping with no duration would hold its channel forever)"
+            ),
+            remediation=(
+                'pass lifetime {"duration": <seconds>} to bound it, ' "or choose a bounded behavior"
+            ),
         )
     return lifetime
 

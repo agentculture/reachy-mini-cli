@@ -32,6 +32,7 @@ import pytest
 
 from reachy.behavior import control as control_mod
 from reachy.behavior import engine as E
+from reachy.behavior import library as behavior_library
 from reachy.behavior.control import CommandSpool, KindRegistry
 from reachy.behavior.engine import Engine, EngineConfig
 from reachy.behavior.intents import (
@@ -42,6 +43,7 @@ from reachy.behavior.intents import (
     SET_MODE,
     IntentDriver,
 )
+from reachy.behavior.model import Lifetime
 from reachy.behavior.rule_engine import RuleEngine
 from reachy.behavior.rules import Mode, RulesConfig
 from reachy.cli._errors import CliError
@@ -199,19 +201,22 @@ def test_root_override_avoids_the_env_var_path(tmp_path, monkeypatch) -> None:
 
 
 def test_run_behavior_roundtrip_admits_and_confirms(tmp_path) -> None:
-    cmd_id = _submit(tmp_path, RUN_BEHAVIOR, name="nod", params={}, lifetime=None)
+    # gaze-hold is a BOUNDED-default entry (looping=False, duration=5.0), so this
+    # exercises the plain roundtrip mechanism unaffected by the t5 unbounded-
+    # lifetime refusal below (which only bites looping-default entries like nod).
+    cmd_id = _submit(tmp_path, RUN_BEHAVIOR, name="gaze-hold", params={}, lifetime=None)
     driver = IntentDriver(root=tmp_path)
     ctx = _RecordingCtx(now=1.0, tick=1)
 
     driver.on_tick(ctx)
 
-    assert [b.name for b in ctx.admits] == ["nod"]
+    assert [b.name for b in ctx.admits] == ["gaze-hold"]
     result = control_mod.await_result(
         cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
     )
     assert result["ok"] is True
     assert result["op"] == RUN_BEHAVIOR
-    assert result["name"] == "nod"
+    assert result["name"] == "gaze-hold"
 
 
 def test_run_behavior_respects_explicit_lifetime(tmp_path) -> None:
@@ -232,14 +237,15 @@ def test_run_behavior_respects_explicit_lifetime(tmp_path) -> None:
 
 def test_run_behavior_is_not_re_admitted_after_eviction(tmp_path) -> None:
     """run_behavior is a ONE-TIME admission — contrast with declare_goal."""
-    _submit(tmp_path, RUN_BEHAVIOR, name="nod", params={}, lifetime=None)
+    # gaze-hold is a BOUNDED-default entry — see the roundtrip test above.
+    _submit(tmp_path, RUN_BEHAVIOR, name="gaze-hold", params={}, lifetime=None)
     driver = IntentDriver(root=tmp_path)
     ctx = _RecordingCtx(now=0.0)
     ctx.tick = 1
     driver.on_tick(ctx)
     assert len(ctx.admits) == 1
 
-    ctx.evict("nod")  # something else stops it
+    ctx.evict("gaze-hold")  # something else stops it
     for tick in range(2, 6):
         ctx.tick = tick
         ctx.now = float(tick)
@@ -248,11 +254,186 @@ def test_run_behavior_is_not_re_admitted_after_eviction(tmp_path) -> None:
 
 
 def test_state_json_reflects_the_run_behavior_goal_is_none(tmp_path) -> None:
+    # This submission is refused (nod is a looping-default entry with no lifetime
+    # payload — see the t5 section below), but the assertion here is about the
+    # "intents" state VIEW, which `_publish_state` writes independently of any
+    # given tick's command outcomes — so it holds whether or not the command was
+    # admitted.
     _submit(tmp_path, RUN_BEHAVIOR, name="nod", params={}, lifetime=None)
     driver = IntentDriver(root=tmp_path)
     driver.on_tick(_RecordingCtx(now=1.0, tick=1))
     state = control_mod.read_state(root=tmp_path)
     assert state["intents"] == {"goal": None, "inhibitions": [], "mode": None}
+
+
+# --------------------------------------------------------------------------- #
+# run_behavior — bounded-lifetime refusal (t5)                                #
+# --------------------------------------------------------------------------- #
+#
+# Background: a react rule admitting the looping `nod` behavior with library
+# defaults held the head channel FOREVER (a live incident on the rules-engine
+# surface, fixed by a sibling task). This closes the same defect on the
+# intent-spool `run_behavior` surface: `_validated_lifetime` now REFUSES
+# whenever the RESULTING lifetime is unbounded (looping=True, duration=None),
+# regardless of whether that shape came from a missing lifetime payload on a
+# looping-default library entry, or an explicit `{"looping": true}` with no
+# duration.
+
+_LOOPING_DEFAULT_ENTRIES = sorted(
+    name
+    for name, entry in behavior_library.LIBRARY.items()
+    if entry.looping and entry.default_duration is None
+)
+
+
+def test_looping_default_entries_fixture_matches_the_library() -> None:
+    """Pins the exact set of entries this refusal protects (nod/shake/speak/
+    antenna-sway/feel-alive) so a library edit that silently changes this set
+    is caught here rather than by a confusing failure in the tests below."""
+    assert _LOOPING_DEFAULT_ENTRIES == [
+        "antenna-sway",
+        "feel-alive",
+        "nod",
+        "shake",
+        "speak",
+    ]
+
+
+def test_run_behavior_refuses_a_looping_default_entry_with_no_lifetime_payload(
+    tmp_path,
+) -> None:
+    """The core t5 case: `run_behavior` naming `nod` with NO lifetime payload at
+    all would silently inherit nod's own (looping=True, duration=None) library
+    defaults — an unbounded admission that holds the head channel forever. It
+    must be refused, not admitted."""
+    cmd_id = _submit(tmp_path, RUN_BEHAVIOR, name="nod", params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1)
+
+    driver.on_tick(ctx)
+
+    assert ctx.admits == []  # never reaches ctx.admit
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is False
+    assert "nod" in result["error"]
+    assert "duration" in result["error"].lower()  # names the remedy
+
+
+def test_run_behavior_refusal_emits_intent_blocked_not_applied(tmp_path) -> None:
+    _submit(tmp_path, RUN_BEHAVIOR, name="nod", params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1)
+    driver.on_tick(ctx)
+
+    blocked = [e for e in ctx.events if e["type"] == "intent.blocked"]
+    applied = [e for e in ctx.events if e["type"] == "intent.applied"]
+    assert blocked and blocked[0]["kind"] == RUN_BEHAVIOR
+    assert applied == []
+
+
+@pytest.mark.parametrize("name", _LOOPING_DEFAULT_ENTRIES)
+def test_run_behavior_refuses_every_looping_default_entry_with_no_lifetime(tmp_path, name) -> None:
+    """Every looping-default library entry — not just nod — is caught."""
+    cmd_id = _submit(tmp_path, RUN_BEHAVIOR, name=name, params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    driver.on_tick(_RecordingCtx(now=1.0, tick=1))
+
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is False
+    assert name in result["error"]
+
+
+def test_run_behavior_admits_a_looping_default_entry_when_given_a_duration(
+    tmp_path,
+) -> None:
+    """The same `nod` payload, but WITH `lifetime={"duration": 5}`, admits — the
+    resulting Lifetime(looping=True, duration=5.0) reaches ctx.admit."""
+    cmd_id = _submit(tmp_path, RUN_BEHAVIOR, name="nod", params={}, lifetime={"duration": 5})
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1)
+
+    driver.on_tick(ctx)
+
+    assert [b.name for b in ctx.admits] == ["nod"]
+    beh = ctx.admits[0]
+    assert beh.lifetime == Lifetime(looping=True, duration=5.0)
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is True
+    assert result["name"] == "nod"
+
+
+def test_run_behavior_refuses_explicit_looping_true_with_no_duration(tmp_path) -> None:
+    """Even on a BOUNDED-default entry (gaze-hold, default_duration=5.0), an
+    EXPLICIT override that resolves to unbounded (`looping: true`, `duration:
+    null`) is refused — the refusal is about the RESULTING shape, not the
+    entry's own defaults. (An explicit `duration: null` is distinct from
+    OMITTING `duration` — the latter would fall back to gaze-hold's own bounded
+    default and admit cleanly; see the byte-identical test below.)"""
+    cmd_id = _submit(
+        tmp_path,
+        RUN_BEHAVIOR,
+        name="gaze-hold",
+        params={},
+        lifetime={"looping": True, "duration": None},
+    )
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1)
+
+    driver.on_tick(ctx)
+
+    assert ctx.admits == []
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is False
+    assert "gaze-hold" in result["error"]
+
+
+def test_run_behavior_still_admits_bounded_looping_true_with_duration(tmp_path) -> None:
+    """looping=True WITH a positive duration is bounded and admitted, exactly as
+    before — the refusal only fires when duration is None."""
+    cmd_id = _submit(
+        tmp_path,
+        RUN_BEHAVIOR,
+        name="shake",
+        params={},
+        lifetime={"looping": True, "duration": 3.0},
+    )
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1)
+
+    driver.on_tick(ctx)
+
+    assert [b.name for b in ctx.admits] == ["shake"]
+    assert ctx.admits[0].lifetime == Lifetime(looping=True, duration=3.0)
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is True
+
+
+def test_run_behavior_bounded_entries_stay_byte_identical_with_no_lifetime_payload(
+    tmp_path,
+) -> None:
+    """Bounded-default entries (gaze-hold, thoughtful) admit on a bare payload
+    exactly as before this change — the refusal never touches them."""
+    for name in ("gaze-hold", "thoughtful"):
+        cmd_id = _submit(tmp_path, RUN_BEHAVIOR, name=name, params={}, lifetime=None)
+        driver = IntentDriver(root=tmp_path)
+        ctx = _RecordingCtx(now=1.0, tick=1)
+        driver.on_tick(ctx)
+
+        assert [b.name for b in ctx.admits] == [name]
+        result = control_mod.await_result(
+            cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+        )
+        assert result["ok"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -531,7 +712,8 @@ def test_set_mode_without_a_wired_setter_still_records_the_mode(tmp_path) -> Non
 
 
 def test_applied_command_emits_intent_applied_event(tmp_path) -> None:
-    _submit(tmp_path, RUN_BEHAVIOR, name="nod", params={}, lifetime=None)
+    # gaze-hold is a BOUNDED-default entry — see the roundtrip test above.
+    _submit(tmp_path, RUN_BEHAVIOR, name="gaze-hold", params={}, lifetime=None)
     driver = IntentDriver(root=tmp_path)
     ctx = _RecordingCtx(now=1.0, tick=1)
     driver.on_tick(ctx)
@@ -561,11 +743,12 @@ def test_sense_log_lines_emitted_for_apply_and_drop(caplog) -> None:
 
 def test_driver_is_directly_usable_as_a_bare_tick_seam(tmp_path) -> None:
     """IntentDriver.__call__ makes it usable as engine.run(tick_seam=driver)."""
-    _submit(tmp_path, RUN_BEHAVIOR, name="nod", params={}, lifetime=None)
+    # gaze-hold is a BOUNDED-default entry — see the roundtrip test above.
+    _submit(tmp_path, RUN_BEHAVIOR, name="gaze-hold", params={}, lifetime=None)
     driver = IntentDriver(root=tmp_path)
     ctx = _RecordingCtx(now=1.0, tick=1)
     driver(ctx)  # not .on_tick(ctx)
-    assert [b.name for b in ctx.admits] == ["nod"]
+    assert [b.name for b in ctx.admits] == ["gaze-hold"]
 
 
 # --------------------------------------------------------------------------- #
