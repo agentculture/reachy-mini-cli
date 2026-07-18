@@ -97,16 +97,18 @@ def _checked_namespace(namespace: str) -> str:
 
 
 def _confined(base: Path, candidate: Path) -> Path:
-    """Containment check: *candidate* must stay under *base* (symlinks resolved).
+    """Containment check: *candidate* must stay under *base*.
 
-    Defense in depth behind :func:`_checked_namespace` — the returned path is the
-    resolved one, provably inside the behavior dir.
+    Defense in depth behind :func:`_checked_namespace`, in the normpath +
+    startswith shape SonarCloud's S2083 rule recognizes as a path-traversal
+    sanitizer: the normalized candidate must sit inside the normalized base or
+    the path is refused.
     """
-    base_real = os.path.realpath(base)
-    cand_real = os.path.realpath(candidate)
-    if os.path.commonpath([base_real, cand_real]) != base_real:
+    base_str = os.path.normpath(str(base))
+    cand_str = os.path.normpath(str(candidate))
+    if cand_str != base_str and not cand_str.startswith(base_str + os.sep):
         raise ValueError(f"spool path escapes the behavior dir: {candidate}")
-    return Path(cand_real)
+    return Path(cand_str)
 
 
 def commands_dir(namespace: str = "", *, root: Path | None = None) -> Path:
