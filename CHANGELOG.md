@@ -23,6 +23,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Pat interaction state no longer goes stale across a sensing gap** (#70). Opening a gap (ownership change, observation-clock jump, blocked stillness gate, or an unavailable reader) clears the interaction exactly once, and cooldown is now *preserved* across that gap instead of being silently forgotten — so a pat that has run its course cannot immediately re-trigger.
 - **Release is anchored to the last press**, not to whichever later quiet sample happened to be observed first, so the release budget measures real quiet rather than observation luck.
+- **Probe mutual exclusion no longer has a rounding-sized hole.** `Engine.state()` writes `round(now, 3)`, which can round *up*, so a live engine's heartbeat could read back marginally ahead of the probe's own `monotonic()`; the old `0.0 <= age` test then reported "not fresh" and admitted a second command owner. A near-future heartbeat now fails **closed**, bounded by `_PROBE_HEARTBEAT_SKEW_S` so a `state.json` left over from before a monotonic-clock reset (a reboot) still reads as stale instead of locking probes out forever.
+- **Feel-alive per-tick cost no longer grows with uptime.** `_FeelAlive._cycle_at()` scanned its cadence schedule from index 0 every tick, so cost climbed continuously on a loop that ticks at 50 Hz for days. Cycle ends are contiguous and strictly increasing, so the scan is now an exact `bisect_right` — identical results, O(log n).
+- **A behavior breaking its return contract can no longer kill the tick.** The completion pre-pass in `Engine.compose_tick()` now reads `done` with the same tolerance `arbitrate()` already applies, so a malformed contribution is an abstention rather than an `AttributeError` inside a boot-persistent presence loop.
+- **Every probe-output open failure is a structured error.** Only `FileExistsError` was converted before, so a missing parent directory or an unwritable path escaped the `CliError` contract; other `OSError`s now report the concrete errno type with a remediation.
 
 ## [0.37.0] - 2026-07-18
 
