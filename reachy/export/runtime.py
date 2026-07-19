@@ -17,7 +17,9 @@ with :data:`reachy.export.blocks.BLOCKS` (see
 Four block types, each ``{t, ts, tick, ...payload}``:
 
 - ``"sense"`` — a perception snapshot, published when it changes (see
-  :class:`SenseSnapshotDriver`).
+  :class:`SenseSnapshotDriver`). Its legacy ``pat`` value remains
+  ``[touch_type, level]``; event-stable interaction details travel in the
+  additive parallel ``pat_state`` object.
 - ``"rule"`` — a rule fire/suppress decision, a passthrough of the ``rule.fire`` /
   ``rule.suppress`` events :mod:`reachy.behavior.rule_engine` already publishes
   through ``ctx.emit`` (its module docstring is the source-of-truth for that raw
@@ -68,6 +70,7 @@ Public API
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import ClassVar, Union
 
@@ -90,6 +93,13 @@ _RAW_MOTION_ACTIONS = frozenset({"admit", "evict", "goto"})
 #: ``goto.cancelled``) — surfaced as ``motion`` blocks with ``action="goto"``.
 _RAW_GOTO_PHASES = frozenset({"admitted", "done", "cancelled"})
 
+_PAT_AVAILABILITIES = frozenset({"available", "blocked", "unavailable"})
+_PAT_TOUCH_TYPES = frozenset({"scratch", "side_pat"})
+_PAT_LEVELS = frozenset({"level1", "level2"})
+_PAT_PHASES = frozenset(
+    {"idle", "receptive", "contentment", "warning", "released", "enough", "cooldown"}
+)
+
 # ---------------------------------------------------------------------------
 # Event types
 # ---------------------------------------------------------------------------
@@ -100,8 +110,11 @@ class SenseEvent:
     """A perception snapshot published when it differs from the last one.
 
     Mirrors :class:`reachy.behavior.sense.Sense`'s fields (``doa``/``speech``/
-    ``rms``/``pat``/``face``/``frame_available``); ``pat`` is serialized as a
-    2-element list (``[kind, level]``) or ``null``, since JSON has no tuple.
+    ``rms``/``pat``/``pat_state``/``face``/``frame_available``); ``pat`` stays
+    the legacy 2-element list (``[kind, level]``) or ``null``. ``pat_state`` is
+    an additive parallel object and is omitted when parsing an older raw shape
+    that did not carry it. Unknown object keys are ignored for forward
+    compatibility.
     """
 
     t: ClassVar[str] = "sense"
@@ -114,6 +127,7 @@ class SenseEvent:
     frame_available: bool
     ts: float = 0.0
     tick: int = 0
+    pat_state: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -209,6 +223,9 @@ def runtime_to_jsonl(event: RuntimeEvent) -> str:
             "face": event.face,
             "frame_available": event.frame_available,
         }
+        pat_state = _pat_state_payload(event.pat_state)
+        if pat_state is not None:
+            payload["pat_state"] = pat_state
     elif isinstance(event, RuleEvent):
         payload = {
             "t": event.t,
@@ -299,6 +316,69 @@ def _rule_event(event: dict, *, action: str) -> RuleEvent:
     )
 
 
+def _optional_finite_float(value: object) -> float | None:
+    """Return a finite float or ``None`` for malformed wire values."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _pat_state_payload(value: object) -> dict | None:
+    """Normalize a PatState-like value to its stable additive wire object.
+
+    The export layer remains independent of :mod:`reachy.behavior`: production
+    values are duck-typed, while raw runtime events use dictionaries. Unknown
+    keys are ignored and malformed individual fields fall back conservatively,
+    so a future or damaged pat-state value cannot poison the legacy sense event.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        raw_read = value.get
+    elif hasattr(value, "availability"):
+
+        def raw_read(name, default=None):
+            return getattr(value, name, default)
+
+    else:
+        return None
+
+    def read(name, default=None):
+        try:
+            return raw_read(name, default)
+        except Exception:  # noqa: BLE001 - one bad field must not drop legacy sense
+            return default
+
+    availability = read("availability", "unavailable")
+    if not isinstance(availability, str) or availability not in _PAT_AVAILABILITIES:
+        availability = "unavailable"
+    touch_type = read("touch_type")
+    if not isinstance(touch_type, str) or touch_type not in _PAT_TOUCH_TYPES:
+        touch_type = None
+    level = read("level")
+    if not isinstance(level, str) or level not in _PAT_LEVELS:
+        level = None
+    phase = read("phase", "idle")
+    if not isinstance(phase, str) or phase not in _PAT_PHASES:
+        phase = "idle"
+    contact = read("contact", False)
+
+    return {
+        "availability": availability,
+        "contact": contact if isinstance(contact, bool) else False,
+        "touch_type": touch_type,
+        "level": level,
+        "yaw_deg": _optional_finite_float(read("yaw_deg")),
+        "phase": phase,
+        "phase_started_at": _optional_finite_float(read("phase_started_at")),
+        "last_press_at": _optional_finite_float(read("last_press_at")),
+    }
+
+
 def _sense_event(event: dict) -> SenseEvent:
     pat = event.get("pat")
     return SenseEvent(
@@ -310,6 +390,7 @@ def _sense_event(event: dict) -> SenseEvent:
         frame_available=bool(event.get("frame_available", False)),
         ts=_safe_float(event.get("ts")),
         tick=_safe_int(event.get("tick")),
+        pat_state=_pat_state_payload(event.get("pat_state")),
     )
 
 
@@ -475,6 +556,7 @@ class SenseSnapshotDriver:
         self._started = True
         self._last = sense
         pat = getattr(sense, "pat_event", None)
+        pat_state = _pat_state_payload(getattr(sense, "pat_state", None))
         ctx.emit(
             {
                 "type": _RAW_TYPE_SENSE,
@@ -482,6 +564,7 @@ class SenseSnapshotDriver:
                 "speech": bool(getattr(sense, "speech_detected", False)),
                 "rms": getattr(sense, "rms", None),
                 "pat": list(pat) if pat is not None else None,
+                "pat_state": pat_state,
                 "face": getattr(sense, "face", None),
                 "frame_available": bool(getattr(sense, "frame_available", False)),
                 "ts": ctx.now,
