@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.0] - 2026-07-20
+
+### Added
+
+- **Live tuning surface for the pat sense** — `REACHY_PAT_HP_TAU` (the frequency
+  discriminator: the robot's own motion is slow, a hand's presses are fast and
+  jagged), `REACHY_PAT_PRESS_DEG` / `REACHY_PAT_YAW_PRESS_DEG`, and
+  `REACHY_PAT_RELEASE_AFTER_S`, alongside t2's `REACHY_PAT_STILL_HOLD_S` /
+  `REACHY_PAT_STILL_EPS`. Every override is additive: absent env leaves the
+  shipped defaults byte-identical, and none of them occupies a keyword a caller
+  may inject itself.
+- **Converged spec and plan for the no-freeze work** (`docs/specs/` +
+  `docs/plans/`), with two recorded deviations (`d1`, `d2`) capturing where
+  hardware contradicted the plan.
+
+### Changed
+
+- **The robot no longer freezes to be pettable** (#82). `feel-alive`'s
+  dead-still four-second hold is gone; idle motion is continuous again, at the
+  shipped amplitude and speed. The hold existed only so the pat sense's
+  stillness gate could open inside it, and on hardware it read as the robot
+  stopping.
+- **Idle motion swings** (`reachy/behavior/feel_alive.py` `swing_time`). One
+  global time-warp makes the whole pose sweep fast through the middle of its arc
+  and decelerate, pause and accelerate out of each extreme, like a swing.
+  Because the warp is applied to the clock every axis shares, amplitudes,
+  periods and total travel are all unchanged -- 330 deg per 40 s either way --
+  while the longest sustained-slow window goes from 0.12 s to 3.42 s, present
+  about 18% of the time. That window is what makes contact sensing possible
+  without stopping.
+- **Pat sensing is gated on sustained slowness rather than exact stillness.** No
+  new gate was needed: `still_eps` was always a per-tick velocity threshold,
+  tuned at 0.01 deg/tick for a dead freeze. Retuned to the swing's slow window
+  it opens 10-15% of the time. Measured there, an untouched head's conditioned
+  residual is 0.70 deg against a petted 2.52 deg -- a 3.6x separation a
+  uniformly moving head never offers.
+
+### Fixed
+
+- **The excited-motion probe can arm again.** It waited for the command vector
+  to hold exactly constant across `SETTLED_EDGE_S`, which continuous idle motion
+  never provides -- so it never armed and read the actual pose zero times. It
+  now falls back to arming on elapsed time after `ARM_FALLBACK_S` and closes a
+  fixed `CONTINUOUS_CAPTURE_S` window cleanly instead of running to a refusal. A
+  genuine settled edge still takes precedence when one exists.
+- **Phantom pat reactions during continuous motion.** Sensing with the gate
+  simply disabled reopened the #66 self-triggering loop -- a reaction's own
+  motion read as a pat about two seconds later and fired another, indefinitely
+  (measured 15-30 fires per 45-50 s hands-off, and raising press thresholds made
+  it worse). Gating on the swing's slow window instead gives zero detections in
+  75 s hands-off, while a real scratch is detected and classified correctly, and
+  reactions stop when the hand leaves.
+
 ## [0.39.0] - 2026-07-19
 
 ### Added

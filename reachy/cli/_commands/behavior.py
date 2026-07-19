@@ -63,7 +63,15 @@ from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
 from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
 from reachy.behavior.model import CHANNELS, StopClass
-from reachy.behavior.pat_sense import DEFAULT_STILL_EPS, DEFAULT_STILL_HOLD_S, PatSenseDriver
+from reachy.behavior.pat_sense import (
+    DEFAULT_HP_TAU,
+    DEFAULT_PRESS_THRESHOLD,
+    DEFAULT_RELEASE_THRESHOLD,
+    DEFAULT_STILL_EPS,
+    DEFAULT_STILL_HOLD_S,
+    RELEASE_AFTER_S,
+    PatSenseDriver,
+)
 from reachy.behavior.pose_feed import LastPoseHolder
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
@@ -77,6 +85,7 @@ from reachy.cli._export import add_runtime_export_args, build_runtime_export_con
 from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.runtime import SenseSnapshotDriver
+from reachy.motion.pat import PatDetector
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, INTERPOLATIONS
 from reachy.robot.state_reader import HeldStateReader
 
@@ -727,6 +736,29 @@ def _pat_sense_enabled() -> bool:
 #: composes a byte-identical driver.
 _STILL_HOLD_S_ENV = "REACHY_PAT_STILL_HOLD_S"
 _STILL_EPS_ENV = "REACHY_PAT_STILL_EPS"
+#: Press-threshold overrides, in degrees of conditioned deviation. Sensing
+#: through CONTINUOUS idle motion needs a far firmer press than sensing on a
+#: still head: `pat_sense`'s 0.5 deg default was measured against a quiet plant
+#: and fires phantom pats once the head never holds still (15 detections /
+#: 11 reaction fires in 45 s hands-off, measured on the robot). `listen`'s
+#: `PatHook` already runs 2.5 deg / 6.0 deg for exactly this reason.
+_PRESS_THRESHOLD_ENV = "REACHY_PAT_PRESS_DEG"
+_YAW_PRESS_THRESHOLD_ENV = "REACHY_PAT_YAW_PRESS_DEG"
+#: Deviation high-pass time constant (s). This is the FREQUENCY discriminator,
+#: and under continuous idle motion it matters more than amplitude: the robot's
+#: own wander is slow (components at 0.13-0.37 Hz) while a hand's presses are
+#: fast and jagged, so a tighter high-pass rejects the plant and keeps the pat.
+#: Measured over the shipped wander fixtures, tightening 0.8 -> 0.08 cuts ghosts
+#: 6 -> 1 while keeping all 8 petted detections; amplitude thresholds alone
+#: could not separate them at any value.
+_HP_TAU_ENV = "REACHY_PAT_HP_TAU"
+#: Seconds of quiet before an interaction is declared released. Must OUTLAST the
+#: window the reaction blinds itself for, or contact dies before it can be
+#: re-acquired and the ladder can never climb (the t12 sustain failure: max
+#: contact 0.82 s against a 4.0 s contentment threshold). That blind window is
+#: the reaction's entry slew plus the gate's re-arm, so a slow-window gate at
+#: `still_hold_s=1.0` needs a release budget well above 1.0 s.
+_RELEASE_AFTER_ENV = "REACHY_PAT_RELEASE_AFTER_S"
 
 
 def _pat_float_env(name: str, default: float) -> float:
@@ -763,6 +795,30 @@ def _pat_still_tuning() -> tuple[float, float]:
     return (
         _pat_float_env(_STILL_HOLD_S_ENV, DEFAULT_STILL_HOLD_S),
         _pat_float_env(_STILL_EPS_ENV, DEFAULT_STILL_EPS),
+    )
+
+
+def _pat_detector() -> PatDetector | None:
+    """Build the pat detector, honouring the press-sensitivity overrides.
+
+    Returns ``None`` when neither override is set, so ``PatSenseDriver`` keeps
+    minting its own tuned default detector (#79) exactly as before — the
+    override path must not change the shipped default by existing.
+
+    Release thresholds track the press thresholds proportionally, preserving the
+    shipped 0.4 press-to-release ratio (0.5/0.2) so raising sensitivity does not
+    accidentally leave a press latched.
+    """
+    press = _pat_float_env(_PRESS_THRESHOLD_ENV, DEFAULT_PRESS_THRESHOLD)
+    yaw_press = _pat_float_env(_YAW_PRESS_THRESHOLD_ENV, DEFAULT_PRESS_THRESHOLD)
+    if press == DEFAULT_PRESS_THRESHOLD and yaw_press == DEFAULT_PRESS_THRESHOLD:
+        return None
+    ratio = DEFAULT_RELEASE_THRESHOLD / DEFAULT_PRESS_THRESHOLD
+    return PatDetector(
+        press_threshold=press,
+        release_threshold=press * ratio,
+        yaw_press_threshold=yaw_press,
+        yaw_release_threshold=yaw_press * ratio,
     )
 
 
@@ -887,11 +943,25 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     if _pat_sense_enabled():
         reader = _make_state_reader()
         still_hold_s, still_eps = _pat_still_tuning()
-        pat_driver = PatSenseDriver(
-            reader=reader.read,  # tuned default detector (#79)
-            still_hold_s=still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
-            still_eps=still_eps,  # REACHY_PAT_STILL_EPS override (t2)
-        )
+        pat_kwargs: dict = {
+            "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
+            "still_eps": still_eps,  # REACHY_PAT_STILL_EPS override (t2)
+        }
+        # `detector` and `hp_tau` are passed ONLY when actually overridden.
+        # Occupying a keyword with its own default looks like a no-op but is
+        # not: a caller injecting its own detector or high-pass (every
+        # pet-runtime integration test does) would collide on it. Env overrides
+        # must be additive — absent env leaves the driver's own defaults alone.
+        override = _pat_detector()
+        if override is not None:
+            pat_kwargs["detector"] = override  # REACHY_PAT_*_PRESS_DEG overrides
+        hp_tau = _pat_float_env(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
+        if hp_tau != DEFAULT_HP_TAU:
+            pat_kwargs["hp_tau"] = hp_tau
+        release_after = _pat_float_env(_RELEASE_AFTER_ENV, RELEASE_AFTER_S)
+        if release_after != RELEASE_AFTER_S:
+            pat_kwargs["release_after_s"] = release_after
+        pat_driver = PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
     holder = LastPoseHolder()
     providers = SenseProviders(
         pat_event=pat_driver.as_provider() if pat_driver is not None else None,

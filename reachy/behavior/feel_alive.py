@@ -29,9 +29,9 @@ from reachy.behavior.sense import Sense
 
 Jitter = Callable[[float, float], float]
 
-# One cadence is MOVE (including its one-second ease into stillness), then HOLD.
-# The 0.5-second commanded-still gate leaves 3.5 seconds of the exact hold open
-# for contact sensing even at the shortest/longest jittered cadence.
+# Legacy cadence constants from the removed pettable-window hold. Kept so the
+# public module surface does not change under callers/tests that import them;
+# nothing in the live path reads them now that idle motion is continuous.
 MOVE_MIN_S = 8.0
 MOVE_MAX_S = 12.0
 SETTLE_S = 1.0
@@ -41,6 +41,39 @@ MAX_TIME_TO_WINDOW_S = MOVE_MAX_S
 
 _INTRO_S = 1.0
 _HEAD_AXES = ("x", "y", "z", "roll", "pitch", "yaw")
+
+# --------------------------------------------------------------------------- #
+# The swing: one rhythm the WHOLE pose slows, stops and speeds up on.          #
+# --------------------------------------------------------------------------- #
+#
+# Idle motion is a sum of unsynchronised sinusoids, so each axis reaches its own
+# extreme at its own moment and the composite never dwells: measured over the
+# shipped profile, the longest window below 10% of peak speed is 0.12 s, and 0%
+# of the time falls inside a >=1 s slow spell.
+#
+# That matters because the plant's noise is servo *ringing*, not lag — it is
+# uncorrelated with instantaneous velocity (#80), so a brief slow moment is
+# still noisy. What quiets it is SUSTAINED slowness: measured on the shipped
+# wander fixtures, the untouched conditioned residual falls from 1.19 deg to
+# 0.70 deg once the head has been slow for a full second, while a petted head
+# stays at ~2.5 deg — a 3.6x separation that a moving head otherwise never
+# offers.
+#
+# So instead of slowing the robot down (tried: reads as silent, or "midway to
+# sleep") or freezing it (tried: reads as stopping), warp TIME. The pose sweeps
+# fast through the middle of its arc and decelerates, pauses, and accelerates
+# out of each extreme — like a swing. Every axis does this together because the
+# warp is applied to the clock they all share, so amplitudes, periods and total
+# travel are all completely unchanged: 330 deg per 40 s either way.
+#
+#: Period of one full slow-down/stop/speed-up rhythm (seconds).
+WARP_PERIOD_S = 10.0
+#: How pronounced the dwell is. ``0.0`` reproduces today's uniform time exactly.
+#: Clamped below ``1.0`` because ``d(warp)/dt = 1 - depth*cos(...)`` must stay
+#: strictly positive — at ``1.0`` the clock momentarily stalls and beyond it
+#: time would run BACKWARDS, reversing the motion.
+WARP_DEPTH = 0.95
+_MAX_WARP_DEPTH = 0.999
 
 
 @dataclass(frozen=True)
@@ -104,6 +137,29 @@ def _raw_motion(t: float, p: dict) -> Contribution:
     return Contribution(head=head, antennas=(sway, -sway), body_yaw=body_yaw)
 
 
+def swing_time(t: float, period: float = WARP_PERIOD_S, depth: float = WARP_DEPTH) -> float:
+    """Warp the shared clock so the whole pose swings instead of drifting.
+
+    Returns a strictly increasing warped time. Feeding it to :func:`_raw_motion`
+    leaves every amplitude and period untouched — only the RATE at which the
+    trajectory is traversed changes, sweeping fast through the middle of the arc
+    and lingering at each extreme.
+
+    ``d(warp)/dt = 1 - depth * cos(2*pi*t/period)`` is strictly positive for
+    ``depth < 1``, so time never stalls or reverses and no axis snaps back.
+    A non-finite or non-positive period disables the warp rather than raising —
+    idle motion must degrade to today's behavior, never to an exception.
+    """
+    if not math.isfinite(t):
+        return t
+    if not math.isfinite(period) or period <= 0.0:
+        return t
+    d = max(0.0, min(_MAX_WARP_DEPTH, float(depth)))
+    if d == 0.0:
+        return t
+    return t - (d * period / (2.0 * math.pi)) * math.sin(2.0 * math.pi * t / period)
+
+
 def _zero() -> Contribution:
     return Contribution(head=neutral_head(), antennas=(0.0, 0.0), body_yaw=0.0)
 
@@ -158,30 +214,28 @@ class _FeelAlive:
         return _raw_motion(cycle.hold_start, params)
 
     def __call__(self, t_local: float, params: dict, _sense: Sense) -> Contribution:
-        t = max(0.0, float(t_local))
-        index, cycle = self._cycle_at(t)
-        elapsed = t - cycle.start
-        hold = self._hold_pose(cycle, params)
+        """Continuous idle motion — the robot never stops to become pettable.
 
-        if elapsed >= cycle.move_s:
-            # Recomputing this pure endpoint yields bit-for-bit equal scalar
-            # values for every tick of the entire four-second hold.
-            return hold
+        The dead-still ``HOLD_S`` window (and the ease into and out of it) is
+        gone: this is the pre-#82 continuous ``_feel_alive`` behavior restored.
+        Amplitude and speed are unchanged, so the presence reads exactly as it
+        did before the pettable-window cadence was introduced.
 
-        settle_start = cycle.move_s - SETTLE_S
-        if elapsed >= settle_start:
-            moving_edge = _raw_motion(cycle.start + settle_start, params)
-            progress = _minjerk((elapsed - settle_start) / SETTLE_S)
-            return _lerp(moving_edge, hold, progress)
+        Motion runs on the swing clock (:func:`swing_time`), so the complete
+        pose decelerates, pauses and accelerates out of each extreme together.
+        Amplitudes, periods and total travel are unchanged — only the rate of
+        traversal varies — which is what creates a recurring multi-second window
+        where the plant is quiet enough to feel a hand, without the robot ever
+        stopping.
 
-        if elapsed < _INTRO_S:
-            previous_hold = (
-                _zero() if index == 0 else self._hold_pose(self._cycles[index - 1], params)
-            )
-            moving_edge = _raw_motion(cycle.start + _INTRO_S, params)
-            return _lerp(previous_hold, moving_edge, _minjerk(elapsed / _INTRO_S))
-
-        return _raw_motion(t, params)
+        Consequence, stated plainly: ``PatSenseDriver``'s stillness gate opens
+        only after the commanded pose has been EXACTLY constant for
+        ``still_hold_s``, which continuous motion never satisfies. The swing
+        window is *slow*, not *still*, so pettability needs a sense gated on
+        sustained low speed rather than exact constancy — follow-up work this
+        change does not silently claim to have done.
+        """
+        return _raw_motion(swing_time(max(0.0, float(t_local))), params)
 
 
 def make_feel_alive(
