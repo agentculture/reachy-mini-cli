@@ -155,7 +155,7 @@ def swing_time(t: float, period: float = WARP_PERIOD_S, depth: float = WARP_DEPT
     if not math.isfinite(period) or period <= 0.0:
         return t
     d = max(0.0, min(_MAX_WARP_DEPTH, float(depth)))
-    if d == 0.0:
+    if d <= 0.0:  # clamped at 0, so this is "disabled" without a float equality
         return t
     return t - (d * period / (2.0 * math.pi)) * math.sin(2.0 * math.pi * t / period)
 

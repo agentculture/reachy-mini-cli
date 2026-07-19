@@ -783,6 +783,19 @@ def _pat_float_env(name: str, default: float) -> float:
         ) from exc
 
 
+def _pat_float_override(name: str, default: float) -> float | None:
+    """Return the override for *name*, or ``None`` when it is not set.
+
+    Presence of the env var — not inequality against the default — decides
+    whether an override exists. That avoids comparing floats for equality, and
+    is the more honest question anyway: setting a variable to the shipped
+    default is still an explicit choice by the operator.
+    """
+    if os.environ.get(name) is None:
+        return None
+    return _pat_float_env(name, default)
+
+
 def _pat_still_tuning() -> tuple[float, float]:
     """Resolve this run's ``(still_hold_s, still_eps)`` for :class:`PatSenseDriver`.
 
@@ -809,10 +822,12 @@ def _pat_detector() -> PatDetector | None:
     shipped 0.4 press-to-release ratio (0.5/0.2) so raising sensitivity does not
     accidentally leave a press latched.
     """
-    press = _pat_float_env(_PRESS_THRESHOLD_ENV, DEFAULT_PRESS_THRESHOLD)
-    yaw_press = _pat_float_env(_YAW_PRESS_THRESHOLD_ENV, DEFAULT_PRESS_THRESHOLD)
-    if press == DEFAULT_PRESS_THRESHOLD and yaw_press == DEFAULT_PRESS_THRESHOLD:
+    press_override = _pat_float_override(_PRESS_THRESHOLD_ENV, DEFAULT_PRESS_THRESHOLD)
+    yaw_override = _pat_float_override(_YAW_PRESS_THRESHOLD_ENV, DEFAULT_PRESS_THRESHOLD)
+    if press_override is None and yaw_override is None:
         return None
+    press = DEFAULT_PRESS_THRESHOLD if press_override is None else press_override
+    yaw_press = DEFAULT_PRESS_THRESHOLD if yaw_override is None else yaw_override
     ratio = DEFAULT_RELEASE_THRESHOLD / DEFAULT_PRESS_THRESHOLD
     return PatDetector(
         press_threshold=press,
@@ -955,11 +970,11 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         override = _pat_detector()
         if override is not None:
             pat_kwargs["detector"] = override  # REACHY_PAT_*_PRESS_DEG overrides
-        hp_tau = _pat_float_env(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
-        if hp_tau != DEFAULT_HP_TAU:
+        hp_tau = _pat_float_override(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
+        if hp_tau is not None:
             pat_kwargs["hp_tau"] = hp_tau
-        release_after = _pat_float_env(_RELEASE_AFTER_ENV, RELEASE_AFTER_S)
-        if release_after != RELEASE_AFTER_S:
+        release_after = _pat_float_override(_RELEASE_AFTER_ENV, RELEASE_AFTER_S)
+        if release_after is not None:
             pat_kwargs["release_after_s"] = release_after
         pat_driver = PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
     holder = LastPoseHolder()
