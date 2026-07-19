@@ -129,7 +129,7 @@ complete-command gaps alike.
 ``lag_tau=0`` disables the filter (raw passthrough).
 
 --------------------------------------------------------------------------
-Gap-edge re-baselining
+Gap lifecycle
 --------------------------------------------------------------------------
 Command motion, ownership changes, malformed pose data, and missing actual-pose
 readings are detection gaps. A logical observation interval over 0.2 seconds is
@@ -138,7 +138,11 @@ integration responsibility. The first blocked/unavailable edge ends the
 ordinary interaction immediately, preserving detector calibration and event
 cooldown; repeated unsafe ticks do not churn that reset. Recovery only reseeds
 the lag/high-pass state. ``PatState`` keeps ``blocked`` distinct from
-``unavailable`` and publishes idle/no-contact throughout either gap.
+``unavailable`` and publishes idle/no-contact throughout either gap. If the
+interaction had reached ``enough`` or was already cooling down, its hidden
+five-second cooldown debt is preserved: unsafe wall time consumes none of it,
+and the full or remaining budget resumes on the first safe observation before
+ordinary detector updates are admitted again.
 
 --------------------------------------------------------------------------
 Degradation
@@ -378,7 +382,10 @@ class PatSenseDriver:
         self._enough_after_s = ENOUGH_MAX_S
         self._release_after_s = max(0.0, float(release_after_s))
         self._cooldown_s = max(0.0, float(cooldown_s))
-        self._cooldown_until: float | None = None
+        #: Safe-observation time still owed after ``enough``. Kept separate
+        #: from public PatState so blocked/unavailable gaps can expose idle
+        #: without dropping or consuming the lifecycle cooldown.
+        self._cooldown_remaining_s: float | None = None
         #: Count of pats latched this run (diagnostics / tests).
         self.events = 0
 
@@ -551,12 +558,13 @@ class PatSenseDriver:
 
     def _end_interaction(self, now: float | None, *, availability: str) -> None:
         """Clear detector and persistent policy state at one interaction edge."""
+        if self._state.phase == "enough" and self._cooldown_remaining_s is None:
+            self._cooldown_remaining_s = self._cooldown_s
         self.detector.clear_interaction()
         self._seen_press_at = None
         self._active_contact_s = 0.0
         self._last_available_at = None
         self._no_fresh_since = None
-        self._cooldown_until = None
         self._state = PatState(
             availability=availability,
             phase="idle",
@@ -591,35 +599,67 @@ class PatSenseDriver:
         )
 
     def _advance_policy_clock(self, now: float | None) -> None:
-        """Advance enough into cooldown, and cooldown into a clean idle state."""
+        """Advance cooldown using safe-observation time, pausing across gaps."""
         if now is None:
             return
         if self._state.phase == "enough":
-            self.detector.clear_presses()
+            self._cooldown_remaining_s = self._cooldown_s
+            self.detector.clear_interaction()
             self._seen_press_at = None
             self._active_contact_s = 0.0
-            self._last_available_at = None
+            self._last_available_at = now
             self._no_fresh_since = None
-            self._cooldown_until = now + self._cooldown_s
+            if self._cooldown_remaining_s <= 0.0:
+                self._cooldown_remaining_s = None
+                self._state = PatState(
+                    availability=self._state.availability,
+                    phase="idle",
+                    phase_started_at=now,
+                )
+                return
             self._state = PatState(
                 availability=self._state.availability,
                 contact=False,
                 phase="cooldown",
                 phase_started_at=now,
             )
-        if (
-            self._state.phase == "cooldown"
-            and self._cooldown_until is not None
-            and now >= self._cooldown_until
-        ):
-            self._cooldown_until = None
-            self.detector.clear_presses()
-            self._seen_press_at = None
+            return
+
+        remaining = self._cooldown_remaining_s
+        if remaining is None:
+            return
+        if self._state.phase != "cooldown":
+            # First safe observation after a gap: resume the full/remaining
+            # budget without charging any blocked or unavailable wall time.
+            self._last_available_at = now
+            if remaining <= 0.0:
+                self._cooldown_remaining_s = None
+                self._state = PatState(
+                    availability=self._state.availability,
+                    phase="idle",
+                    phase_started_at=now,
+                )
+                return
+            self._state = PatState(
+                availability=self._state.availability,
+                phase="cooldown",
+                phase_started_at=now,
+            )
+            return
+
+        previous_available = self._last_available_at
+        elapsed = max(0.0, now - previous_available) if previous_available is not None else 0.0
+        remaining = max(0.0, remaining - elapsed)
+        self._last_available_at = now
+        if remaining <= 1e-9:
+            self._cooldown_remaining_s = None
             self._state = PatState(
                 availability=self._state.availability,
                 phase="idle",
                 phase_started_at=now,
             )
+            return
+        self._cooldown_remaining_s = remaining
 
     def _update_pat_state(self, now: float | None) -> None:
         """Fold immutable detector evidence into the persistent interaction ladder."""

@@ -315,7 +315,7 @@ def test_contact_clock_drives_contentment_warning_enough_and_cooldown() -> None:
     )
 
 
-def test_blocked_edge_ends_enough_without_replaying_cooldown() -> None:
+def test_enough_gap_hides_contact_then_resumes_full_cooldown() -> None:
     reader = _Reader()
     driver = _driver(reader, enough_after_fn=lambda: 8.0)
 
@@ -335,9 +335,55 @@ def test_blocked_edge_ends_enough_without_replaying_cooldown() -> None:
     assert blocked.phase == "idle"
 
     recovered = _tick(driver, reader, T0 + 100.1, (0.0, 0.0))
-    assert recovered.phase == "idle"
+    assert recovered.availability == "available"
+    assert recovered.phase == "cooldown"
     assert recovered.contact is False
-    assert recovered.phase_started_at == pytest.approx(T0 + 100.0)
+    assert recovered.level is None
+    assert recovered.phase_started_at == pytest.approx(T0 + 100.1)
+
+    # Physical pat-shaped samples cannot reach the detector during the full
+    # safe-observation cooldown, even though the rule's original fire is old.
+    _tick(driver, reader, T0 + 100.2, (-3.0, 0.0))
+    _tick(driver, reader, T0 + 100.3, (0.0, 0.0))
+    before_expiry = _tick(driver, reader, T0 + 105.0, (-3.0, 0.0))
+    assert before_expiry.phase == "cooldown"
+    assert driver.peek() is None
+    assert driver.detector.snapshot() == PatEvidence()
+
+    expired = _tick(driver, reader, T0 + 105.1, (0.0, 0.0))
+    assert expired.phase == "idle"
+    assert expired.contact is False
+
+
+def test_mid_cooldown_gap_pauses_remaining_budget() -> None:
+    reader = _Reader()
+    driver = _driver(reader, enough_after_fn=lambda: 8.0)
+
+    _tick(driver, reader, T0, (0.0, 3.0))
+    for step in range(1, 17):
+        now = T0 + step * 0.5
+        _tick(driver, reader, now - 0.1, (0.0, 0.0))
+        state = _tick(driver, reader, now, (0.0, 3.0))
+    assert state.phase == "enough"
+    assert _tick(driver, reader, T0 + 8.1, (0.0, 0.0)).phase == "cooldown"
+
+    # Consume two seconds of safe cooldown, then suspend it in a long gap.
+    assert _tick(driver, reader, T0 + 10.1, (0.0, 0.0)).phase == "cooldown"
+    blocked_head = _head()
+    blocked_head.pop("roll")
+    blocked = _tick(driver, reader, T0 + 10.2, None, head=blocked_head)
+    assert blocked.availability == "blocked"
+    assert blocked.contact is False
+    assert blocked.level is None
+    assert blocked.phase == "idle"
+
+    _tick(driver, reader, T0 + 100.0, None, head=blocked_head)
+    resumed = _tick(driver, reader, T0 + 100.1, (0.0, 0.0))
+    assert resumed.phase == "cooldown"
+
+    # Roughly three seconds remained: the gap neither expired nor restarted it.
+    assert _tick(driver, reader, T0 + 103.0, (0.0, 0.0)).phase == "cooldown"
+    assert _tick(driver, reader, T0 + 103.1, (0.0, 0.0)).phase == "idle"
 
 
 def test_input_gap_clears_interaction_once_on_entry_not_recovery() -> None:
