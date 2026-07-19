@@ -280,7 +280,13 @@ class Engine:
             )
             for ab in live
         }
-        completed = [ab.behavior.id for ab in live if contribs[ab.behavior.id].done]
+        # `getattr(..., "done", False)` rather than `contribs[id].done`: arbitrate()
+        # already treats a missing or malformed contribution as an abstention, and a
+        # boot-persistent presence loop must degrade the same way here — one behavior
+        # breaking its return contract cannot be allowed to kill the tick.
+        completed = [
+            ab.behavior.id for ab in live if getattr(contribs.get(ab.behavior.id), "done", False)
+        ]
         if completed:
             completed_ids = set(completed)
             live = [ab for ab in live if ab.behavior.id not in completed_ids]

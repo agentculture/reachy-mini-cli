@@ -18,6 +18,7 @@ library name is composition work and intentionally does not happen here.
 
 from __future__ import annotations
 
+import bisect
 import math
 import random
 from dataclasses import dataclass
@@ -144,10 +145,13 @@ class _FeelAlive:
         while t >= self._cycles[-1].end:
             previous = self._cycles[-1]
             self._cycles.append(_Cycle(start=previous.end, move_s=_sample_move_s(self._jitter)))
-        for index, cycle in enumerate(self._cycles):
-            if t < cycle.end:
-                return index, cycle
-        raise AssertionError("cycle schedule did not cover local time")
+        # Each cycle starts where the previous ended and every cycle has positive
+        # length, so `end` is strictly increasing and the first cycle ending after
+        # `t` is a binary search rather than a scan from index 0. The schedule grows
+        # for the life of the process — a boot-persistent presence ticks at 50 Hz
+        # for days — so a linear probe made per-tick cost grow with uptime.
+        index = bisect.bisect_right(self._cycles, t, key=lambda cycle: cycle.end)
+        return index, self._cycles[index]
 
     @staticmethod
     def _hold_pose(cycle: _Cycle, params: dict) -> Contribution:

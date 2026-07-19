@@ -85,6 +85,11 @@ _EMPTY_SUBMITTED = "(submitted)"
 _AWAIT_TIMEOUT_HELP = "Seconds to wait for the engine to confirm (default: 1.0)."
 _CLASSES = tuple(c.value for c in StopClass)
 _PROBE_HEARTBEAT_TTL_S = 2.0
+#: How far into the future a heartbeat may sit and still count as live. Engine
+#: writes `round(now, 3)`, so a stamp read back microseconds later can be up to
+#: 0.5ms ahead; this window absorbs that (and any small cross-process jitter)
+#: without letting a monotonic-clock reset masquerade as a live engine.
+_PROBE_HEARTBEAT_SKEW_S = 1.0
 
 #: The six head axes a goto may target, in the order ``goto_intent.HEAD_AXES`` /
 #: ``move goto``'s own ``_HEAD_KEYS`` use — flag names match the GotoSpec payload's
@@ -873,7 +878,16 @@ def _probe_engine_is_fresh() -> bool:
     if not math.isfinite(updated):
         return False
     age = time.monotonic() - updated
-    return 0.0 <= age <= _PROBE_HEARTBEAT_TTL_S
+    if age < 0.0:
+        # Fail CLOSED on a marginally future heartbeat: Engine.state() rounds
+        # `updated` to milliseconds and can round UP, so a genuinely live engine
+        # can read back a hair ahead of us. Treating that as "not fresh" would
+        # let a probe start beside it — the exact race this refusal exists to
+        # prevent. A stamp far in the future is instead a state.json left over
+        # from before a monotonic-clock reset (a reboot), which is stale, not
+        # live, so it must not lock probes out forever.
+        return age >= -_PROBE_HEARTBEAT_SKEW_S
+    return age <= _PROBE_HEARTBEAT_TTL_S
 
 
 def _open_probe_output(path: Path):  # type: ignore[no-untyped-def]
@@ -915,6 +929,18 @@ def _open_probe(probe_mode: str, probe_output: str):  # type: ignore[no-untyped-
             code=EXIT_USER_ERROR,
             message=f"probe output already exists: {probe_output}",
             remediation="choose a new --probe-output path; captures are never overwritten",
+        ) from err
+    except OSError as err:
+        # path.open("x") also raises for a missing parent, an unwritable
+        # directory, or a path that is itself a directory. Each is a user-fixable
+        # mistake and earns the same structured remediation as the clash above.
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"cannot create probe output {probe_output}: {type(err).__name__}: {err}",
+            remediation=(
+                "choose a --probe-output path in an existing, writable directory "
+                "that is not itself a directory"
+            ),
         ) from err
 
     def _probe_emit(record: dict) -> None:

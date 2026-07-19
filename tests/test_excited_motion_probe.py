@@ -604,6 +604,88 @@ def test_cli_probe_refuses_fresh_engine_before_output_or_transport(
     assert "sole foreground 'reachy behavior engine run'" in error
 
 
+def test_cli_probe_refuses_heartbeat_dated_marginally_in_the_future(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A live engine whose stamp rounds up must still be seen as live.
+
+    ``Engine.state()`` writes ``round(now, 3)`` and can round UP, so a genuinely
+    running engine can publish a heartbeat a hair ahead of the probe's own
+    ``monotonic()`` read. Reading that as "not fresh" would admit a second
+    command owner — exactly the race the refusal exists to prevent.
+    """
+    from reachy.behavior import control
+    from reachy.cli import main
+    from reachy.cli._commands import behavior as behavior_module
+
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path / "state"))
+    control.CommandSpool().write_state({"updated": 100.0005})
+    monkeypatch.setattr(behavior_module.time, "monotonic", lambda: 100.0)
+    transport_calls: list[object] = []
+    monkeypatch.setattr(behavior_module, "get_transport", lambda args: transport_calls.append(args))
+    output = tmp_path / "must-not-exist.jsonl"
+
+    rc = main(["behavior", "engine", "run", "--probe-mode", "held", "--probe-output", str(output)])
+
+    assert rc != 0
+    assert not output.exists()
+    assert transport_calls == []
+    assert "already-running" in capsys.readouterr().err
+
+
+def test_cli_probe_allows_heartbeat_from_before_a_monotonic_reset(monkeypatch, tmp_path) -> None:
+    """A far-future stamp is a pre-reboot leftover, not a live engine.
+
+    Failing closed on *any* future timestamp would let one stale state.json lock
+    probes out permanently after a restart, so only a small skew counts as live.
+    """
+    from reachy.behavior import control
+    from reachy.cli import main
+    from reachy.cli._commands import behavior as behavior_module
+
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path / "state"))
+    control.CommandSpool().write_state({"updated": 90_000.0})
+    monkeypatch.setattr(behavior_module.time, "monotonic", lambda: 12.0)
+    engine_calls: list[object] = []
+    monkeypatch.setattr(behavior_module, "get_transport", lambda _args: object())
+    monkeypatch.setattr(behavior_module, "_compose_run_seam", lambda *a, **k: (None, None, None))
+    monkeypatch.setattr(behavior_module, "build_runtime_export_consumer", lambda _args: None)
+    monkeypatch.setattr(
+        behavior_module,
+        "engine_run",
+        lambda *args, **kwargs: (engine_calls.append(args), 0)[1],
+    )
+    output = tmp_path / "capture.jsonl"
+
+    rc = main(["behavior", "engine", "run", "--probe-mode", "held", "--probe-output", str(output)])
+
+    assert rc == 0
+    assert engine_calls, "a pre-reset heartbeat must not block the probe forever"
+
+
+def test_cli_probe_output_missing_parent_is_a_structured_error(monkeypatch, tmp_path, capsys):
+    """A non-FileExistsError open failure earns a CliError, not a bare OSError.
+
+    (A path that is itself a directory already exists, so it is correctly
+    reported by the dedicated already-exists branch instead of this one.)
+    """
+    from reachy.cli import main
+    from reachy.cli._commands import behavior as behavior_module
+
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(behavior_module, "get_transport", lambda _args: object())
+    output = tmp_path / "no-such-dir" / "capture.jsonl"
+
+    rc = main(["behavior", "engine", "run", "--probe-mode", "held", "--probe-output", str(output)])
+
+    assert rc != 0
+    error = capsys.readouterr().err
+    assert "cannot create probe output" in error
+    assert "FileNotFoundError" in error
+    assert "existing, writable directory" in error
+    assert "Traceback" not in error
+
+
 def test_probe_output_closes_when_seam_composition_fails(monkeypatch, tmp_path) -> None:
     from reachy.cli import main
     from reachy.cli._commands import behavior as behavior_module
