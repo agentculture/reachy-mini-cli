@@ -1,0 +1,10 @@
+# Minimal complete candidate rules file for the sensor-driven pet reaction.
+# This is a validated repository fixture, not an installed default. Copy it to
+# the box-local rules path only when activating this behavior deliberately.
+
+[[react]]
+id = "pat-acknowledge"
+when = { field = "pat", op = "is_true" }
+run = "pet-reaction"
+cooldown_s = 5.0
+hysteresis = 0.0
