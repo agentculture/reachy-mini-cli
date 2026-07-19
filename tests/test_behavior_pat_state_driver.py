@@ -146,20 +146,24 @@ def _tick(
         "left-antenna",
     ],
 )
-def test_every_command_axis_blocks_before_reader_and_rebaselines_once(changed) -> None:
+def test_every_command_axis_clears_on_gap_entry_once(changed) -> None:
     reader = _Reader()
     detector = _CountingDetector(min_presses=99)
     driver = _driver(reader, detector=detector, still_hold_s=0.5)
 
     assert _tick(driver, reader, T0, (0.0, 0.0)).availability == "blocked"
+    assert detector.clear_calls == 1
     assert _tick(driver, reader, T0 + 0.5, (0.0, 0.0)).availability == "available"
     assert reader.calls == 1
     assert detector.clear_calls == 1
 
     blocked = _tick(driver, reader, T0 + 1.0, (9.0, 9.0), **changed)
     assert blocked.availability == "blocked"
+    assert blocked.contact is False
+    assert blocked.level is None
+    assert blocked.phase == "idle"
     assert reader.calls == 1
-    assert detector.clear_calls == 1
+    assert detector.clear_calls == 2
 
     assert _tick(driver, reader, T0 + 1.4, (9.0, 9.0), **changed).availability == "blocked"
     available = _tick(driver, reader, T0 + 1.5, (0.0, 0.0), **changed)
@@ -186,7 +190,10 @@ def test_ownership_edge_reearns_hold_but_any_settled_owner_can_sense() -> None:
         owners=reaction_owners,
     )
     assert blocked.availability == "blocked"
-    assert detector.clear_calls == 1
+    assert blocked.contact is False
+    assert blocked.level is None
+    assert blocked.phase == "idle"
+    assert detector.clear_calls == 2
 
     _tick(driver, reader, T0 + 1.4, (0.0, 0.0), owners=reaction_owners)
     available = _tick(
@@ -252,8 +259,9 @@ def test_blocked_and_unavailable_gaps_end_interaction_without_claiming_release()
 
     blocked = _tick(driver, reader, T0 + 2.0, None, head=_head(x=1.0))
     assert blocked.availability == "blocked"
-    assert blocked.contact is True
-    assert blocked.phase == "receptive"
+    assert blocked.contact is False
+    assert blocked.level is None
+    assert blocked.phase == "idle"
 
     _tick(driver, reader, T0 + 2.4, None, head=_head(x=1.0))
     unavailable = _tick(driver, reader, T0 + 2.5, None, head=_head(x=1.0))
@@ -322,12 +330,41 @@ def test_blocked_edge_ends_enough_without_replaying_cooldown() -> None:
     blocked_head.pop("roll")
     blocked = _tick(driver, reader, T0 + 100.0, None, head=blocked_head)
     assert blocked.availability == "blocked"
-    assert blocked.phase == "enough"
+    assert blocked.contact is False
+    assert blocked.level is None
+    assert blocked.phase == "idle"
 
     recovered = _tick(driver, reader, T0 + 100.1, (0.0, 0.0))
     assert recovered.phase == "idle"
     assert recovered.contact is False
-    assert recovered.phase_started_at == pytest.approx(T0 + 100.1)
+    assert recovered.phase_started_at == pytest.approx(T0 + 100.0)
+
+
+def test_input_gap_clears_interaction_once_on_entry_not_recovery() -> None:
+    reader = _Reader()
+    detector = _CountingDetector(min_presses=99)
+    driver = _driver(reader, detector=detector)
+
+    contact = _tick(driver, reader, T0, (0.0, -3.0))
+    assert contact.contact is True
+    assert detector.clear_calls == 0
+
+    unavailable = _tick(driver, reader, T0 + 0.1, None)
+    assert unavailable.availability == "unavailable"
+    assert unavailable.contact is False
+    assert unavailable.level is None
+    assert unavailable.phase == "idle"
+    assert detector.clear_calls == 1
+
+    repeated = _tick(driver, reader, T0 + 0.2, None)
+    assert repeated == unavailable
+    assert detector.clear_calls == 1
+
+    recovered = _tick(driver, reader, T0 + 0.3, (0.0, 0.0))
+    assert recovered.availability == "available"
+    assert recovered.contact is False
+    assert recovered.phase == "idle"
+    assert detector.clear_calls == 1
 
 
 def test_gap_cannot_pair_press_edges_and_legacy_latch_stays_identical() -> None:
@@ -364,7 +401,7 @@ def test_gap_cannot_pair_press_edges_and_legacy_latch_stays_identical() -> None:
 @pytest.mark.parametrize("gap_kind", ["motion", "ownership", "input"])
 def test_level1_cannot_escalate_across_a_detection_gap(gap_kind: str) -> None:
     reader = _Reader()
-    detector = PatDetector(
+    detector = _CountingDetector(
         min_presses=2,
         pat_cooldown=0.0,
         baseline_alpha=0.0,
@@ -384,7 +421,7 @@ def test_level1_cannot_escalate_across_a_detection_gap(gap_kind: str) -> None:
     assert driver.peek() == ("scratch", "level1")
 
     if gap_kind == "motion":
-        _tick(driver, reader, T0 + 1.0, None, antennas=(1.0, 0.0))
+        gap_state = _tick(driver, reader, T0 + 1.0, None, antennas=(1.0, 0.0))
         _tick(driver, reader, T0 + 100.0, (0.0, 0.0), antennas=(1.0, 0.0))
         recovered = _tick(
             driver,
@@ -395,17 +432,22 @@ def test_level1_cannot_escalate_across_a_detection_gap(gap_kind: str) -> None:
         )
     elif gap_kind == "ownership":
         owners = (REACTION_OWNER, REACTION_OWNER, REACTION_OWNER)
-        _tick(driver, reader, T0 + 1.0, None, owners=owners)
+        gap_state = _tick(driver, reader, T0 + 1.0, None, owners=owners)
         _tick(driver, reader, T0 + 100.0, (0.0, 0.0), owners=owners)
         recovered = _tick(driver, reader, T0 + 100.5, (-3.0, 0.0), owners=owners)
     else:
-        _tick(driver, reader, T0 + 1.0, None)
+        gap_state = _tick(driver, reader, T0 + 1.0, None)
         recovered = _tick(driver, reader, T0 + 100.0, (-3.0, 0.0))
 
+    assert gap_state.contact is False
+    assert gap_state.level is None
+    assert gap_state.phase == "idle"
+    assert detector.clear_calls == 2
     assert driver.peek() is None
     assert recovered.level is None
     assert detector.snapshot().level is None
     assert detector._state == "idle"
+    assert detector.clear_calls == 2
 
 
 def test_boot_warmup_publishes_idle_and_clears_interaction_once_on_exit() -> None:
@@ -457,9 +499,9 @@ def test_boot_warmup_publishes_idle_and_clears_interaction_once_on_exit() -> Non
     assert detector.clear_calls == 1
 
 
-def test_logical_clock_gap_ends_level1_before_current_sample() -> None:
+def test_logical_clock_gap_ends_level1_once_before_current_sample() -> None:
     reader = _Reader()
-    detector = PatDetector(
+    detector = _CountingDetector(
         min_presses=2,
         pat_cooldown=0.0,
         baseline_alpha=0.0,
@@ -490,3 +532,4 @@ def test_logical_clock_gap_ends_level1_before_current_sample() -> None:
     assert recovered.phase == "receptive"
     assert recovered.level is None
     assert detector._state == "idle"
+    assert detector.clear_calls == 1

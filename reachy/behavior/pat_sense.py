@@ -62,12 +62,13 @@ vector has remained constant for ``still_hold_s``. A reaction can therefore
 keep sensing while it holds a receptive pose.
 
 Owner ids are never allowlisted. An ownership edge still invalidates temporal
-pairing even if the numeric pose is unchanged: it re-arms the quiet hold and
-causes one re-baseline when the complete-command gate next opens.
+pairing even if the numeric pose is unchanged: it ends the ordinary interaction
+immediately, publishes blocked idle state, and re-arms the quiet hold. Filter
+conditioning is reseeded when the complete-command gate next opens.
 
-Re-baselining calls :meth:`PatDetector.clear_interaction`: press pairing,
-evidence, and the interaction FSM/level clock are dropped while learned EMA
-baselines and the event cooldown are kept. A full reset would make the
+Opening a gap calls :meth:`PatDetector.clear_interaction`: press pairing,
+evidence, and the interaction FSM/level clock are dropped immediately while
+learned EMA baselines and the event cooldown are kept. A full reset would make the
 calibration offset read as fresh presses until the slow EMA relearns. Initial
 convergence at boot is instead covered by the one-time warmup mute.
 
@@ -123,8 +124,8 @@ tracking-lag deviation cancels; a real pat — an *external* force the command
 stream knows nothing about — still produces a fast actual-vs-filtered spike
 and fires exactly as before. The filter seeds at the first commanded sample
 (so a static commanded pose behaves identically to the unfiltered driver from
-tick one) and re-seeds on every detection-gap edge alongside the detector
-re-baseline — ownership and complete-command gap edges alike.
+tick one) and re-seeds when every detection gap recovers — ownership and
+complete-command gaps alike.
 ``lag_tau=0`` disables the filter (raw passthrough).
 
 --------------------------------------------------------------------------
@@ -133,10 +134,11 @@ Gap-edge re-baselining
 Command motion, ownership changes, malformed pose data, and missing actual-pose
 readings are detection gaps. A logical observation interval over 0.2 seconds is
 also a gap; true wall-clock tick overruns live outside this driver and remain an
-integration responsibility. Each blocked/unavailable → safe edge ends the
-ordinary interaction, preserving detector calibration and event cooldown, and
-reseeds the lag/high-pass state exactly once. ``PatState`` keeps ``blocked``
-distinct from ``unavailable``; neither kind of time advances an interaction.
+integration responsibility. The first blocked/unavailable edge ends the
+ordinary interaction immediately, preserving detector calibration and event
+cooldown; repeated unsafe ticks do not churn that reset. Recovery only reseeds
+the lag/high-pass state. ``PatState`` keeps ``blocked`` distinct from
+``unavailable`` and publishes idle/no-contact throughout either gap.
 
 --------------------------------------------------------------------------
 Degradation
@@ -357,9 +359,12 @@ class PatSenseDriver:
         self._latch: tuple[str, str] | None = None
         #: True while the commanded pose is not yet still long enough to sense
         #: (the complete-command stillness gate, #80). The blocked -> unblocked
-        #: edge triggers one re-baseline via :meth:`_rebaseline_after_gap`.
+        #: edge triggers one conditioning re-seed via :meth:`_reseed_after_gap`.
         self._stillness_blocked = False
         self._input_gap = False
+        #: One contiguous unsafe observation interval. Interaction state is
+        #: cleared exactly once when this opens; recovery only reseeds filters.
+        self._gap_active = False
         self._state = UNAVAILABLE_PAT_STATE
         self._seen_press_at: float | None = None
         self._active_contact_s = 0.0
@@ -403,24 +408,26 @@ class PatSenseDriver:
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
         """The gated sensing body, split out so :meth:`__call__` stays a thin guard."""
         now = self._now(ctx)
-        rebaselined = False
+        reseeded = False
         # --- logical observation-clock edge ---------------------------
         # A long or backwards clock jump means samples are missing. It is the
         # only overrun-like edge visible inside this driver; real wall-clock
         # TickMetrics overruns are observed outside this seam.
         if self._observation_clock_gapped(now):
+            self._begin_gap("blocked", now)
             self._rearm_stillness_hold()
             if self._still_hold_s <= 0.0:
-                self._rebaseline_after_gap(now)
-                rebaselined = True
+                self._reseed_after_gap()
+                reseeded = True
 
         # --- ownership edge --------------------------------------------
         if self._ownership_changed(ctx):
+            self._begin_gap("blocked", now)
             self._rearm_stillness_hold()
             if self._still_hold_s <= 0.0:
-                if not rebaselined:
-                    self._rebaseline_after_gap(now)
-                rebaselined = True
+                if not reseeded:
+                    self._reseed_after_gap()
+                reseeded = True
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
         commanded_full = self._commanded_pose(ctx)
@@ -428,7 +435,7 @@ class PatSenseDriver:
             if not self._stillness_blocked:
                 self._rearm_stillness_hold()
             self._stillness_blocked = True
-            self._mark_gap("blocked")
+            self._begin_gap("blocked", now)
             return
         commanded = (commanded_full[4], commanded_full[5])
 
@@ -438,34 +445,39 @@ class PatSenseDriver:
         # ghost class structurally impossible rather than threshold-managed.
         #
         # `_stillness_blocked` owns one blocked -> unblocked edge, so ordinary
-        # wander cannot rerun the re-baseline work on every blocked tick.
+        # wander cannot rerun interaction clearing on every blocked tick.
         if not self._commanded_still(commanded_full, now):
             self._stillness_blocked = True
-            self._mark_gap("blocked")
+            self._begin_gap("blocked", now)
             return
         if self._stillness_blocked:
             # First tick back on a still commanded pose (a genuine
             # blocked -> unblocked edge). `detector.update()` was never called
             # for the whole blocked stretch (this method returned above, every
             # tick), so from the detector's point of view this is the same
-            # situation as the ownership edge: re-baseline once, via the same
-            # helper, for the same reasons.
-            if not rebaselined:
-                self._rebaseline_after_gap(now)
-                rebaselined = True
+            # situation as the ownership edge: reseed conditioning once before
+            # accepting another physical sample.
+            if not reseeded:
+                self._reseed_after_gap()
+                reseeded = True
             self._stillness_blocked = False
 
         # --- actual pose (proprioception) ------------------------------
         actual = self._read_actual()
         if actual is None:
             self._input_gap = True
-            self._mark_gap("unavailable")
+            self._begin_gap("unavailable", now)
             return
         if self._input_gap:
-            if not rebaselined:
-                self._rebaseline_after_gap(now)
-                rebaselined = True
+            if not reseeded:
+                self._reseed_after_gap()
+                reseeded = True
             self._input_gap = False
+
+        # The complete command and actual reading are both safe. The gap has
+        # ended, but its interaction was already cleared at entry.
+        recovered_gap = self._gap_active
+        self._gap_active = False
 
         # Policy time only advances across successful observations. A blocked
         # command or unavailable reader must never masquerade as contact time,
@@ -483,11 +495,10 @@ class PatSenseDriver:
             self._arm_warmup(now)
         warmup_was_armed = self._warmup_until is not None
         warming_up = self._in_warmup(now)
-        if warmup_was_armed and not warming_up and not rebaselined:
+        if warmup_was_armed and not warming_up and not recovered_gap:
             # Drop every edge and FSM transition learned while calibration was
             # converging before accepting the first post-warmup sample.
-            self._reset_interaction(now, availability="available")
-            rebaselined = True
+            self._end_interaction(now, availability="available")
         commanded_pitch, commanded_yaw = self._lag_filtered(commanded, now)
         actual_pitch, actual_yaw = actual
         # Deviation conditioning (see "Lag compensation + wander rejection"):
@@ -518,30 +529,28 @@ class PatSenseDriver:
         self.events += 1
 
     def _rearm_stillness_hold(self) -> None:
-        """Force the stillness gate to re-earn its quiet window (ownership edge only).
+        """Force the stillness gate to re-earn its quiet window.
 
-        See :meth:`_rebaseline_after_gap` for why this is ownership-specific.
+        See :meth:`_reseed_after_gap` for the matching conditioning reset.
         """
         self._last_cmd = None
         self._last_motion_t = None
 
-    def _rebaseline_after_gap(self, now: float | None) -> None:
-        """Drop temporal pairing and reseed conditioning after a detection gap.
+    def _reseed_after_gap(self) -> None:
+        """Reseed conditioning when a detection gap becomes safe again.
 
-        ``clear_interaction`` intentionally keeps learned EMA baselines and the
-        event cooldown, while dropping the stale level FSM/clock. The lag
-        filter, high-pass state, and their clocks are reseeded so a pose step
-        across the gap cannot replay as a physical press. The stillness timer is
-        owned by the gate and is not reset here. Boot warmup is not re-armed.
+        Interaction state was already cleared when the gap opened. Recovery
+        only resets lag/high-pass conditioning so a pose step across the gap
+        cannot replay as a physical press. Learned detector EMA baselines and
+        event cooldown remain untouched. Boot warmup is not re-armed.
         """
-        self._reset_interaction(now, availability=self._state.availability)
         self._filtered = None
         self._dev_lp = None
         self._last_now = None
         self._hp_last_now = None
 
-    def _reset_interaction(self, now: float | None, *, availability: str) -> None:
-        """Clear detector and persistent policy state at one discontinuity edge."""
+    def _end_interaction(self, now: float | None, *, availability: str) -> None:
+        """Clear detector and persistent policy state at one interaction edge."""
         self.detector.clear_interaction()
         self._seen_press_at = None
         self._active_contact_s = 0.0
@@ -553,6 +562,20 @@ class PatSenseDriver:
             phase="idle",
             phase_started_at=now,
         )
+
+    def _begin_gap(self, availability: str, now: float | None) -> None:
+        """Open or update one unsafe interval without repeated clear churn."""
+        if not self._gap_active:
+            self._end_interaction(now, availability=availability)
+            self._gap_active = True
+            return
+        self._state = PatState(
+            availability=availability,
+            phase="idle",
+            phase_started_at=self._state.phase_started_at,
+        )
+        self._last_available_at = None
+        self._no_fresh_since = None
 
     def _publish_warmup_idle(self, now: float | None) -> None:
         """Expose calibration as available idle, never as physical contact."""
@@ -566,12 +589,6 @@ class PatSenseDriver:
             phase="idle",
             phase_started_at=phase_started_at,
         )
-
-    def _mark_gap(self, availability: str) -> None:
-        """Publish blocked/unavailable without treating the gap as release time."""
-        self._state = replace(self._state, availability=availability)
-        self._last_available_at = None
-        self._no_fresh_since = None
 
     def _advance_policy_clock(self, now: float | None) -> None:
         """Advance enough into cooldown, and cooldown into a clean idle state."""
