@@ -28,7 +28,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Literal
 
 # DoA angle is radians: 0 = left, pi/2 = front, pi = right (the daemon's
 # convention). Poll a few Hz, not 50 — DoA updates slowly — and read it with a
@@ -36,6 +36,55 @@ from typing import Callable
 # for long (a missed read just yields EMPTY_SENSE for that window).
 DOA_POLL_PERIOD = 0.2  # seconds (5 Hz)
 DOA_TIMEOUT = 0.1  # seconds
+
+
+# Wire-friendly string literals keep this module stdlib-only while making the
+# persistent pat contract explicit to the detector/driver, behavior, and export
+# layers that meet here. Availability is deliberately tri-state: an available
+# sample with ``contact=False`` is an observed release, while ``blocked`` and
+# ``unavailable`` must never be mistaken for physical no-contact.
+PatAvailability = Literal["available", "blocked", "unavailable"]
+PatTouchType = Literal["scratch", "side_pat"]
+PatLevel = Literal["level1", "level2"]
+PatPhase = Literal[
+    "idle",
+    "receptive",
+    "contentment",
+    "warning",
+    "released",
+    "enough",
+    "cooldown",
+]
+
+
+@dataclass(frozen=True)
+class PatState:
+    """Event-stable snapshot of one proprioceptive pat interaction.
+
+    ``availability`` separates observed samples from commanded-motion blocking
+    and reader failure. ``contact`` therefore only claims what the most recent
+    meaningful state says; consumers must inspect availability before treating
+    ``False`` as an observed release. ``yaw_deg`` is signed robot-frame yaw in
+    degrees, never a guessed physical left/right label.
+
+    The two monotonic anchors let consumers derive recency from their own clock.
+    No derived age or tick timestamp is stored, so equal interaction states stay
+    equal across unchanged 50 Hz ticks and change-only exporters remain bounded.
+    """
+
+    availability: PatAvailability = "unavailable"
+    contact: bool = False
+    touch_type: PatTouchType | None = None
+    level: PatLevel | None = None
+    yaw_deg: float | None = None
+    phase: PatPhase = "idle"
+    phase_started_at: float | None = None
+    last_press_at: float | None = None
+
+
+#: Safe default for a missing, failed, or not-yet-wired pat-state provider.
+#: This is intentionally not an available no-contact observation.
+UNAVAILABLE_PAT_STATE = PatState()
 
 
 @dataclass(frozen=True)
@@ -47,7 +96,7 @@ class Sense:
     (no mic, daemon error, or no sound). ``speech_detected`` is the daemon's
     speech-vs-any-sound flag for the same reading.
 
-    ``rms``, ``pat_event``, ``face``, and ``frame_available`` extend the
+    ``rms``, ``pat_event``, ``pat_state``, ``face``, and ``frame_available`` extend the
     snapshot with the folded-hook cues (mirroring ``listen``'s ``PatHook`` /
     ``VisionHook`` / ``FaceHook``) so a future sensor-driven behavior can read
     them the same way it reads ``doa_angle`` today. Each has a "no reading"
@@ -61,6 +110,8 @@ class Sense:
       detection this tick (mirrors
       ``EventBuffer.feed_pat(kind, level)``'s argument shape), or ``None``
       when there was no pat this tick.
+    - ``pat_state`` — the persistent, event-stable interaction snapshot. Its
+      unavailable default is distinct from an observed no-contact sample.
     - ``face`` — the name of a recognised, named face this tick (mirrors
       ``EventBuffer.feed_face(name)``), or ``None`` (no match, an unnamed
       face, or not sampled).
@@ -76,6 +127,7 @@ class Sense:
     pat_event: tuple[str, str] | None = None
     face: str | None = None
     frame_available: bool = False
+    pat_state: PatState = UNAVAILABLE_PAT_STATE
 
 
 # The "no reading" snapshot — what behaviors get when nothing senses, the poll
@@ -154,6 +206,7 @@ class DoaPoller:
 #: source (no ``reachy_mini``, no ``cv2``) — it stays a dependency-free leaf.
 RmsProvider = Callable[[], float | None]
 PatEventProvider = Callable[[], tuple[str, str] | None]
+PatStateProvider = Callable[[], PatState | None]
 FaceProvider = Callable[[], str | None]
 FrameAvailableProvider = Callable[[], bool]
 
@@ -178,6 +231,7 @@ class SenseProviders:
     pat_event: PatEventProvider | None = None
     face: FaceProvider | None = None
     frame_available: FrameAvailableProvider | None = None
+    pat_state: PatStateProvider | None = None
 
 
 #: A :class:`SenseProviders` with every field unset — "no providers wired".
@@ -219,6 +273,7 @@ def read_perception(
     reads each provider again; a well-behaved ("peek") provider returns the
     identical value every time.
     """
+    pat_state = _peek(providers.pat_state, None)
     return Sense(
         doa_angle=base.doa_angle,
         speech_detected=base.speech_detected,
@@ -226,6 +281,7 @@ def read_perception(
         pat_event=_peek(providers.pat_event, None),
         face=_peek(providers.face, None),
         frame_available=bool(_peek(providers.frame_available, False)),
+        pat_state=pat_state if isinstance(pat_state, PatState) else UNAVAILABLE_PAT_STATE,
     )
 
 
