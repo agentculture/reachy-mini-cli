@@ -1,0 +1,9 @@
+# Minimal complete rollback rules file matching the prior deployed response.
+# This is a validated repository fixture, not an installed default.
+
+[[react]]
+id = "pat-acknowledge"
+when = { field = "pat", op = "is_true" }
+run = "thoughtful"
+cooldown_s = 6.0
+hysteresis = 0.0

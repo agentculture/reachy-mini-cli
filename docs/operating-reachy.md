@@ -1098,35 +1098,94 @@ when = { field = "pat", op = "is_true" }
 
 Key operator facts:
 
-- **Reactions to pat are rules in `rules.toml`.** They are data you edit and
-  push with `behavior reload`, never hardcoded. The deployed
-  pat-acknowledge rule (pat → `thoughtful`, cooldown 6 s) lights up the moment
-  the sense feeds — no rules file change needed.
-- **The robot must be holding still to feel you.** This is physics, not a
-  setting: a hands-on calibration session (issue #80) recorded the real plant
-  untouched and petted, in both conditions. With the head **held still** the
-  measured separation between "petted" and "untouched" is **12-20x on every
-  axis** — the noise floor is 0.07-0.11°, a pat is 0.85-1.90°. With the head
-  **wandering** it collapses to **0.7-2.0x**: the servos hunt while tracking a
-  moving target and manufacture 3-4° of deviation that no threshold can tell
-  from a hand. So the sense **gates on commanded stillness** — it senses only
-  after the commanded pose has been constant for half a second. A wandering
-  robot reports no pats rather than guessing; a still one feels them reliably.
-- **What that means in practice.** Pet the robot while it is settled and it
-  responds. If you want it reliably pettable, give it a still moment: inhibit
-  `feel-alive` (an `[[inhibit]]` rule), or use a mode that holds a pose. Live
-  verification of exactly this: 10 detections and 6 rule-fired gestures during
-  ~15 s of natural scratching on a still head, then **zero** false detections
-  over a 3-minute hands-off soak in the same configuration.
-- **Detection is ownership-gated.** While a rule-fired gesture or a `goto` owns
-  the head channel, the detector suspends and re-baselines, so the robot's own
-  motion can never read as a phantom pat (the false-fire oscillation class
-  from the listen era).
-- **The SDK read client is lazy and self-healing.** If the daemon is down at
-  boot, the pat sense simply stays unfed and comes alive within a few seconds
-  of daemon health — no restart needed.
-- **It degrades cleanly.** Without the `[sdk]` extra the runtime runs exactly
-  as before, DoA-only.
+- **Before-state evidence (`6eab58e`).** The symbolic runtime exposed only the
+  one-tick legacy `pat` tuple, the deployed box-local `pat-acknowledge` rule ran
+  bounded `thoughtful`. The old pure `feel-alive` emitted a continuously changing
+  command. It detected pats only during rare still moments, then played a
+  fixed direction-blind gesture. The rollback fixture below intentionally
+  restores that prior rule while leaving the corrected detector/runtime code in
+  place.
+- **Pettable cadence.** The stateful `feel-alive` base now moves for a jittered
+  8–12 seconds, settles smoothly, and holds the complete commanded pose exactly
+  constant for four seconds. The existing half-second gate therefore leaves at
+  least 3.5 seconds in each hold where Reachy is both alive and honestly
+  pettable; no separate attention shortcut is inferred.
+- **Complete-pose sensing boundary.** Movement on any of the six head axes,
+  `body_yaw`, or either antenna blocks sampling before actual pose is read.
+  Every motion or ownership edge clears stale press pairing and re-seeds the
+  conditioning filters; any owner becomes sense-safe only after its complete
+  commanded pose has stayed constant for 0.5 seconds. The runtime
+  does not infer contact during arbitrary motion.
+- **Persistent, compatible state.** The runtime feed keeps legacy `pat` exactly
+  `[touch_type, level]` and adds event-stable `pat_state` beside it. That object
+  carries availability, contact, touch type, discrete level, signed robot-frame
+  yaw, lifecycle phase, phase-start time, and last-fresh-press time. It has no
+  per-tick derived age, so a stable hold does not flood the feed. Older raw
+  sense events without the key still parse, and unknown state keys are ignored.
+- **Direction and intensity are deliberately narrow.** Signed yaw produces
+  opposite bounded head/body leans for labelled side pats only. A scratch gets
+  a distinct non-directional pitch pose. Intensity means discrete level plus
+  fresh-press recency, not calibrated force. There is no front/back directional
+  claim.
+- **Dog-like lifecycle.** `pet-reaction` is one stoppable engine behavior owning
+  head, antennas, and body yaw together. It settles into the hand, holds its
+  chosen complete pose so sensing can reopen, reaches contentment after four
+  seconds of credible contact, warns by eight, and performs one coordinated
+  done gesture (head/body wiggle plus antenna reorientation) no later than 12
+  seconds. Observed release begins within one second of the last fresh press;
+  the behavior self-completes, releases every channel, and observes the
+  persistent five-second cooldown. An independent finite lifetime is the final
+  safety backstop.
+- **Unavailable is not release.** Command blocking, a reader returning `None`,
+  and a reader failure publish blocked/unavailable state rather than observed
+  no-contact. They never advance contentment or enough and get only bounded
+  reacquisition grace before safe completion. Without the `[sdk]` extra, the
+  runtime remains healthy and DoA-capable while `pat_state` reports unavailable.
+- **One motion owner and scoped composition.** This symbolic reaction streams
+  through normal engine arbitration; it does not start a second `MotionQueue`
+  or enqueue the legacy pat planner. This change
+  does not add RMS or face providers, does not add issue #78 transport work,
+  and makes no arbitrary-motion sensing promise.
+
+The rule remains box-local data. Neither fixture below is installed as a
+repository default. Each is a minimal complete `rules.toml`; if the box carries
+other rules, merge the shown `pat-acknowledge` stanza into that file instead of
+replacing unrelated entries. In either case, validate before the single live
+reload.
+
+#### Activate pet reaction
+
+From a repository checkout, copy the validated candidate to the resolved
+box-local path, check it, then apply exactly one reload between engine ticks:
+
+```bash
+RULES_PATH="$(reachy-mini-cli behavior rules --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])')"
+install -d "$(dirname "$RULES_PATH")"
+install -m 0644 docs/fixtures/behavior-rules/pat-pet-reaction.toml "$RULES_PATH"
+reachy-mini-cli behavior rules check --json
+reachy-mini-cli behavior reload --json
+```
+
+The successful result names one react rule. Confirm `behavior status --json`
+and the runtime feed show rule `pat-acknowledge`, behavior `pet-reaction`, and
+the parallel `pat_state` transitions before treating activation as complete.
+
+#### Roll back to thoughtful
+
+Restore the prior bounded response with the same validate-then-one-reload path;
+the engine process is not restarted:
+
+```bash
+RULES_PATH="$(reachy-mini-cli behavior rules --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])')"
+install -d "$(dirname "$RULES_PATH")"
+install -m 0644 docs/fixtures/behavior-rules/pat-thoughtful-rollback.toml "$RULES_PATH"
+reachy-mini-cli behavior rules check --json
+reachy-mini-cli behavior reload --json
+```
+
+Confirm the result names one react rule and the rendered rule now maps
+`pat-acknowledge` to `thoughtful`. A rejected candidate keeps the last-good live
+configuration; correct the file and submit a new reload rather than restarting.
 
 ### Bounded reactions: no more permanent holds
 
@@ -1138,8 +1197,9 @@ stopped. That class of failure is now structurally impossible.
 (`nod`, `shake`, `speak`, `antenna-sway`, `feel-alive`) **must** carry
 `duration_s = <seconds>`. A rules file without it is refused at load/reload
 with a clear error naming the rule and the fix. Bounded one-shot targets
-(`gaze-hold` 5 s, `thoughtful` 3 s, `body-turn-hold` 5 s) need nothing — they
-already have a fixed lifetime.
+(`gaze-hold` 5 s, `thoughtful` 3 s, `body-turn-hold` 5 s, and the self-completing
+`pet-reaction` with its finite outer backstop) need nothing — they already have
+a fixed lifetime.
 
 ```toml
 [[react]]
@@ -1321,7 +1381,7 @@ line, `t`/`ts`/`tick` always first — see
 
 ```json
 {"t":"rule","ts":1752345678.9,"tick":1,"action":"fire","rule":"wake-sway","kind":"react","field":"doa","op":"absent_for","reason":"fired","behavior":"antenna-sway","disable":[]}
-{"t":"sense","ts":1752345678.9,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false}
+{"t":"sense","ts":1752345678.9,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false,"pat_state":{"availability":"unavailable","contact":false,"touch_type":null,"level":null,"yaw_deg":null,"phase":"idle","phase_started_at":null,"last_press_at":null}}
 ```
 
 ### Agent — attach over the runtime feed and the intent spool

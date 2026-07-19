@@ -428,13 +428,34 @@ Same-channel conflicts resolve by class priority
 
 Each behavior has a natural default (e.g. `gaze-hold` is one-shot, `speak` loops).
 
-## Sensing
+## Pettable presence and sensing
 
-All built-in behaviors are pure motion. For **sound-orienting**, see the dedicated
-`reachy-mini-cli listen` noun (`reachy-mini-cli explain listen`): it drives the
-daemon's smooth minjerk `goto` planner instead of the engine's `set_target`
-stream, which is jerky for big reorienting turns. (The engine keeps a general
-capability to feed a sensor-driven behavior a live reading, but ships none today.)
+`feel-alive` moves for a jittered 8–12 seconds, settles smoothly, then keeps the
+complete commanded pose bit-for-bit still for a four-second pettable window.
+The `pet-reaction` entry is the built-in sensor-driven exception to the pure
+motion entries: a pat rule admits it as one stoppable owner of `head`,
+`antennas`, and `body_yaw`.
+
+The live `pat_state` is additive beside the unchanged legacy `pat`
+`[touch_type, level]` value. It distinguishes available sampling, commanded-pose
+blocking, and an unavailable reader. Only available samples can claim release or
+advance interaction state. Intensity means level plus fresh-press recency; it
+uses the existing discrete level and is not a calibrated force value.
+
+Direction is side-only signed robot-frame yaw: opposite labelled side pats make
+opposite bounded head/body targets. A non-directional scratch gets a distinct
+pitch pose; there is no front/back directional claim. The reaction moves into a
+contact pose, then holds the complete commanded pose so sensing can reopen.
+Contentment starts after four seconds of credible contact, warning by eight, and
+a coordinated done gesture moves head, body, and antennas no later than 12
+seconds. Observed release starts within one second of the last fresh press;
+blocked or unavailable sensing gets bounded grace and is never called physical
+release. The behavior self-completes and also has a finite lifetime backstop.
+
+This symbolic path owns motion only through engine arbitration. It does not run
+the legacy queue reaction or create a second `MotionQueue` owner. For
+sound-orienting, see `reachy-mini-cli explain listen`; that dedicated noun uses
+the daemon's smooth minjerk `goto` planner.
 
 ## Verbs
 
