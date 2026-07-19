@@ -467,7 +467,11 @@ def test_pat_after_boot_warmup_fires() -> None:
     """The same pat AFTER the warmup window fires normally."""
     reader = _Reader()
     driver = PatSenseDriver(
-        reader=reader, still_hold_s=0.0, detector=_fixed_detector(), warmup_s=2.0
+        reader=reader,
+        still_hold_s=0.0,
+        detector=_fixed_detector(),
+        warmup_s=2.0,
+        max_observation_gap_s=0.0,
     )
     _drive(driver, reader, (0.0, 0.0), T0)  # first update arms warmup [T0, T0+2)
     _scratch_sequence(driver, reader, T0 + 2.5)
@@ -530,14 +534,14 @@ def test_real_pat_right_after_resume_fires_no_deadzone() -> None:
 #
 # Command-motion and ownership edges both invalidate temporal pairing, but each
 # safe edge must re-baseline exactly once. These tests spy on
-# ``PatDetector.clear_presses`` to pin call counts, not just event output.
+# ``PatDetector.clear_interaction`` to pin call counts, not just event output.
 
 
 class _CountingDetector(PatDetector):
-    """A :class:`PatDetector` that counts ``clear_presses()`` calls.
+    """A :class:`PatDetector` that counts interaction-clear calls.
 
     Standing in for a spy: the resume/re-baseline block's one distinctive,
-    side-effecting call is ``clear_presses()`` (see
+    side-effecting call is ``clear_interaction()`` (see
     ``PatSenseDriver._rebaseline_after_gap``), so counting it pins exactly how
     many times that block ran without needing to reach into driver internals.
     """
@@ -547,9 +551,9 @@ class _CountingDetector(PatDetector):
         super().__init__(**kw)
         self.clear_presses_calls = 0
 
-    def clear_presses(self) -> None:
+    def clear_interaction(self) -> None:
         self.clear_presses_calls += 1
-        super().clear_presses()
+        super().clear_interaction()
 
 
 def test_continuous_wander_does_not_rerun_rebaseline_every_tick() -> None:

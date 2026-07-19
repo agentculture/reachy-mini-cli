@@ -406,6 +406,28 @@ class PatDetector:
         self._last_press_time = 0.0
         self.last_pat_time = 0.0
 
+    def clear_interaction(self) -> None:
+        """End the current interaction while retaining calibration and cooldown.
+
+        A sensing suspension invalidates more than press pairing: a detector in
+        ``level1`` must not carry its level clock across commanded motion, an
+        ownership handoff, or a missing-input interval and turn the first fresh
+        edge after recovery into ``level2``.  This reset therefore clears edge
+        evidence *and* the interaction FSM/timers, while deliberately retaining
+        the learned EMA baselines and ``last_pat_time`` event-cooldown anchor.
+
+        Use :meth:`clear_presses` when only accumulated edges need dropping;
+        use this method when an observation discontinuity ends the interaction.
+        :meth:`reset` remains the full cold-start reset, including calibration
+        and cooldown history.
+        """
+        self.clear_presses()
+        self._state = "idle"
+        self._level1_time = 0.0
+        self._level2_threshold = 0.0
+        self._last_press_time = 0.0
+        self._current_touch_type = "scratch"
+
     def clear_presses(self) -> None:
         """Clear press accumulation and edge state — but KEEP the learned baselines.
 

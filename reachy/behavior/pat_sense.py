@@ -65,8 +65,9 @@ Owner ids are never allowlisted. An ownership edge still invalidates temporal
 pairing even if the numeric pose is unchanged: it re-arms the quiet hold and
 causes one re-baseline when the complete-command gate next opens.
 
-Re-baselining calls :meth:`PatDetector.clear_presses`: press pairing/edge state
-is dropped while learned EMA baselines are kept. A full reset would make the
+Re-baselining calls :meth:`PatDetector.clear_interaction`: press pairing,
+evidence, and the interaction FSM/level clock are dropped while learned EMA
+baselines and the event cooldown are kept. A full reset would make the
 calibration offset read as fresh presses until the slow EMA relearns. Initial
 convergence at boot is instead covered by the one-time warmup mute.
 
@@ -130,10 +131,12 @@ re-baseline — ownership and complete-command gap edges alike.
 Gap-edge re-baselining
 --------------------------------------------------------------------------
 Command motion, ownership changes, malformed pose data, and missing actual-pose
-readings are detection gaps. Each blocked/unavailable → safe edge clears press
-pairing and reseeds the lag/high-pass state exactly once. ``PatState`` keeps
-``blocked`` distinct from ``unavailable``; neither kind of time advances the
-contact, release, or cooldown clocks.
+readings are detection gaps. A logical observation interval over 0.2 seconds is
+also a gap; true wall-clock tick overruns live outside this driver and remain an
+integration responsibility. Each blocked/unavailable → safe edge ends the
+ordinary interaction, preserving detector calibration and event cooldown, and
+reseeds the lag/high-pass state exactly once. ``PatState`` keeps ``blocked``
+distinct from ``unavailable``; neither kind of time advances an interaction.
 
 --------------------------------------------------------------------------
 Degradation
@@ -237,19 +240,26 @@ DEFAULT_RELEASE_THRESHOLD = 0.2
 DEFAULT_STILL_EPS = 0.01
 DEFAULT_STILL_HOLD_S = 0.5  # commanded must be quiet this long before sensing
 
+#: Longest interval between logical observation ticks that can preserve an
+#: interaction. The 50 Hz engine normally supplies 0.02 s; ten missed ticks is
+#: an input discontinuity, so the ordinary detector must re-earn stillness and
+#: begin a fresh interaction. This is deliberately separate from wall-clock
+#: ``TickMetrics`` overruns, which this driver cannot observe.
+DEFAULT_MAX_OBSERVATION_GAP_S = 0.2
+
 #: Nominal tick period (seconds) used for the filter step when ``ctx.now`` is
 #: unavailable — the engine's 50 Hz default.
 _NOMINAL_DT = 0.02
 
-#: BOOT-ONLY warmup (seconds) during which detected events are MUTED while the
+#: BOOT-ONLY warmup (seconds) during which classification is MUTED while the
 #: detector's EMA baseline first converges. The EMA (``baseline_alpha`` 0.003
 #: at 50 Hz) has a ~6.7 s time constant; learning the several-degree
 #: commanded-vs-actual frame offset down past the release threshold takes ~2x
 #: that, and until then offset + wander edges read as presses — the fire at
 #: boot observed live (d1, issue #79). The detector keeps UPDATING through
-#: warmup (that update IS the convergence); only latching is muted. Resume
-#: edges do NOT re-arm this: they call ``clear_presses()``, which keeps the
-#: learned baselines, so there is no post-gesture deadzone.
+#: warmup (that update IS the convergence), while both the event latch and
+#: persistent PatState remain idle. Exit clears the learned interaction once;
+#: later gap edges keep the baselines, so there is no post-gesture deadzone.
 DEFAULT_WARMUP_S = 15.0
 
 CONTENTMENT_AFTER_S = 4.0
@@ -295,6 +305,7 @@ class PatSenseDriver:
         warmup_s: float = DEFAULT_WARMUP_S,
         still_eps: float = DEFAULT_STILL_EPS,
         still_hold_s: float = DEFAULT_STILL_HOLD_S,
+        max_observation_gap_s: float = DEFAULT_MAX_OBSERVATION_GAP_S,
         enough_after_fn: Callable[[], float] | None = None,
         release_after_s: float = RELEASE_AFTER_S,
         cooldown_s: float = ENOUGH_COOLDOWN_S,
@@ -324,14 +335,16 @@ class PatSenseDriver:
         #: hold required before sensing resumes. ``still_hold_s <= 0`` disables.
         self._still_eps = max(0.0, float(still_eps))
         self._still_hold_s = max(0.0, float(still_hold_s))
+        self._max_observation_gap_s = max(0.0, float(max_observation_gap_s))
+        self._last_observation_at: float | None = None
         #: Last commanded (pitch, yaw) and the clock reading when it last moved.
         self._last_cmd: tuple[float, ...] | None = None
         self._last_motion_t: float | None = None
         self._last_owners: tuple[object, object, object] | None = None
-        #: Post-(re)baseline event-mute window (s); ``0`` disables (see d1 fix).
+        #: Boot calibration-mute window (s); ``0`` disables (see d1 fix).
         self._warmup_s = max(0.0, float(warmup_s))
-        #: Mute latching until this clock reading (armed at first update + on
-        #: every resume re-baseline); ``None`` = not armed / warmup disabled.
+        #: Mute classification until this clock reading (armed once at boot);
+        #: ``None`` = not armed / warmup disabled.
         self._warmup_until: float | None = None
         #: True until the first detector update arms the initial warmup.
         self._first_update = True
@@ -391,11 +404,22 @@ class PatSenseDriver:
         """The gated sensing body, split out so :meth:`__call__` stays a thin guard."""
         now = self._now(ctx)
         rebaselined = False
+        # --- logical observation-clock edge ---------------------------
+        # A long or backwards clock jump means samples are missing. It is the
+        # only overrun-like edge visible inside this driver; real wall-clock
+        # TickMetrics overruns are observed outside this seam.
+        if self._observation_clock_gapped(now):
+            self._rearm_stillness_hold()
+            if self._still_hold_s <= 0.0:
+                self._rebaseline_after_gap(now)
+                rebaselined = True
+
         # --- ownership edge --------------------------------------------
         if self._ownership_changed(ctx):
             self._rearm_stillness_hold()
             if self._still_hold_s <= 0.0:
-                self._rebaseline_after_gap()
+                if not rebaselined:
+                    self._rebaseline_after_gap(now)
                 rebaselined = True
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
@@ -427,7 +451,7 @@ class PatSenseDriver:
             # situation as the ownership edge: re-baseline once, via the same
             # helper, for the same reasons.
             if not rebaselined:
-                self._rebaseline_after_gap()
+                self._rebaseline_after_gap(now)
                 rebaselined = True
             self._stillness_blocked = False
 
@@ -439,7 +463,7 @@ class PatSenseDriver:
             return
         if self._input_gap:
             if not rebaselined:
-                self._rebaseline_after_gap()
+                self._rebaseline_after_gap(now)
                 rebaselined = True
             self._input_gap = False
 
@@ -457,6 +481,13 @@ class PatSenseDriver:
             # to converge before events mean anything — mute latching meanwhile.
             self._first_update = False
             self._arm_warmup(now)
+        warmup_was_armed = self._warmup_until is not None
+        warming_up = self._in_warmup(now)
+        if warmup_was_armed and not warming_up and not rebaselined:
+            # Drop every edge and FSM transition learned while calibration was
+            # converging before accepting the first post-warmup sample.
+            self._reset_interaction(now, availability="available")
+            rebaselined = True
         commanded_pitch, commanded_yaw = self._lag_filtered(commanded, now)
         actual_pitch, actual_yaw = actual
         # Deviation conditioning (see "Lag compensation + wander rejection"):
@@ -472,13 +503,13 @@ class PatSenseDriver:
             dev_yaw,
             now=now,
         )
+        if warming_up:
+            # Baselines continue learning, but muted boot evidence is not an
+            # ordinary interaction and must never leak through PatState.
+            self._publish_warmup_idle(now)
+            return
         self._update_pat_state(now)
         if event is None:
-            return
-        if self._in_warmup(now):
-            # The detector keeps updating through warmup (that IS the baseline
-            # convergence) — only the event is dropped, never silently: name it.
-            logger.debug("pat event dropped: warmup (baseline converging)")
             return
         # PatDetector yields ``(level, touch_type)``; Sense.pat_event is
         # ``(touch_type, level)`` (matching EventBuffer.feed_pat(kind, level)).
@@ -494,22 +525,47 @@ class PatSenseDriver:
         self._last_cmd = None
         self._last_motion_t = None
 
-    def _rebaseline_after_gap(self) -> None:
+    def _rebaseline_after_gap(self, now: float | None) -> None:
         """Drop temporal pairing and reseed conditioning after a detection gap.
 
-        ``clear_presses`` intentionally keeps learned EMA baselines. The lag
+        ``clear_interaction`` intentionally keeps learned EMA baselines and the
+        event cooldown, while dropping the stale level FSM/clock. The lag
         filter, high-pass state, and their clocks are reseeded so a pose step
         across the gap cannot replay as a physical press. The stillness timer is
         owned by the gate and is not reset here. Boot warmup is not re-armed.
         """
-        self.detector.clear_presses()
+        self._reset_interaction(now, availability=self._state.availability)
         self._filtered = None
         self._dev_lp = None
         self._last_now = None
         self._hp_last_now = None
+
+    def _reset_interaction(self, now: float | None, *, availability: str) -> None:
+        """Clear detector and persistent policy state at one discontinuity edge."""
+        self.detector.clear_interaction()
         self._seen_press_at = None
+        self._active_contact_s = 0.0
         self._last_available_at = None
         self._no_fresh_since = None
+        self._cooldown_until = None
+        self._state = PatState(
+            availability=availability,
+            phase="idle",
+            phase_started_at=now,
+        )
+
+    def _publish_warmup_idle(self, now: float | None) -> None:
+        """Expose calibration as available idle, never as physical contact."""
+        phase_started_at = (
+            self._state.phase_started_at
+            if self._state.availability == "available" and self._state.phase == "idle"
+            else now
+        )
+        self._state = PatState(
+            availability="available",
+            phase="idle",
+            phase_started_at=phase_started_at,
+        )
 
     def _mark_gap(self, availability: str) -> None:
         """Publish blocked/unavailable without treating the gap as release time."""
@@ -691,6 +747,15 @@ class PatSenseDriver:
             return False
         return True
 
+    def _observation_clock_gapped(self, now: float | None) -> bool:
+        """Whether logical samples are discontinuous enough to end interaction."""
+        previous = self._last_observation_at
+        self._last_observation_at = now
+        if now is None or previous is None or self._max_observation_gap_s <= 0.0:
+            return False
+        delta = now - previous
+        return delta < 0.0 or delta > self._max_observation_gap_s
+
     # ------------------------------------------------------------------
     # Lag compensation (the d1 live fix — see the module docstring)
     # ------------------------------------------------------------------
@@ -808,7 +873,10 @@ class PatSenseDriver:
         always the deterministic injected clock.
         """
         now = getattr(ctx, "now", None)
-        return now if isinstance(now, (int, float)) else None
+        if not isinstance(now, (int, float)):
+            return None
+        value = float(now)
+        return value if math.isfinite(value) else None
 
     def _read_actual(self) -> tuple[float, float] | None:
         """Call the injected reader, degrading a raise/``None`` to no reading."""
