@@ -16,8 +16,9 @@ Algorithm:
 - Two-level state machine:
     idle         → level1 when ``recent_presses >= min_presses`` and cooldown
                    elapsed; fires ``("level1", touch_type)``.
-    level1       → level2_cooldown when sustained past a random 4–8 s threshold;
-                   fires ``("level2", touch_type)``.
+    level1       → level2_cooldown only when a fresh press arrives after a random
+                   4–8 s threshold; fires the level2 event. Elapsed time without
+                   a fresh edge cannot escalate.
                  → idle on interaction gap (no presses for ``interaction_gap_timeout``).
     level2_cooldown → idle after ``level2_cooldown`` seconds.
 - Touch type is classified by pitch-vs-yaw press count inside the window.
@@ -38,10 +39,41 @@ import random
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np  # noqa: F401  # required: callers may type-hint ndarray inputs
 
 logger = logging.getLogger(__name__)
+
+TouchType = Literal["scratch", "side_pat"]
+PatLevel = Literal["level1", "level2"]
+
+
+@dataclass(frozen=True, slots=True)
+class PatEvidence:
+    """Event-stable evidence from the most recent qualifying press.
+
+    This is deliberately separate from update's legacy event tuple. A caller
+    can inspect contact direction and timing without changing any existing
+    event consumer:
+
+    * pressed reports whether either threshold hysteresis is currently active;
+    * touch_type, yaw_deg, and last_press_at persist across release/deadband
+      samples until clear_presses, an interaction gap, or cooldown expiry;
+    * yaw_deg is the corrected robot-frame deviation in degrees, never abs();
+    * level changes only when the legacy state machine emits that level.
+
+    Mixed-axis samples use normalized threshold dominance, with pitch winning
+    exact ties. Across samples the latest qualifying press wins. A deadband
+    sample never replaces signed evidence.
+    """
+
+    pressed: bool = False
+    touch_type: TouchType | None = None
+    level: PatLevel | None = None
+    yaw_deg: float | None = None
+    last_press_at: float | None = None
 
 
 class PatDetector:
@@ -145,6 +177,12 @@ class PatDetector:
         # Touch type propagated from level1 to level2
         self._current_touch_type: str = "scratch"
 
+        # --- Separate signed evidence snapshot (legacy update tuple unchanged) ---
+        self._evidence_touch_type: TouchType | None = None
+        self._evidence_level: PatLevel | None = None
+        self._evidence_yaw_deg: float | None = None
+        self._evidence_last_press_at: float | None = None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -196,31 +234,58 @@ class PatDetector:
         if now is None:
             now = time.monotonic()
 
-        self._track_pitch(commanded_pitch, actual_pitch, now)
-        self._track_yaw(commanded_yaw, actual_yaw, now)
-        return self._advance_state(now)
+        pitch_edge, pitch_dev = self._track_pitch(commanded_pitch, actual_pitch, now)
+        yaw_edge, yaw_dev = self._track_yaw(commanded_yaw, actual_yaw, now)
+        fresh_press = pitch_edge or yaw_edge
+        if fresh_press:
+            self._record_evidence(
+                now=now,
+                pitch_edge=pitch_edge,
+                pitch_dev=pitch_dev,
+                yaw_edge=yaw_edge,
+                yaw_dev=yaw_dev,
+            )
+        event = self._advance_state(now, fresh_press=fresh_press)
+        if event is not None:
+            self._evidence_level = event[0]
+        return event
+
+    def snapshot(self) -> PatEvidence:
+        """Return immutable signed evidence without consuming or aging it."""
+        return PatEvidence(
+            pressed=self._in_press or self._yaw_in_press,
+            touch_type=self._evidence_touch_type,
+            level=self._evidence_level,
+            yaw_deg=self._evidence_yaw_deg,
+            last_press_at=self._evidence_last_press_at,
+        )
 
     # ------------------------------------------------------------------
     # Per-axis press tracking + state machine (split out of update for clarity
     # and to keep each unit's cognitive complexity low)
     # ------------------------------------------------------------------
 
-    def _track_pitch(self, commanded_pitch: float, actual_pitch: float, now: float) -> None:
+    def _track_pitch(
+        self, commanded_pitch: float, actual_pitch: float, now: float
+    ) -> tuple[bool, float]:
         """Update the EMA-baselined pitch deviation and its press edge state."""
         raw_deviation: float = actual_pitch - commanded_pitch
         self._baseline_offset += self._baseline_alpha * (raw_deviation - self._baseline_offset)
         deviation: float = raw_deviation - self._baseline_offset
         self.deviation_history.append((now, deviation))
 
+        pressed = False
         if deviation < -self.press_threshold and not self._in_press:
             self._in_press = True
             self.press_times.append((now, "pitch"))
             self._last_press_time = now
+            pressed = True
             logger.debug("Pat pitch press: deviation=%.2f deg", deviation)
         elif deviation > -self.release_threshold:
             self._in_press = False
+        return pressed, deviation
 
-    def _track_yaw(self, commanded_yaw: float, actual_yaw: float, now: float) -> None:
+    def _track_yaw(self, commanded_yaw: float, actual_yaw: float, now: float) -> tuple[bool, float]:
         """Update the EMA-baselined yaw deviation and its press edge state."""
         raw_yaw_dev: float = actual_yaw - commanded_yaw
         self._yaw_baseline_offset += self._baseline_alpha * (
@@ -229,25 +294,57 @@ class PatDetector:
         yaw_dev: float = raw_yaw_dev - self._yaw_baseline_offset
         self.yaw_deviation_history.append((now, yaw_dev))
 
+        pressed = False
         if abs(yaw_dev) > self.yaw_press_threshold and not self._yaw_in_press:
             self._yaw_in_press = True
             self.press_times.append((now, "yaw"))
             self._last_press_time = now
+            pressed = True
             logger.debug("Pat yaw press: deviation=%.2f deg", yaw_dev)
         elif abs(yaw_dev) < self.yaw_release_threshold:
             self._yaw_in_press = False
+        return pressed, yaw_dev
 
-    def _advance_state(self, now: float) -> tuple[str, str] | None:
+    def _record_evidence(
+        self,
+        *,
+        now: float,
+        pitch_edge: bool,
+        pitch_dev: float,
+        yaw_edge: bool,
+        yaw_dev: float,
+    ) -> None:
+        """Apply the documented per-sample dominance and cross-sample recency rule."""
+        yaw_wins = yaw_edge and (
+            not pitch_edge
+            or self._normalized_strength(yaw_dev, self.yaw_press_threshold)
+            > self._normalized_strength(pitch_dev, self.press_threshold)
+        )
+        if yaw_wins:
+            self._evidence_touch_type = "side_pat"
+            self._evidence_yaw_deg = yaw_dev
+        else:
+            self._evidence_touch_type = "scratch"
+            self._evidence_yaw_deg = None
+        self._evidence_last_press_at = now
+
+    @staticmethod
+    def _normalized_strength(deviation: float, threshold: float) -> float:
+        if threshold <= 0.0:
+            return float("inf")
+        return abs(deviation) / threshold
+
+    def _advance_state(self, now: float, *, fresh_press: bool) -> tuple[str, str] | None:
         """Run the two-level state machine for one tick; return any event."""
         if self._state == "idle":
             return self._advance_idle(now)
         if self._state == "level1":
-            return self._advance_level1(now)
+            return self._advance_level1(now, fresh_press=fresh_press)
         if self._state == "level2_cooldown":
             if now - self.last_pat_time > self._level2_cooldown:
                 logger.info("Pat cooldown expired — ready for new detection")
                 self._state = "idle"
-                self.press_times.clear()
+                self.clear_presses()
         return None
 
     def _advance_idle(self, now: float) -> tuple[str, str] | None:
@@ -274,7 +371,7 @@ class PatDetector:
         )
         return ("level1", touch_type)
 
-    def _advance_level1(self, now: float) -> tuple[str, str] | None:
+    def _advance_level1(self, now: float, *, fresh_press: bool) -> tuple[str, str] | None:
         """level1 → level2 on a sustained hold, or → idle on an interaction gap."""
         if (
             self._last_press_time > 0
@@ -282,10 +379,11 @@ class PatDetector:
         ):
             logger.info("Pat interaction gap — resetting to idle")
             self._state = "idle"
+            self.clear_presses()
             return None
 
         elapsed = now - self._level1_time
-        if elapsed > self._level2_threshold:
+        if elapsed > self._level2_threshold and fresh_press:
             touch_type = self._current_touch_type
             self.last_pat_time = now
             self.press_times.clear()
@@ -308,6 +406,28 @@ class PatDetector:
         self._last_press_time = 0.0
         self.last_pat_time = 0.0
 
+    def clear_interaction(self) -> None:
+        """End the current interaction while retaining calibration and cooldown.
+
+        A sensing suspension invalidates more than press pairing: a detector in
+        ``level1`` must not carry its level clock across commanded motion, an
+        ownership handoff, or a missing-input interval and turn the first fresh
+        edge after recovery into ``level2``.  This reset therefore clears edge
+        evidence *and* the interaction FSM/timers, while deliberately retaining
+        the learned EMA baselines and ``last_pat_time`` event-cooldown anchor.
+
+        Use :meth:`clear_presses` when only accumulated edges need dropping;
+        use this method when an observation discontinuity ends the interaction.
+        :meth:`reset` remains the full cold-start reset, including calibration
+        and cooldown history.
+        """
+        self.clear_presses()
+        self._state = "idle"
+        self._level1_time = 0.0
+        self._level2_threshold = 0.0
+        self._last_press_time = 0.0
+        self._current_touch_type = "scratch"
+
     def clear_presses(self) -> None:
         """Clear press accumulation and edge state — but KEEP the learned baselines.
 
@@ -322,6 +442,10 @@ class PatDetector:
         self.press_times.clear()
         self._in_press = False
         self._yaw_in_press = False
+        self._evidence_touch_type = None
+        self._evidence_level = None
+        self._evidence_yaw_deg = None
+        self._evidence_last_press_at = None
 
     # ------------------------------------------------------------------
     # Dunder

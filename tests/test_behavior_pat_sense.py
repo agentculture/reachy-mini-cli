@@ -8,10 +8,8 @@ pat. These tests pin, from failing-first:
 * the one-tick latch cadence (r2): the driver advances the detector at the END
   of a tick and latches; the provider PEEKs that latch, delivering it to exactly
   ONE sense snapshot (identical within a tick, cleared by the next driver run);
-* the ownership gate (the #66 phantom-pat fix): a non-base head owner suspends
-  detection (ZERO events for the SAME deviation), and the detector re-baselines
-  on the first tick back on the base layer so a persistent deviation can't fire
-  spuriously right after resume;
+* the complete-command gate (the #66 phantom-pat fix): command motion blocks
+  detection for every owner, while a settled reaction owner remains senseable;
 * degradation: a ``None``/raising reader (and a missing ``ctx.pose``) degrade to
   "no pat" and never raise;
 * the frame mapping (r1): a constant frame offset between commanded
@@ -28,9 +26,7 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 
-import pytest
-
-from reachy.behavior.pat_sense import PatSenseDriver, _is_base_owner
+from reachy.behavior.pat_sense import PatSenseDriver
 from reachy.behavior.sense import SenseProviders, read_perception
 from reachy.motion.pat import PatDetector
 
@@ -93,27 +89,6 @@ def _scratch_sequence(driver: PatSenseDriver, reader: _Reader, start: float, **c
     _drive(driver, reader, (0.0, 0.0), start + DT, **ctx_kw)
     _drive(driver, reader, (-3.0, 0.0), start + 2 * DT, **ctx_kw)
     return start + 2 * DT
-
-
-# --------------------------------------------------------------------------- #
-# _is_base_owner — robust base-layer identity                                 #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.parametrize(
-    "owner_id, expected",
-    [
-        ("feel-alive-1", True),
-        ("feel-alive-42", True),
-        ("thoughtful-3", False),
-        ("body-turn-hold-7", False),
-        (None, False),
-        ("feel-alive", False),  # no numeric seq -> engine never mints this
-        ("feel-alive-foo-2", False),  # a different library name that merely shares a prefix
-    ],
-)
-def test_is_base_owner(owner_id, expected) -> None:
-    assert _is_base_owner(owner_id) is expected
 
 
 # --------------------------------------------------------------------------- #
@@ -184,12 +159,12 @@ def test_as_provider_is_the_peek_callable() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Ownership gate — the #66 phantom-pat fix                                    #
+# Complete-command gate — the #66 phantom-pat fix                             #
 # --------------------------------------------------------------------------- #
 
 
-def test_same_deviation_fires_on_base_owner() -> None:
-    """Control for the gate: on the base layer the deviation DOES fire."""
+def test_same_deviation_fires_on_a_settled_command() -> None:
+    """Control for the gate: a settled complete command remains senseable."""
     reader = _Reader()
     driver = PatSenseDriver(
         reader=reader, still_hold_s=0.0, detector=_fixed_detector(), warmup_s=0.0
@@ -199,21 +174,29 @@ def test_same_deviation_fires_on_base_owner() -> None:
     assert driver.events == 1
 
 
-def test_same_deviation_yields_zero_events_under_a_non_base_owner() -> None:
-    """The SAME deviation, but a gesture owns the head -> detection is suspended."""
+def test_same_deviation_yields_zero_events_while_command_is_moving() -> None:
+    """The same physical samples are ignored while the command keeps moving."""
     reader = _Reader()
     driver = PatSenseDriver(
-        reader=reader, still_hold_s=0.0, detector=_fixed_detector(), warmup_s=0.0
+        reader=reader, still_hold_s=0.5, detector=_fixed_detector(), warmup_s=0.0
     )
-    _scratch_sequence(driver, reader, T0, owner=GESTURE_OWNER)
+    for i, actual in enumerate(((-3.0, 0.0), (0.0, 0.0), (-3.0, 0.0))):
+        _drive(
+            driver,
+            reader,
+            actual,
+            T0 + i * DT,
+            owner=GESTURE_OWNER,
+            pitch=float(i + 1),
+        )
     assert driver.peek() is None
     assert driver.events == 0
-    # The reader is not even consulted while suspended (no work, no read).
+    # The reader is not consulted until the complete command settles.
     assert reader.calls == 0
 
 
-def test_unowned_head_is_treated_as_base_and_detects() -> None:
-    """``ownership['head'] is None`` (a steady neutral pose) is NOT suspended."""
+def test_unowned_settled_head_detects() -> None:
+    """A steady neutral pose remains senseable with no channel owner."""
     reader = _Reader()
     driver = PatSenseDriver(
         reader=reader, still_hold_s=0.0, detector=_fixed_detector(), warmup_s=0.0
@@ -222,22 +205,21 @@ def test_unowned_head_is_treated_as_base_and_detects() -> None:
     assert driver.peek() == ("scratch", "level1")
 
 
-def test_rebaseline_on_resume_and_persistent_deviation_does_not_fire() -> None:
-    """#66: a gesture suspends detection; on return to base the detector resets,
-    and a deviation that persists across the resume must not fire spuriously."""
+def test_ownership_edge_rebaseline_prevents_cross_owner_press_pairing() -> None:
+    """An owner change clears half a press pair without erasing learned bias."""
     reader = _Reader()
     detector = _fixed_detector()
     driver = PatSenseDriver(reader=reader, still_hold_s=0.0, detector=detector, warmup_s=0.0)
 
-    # Phase A: while a gesture owns the head, a full oscillating pat fires nothing.
-    _scratch_sequence(driver, reader, T0, owner=GESTURE_OWNER)
+    # One press edge lands under the first owner, but is not enough to fire.
+    _drive(driver, reader, (0.0, 0.0), T0, owner=GESTURE_OWNER)
+    _drive(driver, reader, (-3.0, 0.0), T0 + DT, owner=GESTURE_OWNER)
+    _drive(driver, reader, (0.0, 0.0), T0 + 2 * DT, owner=GESTURE_OWNER)
     assert driver.events == 0
-    assert detector._state == "idle"  # never advanced while suspended
+    assert len(detector.press_times) == 1
 
-    # Phase B: ownership returns to base with the head still pressed (persistent
-    # deviation carried over). The first base tick re-baselines (reset), so the
-    # settled/offset pose seeds a clean baseline. A SUSTAINED press is a single
-    # edge (< min_presses) and must NOT fire.
+    # Ownership changes with the head held away from command. The edge clears
+    # the old press and reseeds conditioning, so the persistent hold cannot pair.
     for i in range(4):
         _drive(driver, reader, (-3.0, 0.0), T0 + (3 + i) * DT, owner=BASE_OWNER)
         assert driver.peek() is None, f"steady deviation fired spuriously at step {i}"
@@ -256,13 +238,13 @@ def test_rebaseline_on_resume_and_persistent_deviation_does_not_fire() -> None:
     assert driver.events == 1
 
 
-def test_detector_not_advanced_while_suspended() -> None:
-    """A suspended tick performs no ``detector.update`` (state is untouched)."""
+def test_detector_not_advanced_while_complete_command_moves() -> None:
+    """A command-motion blocked tick performs no detector update or pose read."""
     reader = _Reader(value=(-3.0, 0.0))
     detector = _fixed_detector()
-    driver = PatSenseDriver(reader=reader, still_hold_s=0.0, detector=detector, warmup_s=0.0)
+    driver = PatSenseDriver(reader=reader, still_hold_s=0.5, detector=detector, warmup_s=0.0)
     for i in range(10):
-        driver(_ctx(now=T0 + i * DT, owner=GESTURE_OWNER, pitch=0.0))
+        driver(_ctx(now=T0 + i * DT, owner=GESTURE_OWNER, pitch=0.05 * i))
     assert len(detector.deviation_history) == 0  # update() never ran
     assert reader.calls == 0
 
@@ -467,7 +449,7 @@ def test_real_pat_during_wander_still_fires() -> None:
 # presses — observed live as a fire at boot and a fire seconds after a
 # gesture ended. The warmup mutes LATCHING (never the detector update, which
 # is the convergence itself) for warmup_s after boot and after every
-# suspended -> resumed re-baseline.
+# gap-edge re-baseline.
 
 
 def test_boot_ghost_is_muted_by_default_warmup() -> None:
@@ -485,7 +467,11 @@ def test_pat_after_boot_warmup_fires() -> None:
     """The same pat AFTER the warmup window fires normally."""
     reader = _Reader()
     driver = PatSenseDriver(
-        reader=reader, still_hold_s=0.0, detector=_fixed_detector(), warmup_s=2.0
+        reader=reader,
+        still_hold_s=0.0,
+        detector=_fixed_detector(),
+        warmup_s=2.0,
+        max_observation_gap_s=0.0,
     )
     _drive(driver, reader, (0.0, 0.0), T0)  # first update arms warmup [T0, T0+2)
     _scratch_sequence(driver, reader, T0 + 2.5)
@@ -543,29 +529,20 @@ def test_real_pat_right_after_resume_fires_no_deadzone() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Stillness gate vs ownership gate — separate flags (Qodo #3 on PR #83)       #
+# Gap-entry interaction-clear call counts                                     #
 # --------------------------------------------------------------------------- #
 #
-# The stillness gate (#80) and the ownership gate (#66) are independent
-# conditions tracked by two separate flags, `_suspended` (ownership) and
-# `_stillness_blocked` (stillness). Before this fix both gates shared
-# `_suspended`, so under ordinary continuous wander -- where the stillness
-# gate closes and reopens every tick while ownership never changes -- the
-# ownership resume block (`clear_presses()` + a full filter/high-pass/clock
-# reseed) ran on EVERY tick of the moving stretch instead of firing once per
-# genuine suspended -> resumed edge. These tests spy on
-# `PatDetector.clear_presses` (the resume block's signature call) to pin the
-# call COUNT, not just the resulting events -- the churn was invisible to the
-# existing event-count assertions because the resets were idempotent.
+# Command-motion and ownership edges both invalidate temporal pairing, but each
+# contiguous gap must clear exactly once at entry. These tests spy on
+# ``PatDetector.clear_interaction`` to pin call counts, not just event output.
 
 
 class _CountingDetector(PatDetector):
-    """A :class:`PatDetector` that counts ``clear_presses()`` calls.
+    """A :class:`PatDetector` that counts interaction-clear calls.
 
-    Standing in for a spy: the resume/re-baseline block's one distinctive,
-    side-effecting call is ``clear_presses()`` (see
-    ``PatSenseDriver._rebaseline_after_gap``), so counting it pins exactly how
-    many times that block ran without needing to reach into driver internals.
+    Standing in for a spy: the distinctive, side-effecting call is
+    ``clear_interaction()``, so counting it pins exactly
+    one interaction end at gap entry without reaching into driver internals.
     """
 
     def __init__(self, **kw) -> None:
@@ -573,24 +550,18 @@ class _CountingDetector(PatDetector):
         super().__init__(**kw)
         self.clear_presses_calls = 0
 
-    def clear_presses(self) -> None:
+    def clear_interaction(self) -> None:
         self.clear_presses_calls += 1
-        super().clear_presses()
+        super().clear_interaction()
 
 
-def test_continuous_wander_does_not_rerun_ownership_resume_every_tick() -> None:
-    """The churn this fix removes: continuous commanded motion, ownership held
-    constant on the base layer the whole time, must NOT re-run the ownership
-    resume path every tick.
+def test_continuous_wander_clears_once_on_entry_not_every_tick() -> None:
+    """Continuous command motion clears once at its first blocked edge.
 
     The stillness gate stays CLOSED for the entire run (each tick's commanded
     pitch moves well past ``still_eps``), so the sense never detects at all --
-    but ownership never changes either, so there is no genuine ownership edge
-    anywhere in this trace. Before the fix, reusing `_suspended` for the
-    stillness gate meant the resume block (and its `clear_presses()` call)
-    fired on every tick but the first of the moving stretch, even though
-    ownership was rock steady on `BASE_OWNER` throughout. FAILS before the
-    fix (many calls), PASSES after (zero -- no edge ever occurred)."""
+    ownership is constant, so the same gap remains open for the whole trace.
+    Interaction clear therefore runs once, not once per moving tick."""
     reader = _Reader()
     detector = _CountingDetector()
     # Default stillness gate (still_hold_s=DEFAULT_STILL_HOLD_S): ON.
@@ -601,17 +572,15 @@ def test_continuous_wander_does_not_rerun_ownership_resume_every_tick() -> None:
         _drive(driver, reader, (0.0, 0.0), now, owner=BASE_OWNER, pitch=0.05 * i)
         now += DT
 
-    assert detector.clear_presses_calls == 0
+    assert detector.clear_presses_calls == 1
     # The reader is never even consulted while the stillness gate is closed
     # (the driver returns before reaching the actual-pose read) -- a second,
     # independent signal that no per-tick "resume and sense" work ran.
     assert reader.calls == 0
 
 
-def test_stillness_unblock_rebaselines_exactly_once() -> None:
-    """The genuine stillness blocked -> unblocked edge still fires its own
-    one-time re-baseline, symmetric with the ownership edge but through the
-    SEPARATE `_stillness_blocked` flag (so it never touches `_suspended`)."""
+def test_stillness_gap_clears_on_entry_and_not_again_on_unblock() -> None:
+    """A stillness gap clears on entry; recovery only reseeds conditioning."""
     reader = _Reader()
     detector = _CountingDetector()
     driver = PatSenseDriver(
@@ -623,11 +592,11 @@ def test_stillness_unblock_rebaselines_exactly_once() -> None:
     for i in range(20):
         _drive(driver, reader, (0.0, 0.0), now, owner=BASE_OWNER, pitch=0.05 * i)
         now += DT
-    assert detector.clear_presses_calls == 0  # never opened yet -> no resume
+    assert detector.clear_presses_calls == 1
 
     # Now hold the commanded pose perfectly still for longer than
     # still_hold_s: the gate opens exactly once, and the resume block must
-    # fire exactly once -- not zero (the edge is real), not many (no churn).
+    # reseed conditioning without clearing the interaction a second time.
     held_pitch = 0.05 * 19
     for _ in range(40):  # 40 * DT(0.1) = 4.0 s, comfortably past still_hold_s
         now += DT
@@ -635,22 +604,21 @@ def test_stillness_unblock_rebaselines_exactly_once() -> None:
     assert detector.clear_presses_calls == 1
 
 
-def test_ownership_resume_still_rebaselines_exactly_once() -> None:
-    """A genuine ownership suspended -> resumed edge must still perform its
-    one-time re-baseline -- separating the stillness gate from `_suspended`
-    must not silently drop the case it was originally built to handle (#66).
-    The stillness gate is disabled here (``still_hold_s=0.0``) so only the
-    ownership edge is under test."""
+def test_ownership_edge_clears_interaction_exactly_once() -> None:
+    """An ownership edge clears once even with an unchanged pose.
+
+    The stillness gate is disabled so only the ownership edge is under test.
+    """
     reader = _Reader()
     detector = _CountingDetector()
     driver = PatSenseDriver(reader=reader, still_hold_s=0.0, detector=detector, warmup_s=0.0)
 
-    # A gesture owns the head for a few ticks: suspended, no resume yet.
+    # A gesture owns the settled pose for a few ticks: no edge yet.
     for i in range(5):
         _drive(driver, reader, (0.0, 0.0), T0 + i * DT, owner=GESTURE_OWNER)
     assert detector.clear_presses_calls == 0
 
-    # Ownership returns to base: exactly one resume tick.
+    # Ownership returns to base: exactly one edge.
     _drive(driver, reader, (0.0, 0.0), T0 + 5 * DT, owner=BASE_OWNER)
     assert detector.clear_presses_calls == 1
 
@@ -668,13 +636,9 @@ def test_ownership_resume_still_rebaselines_exactly_once() -> None:
 def test_gesture_ending_at_the_same_commanded_pose_re_arms_the_stillness_hold() -> None:
     """A gesture must not hand straight back to a WIDE-OPEN stillness gate.
 
-    ``_commanded_still`` is never reached while a non-base owner holds the head,
-    so the gate's timing state freezes at its pre-gesture values. When a gesture
-    ends by returning the head to EXACTLY the pose it started from — what
-    happens whenever there is no base layer — nothing registers as commanded
-    motion, and a stale ``_last_motion_t`` would satisfy the hold instantly,
-    sensing straight into the plant's ring-down from the gesture. The resume
-    re-arms the hold, so the first post-gesture ticks stay gated.
+    When ownership changes at exactly the same numeric pose, the command vector
+    alone cannot reveal the handoff. The owner edge therefore re-arms the hold,
+    so the first post-handoff ticks cannot sense into plant ring-down.
     """
     reader = _Reader()
     driver = PatSenseDriver(reader=reader, detector=_fixed_detector(), warmup_s=0.0)

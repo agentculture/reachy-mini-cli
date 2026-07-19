@@ -31,6 +31,7 @@ Covers:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import logging
@@ -43,7 +44,7 @@ from reachy.behavior import library as behavior_library
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.rule_engine import RuleEngine, TickBus, compose_rule_seam
 from reachy.behavior.rules import RulesConfig
-from reachy.behavior.sense import EMPTY_SENSE, Sense
+from reachy.behavior.sense import EMPTY_SENSE, PatState, Sense
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.export.blocks import BLOCKS, Selection
 from reachy.export.exporter import JsonlExporter
@@ -146,6 +147,40 @@ class TestEventShapes:
         )
         d = json.loads(runtime_to_jsonl(ev))
         assert d["doa"] is None and d["pat"] is None and d["face"] is None
+
+    def test_pat_state_serializes_as_a_parallel_object(self):
+        ev = SenseEvent(
+            doa=None,
+            speech=False,
+            rms=None,
+            pat=["side_pat", "level1"],
+            face=None,
+            frame_available=False,
+            pat_state={
+                "availability": "available",
+                "contact": True,
+                "touch_type": "side_pat",
+                "level": "level1",
+                "yaw_deg": -3.25,
+                "phase": "receptive",
+                "phase_started_at": 10.0,
+                "last_press_at": 10.4,
+            },
+        )
+
+        d = json.loads(runtime_to_jsonl(ev))
+
+        assert d["pat"] == ["side_pat", "level1"]
+        assert d["pat_state"] == {
+            "availability": "available",
+            "contact": True,
+            "touch_type": "side_pat",
+            "level": "level1",
+            "yaw_deg": -3.25,
+            "phase": "receptive",
+            "phase_started_at": 10.0,
+            "last_press_at": 10.4,
+        }
 
     def test_rule_event_fire_roundtrip(self):
         ev = RuleEvent(
@@ -306,6 +341,103 @@ class TestToRuntimeEvent:
         assert isinstance(mapped, SenseEvent)
         assert mapped.pat == ["scratch", "level1"]  # tuple -> list
 
+    def test_old_raw_sense_shape_parses_and_serializes_without_pat_state(self):
+        raw = {
+            "type": "sense",
+            "doa": 0.5,
+            "speech": False,
+            "rms": None,
+            "pat": ("scratch", "level1"),
+            "face": None,
+            "frame_available": False,
+            "ts": 3.0,
+            "tick": 4,
+        }
+
+        mapped = to_runtime_event(raw)
+
+        assert isinstance(mapped, SenseEvent)
+        assert mapped.pat_state is None
+        encoded = json.loads(runtime_to_jsonl(mapped))
+        assert "pat_state" not in encoded
+        assert encoded["pat"] == ["scratch", "level1"]
+
+    def test_unknown_pat_state_fields_are_ignored(self):
+        raw = {
+            "type": "sense",
+            "pat_state": {
+                "availability": "available",
+                "contact": True,
+                "touch_type": "side_pat",
+                "level": "level1",
+                "yaw_deg": 2.5,
+                "phase": "receptive",
+                "phase_started_at": 1.0,
+                "last_press_at": 1.2,
+                "future_strength": 9000,
+            },
+            "future_top_level": "ignored",
+        }
+
+        mapped = to_runtime_event(raw)
+
+        assert isinstance(mapped, SenseEvent)
+        assert mapped.pat_state == {
+            "availability": "available",
+            "contact": True,
+            "touch_type": "side_pat",
+            "level": "level1",
+            "yaw_deg": 2.5,
+            "phase": "receptive",
+            "phase_started_at": 1.0,
+            "last_press_at": 1.2,
+        }
+
+    @pytest.mark.parametrize("malformed", ["not-an-object", ["available"], 42])
+    def test_malformed_pat_state_isolated_from_legacy_sense(self, malformed):
+        mapped = to_runtime_event(
+            {
+                "type": "sense",
+                "pat": ("scratch", "level1"),
+                "pat_state": malformed,
+            }
+        )
+
+        assert isinstance(mapped, SenseEvent)
+        assert mapped.pat == ["scratch", "level1"]
+        assert mapped.pat_state is None
+
+    def test_malformed_pat_state_fields_degrade_independently(self):
+        mapped = to_runtime_event(
+            {
+                "type": "sense",
+                "pat": ("scratch", "level1"),
+                "pat_state": {
+                    "availability": [],
+                    "contact": "yes",
+                    "touch_type": {},
+                    "level": [],
+                    "yaw_deg": {},
+                    "phase": [],
+                    "phase_started_at": float("nan"),
+                    "last_press_at": float("inf"),
+                },
+            }
+        )
+
+        assert isinstance(mapped, SenseEvent)
+        assert mapped.pat == ["scratch", "level1"]
+        assert mapped.pat_state == {
+            "availability": "unavailable",
+            "contact": False,
+            "touch_type": None,
+            "level": None,
+            "yaw_deg": None,
+            "phase": "idle",
+            "phase_started_at": None,
+            "last_press_at": None,
+        }
+
     def test_unknown_type_maps_to_none(self):
         assert to_runtime_event({"type": "cognition.thinking", "ts": 1.0}) is None
 
@@ -458,6 +590,90 @@ class TestSenseSnapshotDriver:
         ctx = _Ctx(now=0.1, tick=1, sense=Sense(pat_event=("scratch", "level1")))
         driver(ctx)
         assert ctx.events[0]["pat"] == ["scratch", "level1"]
+
+    def test_pat_state_serializes_without_changing_legacy_pat(self):
+        state = PatState(
+            availability="available",
+            contact=True,
+            touch_type="side_pat",
+            level="level1",
+            yaw_deg=-3.25,
+            phase="receptive",
+            phase_started_at=10.0,
+            last_press_at=10.4,
+        )
+        driver = SenseSnapshotDriver()
+        ctx = _Ctx(
+            now=10.5,
+            tick=1,
+            sense=Sense(pat_event=("side_pat", "level1"), pat_state=state),
+        )
+
+        driver(ctx)
+
+        assert ctx.events[0]["pat"] == ["side_pat", "level1"]
+        assert ctx.events[0]["pat_state"] == {
+            "availability": "available",
+            "contact": True,
+            "touch_type": "side_pat",
+            "level": "level1",
+            "yaw_deg": -3.25,
+            "phase": "receptive",
+            "phase_started_at": 10.0,
+            "last_press_at": 10.4,
+        }
+
+    def test_stable_pat_hold_emits_once_across_fifty_hz_ticks(self):
+        state = PatState(
+            availability="available",
+            contact=True,
+            touch_type="scratch",
+            level="level1",
+            phase="receptive",
+            phase_started_at=1.0,
+            last_press_at=1.2,
+        )
+        driver = SenseSnapshotDriver()
+        ctx = _Ctx(sense=Sense(pat_state=state))
+
+        for tick in range(1, 101):
+            ctx.tick = tick
+            ctx.now = tick / 50.0
+            driver(ctx)
+
+        assert len(ctx.events) == 1
+
+    def test_each_meaningful_pat_transition_emits_once(self):
+        state = PatState(
+            availability="available",
+            contact=True,
+            touch_type="side_pat",
+            level="level1",
+            yaw_deg=-2.0,
+            phase="receptive",
+            phase_started_at=1.0,
+            last_press_at=1.2,
+        )
+        transitions = [
+            dataclasses.replace(state, last_press_at=1.5),
+            dataclasses.replace(state, yaw_deg=2.0),
+            dataclasses.replace(state, level="level2"),
+            dataclasses.replace(state, phase="contentment", phase_started_at=4.0),
+            dataclasses.replace(state, availability="blocked"),
+            dataclasses.replace(state, contact=False, phase="released", phase_started_at=5.0),
+        ]
+        driver = SenseSnapshotDriver()
+        ctx = _Ctx(sense=Sense(pat_state=state))
+        driver(ctx)
+
+        for tick, changed in enumerate(transitions, start=2):
+            ctx.tick = tick
+            ctx.now = tick / 10.0
+            ctx.sense = Sense(pat_state=changed)
+            driver(ctx)
+            driver(ctx)  # same transition never emits twice
+
+        assert len(ctx.events) == 1 + len(transitions)
 
 
 # --------------------------------------------------------------------------- #

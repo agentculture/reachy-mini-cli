@@ -29,7 +29,7 @@ from typing import Callable
 from reachy.behavior import control as control_mod
 from reachy.behavior import library
 from reachy.behavior.arbitration import admit, arbitrate
-from reachy.behavior.model import Behavior, Lifetime, StopClass, neutral_head
+from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass, neutral_head
 from reachy.behavior.sense import EMPTY_SENSE, Sense
 from reachy.cli._errors import CliError
 from reachy.looputil import (
@@ -254,11 +254,13 @@ class Engine:
 
     # --- composition -----------------------------------------------------
     def compose_tick(self, now: float, sense: Sense = EMPTY_SENSE) -> dict:
-        """Drop expired, arbitrate, and compose one complete pose. Mutates ``active``.
+        """Drop expired/completed, arbitrate, and compose a pose. Mutates ``active``.
 
         Every live behavior is asked for its contribution once (not just owners) so
         abstention-aware :func:`arbitrate` can fall a channel through to the next
-        claimant when its nominal owner returns ``None`` for it.
+        claimant when its nominal owner returns ``None`` for it. Contributions that
+        explicitly set ``done`` are removed before arbitration, releasing every
+        claimed channel in the same tick; their ids are reported in ``completed``.
         """
         live: list[ActiveBehavior] = []
         expired: list[str] = []
@@ -269,22 +271,44 @@ class Engine:
                 live.append(ab)
         self.active = live
 
-        behaviors = [ab.behavior for ab in live]
         # Only sensor-driven behaviors are fed the live snapshot; everything else
         # gets EMPTY_SENSE, so a behavior can't accidentally become sensor-
         # dependent just because some other behavior is polling.
-        contribs: dict[str, object] = {
+        contribs: dict[str, Contribution] = {
             ab.behavior.id: ab.behavior.contribution(
                 now - ab.start_t, sense if ab.behavior.wants_sense else EMPTY_SENSE
             )
             for ab in live
         }
+        # `getattr(..., "done", False)` rather than `contribs[id].done`: arbitrate()
+        # already treats a missing or malformed contribution as an abstention, and a
+        # boot-persistent presence loop must degrade the same way here — one behavior
+        # breaking its return contract cannot be allowed to kill the tick.
+        completed = [
+            ab.behavior.id for ab in live if getattr(contribs.get(ab.behavior.id), "done", False)
+        ]
+        if completed:
+            completed_ids = set(completed)
+            live = [ab for ab in live if ab.behavior.id not in completed_ids]
+            self.active = live
+            contribs = {
+                behavior_id: contribution
+                for behavior_id, contribution in contribs.items()
+                if behavior_id not in completed_ids
+            }
+
+        behaviors = [ab.behavior for ab in live]
         owners = arbitrate(behaviors, contribs)
         pose = _compose_pose(owners, contribs)
         ownership = {ch: (o.id if o is not None else None) for ch, o in owners.items()}
         self._last_ownership = ownership
         self._last_sense = sense
-        return {"pose": pose, "ownership": ownership, "expired": expired}
+        return {
+            "pose": pose,
+            "ownership": ownership,
+            "expired": expired,
+            "completed": completed,
+        }
 
     # --- snapshot --------------------------------------------------------
     def state(self, now: float, config: EngineConfig) -> dict:
@@ -452,7 +476,7 @@ def _drive(
         changed = _apply_commands(engine, control, t)
         snapshot = _read_sense(engine, sense, t, force=tick_seam is not None)
         tick = engine.compose_tick(t, snapshot)
-        changed = changed or bool(tick["expired"])
+        changed = changed or bool(tick["expired"] or tick["completed"])
         consecutive = _stream_tick(sink, tick["pose"], consecutive, config.max_errors)
         ticks += 1
         # Publish the engine's state snapshot BEFORE the seam runs: a seam rider

@@ -52,45 +52,25 @@ one tick sees one consistent reading. The clear-before-process rule holds on
 into a second tick's sense.
 
 --------------------------------------------------------------------------
-Ownership gate — the #66 phantom-pat fix (a hard requirement)
+Complete-command gate — the #66 phantom-pat fix (a hard requirement)
 --------------------------------------------------------------------------
-While a NON-base behavior owns the head channel (a rule-admitted gesture, a
-goto), the driver **suspends** detection entirely: no detector update, no event
-latching. Rationale: a deliberate gesture commands fast head motion that the
-servos physically lag behind, so ``actual - commanded`` reads as a large
-deviation even though nobody touched the robot — a phantom pat. That phantom
-would trigger a reaction, which commands more motion, which reads as more
-deviation: a self-sustaining oscillation. This is issue #66's false-fire loop
-(the folded ``listen`` :class:`~reachy.motion.listen_pat.PatHook` fought the same
-demon and gates the same way). Detection is safe only while the head is quiet —
-which, at runtime, means owned by the engine's gentle ``feel-alive`` base layer
-(slow breathing the servos track) or owned by nobody (a steady neutral pose).
+Detection is safe while the robot holds a complete commanded pose, not while a
+specially named behavior happens to own the head. The stillness vector includes
+all six head axes, body yaw, and both antenna positions. A change in any value
+blocks before the actual-pose reader, and sensing resumes only after the whole
+vector has remained constant for ``still_hold_s``. A reaction can therefore
+keep sensing while it holds a receptive pose.
 
-"Base" is identified from ``ctx.ownership["head"]``, which is the owner's **id**
-(a string) or ``None``. The engine mints every behavior id as ``f"{name}-{seq}"``
-(:meth:`reachy.behavior.engine.Engine._next_id`), so the base layer's id is
-``f"{BASE_LAYER_NAME}-{seq}"`` (e.g. ``"feel-alive-1"``); :func:`_is_base_owner`
-recovers the library name by stripping the trailing numeric ``-<seq>`` and
-compares it to :data:`~reachy.behavior.engine.BASE_LAYER_NAME` — robust to the
-base name itself containing a hyphen (``feel-alive``) because only the *last*
-segment is stripped, and it requires that last segment to be all digits so a
-same-named-but-suffixed behavior can't masquerade as base. ``None`` (no behavior
-owns the head this tick) is treated as **not suspended**: the composed head then
-falls to a steady neutral pose, which is exactly the quiet state a pat is
-detectable against.
+Owner ids are never allowlisted. An ownership edge still invalidates temporal
+pairing even if the numeric pose is unchanged: it ends the ordinary interaction
+immediately, publishes blocked idle state, and re-arms the quiet hold. Filter
+conditioning is reseeded when the complete-command gate next opens.
 
-On the FIRST tick after ownership returns to base — the suspended -> resumed
-edge — the driver calls :meth:`PatDetector.clear_presses` before feeding any
-fresh sample: press pairing/edge state from before the gesture is dropped so
-edges can never pair across the suspension, while the EMA baselines — the
-*learned* commanded-vs-actual frame offset — are KEPT. This is
-``clear_presses``'s documented purpose; a full :meth:`PatDetector.reset` here
-would wipe the baselines and make the offset read as fresh presses until the
-slow EMA re-learns (~13 s) — the post-gesture ghost-fire chain both the folded
-``listen`` hook and this driver's first live deployment hit (d1, issue #79).
-The initial convergence at boot is instead covered by a one-time warmup mute
-(:data:`DEFAULT_WARMUP_S`): the detector updates normally (that is the
-learning) but events are not latched until the window passes.
+Opening a gap calls :meth:`PatDetector.clear_interaction`: press pairing,
+evidence, and the interaction FSM/level clock are dropped immediately while
+learned EMA baselines and the event cooldown are kept. A full reset would make the
+calibration offset read as fresh presses until the slow EMA relearns. Initial
+convergence at boot is instead covered by the one-time warmup mute.
 
 --------------------------------------------------------------------------
 r1 — frame / unit mapping (commanded vs actual)
@@ -122,8 +102,8 @@ absorbed; no explicit re-framing is applied.
 --------------------------------------------------------------------------
 Lag compensation — the d1 live fix (issue #79)
 --------------------------------------------------------------------------
-The first live deployment falsified an assumption the ownership gate rested
-on: that the base layer's own motion is too small/slow to matter. It is not —
+The first live deployment showed that the base layer's own motion is not too
+small or slow to matter:
 ``feel-alive`` commands gaze wander of ±7° pitch / ±12° yaw (measured actual
 pitch span on the robot: ~13°), and the servos track the streamed pose with a
 transport+plant lag ``L``, so ``actual(t) ≈ commanded(t − L)``. Comparing
@@ -144,42 +124,25 @@ tracking-lag deviation cancels; a real pat — an *external* force the command
 stream knows nothing about — still produces a fast actual-vs-filtered spike
 and fires exactly as before. The filter seeds at the first commanded sample
 (so a static commanded pose behaves identically to the unfiltered driver from
-tick one) and re-seeds on every detection-gap edge alongside the detector
-re-baseline — the ownership suspended→resumed edge and the stillness
-blocked→unblocked edge alike (see "Stillness gate churn fix" below).
+tick one) and re-seeds when every detection gap recovers — ownership and
+complete-command gaps alike.
 ``lag_tau=0`` disables the filter (raw passthrough).
 
 --------------------------------------------------------------------------
-Stillness gate churn fix — two flags, one re-baseline (PR #83, Qodo #3)
+Gap lifecycle
 --------------------------------------------------------------------------
-The ownership gate (above) and the stillness gate (#80, below) are
-independent conditions — one tracks WHO drives the head, the other tracks
-WHETHER the commanded pose is currently moving — so they are tracked by two
-separate flags, :attr:`PatSenseDriver._suspended` and
-:attr:`PatSenseDriver._stillness_blocked`, each owning exactly one
-suspended/blocked → resumed/unblocked EDGE.
-
-The first stillness-gate implementation (#80) reused ``_suspended`` for both
-concepts. That was wrong in a way the tests didn't catch because the
-*output* stayed correct: under continuous idle wander (the ordinary case)
-the stillness gate is closed almost every tick, so ``_process`` set
-``_suspended = True`` on every blocked tick; on the *very next* tick the
-ownership resume block (which only checks "was ``_suspended`` true") saw
-that flag set and ran its full re-baseline — ``clear_presses()``, filter
-reseed, clock reseed — even though ownership had never changed. That
-re-baseline then immediately set ``_suspended = True`` again via the
-stillness check. Net effect: the ownership resume path, meant to fire *once*
-per genuine suspension, ran on *every* tick of ordinary wander at 50 Hz —
-avoidable per-tick work, and a state machine where a real ownership edge was
-indistinguishable from this routine thrash.
-
-The fix keeps ``_suspended`` exclusive to the ownership gate and gives the
-stillness gate its own ``_stillness_blocked`` flag with its own edge-detected
-resume block. Both edges call the same :meth:`PatSenseDriver._rebaseline_after_gap`
-helper (``clear_presses`` + filter/high-pass/clock reseed, baselines kept)
-because both represent the identical situation from the detector's point of
-view — a run of ticks where :meth:`PatDetector.update` was never called; see
-that method's own docstring for the full reasoning.
+Command motion, ownership changes, malformed pose data, and missing actual-pose
+readings are detection gaps. A logical observation interval over 0.2 seconds is
+also a gap; true wall-clock tick overruns live outside this driver and remain an
+integration responsibility. The first blocked/unavailable edge ends the
+ordinary interaction immediately, preserving detector calibration and event
+cooldown; repeated unsafe ticks do not churn that reset. Recovery only reseeds
+the lag/high-pass state. ``PatState`` keeps ``blocked`` distinct from
+``unavailable`` and publishes idle/no-contact throughout either gap. If the
+interaction had reached ``enough`` or was already cooling down, its hidden
+five-second cooldown debt is preserved: unsafe wall time consumes none of it,
+and the full or remaining budget resumes on the first safe observation before
+ordinary detector updates are admitted again.
 
 --------------------------------------------------------------------------
 Degradation
@@ -208,9 +171,12 @@ from :mod:`reachy.behavior.engine`; the reader is duck-typed (a zero-arg
 from __future__ import annotations
 
 import logging
+import math
+import random
+from dataclasses import replace
 from typing import Callable
 
-from reachy.behavior.engine import BASE_LAYER_NAME
+from reachy.behavior.sense import UNAVAILABLE_PAT_STATE, PatState
 from reachy.motion.pat import PatDetector
 
 logger = logging.getLogger(__name__)
@@ -280,37 +246,34 @@ DEFAULT_RELEASE_THRESHOLD = 0.2
 DEFAULT_STILL_EPS = 0.01
 DEFAULT_STILL_HOLD_S = 0.5  # commanded must be quiet this long before sensing
 
+#: Longest interval between logical observation ticks that can preserve an
+#: interaction. The 50 Hz engine normally supplies 0.02 s; ten missed ticks is
+#: an input discontinuity, so the ordinary detector must re-earn stillness and
+#: begin a fresh interaction. This is deliberately separate from wall-clock
+#: ``TickMetrics`` overruns, which this driver cannot observe.
+DEFAULT_MAX_OBSERVATION_GAP_S = 0.2
+
 #: Nominal tick period (seconds) used for the filter step when ``ctx.now`` is
 #: unavailable — the engine's 50 Hz default.
 _NOMINAL_DT = 0.02
 
-#: BOOT-ONLY warmup (seconds) during which detected events are MUTED while the
+#: BOOT-ONLY warmup (seconds) during which classification is MUTED while the
 #: detector's EMA baseline first converges. The EMA (``baseline_alpha`` 0.003
 #: at 50 Hz) has a ~6.7 s time constant; learning the several-degree
 #: commanded-vs-actual frame offset down past the release threshold takes ~2x
 #: that, and until then offset + wander edges read as presses — the fire at
 #: boot observed live (d1, issue #79). The detector keeps UPDATING through
-#: warmup (that update IS the convergence); only latching is muted. Resume
-#: edges do NOT re-arm this: they call ``clear_presses()``, which keeps the
-#: learned baselines, so there is no post-gesture deadzone.
+#: warmup (that update IS the convergence), while both the event latch and
+#: persistent PatState remain idle. Exit clears the learned interaction once;
+#: later gap edges keep the baselines, so there is no post-gesture deadzone.
 DEFAULT_WARMUP_S = 15.0
 
-
-def _is_base_owner(owner_id: str | None) -> bool:
-    """Whether ``owner_id`` names the engine's seeded base layer (``feel-alive``).
-
-    Ids are minted as ``f"{name}-{seq}"`` by
-    :meth:`reachy.behavior.engine.Engine._next_id`, so the base layer's id is
-    ``f"{BASE_LAYER_NAME}-{seq}"`` (e.g. ``"feel-alive-1"``). The library name is
-    recovered by stripping the trailing numeric ``-<seq>`` and compared to
-    :data:`BASE_LAYER_NAME`. ``None`` (no owner this tick) is NOT the base layer.
-    The digit guard means a differently-suffixed behavior (id ``"feel-alive"``
-    with no numeric seq, or ``"feel-alive-foo-2"``) is not mistaken for base.
-    """
-    if owner_id is None:
-        return False
-    name, _, seq = owner_id.rpartition("-")
-    return bool(seq) and seq.isdigit() and name == BASE_LAYER_NAME
+CONTENTMENT_AFTER_S = 4.0
+WARNING_AFTER_S = 8.0
+ENOUGH_MAX_S = 12.0
+RELEASE_AFTER_S = 1.0
+ENOUGH_COOLDOWN_S = 5.0
+_HEAD_AXES = ("x", "y", "z", "roll", "pitch", "yaw")
 
 
 class PatSenseDriver:
@@ -323,7 +286,7 @@ class PatSenseDriver:
     driver reads the actual pose, takes the commanded head pose from
     ``ctx.pose``, advances the detector, and latches any event for the NEXT
     tick's single sense read (see the module docstring for the full cadence,
-    ownership gate, frame mapping, and degradation contract).
+    complete-command gate, frame mapping, and degradation contract).
 
     Parameters
     ----------
@@ -348,6 +311,10 @@ class PatSenseDriver:
         warmup_s: float = DEFAULT_WARMUP_S,
         still_eps: float = DEFAULT_STILL_EPS,
         still_hold_s: float = DEFAULT_STILL_HOLD_S,
+        max_observation_gap_s: float = DEFAULT_MAX_OBSERVATION_GAP_S,
+        enough_after_fn: Callable[[], float] | None = None,
+        release_after_s: float = RELEASE_AFTER_S,
+        cooldown_s: float = ENOUGH_COOLDOWN_S,
     ) -> None:
         self._reader = reader
         self.detector = (
@@ -374,13 +341,16 @@ class PatSenseDriver:
         #: hold required before sensing resumes. ``still_hold_s <= 0`` disables.
         self._still_eps = max(0.0, float(still_eps))
         self._still_hold_s = max(0.0, float(still_hold_s))
+        self._max_observation_gap_s = max(0.0, float(max_observation_gap_s))
+        self._last_observation_at: float | None = None
         #: Last commanded (pitch, yaw) and the clock reading when it last moved.
-        self._last_cmd: tuple[float, float] | None = None
+        self._last_cmd: tuple[float, ...] | None = None
         self._last_motion_t: float | None = None
-        #: Post-(re)baseline event-mute window (s); ``0`` disables (see d1 fix).
+        self._last_owners: tuple[object, object, object] | None = None
+        #: Boot calibration-mute window (s); ``0`` disables (see d1 fix).
         self._warmup_s = max(0.0, float(warmup_s))
-        #: Mute latching until this clock reading (armed at first update + on
-        #: every resume re-baseline); ``None`` = not armed / warmup disabled.
+        #: Mute classification until this clock reading (armed once at boot);
+        #: ``None`` = not armed / warmup disabled.
         self._warmup_until: float | None = None
         #: True until the first detector update arms the initial warmup.
         self._first_update = True
@@ -391,20 +361,34 @@ class PatSenseDriver:
         self._last_now: float | None = None
         #: The one-tick latch: ``(touch_type, level)`` or ``None`` (see r2).
         self._latch: tuple[str, str] | None = None
-        #: True while a non-base behavior owns the head (detection suspended); the
-        #: suspended -> resumed edge triggers a detector re-baseline (see #66 gate).
-        self._suspended = False
         #: True while the commanded pose is not yet still long enough to sense
-        #: (the stillness gate, #80). Deliberately a SEPARATE flag from
-        #: ``_suspended``: ownership and stillness open/close on independent
-        #: conditions, and under ordinary continuous wander this flag flips
-        #: open/closed every tick while ownership never changes at all —
-        #: collapsing the two into one flag made the ownership resume block
-        #: run on every such tick instead of once per real edge (the churn
-        #: fixed by PR #83 / Qodo #3; see the module docstring). The blocked
-        #: -> unblocked edge triggers the SAME re-baseline as the ownership
-        #: edge, via :meth:`_rebaseline_after_gap`.
+        #: (the complete-command stillness gate, #80). The blocked -> unblocked
+        #: edge triggers one conditioning re-seed via :meth:`_reseed_after_gap`.
         self._stillness_blocked = False
+        self._input_gap = False
+        #: Reset at the top of every :meth:`_process`; keeps the per-tick
+        #: conditioning re-seed idempotent however many edges fire at once.
+        self._reseeded_this_tick = False
+        #: One contiguous unsafe observation interval. Interaction state is
+        #: cleared exactly once when this opens; recovery only reseeds filters.
+        self._gap_active = False
+        self._state = UNAVAILABLE_PAT_STATE
+        self._seen_press_at: float | None = None
+        self._active_contact_s = 0.0
+        self._last_available_at: float | None = None
+        self._no_fresh_since: float | None = None
+        self._enough_after_fn = (
+            enough_after_fn
+            if enough_after_fn is not None
+            else lambda: random.uniform(WARNING_AFTER_S, ENOUGH_MAX_S)  # nosec B311
+        )
+        self._enough_after_s = ENOUGH_MAX_S
+        self._release_after_s = max(0.0, float(release_after_s))
+        self._cooldown_s = max(0.0, float(cooldown_s))
+        #: Safe-observation time still owed after ``enough``. Kept separate
+        #: from public PatState so blocked/unavailable gaps can expose idle
+        #: without dropping or consuming the lifecycle cooldown.
+        self._cooldown_remaining_s: float | None = None
         #: Count of pats latched this run (diagnostics / tests).
         self.events = 0
 
@@ -432,68 +416,133 @@ class PatSenseDriver:
             logger.warning("PatSenseDriver tick raised; pat cue dropped", exc_info=True)
 
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
-        """The gated sensing body, split out so :meth:`__call__` stays a thin guard."""
-        # --- ownership gate (#66) --------------------------------------
-        owner = self._head_owner(ctx)
-        if owner is not None and not _is_base_owner(owner):
-            # A non-base behavior drives the head: its commanded motion lags in
-            # the servos and reads as force. Suspend detection entirely.
-            self._suspended = True
-            return
-        if self._suspended:
-            # First tick back on the base layer (a genuine ownership edge —
-            # this branch only runs once per suspension; see the module
-            # docstring's "Stillness gate churn fix" for why that is now
-            # guaranteed). Re-baseline: clear press pairing/edge state, keep
-            # the learned EMA baselines, re-seed the lag filter + high-pass +
-            # their clocks. See :meth:`_rebaseline_after_gap` for the full
-            # reasoning (shared verbatim with the stillness edge below).
-            self._rebaseline_after_gap()
-            # Ownership-edge ONLY: the stillness gate's timing froze when the
-            # gesture took the head, so make it re-earn its quiet window rather
-            # than inherit a stale stamp (colleague review, PR #83).
-            self._rearm_stillness_hold()
-            self._suspended = False
+        """The gated sensing body, split out so :meth:`__call__` stays a thin guard.
+
+        Reads as the gate order it enforces: observation edges, a complete
+        command, the stillness window, a live proprioceptive reading, the policy
+        clock — and only past all of them, an observation.
+        """
+        now = self._now(ctx)
+        # Conditioning is reseeded at most once per tick no matter how many
+        # edges fire; `_reseed_once` owns that, so each gate below stays a
+        # plain guard clause.
+        self._reseeded_this_tick = False
+        self._apply_observation_edges(ctx, now)
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
-        commanded = self._commanded_pitch_yaw(ctx)
-        if commanded is None:
-            return  # a missing/malformed ctx.pose -> skip this tick
-
-        # --- stillness gate (#80) --------------------------------------
-        # The plant is only quiet while it is NOT tracking a moving target, so
-        # sensing is confined to commanded-still windows. This makes the wander
-        # ghost class structurally impossible rather than threshold-managed.
-        #
-        # `_stillness_blocked` is tracked SEPARATELY from `_suspended` (PR #83,
-        # Qodo #3): reusing `_suspended` here made the ownership resume block
-        # above run every tick during ordinary wander (the gate closes and
-        # reopens every tick while ownership never changes) instead of once per
-        # real ownership edge. See the module docstring for the full story.
-        if not self._commanded_still(commanded, self._now(ctx)):
+        commanded_full = self._commanded_pose(ctx)
+        if commanded_full is None:
+            if not self._stillness_blocked:
+                self._rearm_stillness_hold()
             self._stillness_blocked = True
+            self._begin_gap("blocked", now)
             return
-        if self._stillness_blocked:
-            # First tick back on a still commanded pose (a genuine
-            # blocked -> unblocked edge). `detector.update()` was never called
-            # for the whole blocked stretch (this method returned above, every
-            # tick), so from the detector's point of view this is the same
-            # situation as the ownership edge: re-baseline once, via the same
-            # helper, for the same reasons.
-            self._rebaseline_after_gap()
-            self._stillness_blocked = False
+        commanded = (commanded_full[4], commanded_full[5])
+
+        if not self._stillness_open(commanded_full, now):
+            return
 
         # --- actual pose (proprioception) ------------------------------
         actual = self._read_actual()
         if actual is None:
-            return  # reader disconnected / absent / raised -> no reading
+            self._input_gap = True
+            self._begin_gap("unavailable", now)
+            return
+        if self._input_gap:
+            self._reseed_once()
+            self._input_gap = False
 
-        now = self._now(ctx)
+        # The complete command and actual reading are both safe. The gap has
+        # ended, but its interaction was already cleared at entry.
+        recovered_gap = self._gap_active
+        self._gap_active = False
+
+        # Policy time only advances across successful observations. A blocked
+        # command or unavailable reader must never masquerade as contact time,
+        # release time, or cooldown time.
+        self._advance_policy_clock(now)
+        if self._state.phase == "cooldown":
+            self._state = replace(self._state, availability="available")
+            self._last_available_at = now
+            return
+
+        self._observe(commanded, actual, now, recovered_gap)
+
+    def _reseed_once(self) -> None:
+        """Reseed post-gap conditioning at most once per tick."""
+        if self._reseeded_this_tick:
+            return
+        self._reseed_after_gap()
+        self._reseeded_this_tick = True
+
+    def _blocked_edge(self, now: float | None) -> None:
+        """Open a blocked gap and make the stillness gate re-earn its window."""
+        self._begin_gap("blocked", now)
+        self._rearm_stillness_hold()
+        if self._still_hold_s <= 0.0:
+            # With the gate disabled there is no quiet window to re-earn, so
+            # conditioning must be reseeded here instead.
+            self._reseed_once()
+
+    def _apply_observation_edges(  # type: ignore[no-untyped-def]
+        self, ctx, now: float | None
+    ) -> None:
+        """Handle the two edges that mean "samples are missing" before sensing.
+
+        A long or backwards clock jump is the only overrun-like edge visible
+        inside this driver (real wall-clock TickMetrics overruns are observed
+        outside this seam); an ownership change means another behavior drove
+        the head. Both invalidate conditioning the same way.
+        """
+        if self._observation_clock_gapped(now):
+            self._blocked_edge(now)
+        if self._ownership_changed(ctx):
+            self._blocked_edge(now)
+
+    def _stillness_open(self, commanded_full: tuple[float, ...], now: float | None) -> bool:
+        """Whether this tick's commanded pose is inside a sensing-safe still window (#80).
+
+        The plant is only quiet while it is NOT tracking a moving target, so
+        sensing is confined to commanded-still windows. This makes the wander
+        ghost class structurally impossible rather than threshold-managed.
+
+        ``_stillness_blocked`` owns one blocked -> unblocked edge, so ordinary
+        wander cannot rerun interaction clearing on every blocked tick.
+        """
+        if not self._commanded_still(commanded_full, now):
+            self._stillness_blocked = True
+            self._begin_gap("blocked", now)
+            return False
+        if self._stillness_blocked:
+            # First tick back on a still commanded pose (a genuine
+            # blocked -> unblocked edge). `detector.update()` was never called
+            # for the whole blocked stretch (sensing returned early every
+            # tick), so from the detector's point of view this is the same
+            # situation as the ownership edge: reseed conditioning once before
+            # accepting another physical sample.
+            self._reseed_once()
+            self._stillness_blocked = False
+        return True
+
+    def _observe(
+        self,
+        commanded: tuple[float, float],
+        actual: tuple[float, float],
+        now: float | None,
+        recovered_gap: bool,
+    ) -> None:
+        """Condition one past-every-gate sample, feed the detector, latch its event."""
         if self._first_update:
             # Boot: the deviation conditioning below needs ~3x its time constants
             # to converge before events mean anything — mute latching meanwhile.
             self._first_update = False
             self._arm_warmup(now)
+        warmup_was_armed = self._warmup_until is not None
+        warming_up = self._in_warmup(now)
+        if warmup_was_armed and not warming_up and not recovered_gap:
+            # Drop every edge and FSM transition learned while calibration was
+            # converging before accepting the first post-warmup sample.
+            self._end_interaction(now, availability="available")
         commanded_pitch, commanded_yaw = self._lag_filtered(commanded, now)
         actual_pitch, actual_yaw = actual
         # Deviation conditioning (see "Lag compensation + wander rejection"):
@@ -509,12 +558,13 @@ class PatSenseDriver:
             dev_yaw,
             now=now,
         )
-        if event is None:
+        if warming_up:
+            # Baselines continue learning, but muted boot evidence is not an
+            # ordinary interaction and must never leak through PatState.
+            self._publish_warmup_idle(now)
             return
-        if self._in_warmup(now):
-            # The detector keeps updating through warmup (that IS the baseline
-            # convergence) — only the event is dropped, never silently: name it.
-            logger.debug("pat event dropped: warmup (baseline converging)")
+        self._update_pat_state(now)
+        if event is None:
             return
         # PatDetector yields ``(level, touch_type)``; Sense.pat_event is
         # ``(touch_type, level)`` (matching EventBuffer.feed_pat(kind, level)).
@@ -523,81 +573,223 @@ class PatSenseDriver:
         self.events += 1
 
     def _rearm_stillness_hold(self) -> None:
-        """Force the stillness gate to re-earn its quiet window (ownership edge only).
+        """Force the stillness gate to re-earn its quiet window.
 
-        See :meth:`_rebaseline_after_gap` for why this is ownership-specific.
+        See :meth:`_reseed_after_gap` for the matching conditioning reset.
         """
         self._last_cmd = None
         self._last_motion_t = None
 
-    def _rebaseline_after_gap(self) -> None:
-        """Re-baseline after a detection gap — shared by BOTH resume edges.
+    def _reseed_after_gap(self) -> None:
+        """Reseed conditioning when a detection gap becomes safe again.
 
-        The ownership suspended → resumed edge and the stillness blocked →
-        unblocked edge look different from the outside (one is about who
-        drives the head, the other about whether the commanded pose is
-        moving) but they are the identical situation from the detector's
-        point of view: a run of ticks — long or short — during which
-        :meth:`PatDetector.update` was never called, because :meth:`_process`
-        returned early on every one of them. Whatever the detector's
-        press/edge state and the driver's own filters were doing at the
-        moment the gap opened is now stale relative to whatever comes next,
-        so both edges perform the same reset:
-
-        The stillness gate's own timing state (``_last_cmd`` /
-        ``_last_motion_t``) is deliberately NOT reset here — it belongs to the
-        OWNERSHIP edge only, and :meth:`_rearm_stillness_hold` does it there.
-        Clearing it on the stillness edge would be self-defeating: that timing
-        is precisely what just earned the open gate, so wiping it re-closes the
-        gate on the very next tick, thrashing between one open tick and another
-        full ``still_hold_s`` wait.
-
-        Why the ownership edge needs it (colleague review, PR #83):
-        ``_commanded_still`` is
-        never reached while a gesture owns the head, so without a reset a
-        gesture that ends by returning the head to EXACTLY its pre-gesture
-        commanded pose (what happens whenever the base layer is absent, e.g.
-        ``--no-base-layer``) registers no commanded change at all, leaving
-        ``_last_motion_t`` pointing seconds into the past — and the gate
-        would open on the very first post-gesture tick, sensing straight into
-        the plant's ring-down from the gesture — the ghost class re-entering
-        through the back door.
-        * :meth:`PatDetector.clear_presses` — drop press pairing/edge state
-          so it can never pair across the gap, but KEEP the learned EMA
-          baselines. This is deliberate and load-bearing (not a mistake to
-          "improve" into a full :meth:`PatDetector.reset`): a hand can be
-          mid-press at the exact tick a gap opens on EITHER edge — a gesture
-          can grab the head mid-pat, and a pat happens on ACTUAL while the
-          stillness gate reacts only to COMMANDED motion, so the two are
-          uncorrelated and a pat straddling a stillness-gate close/open is
-          equally possible. ``pat.py``'s ``clear_presses`` docstring explains
-          why ``reset`` must not be used here: wiping the baselines makes the
-          learned frame offset read as a fresh press until the slow EMA
-          (~6.7 s time constant) reconverges — the exact post-gesture ghost
-          chain issue #79 hit live.
-        * ``_filtered = None`` / ``_dev_lp = None`` — re-seed the lag filter
-          and the deviation high-pass at the very next sample instead of
-          slewing toward it from a stale value. Both integrate their input
-          over time, and a gap can span a large commanded-pose excursion (a
-          gesture, or several seconds of idle wander), so resuming without a
-          reseed would replay a spurious step transient into the very
-          detector the #79 lag-compensation fix exists to protect.
-        * ``_last_now = None`` / ``_hp_last_now = None`` — keep the ``dt``
-          clocks consistent with the filter/high-pass state they time: left
-          stale, the first post-gap step would compute ``dt`` against a
-          pre-gap timestamp (clamped to 0.2 s and therefore harmless, but
-          not predictable — a colleague review finding on the original
-          ownership edge, carried over here for the identical reason).
-
-        Boot warmup (:data:`DEFAULT_WARMUP_S`) is deliberately NOT re-armed
-        here, on either edge: it is a one-time convergence window for the
-        EMA baselines, which this method never touches.
+        Interaction state was already cleared when the gap opened. Recovery
+        only resets lag/high-pass conditioning so a pose step across the gap
+        cannot replay as a physical press. Learned detector EMA baselines and
+        event cooldown remain untouched. Boot warmup is not re-armed.
         """
-        self.detector.clear_presses()
         self._filtered = None
         self._dev_lp = None
         self._last_now = None
         self._hp_last_now = None
+
+    def _end_interaction(self, now: float | None, *, availability: str) -> None:
+        """Clear detector and persistent policy state at one interaction edge."""
+        if self._state.phase == "enough" and self._cooldown_remaining_s is None:
+            self._cooldown_remaining_s = self._cooldown_s
+        self.detector.clear_interaction()
+        self._seen_press_at = None
+        self._active_contact_s = 0.0
+        self._last_available_at = None
+        self._no_fresh_since = None
+        self._state = PatState(
+            availability=availability,
+            phase="idle",
+            phase_started_at=now,
+        )
+
+    def _begin_gap(self, availability: str, now: float | None) -> None:
+        """Open or update one unsafe interval without repeated clear churn."""
+        if not self._gap_active:
+            self._end_interaction(now, availability=availability)
+            self._gap_active = True
+            return
+        self._state = PatState(
+            availability=availability,
+            phase="idle",
+            phase_started_at=self._state.phase_started_at,
+        )
+        self._last_available_at = None
+        self._no_fresh_since = None
+
+    def _publish_warmup_idle(self, now: float | None) -> None:
+        """Expose calibration as available idle, never as physical contact."""
+        phase_started_at = (
+            self._state.phase_started_at
+            if self._state.availability == "available" and self._state.phase == "idle"
+            else now
+        )
+        self._state = PatState(
+            availability="available",
+            phase="idle",
+            phase_started_at=phase_started_at,
+        )
+
+    def _advance_policy_clock(self, now: float | None) -> None:
+        """Advance cooldown using safe-observation time, pausing across gaps."""
+        if now is None:
+            return
+        if self._state.phase == "enough":
+            self._cooldown_remaining_s = self._cooldown_s
+            self.detector.clear_interaction()
+            self._seen_press_at = None
+            self._active_contact_s = 0.0
+            self._last_available_at = now
+            self._no_fresh_since = None
+            if self._cooldown_remaining_s <= 0.0:
+                self._cooldown_remaining_s = None
+                self._state = PatState(
+                    availability=self._state.availability,
+                    phase="idle",
+                    phase_started_at=now,
+                )
+                return
+            self._state = PatState(
+                availability=self._state.availability,
+                contact=False,
+                phase="cooldown",
+                phase_started_at=now,
+            )
+            return
+
+        remaining = self._cooldown_remaining_s
+        if remaining is None:
+            return
+        if self._state.phase != "cooldown":
+            # First safe observation after a gap: resume the full/remaining
+            # budget without charging any blocked or unavailable wall time.
+            self._last_available_at = now
+            if remaining <= 0.0:
+                self._cooldown_remaining_s = None
+                self._state = PatState(
+                    availability=self._state.availability,
+                    phase="idle",
+                    phase_started_at=now,
+                )
+                return
+            self._state = PatState(
+                availability=self._state.availability,
+                phase="cooldown",
+                phase_started_at=now,
+            )
+            return
+
+        previous_available = self._last_available_at
+        elapsed = max(0.0, now - previous_available) if previous_available is not None else 0.0
+        remaining = max(0.0, remaining - elapsed)
+        self._last_available_at = now
+        if remaining <= 1e-9:
+            self._cooldown_remaining_s = None
+            self._state = PatState(
+                availability=self._state.availability,
+                phase="idle",
+                phase_started_at=now,
+            )
+            return
+        self._cooldown_remaining_s = remaining
+
+    def _update_pat_state(self, now: float | None) -> None:
+        """Fold immutable detector evidence into the persistent interaction ladder.
+
+        A thin three-stage orchestrator: adopt this tick's evidence, then (while
+        contact holds) test the release budget, then walk the contact ladder.
+        """
+        if now is None:
+            self._state = replace(self._state, availability="available")
+            return
+        evidence = self.detector.snapshot()
+        fresh = evidence.last_press_at is not None and evidence.last_press_at != self._seen_press_at
+        previous_available = self._last_available_at
+        self._last_available_at = now
+        dt = max(0.0, now - previous_available) if previous_available is not None else 0.0
+
+        if fresh:
+            self._adopt_fresh_press(evidence, now)
+        else:
+            self._state = replace(self._state, availability="available")
+
+        if not self._state.contact:
+            return
+        if self._release_elapsed(fresh, now):
+            return
+        self._advance_contact_phase(dt, now)
+
+    def _adopt_fresh_press(self, evidence, now: float) -> None:  # type: ignore[no-untyped-def]
+        """Rebuild ``PatState`` around a press the detector has not reported before."""
+        self._seen_press_at = evidence.last_press_at
+        # Release is budgeted from the persisted press anchor, not from
+        # whichever later quiet sample happens to be observed first.
+        self._no_fresh_since = evidence.last_press_at
+        if self._state.phase in ("idle", "released"):
+            self._active_contact_s = 0.0
+            self._enough_after_s = self._draw_enough_after()
+            phase = "receptive"
+            phase_started_at = now
+        else:
+            phase = self._state.phase
+            phase_started_at = self._state.phase_started_at
+        self._state = PatState(
+            availability="available",
+            contact=True,
+            touch_type=evidence.touch_type,
+            level=evidence.level,
+            yaw_deg=evidence.yaw_deg,
+            phase=phase,
+            phase_started_at=phase_started_at,
+            last_press_at=evidence.last_press_at,
+        )
+
+    def _release_elapsed(self, fresh: bool, now: float) -> bool:
+        """Close the interaction when the quiet stretch outlives the release budget.
+
+        Returns ``True`` once the state has been moved to ``released`` — the
+        caller must not then advance the contact ladder.
+        """
+        if not fresh and self._no_fresh_since is None:
+            self._no_fresh_since = now
+        if self._no_fresh_since is None or now - self._no_fresh_since < self._release_after_s:
+            return False
+        self._state = replace(
+            self._state,
+            contact=False,
+            phase="released",
+            phase_started_at=now,
+        )
+        self._last_available_at = now
+        return True
+
+    def _advance_contact_phase(self, dt: float, now: float) -> None:
+        """Accrue contact time and escalate the phase ladder at its thresholds."""
+        self._active_contact_s += dt
+        if self._active_contact_s >= self._enough_after_s:
+            self._state = replace(self._state, phase="enough", phase_started_at=now)
+        elif self._active_contact_s >= WARNING_AFTER_S and self._state.phase != "warning":
+            self._state = replace(self._state, phase="warning", phase_started_at=now)
+        elif self._active_contact_s >= CONTENTMENT_AFTER_S and self._state.phase == "receptive":
+            self._state = replace(
+                self._state,
+                phase="contentment",
+                phase_started_at=now,
+            )
+
+    def _draw_enough_after(self) -> float:
+        try:
+            value = float(self._enough_after_fn())
+        except Exception:  # noqa: BLE001
+            value = ENOUGH_MAX_S
+        if not math.isfinite(value):
+            value = ENOUGH_MAX_S
+        return max(WARNING_AFTER_S, min(ENOUGH_MAX_S, value))
 
     def _highpassed(
         self, dev_pitch: float, dev_yaw: float, now: float | None
@@ -627,13 +819,13 @@ class PatSenseDriver:
         self._dev_lp = (lp_pitch, lp_yaw)
         return (dev_pitch - lp_pitch, dev_yaw - lp_yaw)
 
-    def _commanded_still(self, commanded: tuple[float, float], now: float | None) -> bool:
+    def _commanded_still(self, commanded: tuple[float, ...], now: float | None) -> bool:
         """Whether the COMMANDED pose has been constant long enough to sense.
 
         Any per-axis change beyond ``still_eps`` restamps the motion clock; the
         gate opens only once ``still_hold_s`` has elapsed with no such change.
         Disabled (always open) when ``still_hold_s <= 0``. With no clock the gate
-        stays open — the ownership gate and conditioning still apply.
+        stays open — conditioning and ownership-edge re-baselining still apply.
         """
         if self._still_hold_s <= 0.0:
             return True
@@ -643,7 +835,8 @@ class PatSenseDriver:
             return True
         if (
             prev is None
-            or max(abs(commanded[0] - prev[0]), abs(commanded[1] - prev[1])) > self._still_eps
+            or max(abs(current - previous) for current, previous in zip(commanded, prev))
+            > self._still_eps
         ):
             self._last_motion_t = now
             return False
@@ -667,6 +860,15 @@ class PatSenseDriver:
             self._warmup_until = None
             return False
         return True
+
+    def _observation_clock_gapped(self, now: float | None) -> bool:
+        """Whether logical samples are discontinuous enough to end interaction."""
+        previous = self._last_observation_at
+        self._last_observation_at = now
+        if now is None or previous is None or self._max_observation_gap_s <= 0.0:
+            return False
+        delta = now - previous
+        return delta < 0.0 or delta > self._max_observation_gap_s
 
     # ------------------------------------------------------------------
     # Lag compensation (the d1 live fix — see the module docstring)
@@ -724,35 +926,57 @@ class PatSenseDriver:
         """
         return self.peek
 
+    def peek_state(self) -> PatState:
+        """The current persistent pat interaction snapshot, without consuming it."""
+        return self._state
+
+    def as_state_provider(self) -> Callable[[], PatState]:
+        """The zero-arg ``pat_state`` provider callable."""
+        return self.peek_state
+
     # ------------------------------------------------------------------
     # Defensive readers of the (duck-typed) TickContext + reader
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _head_owner(ctx) -> str | None:  # type: ignore[no-untyped-def]
-        """``ctx.ownership["head"]`` (owner id or ``None``), tolerating any shape."""
+    def _ownership_changed(self, ctx) -> bool:  # type: ignore[no-untyped-def]
         ownership = getattr(ctx, "ownership", None)
-        if not isinstance(ownership, dict):
-            return None
-        return ownership.get("head")
+        current: tuple[object, object, object]
+        if isinstance(ownership, dict):
+            current = (
+                ownership.get("head"),
+                ownership.get("antennas"),
+                ownership.get("body_yaw"),
+            )
+        else:
+            current = (None, None, None)
+        previous = self._last_owners
+        self._last_owners = current
+        return previous is not None and current != previous
 
     @staticmethod
-    def _commanded_pitch_yaw(ctx) -> tuple[float, float] | None:  # type: ignore[no-untyped-def]
-        """Extract ``(pitch, yaw)`` degrees from ``ctx.pose["head"]``, or ``None``.
-
-        Degrees, neutral-relative (see r1). Any missing field or unexpected shape
-        degrades to ``None`` (skip the tick) rather than raising.
-        """
+    def _commanded_pose(ctx) -> tuple[float, ...] | None:  # type: ignore[no-untyped-def]
         pose = getattr(ctx, "pose", None)
         if not isinstance(pose, dict):
             return None
         head = pose.get("head")
-        if not isinstance(head, dict):
+        antennas = pose.get("antennas")
+        if not isinstance(head, dict) or not isinstance(antennas, (tuple, list)):
+            return None
+        if (
+            len(antennas) != 2
+            or "body_yaw" not in pose
+            or any(axis not in head for axis in _HEAD_AXES)
+        ):
             return None
         try:
-            return (float(head.get("pitch", 0.0)), float(head.get("yaw", 0.0)))
+            values = tuple(float(head[axis]) for axis in _HEAD_AXES) + (
+                float(pose["body_yaw"]),
+                float(antennas[0]),
+                float(antennas[1]),
+            )
         except (TypeError, ValueError):
             return None
+        return values if all(math.isfinite(value) for value in values) else None
 
     @staticmethod
     def _now(ctx) -> float | None:  # type: ignore[no-untyped-def]
@@ -763,7 +987,10 @@ class PatSenseDriver:
         always the deterministic injected clock.
         """
         now = getattr(ctx, "now", None)
-        return now if isinstance(now, (int, float)) else None
+        if not isinstance(now, (int, float)):
+            return None
+        value = float(now)
+        return value if math.isfinite(value) else None
 
     def _read_actual(self) -> tuple[float, float] | None:
         """Call the injected reader, degrading a raise/``None`` to no reading."""

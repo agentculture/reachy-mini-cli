@@ -7,10 +7,10 @@ per-channel contention model (``passive`` / ``stoppable`` / ``unstoppable`` /
 conflict. ``feel-alive`` runs as a passive base layer so the robot stays alive on
 any channel nothing else claims.
 
-All built-in behaviors are pure motion. For sound-orienting, the engine streams
-immediate ``set_target`` poses (jerky for big reorienting turns), so that moved to
-the dedicated ``reachy listen`` loop, which drives the daemon's smooth minjerk
-``goto`` planner; run it instead of a ``listen`` behavior here.
+Most built-in behaviors are pure motion. Stateful presence and the sensor-driven
+``pet-reaction`` are freshly instantiated per admission. For sound-orienting,
+use the dedicated ``reachy listen`` loop, which drives the daemon's smooth
+minjerk ``goto`` planner instead of streaming large immediate turns here.
 
 * ``behavior list`` — the built-in behavior catalog (no robot needed).
 * ``behavior run`` / ``stop`` / ``status`` — drive the running engine (auto-starts
@@ -38,7 +38,10 @@ corrected file into the already-running engine without a restart.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -48,6 +51,14 @@ from reachy.behavior import rules as rules_mod
 from reachy.behavior import supervisor
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
+from reachy.behavior.excited_motion_probe import CUES as PROBE_CUES
+from reachy.behavior.excited_motion_probe import MODES as PROBE_MODES
+from reachy.behavior.excited_motion_probe import (
+    ProbeCommandGuard,
+    ProbeDriver,
+    ProbeNamespaceGuard,
+    SharedPoseReader,
+)
 from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
 from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
@@ -73,6 +84,12 @@ _JSON_HELP = "Emit structured JSON."
 _EMPTY_SUBMITTED = "(submitted)"
 _AWAIT_TIMEOUT_HELP = "Seconds to wait for the engine to confirm (default: 1.0)."
 _CLASSES = tuple(c.value for c in StopClass)
+_PROBE_HEARTBEAT_TTL_S = 2.0
+#: How far into the future a heartbeat may sit and still count as live. Engine
+#: writes `round(now, 3)`, so a stamp read back microseconds later can be up to
+#: 0.5ms ahead; this window absorbs that (and any small cross-process jitter)
+#: without letting a monotonic-clock reset masquerade as a live engine.
+_PROBE_HEARTBEAT_SKEW_S = 1.0
 
 #: The six head axes a goto may target, in the order ``goto_intent.HEAD_AXES`` /
 #: ``move goto``'s own ``_HEAD_KEYS`` use — flag names match the GotoSpec payload's
@@ -707,28 +724,36 @@ def _make_state_reader() -> HeldStateReader:
     :class:`~reachy.robot.state_reader.HeldStateReader`, which itself degrades to
     a permanently-``None`` reader (one logged warning, then no reading) when the
     ``[sdk]`` extra is absent — which is why :func:`_compose_run_seam` composes
-    the pat stack UNCONDITIONALLY rather than gating on an SDK-import probe.
+    the enabled pat stack without gating on an SDK-import probe.
     """
     return HeldStateReader()
 
 
-def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer):
+def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer, probe=None):
     """Build ``behavior engine run``'s sense reader + tick seam + held pose reader.
 
-    Composes every merged runtime sense/act piece onto the engine's ONE per-tick
-    seam and returns ``(sense_reader, tick_seam, reader)``. Everything rides ONE
+    Composes runtime sense/act pieces onto the engine's ONE per-tick seam and
+    returns ``(sense_reader, tick_seam, reader)``. Everything rides ONE
     :class:`TickBus` wrapped in :class:`TickMetrics`, so a tick-budget breach
     surfaces as a ``[SENSE ... event=overrun]`` line (c22).
+
+    Probe composition is intentionally separate and observation-only: it omits
+    rules, ordinary pat classification, intents, goto, and the pose holder. Its
+    seam contains only a namespaced-command rejector, the passive probe, and an
+    optional export snapshot. The main command spool is independently guarded by
+    :func:`cmd_engine_run`; both paths return explicit negative command results.
 
     Perception (``sense_reader``)
     -----------------------------
     Each tick's :class:`~reachy.behavior.sense.Sense` is
-    ``read_perception(SenseProviders(pat_event=...), base=doa_poller(t))``: the
+    ``read_perception(SenseProviders(pat_event=..., pat_state=...),
+    base=doa_poller(t))``: the
     :class:`~reachy.behavior.sense.DoaPoller` supplies the throttled DoA/speech
     leg (its own low-rate polling + failure-swallowing preserved), while the pat
-    cue is a non-consuming PEEK of the pat driver's one-tick latch — so the DoA
-    leg keeps its cadence and the pat leg costs only a latch read per call. A
-    mic-less box reads EMPTY_SENSE for the DoA leg exactly as before.
+    legacy cue is a non-consuming PEEK of the pat driver's one-tick latch, while
+    the persistent state is a second PEEK of that same driver — so both views
+    describe one held reader and detector. A mic-less box reads EMPTY_SENSE for
+    the DoA leg exactly as before.
 
     Degrade contract (no ``[sdk]`` extra)
     -------------------------------------
@@ -778,13 +803,34 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     """
     doa_poller = DoaPoller(lambda: read_doa(transport))
 
-    # The pat sense stack — OPT-IN via REACHY_PAT_SENSE=1 (issue #79): on the
-    # measured plant, feel-alive's gaze wander leaves conditioned residuals up
-    # to ~3.3 deg — above any threshold a real pat could still clear — so the
-    # sense ships dormant pending the hands-on calibration pass (real pat data,
-    # possibly a calmer sensing mode). Every other piece of the chain (reader,
-    # driver, conditioning, rules, feed) is live-verified; enabling is one env
-    # var, no restart of anything but the unit.
+    if probe is not None:
+        reader = _make_state_reader()
+        shared_reader = SharedPoseReader(reader.read)
+        mode, probe_emit = probe
+        providers = SenseProviders()
+
+        def probe_sense_reader(t):
+            return read_perception(providers, base=doa_poller(t))
+
+        drivers = [
+            ProbeNamespaceGuard(control.CommandSpool(namespace=INTENT_NAMESPACE)),
+            ProbeDriver(mode, shared_reader, emit=probe_emit),
+        ]
+        consumers = []
+        if runtime_consumer is not None:
+            drivers.append(SenseSnapshotDriver())
+            consumers.append(runtime_consumer)
+        bus = TickBus(drivers=drivers, consumers=consumers)
+        return (
+            probe_sense_reader,
+            TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)),
+            reader,
+        )
+
+    # The pat sense stack ships ON after the hands-on #80 gate finding: the
+    # complete command must hold still before sensing, which removes wander
+    # ghosts structurally while allowing a settled reaction owner to keep
+    # sensing. REACHY_PAT_SENSE=0 is the explicit sensing rollback.
     reader = None
     pat_driver = None
     if _pat_sense_enabled():
@@ -792,12 +838,14 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         pat_driver = PatSenseDriver(reader=reader.read)  # tuned default detector (#79)
     holder = LastPoseHolder()
     providers = SenseProviders(
-        pat_event=pat_driver.as_provider() if pat_driver is not None else None
+        pat_event=pat_driver.as_provider() if pat_driver is not None else None,
+        pat_state=pat_driver.as_state_provider() if pat_driver is not None else None,
     )
 
     def sense_reader(t):
         # DoA (throttled by the poller) as the base; the pat cue (when the
-        # opt-in stack is composed) is peeked from the driver's one-tick latch.
+        # enabled stack is composed) is peeked in legacy-event and persistent-
+        # state forms from the same driver.
         return read_perception(providers, base=doa_poller(t))
 
     goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
@@ -820,58 +868,161 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), reader
 
 
+def _probe_engine_is_fresh() -> bool:
+    """Whether state.json proves another CLI engine heartbeat is still live."""
+    state = control.read_state()
+    updated = state.get("updated") if isinstance(state, dict) else None
+    if isinstance(updated, bool) or not isinstance(updated, (int, float)):
+        return False
+    updated = float(updated)
+    if not math.isfinite(updated):
+        return False
+    age = time.monotonic() - updated
+    if age < 0.0:
+        # Fail CLOSED on a marginally future heartbeat: Engine.state() rounds
+        # `updated` to milliseconds and can round UP, so a genuinely live engine
+        # can read back a hair ahead of us. Treating that as "not fresh" would
+        # let a probe start beside it — the exact race this refusal exists to
+        # prevent. A stamp far in the future is instead a state.json left over
+        # from before a monotonic-clock reset (a reboot), which is stale, not
+        # live, so it must not lock probes out forever.
+        return age >= -_PROBE_HEARTBEAT_SKEW_S
+    return age <= _PROBE_HEARTBEAT_TTL_S
+
+
+def _open_probe_output(path: Path):  # type: ignore[no-untyped-def]
+    """Exclusive output-open seam, kept narrow for cleanup verification."""
+    return path.open("x", encoding="utf-8")
+
+
+def _refuse_bad_probe_request(probe_mode: str | None, probe_output: str | None) -> None:
+    """Reject a malformed or unsafe probe request before anything is constructed."""
+    if bool(probe_mode) != bool(probe_output):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="--probe-mode and --probe-output must be supplied together",
+            remediation="choose held/unheld and a new JSONL output path",
+        )
+    if probe_mode is not None and _probe_engine_is_fresh():
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message="probe refused: already-running CLI behavior engine has a fresh heartbeat",
+            remediation=(
+                "for a foreground 'reachy behavior engine run', press Ctrl-C in its owning "
+                "terminal; use 'reachy behavior engine stop' only when it was launched with "
+                "'reachy behavior engine start'; then start the sole foreground "
+                "'reachy behavior engine run' with --probe-mode and --probe-output"
+            ),
+        )
+
+
+def _open_probe(probe_mode: str, probe_output: str):  # type: ignore[no-untyped-def]
+    """Open the exclusive capture stream and pair it with its record emitter.
+
+    Returns ``(stream, probe)`` so the caller keeps the stream for its
+    ``finally`` cleanup while handing ``probe`` to the seam composer.
+    """
+    try:
+        stream = _open_probe_output(Path(probe_output))
+    except FileExistsError as err:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"probe output already exists: {probe_output}",
+            remediation="choose a new --probe-output path; captures are never overwritten",
+        ) from err
+    except OSError as err:
+        # path.open("x") also raises for a missing parent, an unwritable
+        # directory, or a path that is itself a directory. Each is a user-fixable
+        # mistake and earns the same structured remediation as the clash above.
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"cannot create probe output {probe_output}: {type(err).__name__}: {err}",
+            remediation=(
+                "choose a --probe-output path in an existing, writable directory "
+                "that is not itself a directory"
+            ),
+        ) from err
+
+    def _probe_emit(record: dict) -> None:
+        stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+
+    return stream, (probe_mode, _probe_emit)
+
+
+def _engine_live_line(  # type: ignore[no-untyped-def]
+    config, transport, rules_driver, probe_mode: str | None
+) -> str:
+    """Build the one-line 'engine live' banner naming the composed layers."""
+    if probe_mode is not None:
+        rules_note = " (observation-only probe)"
+    elif rules_driver is not None:
+        rules_note = " + rules"
+    else:
+        rules_note = " (rules rejected — base presence only)"
+    base_note = " + base layer" if config.base_layer else ""
+    return (
+        f"[behavior] engine live: {config.compose_hz:g} Hz via {transport.name}"
+        f"{base_note}{rules_note}; Ctrl-C to stop"
+    )
+
+
 def cmd_engine_run(args: argparse.Namespace) -> int:
     install_logging(getattr(args, "log_level", None))
     json_mode = bool(getattr(args, "json", False))
+    probe_mode = getattr(args, "probe_mode", None)
+    probe_output = getattr(args, "probe_output", None)
+    _refuse_bad_probe_request(probe_mode, probe_output)
+
+    # The fresh-heartbeat refusal above precedes transport construction, output
+    # creation, and engine_run's control.reset() preamble: a probe invocation can
+    # never become a second command owner beside a known-live CLI engine.
     transport = get_transport(args)
     config = _engine_config(args)
     spool = control.CommandSpool()
-    rules_driver = _boot_tick_seam()  # None on a rejected rules file -> base presence only
-
-    def _on_start() -> None:
-        if not json_mode:
-            rules_note = (
-                " + rules" if rules_driver is not None else " (rules rejected — base presence only)"
-            )
-            emit_diagnostic(
-                f"[behavior] engine live: {config.compose_hz:g} Hz via {transport.name}"
-                f"{' + base layer' if config.base_layer else ''}{rules_note}; Ctrl-C to stop"
-            )
-
-    # Runtime-events export sink (None unless --export -); see
-    # reachy.cli._export.build_runtime_export_consumer. SEPARATE contract from the
-    # think/listen cognition feed (decision c27) — carries no thinking/message/
-    # emotion blocks, only perception/rule/intent/motion runtime events.
-    runtime_consumer = build_runtime_export_consumer(args)
-    sense_reader, tick_seam, reader = _compose_run_seam(
-        transport, config, rules_driver, runtime_consumer
-    )
-
-    def _emit(event: dict) -> None:
-        # Suppress the per-tick JSON summary while exporting so stdout carries
-        # ONLY the runtime-event JSONL feed (stdout purity).
-        if json_mode and runtime_consumer is None:
-            emit_result(event, json_mode=True)
-
+    rules_driver = None if probe_mode is not None else _boot_tick_seam()
+    engine_control = ProbeCommandGuard(spool) if probe_mode is not None else spool
+    probe_stream = None
+    reader = None
+    runtime_consumer = None
     try:
+        probe = None
+        if probe_mode is not None:
+            probe_stream, probe = _open_probe(probe_mode, probe_output)
+
+        def _on_start() -> None:
+            if probe_mode is not None:
+                emit_diagnostic(f"{PROBE_CUES[probe_mode]} — passive {probe_mode} observation")
+            if not json_mode:
+                emit_diagnostic(_engine_live_line(config, transport, rules_driver, probe_mode))
+
+        # Runtime-events export sink (None unless --export -); this remains
+        # separate from the cognition feed and carries runtime events only.
+        runtime_consumer = build_runtime_export_consumer(args)
+        sense_reader, tick_seam, reader = _compose_run_seam(
+            transport, config, rules_driver, runtime_consumer, probe=probe
+        )
+
+        def _emit(event: dict) -> None:
+            if json_mode and runtime_consumer is None:
+                emit_result(event, json_mode=True)
+
         ticks = engine_run(
             transport,
             config,
             on_start=_on_start,
             emit=_emit,
             max_ticks=args.max_ticks,
-            control=spool,
+            control=engine_control,
             sense=sense_reader,
             tick_seam=tick_seam,
         )
     finally:
-        # Release the held media-free SDK pose reader on EVERY exit path. REQUIRED
-        # for a clean stop: an unclosed no_media ReachyMini client hangs the
-        # process at interpreter exit (see reachy.robot.state_reader), which would
-        # wedge a SIGTERM. close() is idempotent and never raises. None when the
-        # opt-in pat stack is not composed (REACHY_PAT_SENSE unset, issue #79).
+        # Covers output-open, export setup, seam composition, and engine_run.
         if reader is not None:
             reader.close()
+        if probe_stream is not None:
+            probe_stream.close()
     if runtime_consumer is not None:
         emit_diagnostic(f"[behavior] engine stopped after {ticks} tick(s) (export: stdout)")
     elif not json_mode:
@@ -1100,6 +1251,18 @@ def _register_engine(noun_sub: argparse._SubParsersAction) -> None:
         default=None,
         dest="max_ticks",
         help="Stop after this many ticks (default: run until signalled).",
+    )
+    run.add_argument(
+        "--probe-mode",
+        choices=PROBE_MODES,
+        default=None,
+        help="Passively observe the next full feel-alive motion episode through settling.",
+    )
+    run.add_argument(
+        "--probe-output",
+        type=Path,
+        default=None,
+        help="New JSONL path for --probe-mode (existing files are never overwritten).",
     )
     add_runtime_export_args(run)
     add_robot_args(run)
