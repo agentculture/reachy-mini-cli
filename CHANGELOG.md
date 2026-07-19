@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-07-19
+
+### Added
+
+- **Sustained dog-like pet reaction** (#70). A pat is now an *interaction* with a lifetime rather than a one-shot twitch: `reachy/behavior/pat_state.py` carries a persistent `PatState` ladder (`receptive` -> `contentment` -> `warning` -> `enough` -> `released` -> `cooldown`) that `reachy/behavior/pet_reaction.py` renders as a graded, bounded response — leaning in while contact is welcome, easing off once it has had enough.
+- **Pettable feel-alive cadence** — the base presence layer now yields a still, invitational posture the pat sense can actually read, so petting and idle wander stop fighting each other.
+- **Passive CLI-owned excited motion probe** (`reachy/behavior/excited_motion_probe.py`). `reachy behavior engine run --probe-mode {held,unheld} --probe-output PATH` records a bounded, observation-only JSONL capture of one commanded-motion episode (arm -> onset -> settled edge) for hardware calibration. It is strictly read-only: `ProbeCommandGuard` refuses to let a probe run become a second command owner, and the run is refused outright when an already-running CLI engine has a fresh heartbeat.
+- **Signed pat evidence** + an event-stable pat state contract, so downstream consumers see a stable, directional reading instead of re-deriving it from raw detector output.
+- **Explicit behavior completion seam** — a bounded behavior now reports its own completion rather than being inferred as done.
+
+### Changed
+
+- **Cognitive-complexity refactor of four hot paths**, behavior-preserving and covered by the existing suite: `ProbeDriver.__call__` is now a thin stage spine (`_accept_tick` / `_begin_observation` / `_advance_onset` / `_try_arm` / `_phase_for` / `_emit_sample`); `PatSenseDriver._process` reads as the gate order it enforces, with per-tick conditioning re-seeding made idempotent by `_reseed_once` instead of threading a `reseeded` flag through every branch; `_update_pat_state` splits into adopt-press / release-budget / phase-ladder stages; and `cmd_engine_run` extracts probe validation, capture-stream setup, and the live banner.
+
+### Fixed
+
+- **Pat interaction state no longer goes stale across a sensing gap** (#70). Opening a gap (ownership change, observation-clock jump, blocked stillness gate, or an unavailable reader) clears the interaction exactly once, and cooldown is now *preserved* across that gap instead of being silently forgotten — so a pat that has run its course cannot immediately re-trigger.
+- **Release is anchored to the last press**, not to whichever later quiet sample happened to be observed first, so the release budget measures real quiet rather than observation luck.
+
 ## [0.37.0] - 2026-07-18
 
 ### Changed

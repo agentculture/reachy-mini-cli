@@ -204,23 +204,19 @@ class ProbeDriver:
         self._terminal = False
 
     def __call__(self, ctx) -> None:  # type: ignore[no-untyped-def]
+        """Observe one engine tick, walking the probe's fixed stage order.
+
+        Each stage below either refuses (terminal) or hands the next one a value
+        it has already validated, so this method stays the readable spine:
+        accept the tick, confirm the owner and command, then arm -> onset ->
+        sample.
+        """
         self._reader.begin_tick(getattr(ctx, "tick", None))
         if self._terminal:
             return
-        timestamp = getattr(ctx, "now", None)
-        if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
-            self._refuse(0.0, "engine tick timestamp is unavailable")
+        timestamp = self._accept_tick(ctx)
+        if timestamp is None:
             return
-        timestamp = float(timestamp)
-        if self._last_tick_timestamp is not None:
-            gap = timestamp - self._last_tick_timestamp
-            if gap <= 0.0:
-                self._refuse(timestamp, "backward or duplicate engine tick timestamp")
-                return
-            if gap > self._max_tick_gap_s + 1e-9:
-                self._refuse(timestamp, f"excessive engine tick gap ({gap:.6f}s)")
-                return
-        self._last_tick_timestamp = timestamp
 
         owner, refusal = _feel_alive_owner(ctx)
         if refusal is not None:
@@ -234,71 +230,129 @@ class ProbeDriver:
         vector = _command_vector(command)
 
         if self._observation_start is None:
-            self._observation_start = timestamp
-            self._last_command = vector
-            self._stable_since = float(timestamp)
-            self._emit(
-                {
-                    "schema": SCHEMA,
-                    "type": "probe_start",
-                    "label": self._mode,
-                    "phase": "armed",
-                    "cue": CUES[self._mode],
-                    "timestamp_s": timestamp,
-                    "arm_timeout_s": ARM_TIMEOUT_S,
-                    "settled_edge_s": SETTLED_EDGE_S,
-                    "owner": owner,
-                }
-            )
+            self._begin_observation(timestamp, vector, owner)
             return
 
-        onset = False
-        if self._motion_start is None:
-            if timestamp - self._observation_start > ARM_TIMEOUT_S:
-                self._refuse(timestamp, "observation timeout waiting for motion onset")
-                return
-            if not self._armed:
-                if vector != self._last_command:
-                    self._last_command = vector
-                    self._stable_since = timestamp
-                    return
-                if (
-                    self._stable_since is not None
-                    and timestamp - self._stable_since >= SETTLED_EDGE_S
-                ):
-                    self._armed = True
-                    self._emit(
-                        {
-                            "schema": SCHEMA,
-                            "type": "probe_armed",
-                            "label": self._mode,
-                            "phase": "armed",
-                            "timestamp_s": timestamp,
-                            "owner": owner,
-                        }
-                    )
-                return
-            if vector == self._last_command:
-                return
-            self._motion_start = timestamp
-            self._last_command = vector
-            self._stable_since = None
-            onset = True
+        onset = self._advance_onset(timestamp, vector, owner)
+        if onset is None:
+            return
 
         elapsed = timestamp - self._motion_start
         if elapsed > MOTION_TIMEOUT_S:
             self._refuse(timestamp, "motion episode timeout before settled edge")
             return
 
+        phase = self._phase_for(timestamp, vector, onset)
+        self._emit_sample(timestamp, elapsed, phase, owner, command)
+
+    def _accept_tick(self, ctx) -> float | None:  # type: ignore[no-untyped-def]
+        """Validate the tick clock; refuse and return ``None`` when unusable.
+
+        A missing, non-finite, backwards, duplicate, or far-apart timestamp all
+        mean the observation series has a hole in it, which the probe reports
+        rather than papers over.
+        """
+        timestamp = getattr(ctx, "now", None)
+        if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
+            self._refuse(0.0, "engine tick timestamp is unavailable")
+            return None
+        timestamp = float(timestamp)
+        if self._last_tick_timestamp is not None:
+            gap = timestamp - self._last_tick_timestamp
+            if gap <= 0.0:
+                self._refuse(timestamp, "backward or duplicate engine tick timestamp")
+                return None
+            if gap > self._max_tick_gap_s + 1e-9:
+                self._refuse(timestamp, f"excessive engine tick gap ({gap:.6f}s)")
+                return None
+        self._last_tick_timestamp = timestamp
+        return timestamp
+
+    def _begin_observation(  # type: ignore[no-untyped-def]
+        self, timestamp: float, vector: tuple[float, ...], owner
+    ) -> None:
+        """Anchor the observation window on the first usable tick."""
+        self._observation_start = timestamp
+        self._last_command = vector
+        self._stable_since = float(timestamp)
+        self._emit(
+            {
+                "schema": SCHEMA,
+                "type": "probe_start",
+                "label": self._mode,
+                "phase": "armed",
+                "cue": CUES[self._mode],
+                "timestamp_s": timestamp,
+                "arm_timeout_s": ARM_TIMEOUT_S,
+                "settled_edge_s": SETTLED_EDGE_S,
+                "owner": owner,
+            }
+        )
+
+    def _advance_onset(  # type: ignore[no-untyped-def]
+        self, timestamp: float, vector: tuple[float, ...], owner
+    ) -> bool | None:
+        """Drive the pre-motion arming ladder toward a motion onset.
+
+        Returns ``True`` on the tick motion starts, ``False`` when an episode is
+        already running, and ``None`` when this tick yields no sample (still
+        settling, just armed, or refused on the arm timeout).
+        """
+        if self._motion_start is not None:
+            return False
+        if timestamp - self._observation_start > ARM_TIMEOUT_S:
+            self._refuse(timestamp, "observation timeout waiting for motion onset")
+            return None
+        if not self._armed:
+            self._try_arm(timestamp, vector, owner)
+            return None
+        if vector == self._last_command:
+            return None
+        self._motion_start = timestamp
+        self._last_command = vector
+        self._stable_since = None
+        return True
+
+    def _try_arm(  # type: ignore[no-untyped-def]
+        self, timestamp: float, vector: tuple[float, ...], owner
+    ) -> None:
+        """Arm once the command vector has held still across the settled edge."""
+        if vector != self._last_command:
+            self._last_command = vector
+            self._stable_since = timestamp
+            return
+        if self._stable_since is not None and timestamp - self._stable_since >= SETTLED_EDGE_S:
+            self._armed = True
+            self._emit(
+                {
+                    "schema": SCHEMA,
+                    "type": "probe_armed",
+                    "label": self._mode,
+                    "phase": "armed",
+                    "timestamp_s": timestamp,
+                    "owner": owner,
+                }
+            )
+
+    def _phase_for(self, timestamp: float, vector: tuple[float, ...], onset: bool) -> str:
+        """Classify this tick as ongoing motion or a settled hold, restamping the edge."""
         if onset or vector != self._last_command:
             self._last_command = vector
             self._stable_since = None
-            phase = "excited_motion"
-        else:
-            if self._stable_since is None:
-                self._stable_since = timestamp
-            phase = "settled"
+            return "excited_motion"
+        if self._stable_since is None:
+            self._stable_since = timestamp
+        return "settled"
 
+    def _emit_sample(
+        self,
+        timestamp: float,
+        elapsed: float,
+        phase: str,
+        owner,  # type: ignore[no-untyped-def]
+        command: dict,
+    ) -> None:
+        """Read proprioception and publish one sample, closing the probe when settled."""
         read_started = self._wall_now()
         actual = self._reader.read()
         read_lag = self._wall_now() - read_started

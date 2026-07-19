@@ -881,11 +881,8 @@ def _open_probe_output(path: Path):  # type: ignore[no-untyped-def]
     return path.open("x", encoding="utf-8")
 
 
-def cmd_engine_run(args: argparse.Namespace) -> int:
-    install_logging(getattr(args, "log_level", None))
-    json_mode = bool(getattr(args, "json", False))
-    probe_mode = getattr(args, "probe_mode", None)
-    probe_output = getattr(args, "probe_output", None)
+def _refuse_bad_probe_request(probe_mode: str | None, probe_output: str | None) -> None:
+    """Reject a malformed or unsafe probe request before anything is constructed."""
     if bool(probe_mode) != bool(probe_output):
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -904,6 +901,53 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
             ),
         )
 
+
+def _open_probe(probe_mode: str, probe_output: str):  # type: ignore[no-untyped-def]
+    """Open the exclusive capture stream and pair it with its record emitter.
+
+    Returns ``(stream, probe)`` so the caller keeps the stream for its
+    ``finally`` cleanup while handing ``probe`` to the seam composer.
+    """
+    try:
+        stream = _open_probe_output(Path(probe_output))
+    except FileExistsError as err:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"probe output already exists: {probe_output}",
+            remediation="choose a new --probe-output path; captures are never overwritten",
+        ) from err
+
+    def _probe_emit(record: dict) -> None:
+        stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+
+    return stream, (probe_mode, _probe_emit)
+
+
+def _engine_live_line(  # type: ignore[no-untyped-def]
+    config, transport, rules_driver, probe_mode: str | None
+) -> str:
+    """Build the one-line 'engine live' banner naming the composed layers."""
+    if probe_mode is not None:
+        rules_note = " (observation-only probe)"
+    elif rules_driver is not None:
+        rules_note = " + rules"
+    else:
+        rules_note = " (rules rejected — base presence only)"
+    base_note = " + base layer" if config.base_layer else ""
+    return (
+        f"[behavior] engine live: {config.compose_hz:g} Hz via {transport.name}"
+        f"{base_note}{rules_note}; Ctrl-C to stop"
+    )
+
+
+def cmd_engine_run(args: argparse.Namespace) -> int:
+    install_logging(getattr(args, "log_level", None))
+    json_mode = bool(getattr(args, "json", False))
+    probe_mode = getattr(args, "probe_mode", None)
+    probe_output = getattr(args, "probe_output", None)
+    _refuse_bad_probe_request(probe_mode, probe_output)
+
     # The fresh-heartbeat refusal above precedes transport construction, output
     # creation, and engine_run's control.reset() preamble: a probe invocation can
     # never become a second command owner beside a known-live CLI engine.
@@ -918,39 +962,13 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     try:
         probe = None
         if probe_mode is not None:
-            try:
-                probe_stream = _open_probe_output(Path(probe_output))
-            except FileExistsError as err:
-                raise CliError(
-                    code=EXIT_USER_ERROR,
-                    message=f"probe output already exists: {probe_output}",
-                    remediation=(
-                        "choose a new --probe-output path; captures are never overwritten"
-                    ),
-                ) from err
-
-            def _probe_emit(record: dict) -> None:
-                probe_stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
-                probe_stream.flush()
-
-            probe = (probe_mode, _probe_emit)
+            probe_stream, probe = _open_probe(probe_mode, probe_output)
 
         def _on_start() -> None:
             if probe_mode is not None:
                 emit_diagnostic(f"{PROBE_CUES[probe_mode]} — passive {probe_mode} observation")
             if not json_mode:
-                if probe_mode is not None:
-                    rules_note = " (observation-only probe)"
-                else:
-                    rules_note = (
-                        " + rules"
-                        if rules_driver is not None
-                        else " (rules rejected — base presence only)"
-                    )
-                emit_diagnostic(
-                    f"[behavior] engine live: {config.compose_hz:g} Hz via {transport.name}"
-                    f"{' + base layer' if config.base_layer else ''}{rules_note}; Ctrl-C to stop"
-                )
+                emit_diagnostic(_engine_live_line(config, transport, rules_driver, probe_mode))
 
         # Runtime-events export sink (None unless --export -); this remains
         # separate from the cognition feed and carries runtime events only.

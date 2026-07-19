@@ -641,6 +641,9 @@ def test_probe_output_closes_when_seam_composition_fails(monkeypatch, tmp_path) 
 
 def test_invalid_mode_is_rejected_without_a_read() -> None:
     source = _Reader()
+    # Constructed outside the raises block so the assertion below pins the
+    # refusal to ProbeDriver's own mode check, not to reader construction.
+    reader = SharedPoseReader(source)
     with pytest.raises(ValueError, match="mode"):
-        ProbeDriver("unknown", SharedPoseReader(source), emit=lambda _record: None)
+        ProbeDriver("unknown", reader, emit=lambda _record: None)
     assert source.calls == 0

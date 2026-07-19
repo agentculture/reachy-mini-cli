@@ -366,6 +366,9 @@ class PatSenseDriver:
         #: edge triggers one conditioning re-seed via :meth:`_reseed_after_gap`.
         self._stillness_blocked = False
         self._input_gap = False
+        #: Reset at the top of every :meth:`_process`; keeps the per-tick
+        #: conditioning re-seed idempotent however many edges fire at once.
+        self._reseeded_this_tick = False
         #: One contiguous unsafe observation interval. Interaction state is
         #: cleared exactly once when this opens; recovery only reseeds filters.
         self._gap_active = False
@@ -413,28 +416,18 @@ class PatSenseDriver:
             logger.warning("PatSenseDriver tick raised; pat cue dropped", exc_info=True)
 
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
-        """The gated sensing body, split out so :meth:`__call__` stays a thin guard."""
-        now = self._now(ctx)
-        reseeded = False
-        # --- logical observation-clock edge ---------------------------
-        # A long or backwards clock jump means samples are missing. It is the
-        # only overrun-like edge visible inside this driver; real wall-clock
-        # TickMetrics overruns are observed outside this seam.
-        if self._observation_clock_gapped(now):
-            self._begin_gap("blocked", now)
-            self._rearm_stillness_hold()
-            if self._still_hold_s <= 0.0:
-                self._reseed_after_gap()
-                reseeded = True
+        """The gated sensing body, split out so :meth:`__call__` stays a thin guard.
 
-        # --- ownership edge --------------------------------------------
-        if self._ownership_changed(ctx):
-            self._begin_gap("blocked", now)
-            self._rearm_stillness_hold()
-            if self._still_hold_s <= 0.0:
-                if not reseeded:
-                    self._reseed_after_gap()
-                reseeded = True
+        Reads as the gate order it enforces: observation edges, a complete
+        command, the stillness window, a live proprioceptive reading, the policy
+        clock — and only past all of them, an observation.
+        """
+        now = self._now(ctx)
+        # Conditioning is reseeded at most once per tick no matter how many
+        # edges fire; `_reseed_once` owns that, so each gate below stays a
+        # plain guard clause.
+        self._reseeded_this_tick = False
+        self._apply_observation_edges(ctx, now)
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
         commanded_full = self._commanded_pose(ctx)
@@ -446,28 +439,8 @@ class PatSenseDriver:
             return
         commanded = (commanded_full[4], commanded_full[5])
 
-        # --- stillness gate (#80) --------------------------------------
-        # The plant is only quiet while it is NOT tracking a moving target, so
-        # sensing is confined to commanded-still windows. This makes the wander
-        # ghost class structurally impossible rather than threshold-managed.
-        #
-        # `_stillness_blocked` owns one blocked -> unblocked edge, so ordinary
-        # wander cannot rerun interaction clearing on every blocked tick.
-        if not self._commanded_still(commanded_full, now):
-            self._stillness_blocked = True
-            self._begin_gap("blocked", now)
+        if not self._stillness_open(commanded_full, now):
             return
-        if self._stillness_blocked:
-            # First tick back on a still commanded pose (a genuine
-            # blocked -> unblocked edge). `detector.update()` was never called
-            # for the whole blocked stretch (this method returned above, every
-            # tick), so from the detector's point of view this is the same
-            # situation as the ownership edge: reseed conditioning once before
-            # accepting another physical sample.
-            if not reseeded:
-                self._reseed_after_gap()
-                reseeded = True
-            self._stillness_blocked = False
 
         # --- actual pose (proprioception) ------------------------------
         actual = self._read_actual()
@@ -476,9 +449,7 @@ class PatSenseDriver:
             self._begin_gap("unavailable", now)
             return
         if self._input_gap:
-            if not reseeded:
-                self._reseed_after_gap()
-                reseeded = True
+            self._reseed_once()
             self._input_gap = False
 
         # The complete command and actual reading are both safe. The gap has
@@ -495,6 +466,72 @@ class PatSenseDriver:
             self._last_available_at = now
             return
 
+        self._observe(commanded, actual, now, recovered_gap)
+
+    def _reseed_once(self) -> None:
+        """Reseed post-gap conditioning at most once per tick."""
+        if self._reseeded_this_tick:
+            return
+        self._reseed_after_gap()
+        self._reseeded_this_tick = True
+
+    def _blocked_edge(self, now: float | None) -> None:
+        """Open a blocked gap and make the stillness gate re-earn its window."""
+        self._begin_gap("blocked", now)
+        self._rearm_stillness_hold()
+        if self._still_hold_s <= 0.0:
+            # With the gate disabled there is no quiet window to re-earn, so
+            # conditioning must be reseeded here instead.
+            self._reseed_once()
+
+    def _apply_observation_edges(  # type: ignore[no-untyped-def]
+        self, ctx, now: float | None
+    ) -> None:
+        """Handle the two edges that mean "samples are missing" before sensing.
+
+        A long or backwards clock jump is the only overrun-like edge visible
+        inside this driver (real wall-clock TickMetrics overruns are observed
+        outside this seam); an ownership change means another behavior drove
+        the head. Both invalidate conditioning the same way.
+        """
+        if self._observation_clock_gapped(now):
+            self._blocked_edge(now)
+        if self._ownership_changed(ctx):
+            self._blocked_edge(now)
+
+    def _stillness_open(self, commanded_full: tuple[float, ...], now: float | None) -> bool:
+        """Whether this tick's commanded pose is inside a sensing-safe still window (#80).
+
+        The plant is only quiet while it is NOT tracking a moving target, so
+        sensing is confined to commanded-still windows. This makes the wander
+        ghost class structurally impossible rather than threshold-managed.
+
+        ``_stillness_blocked`` owns one blocked -> unblocked edge, so ordinary
+        wander cannot rerun interaction clearing on every blocked tick.
+        """
+        if not self._commanded_still(commanded_full, now):
+            self._stillness_blocked = True
+            self._begin_gap("blocked", now)
+            return False
+        if self._stillness_blocked:
+            # First tick back on a still commanded pose (a genuine
+            # blocked -> unblocked edge). `detector.update()` was never called
+            # for the whole blocked stretch (sensing returned early every
+            # tick), so from the detector's point of view this is the same
+            # situation as the ownership edge: reseed conditioning once before
+            # accepting another physical sample.
+            self._reseed_once()
+            self._stillness_blocked = False
+        return True
+
+    def _observe(
+        self,
+        commanded: tuple[float, float],
+        actual: tuple[float, float],
+        now: float | None,
+        recovered_gap: bool,
+    ) -> None:
+        """Condition one past-every-gate sample, feed the detector, latch its event."""
         if self._first_update:
             # Boot: the deviation conditioning below needs ~3x its time constants
             # to converge before events mean anything — mute latching meanwhile.
@@ -662,7 +699,11 @@ class PatSenseDriver:
         self._cooldown_remaining_s = remaining
 
     def _update_pat_state(self, now: float | None) -> None:
-        """Fold immutable detector evidence into the persistent interaction ladder."""
+        """Fold immutable detector evidence into the persistent interaction ladder.
+
+        A thin three-stage orchestrator: adopt this tick's evidence, then (while
+        contact holds) test the release budget, then walk the contact ladder.
+        """
         if now is None:
             self._state = replace(self._state, availability="available")
             return
@@ -673,46 +714,62 @@ class PatSenseDriver:
         dt = max(0.0, now - previous_available) if previous_available is not None else 0.0
 
         if fresh:
-            self._seen_press_at = evidence.last_press_at
-            # Release is budgeted from the persisted press anchor, not from
-            # whichever later quiet sample happens to be observed first.
-            self._no_fresh_since = evidence.last_press_at
-            if self._state.phase in ("idle", "released"):
-                self._active_contact_s = 0.0
-                self._enough_after_s = self._draw_enough_after()
-                phase = "receptive"
-                phase_started_at = now
-            else:
-                phase = self._state.phase
-                phase_started_at = self._state.phase_started_at
-            self._state = PatState(
-                availability="available",
-                contact=True,
-                touch_type=evidence.touch_type,
-                level=evidence.level,
-                yaw_deg=evidence.yaw_deg,
-                phase=phase,
-                phase_started_at=phase_started_at,
-                last_press_at=evidence.last_press_at,
-            )
+            self._adopt_fresh_press(evidence, now)
         else:
             self._state = replace(self._state, availability="available")
 
         if not self._state.contact:
             return
+        if self._release_elapsed(fresh, now):
+            return
+        self._advance_contact_phase(dt, now)
 
+    def _adopt_fresh_press(self, evidence, now: float) -> None:  # type: ignore[no-untyped-def]
+        """Rebuild ``PatState`` around a press the detector has not reported before."""
+        self._seen_press_at = evidence.last_press_at
+        # Release is budgeted from the persisted press anchor, not from
+        # whichever later quiet sample happens to be observed first.
+        self._no_fresh_since = evidence.last_press_at
+        if self._state.phase in ("idle", "released"):
+            self._active_contact_s = 0.0
+            self._enough_after_s = self._draw_enough_after()
+            phase = "receptive"
+            phase_started_at = now
+        else:
+            phase = self._state.phase
+            phase_started_at = self._state.phase_started_at
+        self._state = PatState(
+            availability="available",
+            contact=True,
+            touch_type=evidence.touch_type,
+            level=evidence.level,
+            yaw_deg=evidence.yaw_deg,
+            phase=phase,
+            phase_started_at=phase_started_at,
+            last_press_at=evidence.last_press_at,
+        )
+
+    def _release_elapsed(self, fresh: bool, now: float) -> bool:
+        """Close the interaction when the quiet stretch outlives the release budget.
+
+        Returns ``True`` once the state has been moved to ``released`` — the
+        caller must not then advance the contact ladder.
+        """
         if not fresh and self._no_fresh_since is None:
             self._no_fresh_since = now
-        if self._no_fresh_since is not None and now - self._no_fresh_since >= self._release_after_s:
-            self._state = replace(
-                self._state,
-                contact=False,
-                phase="released",
-                phase_started_at=now,
-            )
-            self._last_available_at = now
-            return
+        if self._no_fresh_since is None or now - self._no_fresh_since < self._release_after_s:
+            return False
+        self._state = replace(
+            self._state,
+            contact=False,
+            phase="released",
+            phase_started_at=now,
+        )
+        self._last_available_at = now
+        return True
 
+    def _advance_contact_phase(self, dt: float, now: float) -> None:
+        """Accrue contact time and escalate the phase ladder at its thresholds."""
         self._active_contact_s += dt
         if self._active_contact_s >= self._enough_after_s:
             self._state = replace(self._state, phase="enough", phase_started_at=now)
