@@ -11,6 +11,10 @@ Coverage:
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+
+import pytest
+
 from reachy.motion.pat import PatDetector
 
 # ---------------------------------------------------------------------------
@@ -164,3 +168,137 @@ def test_no_reachy_mini_import():
     src = inspect.getsource(pat_module)
     assert "reachy_mini" not in src, "pat.py must not import reachy_mini"
     assert "import numpy" in src or "import numpy as np" in src, "pat.py must use numpy"
+
+
+def test_snapshot_adds_signed_evidence_without_changing_legacy_tuple() -> None:
+    det = PatDetector(
+        min_presses=2,
+        pat_cooldown=0.0,
+        baseline_alpha=0.0,
+        level2_threshold_fn=lambda: 6.0,
+    )
+
+    assert det.update(0.0, 0.0, 0.0, 3.0, now=10.0) is None
+    det.update(0.0, 0.0, 0.0, 0.0, now=10.1)
+    event = det.update(0.0, 0.0, 0.0, 4.0, now=10.4)
+
+    assert event == ("level1", "side_pat")
+    evidence = det.snapshot()
+    assert evidence.pressed is True
+    assert evidence.touch_type == "side_pat"
+    assert evidence.level == "level1"
+    assert evidence.yaw_deg == pytest.approx(4.0)
+    assert evidence.last_press_at == pytest.approx(10.4)
+    with pytest.raises(FrozenInstanceError):
+        evidence.yaw_deg = -4.0  # type: ignore[misc]
+
+
+def test_snapshot_uses_latest_qualifying_yaw_and_ignores_deadband() -> None:
+    det = PatDetector(min_presses=99, baseline_alpha=0.0)
+
+    det.update(0.0, 0.0, 0.0, -3.0, now=20.0)
+    negative = det.snapshot()
+    det.update(0.0, 0.0, 0.0, 0.0, now=20.1)
+    det.update(0.0, 0.0, 0.0, 0.2, now=20.2)
+    deadband = det.snapshot()
+    det.update(0.0, 0.0, 0.0, 3.5, now=20.5)
+    positive = det.snapshot()
+    det.update(0.0, 0.0, 0.0, 0.0, now=20.6)
+    det.update(0.0, 0.0, 0.0, 4.0, now=20.9)
+    repeated = det.snapshot()
+
+    assert negative.yaw_deg == pytest.approx(-3.0)
+    assert deadband.yaw_deg == pytest.approx(-3.0)
+    assert deadband.last_press_at == negative.last_press_at
+    assert positive.yaw_deg == pytest.approx(3.5)
+    assert repeated.yaw_deg == pytest.approx(4.0)
+    assert repeated.last_press_at == pytest.approx(20.9)
+
+
+def test_simultaneous_axes_use_normalized_dominance_with_pitch_winning_ties() -> None:
+    det = PatDetector(
+        min_presses=99,
+        press_threshold=1.0,
+        yaw_press_threshold=1.0,
+        baseline_alpha=0.0,
+    )
+
+    det.update(0.0, -3.0, 0.0, 2.0, now=30.0)
+    pitch_dominant = det.snapshot()
+    det.update(0.0, 0.0, 0.0, 0.0, now=30.1)
+    det.update(0.0, -2.0, 0.0, 4.0, now=30.5)
+    yaw_dominant = det.snapshot()
+    det.update(0.0, 0.0, 0.0, 0.0, now=30.6)
+    det.update(0.0, -3.0, 0.0, -3.0, now=31.0)
+    tie = det.snapshot()
+
+    assert pitch_dominant.touch_type == "scratch"
+    assert pitch_dominant.yaw_deg is None
+    assert yaw_dominant.touch_type == "side_pat"
+    assert yaw_dominant.yaw_deg == pytest.approx(4.0)
+    assert tie.touch_type == "scratch"
+    assert tie.yaw_deg is None
+
+
+def _level1_with_exactly_two_presses(det: PatDetector, now: float) -> float:
+    assert det.update(0.0, -5.0, now=now) is None
+    assert det.update(0.0, 0.0, now=now + 0.1) is None
+    level1_at = now + 0.4
+    assert det.update(0.0, -5.0, now=level1_at) == ("level1", "scratch")
+    assert det.update(0.0, 0.0, now=level1_at + 0.1) is None
+    return level1_at
+
+
+def test_level1_followed_by_silence_cannot_invent_level2() -> None:
+    det = PatDetector(
+        pat_cooldown=0.0,
+        interaction_gap_timeout=5.0,
+        level2_threshold_fn=lambda: 0.5,
+    )
+    level1_at = _level1_with_exactly_two_presses(det, 40.0)
+
+    assert det.update(0.0, 0.0, now=level1_at + 0.6) is None
+    assert det.snapshot().level == "level1"
+
+    assert det.update(0.0, 0.0, now=level1_at + 5.1) is None
+    released = det.snapshot()
+    assert released.pressed is False
+    assert released.touch_type is None
+    assert released.level is None
+    assert released.yaw_deg is None
+    assert released.last_press_at is None
+
+
+def test_fresh_post_level1_press_can_escalate_and_cooldown_clears() -> None:
+    det = PatDetector(
+        pat_cooldown=0.0,
+        level2_cooldown=0.5,
+        level2_threshold_fn=lambda: 0.5,
+    )
+    level1_at = _level1_with_exactly_two_presses(det, 50.0)
+
+    event = det.update(0.0, -5.0, now=level1_at + 0.6)
+    assert event == ("level2", "scratch")
+    assert det.snapshot().level == "level2"
+
+    det.update(0.0, 0.0, now=level1_at + 0.7)
+    assert det.update(0.0, 0.0, now=level1_at + 1.2) is None
+    assert det.snapshot().touch_type is None
+    assert det.snapshot().level is None
+    assert det.snapshot().last_press_at is None
+
+
+def test_clear_presses_clears_evidence_but_keeps_ema_baseline() -> None:
+    det = PatDetector(min_presses=99, baseline_alpha=0.5)
+    det.update(0.0, 0.0, 0.0, -3.0, now=60.0)
+    learned_yaw_baseline = det._yaw_baseline_offset
+    assert det.snapshot().touch_type == "side_pat"
+
+    det.clear_presses()
+
+    assert det._yaw_baseline_offset == learned_yaw_baseline
+    assert det.snapshot().pressed is False
+    assert det.snapshot().touch_type is None
+    assert det.snapshot().level is None
+    assert det.snapshot().yaw_deg is None
+    assert det.snapshot().last_press_at is None

@@ -103,6 +103,23 @@ def test_prelabelled_sides_condition_to_opposite_robot_frame_signs() -> None:
     assert target_yaw_by_label == {LEFT_LABEL: 8.0, RIGHT_LABEL: -8.0}
 
 
+def test_detector_evidence_preserves_both_conditioned_fixture_signs() -> None:
+    evidence_by_label: dict[str, float | None] = {}
+    for side, label in (("left", LEFT_LABEL), ("right", RIGHT_LABEL)):
+        rows = _load(side)
+        conditioned_yaw = _phase_median(rows, "scratch", "a_yaw_deg") - _phase_median(
+            rows, "baseline", "a_yaw_deg"
+        )
+        detector = PatDetector(min_presses=99, baseline_alpha=0.0)
+        detector.update(0.0, 0.0, 0.0, conditioned_yaw, now=1.0)
+        evidence_by_label[label] = detector.snapshot().yaw_deg
+
+    assert evidence_by_label[LEFT_LABEL] is not None
+    assert evidence_by_label[RIGHT_LABEL] is not None
+    assert evidence_by_label[LEFT_LABEL] > 0.0
+    assert evidence_by_label[RIGHT_LABEL] < 0.0
+
+
 class _RecordingDetector(PatDetector):
     def __init__(self) -> None:
         super().__init__(level2_threshold_fn=lambda: 99.0)
