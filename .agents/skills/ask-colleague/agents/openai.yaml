@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ask Colleague"
+  short_description: "Get an independent repo perspective"
+  default_prompt: "Use $ask-colleague to get a read-only independent exploration of this repository question."

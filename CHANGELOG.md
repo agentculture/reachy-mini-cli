@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-07-19
+
+### Added
+
+- **t12 live-acceptance findings for the expressive pat reaction** (`docs/deliveries/2026-07-19-expressive-pat-reaction-82-t12-findings.md`, #82). The hardware gate that closes t1-t11 was run on 0.38.0 and is recorded as **not met**, with the measurements rather than a tuned-away result: detection is sound (6/6 correctly typed `side_pat`, 4 clean rule fires, 188.5 s ghost-free) and the reaction is pleasant, but contact never sustains past `receptive` (4.00 s needed for contentment, 0.82 s observed) and the side signal (0.55-0.96 deg) straddles the 0.75 deg direction deadband with the sign flipping mid-contact in 4 of 6 episodes.
+- **Converged spec and plan for #82** under `docs/specs/` and `docs/plans/`, the devague frame behind the shipped t1-t11 work.
+- **Codex skill adapters** under `.agents/skills/` — thin, Codex-native frontmatter over the canonical `.claude/skills/<name>/SKILL.md`, reusing the canonical resolver scripts rather than copying them so the two runtimes cannot drift.
+
+### Changed
+
+- `docs/skill-sources.md` documents the `.agents/` adapter layer and records the devague-origin skills (`scope`, `challenge`, `deviate`, `summarize-delivery`) plus `communicate` in the provenance table.
+
 ## [0.38.0] - 2026-07-19
 
 ### Added

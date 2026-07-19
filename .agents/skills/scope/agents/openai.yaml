@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scope"
+  short_description: "Map feature boundaries from repository evidence"
+  default_prompt: "Use $scope to map this feature across code, tests, docs, deployment, and hardware before framing a spec."
