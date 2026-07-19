@@ -1,0 +1,4 @@
+interface:
+  display_name: "Challenge"
+  short_description: "Pressure-test a spec for blind spots"
+  default_prompt: "Use $challenge to pressure-test this exported spec before planning."

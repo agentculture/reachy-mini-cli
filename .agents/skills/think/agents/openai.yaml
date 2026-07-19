@@ -1,0 +1,4 @@
+interface:
+  display_name: "Think"
+  short_description: "Turn a vague idea into a buildable spec"
+  default_prompt: "Use $think to work this idea backwards into a converged Devague spec."

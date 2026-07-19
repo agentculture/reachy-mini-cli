@@ -1,0 +1,4 @@
+interface:
+  display_name: "Communicate"
+  short_description: "Coordinate across GitHub and the Culture mesh"
+  default_prompt: "Use $communicate to send this cross-repo or mesh handoff through the appropriate single channel."

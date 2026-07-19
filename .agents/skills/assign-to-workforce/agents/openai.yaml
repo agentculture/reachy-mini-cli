@@ -1,0 +1,4 @@
+interface:
+  display_name: "Assign to Workforce"
+  short_description: "Fan out an approved plan safely"
+  default_prompt: "Use $assign-to-workforce to present and execute the approved Devague plan waves."

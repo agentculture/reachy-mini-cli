@@ -1,0 +1,4 @@
+interface:
+  display_name: "Summarize Delivery"
+  short_description: "Record planned versus actual delivery"
+  default_prompt: "Use $summarize-delivery to produce an evidence-backed accountability artifact for this run."

@@ -5,28 +5,103 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-07-19
+
+### Added
+
+- **t12 live-acceptance findings for the expressive pat reaction**
+  (`docs/deliveries/2026-07-19-expressive-pat-reaction-82-t12-findings.md`,
+  #82). The hardware gate that closes t1-t11 was run on 0.38.0 and is recorded
+  as **not met**, with the measurements rather than a tuned-away result:
+  detection is sound (6/6 correctly typed `side_pat`, 4 clean rule fires, 188.5
+  s ghost-free) and the reaction is pleasant, but contact never sustains past
+  `receptive` (4.00 s needed for contentment, 0.82 s observed) and the side
+  signal (0.55-0.96 deg) straddles the 0.75 deg direction deadband with the sign
+  flipping mid-contact in 4 of 6 episodes.
+- **Converged spec and plan for #82** under `docs/specs/` and `docs/plans/`, the
+  devague frame behind the shipped t1-t11 work.
+- **Codex skill adapters** under `.agents/skills/` — thin, Codex-native
+  frontmatter over the canonical `.claude/skills/<name>/SKILL.md`, reusing the
+  canonical resolver scripts rather than copying them so the two runtimes cannot
+  drift.
+
+### Changed
+
+- `docs/skill-sources.md` documents the `.agents/` adapter layer and records the
+  devague-origin skills (`scope`, `challenge`, `deviate`, `summarize-delivery`)
+  plus `communicate` in the provenance table.
+
 ## [0.38.0] - 2026-07-19
 
 ### Added
 
-- **Sustained dog-like pet reaction** (#70). A pat is now an *interaction* with a lifetime rather than a one-shot twitch: `reachy/behavior/pat_state.py` carries a persistent `PatState` ladder (`receptive` -> `contentment` -> `warning` -> `enough` -> `released` -> `cooldown`) that `reachy/behavior/pet_reaction.py` renders as a graded, bounded response — leaning in while contact is welcome, easing off once it has had enough.
-- **Pettable feel-alive cadence** — the base presence layer now yields a still, invitational posture the pat sense can actually read, so petting and idle wander stop fighting each other.
-- **Passive CLI-owned excited motion probe** (`reachy/behavior/excited_motion_probe.py`). `reachy behavior engine run --probe-mode {held,unheld} --probe-output PATH` records a bounded, observation-only JSONL capture of one commanded-motion episode (arm -> onset -> settled edge) for hardware calibration. It is strictly read-only: `ProbeCommandGuard` refuses to let a probe run become a second command owner, and the run is refused outright when an already-running CLI engine has a fresh heartbeat.
-- **Signed pat evidence** + an event-stable pat state contract, so downstream consumers see a stable, directional reading instead of re-deriving it from raw detector output.
-- **Explicit behavior completion seam** — a bounded behavior now reports its own completion rather than being inferred as done.
+- **Sustained dog-like pet reaction** (#70). A pat is now an *interaction* with
+  a lifetime rather than a one-shot twitch: `reachy/behavior/pat_state.py`
+  carries a persistent `PatState` ladder (`receptive` -> `contentment` ->
+  `warning` -> `enough` -> `released` -> `cooldown`) that
+  `reachy/behavior/pet_reaction.py` renders as a graded, bounded response —
+  leaning in while contact is welcome, easing off once it has had enough.
+- **Pettable feel-alive cadence** — the base presence layer now yields a still,
+  invitational posture the pat sense can actually read, so petting and idle
+  wander stop fighting each other.
+- **Passive CLI-owned excited motion probe**
+  (`reachy/behavior/excited_motion_probe.py`). `reachy behavior engine run
+  --probe-mode {held,unheld} --probe-output PATH` records a bounded,
+  observation-only JSONL capture of one commanded-motion episode (arm -> onset
+  -> settled edge) for hardware calibration. It is strictly read-only:
+  `ProbeCommandGuard` refuses to let a probe run become a second command owner,
+  and the run is refused outright when an already-running CLI engine has a fresh
+  heartbeat.
+- **Signed pat evidence** + an event-stable pat state contract, so downstream
+  consumers see a stable, directional reading instead of re-deriving it from raw
+  detector output.
+- **Explicit behavior completion seam** — a bounded behavior now reports its own
+  completion rather than being inferred as done.
 
 ### Changed
 
-- **Cognitive-complexity refactor of four hot paths**, behavior-preserving and covered by the existing suite: `ProbeDriver.__call__` is now a thin stage spine (`_accept_tick` / `_begin_observation` / `_advance_onset` / `_try_arm` / `_phase_for` / `_emit_sample`); `PatSenseDriver._process` reads as the gate order it enforces, with per-tick conditioning re-seeding made idempotent by `_reseed_once` instead of threading a `reseeded` flag through every branch; `_update_pat_state` splits into adopt-press / release-budget / phase-ladder stages; and `cmd_engine_run` extracts probe validation, capture-stream setup, and the live banner.
+- **Cognitive-complexity refactor of four hot paths**, behavior-preserving and
+  covered by the existing suite: `ProbeDriver.__call__` is now a thin stage
+  spine (`_accept_tick` / `_begin_observation` / `_advance_onset` / `_try_arm` /
+  `_phase_for` / `_emit_sample`); `PatSenseDriver._process` reads as the gate
+  order it enforces, with per-tick conditioning re-seeding made idempotent by
+  `_reseed_once` instead of threading a `reseeded` flag through every branch;
+  `_update_pat_state` splits into adopt-press / release-budget / phase-ladder
+  stages; and `cmd_engine_run` extracts probe validation, capture-stream setup,
+  and the live banner.
 
 ### Fixed
 
-- **Pat interaction state no longer goes stale across a sensing gap** (#70). Opening a gap (ownership change, observation-clock jump, blocked stillness gate, or an unavailable reader) clears the interaction exactly once, and cooldown is now *preserved* across that gap instead of being silently forgotten — so a pat that has run its course cannot immediately re-trigger.
-- **Release is anchored to the last press**, not to whichever later quiet sample happened to be observed first, so the release budget measures real quiet rather than observation luck.
-- **Probe mutual exclusion no longer has a rounding-sized hole.** `Engine.state()` writes `round(now, 3)`, which can round *up*, so a live engine's heartbeat could read back marginally ahead of the probe's own `monotonic()`; the old `0.0 <= age` test then reported "not fresh" and admitted a second command owner. A near-future heartbeat now fails **closed**, bounded by `_PROBE_HEARTBEAT_SKEW_S` so a `state.json` left over from before a monotonic-clock reset (a reboot) still reads as stale instead of locking probes out forever.
-- **Feel-alive per-tick cost no longer grows with uptime.** `_FeelAlive._cycle_at()` scanned its cadence schedule from index 0 every tick, so cost climbed continuously on a loop that ticks at 50 Hz for days. Cycle ends are contiguous and strictly increasing, so the scan is now an exact `bisect_right` — identical results, O(log n).
-- **A behavior breaking its return contract can no longer kill the tick.** The completion pre-pass in `Engine.compose_tick()` now reads `done` with the same tolerance `arbitrate()` already applies, so a malformed contribution is an abstention rather than an `AttributeError` inside a boot-persistent presence loop.
-- **Every probe-output open failure is a structured error.** Only `FileExistsError` was converted before, so a missing parent directory or an unwritable path escaped the `CliError` contract; other `OSError`s now report the concrete errno type with a remediation.
+- **Pat interaction state no longer goes stale across a sensing gap** (#70).
+  Opening a gap (ownership change, observation-clock jump, blocked stillness
+  gate, or an unavailable reader) clears the interaction exactly once, and
+  cooldown is now *preserved* across that gap instead of being silently
+  forgotten — so a pat that has run its course cannot immediately re-trigger.
+- **Release is anchored to the last press**, not to whichever later quiet sample
+  happened to be observed first, so the release budget measures real quiet
+  rather than observation luck.
+- **Probe mutual exclusion no longer has a rounding-sized hole.**
+  `Engine.state()` writes `round(now, 3)`, which can round *up*, so a live
+  engine's heartbeat could read back marginally ahead of the probe's own
+  `monotonic()`; the old `0.0 <= age` test then reported "not fresh" and
+  admitted a second command owner. A near-future heartbeat now fails **closed**,
+  bounded by `_PROBE_HEARTBEAT_SKEW_S` so a `state.json` left over from before a
+  monotonic-clock reset (a reboot) still reads as stale instead of locking
+  probes out forever.
+- **Feel-alive per-tick cost no longer grows with uptime.**
+  `_FeelAlive._cycle_at()` scanned its cadence schedule from index 0 every tick,
+  so cost climbed continuously on a loop that ticks at 50 Hz for days. Cycle
+  ends are contiguous and strictly increasing, so the scan is now an exact
+  `bisect_right` — identical results, O(log n).
+- **A behavior breaking its return contract can no longer kill the tick.** The
+  completion pre-pass in `Engine.compose_tick()` now reads `done` with the same
+  tolerance `arbitrate()` already applies, so a malformed contribution is an
+  abstention rather than an `AttributeError` inside a boot-persistent presence
+  loop.
+- **Every probe-output open failure is a structured error.** Only
+  `FileExistsError` was converted before, so a missing parent directory or an
+  unwritable path escaped the `CliError` contract; other `OSError`s now report
+  the concrete errno type with a remediation.
 
 ## [0.37.0] - 2026-07-18
 

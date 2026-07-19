@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deviate"
+  short_description: "Record an approved plan departure"
+  default_prompt: "Use $deviate to stop and record this execution-time departure before work resumes."

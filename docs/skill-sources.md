@@ -24,6 +24,13 @@ declares a culture agent (`culture.yaml`, `backend: claude`), and
 `core.skill_loader` silently skips any `SKILL.md` lacking `type:` — so the field
 is load-bearing, even where guildmaster's upstream copy omits it.
 
+Codex discovers the same operator workflows through thin adapters under
+`.agents/skills/`. Each adapter carries Codex-native `name`/`description`
+frontmatter and requires a complete read of the matching canonical
+`.claude/skills/<name>/SKILL.md`; CLI-driving adapters reuse the canonical
+resolver scripts rather than copying them. Keep the method and scripts in the
+`.claude` source only so the two runtimes cannot drift.
+
 | Skill | Upstream | Origin | Notes | Last synced |
 |-------|----------|--------|-------|-------------|
 | `cicd` | `../guildmaster/.claude/skills/cicd/` | guildmaster | CI/CD lane layered on `agex pr`: the 5 thin scripts (`workflow.sh`, `pr-status.sh`, `pr-reply.sh`, `_resolve-nick.sh`, `portability-lint.sh`) delegate lint/open/read/reply/delta to `agex` and add the `status` / `await` SonarCloud-gating extensions. Consumer-identifying prose (`guildmaster` → `reachy-mini-cli`) adapted in the description + heading; upstream history (`Renamed from pr-review in steward 0.7.0; rebased on agex in 0.12.0`) and env-var literals (`STEWARD_*`) kept verbatim. The PR signature resolves at runtime from `culture.yaml` via `_resolve-nick.sh` (→ `reachy-mini-cli`). Requires `agex` on PATH. | 2026-05-26 (guildmaster 0.6.0) |
@@ -37,6 +44,11 @@ is load-bearing, even where guildmaster's upstream copy omits it.
 | `think` | `../guildmaster/.claude/skills/think/` | **devague** (re-broadcast via guildmaster) | idea→spec leg of the devague workflow chain. Verbatim (already carried `type: command` at guildmaster). Origin/broadcast prose left verbatim. | 2026-05-26 (guildmaster 0.6.0) |
 | `spec-to-plan` | `../guildmaster/.claude/skills/spec-to-plan/` | **devague** (re-broadcast via guildmaster) | spec→plan leg of the devague workflow chain. Verbatim (already carried `type: command`). | 2026-05-26 (guildmaster 0.6.0) |
 | `assign-to-workforce` | `../guildmaster/.claude/skills/assign-to-workforce/` | **devague** (re-broadcast via guildmaster) | plan→parallel-implementation leg of the devague workflow chain. Verbatim (already carried `type: command`). | 2026-05-26 (guildmaster 0.6.0) |
+| `scope` | `agentculture/devague/.claude/skills/scope/` | **devague** | Optional read-only idea→scope opening leg; records provenanced findings through deterministic Devague moves. | 2026-07-17 (devague chain rollout) |
+| `challenge` | `agentculture/devague/.claude/skills/challenge/` | **devague** | Risk-scaled blind-spot pass between exported spec and plan; findings remain proposed for human adjudication. | 2026-07-17 (devague chain rollout) |
+| `deviate` | `agentculture/devague/.claude/skills/deviate/` | **devague** | Execution-time, human-approved deviation ledger for departures from the confirmed plan. | 2026-07-17 (devague chain rollout) |
+| `summarize-delivery` | `agentculture/devague/.claude/skills/summarize-delivery/` | **devague** | Evidence-backed planned-versus-actual accountability artifact for complete, partial, or failed runs. | 2026-07-17 (devague chain rollout) |
+| `communicate` | `../guildmaster/.claude/skills/communicate/` | guildmaster / steward | Cross-repo GitHub handoffs and Culture mesh coordination; Codex uses a thin adapter over the canonical scripts and channel-selection rules. | 2026-07-19 (Codex adapter) |
 | `ask-colleague` | `../colleague/.claude/skills/ask-colleague/` | **colleague** (first-party) | The **exception** to the guildmaster supply line — colleague is both upstream and origin. Drives the `colleague` CLI to hand a scoped repo task to a *different* backend/model: `review` / `explore` (read-only, throwaway-worktree) / `write` (preview-by-default; `--apply`/`--pr`) / `feedback` (ROI loop) / `clean`. Only consumer-identifying prose adapted in SKILL.md (`colleague` → `reachy-mini-cli`); script + prompt bodies have **no downstream edits** (already carried `type: command`). Snapshot may trail current colleague HEAD — re-sync from `../colleague/`. Vendored via the mass-update skill (PR #46). | 2026-06-14 (colleague mass-update) |
 
 ## Re-sync procedure

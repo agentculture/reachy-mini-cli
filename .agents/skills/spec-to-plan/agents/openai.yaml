@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spec to Plan"
+  short_description: "Convert a converged spec into a plan"
+  default_prompt: "Use $spec-to-plan to produce a dependency-ordered plan with testable acceptance criteria."
