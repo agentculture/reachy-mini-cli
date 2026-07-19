@@ -105,12 +105,17 @@ class Contribution:
 
     A channel left ``None`` is one this behavior does not drive this tick. ``head``
     is the six-key offset dict, ``antennas`` a ``(right, left)`` degree pair,
-    ``body_yaw`` a scalar in degrees — all friendly units.
+    ``body_yaw`` a scalar in degrees — all friendly units. ``done=True`` tells
+    the engine this behavior has naturally completed; its channel values are then
+    ignored and all of its claims are released before this tick's arbitration.
+    Leaving every channel ``None`` without setting ``done`` only abstains for the
+    tick and does not end the behavior.
     """
 
     head: dict[str, float] | None = None
     antennas: tuple[float, float] | None = None
     body_yaw: float | None = None
+    done: bool = False
 
     def channel(self, name: str):
         """The value for ``name`` (``head`` / ``antennas`` / ``body_yaw``)."""
