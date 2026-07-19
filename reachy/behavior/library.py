@@ -6,18 +6,14 @@ contention class, its natural lifetime, a typed parameter schema) plus a
 registry without instantiating anything; the engine calls :func:`build` to turn a
 resolved (name, params, class, lifetime) into a live :class:`Behavior`.
 
-Almost every generator is a *pure, continuous* function of behavior-local time —
-smooth trig, no randomness, ignoring ``sense`` — because the engine streams
-immediate ``set_target`` poses at 50 Hz with no daemon-side interpolation. (This
-is why the idle ``feel-alive`` layer here is a fresh continuous formulation rather
-than ``alive.next_pose``, which re-samples a random gaze target per call and is
-built for the slower, ``goto``-interpolated demo-mode loop.)
+Most generators are *pure, continuous* functions of behavior-local time — smooth
+trig, ignoring ``sense`` — because the engine streams immediate ``set_target``
+poses at 50 Hz with no daemon-side interpolation. Stateful presence generators
+live in focused leaf modules and are minted per behavior through ``make_fn``.
 
-The engine can still feed a *sensor-driven* entry (one with ``wants_sense=True``,
-built per-instance via ``make_fn`` so it may hold state) a live :class:`Sense`
-reading, but no built-in behavior currently uses it — sound-orienting moved to the
-dedicated, smoother ``reachy listen`` loop (:mod:`reachy.motion`), which drives the
-daemon's minjerk ``goto`` planner instead of streaming ``set_target``.
+The engine feeds a *sensor-driven* entry (one with ``wants_sense=True``, built
+per-instance via ``make_fn`` so it may hold state) a live :class:`Sense` reading.
+Pure entries continue to receive an empty snapshot.
 
 Units are the CLI's friendly ones: millimetres, degrees, seconds.
 """
@@ -28,7 +24,14 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable
 
+from reachy.behavior.feel_alive import make_feel_alive
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass, neutral_head
+from reachy.behavior.pet_reaction import (
+    DONE_GESTURE_S,
+    MAX_CONTACT_S,
+    NOMINAL_TICK_S,
+    make_pet_reaction,
+)
 from reachy.behavior.sense import Sense
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 
@@ -108,24 +111,6 @@ def _sin_at(t: float, period: float) -> float:
 # --------------------------------------------------------------------------- #
 
 
-def _feel_alive(t: float, p: dict, _sense: Sense) -> Contribution:
-    """Continuous idle motion: breathing + slow organic gaze wander + antenna sway."""
-    e = p["energy"]
-    phase = 2.0 * math.pi * t / p["breathe_period"] if p["breathe_period"] else 0.0
-    z = p["breathe_z"] * e * math.sin(phase)
-    breathe_pitch = p["breathe_pitch"] * e * math.sin(phase)
-    # Sum two slow incommensurate sines -> a smooth, non-repeating wander.
-    yaw = e * p["gaze_yaw"] * (0.6 * math.sin(0.13 * t) + 0.4 * math.sin(0.37 * t + 1.3))
-    gaze_pitch = e * p["gaze_pitch"] * (0.6 * math.sin(0.11 * t + 0.7) + 0.4 * math.sin(0.29 * t))
-    sway = p["antenna"] * e * _sin_at(t, p["antenna_period"])
-    body_yaw = e * p["body_yaw"] * math.sin(0.07 * t + 0.5)
-    return Contribution(
-        head=_head(z=z, pitch=breathe_pitch + gaze_pitch, yaw=yaw),
-        antennas=(sway, -sway),
-        body_yaw=body_yaw,
-    )
-
-
 def _gaze_hold(t: float, p: dict, _sense: Sense) -> Contribution:
     """Hold a fixed head offset (the 'look up-and-aside, hold N seconds' case)."""
     return Contribution(head=_head(yaw=p["yaw"], pitch=p["pitch"], roll=p["roll"], z=p["z"]))
@@ -176,6 +161,11 @@ _HEAD = frozenset({"head"})
 _ANTENNAS = frozenset({"antennas"})
 _BODY = frozenset({"body_yaw"})
 
+# The reaction normally self-completes no later than its internal contact limit
+# plus one done gesture. Keep a two-tick margin so the engine can observe
+# ``done=True`` before this independent finite lifetime releases the channels.
+_PET_REACTION_BACKSTOP_S = MAX_CONTACT_S + DONE_GESTURE_S + 2.0 * NOMINAL_TICK_S
+
 LIBRARY: dict[str, LibraryEntry] = {
     "feel-alive": LibraryEntry(
         name="feel-alive",
@@ -195,7 +185,18 @@ LIBRARY: dict[str, LibraryEntry] = {
             "antenna_period": Param(6.0, "s", "antenna sway cycle length"),
             "body_yaw": Param(6.0, "deg", "slow body-yaw wander amplitude"),
         },
-        fn=_feel_alive,
+        make_fn=make_feel_alive,
+    ),
+    "pet-reaction": LibraryEntry(
+        name="pet-reaction",
+        summary="settle into sustained petting, then signal release or enough",
+        channels=frozenset({"head", "antennas", "body_yaw"}),
+        default_class=StopClass.STOPPABLE,
+        looping=False,
+        default_duration=_PET_REACTION_BACKSTOP_S,
+        params={},
+        make_fn=make_pet_reaction,
+        wants_sense=True,
     ),
     "gaze-hold": LibraryEntry(
         name="gaze-hold",
