@@ -175,6 +175,17 @@ def test_pat_sense_flows_into_the_feed_via_the_composed_stack(_isolated, monkeyp
     pats = [b["pat"] for b in sense_blocks if b["pat"] is not None]
     assert pats, "no sense block carried a pat_event — the pat stack is not composed into sense"
     assert pats[0] == ["scratch", "level1"]
+    detected = next(block for block in sense_blocks if block["pat"] is not None)
+    state = detected["pat_state"]
+    assert {key: value for key, value in state.items() if not key.endswith("_at")} == {
+        "availability": "available",
+        "contact": True,
+        "touch_type": "scratch",
+        "level": "level1",
+        "yaw_deg": None,
+        "phase": "receptive",
+    }
+    assert state["phase_started_at"] <= state["last_press_at"]
     assert reader.reads > 0, "the injected reader was never consulted — pat driver did not run"
 
 
