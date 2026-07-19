@@ -7,10 +7,10 @@ per-channel contention model (``passive`` / ``stoppable`` / ``unstoppable`` /
 conflict. ``feel-alive`` runs as a passive base layer so the robot stays alive on
 any channel nothing else claims.
 
-All built-in behaviors are pure motion. For sound-orienting, the engine streams
-immediate ``set_target`` poses (jerky for big reorienting turns), so that moved to
-the dedicated ``reachy listen`` loop, which drives the daemon's smooth minjerk
-``goto`` planner; run it instead of a ``listen`` behavior here.
+Most built-in behaviors are pure motion. Stateful presence and the sensor-driven
+``pet-reaction`` are freshly instantiated per admission. For sound-orienting,
+use the dedicated ``reachy listen`` loop, which drives the daemon's smooth
+minjerk ``goto`` planner instead of streaming large immediate turns here.
 
 * ``behavior list`` — the built-in behavior catalog (no robot needed).
 * ``behavior run`` / ``stop`` / ``status`` — drive the running engine (auto-starts
@@ -707,7 +707,7 @@ def _make_state_reader() -> HeldStateReader:
     :class:`~reachy.robot.state_reader.HeldStateReader`, which itself degrades to
     a permanently-``None`` reader (one logged warning, then no reading) when the
     ``[sdk]`` extra is absent — which is why :func:`_compose_run_seam` composes
-    the pat stack UNCONDITIONALLY rather than gating on an SDK-import probe.
+    the enabled pat stack without gating on an SDK-import probe.
     """
     return HeldStateReader()
 
@@ -723,12 +723,14 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     Perception (``sense_reader``)
     -----------------------------
     Each tick's :class:`~reachy.behavior.sense.Sense` is
-    ``read_perception(SenseProviders(pat_event=...), base=doa_poller(t))``: the
+    ``read_perception(SenseProviders(pat_event=..., pat_state=...),
+    base=doa_poller(t))``: the
     :class:`~reachy.behavior.sense.DoaPoller` supplies the throttled DoA/speech
     leg (its own low-rate polling + failure-swallowing preserved), while the pat
-    cue is a non-consuming PEEK of the pat driver's one-tick latch — so the DoA
-    leg keeps its cadence and the pat leg costs only a latch read per call. A
-    mic-less box reads EMPTY_SENSE for the DoA leg exactly as before.
+    legacy cue is a non-consuming PEEK of the pat driver's one-tick latch, while
+    the persistent state is a second PEEK of that same driver — so both views
+    describe one held reader and detector. A mic-less box reads EMPTY_SENSE for
+    the DoA leg exactly as before.
 
     Degrade contract (no ``[sdk]`` extra)
     -------------------------------------
@@ -778,13 +780,10 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     """
     doa_poller = DoaPoller(lambda: read_doa(transport))
 
-    # The pat sense stack — OPT-IN via REACHY_PAT_SENSE=1 (issue #79): on the
-    # measured plant, feel-alive's gaze wander leaves conditioned residuals up
-    # to ~3.3 deg — above any threshold a real pat could still clear — so the
-    # sense ships dormant pending the hands-on calibration pass (real pat data,
-    # possibly a calmer sensing mode). Every other piece of the chain (reader,
-    # driver, conditioning, rules, feed) is live-verified; enabling is one env
-    # var, no restart of anything but the unit.
+    # The pat sense stack ships ON after the hands-on #80 gate finding: the
+    # complete command must hold still before sensing, which removes wander
+    # ghosts structurally while allowing a settled reaction owner to keep
+    # sensing. REACHY_PAT_SENSE=0 is the explicit sensing rollback.
     reader = None
     pat_driver = None
     if _pat_sense_enabled():
@@ -792,12 +791,14 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         pat_driver = PatSenseDriver(reader=reader.read)  # tuned default detector (#79)
     holder = LastPoseHolder()
     providers = SenseProviders(
-        pat_event=pat_driver.as_provider() if pat_driver is not None else None
+        pat_event=pat_driver.as_provider() if pat_driver is not None else None,
+        pat_state=pat_driver.as_state_provider() if pat_driver is not None else None,
     )
 
     def sense_reader(t):
         # DoA (throttled by the poller) as the base; the pat cue (when the
-        # opt-in stack is composed) is peeked from the driver's one-tick latch.
+        # enabled stack is composed) is peeked in legacy-event and persistent-
+        # state forms from the same driver.
         return read_perception(providers, base=doa_poller(t))
 
     goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
