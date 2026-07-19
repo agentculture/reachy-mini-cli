@@ -63,7 +63,7 @@ from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
 from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
 from reachy.behavior.model import CHANNELS, StopClass
-from reachy.behavior.pat_sense import PatSenseDriver
+from reachy.behavior.pat_sense import DEFAULT_STILL_EPS, DEFAULT_STILL_HOLD_S, PatSenseDriver
 from reachy.behavior.pose_feed import LastPoseHolder
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
@@ -715,6 +715,57 @@ def _pat_sense_enabled() -> bool:
     return value not in _PAT_SENSE_FALSEY
 
 
+#: Env vars exposing the pat-sense stillness gate's tuning without editing
+#: source (t2, "no-freeze pat sense" — a runnable experiment surface). Each is
+#: read directly at composition time, mirroring ``REACHY_PAT_SENSE`` right
+#: above rather than threading through ``EngineConfig``/``supervisor``'s
+#: background-spawn argv: those exist for tuning that must survive `behavior
+#: engine start`'s detached re-spawn, while this pair is a bench/experiment
+#: knob for the foreground `_compose_run_seam` call the on/off switch beside
+#: it already reads the same way. Unset -> the shipped defaults from
+#: :mod:`reachy.behavior.pat_sense`, so a box that never sets either var
+#: composes a byte-identical driver.
+_STILL_HOLD_S_ENV = "REACHY_PAT_STILL_HOLD_S"
+_STILL_EPS_ENV = "REACHY_PAT_STILL_EPS"
+
+
+def _pat_float_env(name: str, default: float) -> float:
+    """Parse *name* as a float, or fall back to *default* when unset.
+
+    A set-but-unparseable value is a clean user error (never a silent
+    fallback to *default*, never a raw traceback) naming the offending env
+    var and its value, matching the error contract every other malformed-
+    input path in this CLI follows (see e.g. ``reachy.speech.harmonic``'s
+    ``REACHY_HARMONIC_ARTICULATION`` handling).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError as exc:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid {name}={raw!r} (expected a number)",
+            remediation=f"set {name} to a number, or unset it to use the default",
+        ) from exc
+
+
+def _pat_still_tuning() -> tuple[float, float]:
+    """Resolve this run's ``(still_hold_s, still_eps)`` for :class:`PatSenseDriver`.
+
+    Both default to today's shipped values
+    (:data:`~reachy.behavior.pat_sense.DEFAULT_STILL_HOLD_S` /
+    :data:`~reachy.behavior.pat_sense.DEFAULT_STILL_EPS`) when
+    :data:`_STILL_HOLD_S_ENV` / :data:`_STILL_EPS_ENV` are unset, so an
+    operator who never touches either var gets a byte-identical driver.
+    """
+    return (
+        _pat_float_env(_STILL_HOLD_S_ENV, DEFAULT_STILL_HOLD_S),
+        _pat_float_env(_STILL_EPS_ENV, DEFAULT_STILL_EPS),
+    )
+
+
 def _make_state_reader() -> HeldStateReader:
     """Build the held, media-free SDK pose reader — a test-injection seam.
 
@@ -835,7 +886,12 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     pat_driver = None
     if _pat_sense_enabled():
         reader = _make_state_reader()
-        pat_driver = PatSenseDriver(reader=reader.read)  # tuned default detector (#79)
+        still_hold_s, still_eps = _pat_still_tuning()
+        pat_driver = PatSenseDriver(
+            reader=reader.read,  # tuned default detector (#79)
+            still_hold_s=still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
+            still_eps=still_eps,  # REACHY_PAT_STILL_EPS override (t2)
+        )
     holder = LastPoseHolder()
     providers = SenseProviders(
         pat_event=pat_driver.as_provider() if pat_driver is not None else None,
