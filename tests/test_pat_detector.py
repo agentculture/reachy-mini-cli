@@ -15,7 +15,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from reachy.motion.pat import PatDetector
+from reachy.motion.pat import PatDetector, PatEvidence
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -302,3 +302,35 @@ def test_clear_presses_clears_evidence_but_keeps_ema_baseline() -> None:
     assert det.snapshot().level is None
     assert det.snapshot().yaw_deg is None
     assert det.snapshot().last_press_at is None
+
+
+def test_clear_interaction_drops_level1_clock_but_keeps_baseline_and_cooldown() -> None:
+    det = PatDetector(
+        min_presses=2,
+        pat_cooldown=2.0,
+        baseline_alpha=0.5,
+        level2_threshold_fn=lambda: 0.5,
+    )
+    level1_at = _level1_with_exactly_two_presses(det, 70.0)
+    det.update(0.0, 2.0, 0.0, -3.0, now=level1_at + 0.2)
+    pitch_baseline = det._baseline_offset
+    yaw_baseline = det._yaw_baseline_offset
+    cooldown_anchor = det.last_pat_time
+
+    det.clear_interaction()
+
+    assert det._state == "idle"
+    assert det._level1_time == 0.0
+    assert det._level2_threshold == 0.0
+    assert det._last_press_time == 0.0
+    assert det._baseline_offset == pitch_baseline
+    assert det._yaw_baseline_offset == yaw_baseline
+    assert det.last_pat_time == cooldown_anchor
+    assert det.snapshot() == PatEvidence()
+
+    # A post-gap press cannot reuse the old level1 clock and the preserved
+    # event cooldown still prevents an immediate new level1.
+    assert det.update(0.0, -5.0, now=level1_at + 0.8) is None
+    assert det.update(0.0, 0.0, now=level1_at + 0.9) is None
+    assert det.update(0.0, -5.0, now=level1_at + 1.2) is None
+    assert det._state == "idle"

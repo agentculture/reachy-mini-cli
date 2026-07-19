@@ -223,7 +223,12 @@ def test_labelled_side_trace_reacts_holds_reacquires_and_completes(monkeypatch, 
 
     sense_events = [event for event in run.events if event.get("type") == "sense"]
     legacy = [event["pat"] for event in sense_events if event.get("pat")]
-    assert legacy == [["side_pat", "level1"]]
+    # The reaction ownership edge ends the detector interaction. Continued
+    # post-handoff presses may therefore form a fresh level1, but can never
+    # reuse the pre-handoff clock as level2; the rule cooldown still admits
+    # exactly one reaction below.
+    assert legacy
+    assert all(event == ["side_pat", "level1"] for event in legacy)
     signed_states = [
         event["pat_state"]
         for event in sense_events

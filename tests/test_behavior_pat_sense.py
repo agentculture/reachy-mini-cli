@@ -467,7 +467,11 @@ def test_pat_after_boot_warmup_fires() -> None:
     """The same pat AFTER the warmup window fires normally."""
     reader = _Reader()
     driver = PatSenseDriver(
-        reader=reader, still_hold_s=0.0, detector=_fixed_detector(), warmup_s=2.0
+        reader=reader,
+        still_hold_s=0.0,
+        detector=_fixed_detector(),
+        warmup_s=2.0,
+        max_observation_gap_s=0.0,
     )
     _drive(driver, reader, (0.0, 0.0), T0)  # first update arms warmup [T0, T0+2)
     _scratch_sequence(driver, reader, T0 + 2.5)
@@ -525,21 +529,20 @@ def test_real_pat_right_after_resume_fires_no_deadzone() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Gap-edge re-baseline call counts                                             #
+# Gap-entry interaction-clear call counts                                     #
 # --------------------------------------------------------------------------- #
 #
 # Command-motion and ownership edges both invalidate temporal pairing, but each
-# safe edge must re-baseline exactly once. These tests spy on
-# ``PatDetector.clear_presses`` to pin call counts, not just event output.
+# contiguous gap must clear exactly once at entry. These tests spy on
+# ``PatDetector.clear_interaction`` to pin call counts, not just event output.
 
 
 class _CountingDetector(PatDetector):
-    """A :class:`PatDetector` that counts ``clear_presses()`` calls.
+    """A :class:`PatDetector` that counts interaction-clear calls.
 
-    Standing in for a spy: the resume/re-baseline block's one distinctive,
-    side-effecting call is ``clear_presses()`` (see
-    ``PatSenseDriver._rebaseline_after_gap``), so counting it pins exactly how
-    many times that block ran without needing to reach into driver internals.
+    Standing in for a spy: the distinctive, side-effecting call is
+    ``clear_interaction()``, so counting it pins exactly
+    one interaction end at gap entry without reaching into driver internals.
     """
 
     def __init__(self, **kw) -> None:
@@ -547,18 +550,18 @@ class _CountingDetector(PatDetector):
         super().__init__(**kw)
         self.clear_presses_calls = 0
 
-    def clear_presses(self) -> None:
+    def clear_interaction(self) -> None:
         self.clear_presses_calls += 1
-        super().clear_presses()
+        super().clear_interaction()
 
 
-def test_continuous_wander_does_not_rerun_rebaseline_every_tick() -> None:
-    """Continuous command motion must not re-run the re-baseline every tick.
+def test_continuous_wander_clears_once_on_entry_not_every_tick() -> None:
+    """Continuous command motion clears once at its first blocked edge.
 
     The stillness gate stays CLOSED for the entire run (each tick's commanded
     pitch moves well past ``still_eps``), so the sense never detects at all --
-    ownership is constant, so no safe edge occurs anywhere in this trace. The
-    re-baseline call count therefore remains zero."""
+    ownership is constant, so the same gap remains open for the whole trace.
+    Interaction clear therefore runs once, not once per moving tick."""
     reader = _Reader()
     detector = _CountingDetector()
     # Default stillness gate (still_hold_s=DEFAULT_STILL_HOLD_S): ON.
@@ -569,16 +572,15 @@ def test_continuous_wander_does_not_rerun_rebaseline_every_tick() -> None:
         _drive(driver, reader, (0.0, 0.0), now, owner=BASE_OWNER, pitch=0.05 * i)
         now += DT
 
-    assert detector.clear_presses_calls == 0
+    assert detector.clear_presses_calls == 1
     # The reader is never even consulted while the stillness gate is closed
     # (the driver returns before reaching the actual-pose read) -- a second,
     # independent signal that no per-tick "resume and sense" work ran.
     assert reader.calls == 0
 
 
-def test_stillness_unblock_rebaselines_exactly_once() -> None:
-    """The genuine stillness blocked -> unblocked edge still fires its own
-    one-time re-baseline, symmetric with an ownership edge."""
+def test_stillness_gap_clears_on_entry_and_not_again_on_unblock() -> None:
+    """A stillness gap clears on entry; recovery only reseeds conditioning."""
     reader = _Reader()
     detector = _CountingDetector()
     driver = PatSenseDriver(
@@ -590,11 +592,11 @@ def test_stillness_unblock_rebaselines_exactly_once() -> None:
     for i in range(20):
         _drive(driver, reader, (0.0, 0.0), now, owner=BASE_OWNER, pitch=0.05 * i)
         now += DT
-    assert detector.clear_presses_calls == 0  # never opened yet -> no resume
+    assert detector.clear_presses_calls == 1
 
     # Now hold the commanded pose perfectly still for longer than
     # still_hold_s: the gate opens exactly once, and the resume block must
-    # fire exactly once -- not zero (the edge is real), not many (no churn).
+    # reseed conditioning without clearing the interaction a second time.
     held_pitch = 0.05 * 19
     for _ in range(40):  # 40 * DT(0.1) = 4.0 s, comfortably past still_hold_s
         now += DT
@@ -602,8 +604,8 @@ def test_stillness_unblock_rebaselines_exactly_once() -> None:
     assert detector.clear_presses_calls == 1
 
 
-def test_ownership_edge_rebaselines_exactly_once() -> None:
-    """An ownership edge performs one re-baseline even with an unchanged pose.
+def test_ownership_edge_clears_interaction_exactly_once() -> None:
+    """An ownership edge clears once even with an unchanged pose.
 
     The stillness gate is disabled so only the ownership edge is under test.
     """
