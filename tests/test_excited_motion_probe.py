@@ -186,8 +186,8 @@ def test_never_settling_motion_episode_has_a_separate_hard_timeout() -> None:
     assert source.calls == 1
 
 
-@pytest.mark.parametrize("actual", [(float("nan"), 1.0), (1.0, float("inf"))])
-def test_nonfinite_actual_is_explicitly_unavailable(actual) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize("actual", [None, (float("nan"), 1.0), (1.0, float("inf"))])
+def test_missing_or_nonfinite_actual_refuses_capture(actual: object) -> None:
     source = _Reader(actual)
     records: list[dict] = []
     driver = _driver("held", SharedPoseReader(source), emit=records.append)
@@ -196,13 +196,31 @@ def test_nonfinite_actual_is_explicitly_unavailable(actual) -> None:  # type: ig
     driver(_ctx(SETTLED_EDGE_S))
     driver(_ctx(1.0, pitch=1.0))
 
-    assert records[-1]["actual"] == {
-        "availability": "unavailable",
-        "pitch": None,
-        "yaw": None,
-    }
+    assert records[-1]["type"] == "probe_refused"
+    assert "actual pose unavailable" in records[-1]["reason"]
+    assert not any(record["type"] == "sample" for record in records)
+    assert not any(record["type"] == "probe_end" for record in records)
     json.dumps(records, allow_nan=False)
     assert source.calls == 1
+
+
+def test_raising_actual_reader_refuses_capture() -> None:
+    calls = 0
+
+    def fail():  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("reader failed")
+
+    records: list[dict] = []
+    driver = _driver("held", SharedPoseReader(fail), emit=records.append)
+    driver(_ctx(0.0))
+    driver(_ctx(SETTLED_EDGE_S))
+    driver(_ctx(1.0, pitch=1.0))
+
+    assert records[-1]["type"] == "probe_refused"
+    assert "actual pose unavailable" in records[-1]["reason"]
+    assert calls == 1
 
 
 @pytest.mark.parametrize(
@@ -398,6 +416,152 @@ def test_cli_engine_run_wires_passive_probe_without_extra_sends(
     assert held.closed is True
 
 
+def test_probe_mode_omits_acting_stack_and_rejects_both_command_spools(
+    monkeypatch, tmp_path
+) -> None:
+    from reachy.behavior import control
+    from reachy.behavior import engine as engine_module
+    from reachy.behavior.intents import INTENT_NAMESPACE
+    from reachy.behavior.rules import default_rules_path
+    from reachy.cli import main
+    from reachy.cli._commands import behavior as behavior_module
+
+    state_root = tmp_path / "state"
+    monkeypatch.setenv("REACHY_STATE_DIR", str(state_root))
+    rules_path = default_rules_path()
+    rules_path.parent.mkdir(parents=True, exist_ok=True)
+    rules_path.write_text(
+        """
+[[react]]
+id = "pat-acknowledge"
+when = { field = "pat", op = "is_true" }
+run = "pet-reaction"
+cooldown_s = 0.0
+""".strip(),
+        encoding="utf-8",
+    )
+
+    main_id = control.submit("add", name="thoughtful")
+    intent_id = control.submit("run_behavior", namespace=INTENT_NAMESPACE, name="pet-reaction")
+    goto_id = control.submit("goto", namespace=INTENT_NAMESPACE, head={"pitch": 9.0}, duration=1.0)
+
+    class Sink:
+        def set_target(self, **_command) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+    class Transport:
+        name = "fake"
+
+        @contextlib.contextmanager
+        def streaming(self):  # type: ignore[no-untyped-def]
+            yield Sink()
+
+        def doa(self, timeout=None):  # type: ignore[no-untyped-def]
+            return None
+
+    class Held:
+        def __init__(self) -> None:
+            self.samples = iter([(-3.0, 0.0), (0.0, 0.0), (-3.0, 0.0)])
+            self.last = (0.0, 0.0)
+            self.calls = 0
+            self.closed = False
+
+        def read(self):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            self.last = next(self.samples, self.last)
+            return self.last
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Clock:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def __call__(self) -> float:
+            self.value += 0.02
+            return self.value
+
+    def forbidden(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("acting runtime component composed in probe mode")
+
+    held = Held()
+    transport = Transport()
+    events: list[dict] = []
+    admissions: list[str] = []
+    real_admit = engine_module.Engine.admit_behavior
+
+    def record_admit(self, behavior, now):  # type: ignore[no-untyped-def]
+        admissions.append(behavior.name)
+        return real_admit(self, behavior, now)
+
+    monkeypatch.setattr(behavior_module, "get_transport", lambda _args: transport)
+    monkeypatch.setattr(behavior_module, "_make_state_reader", lambda: held)
+    monkeypatch.setattr(behavior_module, "_boot_tick_seam", forbidden)
+    monkeypatch.setattr(behavior_module, "PatSenseDriver", forbidden)
+    monkeypatch.setattr(behavior_module, "IntentDriver", forbidden)
+    monkeypatch.setattr(behavior_module, "GotoLane", forbidden)
+    monkeypatch.setattr(engine_module.Engine, "admit_behavior", record_admit)
+    real_run = engine_module.run
+
+    def run_observed(*args, **kwargs):  # type: ignore[no-untyped-def]
+        original_emit = kwargs["emit"]
+
+        def emit(event):  # type: ignore[no-untyped-def]
+            events.append(event)
+            original_emit(event)
+
+        return real_run(
+            *args,
+            **{
+                **kwargs,
+                "emit": emit,
+                "now": Clock(),
+                "sleep": lambda _seconds: None,
+            },
+        )
+
+    monkeypatch.setattr(behavior_module, "engine_run", run_observed)
+    output = tmp_path / "held.jsonl"
+
+    rc = main(
+        [
+            "behavior",
+            "engine",
+            "run",
+            "--json",
+            "--max-ticks",
+            "850",
+            "--probe-mode",
+            "held",
+            "--probe-output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    assert admissions == []
+    assert held.calls > 0
+    assert held.closed is True
+    for event in events:
+        owners = event["ownership"]
+        assert len(set(owners.values())) == 1
+        owner = owners["head"]
+        assert owner.startswith("feel-alive-")
+        assert owner.removeprefix("feel-alive-").isdigit()
+    state = control.read_state()
+    assert {item["name"] for item in state["active"]} == {"feel-alive"}
+
+    for cmd_id, namespace in (
+        (main_id, ""),
+        (intent_id, INTENT_NAMESPACE),
+        (goto_id, INTENT_NAMESPACE),
+    ):
+        result = control.await_result(cmd_id, namespace=namespace, timeout=0.0)
+        assert result["ok"] is False
+        assert "observation-only" in result["error"]
+
+
 def test_cli_probe_refuses_fresh_engine_before_output_or_transport(
     monkeypatch, tmp_path, capsys
 ) -> None:
@@ -434,7 +598,10 @@ def test_cli_probe_refuses_fresh_engine_before_output_or_transport(
     assert engine_calls == []
     error = capsys.readouterr().err
     assert "already-running" in error
-    assert "stop" in error and "restart" in error
+    assert "Ctrl-C in its owning terminal" in error
+    assert "behavior engine stop' only" in error
+    assert "launched with 'reachy behavior engine start'" in error
+    assert "sole foreground 'reachy behavior engine run'" in error
 
 
 def test_probe_output_closes_when_seam_composition_fails(monkeypatch, tmp_path) -> None:

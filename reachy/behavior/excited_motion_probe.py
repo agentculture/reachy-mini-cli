@@ -22,6 +22,7 @@ MOTION_TIMEOUT_S = 13.0
 MAX_TICK_GAP_S = 0.1
 HEAD_AXES = ("x", "y", "z", "roll", "pitch", "yaw")
 CHANNELS = ("head", "antennas", "body_yaw")
+OBSERVATION_ONLY_ERROR = "probe mode is observation-only; command rejected"
 
 _UNSET = object()
 
@@ -59,6 +60,57 @@ class SharedPoseReader:
         except (TypeError, ValueError):
             return None
         return result if all(math.isfinite(axis) for axis in result) else None
+
+
+def _reject_pending(spool) -> None:  # type: ignore[no-untyped-def]
+    """Drain one command spool with an explicit observation-only result."""
+    for command in spool.drain():
+        spool.write_result(
+            command.get("cmd_id"),
+            {
+                "ok": False,
+                "op": command.get("op"),
+                "error": OBSERVATION_ONLY_ERROR,
+            },
+        )
+
+
+class ProbeCommandGuard:
+    """Main engine-control facade that rejects commands but publishes heartbeat.
+
+    ``engine.run`` resets its control object before entering the loop. Probe
+    mode deliberately keeps commands queued before startup so its first tick can
+    answer every one explicitly instead of silently deleting them.
+    """
+
+    def __init__(self, spool) -> None:  # type: ignore[no-untyped-def]
+        self._spool = spool
+
+    def reset(self) -> None:
+        return None
+
+    def drain(self) -> list[dict]:
+        _reject_pending(self._spool)
+        return []
+
+    def write_result(self, cmd_id: str | None, result: dict) -> None:
+        self._spool.write_result(cmd_id, result)
+
+    def write_state(self, state: dict) -> None:
+        self._spool.write_state(state)
+
+    def read_state(self) -> dict | None:
+        return self._spool.read_state()
+
+
+class ProbeNamespaceGuard:
+    """Tick driver that rejects every namespaced intent/goto command."""
+
+    def __init__(self, spool) -> None:  # type: ignore[no-untyped-def]
+        self._spool = spool
+
+    def __call__(self, _ctx) -> None:  # type: ignore[no-untyped-def]
+        _reject_pending(self._spool)
 
 
 def _feel_alive_owner(ctx) -> tuple[str | None, str | None]:  # type: ignore[no-untyped-def]
@@ -250,9 +302,12 @@ class ProbeDriver:
         read_started = self._wall_now()
         actual = self._reader.read()
         read_lag = self._wall_now() - read_started
-        pitch, yaw = actual if actual is not None else (None, None)
+        if actual is None:
+            self._refuse(timestamp, "actual pose unavailable")
+            return
+        pitch, yaw = actual
         actual_record = {
-            "availability": "available" if actual is not None else "unavailable",
+            "availability": "available",
             "pitch": pitch,
             "yaw": yaw,
         }
@@ -317,7 +372,10 @@ __all__ = [
     "MAX_TICK_GAP_S",
     "MODES",
     "MOTION_TIMEOUT_S",
+    "OBSERVATION_ONLY_ERROR",
+    "ProbeCommandGuard",
     "ProbeDriver",
+    "ProbeNamespaceGuard",
     "SCHEMA",
     "SETTLED_EDGE_S",
     "SharedPoseReader",

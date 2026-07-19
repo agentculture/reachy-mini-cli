@@ -53,7 +53,12 @@ from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.excited_motion_probe import CUES as PROBE_CUES
 from reachy.behavior.excited_motion_probe import MODES as PROBE_MODES
-from reachy.behavior.excited_motion_probe import ProbeDriver, SharedPoseReader
+from reachy.behavior.excited_motion_probe import (
+    ProbeCommandGuard,
+    ProbeDriver,
+    ProbeNamespaceGuard,
+    SharedPoseReader,
+)
 from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
 from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
@@ -722,10 +727,16 @@ def _make_state_reader() -> HeldStateReader:
 def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer, probe=None):
     """Build ``behavior engine run``'s sense reader + tick seam + held pose reader.
 
-    Composes every merged runtime sense/act piece onto the engine's ONE per-tick
-    seam and returns ``(sense_reader, tick_seam, reader)``. Everything rides ONE
+    Composes runtime sense/act pieces onto the engine's ONE per-tick seam and
+    returns ``(sense_reader, tick_seam, reader)``. Everything rides ONE
     :class:`TickBus` wrapped in :class:`TickMetrics`, so a tick-budget breach
     surfaces as a ``[SENSE ... event=overrun]`` line (c22).
+
+    Probe composition is intentionally separate and observation-only: it omits
+    rules, ordinary pat classification, intents, goto, and the pose holder. Its
+    seam contains only a namespaced-command rejector, the passive probe, and an
+    optional export snapshot. The main command spool is independently guarded by
+    :func:`cmd_engine_run`; both paths return explicit negative command results.
 
     Perception (``sense_reader``)
     -----------------------------
@@ -787,23 +798,39 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     """
     doa_poller = DoaPoller(lambda: read_doa(transport))
 
+    if probe is not None:
+        reader = _make_state_reader()
+        shared_reader = SharedPoseReader(reader.read)
+        mode, probe_emit = probe
+        providers = SenseProviders()
+
+        def probe_sense_reader(t):
+            return read_perception(providers, base=doa_poller(t))
+
+        drivers = [
+            ProbeNamespaceGuard(control.CommandSpool(namespace=INTENT_NAMESPACE)),
+            ProbeDriver(mode, shared_reader, emit=probe_emit),
+        ]
+        consumers = []
+        if runtime_consumer is not None:
+            drivers.append(SenseSnapshotDriver())
+            consumers.append(runtime_consumer)
+        bus = TickBus(drivers=drivers, consumers=consumers)
+        return (
+            probe_sense_reader,
+            TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)),
+            reader,
+        )
+
     # The pat sense stack ships ON after the hands-on #80 gate finding: the
     # complete command must hold still before sensing, which removes wander
     # ghosts structurally while allowing a settled reaction owner to keep
     # sensing. REACHY_PAT_SENSE=0 is the explicit sensing rollback.
     reader = None
     pat_driver = None
-    probe_driver = None
-    if _pat_sense_enabled() or probe is not None:
+    if _pat_sense_enabled():
         reader = _make_state_reader()
-        shared_reader = SharedPoseReader(reader.read) if probe is not None else None
-        if _pat_sense_enabled():
-            pat_driver = PatSenseDriver(
-                reader=shared_reader.read if shared_reader is not None else reader.read
-            )  # tuned default detector (#79)
-        if probe is not None:
-            mode, probe_emit = probe
-            probe_driver = ProbeDriver(mode, shared_reader, emit=probe_emit)
+        pat_driver = PatSenseDriver(reader=reader.read)  # tuned default detector (#79)
     holder = LastPoseHolder()
     providers = SenseProviders(
         pat_event=pat_driver.as_provider() if pat_driver is not None else None,
@@ -825,12 +852,8 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     # carries the four intent defaults) so all five kinds share one registry.
     intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
 
-    # The passive probe precedes pat sensing so both consumers share exactly one
-    # actual-pose read on a captured tick. It never admits/evicts or commands.
     drivers = [
-        d
-        for d in (rules_driver, intent_driver, probe_driver, pat_driver, holder, goto_lane)
-        if d is not None
+        d for d in (rules_driver, intent_driver, pat_driver, holder, goto_lane) if d is not None
     ]
     consumers = []
     if runtime_consumer is not None:
@@ -874,8 +897,10 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
             code=EXIT_USER_ERROR,
             message="probe refused: already-running CLI behavior engine has a fresh heartbeat",
             remediation=(
-                "stop it with 'reachy behavior engine stop', then restart the CLI engine "
-                "with --probe-mode and --probe-output on that sole owner process"
+                "for a foreground 'reachy behavior engine run', press Ctrl-C in its owning "
+                "terminal; use 'reachy behavior engine stop' only when it was launched with "
+                "'reachy behavior engine start'; then start the sole foreground "
+                "'reachy behavior engine run' with --probe-mode and --probe-output"
             ),
         )
 
@@ -885,7 +910,8 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     transport = get_transport(args)
     config = _engine_config(args)
     spool = control.CommandSpool()
-    rules_driver = _boot_tick_seam()  # None on a rejected rules file -> base presence only
+    rules_driver = None if probe_mode is not None else _boot_tick_seam()
+    engine_control = ProbeCommandGuard(spool) if probe_mode is not None else spool
     probe_stream = None
     reader = None
     runtime_consumer = None
@@ -913,11 +939,14 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
             if probe_mode is not None:
                 emit_diagnostic(f"{PROBE_CUES[probe_mode]} — passive {probe_mode} observation")
             if not json_mode:
-                rules_note = (
-                    " + rules"
-                    if rules_driver is not None
-                    else " (rules rejected — base presence only)"
-                )
+                if probe_mode is not None:
+                    rules_note = " (observation-only probe)"
+                else:
+                    rules_note = (
+                        " + rules"
+                        if rules_driver is not None
+                        else " (rules rejected — base presence only)"
+                    )
                 emit_diagnostic(
                     f"[behavior] engine live: {config.compose_hz:g} Hz via {transport.name}"
                     f"{' + base layer' if config.base_layer else ''}{rules_note}; Ctrl-C to stop"
@@ -940,7 +969,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
             on_start=_on_start,
             emit=_emit,
             max_ticks=args.max_ticks,
-            control=spool,
+            control=engine_control,
             sense=sense_reader,
             tick_seam=tick_seam,
         )
