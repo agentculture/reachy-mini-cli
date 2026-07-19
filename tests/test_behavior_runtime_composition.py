@@ -551,3 +551,31 @@ def test_engine_run_cli_reports_clean_error_on_malformed_still_tuning_env(_isola
 
     rc = main(["behavior", "engine", "run", "--max-ticks", "1", "--json"])
     assert rc == 1
+
+
+def test_pat_env_rejects_non_finite_and_negative_values(monkeypatch) -> None:
+    """'nan'/'inf' parse as floats but are never valid tuning.
+
+    Left unchecked they propagate into the conditioning filters and thresholds
+    and silently disable sensing, rather than reporting the operator's mistake —
+    which is exactly what the tuning surface's error contract promises not to do.
+    """
+    from reachy.cli._commands.behavior import _pat_float_env
+    from reachy.cli._errors import EXIT_USER_ERROR, CliError
+
+    for raw in ("nan", "inf", "-inf", "NaN", "Infinity"):
+        monkeypatch.setenv("REACHY_PAT_HP_TAU", raw)
+        with pytest.raises(CliError) as excinfo:
+            _pat_float_env("REACHY_PAT_HP_TAU", 0.8)
+        assert excinfo.value.code == EXIT_USER_ERROR
+        assert "finite" in str(excinfo.value.message)
+
+    monkeypatch.setenv("REACHY_PAT_HP_TAU", "-0.5")
+    with pytest.raises(CliError) as excinfo:
+        _pat_float_env("REACHY_PAT_HP_TAU", 0.8)
+    assert "non-negative" in str(excinfo.value.message)
+
+    # Valid values still pass straight through, including an explicit zero.
+    for raw, expected in (("0", 0.0), ("0.08", 0.08), ("2.5", 2.5)):
+        monkeypatch.setenv("REACHY_PAT_HP_TAU", raw)
+        assert _pat_float_env("REACHY_PAT_HP_TAU", 0.8) == expected

@@ -8,7 +8,7 @@ import random
 import pytest
 
 from reachy.behavior.arbitration import arbitrate
-from reachy.behavior.feel_alive import make_feel_alive, swing_time
+from reachy.behavior.feel_alive import _raw_motion, make_feel_alive, swing_time
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass
 from reachy.behavior.sense import EMPTY_SENSE
 
@@ -246,9 +246,13 @@ def test_swing_creates_a_sustained_slow_window_without_losing_travel() -> None:
     assert longest * dt >= 1.0, f"no sustained slow window: longest was {longest * dt:.2f}s"
 
     # Liveliness is NOT the price: total travel matches the unwarped trajectory.
+    #
+    # The baseline MUST come from `_raw_motion` directly. Feeding
+    # `swing_time(t, depth=0.0)` into the callable does not disable anything —
+    # `__call__` applies its own warp to whatever time it is handed — so that
+    # would compare the warped trajectory against itself and pass vacuously.
     unwarped = [
-        _vector(_contribution(make_feel_alive(jitter=_Jitter(9.0)), swing_time(i * dt, depth=0.0)))
-        for i in range(int(40 / dt))
+        _vector(_raw_motion(i * dt, {**PARAMS, "energy": 1.0})) for i in range(int(40 / dt))
     ]
     unwarped_travel = sum(
         max(abs(a - b) for a, b in zip(u, v)) for u, v in zip(unwarped, unwarped[1:])

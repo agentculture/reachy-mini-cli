@@ -228,12 +228,19 @@ class _FeelAlive:
         where the plant is quiet enough to feel a hand, without the robot ever
         stopping.
 
-        Consequence, stated plainly: ``PatSenseDriver``'s stillness gate opens
-        only after the commanded pose has been EXACTLY constant for
-        ``still_hold_s``, which continuous motion never satisfies. The swing
-        window is *slow*, not *still*, so pettability needs a sense gated on
-        sustained low speed rather than exact constancy — follow-up work this
-        change does not silently claim to have done.
+        How this meets the pat sense: ``PatSenseDriver``'s gate is *tolerance*
+        based, not exact. It restamps its motion clock whenever the largest
+        per-axis change in a tick exceeds ``still_eps``, and opens once
+        ``still_hold_s`` has passed without one — so ``still_eps`` is really a
+        per-tick VELOCITY threshold, and the gate is already a sustained-slow
+        gate rather than a stillness one.
+
+        At its shipped ``still_eps`` of 0.01 deg/tick, tuned for the removed
+        dead-still hold, continuous motion does not open it in practice
+        (measured: 0.0% of the time at a 1.0 s hold). The swing exists to make
+        that a tuning question instead of an impossibility — retuned toward the
+        slow window it opens 10-15% of the time, which is where the measured
+        3.6x pat-vs-plant separation lives.
         """
         return _raw_motion(swing_time(max(0.0, float(t_local))), params)
 

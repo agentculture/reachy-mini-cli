@@ -774,13 +774,29 @@ def _pat_float_env(name: str, default: float) -> float:
     if raw is None:
         return default
     try:
-        return float(raw.strip())
+        value = float(raw.strip())
     except ValueError as exc:
         raise CliError(
             code=EXIT_USER_ERROR,
             message=f"invalid {name}={raw!r} (expected a number)",
             remediation=f"set {name} to a number, or unset it to use the default",
         ) from exc
+    # "nan"/"inf" parse cleanly as floats but are never valid tuning. Left
+    # unchecked they propagate into the filters and thresholds and silently
+    # disable sensing rather than reporting a mistake.
+    if not math.isfinite(value):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid {name}={raw!r} (expected a finite number)",
+            remediation=f"set {name} to a finite number, or unset it to use the default",
+        )
+    if value < 0.0:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid {name}={raw!r} (expected a non-negative number)",
+            remediation=f"set {name} to zero or more, or unset it to use the default",
+        )
+    return value
 
 
 def _pat_float_override(name: str, default: float) -> float | None:
