@@ -561,7 +561,9 @@ class PatSenseDriver:
 
         if fresh:
             self._seen_press_at = evidence.last_press_at
-            self._no_fresh_since = None
+            # Release is budgeted from the persisted press anchor, not from
+            # whichever later quiet sample happens to be observed first.
+            self._no_fresh_since = evidence.last_press_at
             if self._state.phase in ("idle", "released"):
                 self._active_contact_s = 0.0
                 self._enough_after_s = self._draw_enough_after()
