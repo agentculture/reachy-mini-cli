@@ -237,3 +237,6 @@ skills.local.yaml
 
 # Local-only scratch, live-session evidence, and box state (never committed).
 .local/
+
+# Auto-generated steward doctor report (regenerate: steward doctor --scope siblings).
+docs/steward/
