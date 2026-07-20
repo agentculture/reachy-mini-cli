@@ -149,6 +149,33 @@ SENSE_FIELDS: frozenset[str] = frozenset(
     {"doa", "speech", "rms", "pat", "face", "frame_available", "transcript"}
 )
 
+#: Sense fields whose bare reading is measured to be too noisy to key a rule on
+#: BY ITSELF. Today that is ``speech`` alone.
+#:
+#: Measured on the deployed robot in a QUIET room with nobody speaking, 120
+#: samples over 60 s (``docs/verification/2026-07-20-retire-old-flow-baseline.md``
+#: section 2): ``speech_detected`` read True **55/120 = 45.8 %** of the time,
+#: while the bearing wandered essentially the full 0.000-3.124 rad range. A rule
+#: keyed on it fires on roughly a coin flip, pointed at nothing.
+#:
+#: A :class:`Rule` carries exactly ONE ``when`` predicate — the schema has no
+#: conjunction — so ANY rule whose ``when.field`` is in this set is by
+#: construction keyed on the BARE signal. That is why the check downstream needs
+#: no cross-predicate analysis, and it is also the honest reason this is a lint
+#: rather than a schema refusal: refusing would amount to deleting ``speech``
+#: from :data:`SENSE_FIELDS` outright, which is a product decision, not a
+#: validator's call.
+UNCORROBORATED_SENSE_FIELDS: frozenset[str] = frozenset({"speech"})
+
+#: The measured at-rest true-rate for the fields above, quoted verbatim in the
+#: warning so an operator sees EVIDENCE rather than an assertion.
+UNCORROBORATED_AT_REST_RATE = "45.8% (55/120 samples, quiet room, nobody speaking)"
+
+#: Fields that DO carry corroboration, named in the warning as the fix. Each is
+#: either already gated (``transcript`` is an utterance that cleared the layered
+#: engagement gate) or a physical measurement (``rms``/``pat``/``face``).
+CORROBORATING_SENSE_FIELDS: tuple[str, ...] = ("transcript", "rms", "pat", "face")
+
 #: Ordered numeric comparators — require a numeric ``value``.
 _ORDERED_OPS: frozenset[str] = frozenset({"lt", "gt", "ge", "le"})
 #: Equality comparators — require a ``value`` (any JSON scalar).
