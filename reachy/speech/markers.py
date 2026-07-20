@@ -38,9 +38,11 @@ is treated as noise rather than garbage speech or a ghost expression.
 Public API
 ----------
 :class:`MarkerEvent`
-    Frozen dataclass — ``kind="marker"``, ``emoji: str``.
+    Frozen dataclass — ``kind="marker"``, ``emoji: str``.  Defined in
+    :mod:`reachy.speech.marker_events` and re-exported here unchanged.
 :class:`SpeechEvent`
-    Frozen dataclass — ``kind="speech"``, ``text: str``.
+    Frozen dataclass — ``kind="speech"``, ``text: str``.  Also defined in
+    :mod:`reachy.speech.marker_events` and re-exported here unchanged.
 :data:`Event`
     ``MarkerEvent | SpeechEvent`` union alias (for type annotations).
 :class:`MarkerParser`
@@ -48,50 +50,29 @@ Public API
     ``flush() -> list[Event]``.
 :func:`parse`
     Convenience whole-string parser built on :class:`MarkerParser`.
+
+Note on the event types' home
+------------------------------
+``MarkerEvent``/``SpeechEvent``/``Event`` are defined in the sibling module
+:mod:`reachy.speech.marker_events`, not here — this module re-exports them
+(the same class objects, not a redefinition) purely for backward
+compatibility. :mod:`reachy.motion.expression` (part of the ``apply_pose``
+tool path that survives this module's eventual retirement) imports the types
+from :mod:`reachy.speech.marker_events` directly, so it never depends on this
+module at all.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, Union
+from reachy.speech.marker_events import Event, MarkerEvent, SpeechEvent
 
-# ---------------------------------------------------------------------------
-# Event types
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class MarkerEvent:
-    """An expression-marker event emitted when a ``*…*`` span closes.
-
-    Parameters
-    ----------
-    emoji:
-        The trimmed content between the asterisks.  Typically a single emoji
-        (``🤔``) or a short action word (``thinking``).
-    """
-
-    emoji: str
-    kind: Literal["marker"] = "marker"
-
-
-@dataclass(frozen=True)
-class SpeechEvent:
-    """A speech event emitted when a ``"…"`` span closes.
-
-    Parameters
-    ----------
-    text:
-        The trimmed text between the double-quote delimiters.
-    """
-
-    text: str
-    kind: Literal["speech"] = "speech"
-
-
-#: Union type alias for use in annotations.
-Event = Union[MarkerEvent, SpeechEvent]
-
+__all__ = [
+    "Event",
+    "MarkerEvent",
+    "SpeechEvent",
+    "MarkerParser",
+    "parse",
+]
 
 # ---------------------------------------------------------------------------
 # State machine constants
