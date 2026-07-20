@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 
 import pytest
 
 from reachy import __version__
-from reachy.cli import main
+from reachy.cli import _build_parser, main
 from reachy.explain import known_paths
 
 
@@ -133,3 +134,89 @@ def test_every_catalog_path_resolves(capsys: pytest.CaptureFixture[str]) -> None
         rc = main(["explain", *path])
         assert rc == 0, f"explain {' '.join(path)} failed"
         capsys.readouterr()
+
+
+# --- explain catalog <-> CLI argparse tree agreement -----------------------
+#
+# The test above only walks ENTRIES and asserts each key resolves *within the
+# catalog itself* — it never consults the live argparse tree, so it stays green
+# even if a verb is deleted from the CLI while its catalog entry is left behind
+# (explain would then document a command that no longer exists), and it stays
+# green even if a brand-new verb is added with no catalog entry at all. The two
+# tests below close both gaps by walking `_build_parser()`'s subparsers tree
+# directly and comparing it against `known_paths()` in both directions.
+
+#: Self-reference aliases for the catalog root entry (see the module docstring
+#: of ``reachy/explain/catalog.py``): ``()`` is the actual root path in the
+#: argparse tree (the top-level parser itself), while ``("reachy",)`` and
+#: ``("reachy-mini-cli",)`` are documented stand-ins for it — the installed
+#: console-script name and the display name used throughout help text — so that
+#: ``explain reachy`` / ``explain reachy-mini-cli`` (the rubric's
+#: ``explain_self`` check) resolve to the same root markdown. No subcommand
+#: literally named "reachy" or "reachy-mini-cli" is ever registered, so these
+#: two keys can never appear as a live argparse path; they are exempted from
+#: the "every catalog key is a live path" direction below, not because they are
+#: stale, but because they were never meant to be verbs.
+_ROOT_ALIASES: frozenset[tuple[str, ...]] = frozenset({(), ("reachy",), ("reachy-mini-cli",)})
+
+
+def _iter_argparse_paths(parser: argparse.ArgumentParser) -> set[tuple[str, ...]]:
+    """Walk *parser*'s subparsers tree and return every reachable command path.
+
+    A path is the tuple of verb tokens from the root to a (sub)parser, e.g.
+    ``("behavior", "rules", "check")``; the root parser itself is ``()``. This
+    walks ``argparse._SubParsersAction.choices`` recursively — the same
+    structure ``_build_parser()`` populates via nested ``add_subparsers()`` /
+    ``add_parser()`` calls — so it reflects exactly what
+    ``reachy-mini-cli <path>`` accepts, with no need to duplicate the noun
+    catalog by hand.
+    """
+    paths: set[tuple[str, ...]] = set()
+
+    def walk(p: argparse.ArgumentParser, prefix: tuple[str, ...]) -> None:
+        paths.add(prefix)
+        for action in p._actions:  # noqa: SLF001 - argparse has no public walk API
+            if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+                for name, subparser in action.choices.items():
+                    walk(subparser, prefix + (name,))
+
+    walk(parser, ())
+    return paths
+
+
+def test_catalog_entries_resolve_to_live_argparse_paths() -> None:
+    """Every ``ENTRIES`` key must name a command path that actually exists.
+
+    Catches a verb being deleted from the CLI while its catalog entry is left
+    behind: without this, ``reachy-mini-cli explain <deleted verb>`` would keep
+    printing full documentation for a command ``reachy-mini-cli <deleted
+    verb>`` itself now rejects, and CI would stay green.
+    """
+    live_paths = _iter_argparse_paths(_build_parser())
+    stale = sorted(
+        path for path in known_paths() if path not in _ROOT_ALIASES and path not in live_paths
+    )
+    assert not stale, (
+        "explain catalog entries name no live CLI command (stale after a verb was "
+        f"deleted from _build_parser()): {stale!r}. Fix: remove these keys from "
+        "reachy/explain/catalog.py's ENTRIES (and their markdown body, if unused "
+        "elsewhere)."
+    )
+
+
+def test_every_registered_verb_has_catalog_entry() -> None:
+    """Every live CLI command path must have an ``ENTRIES`` key.
+
+    Catches a new verb/noun being registered in ``_build_parser()`` with no
+    matching catalog entry: without this, ``reachy-mini-cli explain <path>``
+    would raise "no explain entry for" on a command that otherwise works fine,
+    and CI would stay green.
+    """
+    live_paths = _iter_argparse_paths(_build_parser())
+    entry_keys = set(known_paths())
+    undocumented = sorted(path for path in live_paths if path not in entry_keys)
+    assert not undocumented, (
+        "CLI command paths have no explain catalog entry (missing docs for a new "
+        f"or renamed verb): {undocumented!r}. Fix: add a key for each path to "
+        "reachy/explain/catalog.py's ENTRIES."
+    )
