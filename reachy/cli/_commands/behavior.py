@@ -483,7 +483,16 @@ def _rules_config_payload(config: rules_mod.RulesConfig, *, path: Path, exists: 
         "modes": {name: dict(mode.params) for name, mode in config.modes.items()},
     }
     if not exists:
-        payload["note"] = "no rules file yet — nothing configured"
+        # "No overlay" stopped meaning "no rules" when the release began
+        # shipping defaults (t15): the rules listed above are real and running,
+        # they just came from the package rather than from this path. Saying
+        # "nothing configured" next to three listed rules would read as a bug.
+        shipped = len(config.react) + len(config.inhibit)
+        payload["note"] = (
+            f"no box-local rules file yet — showing the {shipped} shipped default rule(s)"
+            if shipped
+            else "no rules file yet — nothing configured"
+        )
     return payload
 
 
@@ -1807,9 +1816,20 @@ def _open_probe(probe_mode: str, probe_output: str):  # type: ignore[no-untyped-
 def _engine_live_line(  # type: ignore[no-untyped-def]
     config, transport, rules_driver, probe_mode: str | None
 ) -> str:
-    """Build the one-line 'engine live' banner naming the composed layers."""
+    """Build the one-line 'engine live' banner naming the composed layers.
+
+    The three-way split matters because the shipped layer now carries content
+    (t15): a rejected overlay no longer means "no rules at all", it means the
+    SHIPPED rules survived and only the operator's edits were lost. Saying
+    plain ``+ rules`` there would read as "your file loaded" to the one person
+    who most needs to know it did not — so a rejection is named on the banner,
+    not left to the ``[SENSE ... event=boot]`` drop line alone.
+    """
+    rejected = rules_driver is not None and rules_driver.loader.last_error is not None
     if probe_mode is not None:
         rules_note = " (observation-only probe)"
+    elif rejected:
+        rules_note = " + shipped rules (your overlay was rejected)"
     elif rules_driver is not None:
         rules_note = " + rules"
     else:
