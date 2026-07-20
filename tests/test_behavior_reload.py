@@ -322,11 +322,14 @@ def test_reload_swaps_config_mid_run_via_real_engine_loop() -> None:
             reload_driver.submit_reload()
             state["edited"] = True
 
+    # dt=0.005 keeps each tick's apparent work (one clock step) under the 20 ms
+    # period, so the #97 deadline scheduler still requests an inter-tick sleep
+    # (dt=0.02 would consume the whole budget and skip the sleep seam entirely).
     ticks = engine_run(
         tr,
         EngineConfig(compose_hz=50, base_layer=True, settle=False),
         sleep=_sleep_seam,
-        now=_Clock(),
+        now=_Clock(dt=0.005),
         max_ticks=2,
         engine=eng,
         tick_seam=driver,
