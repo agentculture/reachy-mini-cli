@@ -31,6 +31,36 @@ needs both a live media session (mic/camera) and a held pose reader constructs
 one of each, never sharing the ``no_media`` client with the media one (they are
 different ``ReachyMini`` construction profiles).
 
+**Construction BLOCKS — warm it up off the tick thread.** Even the light
+``no_media`` profile takes order-of-a-second to come up, and construct-on-first-
+read charges that to whichever thread reads first. On the deployed box that is
+the 50 Hz tick thread, and it produced a REPRODUCIBLE tick-budget violation on
+every single runtime start — the ``[SENSE stage=state]`` "connected" line
+immediately followed by an overrun of **424.93, 974.39, 990.61, 1102.92 or
+1212.66 ms against a 20 ms budget** (21x-61x over), at tick ~447-453
+(``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 3).
+
+A tick-thread caller therefore gets two doors, and should use both:
+
+* :meth:`HeldStateReader.warm_up` — the owner constructs at setup (before the
+  loop starts) or from a background thread, and checks the result. Once it
+  succeeds, no read ever constructs.
+* ``allow_inline_connect=False`` — closes the on-thread door outright: reads
+  then NEVER construct, only :meth:`HeldStateReader.warm_up` does. This covers
+  what warm-up alone cannot. A mid-run read fault drops the client, and the next
+  read would otherwise rebuild it inline — reproducing the same stall mid-run
+  rather than at start. With the door closed the owner notices via
+  :attr:`HeldStateReader.connected` and re-warms off-thread.
+
+Both are ADDITIVE, with a lazy default: an owner that is not on a tick thread
+needs no ceremony and every pre-existing caller is unaffected. The class also
+stays PASSIVE — it spawns no thread of its own to warm itself, which would
+re-introduce the interpreter-exit hazard :meth:`HeldStateReader.close` exists to
+avoid. It only stops forcing the caller to construct on whatever thread happens
+to read first. This mirrors
+:class:`reachy.robot.media_client.HeldMediaClient` point for point, so the two
+holders a runtime process owns are warmed and closed the same way.
+
 Pitch/yaw extraction reuses
 :func:`reachy.robot.sdk_transport._euler_pitch_yaw` — the exact same
 decomposition ``SdkTransport.head_pose`` / ``MediaSession.head_pose`` already
@@ -61,25 +91,39 @@ _SOURCE = "head_pose"
 class HeldStateReader:
     """Hold AT MOST ONE ``ReachyMini(media_backend='no_media')`` client, lazily.
 
-    Construction is attempted on first :meth:`read`, never per call: once a
-    client is up, every subsequent read reuses it. If construction (or a read
-    on an already-open client) fails, the client is dropped and reconstruction
-    is not re-attempted until ``retry_backoff`` seconds have elapsed (an
-    injected clock — see the ``now`` parameter — makes this deterministic in
-    tests, mirroring the pattern in :class:`reachy.behavior.sense.DoaPoller`
-    and :class:`reachy.sleep.state.SleepStateMachine`). A missing SDK is a
-    special case: it degrades to a PERMANENTLY-None reader after exactly one
-    logged warning — the extra will not appear mid-process, so there is no
-    point retrying, and doing so would just be a retry storm.
+    Construction happens once, and the owner chooses where. Call :meth:`warm_up`
+    off the tick thread before the loop starts (see the module docstring's
+    measured 425-1213 ms startup overruns). By default construction ALSO happens
+    lazily on first :meth:`read` — convenient for a non-tick-thread owner, but
+    exactly the tick-budget hazard on a 50 Hz loop; pass
+    ``allow_inline_connect=False`` to forbid it.
 
-    :meth:`read` never raises: every failure (missing SDK, construction error,
-    a raising pose read) degrades to ``None``.
+    Once a client is up, every subsequent read reuses it. If construction (or a
+    read on an already-open client) fails, the client is dropped and
+    reconstruction is not re-attempted until ``retry_backoff`` seconds have
+    elapsed (an injected clock — see the ``now`` parameter — makes this
+    deterministic in tests, mirroring the pattern in
+    :class:`reachy.behavior.sense.DoaPoller` and
+    :class:`reachy.sleep.state.SleepStateMachine`). A missing SDK is a special
+    case: it degrades to a PERMANENTLY-None reader after exactly one logged
+    warning — the extra will not appear mid-process, so there is no point
+    retrying, and doing so would just be a retry storm.
 
-    Thread-use note: this class is touched only from the owning engine's tick
-    thread (construct-on-first-read, read, close — all on that one thread). It
-    holds no locks and is **not thread-safe** by design, exactly like the
-    serial ``MotionQueue`` / single-SDK-owner objects elsewhere in this repo —
-    do not share one instance across threads.
+    No public method raises: every failure (missing SDK, construction error, a
+    raising pose read) degrades to ``None`` / ``False``.
+
+    Thread-use note: this object holds no locks and is **not thread-safe** by
+    design, exactly like the serial ``MotionQueue`` / single-SDK-owner objects
+    elsewhere in this repo. The supported split is narrow and deliberate, and
+    matches :class:`reachy.robot.media_client.HeldMediaClient`: :meth:`warm_up`
+    and :meth:`close` on the owner's thread while the loop is NOT running (setup
+    and teardown), and every :meth:`read` on the one tick thread. Do not call
+    :meth:`warm_up` concurrently with reads.
+
+    :param allow_inline_connect:
+        When ``False``, reads never construct — only :meth:`warm_up` does — so a
+        tick-thread caller can never stall on a connect, at start OR mid-run
+        after a fault. Defaults to ``True`` (lazy, the pre-existing shape).
     """
 
     def __init__(
@@ -87,9 +131,11 @@ class HeldStateReader:
         *,
         retry_backoff: float = DEFAULT_RETRY_BACKOFF,
         now: Callable[[], float] = time.monotonic,
+        allow_inline_connect: bool = True,
     ) -> None:
         self._retry_backoff = retry_backoff
         self._now = now
+        self._allow_inline_connect = allow_inline_connect
         self._client: object | None = None
         self._closed = False
         self._sdk_absent = False
@@ -123,7 +169,45 @@ class HeldStateReader:
         return ReachyMini
 
     # ------------------------------------------------------------------
-    # public API
+    # public API — warm-up (call this OFF the tick thread)
+    # ------------------------------------------------------------------
+
+    def warm_up(self) -> bool:
+        """Construct the client now, on the CALLER's thread. Returns success.
+
+        The affordance that keeps a connect off the tick thread. Bringing up
+        even the light ``no_media`` handle blocks for order-of-a-second on real
+        hardware (425-1213 ms measured — see the module docstring), so the owner
+        calls this at setup or from a background thread and only then starts the
+        loop; afterwards no read constructs.
+
+        Idempotent and never raises: returns ``True`` when a live client is held
+        (including when one already was), ``False`` for every degradation — the
+        reader is closed, the ``[sdk]`` extra is absent, the attempt is inside
+        the retry-backoff window, or construction just failed. A ``False`` is
+        safe to retry; the backoff throttles a polling owner to the same cadence
+        a read would have got, so an off-thread retry loop cannot storm.
+
+        This method spawns NO thread. Which thread warms the reader is the
+        owner's decision — see the class docstring's thread-use note.
+        """
+        if self._closed:
+            return False
+        if self._client is None:
+            self._ensure_client()
+        return self._client is not None
+
+    @property
+    def connected(self) -> bool:
+        """Whether a live client is currently held. Pure predicate, never constructs.
+
+        Free to poll: a supervisor watching for a mid-run drop (so it can
+        :meth:`warm_up` again off-thread) reads this every tick at no cost.
+        """
+        return self._client is not None
+
+    # ------------------------------------------------------------------
+    # public API — reads
     # ------------------------------------------------------------------
 
     def read(self) -> tuple[float, float] | None:
@@ -131,11 +215,18 @@ class HeldStateReader:
 
         ``None`` covers every "no reading" case: the reader is closed, the SDK
         is absent, construction is in its retry backoff window, construction
-        just failed, or the pose read itself raised. Never raises.
+        just failed, inline construction is forbidden and :meth:`warm_up` has
+        not yet succeeded, or the pose read itself raised. Never raises.
+
+        Non-blocking on the real SDK surface (a subscription-backed local read,
+        ~0.02 ms) — EXCEPT a first read that triggers the lazy construction,
+        which blocks for order-of-a-second. On a tick thread, :meth:`warm_up`
+        first (and ideally construct the reader with
+        ``allow_inline_connect=False``).
         """
         if self._closed:
             return None
-        if self._client is None:
+        if self._client is None and self._allow_inline_connect:
             self._ensure_client()
         if self._client is None:
             return None
@@ -147,11 +238,17 @@ class HeldStateReader:
             return None
         return _euler_pitch_yaw(pose)
 
+    # ------------------------------------------------------------------
+    # public API — lifecycle
+    # ------------------------------------------------------------------
+
     def close(self) -> None:
         """Release the held client, if any. Idempotent; safe to call repeatedly.
 
-        After ``close()``, :meth:`read` always returns ``None`` and no further
-        construction is ever attempted — the reader stays closed for good.
+        After ``close()``, :meth:`read` returns ``None``, :meth:`warm_up`
+        returns ``False``, and no further construction is ever attempted — the
+        reader stays closed for good. This is the method that keeps the process
+        from hanging at interpreter exit; it is the owner's job to call it.
         """
         if self._closed:
             return

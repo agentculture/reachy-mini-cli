@@ -115,6 +115,282 @@ def _patch_import_absent(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Off-thread warm-up — the tick-budget affordance (live evidence, t1 section 3)
+# ---------------------------------------------------------------------------
+#
+# This class is the MEASURED cause of a reproducible tick-budget violation on
+# the deployed box. Every start of ``reachy-runtime.service`` logs this pair,
+# in this order, at tick ~447-453:
+#
+#     [SENSE stage=state source=head_pose event=…] connected (media_backend=no_media)
+#     [SENSE stage=rule source=tick event=overrun] overrun tick=449
+#         duration_ms=424.93 budget_ms=20.00
+#
+# Durations across restarts: 424.93 / 974.39 / 990.61 / 1102.92 / 1212.66 ms
+# against a 20 ms budget — 21x to 61x over
+# (``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 3).
+# The cause is construct-on-first-read building the ``no_media`` client ON THE
+# TICK THREAD, so the 50 Hz loop stalls for up to ~1.2 s.
+#
+# The fix mirrors :class:`reachy.robot.media_client.HeldMediaClient` exactly,
+# giving a tick-thread caller two doors:
+#   * :meth:`warm_up` — the owner constructs off-thread, before the loop starts.
+#   * ``allow_inline_connect=False`` — closes the on-thread door entirely, which
+#     ``warm_up()`` alone cannot do (a mid-run reconnect after a read fault
+#     would otherwise construct inline, reproducing the stall mid-run).
+#
+# Both are ADDITIVE: the lazy default is unchanged, so every existing caller
+# (notably ``_commands/behavior.py::_make_state_reader``) keeps working.
+
+
+def test_warm_up_constructs_and_reports_success(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    assert reader.warm_up() is True
+    assert len(fake_cls.calls) == 1
+    assert reader.connected is True
+
+
+def test_reads_after_warm_up_never_construct(monkeypatch) -> None:
+    """THE contract: a warmed reader does zero construction on the tick thread."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    assert reader.warm_up() is True
+    calls_after_warm_up = len(fake_cls.calls)
+
+    for _ in range(50):
+        assert reader.read() == (0.0, 0.0)
+
+    assert len(fake_cls.calls) == calls_after_warm_up == 1
+
+
+def test_warm_up_off_thread_means_the_tick_thread_never_constructs(monkeypatch) -> None:
+    """Criterion 1, stated as the deployment actually runs it.
+
+    The composition root warms the reader on a setup/background thread; the
+    engine then reads on its one tick thread. This asserts the construction
+    happened on the OTHER thread — i.e. the ~1.2 s ``no_media`` bring-up is
+    charged to setup, never to a tick.
+    """
+    import threading
+
+    construct_threads: list[int] = []
+
+    class _ThreadRecordingCls(_FakeMiniCls):
+        def __call__(self, **kwargs):  # type: ignore[no-untyped-def]
+            construct_threads.append(threading.get_ident())
+            return super().__call__(**kwargs)
+
+    fake_cls = _ThreadRecordingCls()
+    _patch_import(monkeypatch, fake_cls)
+    # The door is closed too, so a mid-run drop can never reopen it inline.
+    reader = HeldStateReader(now=_FakeClock(0.0), allow_inline_connect=False)
+
+    warmer = threading.Thread(target=reader.warm_up)
+    warmer.start()
+    warmer.join()
+
+    assert reader.connected is True
+    assert construct_threads == [warmer.ident]
+
+    tick_thread_ident = threading.get_ident()
+    assert tick_thread_ident != warmer.ident
+    for _ in range(100):
+        assert reader.read() == (0.0, 0.0)
+
+    # Exactly one construction, and it did not happen on this (tick) thread.
+    assert len(construct_threads) == 1
+    assert tick_thread_ident not in construct_threads
+
+
+def test_warm_up_is_idempotent(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    for _ in range(5):
+        assert reader.warm_up() is True
+
+    assert len(fake_cls.calls) == 1
+
+
+def test_warm_up_is_safe_and_false_when_sdk_absent(monkeypatch, caplog) -> None:
+    """A bare box (no ``[sdk]`` extra) degrades: False, one warning, no storm."""
+    _patch_import_absent(monkeypatch)
+    clock = _FakeClock(0.0)
+    reader = HeldStateReader(now=clock, retry_backoff=0.001)
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        for _ in range(10):
+            assert reader.warm_up() is False  # must not raise
+            clock.advance(1.0)
+
+    assert reader.connected is False
+    sense_records = [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
+    assert len(sense_records) == 1
+
+
+def test_warm_up_reports_failure_and_can_be_retried_after_backoff(monkeypatch) -> None:
+    """An owner polling warm_up() off-thread recovers when the daemon comes up."""
+    fake_cls = _FakeMiniCls(should_fail=True)
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    reader = HeldStateReader(now=clock, retry_backoff=5.0)
+
+    assert reader.warm_up() is False
+    assert reader.connected is False
+
+    clock.advance(1.0)
+    assert reader.warm_up() is False
+    assert len(fake_cls.calls) == 1  # backoff still throttles the off-thread caller
+
+    clock.advance(5.0)
+    fake_cls.should_fail = False
+    assert reader.warm_up() is True
+    assert len(fake_cls.calls) == 2
+
+
+def test_warm_up_after_close_returns_false_and_never_constructs(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    reader.close()
+
+    assert reader.warm_up() is False
+    assert len(fake_cls.calls) == 0
+
+
+def test_connected_never_constructs(monkeypatch) -> None:
+    """``connected`` is a pure predicate — a supervisor can poll it freely."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    for _ in range(10):
+        assert reader.connected is False
+    assert len(fake_cls.calls) == 0
+
+    reader.warm_up()
+    assert reader.connected is True
+
+    reader.close()
+    assert reader.connected is False
+
+
+# --- allow_inline_connect=False: the on-thread door, closed -----------------
+
+
+def test_inline_connect_disabled_reads_never_construct(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    reader = HeldStateReader(now=clock, allow_inline_connect=False)
+
+    for _ in range(20):
+        assert reader.read() is None
+        clock.advance(10.0)
+
+    assert len(fake_cls.calls) == 0
+
+
+def test_inline_connect_disabled_works_normally_after_warm_up(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0), allow_inline_connect=False)
+
+    assert reader.warm_up() is True
+
+    for _ in range(10):
+        assert reader.read() == (0.0, 0.0)
+
+    assert len(fake_cls.calls) == 1
+
+
+def test_inline_connect_disabled_does_not_reconnect_on_the_tick_thread(monkeypatch) -> None:
+    """A mid-run fault must not turn into an inline reconnect stall.
+
+    This is the case ``warm_up()`` alone cannot cover: the first construction is
+    off-thread, but a dropped client would otherwise be rebuilt by whichever
+    read noticed — i.e. on the tick thread, reproducing the measured overrun
+    mid-run instead of at start.
+    """
+    fake_cls = _FakeMiniCls(mini_factory=lambda: _FakeMini(fail_reads=True))
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    reader = HeldStateReader(now=clock, retry_backoff=2.0, allow_inline_connect=False)
+
+    assert reader.warm_up() is True
+    assert reader.read() is None  # the read faults and drops the client
+    assert reader.connected is False
+
+    clock.advance(100.0)  # well past the backoff window
+    for _ in range(10):
+        assert reader.read() is None
+    assert len(fake_cls.calls) == 1  # NO inline reconnect
+
+    # The owner re-warms off-thread, having noticed via ``connected``.
+    fake_cls._mini_factory = _FakeMini
+    assert reader.warm_up() is True
+    assert len(fake_cls.calls) == 2
+    assert reader.read() == (0.0, 0.0)
+
+
+def test_inline_connect_enabled_is_the_default(monkeypatch) -> None:
+    """The lazy default is unchanged — every existing caller keeps working."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    assert reader.read() == (0.0, 0.0)
+    assert len(fake_cls.calls) == 1
+
+
+def test_warm_up_starts_no_threads(monkeypatch) -> None:
+    """The reader stays PASSIVE: warm-up runs on the caller's thread, by design.
+
+    Spawning a thread inside the class would re-introduce exactly the
+    interpreter-exit hazard ``close()`` exists to avoid. The owner decides which
+    thread warms it.
+    """
+    import threading
+
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    before = threading.active_count()
+    reader.warm_up()
+
+    assert threading.active_count() == before
+
+
+def test_warm_up_holds_exactly_one_client_for_the_process_lifetime(monkeypatch) -> None:
+    """The load-bearing contract survives the new API: ONE ``no_media`` client."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0), allow_inline_connect=False)
+
+    reader.warm_up()
+    for _ in range(200):
+        reader.read()
+    reader.warm_up()
+
+    assert len(fake_cls.instances) == 1
+    assert fake_cls.calls == [{"media_backend": "no_media"}]
+
+    # ...and close() still explicitly releases it (the interpreter-exit hazard).
+    reader.close()
+    assert fake_cls.instances[0].closed is True
+
+
+# ---------------------------------------------------------------------------
 # Lazy construction — at most one construction across many reads
 # ---------------------------------------------------------------------------
 
