@@ -288,12 +288,21 @@ _LOOPING_DEFAULT_ENTRIES = sorted(
 
 def test_looping_default_entries_fixture_matches_the_library() -> None:
     """Pins the exact set of entries this refusal protects (nod/shake/speak/
-    antenna-sway/feel-alive) so a library edit that silently changes this set
-    is caught here rather than by a confusing failure in the tests below."""
+    antenna-sway/feel-alive, plus orient-to-sound) so a library edit that
+    silently changes this set is caught here rather than by a confusing failure
+    in the tests below.
+
+    ``orient-to-sound`` (task t8) joined deliberately: sound-orienting is a
+    STANDING goal, so its library defaults are looping-with-no-duration and the
+    one-time ``run_behavior`` surface must bound it explicitly. The standing,
+    indefinite ``declare_goal`` surface — exempt by design — is the documented
+    way to sustain it.
+    """
     assert _LOOPING_DEFAULT_ENTRIES == [
         "antenna-sway",
         "feel-alive",
         "nod",
+        "orient-to-sound",
         "shake",
         "speak",
     ]

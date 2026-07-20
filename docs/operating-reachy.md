@@ -1220,8 +1220,8 @@ Background incident: a react rule `speech → nod` once admitted the looping
 stopped. That class of failure is now structurally impossible.
 
 **React rules.** A rule targeting a looping-default library entry
-(`nod`, `shake`, `speak`, `antenna-sway`, `feel-alive`) **must** carry
-`duration_s = <seconds>`. A rules file without it is refused at load/reload
+(`nod`, `shake`, `speak`, `antenna-sway`, `feel-alive`, `orient-to-sound`)
+**must** carry `duration_s = <seconds>`. A rules file without it is refused at load/reload
 with a clear error naming the rule and the fix. Bounded one-shot targets
 (`gaze-hold` 5 s, `thoughtful` 3 s, `body-turn-hold` 5 s, and the self-completing
 `pet-reaction` with its finite outer backstop) need nothing — they already have
@@ -1248,6 +1248,66 @@ documented indefinite-intent surface.
 
 A bounded looping admission (e.g. `duration_s = 8` on `nod`) loops for 8
 seconds then releases its channel automatically.
+
+### Orienting — `orient-to-sound` turns toward what it hears
+
+The runtime has always *sensed* sound direction (`doa`, `speech`) and could
+*react* to it discretely with a rule. `orient-to-sound` is the missing other
+half: a behavior that turns a live bearing into a **sustained** gaze target and
+keeps it there, updating as the sound moves.
+
+It is a standing goal, so the way to switch it on is the standing-intent
+surface:
+
+```json
+{"op": "declare_goal", "goal": "orient-to-sound"}
+```
+
+or, bounded, from a rule (it is a looping-default entry, so `duration_s` is
+required — see [bounded reactions](#bounded-reactions-no-more-permanent-holds)):
+
+```toml
+[[react]]
+id = "look-at-the-voice"
+when = { field = "transcript", op = "is_true" }
+run = "orient-to-sound"
+duration_s = 12
+cooldown_s = 2.0
+```
+
+**The reaction is graded, not a switch.** Three tiers, strongest last:
+
+| It hears | It does |
+|---|---|
+| live sound, no bearing worth turning to | the **near-side antenna** leans toward it; the head does not move |
+| speech from a bearing that holds still | a **bounded head-only nudge** (max 20°), never a body rotation |
+| an utterance addressed to the robot (`transcript`) | a **deliberate head turn**, escalating to a body rotation past 30° with the head re-centring onto the residual |
+
+**It will not swivel at nothing.** This is the load-bearing design constraint,
+and it comes from measurement rather than taste: on the deployed robot, 120
+samples over a minute in a *quiet room with nobody speaking* read
+`speech_detected` true 46 % of the time, with the bearing wandering across
+essentially the full 0–3.12 rad range. A goal keyed on that bare flag would
+turn the robot at nothing about half the time, in an uncorrelated direction.
+So the head only moves when the flag is corroborated by **sound energy**
+(the same loudness floor `listen`'s snap detector used) **and** a bearing that
+has held still for `dwell_s`; the deliberate turn additionally requires
+*words* that already cleared the engagement gate.
+
+**It yields like anything else.** `orient-to-sound` is an ordinary `stoppable`
+channel owner: a pat reaction admitted while it is turning takes the head,
+antennas and body immediately, and any `stopping`/`unstoppable` behavior
+outranks it outright. With no sound it **abstains** rather than freezing, so
+`feel-alive` keeps breathing through it, and after `recenter_after` seconds of
+silence the committed heading eases back to front before it lets go.
+
+Every knob (`gain`, `max_yaw`, `deadband`, `hold`, `head_only_band`,
+`rms_floor`, `dwell_s`, …) is a behavior parameter — retune it from the rule or
+the goal payload, no code change:
+
+```bash
+reachy-mini-cli behavior list --json   # every orient-to-sound param, unit and default
+```
 
 ### Speech — the `say` field gives a rule a voice
 
