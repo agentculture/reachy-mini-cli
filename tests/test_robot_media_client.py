@@ -180,6 +180,223 @@ def _patch_import_absent(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Off-thread warm-up — the tick-budget affordance (live evidence, t1 section 3)
+# ---------------------------------------------------------------------------
+#
+# The deployed box shows a REPRODUCIBLE tick-budget violation on every runtime
+# start: the ``[SENSE stage=state]`` "connected" line is immediately followed by
+# a ``stage=rule source=tick event=overrun`` at 424.93 / 974.39 / 990.61 /
+# 1102.92 / 1212.66 ms against a 20 ms budget (21x-61x over). The cause is
+# construct-on-first-read building the SDK client ON THE TICK THREAD. A camera
+# pipeline warms slower than a ``no_media`` handle, so this holder MUST offer a
+# supported way for a tick-thread caller never to construct inline.
+#
+# Two doors, tested here:
+#   * :meth:`warm_up` — the owner constructs off-thread, before the loop starts.
+#   * ``allow_inline_connect=False`` — closes the on-thread door entirely, which
+#     ``warm_up()`` alone cannot do (a mid-run reconnect after a fault would
+#     otherwise construct inline all over again).
+
+
+def test_warm_up_constructs_and_reports_success(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+
+    holder = HeldMediaClient(now=_FakeClock(0.0))
+
+    assert holder.warm_up() is True
+    assert len(fake_cls.calls) == 1
+    assert holder.connected is True
+
+
+def test_reads_after_warm_up_never_construct(monkeypatch) -> None:
+    """THE contract: a warmed holder does zero construction on the tick thread."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0))
+
+    assert holder.warm_up() is True
+    calls_after_warm_up = len(fake_cls.calls)
+
+    for _ in range(50):
+        assert holder.audio() is not None
+        assert holder.frame() is not None
+        assert holder.samplerate == 16000
+        assert holder.channels == 1
+        assert holder.camera_available is True
+
+    assert len(fake_cls.calls) == calls_after_warm_up == 1
+
+
+def test_warm_up_is_idempotent(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0))
+
+    for _ in range(5):
+        assert holder.warm_up() is True
+
+    assert len(fake_cls.calls) == 1
+
+
+def test_warm_up_is_safe_and_false_when_sdk_absent(monkeypatch, caplog) -> None:
+    _patch_import_absent(monkeypatch)
+    clock = _FakeClock(0.0)
+    holder = HeldMediaClient(now=clock, retry_backoff=0.001)
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        for _ in range(10):
+            assert holder.warm_up() is False  # must not raise
+            clock.advance(1.0)
+
+    assert holder.connected is False
+    sense_records = [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
+    assert len(sense_records) == 1  # still exactly one warning, no storm
+
+
+def test_warm_up_reports_failure_and_can_be_retried_after_backoff(monkeypatch) -> None:
+    """An owner polling warm_up() off-thread recovers when the daemon comes up."""
+    fake_cls = _FakeMiniCls(should_fail=True)
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    holder = HeldMediaClient(now=clock, retry_backoff=5.0)
+
+    assert holder.warm_up() is False
+    assert holder.connected is False
+
+    clock.advance(1.0)
+    assert holder.warm_up() is False
+    assert len(fake_cls.calls) == 1  # backoff still throttles the off-thread caller
+
+    clock.advance(5.0)
+    fake_cls.should_fail = False
+    assert holder.warm_up() is True
+    assert len(fake_cls.calls) == 2
+
+
+def test_warm_up_after_close_returns_false_and_never_constructs(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0))
+
+    holder.close()
+
+    assert holder.warm_up() is False
+    assert len(fake_cls.calls) == 0
+
+
+def test_connected_never_constructs(monkeypatch) -> None:
+    """``connected`` is a pure predicate — a supervisor can poll it freely."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0))
+
+    for _ in range(10):
+        assert holder.connected is False
+    assert len(fake_cls.calls) == 0
+
+    holder.warm_up()
+    assert holder.connected is True
+
+    holder.close()
+    assert holder.connected is False
+
+
+# --- allow_inline_connect=False: the on-thread door, closed -----------------
+
+
+def test_inline_connect_disabled_reads_never_construct(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    holder = HeldMediaClient(now=clock, allow_inline_connect=False)
+
+    for _ in range(20):
+        assert holder.audio() is None
+        assert holder.frame() is None
+        assert holder.samplerate is None
+        assert holder.channels is None
+        assert holder.camera_available is False
+        clock.advance(10.0)
+
+    assert len(fake_cls.calls) == 0
+
+
+def test_inline_connect_disabled_works_normally_after_warm_up(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0), allow_inline_connect=False)
+
+    assert holder.warm_up() is True
+
+    for _ in range(10):
+        assert holder.audio() is not None
+        assert holder.frame() is not None
+
+    assert len(fake_cls.calls) == 1
+
+
+def test_inline_connect_disabled_does_not_reconnect_on_the_tick_thread(monkeypatch) -> None:
+    """A mid-run fault must not turn into an inline reconnect stall.
+
+    This is the case ``warm_up()`` alone cannot cover: the first construction is
+    off-thread, but a dropped client would otherwise be rebuilt by whichever
+    read noticed — i.e. on the tick thread, reproducing the measured overrun
+    mid-run instead of at start.
+    """
+    failing = _FakeMini(media=_FakeMedia(fail_audio=True))
+    fake_cls = _FakeMiniCls(mini_factory=lambda: failing)
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    holder = HeldMediaClient(now=clock, retry_backoff=2.0, allow_inline_connect=False)
+
+    assert holder.warm_up() is True
+    assert holder.audio() is None  # the read faults and drops the client
+    assert holder.connected is False
+
+    clock.advance(100.0)  # well past the backoff window
+    for _ in range(10):
+        assert holder.audio() is None
+    assert len(fake_cls.calls) == 1  # NO inline reconnect
+
+    # The owner re-warms off-thread, having noticed via ``connected``.
+    fake_cls._mini_factory = _FakeMini
+    assert holder.warm_up() is True
+    assert len(fake_cls.calls) == 2
+    assert holder.audio() is not None
+
+
+def test_inline_connect_enabled_is_the_default(monkeypatch) -> None:
+    """The default stays lazy — a non-tick-thread owner needs no ceremony."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+
+    holder = HeldMediaClient(now=_FakeClock(0.0))
+
+    assert holder.audio() is not None
+    assert len(fake_cls.calls) == 1
+
+
+def test_warm_up_starts_no_threads(monkeypatch) -> None:
+    """The holder stays PASSIVE: warm-up runs on the caller's thread, by design.
+
+    Spawning a thread inside the class would re-introduce exactly the
+    interpreter-exit hazard ``close()`` exists to avoid. The owner decides which
+    thread warms it.
+    """
+    import threading
+
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0))
+
+    before = threading.active_count()
+    holder.warm_up()
+
+    assert threading.active_count() == before
+
+
+# ---------------------------------------------------------------------------
 # Criterion 1 — exactly ONE media client, constructed lazily, reused forever
 # ---------------------------------------------------------------------------
 

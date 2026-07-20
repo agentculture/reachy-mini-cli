@@ -18,10 +18,36 @@ construction profiles:
 * ``ReachyMini()`` — the DEFAULT profile, which brings up the full media chain
   (mic + camera + speaker). Owned here, once, for the process lifetime.
 
+**Construction BLOCKS — warm it up off the tick thread.** This is the one place
+this class deliberately departs from :class:`HeldStateReader`, on live evidence.
+On the deployed box, that class's construct-on-first-read builds its client on
+the tick thread and the very next log line is a tick overrun: measured at
+**424.93, 974.39, 990.61, 1102.92 and 1212.66 ms against a 20 ms budget**
+(21x-61x over), reproducibly, on every runtime start
+(``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 3). A full
+media chain warms *slower* than a ``no_media`` handle, so a naive port of that
+discipline would add a second, larger stall on top of the existing one.
+
+A tick-thread caller therefore gets two doors, and should use both:
+
+* :meth:`warm_up` — the owner constructs from a background thread (or at setup,
+  before the loop starts) and checks the result. Once it succeeds, no read ever
+  constructs.
+* ``allow_inline_connect=False`` — closes the on-thread door outright: reads
+  then NEVER construct, only :meth:`warm_up` does. This covers what warm-up
+  alone cannot. A mid-run fault drops the client, and the next read would
+  otherwise rebuild it inline — reproducing the same stall mid-run rather than
+  at start. With the door closed the owner notices via :attr:`connected` and
+  re-warms off-thread.
+
+The class stays PASSIVE: it spawns no thread of its own to do this (that would
+re-introduce the interpreter-exit hazard :meth:`close` exists to avoid). It only
+stops forcing the caller to construct on whatever thread happens to read first.
+
 Discipline this class inherits from :class:`HeldStateReader`, point for point:
 
-* **Construct on first use**, never per read: opening the media chain per tick
-  is both slow and leaks file descriptors (issue #51, the fd-leak crash-loop).
+* **Construct once, never per read**: opening the media chain per tick is both
+  slow and leaks file descriptors (issue #51, the fd-leak crash-loop).
 * **Lazy retry with backoff** behind an injected clock, so a daemon that is not
   up yet is a degradation, not a crash, and not a retry storm.
 * **Explicit, idempotent** :meth:`close`. Regardless of profile, the process
@@ -38,9 +64,10 @@ The reads it exposes are the ones the runtime's senses need — :meth:`audio`
 (transcript + rms) and :meth:`frame` (face + frame-available) — plus the mic
 :attr:`samplerate` / :attr:`channels` an STT leg needs for a WAV header, and
 :attr:`camera_available` for a sense that wants to know whether frames can
-exist at all. Both reads are non-blocking on the real SDK surface (a local
-subscription read, ``None`` when nothing is ready this instant), so they are
-safe to call at tick rate.
+exist at all. On the real SDK surface a *steady-state* read is non-blocking (a
+local subscription read, ``None`` when nothing is ready this instant) and so is
+safe at tick rate — but the FIRST read is not, because it triggers construction;
+see the warm-up note above.
 
 Wiring note: this module is a **holder only**. It is composed by the runtime's
 composition root, which is what guarantees a single instance exists; nothing in
@@ -71,21 +98,33 @@ _SOURCE = "held_client"
 class HeldMediaClient:
     """Hold AT MOST ONE default-profile ``ReachyMini`` client (mic + camera), lazily.
 
-    Construction is attempted on first use (a read, or a
-    :attr:`samplerate`/:attr:`channels`/:attr:`camera_available` query), never
-    per call: once the client is up, every subsequent read reuses it. A failure
-    drops the client and suppresses reconstruction until ``retry_backoff``
-    seconds have elapsed on the injected clock. A missing SDK is the one
-    permanent case: it latches to a disabled holder after exactly one logged
-    warning (the extra cannot appear mid-process, so retrying would only be a
-    storm).
+    Construction happens once, and the owner chooses where. Call :meth:`warm_up`
+    off the tick thread before the loop starts (see the module docstring's
+    measured 425-1213 ms stalls). By default construction ALSO happens lazily on
+    first use — a read, or a
+    :attr:`samplerate`/:attr:`channels`/:attr:`camera_available` query — which is
+    convenient for a non-tick-thread owner but is exactly the tick-budget hazard
+    on a 50 Hz loop; pass ``allow_inline_connect=False`` to forbid it.
+
+    Once the client is up, every subsequent read reuses it. A failure drops the
+    client and suppresses reconstruction until ``retry_backoff`` seconds have
+    elapsed on the injected clock. A missing SDK is the one permanent case: it
+    latches to a disabled holder after exactly one logged warning (the extra
+    cannot appear mid-process, so retrying would only be a storm).
 
     No public method raises: every failure path degrades to ``None`` / ``False``.
 
     Thread-use note: like :class:`~reachy.robot.state_reader.HeldStateReader` and
-    the serial ``MotionQueue``, this object is touched only from the owning
-    engine's tick thread. It holds no locks and is **not thread-safe** by
-    design — do not share one instance across threads.
+    the serial ``MotionQueue``, this object holds no locks and is **not
+    thread-safe** by design. The supported split is narrow and deliberate:
+    :meth:`warm_up` / :meth:`close` on the owner's thread while the loop is NOT
+    running (setup and teardown), and every read on the one tick thread. Do not
+    call :meth:`warm_up` concurrently with reads.
+
+    :param allow_inline_connect:
+        When ``False``, reads never construct — only :meth:`warm_up` does — so a
+        tick-thread caller can never stall on a connect, at start OR mid-run
+        after a fault. Defaults to ``True`` (lazy, the convenient shape).
     """
 
     def __init__(
@@ -93,9 +132,11 @@ class HeldMediaClient:
         *,
         retry_backoff: float = DEFAULT_RETRY_BACKOFF,
         now: Callable[[], float] = time.monotonic,
+        allow_inline_connect: bool = True,
     ) -> None:
         self._retry_backoff = retry_backoff
         self._now = now
+        self._allow_inline_connect = allow_inline_connect
         self._client: Any | None = None
         self._media: Any | None = None
         self._samplerate: int | None = None
@@ -134,6 +175,44 @@ class HeldMediaClient:
         return ReachyMini
 
     # ------------------------------------------------------------------
+    # public API — warm-up (call this OFF the tick thread)
+    # ------------------------------------------------------------------
+
+    def warm_up(self) -> bool:
+        """Construct the client now, on the CALLER's thread. Returns success.
+
+        The affordance that keeps a connect off the tick thread. Bringing up the
+        media chain blocks for order-of-seconds on real hardware (425-1213 ms
+        measured for the lighter ``no_media`` profile — see the module
+        docstring), so the owner calls this at setup or from a background thread
+        and only then starts the loop; afterwards no read constructs.
+
+        Idempotent and never raises: returns ``True`` when a live client is held
+        (including when one already was), ``False`` for every degradation — the
+        holder is closed, the ``[sdk]`` extra is absent, the attempt is inside
+        the retry-backoff window, or construction just failed. A ``False`` is
+        safe to retry; the backoff throttles a polling owner to the same cadence
+        a read would have got, so an off-thread retry loop cannot storm.
+
+        This method spawns NO thread. Which thread warms the holder is the
+        owner's decision — see the class docstring's thread-use note.
+        """
+        if self._closed:
+            return False
+        if self._client is None:
+            self._ensure_client()
+        return self._client is not None
+
+    @property
+    def connected(self) -> bool:
+        """Whether a live client is currently held. Pure predicate, never constructs.
+
+        Free to poll: a supervisor watching for a mid-run drop (so it can
+        :meth:`warm_up` again off-thread) reads this every tick at no cost.
+        """
+        return self._client is not None
+
+    # ------------------------------------------------------------------
     # public API — reads
     # ------------------------------------------------------------------
 
@@ -142,8 +221,12 @@ class HeldMediaClient:
 
         ``None`` covers every "no audio" case: closed holder, absent SDK, inside
         the retry backoff, construction just failed, or the read itself raised
-        (which drops the client and schedules a retry). Non-blocking on the real
-        SDK surface — safe at tick rate. Never raises.
+        (which drops the client and schedules a retry).
+
+        Non-blocking on the real SDK surface — EXCEPT a first read that triggers
+        the lazy construction, which blocks for order-of-seconds. On a tick
+        thread, :meth:`warm_up` first (and ideally construct the holder with
+        ``allow_inline_connect=False``). Never raises.
         """
         media = self._ensure_media()
         if media is None:
@@ -164,6 +247,9 @@ class HeldMediaClient:
         camera at all (a latched, once-warned degradation; see
         :attr:`camera_available`). A read that *raises* drops the client and
         schedules a retry. Never raises.
+
+        Carries :meth:`audio`'s first-read caveat, more so: a camera pipeline
+        warms slower than the mic. Warm up off the tick thread.
         """
         media = self._ensure_media()
         if media is None:
@@ -186,15 +272,21 @@ class HeldMediaClient:
         """Mic input sample rate in Hz, or ``None`` when there is no live client.
 
         Read off the held client at construction (an STT leg needs it for the WAV
-        header). Touching this may trigger the lazy construction, exactly like a
-        read does; it never opens a second client.
+        header). Like a read, touching this may trigger the lazy construction and
+        therefore BLOCK for order-of-seconds — it is not a free status query on a
+        cold holder. It never opens a second client. Under
+        ``allow_inline_connect=False`` it simply reports ``None`` until
+        :meth:`warm_up` has succeeded.
         """
         self._ensure_media()
         return self._samplerate
 
     @property
     def channels(self) -> int | None:
-        """Mic input channel count, or ``None`` when there is no live client."""
+        """Mic input channel count, or ``None`` when there is no live client.
+
+        Carries :attr:`samplerate`'s construction caveat.
+        """
         self._ensure_media()
         return self._channels
 
@@ -206,6 +298,10 @@ class HeldMediaClient:
         (``media.camera is None`` — the real 1.9.x availability surface). A
         genuinely absent camera is reported once and then latched, so a
         frame-available sense can poll it every tick without log spam.
+
+        Carries :attr:`samplerate`'s construction caveat: cheap once warmed, a
+        blocking connect on a cold holder. Poll :attr:`connected` instead if what
+        you want is a genuinely free liveness check.
         """
         if self._ensure_media() is None:
             return False
@@ -239,10 +335,15 @@ class HeldMediaClient:
     # ------------------------------------------------------------------
 
     def _ensure_media(self) -> Any | None:
-        """Return the live media manager, constructing the client if needed."""
+        """Return the live media manager, constructing the client if allowed.
+
+        The inline-construction gate lives HERE, on the read path, rather than in
+        :meth:`_ensure_client` — so :meth:`warm_up` can always construct, on
+        purpose, from whatever thread the owner chose.
+        """
         if self._closed:
             return None
-        if self._client is None:
+        if self._client is None and self._allow_inline_connect:
             self._ensure_client()
         return self._media
 
