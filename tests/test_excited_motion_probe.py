@@ -379,11 +379,13 @@ def test_cli_engine_run_wires_passive_probe_without_extra_sends(
             self.closed = True
 
     class Clock:
+        # 0.05 per call: the #97 deadline scheduler reads the clock twice per
+        # tick, so the per-tick ctx.now stride stays 0.1 (the probe's max gap).
         def __init__(self) -> None:
             self.value = 0.0
 
         def __call__(self) -> float:
-            self.value += 0.1
+            self.value += 0.05
             return self.value
 
     transport = Transport()

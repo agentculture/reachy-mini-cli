@@ -466,13 +466,33 @@ def _drive(
     sense=None,
     tick_seam=None,
 ) -> int:
-    """The 50 Hz body: drain → compose → stream → publish, until stopped. Returns ticks."""
+    """The 50 Hz body: drain → compose → stream → publish, until stopped. Returns ticks.
+
+    Cadence is deadline-based (#97). The loop used to sleep the FULL period after
+    each tick's work, so cadence = work + period — measured on the deployed robot
+    as a mean 43.17 ms tick (23.16 Hz against the 50 Hz target: ~20.7 ms work +
+    20 ms sleep reproduces the number exactly). Now each tick sleeps only the time
+    remaining to an absolute per-tick deadline (established from the first clock
+    read, advanced one period per tick), so the work is absorbed into the gap and
+    the achieved cadence equals the period. A tick that overruns its budget sleeps
+    zero — and once the loop is more than one full period behind, the deadline is
+    RESET to "now" rather than running back-to-back catch-up ticks (a burst would
+    violate the one-move-at-a-time motion discipline downstream). ``emit`` carries
+    the per-tick timing seam: additive ``work_s`` (measured work duration) and
+    ``sleep_s`` (the sleep actually requested, clamped ≥ 0) keys, the numbers an
+    on-box profile run reads to apportion the work. Overrun *observability* is
+    unchanged — :mod:`reachy.behavior.tick_metrics` still measures the seam's own
+    duration against the budget on its own clock, independent of this scheduling.
+    """
     ticks = 0
     consecutive = 0
     last_state_tick = -timing.heartbeat
     seam_emit = _resolve_seam_emit(tick_seam)
+    deadline: float | None = None  # established from the first tick's clock read
     while not stop["flag"]:
         t = now()
+        if deadline is None:
+            deadline = t
         changed = _apply_commands(engine, control, t)
         snapshot = _read_sense(engine, sense, t, force=tick_seam is not None)
         tick = engine.compose_tick(t, snapshot)
@@ -487,11 +507,28 @@ def _drive(
             last_state_tick = ticks
         if tick_seam is not None:
             _invoke_seam(tick_seam, seam_emit, engine, t, ticks, snapshot, tick)
+        # Second clock read: the tick's work ends here. emit's own cost lands after
+        # it, but the ABSOLUTE deadline arithmetic self-corrects on the next tick.
+        work_end = now()
+        remaining = deadline + timing.period - work_end
+        sleep_s = remaining if remaining > 0.0 else 0.0
         if emit is not None:
-            emit({"tick": ticks, "ownership": tick["ownership"]})
+            emit(
+                {
+                    "tick": ticks,
+                    "ownership": tick["ownership"],
+                    "work_s": work_end - t,
+                    "sleep_s": sleep_s,
+                }
+            )
         if max_ticks is not None and ticks >= max_ticks:
             break
-        interruptible_sleep(timing.period, stop, sleep, timing.slice_seconds)
+        if remaining <= -timing.period:
+            deadline = work_end  # >1 period behind: restart the schedule, never burst
+        else:
+            deadline += timing.period
+        if sleep_s > 0.0:
+            interruptible_sleep(sleep_s, stop, sleep, timing.slice_seconds)
     return ticks
 
 

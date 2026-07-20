@@ -111,8 +111,9 @@ def test_tick_context_exposes_the_documented_fields() -> None:
 def test_ctx_now_tracks_the_injected_clock() -> None:
     times = []
     _run(tick_seam=lambda ctx: times.append(ctx.now), max_ticks=3)
-    # run() consumes the first now() for start_t before the loop; ticks see 0.04+.
-    assert times == [pytest.approx(0.04), pytest.approx(0.06), pytest.approx(0.08)]
+    # run() consumes the first now() for start_t; each tick then reads the clock
+    # twice (tick start + work end, the #97 deadline scheduler) -> 0.04, 0.08, ...
+    assert times == [pytest.approx(0.04), pytest.approx(0.08), pytest.approx(0.12)]
 
 
 # --------------------------------------------------------------------------- #
