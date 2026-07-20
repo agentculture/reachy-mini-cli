@@ -222,8 +222,9 @@ except for an always-`None` pat field.
   goto) owns the head channel, detection suspends and re-baselines on
   resume, so the engine's own commanded motion can never read as a phantom
   pat. **Stillness-gated** (#80, the constraint that actually makes the sense
-  work): detection runs only after the COMMANDED pose has been constant for
-  `still_hold_s` (0.5 s). Hands-on calibration measured the real plant in four
+  work): detection runs only after the COMMANDED pose has been SLOW for
+  `still_hold_s` — a per-tick VELOCITY tolerance, not exact constancy, which is
+  why it can open inside the swinging idle's decelerate-pause window at all. Hands-on calibration measured the real plant in four
   recordings — still/wandering x untouched/petted, all six DOF — and found the
   separation between a pat and the noise floor is **12-20x with the head still**
   but **0.7-2.0x while it wanders**, on every axis including the ones
@@ -232,9 +233,28 @@ except for an always-`None` pat field.
   commanded velocity, a fitted 40-tap FIR plant model removes only 1.1x of it,
   and it collapses to a 0.07-0.11 deg floor the moment the command stops moving.
   So the ghost class (#79) is closed structurally — a moving robot declines to
-  guess — and the thresholds are back to sensitive values (press 0.5 deg) rather
-  than the blind 2.0 deg that shipped dormant. The recordings live in
-  `tests/data/pat_*.csv` and back `tests/test_behavior_pat_sense_hardware.py`.
+  guess. The recordings live in `tests/data/pat_*.csv` and back
+  `tests/test_behavior_pat_sense_hardware.py`.
+
+  **Shipped tuning is ONE operating point (v0.41.0)** — `still_eps` 0.035,
+  `still_hold_s` 1.0 s, press 1.2 deg, `release_after_s` 2.5 s, `hp_tau` 0.8.
+  These move TOGETHER or not at all. The sensitive 0.5 deg press belongs with a
+  tight gate that only opens at a dead stop (the freeze-era pairing measured
+  above, where the untouched residual is 0.07-0.11 deg); the looser gate senses
+  inside the swing's slow window where that residual is 0.70 deg against a
+  petted 2.52 deg, so it needs the blunter press to stay above it. Mixing the
+  two — a loose gate with a sensitive press, or vice versa — is a phantom-pat
+  or a dead sense respectively. Cost of the shipped pairing, stated plainly: on
+  a head held genuinely still the petting p90 is 0.85-1.90 deg, so 1.2 misses
+  the gentlest pats there; a caller driving a STATIC commanded pose should
+  inject the sensitive detector rather than take the defaults.
+
+  `hp_tau` is the one value a deployed box must never override downward: it is
+  a high-pass TIME CONSTANT, so 0.08 s passes only fast transients while a pet
+  is a SUSTAINED push lasting ~0.5-2 s. A box-local drop-in setting it silenced
+  the sense entirely — the gate opened normally and the detector simply never
+  saw the press, which reads in the journal as a bare `Pat level1!` with no
+  `pat-acknowledge` fire.
 - **`reachy/behavior/pose_feed.py` `LastPoseHolder`** — a `TickBus` driver
   stashing each tick's `ctx.pose` (now carried on `TickContext`) so a later
   rider can read "the robot's current pose" without re-deriving it from

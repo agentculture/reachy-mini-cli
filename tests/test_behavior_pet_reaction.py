@@ -6,9 +6,11 @@ import pytest
 
 from reachy.behavior.engine import Engine
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass
+from reachy.behavior.pat_sense import DEFAULT_STILL_HOLD_S
 from reachy.behavior.pet_reaction import (
     ANTENNA_LIMIT_DEG,
     ANTENNA_STEP_DEG,
+    BLOCKED_GRACE_S,
     BODY_YAW_LIMIT_DEG,
     BODY_YAW_STEP_DEG,
     DONE_GESTURE_S,
@@ -247,21 +249,27 @@ def test_blocked_or_unavailable_never_escalates_and_uses_bounded_grace() -> None
     _run(reaction, _state(phase="receptive"), ticks=10)
     blocked = _state(availability="blocked", phase="enough")
 
+    # `blocked` is the reaction's own motion closing the stillness gate, so it
+    # carries BLOCKED_GRACE_S rather than the short fault budget — otherwise the
+    # gesture aborts inside its own blind window (review finding on #90). The
+    # two properties this test names are unchanged: a blocked sense NEVER
+    # escalates the phase (the state below says "enough" and is ignored), and
+    # the grace is BOUNDED.
     reaction(0.2, {}, blocked)
-    before_grace = reaction(0.2 + SENSE_LOSS_GRACE_S - DT, {}, blocked)
+    before_grace = reaction(0.2 + BLOCKED_GRACE_S - DT, {}, blocked)
     assert before_grace.done is False
     assert reaction.phase == "receptive"
     assert reaction.finish_reason is None
 
-    reaction(0.2 + SENSE_LOSS_GRACE_S, {}, blocked)
+    reaction(0.2 + BLOCKED_GRACE_S, {}, blocked)
     assert reaction.finish_reason == "sensing_lost"
     assert reaction.finish_reason != "observed_release"
     done = _run_until_done(
         reaction,
         _state(availability="unavailable", phase="released", contact=False),
-        start=0.2 + SENSE_LOSS_GRACE_S + DT,
+        start=0.2 + BLOCKED_GRACE_S + DT,
     )
-    assert done <= 0.2 + SENSE_LOSS_GRACE_S + DONE_GESTURE_S + 2 * DT
+    assert done <= 0.2 + BLOCKED_GRACE_S + DONE_GESTURE_S + 2 * DT
 
 
 def test_available_contact_has_finite_safety_backstop() -> None:
@@ -374,3 +382,35 @@ def _run_until_done(reaction, sense: Sense, *, start: float) -> float:
         if reaction(t, {}, sense).done:
             return t
     raise AssertionError("pet reaction did not complete within the bounded test window")
+
+
+def test_blocked_by_own_motion_does_not_abort_but_a_dead_reader_still_does() -> None:
+    """The reaction must outlast its OWN blind window, but not a real fault.
+
+    Regression for the defect found in review on #90. ``PetReaction`` treated any
+    ``availability != "available"`` past ``SENSE_LOSS_GRACE_S`` (1.0 s) as a
+    sensing failure. But the reaction's own motion necessarily blocks the sense
+    for the entry slew plus ``DEFAULT_STILL_HOLD_S``, which under shipped v0.41.0
+    defaults is ~1.40 s (antenna slew 0.40 s is the binding axis, not the head's
+    0.24 s). So every gesture aborted mid-flight as ``sensing_lost``.
+
+    The two states now carry different budgets, and this pins both directions —
+    a longer grace for ``blocked`` is only safe if ``unavailable`` stays short.
+    """
+    blind = DEFAULT_STILL_HOLD_S + 0.40  # hold + worst-case (antenna) entry slew
+    assert BLOCKED_GRACE_S > blind, "grace must cover the reaction's own blind window"
+
+    blocked = make_pet_reaction()
+    out = None
+    for step in range(1, int(blind / DT) + 1):
+        out = blocked(step * DT, {}, _state(availability="blocked"))
+    assert out is not None
+    assert not out.done, "the reaction aborted during its own commanded motion"
+
+    # A genuinely dead reader is still a fault and must still finish promptly on
+    # the short budget — the fix must not blanket-extend every loss path.
+    dead = make_pet_reaction()
+    for step in range(1, int((SENSE_LOSS_GRACE_S + 4.0) / DT) + 1):
+        out = dead(step * DT, {}, _state(availability="unavailable"))
+    assert out is not None
+    assert out.done, "a dead pose reader should still end the reaction"

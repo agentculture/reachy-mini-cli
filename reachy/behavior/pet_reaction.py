@@ -23,11 +23,16 @@ import math
 from typing import Callable, cast
 
 from reachy.behavior.model import Contribution, neutral_head
+from reachy.behavior.pat_sense import DEFAULT_STILL_HOLD_S
 from reachy.behavior.sense import PatState, Sense
 
 # Public timing/limit constants make the physical envelope directly testable.
 NOMINAL_TICK_S = 0.02
+#: Grace before a reaction gives up because the sense stopped answering. This is
+#: the FAULT case — ``unavailable`` means the pose reader itself failed — so it
+#: stays short.
 SENSE_LOSS_GRACE_S = 1.0
+
 PAT_COOLDOWN_S = 5.0
 MAX_CONTACT_S = 15.0
 DONE_GESTURE_S = 1.2
@@ -76,6 +81,30 @@ ANTENNA_LIMIT_DEG = 20.0
 HEAD_ROTATION_STEP_DEG = 1.0
 BODY_YAW_STEP_DEG = 0.5
 ANTENNA_STEP_DEG = 1.0
+
+#: Grace for ``blocked``, which is NOT a fault: it is the expected consequence of
+#: this reaction's OWN motion. The commanded pose moves for the entry slew, and
+#: the stillness gate must then re-earn ``DEFAULT_STILL_HOLD_S`` before sensing
+#: reopens — so the reaction is necessarily blind through both.
+#:
+#: Under shipped v0.41.0 defaults that is 0.40 s of ANTENNA slew (the binding
+#: axis: 20 deg at ``ANTENNA_STEP_DEG``, longer than the head's 0.24 s) plus a
+#: 1.0 s hold = 1.40 s, which EXCEEDS ``SENSE_LOSS_GRACE_S``. Reusing that grace
+#: aborted the gesture mid-flight as ``sensing_lost`` (found in review on #90;
+#: masked locally because the runtime integration test pins ``still_hold_s=0.5``).
+#:
+#: DERIVED rather than hardcoded, so retuning any of the rate limits, the axis
+#: clamps, or the stillness hold keeps this correct by construction.
+_WORST_ENTRY_SLEW_S = (
+    max(
+        HEAD_YAW_LIMIT_DEG / HEAD_ROTATION_STEP_DEG,
+        HEAD_PITCH_LIMIT_DEG / HEAD_ROTATION_STEP_DEG,
+        ANTENNA_LIMIT_DEG / ANTENNA_STEP_DEG,
+        BODY_YAW_LIMIT_DEG / BODY_YAW_STEP_DEG,
+    )
+    * NOMINAL_TICK_S
+)
+BLOCKED_GRACE_S = DEFAULT_STILL_HOLD_S + _WORST_ENTRY_SLEW_S + 0.5
 
 #: Forward lean accompanying a side-pat turn. Raised 2.5 -> 4.0 (2026-07-20) on
 #: operator feedback that the reaction read as "moving straight forward": with
@@ -228,9 +257,13 @@ class PetReaction:
             raise TypeError("sense.pat_state must be PatState")
 
         if state.availability != "available":
+            # `blocked` is this reaction's own motion closing the stillness gate
+            # — expected, and necessarily longer than a reader fault. Treating
+            # the two alike aborted the gesture mid-flight (see BLOCKED_GRACE_S).
+            grace = BLOCKED_GRACE_S if state.availability == "blocked" else SENSE_LOSS_GRACE_S
             if self._loss_started_at is None:
                 self._loss_started_at = t
-            elif t - self._loss_started_at >= SENSE_LOSS_GRACE_S:
+            elif t - self._loss_started_at >= grace:
                 self._begin_finish(t, "sensing_lost")
             return
 
@@ -350,5 +383,6 @@ __all__ = [
     "PAT_COOLDOWN_S",
     "PetReaction",
     "SENSE_LOSS_GRACE_S",
+    "BLOCKED_GRACE_S",
     "make_pet_reaction",
 ]
