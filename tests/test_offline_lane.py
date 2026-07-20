@@ -12,6 +12,7 @@ that must survive with every network leg pointed nowhere:
     pat             -> test_pat_detect_then_react_enqueues_lean_nuzzle_settle
     sleep/wake      -> test_sleep_wake_demo_walks_the_full_arc_with_no_robot
     rules           -> test_rules_file_changes_robot_behavior_in_a_bounded_run
+    speak           -> test_speak_renders_and_plays_a_say_rule_with_every_endpoint_unreachable
 
 Every test below drives the SAME production seam a pre-existing, more thorough
 test file already proves (named in each test's docstring) — this file is
@@ -326,3 +327,56 @@ def test_rules_file_changes_robot_behavior_in_a_bounded_run() -> None:
     active_names = {ab.behavior.name for ab in eng.active}
     assert "nod" in active_names
     assert eng._last_ownership["head"].startswith("rule:hear:")
+
+
+# --------------------------------------------------------------------------- #
+# speak — the robot has a voice with nothing reachable at all                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_speak_renders_and_plays_a_say_rule_with_every_endpoint_unreachable() -> None:
+    """Mirrors tests/test_behavior_speech_act.py's own offline tests: a react
+    rule's ``say`` reaches the actuator and the SHIPPED default voice — the
+    in-process harmonic synth — renders real PCM with no TTS, no LLM, no STT and
+    no socket available to it.
+
+    This is the whole point of choosing harmonics-as-default: a robot with a
+    dead LAN, a down TTS container, or a fresh box that has never reached
+    anything is still not mute. Only the speaker is a stand-in (audio has to
+    leave the process somehow); everything upstream of it is production code.
+    """
+    from reachy.behavior.speech_act import SpeechActuator
+
+    clips: list = []
+    actuator = SpeechActuator(play=lambda pcm, *, samplerate: clips.append((pcm, samplerate)))
+    assert actuator.voice.name == "harmonic", "the offline-safe voice is not the default"
+
+    cfg = RulesConfig.from_dict(
+        {"react": [{**_react_rule("greet", "speech", "is_true", "speak"), "say": "hello there"}]}
+    )
+    bus = compose_rule_seam(cfg, speech=actuator.say)
+
+    def sense(_t):
+        return Sense(speech_detected=True)
+
+    try:
+        actuator.start()
+        ticks = engine_run(
+            _FakeTransport(),
+            EngineConfig(compose_hz=50, base_layer=True, settle=False),
+            sleep=lambda *_: None,
+            now=_Clock(),
+            max_ticks=3,
+            sense=sense,
+            tick_seam=bus,
+        )
+        assert ticks == 3
+        assert actuator.join_idle(timeout=5.0), "the speech worker never drained"
+    finally:
+        actuator.close()
+
+    assert len(clips) == 1, f"expected exactly one utterance, got {len(clips)}"
+    pcm, samplerate = clips[0]
+    assert samplerate == 16000
+    assert len(pcm) > 1000, "the offline default voice rendered no audio"
+    assert actuator.failures == 0

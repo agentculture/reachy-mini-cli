@@ -390,7 +390,8 @@ vars override the built-in default.
 | `XDG_CONFIG_HOME` | `~/.config` | Base for config (`<…>/reachy/demo-mode.json`) | `demo_config.py` |
 | `REACHY_TTS_URL` | `http://localhost:9000` | Magpie-style TTS HTTP endpoint | `speech/tts.py` (`say`, `think`) |
 | `REACHY_TTS_VOICE` | `Magpie-Multilingual.EN-US.Mia.Calm` | TTS voice identifier | `speech/tts.py` |
-| `REACHY_VOICE_ENGINE` | `tts` | Speech backend for `say`/`think`/`listen --live`: `tts` or `harmonic` | `speech/voice.py` |
+| `REACHY_VOICE_ENGINE` | `tts` for `say`/`think`/`listen --live`; **`harmonic`** for the behavior runtime | Speech backend: `tts` or `harmonic`. The symbolic runtime defaults the other way on purpose — its voice must work with nothing reachable | `speech/voice.py`, `behavior/speech_act.py` |
+| `REACHY_SPEECH_TRANSPORT` | `http` | How the behavior runtime's voice reaches the speaker: `http` (upload + play via the daemon) or `sdk` (push PCM in-process). Falls back to `REACHY_TRANSPORT`; `http` is the default because the media-profile SDK client is currently unconstructable on the robot (issue #94) | `behavior/speech_act.py` |
 | `REACHY_COGNITION` | `marker` | Folded live cognition engine for `listen --live`: `marker` or `agent` | `cli/_commands/listen.py` |
 | `REACHY_HARMONIC_IDENTITY` | `reachy` | Harmonic voice identity signature (root pitch + instrument) | `speech/harmonic.py` |
 | `REACHY_HARMONIC_ARTICULATION` | `smooth` | Harmonic rendering style: `discrete` / `speechy` / `smooth` / `alien` | `speech/harmonic.py` |
@@ -1247,6 +1248,72 @@ documented indefinite-intent surface.
 
 A bounded looping admission (e.g. `duration_s = 8` on `nod`) loops for 8
 seconds then releases its channel automatically.
+
+### Speech — the `say` field gives a rule a voice
+
+A react rule can also **speak**. Add `say = "..."` and the robot says those
+words aloud when the rule fires:
+
+```toml
+[[react]]
+id = "greet-on-name"
+when = { field = "transcript", op = "is_true" }
+run = "speak"
+duration_s = 2.0
+cooldown_s = 6.0
+say = "hello, I'm right here"
+```
+
+`run` is what the robot **does**; `say` is what it **says**. They are the two
+halves of one reaction, and the library's `speak` entry is the natural partner
+— `speak` has always been a head *bob* with no sound (the mouth-movement
+analogue), so pairing it with `say` is what "the robot is talking" looks like.
+Either half works alone: `run = "nod"` with a `say` nods while it talks, and a
+rule with no `say` is silent exactly as before.
+
+Rules of thumb:
+
+- `say` is **react-only** (an inhibit rule has nothing to speak) and is plain
+  data — a string in a TOML file, never a template or a path to code.
+- It is capped at **500 characters**, refused fail-closed rather than
+  truncated, the same posture as `goto`'s axis bounds.
+- Give a speaking rule a real `cooldown_s`. Speech occupies the room for
+  seconds; the default 5.0 s is a sensible floor.
+
+**The voice is offline by default.** Speech is synthesized in-process by the
+harmonic voice (`reachy.speech.harmonic`, backed by the base dependency
+`harmonics-cli`) — no TTS container, no network hop, no model download. A
+robot with a dead LAN, or a fresh box that has never reached anything, still
+has a voice. Set `REACHY_VOICE_ENGINE=tts` to use the external Chatterbox
+endpoint instead (see [the harmonic voice](#the-harmonic-voice) for the
+identity and articulation knobs, which apply here unchanged).
+
+**Playback goes through the daemon by default.** Audio is uploaded to the
+daemon and played there (`REACHY_SPEECH_TRANSPORT=http`, the default) rather
+than through an in-process SDK media session. That is deliberate: on the
+deployed robot a media-profile SDK client currently cannot be constructed at
+all (`ConnectionRefusedError`, issue #94) while the daemon's HTTP API answers
+normally, and the daemon route needs no `[sdk]` extra. Set
+`REACHY_SPEECH_TRANSPORT=sdk` to push PCM through the SDK instead — one
+variable, no code change.
+
+**Nothing slow happens on the engine tick.** Synthesis and playback both run
+on a background worker; the tick thread only hands over the text. A wedged or
+unreachable backend therefore costs you silence, never a stalled loop — the
+utterance is dropped with a named reason, and a persistently dead sink latches
+off for 30 s before retrying rather than being re-dialled every utterance.
+
+**The robot does not answer itself.** While a clip is playing (plus a short
+margin) the transcript sense is muted, so the robot never hears its own voice,
+transcribes it, and replies to it.
+
+Grep what the voice did:
+
+```bash
+journalctl --user -u reachy-behavior -f | grep 'stage=speech'
+# [SENSE stage=speech source=say event=utt7] spoke voice=harmonic chars=24 duration_s=1.31
+# [SENSE stage=speech source=say event=utt8] dropped reason=queue-full
+```
 
 ### The `goto` verb — a spool-submitted, engine-arbitrated move
 

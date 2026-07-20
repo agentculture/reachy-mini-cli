@@ -125,7 +125,18 @@ def _shake(t: float, p: dict, _sense: Sense) -> Contribution:
 
 
 def _speak(t: float, p: dict, _sense: Sense) -> Contribution:
-    """Speech-like head bob: a quick pitch oscillation with a smaller offset yaw."""
+    """Speech-like head bob: a quick pitch oscillation with a smaller offset yaw.
+
+    MOTION ONLY, and deliberately still so — the mouth-movement analogue, not a
+    voice. The audible half of speech is a react rule's ``say`` text (see
+    :mod:`reachy.behavior.rules`), rendered off the tick thread by
+    :class:`reachy.behavior.speech_act.SpeechActuator`. The two were reconciled
+    rather than merged: a library entry is a PURE, stateless function of
+    behavior-local time evaluated at 50 Hz, so giving this one a side effect
+    would put synthesis on the tick thread — exactly the defect the actuator
+    exists to avoid. Pair them in ONE rule (``run = "speak"`` + ``say = "..."``)
+    to get a robot that both looks and sounds like it is talking.
+    """
     ph = 2.0 * math.pi * t / p["period"] if p["period"] else 0.0
     return Contribution(
         head=_head(pitch=p["pitch"] * math.sin(ph), yaw=p["yaw"] * math.sin(ph * 1.7 + 0.5))
@@ -241,7 +252,10 @@ LIBRARY: dict[str, LibraryEntry] = {
     ),
     "speak": LibraryEntry(
         name="speak",
-        summary="bob the head like speech (for N seconds or until stopped)",
+        summary=(
+            "bob the head like speech — motion only, no sound; pair with a rule's "
+            'say = "..." for the voice (for N seconds or until stopped)'
+        ),
         channels=_HEAD,
         default_class=StopClass.STOPPABLE,
         looping=True,

@@ -202,7 +202,8 @@ class _StaticRules:
     """A one-rule real ``RuleEngine`` in the shape ``_compose_run_seam`` expects.
 
     Mirrors ``cmd_engine_run``'s ``ReloadDriver``: callable as a tick driver, plus
-    the ``set_active_mode`` / ``known_modes`` members the intent driver reads.
+    the ``set_active_mode`` / ``known_modes`` members the intent driver reads and
+    the ``set_speech`` member composition wires the voice through (t6).
     """
 
     def __init__(self, field: str, *, run: str = "pet-reaction") -> None:
@@ -227,6 +228,9 @@ class _StaticRules:
 
     def set_active_mode(self, name: str | None) -> None:
         self._engine.set_active_mode(name)
+
+    def set_speech(self, speech) -> None:
+        self._engine.set_speech(speech)
 
     @staticmethod
     def known_modes() -> tuple[str, ...]:

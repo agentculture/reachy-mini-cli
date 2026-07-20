@@ -173,7 +173,7 @@ transport. Deep notes for the non-trivial nouns follow in
 | `daemon` | `_commands/daemon.py` | `reachy/daemon.py` (process mgmt, `is_robot_live`) | none |
 | `device`/`app`/`move` | `_commands/{device,app,move}.py` | `reachy/robot/*` transports | `http` default |
 | `demo-mode` | `_commands/demo_mode.py` | `reachy/alive.py`, `reachy/motion/idle.py`, `demo_config.py`, `demo_service.py` | `sdk`/`http` |
-| `behavior` | `_commands/behavior.py` | 50 Hz engine (`behavior/engine.py`) + rules/intents (`rules.py`/`rule_engine.py`/`intents.py`/`control.py`); composes the full sense stack — proprioceptive pat (`pat_sense.py` + `robot/state_reader.py`), loudness (`rms_sense.py`), heard words (`transcript_sense.py`), face + frame availability (`face_sense.py`), all reading the one held `robot/media_client.py` — and a fail-closed live `goto` (`goto_intent.py` + `goto_lane.py`, seeded via `pose_feed.py`) onto the same tick seam | `sdk`/`http` |
+| `behavior` | `_commands/behavior.py` | 50 Hz engine (`behavior/engine.py`) + rules/intents (`rules.py`/`rule_engine.py`/`intents.py`/`control.py`); composes the full sense stack — proprioceptive pat (`pat_sense.py` + `robot/state_reader.py`), loudness (`rms_sense.py`), heard words (`transcript_sense.py`), face + frame availability (`face_sense.py`), all reading the one held `robot/media_client.py` — a fail-closed live `goto` (`goto_intent.py` + `goto_lane.py`, seeded via `pose_feed.py`), and the background-worker voice (`speech_act.py`, reached from a rule's `say`) onto the same tick seam | `sdk`/`http` |
 | `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43); `--live`: `listen_hooks.py` `HookChain` + `sense_sample.py` + `listen_{think,vision,sleep}.py` + `speech/voice.py` (`--voice-engine`, `--live` only) + `speech/agent_turn.py` `AgentTurnEngine` + `speech/tools.py` `ToolRegistry` (`--cognition agent`, `--live` only); `motion/supervisor.py` | `sdk` default |
 | `vision` | `_commands/vision.py` | pixel motion/light detectors, serial MotionQueue | `sdk` default |
 | `say` | `_commands/say.py` | `reachy/speech/{tts,harmonic,voice,playback}.py` | `sdk` default |
@@ -303,6 +303,32 @@ a stale value makes the linter lie in one direction or the other.
   "Import boundary" docstring), so `behavior goto` (the CLI front,
   `_commands/behavior.py`) and an agent's equivalent call share one
   admission path.
+- **`reachy/behavior/speech_act.py` `SpeechActuator`** — the runtime's VOICE,
+  and the only genuinely BLOCKING side effect in the loop. Reached from a
+  react rule's optional `say: str` (validated in `rules.py`, capped at
+  `MAX_SAY_CHARS = 500`, refused fail-closed never truncated), dispatched by
+  `RuleEngine._speak` through an INJECTED `speech(text)` seam — so
+  `rule_engine.py` never imports the audio stack, and a missing seam is a
+  named `no-speech-actuator` drop rather than silence. `say()` is O(1) on the
+  tick thread (validate → `put_nowait` on a depth-2 bounded queue); a worker
+  thread does synthesis + playback. A full queue, a wedged TTS or a dead
+  speaker all resolve to a named drop, never backpressure onto the 20 ms
+  budget — this is the same defect class as the 425-1213 ms startup overruns
+  t27/t28 removed, and it must not come back. Three defaults are product
+  decisions, not conveniences: the voice is `harmonic` (in-process, offline —
+  deliberately NOT `speech/voice.py`'s own `tts` default, so a box with
+  nothing reachable still speaks); playback defaults to the daemon's `http`
+  route (the media-profile SDK client is unconstructable on the robot today,
+  issue #94 — `REACHY_SPEECH_TRANSPORT=sdk` flips it back with no code
+  change); and a persistently dead sink latches off for 30 s and RETRIES
+  (time-bounded, unlike `CognitionEngine`'s permanent latch, because a
+  boot-persistent robot must survive a daemon restart un-muted).
+  `mute_until()` is wired at composition into `TranscriptSenseDriver`'s
+  `mute_until` seam, so the robot cannot transcribe its own voice and answer
+  itself. The library's `speak` entry stays PURE MOTION (a 50 Hz head bob with
+  no sound) — pairing `run = "speak"` with `say = "..."` is the visible +
+  audible halves of one reaction; giving that entry a side effect would put
+  synthesis back on the tick thread.
 
 **The bounded-lifetime invariant — enforced on BOTH admission surfaces.** A
 background incident (a react rule admitting looping `nod` with library
@@ -322,8 +348,9 @@ UNBOUNDED admission, fail-closed:
   lifetime is intentionally exempt (the documented indefinite-intent
   surface).
 
-See [the operating guide's pat sense](docs/operating-reachy.md#the-pat-sense)
-and [bounded reactions](docs/operating-reachy.md#bounded-reactions-no-more-permanent-holds)
+See [the operating guide's pat sense](docs/operating-reachy.md#the-pat-sense),
+[bounded reactions](docs/operating-reachy.md#bounded-reactions-no-more-permanent-holds)
+and [speech](docs/operating-reachy.md#speech--the-say-field-gives-a-rule-a-voice)
 sections for the operator-facing walkthrough and the deployed `rules.toml`
 example.
 
