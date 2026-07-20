@@ -35,6 +35,18 @@ from reachy.motion.pat import PatDetector
 from reachy.motion.pat_reaction import LEAN_PITCH_DOWN, LEAN_YAW_SIDE, SIDE_BODY_YAW, PatReaction
 from reachy.motion.queue import MotionAction, MotionQueue
 
+
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path, monkeypatch):
+    """Never read the REAL state dir — ``pat run`` now arbitrates against it.
+
+    ``pat run`` refuses to start beside a live behavior engine heartbeat
+    (``reachy.behavior.liveness``), read from ``state_dir()``. Isolating keeps
+    this suite independent of whether a runtime service is up on the box.
+    """
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+
+
 # ---------------------------------------------------------------------------
 # Deterministic impulse helpers (mirror tests/test_pat_detector.py)
 # ---------------------------------------------------------------------------
