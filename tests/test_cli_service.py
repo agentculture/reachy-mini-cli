@@ -24,7 +24,7 @@ import pytest
 from reachy.cli import main
 from reachy.cli._commands import service as service_cmd
 from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR
-from reachy.service.units import DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT
+from reachy.service.units import DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RETIRED_UNITS
 
 # --------------------------------------------------------------------------- #
 # Fake systemctl runner — records arg vectors, serves canned query state.
@@ -265,10 +265,15 @@ def test_install_writes_units_and_reloads_without_enabling(fake, capsys, tmp_pat
     # Both presence units + the daemon unit are written.
     for unit in (DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT):
         assert (_unit_dir(tmp_path) / unit).is_file()
-    # daemon-reload happened, but NO enable/disable.
+    # daemon-reload happened, and NOTHING was enabled.
     assert ["--user", "daemon-reload"] in fake.calls
     assert fake.verbs_for("enable") == []
-    assert fake.verbs_for("disable") == []
+    # The only `disable` install may issue is the retired-unit migration, which
+    # purges names this CLI no longer installs (see RETIRED_UNITS). No unit in
+    # the CURRENT catalog is ever disabled by install.
+    disabled = [c[-1] for c in fake.verbs_for("disable")]
+    assert set(disabled) <= set(RETIRED_UNITS)
+    assert not {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT} & set(disabled)
     assert err == ""
     assert out != ""
 

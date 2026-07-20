@@ -15,7 +15,13 @@ import pytest
 
 from reachy.cli import main
 from reachy.cli._commands import service as service_cmd
-from reachy.service.units import DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT
+from reachy.service.units import (
+    DAEMON_UNIT,
+    DEMO_UNIT,
+    LIVE_UNIT,
+    RETIRED_UNITS,
+    RUNTIME_UNIT,
+)
 
 
 class FakeSystemctl:
@@ -166,7 +172,11 @@ def test_install_writes_all_four_units_without_enabling(fake, capsys, tmp_path):
         assert (_unit_dir(tmp_path) / unit).is_file(), f"{unit} not written by install"
     assert ["--user", "daemon-reload"] in fake.calls
     assert fake.verbs_for("enable") == []
-    assert fake.verbs_for("disable") == []
+    # install's only `disable` is the retired-unit migration (RETIRED_UNITS);
+    # no unit in the CURRENT catalog is ever disabled by install.
+    disabled = [c[-1] for c in fake.verbs_for("disable")]
+    assert set(disabled) <= set(RETIRED_UNITS)
+    assert not {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT} & set(disabled)
     assert err == ""
     assert out != ""
 

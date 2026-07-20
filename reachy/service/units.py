@@ -45,6 +45,32 @@ DEMO_UNIT = "reachy-demo-mode.service"
 LIVE_UNIT = "reachy-live.service"
 RUNTIME_UNIT = "reachy-runtime.service"
 
+# --------------------------------------------------------------------------- #
+# Retired unit names (CROSS-TASK CONTRACT — the migration list).
+# --------------------------------------------------------------------------- #
+#
+# Unit names this CLI once installed and no longer does. A name leaving the
+# catalog above does NOT make it leave the deployed robot: nothing writes or
+# removes unit files on ``pip upgrade``, and every install/enable path only ever
+# touches units still IN the catalog. So a retired unit survives the upgrade
+# with an ``ExecStart`` naming a subcommand that no longer exists — and because
+# every unit here carries ``Restart=on-failure`` + ``RestartSec=5`` (see
+# :func:`_render`), that is a 5-second crash loop, not a quiet no-op.
+#
+# ``ServiceManager.cleanup_retired_units`` walks this tuple on every ordinary
+# ``service enable`` / ``install`` / ``uninstall`` and unconditionally
+# ``disable --now``s each name, unlinks its unit file, and removes its ``.d/``
+# drop-in directory. **Retiring a unit is therefore a one-line change: move the
+# name out of the catalog above and into this tuple.** Never list a unit that is
+# still a live presence mode — the migration would disable it out from under the
+# operator on the next ``service`` command.
+#
+# ``reachy-listen.service`` is the hand-authored unit the CLI-generated
+# :data:`LIVE_UNIT` superseded; an orphaned copy still sits enabled in
+# ``~/.config/systemd/user`` on the deployed box, in no catalog and removed by
+# nothing. It is the reason this list exists.
+RETIRED_UNITS: tuple[str, ...] = ("reachy-listen.service",)
+
 
 def _unit_arg(value: str) -> str:
     """Quote/escape one ExecStart argument for the systemd unit grammar.

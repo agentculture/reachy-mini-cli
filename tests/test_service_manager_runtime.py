@@ -21,6 +21,7 @@ from reachy.service.units import (
     DAEMON_UNIT,
     DEMO_UNIT,
     LIVE_UNIT,
+    RETIRED_UNITS,
     RUNTIME_UNIT,
     daemon_unit_text,
     demo_unit_text,
@@ -262,7 +263,14 @@ def test_status_units_dict_has_all_four_keys(make_manager):
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
     st = mgr.status()
-    assert set(st["units"]) == {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT}
+    # The four catalogued units are always probed. status() ALSO probes every
+    # RETIRED_UNITS name — a retired unit still enabled is a crash loop, and a
+    # status that only iterated the current catalog would report mode=None for
+    # exactly the box that most needs a true answer.
+    assert {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT} <= set(st["units"])
+    assert set(st["units"]) == {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT} | set(
+        RETIRED_UNITS
+    )
 
 
 def test_status_reports_none_when_no_presence_enabled_among_three(make_manager):
