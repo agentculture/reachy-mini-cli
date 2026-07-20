@@ -87,6 +87,8 @@ from reachy.export.runtime import SenseSnapshotDriver
 from reachy.motion.pat import PatDetector
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, INTERPOLATIONS
 from reachy.robot.state_reader import HeldStateReader
+from reachy.speech.distinctness import find_too_similar as _find_too_similar
+from reachy.speech.expressions import NEUTRAL_KEY, Catalog
 
 _JSON_HELP = "Emit structured JSON."
 _EMPTY_SUBMITTED = "(submitted)"
@@ -112,6 +114,7 @@ _VERBS = [
     "spool, the same path a live agent uses",
     "behavior rules — render the loaded rules.toml (react/inhibit rules, modes)",
     "behavior rules check — validate rules.toml (a linter; exit 0 unless unreadable)",
+    "behavior expressions — list the expression pose catalog (and 'expressions check')",
     "behavior engine start — start the 50 Hz engine in the background",
     "behavior engine stop — stop the engine (eases the robot to neutral)",
     "behavior engine status — engine process + daemon reachability",
@@ -573,6 +576,137 @@ def cmd_rules_overview(args: argparse.Namespace) -> int:
 def _rules_no_verb(args: argparse.Namespace) -> int:
     # Bare `behavior rules` renders the loaded config (mirrors `think expressions`).
     return cmd_rules_list(args)
+
+
+# --------------------------------------------------------------------------- #
+# expressions sub-noun — the pose catalog + distinctness check (t18)          #
+# --------------------------------------------------------------------------- #
+#
+# Ported from `think expressions` (`reachy/cli/_commands/think.py`), which is
+# being retired along with the rest of the LLM-cognition `think` noun. The
+# catalog itself (`reachy.speech.expressions`, backed by `expressions.toml`)
+# and the distinctness check (`reachy.speech.distinctness`) are NOT
+# LLM-coupled — a TOML table and a geometric distance function — and stay
+# needed afterward: `reachy.speech.tools`'s `apply_pose` tool (kept by `agent
+# attach`) imports the catalog directly. So the data survives but its only CLI
+# inspection surface would otherwise vanish with `think`; `behavior` is the
+# new home — the surviving presence noun, and already hosts a sibling
+# sub-noun (`rules`, just above) in exactly this "render + lint a file, no
+# running engine needed" shape. `think expressions` itself is untouched here
+# (a separate task deletes `think` wholesale) — the duplication between the
+# two homes is deliberate and temporary.
+
+_EXPRESSIONS_VERBS = [
+    "expressions / expressions list — list the expression catalog (emoji + pose descriptor)",
+    "expressions check — flag catalog poses too similar to be distinct",
+    "expressions overview — this summary",
+]
+
+
+def _expression_emojis(catalog: Catalog | None = None) -> list[str]:
+    """The catalog's expression emojis (every key except the neutral fallback)."""
+    cat = catalog if catalog is not None else Catalog()
+    return [key for key in cat.keys() if key != NEUTRAL_KEY]
+
+
+def _pose_descriptor(catalog: Catalog, emoji: str) -> str:
+    """A short, generated descriptor of an emoji's pose (its non-zero axes).
+
+    The catalog is pose values only (the TOML's prose lives in comments, which
+    ``tomllib`` drops), so we summarise the pose itself — the non-zero axes and
+    their signed magnitudes — giving an agent a machine-stable, catalog-derived
+    descriptor without duplicating the TOML comments in code.
+    """
+    pose = catalog.get(emoji)
+    axes = [
+        ("head_x", pose.head_x),
+        ("head_y", pose.head_y),
+        ("head_z", pose.head_z),
+        ("head_roll", pose.head_roll),
+        ("head_pitch", pose.head_pitch),
+        ("head_yaw", pose.head_yaw),
+        ("antenna_right", pose.antenna_right),
+        ("antenna_left", pose.antenna_left),
+        ("body_yaw", pose.body_yaw),
+    ]
+    moved = [f"{name}{value:+g}" for name, value in axes if value]
+    return ", ".join(moved) if moved else "neutral (no offset)"
+
+
+def cmd_expressions_list(args: argparse.Namespace) -> int:
+    """List the expression catalog: each emoji + a short pose descriptor."""
+    catalog = Catalog()
+    rows = [
+        {"emoji": emoji, "descriptor": _pose_descriptor(catalog, emoji)}
+        for emoji in _expression_emojis(catalog)
+    ]
+    if bool(getattr(args, "json", False)):
+        emit_result({"expressions": rows}, json_mode=True)
+    else:
+        lines = [f"{row['emoji']}  {row['descriptor']}" for row in rows]
+        emit_result("\n".join(lines), json_mode=False)
+    return 0
+
+
+def cmd_expressions_check(args: argparse.Namespace) -> int:
+    """Run the distinctness check; report flagged pairs (clean check exits 0).
+
+    A flagged pair is a *warning*, not an error — the catalog still works — so
+    the exit code stays 0; the ``--json`` ``ok`` field is the machine-readable
+    signal (mirrors ``behavior rules check``'s exit-0-warnings idiom).
+    """
+    catalog = Catalog()
+    flagged = _find_too_similar(catalog)
+    ok = not flagged
+    if bool(getattr(args, "json", False)):
+        emit_result(
+            {"ok": ok, "flagged": [[a, b, score] for a, b, score in flagged]},
+            json_mode=True,
+        )
+    else:
+        if ok:
+            emit_result("clean — all expressions are sufficiently distinct", json_mode=False)
+        else:
+            lines = [f"{a} ~ {b} (distance {score:.3f})" for a, b, score in flagged]
+            emit_result(
+                "too similar (" + str(len(flagged)) + " pair(s)):\n" + "\n".join(lines),
+                json_mode=False,
+            )
+    return 0
+
+
+def cmd_expressions_overview(args: argparse.Namespace) -> int:
+    emit_overview(
+        "reachy-mini-cli behavior expressions",
+        [
+            {
+                "title": "What",
+                "items": [
+                    "The emoji-keyed expression pose catalog (loaded from "
+                    "expressions.toml) that agent tool-use's apply_pose drives.",
+                    "list — every catalog emoji + a generated pose descriptor.",
+                    "check — flags catalog poses too similar to be meaningfully " "distinct.",
+                    "These verbs read the catalog file directly — no running " "engine needed.",
+                ],
+            },
+            {"title": "Verbs", "items": list(_EXPRESSIONS_VERBS)},
+            {
+                "title": "Conventions",
+                "items": [
+                    "every command supports --json",
+                    "results to stdout, diagnostics to stderr (never mixed)",
+                    "a flagged 'check' is a warning, not an error — exit stays 0",
+                ],
+            },
+        ],
+        json_mode=bool(getattr(args, "json", False)),
+    )
+    return 0
+
+
+def _expressions_no_verb(args: argparse.Namespace) -> int:
+    # Bare `behavior expressions` lists the catalog (mirrors `behavior rules`).
+    return cmd_expressions_list(args)
 
 
 # --------------------------------------------------------------------------- #
@@ -1378,6 +1512,37 @@ def _register_rules(noun_sub: argparse._SubParsersAction) -> None:
     ck.set_defaults(func=cmd_rules_check)
 
 
+def _register_expressions(noun_sub: argparse._SubParsersAction) -> None:
+    """The ``behavior expressions`` sub-noun: list + check the expression catalog.
+
+    Ported from ``think expressions`` (t18) — see the "expressions sub-noun"
+    section above for why. A noun with action-verbs must also expose
+    ``overview`` (rubric requirement); bare ``expressions`` (no sub-verb) lists
+    the catalog, mirroring ``behavior rules``' bare-defaults-to-list idiom.
+    ``parser_class`` propagates so nested parse errors keep the structured
+    error contract.
+    """
+    ex = noun_sub.add_parser(
+        "expressions",
+        help="List/check the expression pose catalog (see 'behavior expressions overview').",
+    )
+    ex.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ex.set_defaults(func=_expressions_no_verb, json=False)
+    ex_sub = ex.add_subparsers(dest="expressions_command", parser_class=type(ex))
+
+    ov = ex_sub.add_parser("overview", help="Describe the expressions sub-noun.")
+    ov.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ov.set_defaults(func=cmd_expressions_overview)
+
+    ls = ex_sub.add_parser("list", help="List the expression pose catalog.")
+    ls.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ls.set_defaults(func=cmd_expressions_list)
+
+    ck = ex_sub.add_parser("check", help="Flag catalog poses too similar to be distinct.")
+    ck.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ck.set_defaults(func=cmd_expressions_check)
+
+
 def _register_engine(noun_sub: argparse._SubParsersAction) -> None:
     eng = noun_sub.add_parser("engine", help="Manage the 50 Hz engine process.")
     eng.add_argument("--json", action="store_true", help=_JSON_HELP)
@@ -1461,4 +1626,5 @@ def register(sub: argparse._SubParsersAction) -> None:
     _register_reload(noun_sub)
     _register_goto(noun_sub)
     _register_rules(noun_sub)
+    _register_expressions(noun_sub)
     _register_engine(noun_sub)
