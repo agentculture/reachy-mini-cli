@@ -1243,6 +1243,18 @@ Three composition seams:
   rather than around it. The built-in `speak`/`harmonics`/`apply_pose` tools are
   present too but publish-only — they feed the cognition feed's
   `message`/`emotion` blocks without the external client touching the robot.
+- **SELF-EXTENSION** — the `forge` tool hands a natural-language goal to a coder
+  model (`FORGE_BASE_URL` / `FORGE_MODEL`, default the lobes gateway's `qwen3`).
+  What comes back is **never trusted**: it must clear a fail-closed, AST-only
+  validator — which never imports or executes the code — before it is
+  auto-activated and hot-registered, becoming callable on the **next** turn with
+  no restart. A forged skill runs over a restricted context exposing exactly
+  `speak`/`harmonics`/`express`/`state_get`/`state_update`, wired to the same
+  publish-only seams above, so it too never reaches the robot's SDK. Rejected
+  code is quarantined under `<state-dir>/forge/staged/.rejected/`; activated
+  skills live in `<state-dir>/forge/active/` and are reloaded at every attach.
+  A missing or broken forge stack disables only this tool — cognition keeps
+  running.
 - **OUTPUT** — `--export -` / `--export-blocks`: the agent publishes its OWN
   `thinking`/`message`/`emotion` feed through the SAME exporter `think`/`listen`
   use (decision c27: the runtime feed carries no cognition block). See
