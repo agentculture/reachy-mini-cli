@@ -219,9 +219,12 @@ def test_cooldown_skip_is_logged_with_reason(caplog) -> None:
         # true every tick, dt=0.25 -> fires t=0.25, then cooldown until t>=1.25
         _drive_ticks(re, [Sense(speech_detected=True)] * 3)
     lines = _sense_lines(caplog)
+    # #99 cadence: the gated streak logs ONE entry line, not one per tick (the
+    # second gated tick continues the streak silently; the streak is still open
+    # at run end, so no summary either). The decisions are unchanged.
+    assert len(lines) == 2
     assert lines[0].endswith("] fired kind=react run=nod")
     assert lines[1].endswith("] dropped reason=cooldown")
-    assert lines[2].endswith("] dropped reason=cooldown")
     for ln in lines:
         assert "event=hear" in ln  # rule id present on every decision
 
@@ -256,8 +259,12 @@ def test_every_tick_refire_settles_under_cooldown(caplog) -> None:
     cooldowns = [ln for ln in lines if "reason=cooldown" in ln]
     # dt=0.25, cd=1.0 over t=0.25..5.0 -> fires at 0.25,1.25,2.25,3.25,4.25
     assert len(fires) == 5
-    assert len(cooldowns) == 15
-    assert len(lines) == 20  # every matching tick emits exactly one decision
+    # #99 cadence: each 3-tick gated streak logs one entry + one summary when
+    # the refire closes it (5 entries + 4 summaries; the last streak is still
+    # open at run end), instead of 15 per-tick drop lines. Decisions unchanged.
+    assert len(cooldowns) == 9
+    assert sum("suppressed 3 ticks" in ln for ln in lines) == 4
+    assert len(lines) == 14
     assert len(ctx.admits) == 5
 
 
@@ -297,8 +304,12 @@ def test_two_rule_ping_pong_settles_under_cooldown(caplog) -> None:
     a_cool = [ln for ln in lines if "event=A]" in ln and "reason=cooldown" in ln]
     b_cool = [ln for ln in lines if "event=B]" in ln and "reason=cooldown" in ln]
     assert len(a_fires) == 5 and len(b_fires) == 5  # settled, not 10 each
-    assert len(a_cool) == 5 and len(b_cool) == 5
-    assert len(lines) == 20  # exactly one decision per tick (the non-matching rule is silent)
+    # #99 cadence: the alternating predicate makes every gated streak exactly
+    # one tick long, so each closes with a summary on the next (non-matching)
+    # tick — entry + summary per streak. A's 5 streaks all close inside the
+    # run (10 lines); B's last streak is still open at tick 20 (9 lines).
+    assert len(a_cool) == 10 and len(b_cool) == 9
+    assert len(lines) == 29
     names = [b.name for b in ctx.admits]
     assert names.count("nod") == 5 and names.count("shake") == 5
 
@@ -472,7 +483,9 @@ def test_already_active_behavior_is_not_readmitted(caplog) -> None:
     with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
         ctx = _drive_ticks(re, [Sense(speech_detected=True)] * 4, keep_active=True)
     assert len(ctx.admits) == 1  # admitted once; then already active
-    assert sum("reason=already-active" in ln for ln in _sense_lines(caplog)) == 3
+    # #99 cadence: the 3-tick already-active streak logs ONE entry line (it is
+    # still open at run end, so no summary). The dedup decision is unchanged.
+    assert sum("reason=already-active" in ln for ln in _sense_lines(caplog)) == 1
 
 
 # --------------------------------------------------------------------------- #

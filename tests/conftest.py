@@ -120,16 +120,26 @@ def _isolate_reachy_logging():
     so it presented as an order-dependent flake (6 of 8 runs) rather than a
     reproducible failure — and the emitting code was blameless.
 
-    Snapshot the handlers and the level, restore both afterwards. Cheap, and it
-    makes "does this code log?" a local question again.
+    Since the #96 fix, ``install_logging`` also sets ``propagate = False`` on
+    the ``"reachy"`` logger (so a foreign root handler can never double our
+    lines). In a test worker that same flag would starve every LATER test's
+    ``caplog`` — pytest's capture handler lives on the ROOT logger — turning
+    one ``main([... run ...])`` call into silent capture failures elsewhere in
+    the worker. So the snapshot covers ``propagate`` too.
+
+    Snapshot the handlers, the level, and the propagate flag; restore all
+    three afterwards. Cheap, and it makes "does this code log?" a local
+    question again.
     """
     import logging as _logging
 
     logger = _logging.getLogger("reachy")
     saved_handlers = list(logger.handlers)
     saved_level = logger.level
+    saved_propagate = logger.propagate
     try:
         yield
     finally:
         logger.handlers[:] = saved_handlers
         logger.setLevel(saved_level)
+        logger.propagate = saved_propagate

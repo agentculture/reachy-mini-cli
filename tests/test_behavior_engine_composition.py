@@ -76,8 +76,17 @@ duration_s = 30.0
 
 def test_speech_rule_fires_through_the_cli_composition(_isolated, capsys, caplog) -> None:
     _write_rules(_isolated, SPEECH_RULE)
-    with caplog.at_level(logging.INFO, logger="reachy.sense"):
-        rc = main(["behavior", "engine", "run", "--max-ticks", "8", "--json"])
+    # #96: install_logging (the first thing `engine run` does) severs
+    # propagation past the "reachy" logger, so caplog's ROOT-logger capture
+    # handler no longer sees reachy.sense records — attach that same handler
+    # to the sense logger itself for the duration of the call.
+    sense_logger = logging.getLogger("reachy.sense")
+    sense_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger="reachy.sense"):
+            rc = main(["behavior", "engine", "run", "--max-ticks", "8", "--json"])
+    finally:
+        sense_logger.removeHandler(caplog.handler)
     assert rc == 0
     fired = [r.message for r in caplog.records if "hear-speech" in r.message]
     assert fired, "the speech rule never fired — live sense is not reaching the rules"

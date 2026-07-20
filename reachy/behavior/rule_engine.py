@@ -51,12 +51,29 @@ Timing semantics (asserted exactly by the tests)
 
 Observability
 -------------
-Every decision that fires, inhibits, or suppresses a rule emits one
-``[SENSE stage=rule source=<field> event=<rule id>] ...`` line via
-:mod:`reachy.senselog` (``stage`` for a fire naming the reason, ``drop`` for a
-suppression naming the reason). A tick where nothing matches logs nothing — no
-per-tick no-match noise — so a log capture reconstructs every non-trivial
-decision and a silent side effect is impossible.
+Every decision that fires or inhibits emits one ``[SENSE stage=rule
+source=<field> event=<rule id>] ...`` line via :mod:`reachy.senselog`
+(``stage`` for a fire naming the reason, ``drop`` for a suppression naming the
+reason). A tick where nothing matches logs nothing — no per-tick no-match
+noise — so a log capture reconstructs every non-trivial decision and a silent
+side effect is impossible.
+
+Suppressions are logged per EPISODE, not per tick (#99). The gating itself is
+measured correct on the live robot and unchanged (spec decision c46) — but
+emitting a ``dropped reason=...`` line on every tick a predicate held while
+gated meant one deployed rule wrote 6722 drop lines into a 3 h journal window
+(5414 ``already-active`` + 1308 ``cooldown``) against 42 genuine fires, at the
+engine's ~23 Hz tick rate. A gated streak now emits ONE line at entry naming
+the reason, one more line only when the reason CHANGES mid-streak (e.g.
+``cooldown`` giving way to ``already-active`` once the timer lapses while the
+behavior is still active), and ONE summary when the streak ends — before the
+fire line when a fire ends it — naming every reason seen and the streak length
+(``dropped reason=cooldown suppressed 214 ticks``). The ``ctx.emit`` event
+stream follows the same transition cadence (the summary event carries a
+structured ``ticks`` count), so the export feed is spared the same flood. A
+streak still open when the loop stops (or when ``reload`` rebuilds the engine)
+emits no summary — its entry line is the record of it. The drop grammar is
+preserved throughout: a drop always names its reason.
 
 Pure standard library (``logging`` only) plus in-package imports; nothing here
 touches a network, an LLM, or ``reachy_mini``.
@@ -65,7 +82,12 @@ touches a network, an LLM, or ``reachy_mini``.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+
+# ``field`` is aliased: this module uses ``field`` as a local for sense-field
+# names throughout (``pred.field``), which would shadow the dataclasses helper.
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from dataclasses import replace
 
 from reachy import senselog
 from reachy.behavior import library as behavior_library
@@ -169,11 +191,23 @@ def _compare(op: str, left, right) -> bool:
 
 @dataclass
 class _RuleState:
-    """The cooldown + hysteresis bookkeeping for one rule."""
+    """The cooldown + hysteresis bookkeeping for one rule, plus its
+    suppression-episode ledger (#99).
+
+    ``suppress_reason`` is the CURRENT episode's latest reason (``None`` means
+    no episode is open); ``suppress_ticks`` counts every suppressed tick of the
+    open episode; ``suppress_reasons`` is the ordered, deduplicated list of
+    every reason the episode has passed through, so the release summary can
+    name them all. The trio only shapes what gets LOGGED/EMITTED — the
+    fire/suppress decisions themselves never read it (spec decision c46).
+    """
 
     last_fire_t: float | None = None
     false_since: float | None = None
     armed: bool = True
+    suppress_reason: str | None = None
+    suppress_ticks: int = 0
+    suppress_reasons: list[str] = dataclass_field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -366,11 +400,13 @@ class RuleEngine:
         matched = self._eval(rule.when, sense, now)
         self._step_arming(rule, matched, now)
         if not matched:
+            self._release_suppression(ctx, rule)
             return
         reason = self._fire_reason(rule, now)
         if reason != REASON_FIRED:
-            self._emit_suppress(ctx, rule, reason)
+            self._suppress(ctx, rule, reason)
             return
+        self._release_suppression(ctx, rule)
         for name in sorted(rule.disable):
             ctx.evict(name)
         self._mark_fired(rule, now)
@@ -392,17 +428,19 @@ class RuleEngine:
         matched = self._eval(rule.when, sense, now)
         self._step_arming(rule, matched, now)
         if not matched:
+            self._release_suppression(ctx, rule)
             return False
         if rule.behavior in inhibited:
-            self._emit_suppress(ctx, rule, REASON_INHIBITED)
+            self._suppress(ctx, rule, REASON_INHIBITED)
             return False
         reason = self._fire_reason(rule, now)
         if reason != REASON_FIRED:
-            self._emit_suppress(ctx, rule, reason)
+            self._suppress(ctx, rule, reason)
             return False
         if rule.behavior in active:
-            self._emit_suppress(ctx, rule, REASON_ALREADY_ACTIVE)
+            self._suppress(ctx, rule, REASON_ALREADY_ACTIVE)
             return False
+        self._release_suppression(ctx, rule)
         ctx.admit(self._build(rule))
         self._speak(rule)
         self._mark_fired(rule, now)
@@ -467,6 +505,44 @@ class RuleEngine:
 
     # -- observability ----------------------------------------------------- #
 
+    def _suppress(self, ctx, rule: Rule, reason: str) -> None:
+        """Record one suppressed tick, emitting only on an episode TRANSITION.
+
+        The #99 fix: the first suppressed tick of a streak emits the usual
+        ``dropped reason=<reason>`` line/event; a tick continuing the streak
+        under the SAME reason is counted silently; a mid-streak reason change
+        emits one new line naming the new reason. The eventual summary is
+        :meth:`_release_suppression`'s job.
+        """
+        state = self._state[rule.id]
+        state.suppress_ticks += 1
+        if reason == state.suppress_reason:
+            return  # continuation — counted, not logged (the 23 Hz flood class)
+        if reason not in state.suppress_reasons:
+            state.suppress_reasons.append(reason)
+        state.suppress_reason = reason
+        self._emit_suppress(ctx, rule, reason)
+
+    def _release_suppression(self, ctx, rule: Rule) -> None:
+        """Close an open suppression episode with ONE summary line/event.
+
+        Called on the first tick the rule is no longer suppressed — either its
+        predicate stopped matching or it is about to FIRE (in which case the
+        summary is emitted before the fire line, keeping the log
+        chronological). The summary names every reason the episode passed
+        through, in order, plus its length in ticks — the drop grammar still
+        names its reason(s). A no-op when no episode is open, so non-suppressed
+        ticks stay exactly as silent as before.
+        """
+        state = self._state[rule.id]
+        if state.suppress_reason is None:
+            return
+        summary = f"{','.join(state.suppress_reasons)} suppressed {state.suppress_ticks} ticks"
+        self._emit_suppress(ctx, rule, summary, ticks=state.suppress_ticks)
+        state.suppress_reason = None
+        state.suppress_ticks = 0
+        state.suppress_reasons = []
+
     def _emit_fire(self, ctx, rule: Rule, *, run: str | None = None, disabled=None) -> None:
         detail = f"fired kind={rule.kind}"
         if run is not None:
@@ -492,20 +568,21 @@ class RuleEngine:
             }
         )
 
-    def _emit_suppress(self, ctx, rule: Rule, reason: str) -> None:
+    def _emit_suppress(self, ctx, rule: Rule, reason: str, *, ticks: int | None = None) -> None:
         senselog.drop(STAGE, rule.when.field, rule.id, reason)
-        ctx.emit(
-            {
-                "type": EVENT_SUPPRESS,
-                "rule": rule.id,
-                "kind": rule.kind,
-                "field": rule.when.field,
-                "op": rule.when.op,
-                "reason": reason,
-                "ts": ctx.now,
-                "tick": ctx.tick,
-            }
-        )
+        event = {
+            "type": EVENT_SUPPRESS,
+            "rule": rule.id,
+            "kind": rule.kind,
+            "field": rule.when.field,
+            "op": rule.when.op,
+            "reason": reason,
+            "ts": ctx.now,
+            "tick": ctx.tick,
+        }
+        if ticks is not None:
+            event["ticks"] = ticks  # the episode-summary event's structured length
+        ctx.emit(event)
 
 
 # --------------------------------------------------------------------------- #
