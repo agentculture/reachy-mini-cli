@@ -418,8 +418,11 @@ def test_compose_run_seam_default_pat_sense_uses_todays_shipped_values(_isolated
         reader.close()
 
     assert len(calls) == 1, "PatSenseDriver must be constructed exactly once"
-    assert calls[0]["still_hold_s"] == DEFAULT_STILL_HOLD_S == 0.5
-    assert calls[0]["still_eps"] == DEFAULT_STILL_EPS == 0.01
+    # The literals are repeated on purpose: this is a tripwire, so a default
+    # change has to be acknowledged here rather than sliding through. Moved
+    # 0.5/0.01 -> 1.0/0.035 in v0.41.0 when the swing-era gate became shipped.
+    assert calls[0]["still_hold_s"] == DEFAULT_STILL_HOLD_S == 1.0
+    assert calls[0]["still_eps"] == DEFAULT_STILL_EPS == 0.035
 
 
 def test_compose_run_seam_env_override_reaches_the_driver(_isolated, monkeypatch):
@@ -474,8 +477,8 @@ def test_still_tuning_env_vars_do_not_enable_pat_sense_when_toggle_is_off(_isola
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        pytest.param(None, 0.5, id="absent-default"),
-        pytest.param("0.5", 0.5, id="matches-default"),
+        pytest.param(None, 1.0, id="absent-default"),
+        pytest.param("1.0", 1.0, id="matches-default"),
         pytest.param("2", 2.0, id="override"),
         pytest.param("0", 0.0, id="zero-disables-gate"),
         pytest.param("  1.5  ", 1.5, id="whitespace-trimmed"),
@@ -497,8 +500,8 @@ def test_pat_still_hold_s_env_parsing(monkeypatch, raw, expected):
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        pytest.param(None, 0.01, id="absent-default"),
-        pytest.param("0.01", 0.01, id="matches-default"),
+        pytest.param(None, 0.035, id="absent-default"),
+        pytest.param("0.035", 0.035, id="matches-default"),
         pytest.param("0.25", 0.25, id="override"),
     ],
 )

@@ -23,18 +23,45 @@ import math
 from typing import Callable, cast
 
 from reachy.behavior.model import Contribution, neutral_head
+from reachy.behavior.pat_sense import DEFAULT_STILL_HOLD_S
 from reachy.behavior.sense import PatState, Sense
 
 # Public timing/limit constants make the physical envelope directly testable.
 NOMINAL_TICK_S = 0.02
+#: Grace before a reaction gives up because the sense stopped answering. This is
+#: the FAULT case — ``unavailable`` means the pose reader itself failed — so it
+#: stays short.
 SENSE_LOSS_GRACE_S = 1.0
+
 PAT_COOLDOWN_S = 5.0
 MAX_CONTACT_S = 15.0
 DONE_GESTURE_S = 1.2
 
 YAW_DEADBAND_DEG = 0.75
-SIDE_HEAD_GAIN = 2.5
-SIDE_BODY_GAIN = 1.0
+
+#: Deviation -> lean gains. RAISED 2.5/1.0 -> 6.0/2.5 (2026-07-20) from measured
+#: hardware data, not taste: nine live side-pats through the export feed gave
+#: |yaw_deg| of 1.30-2.08 deg (median 1.70). That is a structural consequence of
+#: DEFAULT_PRESS_THRESHOLD = 1.2 — detection happens right AT the threshold, so
+#: the deviation handed to the planner is always near it. At the old 2.5 the
+#: resulting turn was 3.3-5.2 deg, comparable to SIDE_PITCH_DEG and swamped by
+#: feel-alive's own swing, which the operator read as "moving straight forward".
+#: At 6.0 the median pat turns ~10.2 deg and anything >= 2.0 deg clamps at the
+#: 12 deg limit — legible as a turn toward the hand. Re-derive these if the press
+#: threshold moves: gain and threshold are coupled through this arithmetic.
+SIDE_HEAD_GAIN = 6.0
+SIDE_BODY_GAIN = 2.5
+
+#: Sign applied to the measured deviation when planning the side-pat lean.
+#:
+#: ``PatState.yaw_deg`` is the signed actual-minus-commanded deviation
+#: (:mod:`reachy.motion.pat`), so a hand resting on the robot's RIGHT pushes the
+#: head LEFT and the deviation carries the left sign. Seeking the hand therefore
+#: means moving OPPOSITE the deviation: ``-1`` presses the head back along the
+#: axis it was pushed, so it meets the palm and sustains contact — the
+#: "cat leaning into a scratch" read. ``+1`` (the behaviour through v0.40.0)
+#: continued WITH the push, which reads as yielding away from the hand.
+SIDE_SEEK_SIGN = -1.0
 
 HEAD_YAW_LIMIT_DEG = 12.0
 HEAD_PITCH_LIMIT_DEG = 12.0
@@ -43,18 +70,61 @@ ANTENNA_LIMIT_DEG = 20.0
 
 # Per-call limits at the engine's 50 Hz cadence.  They also contain a delayed
 # fake/replay clock: one invocation can never jump farther because wall time did.
-HEAD_ROTATION_STEP_DEG = 0.5
-BODY_YAW_STEP_DEG = 0.25
+# Raised 0.5/0.25 -> 1.0/0.5 (2026-07-20) IN STEP with SIDE_HEAD_GAIN, and for a
+# structural reason rather than for speed's sake. The entry slew is part of the
+# reaction's blind window (slew + gate re-arm), which RELEASE_AFTER_S must
+# outlast or a sustained pet dies mid-gesture and never ladders receptive ->
+# contentment -> warning (the t12 sustain bug). Raising the gain alone doubled
+# the slew (12 deg at 0.5 deg/tick = 0.48 s vs 0.24 s) and the offline labelled
+# trace stopped reaching contentment at all. Doubling the step restores the old
+# TIMING at the new amplitude, so the gesture is bigger without being slower.
+HEAD_ROTATION_STEP_DEG = 1.0
+BODY_YAW_STEP_DEG = 0.5
 ANTENNA_STEP_DEG = 1.0
 
-SIDE_PITCH_DEG = 2.5
+#: Grace for ``blocked``, which is NOT a fault: it is the expected consequence of
+#: this reaction's OWN motion. The commanded pose moves for the entry slew, and
+#: the stillness gate must then re-earn ``DEFAULT_STILL_HOLD_S`` before sensing
+#: reopens — so the reaction is necessarily blind through both.
+#:
+#: Under shipped v0.41.0 defaults that is 0.40 s of ANTENNA slew (the binding
+#: axis: 20 deg at ``ANTENNA_STEP_DEG``, longer than the head's 0.24 s) plus a
+#: 1.0 s hold = 1.40 s, which EXCEEDS ``SENSE_LOSS_GRACE_S``. Reusing that grace
+#: aborted the gesture mid-flight as ``sensing_lost`` (found in review on #90;
+#: masked locally because the runtime integration test pins ``still_hold_s=0.5``).
+#:
+#: DERIVED rather than hardcoded, so retuning any of the rate limits, the axis
+#: clamps, or the stillness hold keeps this correct by construction.
+_WORST_ENTRY_SLEW_S = (
+    max(
+        HEAD_YAW_LIMIT_DEG / HEAD_ROTATION_STEP_DEG,
+        HEAD_PITCH_LIMIT_DEG / HEAD_ROTATION_STEP_DEG,
+        ANTENNA_LIMIT_DEG / ANTENNA_STEP_DEG,
+        BODY_YAW_LIMIT_DEG / BODY_YAW_STEP_DEG,
+    )
+    * NOMINAL_TICK_S
+)
+BLOCKED_GRACE_S = DEFAULT_STILL_HOLD_S + _WORST_ENTRY_SLEW_S + 0.5
+
+#: Forward lean accompanying a side-pat turn. Raised 2.5 -> 4.0 (2026-07-20) on
+#: operator feedback that the reaction read as "moving straight forward": with
+#: the old 2.5 gain the yaw was only ~4 deg, comparable to this pitch, so the
+#: two blended into a nod. Kept as a deliberate accent — the head leans in as
+#: well as turning — but now well under the ~10 deg yaw so the turn dominates.
+SIDE_PITCH_DEG = 4.0
 SCRATCH_PITCH_DEG = 8.0
 HEAD_WIGGLE_DEG = 4.0
 PITCH_WIGGLE_DEG = 2.0
 BODY_WIGGLE_DEG = 2.5
 
-RECEPTIVE_ANTENNAS = (12.0, -12.0)
-CONTENTMENT_ANTENNAS = (17.0, -17.0)
+# Antisymmetric pairs draw the antennas TOGETHER: the right joint's sign is
+# mirrored from the left (reachy/motion/listen.py:154-157), hardware-verified
+# again on 2026-07-20 by holding (+12, -12) on the deployed robot. Amplitudes
+# raised from 12/17 after that check — the contraction was legible but
+# understated at 12 deg, and the ladder reads better with more range against
+# the 20 deg ANTENNA_LIMIT_DEG ceiling.
+RECEPTIVE_ANTENNAS = (15.0, -15.0)
+CONTENTMENT_ANTENNAS = (20.0, -20.0)
 WARNING_ANTENNAS = (-6.0, 6.0)
 DONE_ANTENNAS = (-10.0, -10.0)
 
@@ -187,9 +257,13 @@ class PetReaction:
             raise TypeError("sense.pat_state must be PatState")
 
         if state.availability != "available":
+            # `blocked` is this reaction's own motion closing the stillness gate
+            # — expected, and necessarily longer than a reader fault. Treating
+            # the two alike aborted the gesture mid-flight (see BLOCKED_GRACE_S).
+            grace = BLOCKED_GRACE_S if state.availability == "blocked" else SENSE_LOSS_GRACE_S
             if self._loss_started_at is None:
                 self._loss_started_at = t
-            elif t - self._loss_started_at >= SENSE_LOSS_GRACE_S:
+            elif t - self._loss_started_at >= grace:
                 self._begin_finish(t, "sensing_lost")
             return
 
@@ -221,8 +295,8 @@ class PetReaction:
         yaw = state.yaw_deg
         if yaw is None or not math.isfinite(yaw) or abs(yaw) <= YAW_DEADBAND_DEG:
             return
-        self._side_head_yaw = _clamp(yaw * SIDE_HEAD_GAIN, HEAD_YAW_LIMIT_DEG)
-        self._side_body_yaw = _clamp(yaw * SIDE_BODY_GAIN, BODY_YAW_LIMIT_DEG)
+        self._side_head_yaw = _clamp(yaw * SIDE_SEEK_SIGN * SIDE_HEAD_GAIN, HEAD_YAW_LIMIT_DEG)
+        self._side_body_yaw = _clamp(yaw * SIDE_SEEK_SIGN * SIDE_BODY_GAIN, BODY_YAW_LIMIT_DEG)
         self._direction_latched = True
 
     def _contact_target(self) -> Contribution:
@@ -309,5 +383,6 @@ __all__ = [
     "PAT_COOLDOWN_S",
     "PetReaction",
     "SENSE_LOSS_GRACE_S",
+    "BLOCKED_GRACE_S",
     "make_pet_reaction",
 ]

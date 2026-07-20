@@ -204,6 +204,15 @@ DEFAULT_LAG_TAU = 0.3
 #: commanded-vs-actual recording from the real robot (see issue #79): the
 #: viable band was hp_tau 0.5-0.8 x press 1.8-2.2, and (0.8, 2.0) sits centred
 #: in it (zero ghost fires on the recording, 6/6 synthetic pats detected).
+#:
+#: DELIBERATELY UNCHANGED at 0.8, and the one value a deployed box must not
+#: override downward. A box-local drop-in setting 0.08 silenced the pat sense
+#: entirely (2026-07-20): tau is a high-pass TIME CONSTANT, so 0.08 s passes
+#: only fast transients while a pet is a SUSTAINED push lasting ~0.5-2 s. The
+#: failure is quiet and easy to misread — the stillness gate opens normally and
+#: the detector simply never sees the press, so the journal shows a bare
+#: ``Pat level1!`` with no rule fire. Bisected on hardware: restoring 0.8 with
+#: every other value unchanged restored detection immediately.
 DEFAULT_HP_TAU = 0.8
 
 #: Runtime-tuned press/release thresholds (degrees) for the driver's DEFAULT
@@ -215,7 +224,14 @@ DEFAULT_HP_TAU = 0.8
 #: discriminator. Cost, stated plainly: very gentle pats (<~2 deg deflection)
 #: are missed; the hands-on tuning pass (issue #79 follow-up) refines with real
 #: pat data. Injected detectors (tests, listen-era callers) are unaffected.
-DEFAULT_PRESS_THRESHOLD = 0.5
+#:
+#: RAISED 0.5 -> 1.2 (2026-07-20), paired with the looser slow-window gate
+#: below. Sensing now happens inside the swing's slow window rather than at a
+#: dead stop, where the measured untouched residual is 0.70 deg (vs 0.07-0.11
+#: deg for a genuinely held head) and a pet peaks at 2.52 deg. 1.2 sits between
+#: them. This value and the gate are ONE operating point and must move together:
+#: the sensitive 0.5 belongs with a tight gate that only opens at a dead stop.
+DEFAULT_PRESS_THRESHOLD = 1.2
 DEFAULT_RELEASE_THRESHOLD = 0.2
 
 #: The STILLNESS GATE (issue #80). Detection runs only while the COMMANDED head
@@ -238,13 +254,28 @@ DEFAULT_RELEASE_THRESHOLD = 0.2
 #: sense, not a tuning knob: gating on it makes ghost fires structurally impossible
 #: while leaving a still robot fully pettable.
 #: Tolerance for "the commanded pose did not change" (degrees, per tick, per
-#: axis). A genuinely still command is EXACTLY constant, so this only needs to
-#: absorb float noise — it must stay well under the per-tick change of the idle
-#: wander (~0.03-0.06 deg/tick at 50 Hz), or the gate creeps open at the wander's
-#: turning points where velocity momentarily crosses zero while the plant is
-#: still ringing from the preceding swing.
-DEFAULT_STILL_EPS = 0.01
-DEFAULT_STILL_HOLD_S = 0.5  # commanded must be quiet this long before sensing
+#: axis) — really a per-tick VELOCITY threshold, so the gate opens after
+#: :data:`DEFAULT_STILL_HOLD_S` below it. It was always a sustained-SLOW gate;
+#: it merely looked like a stillness gate while the idle behaviour froze.
+#:
+#: RAISED 0.01 -> 0.035 and the hold 0.5 -> 1.0 (2026-07-20). The reasoning
+#: above this line was written for the FROZEN idle and inverts under v0.40.0's
+#: swinging ``feel-alive``: that commit measured the old 0.01 as opening the
+#: gate **0.0% of the time** under continuous motion at a 1.0 s hold, i.e. a
+#: robot that can never feel anything at all. It was deployed as a box-local
+#: systemd drop-in for months; shipping it makes a fresh box work unconfigured.
+#:
+#: 0.035 deg/tick sits inside the swing's decelerate-pause-accelerate window
+#: (~10-15% of the time) where the plant has stopped ringing. The old warning
+#: that this range "creeps open at the wander's turning points" was true of the
+#: WANDER, whose zero crossings are instantaneous; the swing's extremes hold a
+#: genuine ~3.4 s slow window, which is the whole point of #82. Measured there:
+#: untouched residual 0.70 deg vs petted 2.52 deg, hence the 1.2 press below.
+#:
+#: The longer 1.0 s hold is what buys the "plant has stopped ringing" part —
+#: shortening it back toward 0.5 s re-admits the ring at this looser tolerance.
+DEFAULT_STILL_EPS = 0.035
+DEFAULT_STILL_HOLD_S = 1.0  # commanded must be quiet this long before sensing
 
 #: Longest interval between logical observation ticks that can preserve an
 #: interaction. The 50 Hz engine normally supplies 0.02 s; ten missed ticks is
@@ -271,7 +302,12 @@ DEFAULT_WARMUP_S = 15.0
 CONTENTMENT_AFTER_S = 4.0
 WARNING_AFTER_S = 8.0
 ENOUGH_MAX_S = 12.0
-RELEASE_AFTER_S = 1.0
+#: RAISED 1.0 -> 2.5 (2026-07-20). Contact must survive the reaction's own blind
+#: window — the entry slew plus the 1.0 s gate re-arm — or a sustained pet dies
+#: and re-acquires as separate interactions instead of laddering receptive ->
+#: contentment (the t12 sustain bug). Must stay comfortably above
+#: DEFAULT_STILL_HOLD_S for that reason.
+RELEASE_AFTER_S = 2.5
 ENOUGH_COOLDOWN_S = 5.0
 _HEAD_AXES = ("x", "y", "z", "roll", "pitch", "yaw")
 
@@ -372,6 +408,9 @@ class PatSenseDriver:
         #: One contiguous unsafe observation interval. Interaction state is
         #: cleared exactly once when this opens; recovery only reseeds filters.
         self._gap_active = False
+        #: When the current gap opened, so a SUSPENDED interaction can charge
+        #: the blind stretch to its release budget on recovery.
+        self._gap_started_at: float | None = None
         self._state = UNAVAILABLE_PAT_STATE
         self._seen_press_at: float | None = None
         self._active_contact_s = 0.0
@@ -456,6 +495,16 @@ class PatSenseDriver:
         # ended, but its interaction was already cleared at entry.
         recovered_gap = self._gap_active
         self._gap_active = False
+        # A SUSPENDED interaction survived this gap (see `_begin_gap`). Charge the
+        # blind stretch to its release budget by measuring the quiet run from when
+        # the gap OPENED, not from now: the reaction's own ~1.24 s blind window
+        # stays comfortably inside the 2.5 s budget and keeps laddering, while a
+        # long blackout can no longer masquerade as a hand that never left.
+        if recovered_gap and self._state.contact and self._gap_started_at is not None:
+            if self._no_fresh_since is None or self._no_fresh_since > self._gap_started_at:
+                self._no_fresh_since = self._gap_started_at
+        if not recovered_gap:
+            self._gap_started_at = None
 
         # Policy time only advances across successful observations. A blocked
         # command or unavailable reader must never masquerade as contact time,
@@ -608,8 +657,70 @@ class PatSenseDriver:
             phase_started_at=now,
         )
 
+    def _suspend_interaction(self, availability: str) -> None:
+        """Pause a LIVE interaction across a gap without ending it.
+
+        The split from :meth:`_end_interaction` is the whole point: every
+        DETECTOR-level safety still fires, and only the PERSISTENT ladder is
+        preserved.
+
+        * ``detector.clear_interaction()`` still runs, so press edges either
+          side of a gap can never pair into a level2 that was never physically
+          sustained (the #66/#79 guarantee, and the reason a naive "just don't
+          clear anything" version of this fix broke nine safety tests).
+        * ``_active_contact_s`` and the phase survive, so a pet that spans the
+          reaction's own motion keeps laddering instead of restarting.
+        * ``_last_available_at = None`` freezes CONTACT accrual, so unobserved
+          blind time is never banked as contact time.
+        """
+        self.detector.clear_interaction()
+        self._seen_press_at = None
+        self._last_available_at = None
+        self._state = replace(self._state, availability=availability)
+
     def _begin_gap(self, availability: str, now: float | None) -> None:
-        """Open or update one unsafe interval without repeated clear churn."""
+        """Open or update one unsafe interval without repeated clear churn.
+
+        A gap means "cannot sense right now", which is NOT the same as "the
+        interaction is over". While contact is LIVE the ladder is therefore
+        SUSPENDED rather than cleared.
+
+        Why this matters (the sustain bug, 2026-07-20): admitting a reaction
+        immediately moves the head, which closes the stillness gate, which used
+        to land here and ``_end_interaction`` the very contact the reaction was
+        admitted for. A continuous pet was chopped into repeated level1s that
+        never laddered ``receptive`` -> ``contentment``, and the robot dropped
+        back to idle motion under the operator's still-moving hand.
+
+        Suspending is safe against the #66/#79 ghost class because reactions are
+        admitted on the one-tick ``pat_event`` latch, never on ``contact``.
+        Preserving contact keeps the PHASE ladder alive; it cannot manufacture a
+        new event, so it cannot self-retrigger.
+
+        Release is still charged real time across the gap (``_no_fresh_since`` is
+        deliberately NOT reset here), so letting go during a blind window still
+        ends the interaction. That knowingly departs from the "policy time only
+        advances across successful observations" rule for this one clock, in the
+        conservative direction — it can only end contact earlier, never invent
+        it — and the arithmetic has margin: the reaction's blind window is entry
+        slew + gate re-arm (~1.24 s) against a 2.5 s ``RELEASE_AFTER_S``.
+        """
+        # `enough` is the one live-contact phase that must still END here: it is
+        # the interaction deliberately concluding, and `_end_interaction` is what
+        # arms the lifecycle cooldown. Suspending it would drop that cooldown and
+        # let a robot that has had enough be re-engaged immediately.
+        if self._state.contact and self._state.phase != "enough":
+            # Entry only — suspending re-clears the DETECTOR, so doing it every
+            # blocked tick would be exactly the clear churn this method exists
+            # to avoid (and would reset the escalation guard repeatedly).
+            if not self._gap_active:
+                self._gap_started_at = now
+                self._suspend_interaction(availability)
+                self._gap_active = True
+                return
+            self._state = replace(self._state, availability=availability)
+            self._last_available_at = None
+            return
         if not self._gap_active:
             self._end_interaction(now, availability=availability)
             self._gap_active = True

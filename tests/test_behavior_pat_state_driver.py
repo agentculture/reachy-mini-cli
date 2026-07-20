@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from reachy.behavior.pat_sense import PatSenseDriver
+from reachy.behavior.pat_sense import RELEASE_AFTER_S, PatSenseDriver
 from reachy.behavior.sense import PatState
 from reachy.motion.pat import PatDetector, PatEvidence
 
@@ -219,7 +219,13 @@ def test_incomplete_command_is_blocked_before_reader() -> None:
     assert reader.calls == 0
 
 
-def test_fresh_contact_then_one_second_observed_silence_releases() -> None:
+def test_fresh_contact_then_release_budget_of_observed_silence_releases() -> None:
+    """Contact survives silence up to ``RELEASE_AFTER_S``, then releases on it.
+
+    Timed against the constant rather than a literal so the budget can be
+    retuned (1.0 -> 2.5 s in v0.41.0, so a sustained pet outlives the reaction's
+    own blind window) without silently invalidating this test.
+    """
     reader = _Reader()
     driver = _driver(reader)
 
@@ -236,19 +242,19 @@ def test_fresh_contact_then_one_second_observed_silence_releases() -> None:
     )
 
     _tick(driver, reader, T0 + 0.1, (0.0, 0.0))
-    still_contact = _tick(driver, reader, T0 + 0.99, (0.0, 0.0))
+    still_contact = _tick(driver, reader, T0 + RELEASE_AFTER_S - 0.01, (0.0, 0.0))
     assert still_contact.contact is True
     assert still_contact.phase == "receptive"
 
-    released = _tick(driver, reader, T0 + 1.0, (0.0, 0.0))
+    released = _tick(driver, reader, T0 + RELEASE_AFTER_S, (0.0, 0.0))
     assert released.availability == "available"
     assert released.contact is False
     assert released.phase == "released"
-    assert released.phase_started_at == pytest.approx(T0 + 1.0)
+    assert released.phase_started_at == pytest.approx(T0 + RELEASE_AFTER_S)
     assert released.last_press_at == T0
 
 
-def test_blocked_and_unavailable_gaps_end_interaction_without_claiming_release() -> None:
+def test_blocked_and_unavailable_gaps_suspend_then_bound_the_interaction() -> None:
     reader = _Reader()
     driver = _driver(reader, still_hold_s=0.5)
 
@@ -257,22 +263,28 @@ def test_blocked_and_unavailable_gaps_end_interaction_without_claiming_release()
     contact = _tick(driver, reader, T0 + 0.6, (0.0, -3.0))
     assert contact.contact is True
 
+    # A gap SUSPENDS a live interaction rather than ending it (2026-07-20 sustain
+    # fix): "cannot sense right now" is not "the human let go". Availability
+    # carries the uncertainty while contact and the phase are preserved.
     blocked = _tick(driver, reader, T0 + 2.0, None, head=_head(x=1.0))
     assert blocked.availability == "blocked"
-    assert blocked.contact is False
-    assert blocked.level is None
-    assert blocked.phase == "idle"
+    assert blocked.contact is True
+    assert blocked.phase == "receptive"
 
     _tick(driver, reader, T0 + 2.4, None, head=_head(x=1.0))
     unavailable = _tick(driver, reader, T0 + 2.5, None, head=_head(x=1.0))
     assert unavailable.availability == "unavailable"
-    assert unavailable.contact is False
-    assert unavailable.phase == "idle"
+    assert unavailable.contact is True
+    assert unavailable.phase == "receptive"
 
+    # ...but suspension is BOUNDED. On recovery the blind stretch is charged to
+    # the release budget from when the gap opened, so this ~18 s blackout cannot
+    # masquerade as a hand that never left. Short gaps (a reaction's own ~1.24 s
+    # blind window) stay inside the 2.5 s budget and keep laddering; this does not.
     recovered = _tick(driver, reader, T0 + 20.0, (0.0, 0.0), head=_head(x=1.0))
     assert recovered.availability == "available"
     assert recovered.contact is False
-    assert recovered.phase == "idle"
+    assert recovered.phase == "released"
 
 
 def test_contact_clock_drives_contentment_warning_enough_and_cooldown() -> None:
@@ -395,11 +407,15 @@ def test_input_gap_clears_interaction_once_on_entry_not_recovery() -> None:
     assert contact.contact is True
     assert detector.clear_calls == 0
 
+    # The SUBJECT of this test is the clear COUNT: the detector is cleared exactly
+    # once, on gap entry, and never again on repeat or on recovery. That is the
+    # escalation guard and it is unchanged. The interaction itself is suspended
+    # rather than ended (2026-07-20 sustain fix), so contact and phase survive a
+    # gap this short — 0.2 s, far inside the release budget.
     unavailable = _tick(driver, reader, T0 + 0.1, None)
     assert unavailable.availability == "unavailable"
-    assert unavailable.contact is False
-    assert unavailable.level is None
-    assert unavailable.phase == "idle"
+    assert unavailable.contact is True
+    assert unavailable.phase == "receptive"
     assert detector.clear_calls == 1
 
     repeated = _tick(driver, reader, T0 + 0.2, None)
@@ -408,8 +424,8 @@ def test_input_gap_clears_interaction_once_on_entry_not_recovery() -> None:
 
     recovered = _tick(driver, reader, T0 + 0.3, (0.0, 0.0))
     assert recovered.availability == "available"
-    assert recovered.contact is False
-    assert recovered.phase == "idle"
+    assert recovered.contact is True
+    assert recovered.phase == "receptive"
     assert detector.clear_calls == 1
 
 
@@ -485,9 +501,18 @@ def test_level1_cannot_escalate_across_a_detection_gap(gap_kind: str) -> None:
         gap_state = _tick(driver, reader, T0 + 1.0, None)
         recovered = _tick(driver, reader, T0 + 100.0, (-3.0, 0.0))
 
-    assert gap_state.contact is False
-    assert gap_state.level is None
-    assert gap_state.phase == "idle"
+    # NEW CONTRACT (2026-07-20 sustain fix): a gap SUSPENDS a live interaction
+    # instead of ending it — "cannot sense right now" is not "the human let go".
+    # Contact / level / phase are preserved and `availability` carries the
+    # uncertainty, so a reaction whose own motion closed the gate keeps holding
+    # instead of dropping back to idle under a still-moving hand.
+    assert gap_state.availability in {"blocked", "unavailable"}
+    assert gap_state.contact is True
+    assert gap_state.level == "level1"
+    assert gap_state.phase == "receptive"
+    # What must NOT survive a gap is ESCALATION, and that guarantee is untouched:
+    # the detector is still cleared, so press edges either side of the gap can
+    # never pair into a level2 that was never physically sustained.
     assert detector.clear_calls == 2
     assert driver.peek() is None
     assert recovered.level is None
@@ -579,3 +604,56 @@ def test_logical_clock_gap_ends_level1_once_before_current_sample() -> None:
     assert recovered.level is None
     assert detector._state == "idle"
     assert detector.clear_calls == 1
+
+
+def test_reaction_motion_does_not_end_the_pet_it_was_admitted_for() -> None:
+    """The sustain regression: a pet survives the reaction's own head motion.
+
+    Reproduces the 2026-07-20 field bug directly. Admitting a reaction moves the
+    head, which closes the stillness gate, which used to ``_end_interaction`` the
+    very contact that triggered it. A continuous scratch was chopped into repeated
+    level1s that never laddered past ``receptive``, and the robot dropped back to
+    idle motion under a still-moving hand.
+
+    Here the commanded pose moves for the length of a real entry slew, then holds,
+    exactly as ``pet_reaction`` drives it. Contact and the phase clock must both
+    survive, and the ladder must go on to reach ``contentment``.
+    """
+    reader = _Reader()
+    driver = _driver(reader, still_hold_s=0.5, enough_after_fn=lambda: 9.0)
+
+    # Earn the stillness gate first, then take a real press.
+    _tick(driver, reader, T0, (0.0, 0.0))
+    _tick(driver, reader, T0 + 0.5, (0.0, 0.0))
+    contact_at = T0 + 0.6
+    assert _tick(driver, reader, contact_at, (0.0, 3.0)).phase == "receptive"
+
+    # The reaction slews the head — commanded pose changes every tick, so the
+    # stillness gate is shut and nothing can be sensed.
+    for step in range(1, 13):
+        blind = _tick(
+            driver, reader, contact_at + step * 0.02, (0.0, 3.0), head=_head(yaw=step * 1.0)
+        )
+        assert blind.availability == "blocked"
+        assert blind.contact is True, "the reaction's own motion ended its pet"
+        assert blind.phase == "receptive"
+
+    # It then HOLDS the contact pose, so the gate re-earns its quiet window and
+    # sensing resumes with the interaction STILL ALIVE. A hand that keeps
+    # scratching supplies fresh press edges against that held pose, and the
+    # ladder goes on to reach contentment — unreachable before the fix, because
+    # the reaction's own motion restarted the clock every time.
+    held = _head(yaw=12.0)
+    state = None
+    for step in range(1, 30):
+        now = contact_at + 0.24 + step * 0.4
+        # Actuals are RELATIVE to the held commanded pose (yaw=12): 12.0 is the
+        # hand off, 15.0 is a fresh press. Using 0.0 here would read as a
+        # permanent -12 deg deviation, so the press edge would never re-arm.
+        _tick(driver, reader, now - 0.15, (0.0, 12.0), head=held)
+        state = _tick(driver, reader, now, (0.0, 15.0), head=held)
+        if state.phase == "contentment":
+            break
+    assert state is not None
+    assert state.phase == "contentment"
+    assert state.contact is True

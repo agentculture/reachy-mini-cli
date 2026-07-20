@@ -19,6 +19,9 @@ pytestmark = pytest.mark.offline
 
 DT = 0.02
 REACTION_PREFIX = "rule:pat-to-pet-reaction:"
+#: The react rule's cooldown, defined once and used both to build the rules
+#: config below and to assert the spacing between repeat admissions.
+RULE_COOLDOWN_S = 5.0
 
 
 class _TrackingSink:
@@ -112,7 +115,7 @@ class _StaticRules:
                         "id": "pat-to-pet-reaction",
                         "when": {"field": "pat", "op": "is_true"},
                         "run": "pet-reaction",
-                        "cooldown_s": 5.0,
+                        "cooldown_s": RULE_COOLDOWN_S,
                     }
                 ]
             }
@@ -169,10 +172,14 @@ def _run_side(
             baseline_alpha=0.0,
             level2_threshold_fn=lambda: 100.0,
         )
-        # `kwargs` already carries `still_hold_s`/`still_eps` from
-        # `_compose_run_seam` (t2's tuning surface) — with no env override that
-        # resolves to today's shipped default (0.5 / 0.01), same as this test
-        # relied on before, so no explicit override is needed here anymore.
+        # `kwargs` carries `still_hold_s`/`still_eps` from `_compose_run_seam`
+        # (t2's tuning surface). This test is about the REACTION chain and side
+        # direction, not about whichever gate tuning happens to ship, so pin the
+        # gate explicitly instead of inheriting it: the synthetic trace below is
+        # timed against a 0.5 s hold, and inheriting the v0.41.0 swing-era
+        # defaults (1.0 / 0.035) silently retimed it until nothing was admitted
+        # at all. Pinning keeps this test measuring what it names.
+        kwargs = {**kwargs, "still_hold_s": 0.5, "still_eps": 0.01}
         return RealPatSenseDriver(
             **kwargs,
             detector=detector,
@@ -241,7 +248,22 @@ def test_labelled_side_trace_reacts_holds_reacquires_and_completes(monkeypatch, 
     assert all(state["yaw_deg"] * sign > 0.0 for state in signed_states)
 
     rule_fires = [event for event in run.events if event.get("type") == "rule.fire"]
-    assert [event.get("behavior") for event in rule_fires] == ["pet-reaction"]
+    # Only pet-reaction is ever admitted, and repeat admissions are COOLDOWN-SPACED.
+    #
+    # This previously asserted exactly one fire, which was an artifact of the old
+    # SIDE_HEAD_GAIN: raising it lengthened the reaction's slew and shifted where
+    # the trace's continuing injected presses land, yielding a second legitimate
+    # admission inside these 19.2 s. Pinning the count made a gain change look
+    # like a regression. The cooldown is the actual contract, so assert that.
+    #
+    # This can never mask the #66 self-retrigger class: _MirroredPatReader tracks
+    # the commanded pose EXACTLY, so the robot's own reaction motion contributes
+    # zero deviation by construction. A runaway would also violate the spacing.
+    assert rule_fires, "the pat never admitted a reaction"
+    assert {event.get("behavior") for event in rule_fires} == {"pet-reaction"}
+    fire_times = [event["ts"] for event in rule_fires]
+    gaps = [later - earlier for earlier, later in zip(fire_times, fire_times[1:])]
+    assert all(gap >= RULE_COOLDOWN_S for gap in gaps), fire_times
 
     ownership = [tick["ownership"]["head"] for tick in run.ticks]
     reaction_ticks = [
@@ -252,8 +274,11 @@ def test_labelled_side_trace_reacts_holds_reacquires_and_completes(monkeypatch, 
     assert reaction_ticks
     reaction_poses = [run.targets[index] for index in reaction_ticks]
     settled = reaction_poses[40:]
-    assert max(pose["head"]["yaw"] * sign for pose in settled) > 2.0
-    assert max(pose["body_yaw"] * sign for pose in settled) > 1.0
+    # The SENSE carries the push direction (asserted above); the REACTION opposes
+    # it, pressing back toward the hand rather than following the shove. So the
+    # settled pose must land on the sign opposite the labelled trace's.
+    assert max(pose["head"]["yaw"] * -sign for pose in settled) > 2.0
+    assert max(pose["body_yaw"] * -sign for pose in settled) > 1.0
 
     states = [event.get("pat_state") for event in sense_events]
     phases = {state["phase"] for state in states if state is not None}
