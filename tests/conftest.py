@@ -73,6 +73,36 @@ def _offline_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPat
 
 
 @pytest.fixture(autouse=True)
+def _no_live_daemon_media_gate(monkeypatch: pytest.MonkeyPatch):
+    """No test may acquire or release the REAL robot's media subsystem.
+
+    ``HeldMediaClient`` gained a daemon readiness gate (t30): before constructing
+    its SDK client it probes ``GET /api/media/status`` and, when media is
+    released, takes it with ``POST /api/media/acquire`` — releasing it again on
+    ``close()``. That gate defaults to ``http://localhost:8000``, which on a
+    developer box or the robot itself is a LIVE daemon. Without this fixture,
+    running the suite would mutate real hardware state: every test that
+    constructs a holder would acquire the physical mic/camera, and a test that
+    crashed before ``close()`` would leave them held.
+
+    So the two HTTP seams are stubbed suite-wide to "daemon unreachable", which
+    the gate treats as absence of information and falls open on — i.e. every test
+    that does not care about the gate sees exactly the pre-t30 behavior.
+
+    Tests that DO exercise the gate re-patch these same two names with their own
+    fake daemon (``tests/test_robot_media_client.py``); a function-scoped
+    ``monkeypatch.setattr`` in the test body simply wins over this one, and both
+    are undone at teardown. The few tests that need the *real* helpers hold a
+    module-level reference captured at import time.
+    """
+    from reachy.robot import media_client as _media_client
+
+    monkeypatch.setattr(_media_client, "_get_json", lambda _url, _timeout: None)
+    monkeypatch.setattr(_media_client, "_post_ok", lambda _url, _timeout: False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_reachy_logging():
     """Never let one test's installed log handler outlive it.
 
