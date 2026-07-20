@@ -96,9 +96,10 @@ class Sense:
     (no mic, daemon error, or no sound). ``speech_detected`` is the daemon's
     speech-vs-any-sound flag for the same reading.
 
-    ``rms``, ``pat_event``, ``pat_state``, ``face``, and ``frame_available`` extend the
+    ``rms``, ``pat_event``, ``pat_state``, ``face``, ``frame_available``, and
+    ``transcript`` extend the
     snapshot with the folded-hook cues (mirroring ``listen``'s ``PatHook`` /
-    ``VisionHook`` / ``FaceHook``) so a future sensor-driven behavior can read
+    ``VisionHook`` / ``FaceHook`` / ``TranscribeHook``) so a future sensor-driven behavior can read
     them the same way it reads ``doa_angle`` today. Each has a "no reading"
     default so every existing bare or doa-only ``Sense(...)`` call site keeps
     constructing a valid, fully-populated snapshot with no code change:
@@ -119,6 +120,13 @@ class Sense:
       tick. A signal only — never the frame itself, so this module never
       needs to name a frame's concrete type (numpy/cv2) and stays a
       dependency-free leaf. Defaults ``False``.
+    - ``transcript`` — the WORDS of an addressed utterance heard this tick
+      (mirroring the retiring loop's ``feed_transcript(text)``), or ``None``
+      when nothing was heard or the utterance did not clear the engagement
+      gate. Delivered to exactly ONE snapshot by
+      :class:`reachy.behavior.transcript_sense.TranscriptSenseDriver`'s
+      one-tick latch, the same cadence ``pat_event`` uses — so it is a cue
+      ("this was just said"), never a standing value to poll.
     """
 
     doa_angle: float | None = None
@@ -128,6 +136,7 @@ class Sense:
     face: str | None = None
     frame_available: bool = False
     pat_state: PatState = UNAVAILABLE_PAT_STATE
+    transcript: str | None = None
 
 
 # The "no reading" snapshot — what behaviors get when nothing senses, the poll
@@ -209,6 +218,7 @@ PatEventProvider = Callable[[], tuple[str, str] | None]
 PatStateProvider = Callable[[], PatState | None]
 FaceProvider = Callable[[], str | None]
 FrameAvailableProvider = Callable[[], bool]
+TranscriptProvider = Callable[[], str | None]
 
 
 @dataclass(frozen=True)
@@ -232,6 +242,7 @@ class SenseProviders:
     face: FaceProvider | None = None
     frame_available: FrameAvailableProvider | None = None
     pat_state: PatStateProvider | None = None
+    transcript: TranscriptProvider | None = None
 
 
 #: Predicate-field names (the ``Predicate.field`` vocabulary validated against
@@ -329,6 +340,7 @@ def read_perception(
         face=_peek(providers.face, None),
         frame_available=bool(_peek(providers.frame_available, False)),
         pat_state=pat_state if isinstance(pat_state, PatState) else UNAVAILABLE_PAT_STATE,
+        transcript=_peek(providers.transcript, None),
     )
 
 

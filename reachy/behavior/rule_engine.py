@@ -117,6 +117,8 @@ def _field_present(sense: Sense, field: str) -> bool:
         return sense.pat_event is not None
     if field == "face":
         return sense.face is not None
+    if field == "transcript":
+        return sense.transcript is not None
     return False
 
 
@@ -129,6 +131,7 @@ def _field_value(sense: Sense, field: str):
         "pat": sense.pat_event,
         "face": sense.face,
         "frame_available": sense.frame_available,
+        "transcript": sense.transcript,
     }.get(field)
 
 
