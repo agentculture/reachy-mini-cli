@@ -126,9 +126,13 @@ SHIPPED_RULES_PACKAGE = "reachy.behavior"
 SHIPPED_RULES_RESOURCE = "default_rules.toml"
 
 #: The Sense-snapshot fields a predicate may test. Deliberately small and
-#: hand-picked to match the live perception fields the sense pipeline actually
-#: produces today — NOT a placeholder for every attribute a future engine
-#: might ever track.
+#: hand-picked to match the perception fields :mod:`reachy.behavior.sense`
+#: knows how to carry — NOT a placeholder for every attribute a future engine
+#: might ever track. This is the SCHEMA-ACCEPTED vocabulary only: a field
+#: being valid here does not mean the current engine composition feeds it a
+#: live reading. ``reachy.behavior.sense.FED_SENSE_FIELDS`` is the (usually
+#: smaller) subset actually wired today, and ``behavior rules check`` warns on
+#: any rule keyed outside it — see that module for why the two can differ.
 SENSE_FIELDS: frozenset[str] = frozenset({"doa", "speech", "rms", "pat", "face"})
 
 #: Ordered numeric comparators — require a numeric ``value``.
