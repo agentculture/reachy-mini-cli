@@ -50,6 +50,7 @@ from reachy import senselog
 from reachy.behavior import control, library, liveness, reload_driver
 from reachy.behavior import rules as rules_mod
 from reachy.behavior import supervisor
+from reachy.behavior.audio_pump import AudioPump
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.excited_motion_probe import CUES as PROBE_CUES
@@ -1367,42 +1368,51 @@ class _HolderKeeper:
 
 
 class _AudioTap:
-    """ONE mic read per tick, fanned out to every audio consumer.
+    """ONE pump take per tick, fanned out to every audio consumer.
 
-    ``HeldMediaClient.audio()`` is a CONSUMING read of the single-consumer media
-    subsystem: calling it twice in a tick would hand each consumer half the
-    audio. Two consumers need it — the ``rms`` provider (read at the START of the
-    tick, when perception is composed) and the transcript driver (which runs at
-    the END of the tick) — so composition, not either module, owns the fan-out.
+    ``AudioPump.take()`` is a CONSUMING swap of the pump's pending buffer:
+    calling it twice in a tick would hand each consumer half the audio. Two
+    consumers need it — the ``rms`` provider (read at the START of the tick,
+    when perception is composed) and the transcript driver (which runs at the
+    END of the tick) — so composition, not either module, owns the fan-out.
     This is the ``SenseSample`` pattern the folded ``listen`` loop already uses,
     restated for the engine's tick seam.
+
+    Since #100 the tap performs NO audio I/O of its own: acquisition lives on
+    the background :class:`~reachy.behavior.audio_pump.AudioPump` (the SDK's
+    appsink is a ``drop=True, max-buffers=500`` FIFO whose ``get_sample``
+    blocks up to 20 ms when empty — read at tick rate it serves seconds-stale
+    audio, and the block lands on the 20 ms tick budget). :meth:`pull` is a
+    latch swap of whatever the pump accumulated since last tick, returned as
+    one concatenated chunk.
 
     :meth:`pull` is called once per tick from the sense reader and is idempotent
     within a tick (guarded on the tick's clock value), so a second perception
     read in the same tick cannot steal a chunk. Both consumers then see the
     identical chunk via :meth:`audio`. Also duck-types ``samplerate`` /
-    ``channels`` so it can be injected wherever the media client itself would be
-    for an audio-only consumer.
+    ``channels`` (off the held media client) so it can be injected wherever the
+    media client itself would be for an audio-only consumer.
     """
 
-    def __init__(self, media) -> None:
+    def __init__(self, pump, media) -> None:
+        self._pump = pump
         self._media = media
         self._chunk = None
         self._pulled_at: float | None = None
 
     def pull(self, t: float | None = None) -> None:
-        """Read this tick's chunk once. Never raises — a fault is "no audio"."""
+        """Latch this tick's audio once. Never raises — a fault is "no audio"."""
         if t is not None and t == self._pulled_at:
             return
         self._pulled_at = t
         try:
-            self._chunk = self._media.audio()
-        except Exception as err:  # noqa: BLE001 — a read fault degrades to no audio
-            logger.debug("behavior: mic read raised (%s); no audio this tick", err)
+            self._chunk = self._pump.take()
+        except Exception as err:  # noqa: BLE001 — a take fault degrades to no audio
+            logger.debug("behavior: audio take raised (%s); no audio this tick", err)
             self._chunk = None
 
     def audio(self):
-        """This tick's mic chunk (or ``None``) — a non-consuming PEEK."""
+        """This tick's mic audio (or ``None``) — a non-consuming PEEK."""
         return self._chunk
 
     @property
@@ -1429,15 +1439,20 @@ class _RuntimeResources:
     The speech actuator is released BEFORE the sense drivers on purpose: it is
     the only piece that can still be mid-I/O when the loop ends, and its join is
     bounded, so draining it first keeps the shutdown ordering honest rather than
-    racing a half-played clip against a closing media client.
+    racing a half-played clip against a closing media client. The audio pump
+    (#100) closes after the drivers and BEFORE the media client it reads, so its
+    final guarded read still lands on a live-ish holder rather than a closed one.
     """
 
-    def __init__(self, *, pose_reader=None, media=None, drivers=(), keeper=None, speech=None):
+    def __init__(
+        self, *, pose_reader=None, media=None, drivers=(), keeper=None, speech=None, pump=None
+    ):
         self.pose_reader = pose_reader
         self.media = media
         self.drivers = tuple(driver for driver in drivers if driver is not None)
         self.keeper = keeper
         self.speech = speech
+        self.pump = pump
         self._closed = False
 
     def close(self) -> None:
@@ -1450,6 +1465,8 @@ class _RuntimeResources:
             self._release(self.speech.close, "speech actuator")
         for driver in self.drivers:
             self._release(driver.close, f"{type(driver).__name__}")
+        if self.pump is not None:
+            self._release(self.pump.close, "audio pump")
         if self.media is not None:
             self._release(self.media.close, "media client")
         if self.pose_reader is not None:
@@ -1544,13 +1561,24 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     against (:data:`reachy.behavior.sense.FED_SENSE_FIELDS`) moves in lockstep
     with this function — see that module's contract note.
 
-    ONE mic read per tick
-    ---------------------
-    ``rms`` and the transcript driver are two consumers of the SAME consuming
-    ``media.audio()`` read, so :class:`_AudioTap` pulls it ONCE at the top of the
-    tick (in ``sense_reader``) and both read that chunk. Neither module opens a
-    media source of its own; both take an injected one, and this is the only
-    place that decides there is exactly one.
+    Audio rides a background pump; the tick side is a latch (#100)
+    --------------------------------------------------------------
+    ALL mic acquisition lives on ONE :class:`~reachy.behavior.audio_pump.
+    AudioPump` — a background thread draining ``media.audio()`` at production
+    pace. The SDK's audio appsink is a ``drop=True, max-buffers=500`` FIFO
+    whose ``get_sample`` blocks up to 20 ms when empty: pulled once per tick
+    (the pre-#100 shape) it serves SECONDS-stale audio (live-verified: rule
+    fires the instant the #95 gate closed, STT transcribing the past) and puts
+    audio I/O on the 20 ms tick budget (#97's residual). The pump discards any
+    standing backlog before going live and is started HERE, after the media
+    warm-up, so its drain measures a real queue rather than a cold holder.
+
+    ``rms`` and the transcript driver are still two consumers of ONE consuming
+    read — now :meth:`AudioPump.take`, an O(1) latch swap — so
+    :class:`_AudioTap` takes it ONCE at the top of the tick (in
+    ``sense_reader``) and both read that concatenated chunk. Neither module
+    opens an audio source of its own; both take an injected one, and this is
+    the only place that decides there is exactly one.
 
     Held clients: warmed HERE, before the first tick
     ------------------------------------------------
@@ -1663,12 +1691,13 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         )
 
     # Everything below OPENS resources (two held SDK clients, two worker-owning
-    # drivers, the keeper thread). A raise part-way through would strand them:
-    # `cmd_engine_run` only closes what it was RETURNED, and an unclosed client
-    # hangs the process at interpreter exit — turning a clean structured failure
-    # into a wedged unit that `Restart=on-failure` never restarts. So the whole
-    # construction is guarded and releases what it opened before re-raising.
-    reader = media = transcript_driver = face_driver = keeper = speech = None
+    # drivers, the keeper thread, the audio pump thread). A raise part-way
+    # through would strand them: `cmd_engine_run` only closes what it was
+    # RETURNED, and an unclosed client hangs the process at interpreter exit —
+    # turning a clean structured failure into a wedged unit that
+    # `Restart=on-failure` never restarts. So the whole construction is guarded
+    # and releases what it opened before re-raising.
+    reader = media = transcript_driver = face_driver = keeper = speech = pump = None
     try:
         # The voice, first: built and STARTED here on the setup thread so no tick
         # ever pays for thread creation, and so a malformed REACHY_VOICE_ENGINE /
@@ -1706,8 +1735,11 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
 
         # The ONE media owner, and the two senses that read through it. Composed
         # unconditionally: both degrade to permanently-quiet without their extras.
+        # The pump is CONSTRUCTED here but started only after the media warm-up
+        # below, so its backlog drain measures a real appsink queue (#100).
         media = _make_media_client()
-        audio_tap = _AudioTap(media)
+        pump = AudioPump(media)
+        audio_tap = _AudioTap(pump, media)
         transcript_driver = TranscriptSenseDriver(
             media=audio_tap,  # the shared per-tick chunk, never a second mic read
             classifier=_engagement_classifier(),
@@ -1735,6 +1767,10 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         _warm_holder(media, label="media")
         keeper = _HolderKeeper([("state", reader), ("media", media)])
         keeper.start()
+        # Start the audio pump strictly AFTER the media warm-up: from here on the
+        # pump thread owns every `media.audio()` call, drains the appsink's
+        # standing backlog, and the tick thread only ever swaps its latch (#100).
+        pump.start()
 
         holder = LastPoseHolder()
         # The self-motion latch (#95): composed UNCONDITIONALLY (it reads only
@@ -1756,8 +1792,9 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         )
 
         def sense_reader(t):
-            # Take the tick's ONE mic read first, so the rms provider below and the
-            # transcript driver later in this same tick share the identical chunk.
+            # Take the tick's ONE audio latch swap first (no mic I/O — the pump
+            # owns that, #100), so the rms provider below and the transcript
+            # driver later in this same tick share the identical chunk.
             audio_tap.pull(t)
             # DoA (throttled by the poller) as the base; every other field is a
             # non-consuming peek of a driver's latch or held condition.
@@ -1804,6 +1841,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             drivers=(transcript_driver, face_driver),
             keeper=keeper,
             speech=speech,
+            pump=pump,
         )
     except BaseException:
         _RuntimeResources(
@@ -1812,6 +1850,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             drivers=(transcript_driver, face_driver),
             keeper=keeper,
             speech=speech,
+            pump=pump,
         ).close()
         raise
     return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), resources
