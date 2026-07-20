@@ -29,9 +29,10 @@ Admission is a SEAM, deliberately
 The gate is a plain injectable callable ``gate(sense, now, params) ->
 OrientTier``. It is not folded into :func:`plan_orient` and it is not an
 ``if sense.speech_detected`` buried in the middle of the behavior, because the
-admission decision is the part still being hardened: task **t9** ports the old
-flow's *latched-DoA guard* and plugs in here, wrapping or replacing
-:class:`CorroboratedGate` with no change to the geometry or the behavior.
+admission decision is the part still being hardened. Task **t9** used that seam
+exactly as intended: the shipped gate is now
+``LatchedDoaGuard(CorroboratedGate())`` — a pure NARROWING wrapper, with no
+change to the geometry, the behavior, or the inner gate's own verdicts.
 
 Why the default gate is a CONJUNCTION, not ``speech_detected``
 ---------------------------------------------------------------
@@ -67,12 +68,14 @@ cheapest first:
    corroboration available in the runtime, and it needs neither dwell nor
    loudness.
 
-The honest limits of that stopgap, stated rather than hidden: it is *energy plus
+The honest limits of that rule, stated rather than hidden: it is *energy plus
 steadiness*, so a loud steady non-speech source (a fan, music) can still open
-the SPEECH tier, and a genuinely frozen-but-plausible daemon angle inside a loud
-room would pass the dwell test. Closing those is precisely what t9's
-latched-DoA guard is for — it can see that the angle has not CHANGED at all,
-which is a different question from whether it is steady.
+the SPEECH tier. The other limit it named — a frozen-but-plausible daemon angle
+inside a loud room passing the dwell test — is closed by
+:class:`LatchedDoaGuard`, which asks the different question of whether the angle
+has CHANGED at all. Read that class's docstring for what it does and does not
+defend; notably, on the daemon build actually measured it never fires, and
+``rms`` remains the conjunct that keeps a quiet room still.
 
 Pure standard library plus in-package value types. No transport, no
 ``reachy_mini``, no :mod:`reachy.motion` import.
@@ -133,6 +136,7 @@ class OrientParams:
     rms_floor: float = 0.02  # the donor's ``sound_present`` floor (SnapDetector.min_rms)
     dwell_s: float = 0.6  # the bearing must hold this long before the head moves
     dwell_tol_rad: float = 0.12  # how far the bearing may move and still count as held
+    latch_after_s: float = 8.0  # a BIT-IDENTICAL bearing this long is a wedged feed
 
 
 #: The library entry's parameter names, in declaration order — every
@@ -382,6 +386,136 @@ class CorroboratedGate:
         return max(0.0, now - self._ref_since)
 
 
+class LatchedDoaGuard:
+    """Veto every tier while the bearing feed is FROZEN — the donor's guard, finished.
+
+    What the donor actually guarded
+    ===============================
+    :class:`reachy.motion.listen.ListenProducer` computed its liveness as::
+
+        live = sound_present if sound_present is not None else (angle is not None)
+
+    — "prefer the live mic floor; fall back to the (latched) angle only when
+    there is no audio path at all" — with ``sound_present`` being literally
+    ``rms > SnapDetector.min_rms`` (``_audio`` in
+    ``reachy.cli._commands.listen``). :class:`CorroboratedGate`'s first conjunct
+    IS that check, so the substance of the donor's latched-DoA guard is already
+    ported and this class does NOT re-implement it. (This port is also the
+    stricter of the two: the donor DEGRADED to the latched angle on an audio-less
+    profile, while the runtime refuses — there is always a mic here.)
+
+    The half a floor+dwell gate cannot reach
+    ========================================
+    Dwell asks "is the bearing STEADY"; a wedged feed is *maximally* steady, so
+    the dwell conjunct votes YES **because of** the fault. ``rms`` (the held
+    media client's mic) and ``doa_angle`` (the daemon's ``/api/state/doa`` route)
+    are independent sources, so a wedged DoA route inside a room with real sound
+    passes both of t8's conjuncts and parks the robot in a stuck stare — pointed
+    at a bearing that stopped meaning anything. This guard asks the different
+    question t8's docstring named: has the angle CHANGED at all?
+
+    Honest scope — a fault this daemon build does not produce
+    ---------------------------------------------------------
+    The measured at-rest feed
+    (``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 2) had
+    **35 distinct angles in 60 s**: the exact value changes constantly, so on the
+    build we can observe, this guard never fires and a test pins that. It is a
+    defence against a *different* state — a wedged pipeline, or another daemon
+    build that latches at rest the way the donor's docstring said the daemon
+    did. It is emphatically NOT what keeps a quiet room still; ``rms`` is. Stated
+    plainly because a guard nobody can trigger is easy to mistake for a guard
+    that is doing the work.
+
+    Mechanics: exact-value repetition, not tolerance. A bearing must be
+    BIT-IDENTICAL for ``latch_after_s`` before the veto engages, which is what
+    keeps "steady" (a talker holding still, jittering within the mic array's own
+    noise) distinct from "frozen". ``latch_after_s`` defaults well above
+    ``dwell_s`` deliberately: a false latch silences a working sense, so the
+    trade is biased toward a bounded stare over a bounded deafness.
+
+    O(1) per tick, deterministic under the injected ``now``, and never raises —
+    a raising or non-``OrientTier`` inner verdict resolves to
+    :data:`OrientTier.NONE`, matching :class:`CorroboratedGate`'s contract.
+    """
+
+    def __init__(
+        self,
+        inner: OrientGate | None = None,
+        *,
+        latch_after_s: float | None = None,
+    ) -> None:
+        self.inner: OrientGate = inner if inner is not None else CorroboratedGate()
+        self._latch_after_s = latch_after_s
+        self._angle: float | None = None
+        self._since = 0.0
+        self._latched = False
+
+    @property
+    def latched(self) -> bool:
+        """Whether the bearing feed is currently declared frozen."""
+        return self._latched
+
+    def __call__(self, sense: Sense, now: float, params: OrientParams) -> OrientTier:
+        try:
+            frozen = self._track(sense, now, params)
+        except Exception:  # noqa: BLE001 - an unreadable bearing must never steer or raise
+            self._reset()
+            return OrientTier.NONE
+        try:
+            tier = self.inner(sense, now, params)
+        except Exception:  # noqa: BLE001 - a raising inner gate means "no reading"
+            return OrientTier.NONE
+        if not isinstance(tier, OrientTier):
+            return OrientTier.NONE
+        return OrientTier.NONE if frozen else tier
+
+    def _track(self, sense: Sense, now: float, params: OrientParams) -> bool:
+        """Update the repetition tracker; return whether the feed reads as frozen."""
+        raw = getattr(sense, "doa_angle", None)
+        if raw is None:
+            self._reset(now)  # no bearing at all is not a frozen one
+            return False
+        angle = float(raw)
+        if not math.isfinite(angle):
+            self._reset(now)
+            return False
+        if self._angle is None or angle != self._angle:
+            self._release(angle, now)
+            return False
+        after = self._latch_after_s if self._latch_after_s is not None else params.latch_after_s
+        held = now - self._since
+        if held < after:
+            return False
+        if not self._latched:
+            self._latched = True
+            senselog.drop(
+                STAGE,
+                "doa",
+                "latch",
+                f"latched-doa bearing={angle:.3f}rad frozen_for={held:.1f}s",
+            )
+        return True
+
+    def _release(self, angle: float, now: float) -> None:
+        if self._latched:
+            senselog.stage(
+                STAGE,
+                "doa",
+                "latch",
+                f"released reason=latched-doa bearing={angle:.3f}rad",
+            )
+        self._angle = angle
+        self._since = now
+        self._latched = False
+
+    def _reset(self, now: float = 0.0) -> None:
+        if self._latched:
+            senselog.stage(STAGE, "doa", "latch", "released reason=latched-doa bearing=none")
+        self._angle = None
+        self._since = now
+        self._latched = False
+
+
 # --------------------------------------------------------------------------- #
 # The behavior — a sustained gaze goal                                        #
 # --------------------------------------------------------------------------- #
@@ -463,7 +597,7 @@ class OrientToSound:
     def __init__(self, params: OrientParams | None = None, *, gate: OrientGate | None = None):
         self._params = params if params is not None else OrientParams()
         self._explicit_params = params is not None
-        self._gate: OrientGate = gate if gate is not None else CorroboratedGate()
+        self._gate: OrientGate = gate if gate is not None else LatchedDoaGuard(CorroboratedGate())
         self._head = _Axis()
         self._body = _Axis()
         self._ant_r = _Axis()
@@ -651,6 +785,7 @@ __all__ = [
     "ANTENNA_LEAN_S",
     "CorroboratedGate",
     "HOME_EPS_DEG",
+    "LatchedDoaGuard",
     "OrientGate",
     "OrientParams",
     "OrientTarget",

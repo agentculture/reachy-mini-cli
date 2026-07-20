@@ -390,3 +390,110 @@ def test_explain_resolves_rules_paths(capsys) -> None:
         rc = main(["explain", *path])
         assert rc == 0
         capsys.readouterr()
+
+
+# --------------------------------------------------------------------------- #
+# behavior rules check — uncorroborated `speech` warnings                     #
+# (retire-the-old-ai-first-flow t9, acceptance criterion 2)                   #
+# --------------------------------------------------------------------------- #
+#
+# Measured on the deployed robot in a QUIET room with nobody speaking, 120
+# samples over 60 s (docs/verification/2026-07-20-retire-old-flow-baseline.md
+# section 2): `speech_detected` read True 55/120 = 45.8 % of the time, with the
+# bearing wandering the full 0.000-3.124 rad range. A rule keyed on it fires on
+# roughly a coin flip, pointed at nothing.
+#
+# A `Rule` carries exactly ONE `when` predicate (there is no conjunction in the
+# schema), so ANY rule whose `when.field` is "speech" is by construction keyed
+# on BARE `speech_detected` — the check needs no cross-predicate analysis.
+
+SPEECH_ONLY_TOML = """\
+[[react]]
+id = "r-speech"
+when = { field = "speech", op = "is_true" }
+run = "nod"
+duration_s = 5.0
+"""
+
+CORROBORATED_TOML = """\
+[[react]]
+id = "r-heard"
+when = { field = "transcript", op = "is_true" }
+run = "nod"
+duration_s = 5.0
+"""
+
+
+def test_rules_check_warns_on_a_rule_keyed_on_bare_speech(capsys) -> None:
+    _write_rules(SPEECH_ONLY_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0  # a warning, not a gate
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["reasons"] == []  # schema-valid; this is a LINT finding
+    assert len(payload["warnings"]) == 1
+    warning = payload["warnings"][0]
+    assert "r-speech" in warning
+    assert "speech" in warning
+    assert "45.8" in warning  # cites the measurement, not just an opinion
+    assert "corroborat" in warning  # names the requirement
+
+
+def test_the_uncorroborated_warning_names_a_corroborating_field(capsys) -> None:
+    _write_rules(SPEECH_ONLY_TOML)
+    main(["behavior", "rules", "check", "--json"])
+    warning = json.loads(capsys.readouterr().out)["warnings"][0]
+    assert any(f in warning for f in ("transcript", "rms"))
+
+
+def test_a_rule_keyed_on_a_corroborating_field_earns_no_such_warning(capsys) -> None:
+    _write_rules(CORROBORATED_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["warnings"] == []
+
+
+def test_rules_check_text_mode_surfaces_the_uncorroborated_warning(capsys) -> None:
+    _write_rules(SPEECH_ONLY_TOML)
+    assert main(["behavior", "rules", "check"]) == 0
+    out = capsys.readouterr().out
+    assert "r-speech" in out
+    assert "45.8" in out
+
+
+def test_an_inhibit_rule_keyed_on_bare_speech_is_flagged_too(capsys) -> None:
+    _write_rules("""\
+[[inhibit]]
+id = "i-speech"
+when = { field = "speech", op = "is_false" }
+disable = ["speak"]
+""")
+    main(["behavior", "rules", "check", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["warnings"]) == 1
+    assert "i-speech" in payload["warnings"][0]
+
+
+def test_no_shipped_rule_keys_on_an_uncorroborated_sense_field() -> None:
+    """Acceptance criterion 2, pinned where it is scoped.
+
+    The operator's own overlay only earns a WARNING (see the module note above
+    and ``_uncorroborated_field_warnings``' docstring for why refusal would be
+    the wrong trade on a boot-persistent robot). The SHIPPED layer is different:
+    it is ours, it lands on every robot on upgrade, and nobody is watching a
+    linter when it does — so it is enforced HARD, here, and a future task that
+    ships such a rule fails CI.
+    """
+    shipped = rules_mod.load_shipped_rules()
+    offenders = [
+        rule.id
+        for rule in (*shipped.react, *shipped.inhibit)
+        if rule.when.field in rules_mod.UNCORROBORATED_SENSE_FIELDS
+    ]
+    assert offenders == [], (
+        f"shipped rules {offenders} key on a bare uncorroborated sense field; "
+        "measured at 45.8% true in a quiet room — pair it with a corroborating "
+        "signal (transcript/rms/face/pat) instead"
+    )

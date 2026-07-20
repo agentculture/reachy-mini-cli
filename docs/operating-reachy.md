@@ -1012,7 +1012,11 @@ active_mode = "calm"
 
 [[react]]
 id = "orient-to-speech"
-when = { field = "speech", op = "is_true" }
+# NOT `speech` — that flag reads true 45.8% of the time in a quiet room with
+# nobody speaking, so a rule on it fires on a coin flip. `transcript` is an
+# utterance that already cleared the engagement gate. `behavior rules check`
+# warns on the bare-`speech` form.
+when = { field = "transcript", op = "is_true" }
 run = "gaze-hold"
 params = { yaw = 20.0, pitch = 5.0 }
 cooldown_s = 3.0
@@ -1294,6 +1298,37 @@ So the head only moves when the flag is corroborated by **sound energy**
 has held still for `dwell_s`; the deliberate turn additionally requires
 *words* that already cleared the engagement gate.
 
+The same measurement is enforced on the rules side: `behavior rules check`
+**warns** on any rule keyed on bare `speech` and names the 45.8 % figure plus
+the fields that do corroborate (`transcript`, `rms`, `pat`, `face`). It stays a
+warning rather than a refusal on purpose — rules are loaded by the
+boot-persistent runtime, so refusing one would turn an upgrade into a robot
+whose presence will not start. No *shipped* rule may key on it, and a test
+enforces that.
+
+**And a frozen bearing is refused outright.** "Steady" and "frozen" are
+different questions, and the dwell test above only answers the first — a wedged
+DoA feed is *maximally* steady, so dwell would vote yes because of the fault and
+park the robot in a stuck stare pointed at a bearing that stopped meaning
+anything. (`rms` comes from the mic, `doa` from the daemon's HTTP route, so one
+genuinely can wedge while the other stays live.) So a bearing that is
+bit-identical for `latch_after_s` (default 8 s) vetoes every tier until it moves
+again. Two caveats worth stating plainly: on the daemon build actually measured,
+the angle changes constantly (35 distinct values in a minute), so this guard
+**never fires there** — it defends a wedged pipeline, not a quiet room, and
+`rms` is what keeps a quiet room still. And because the guard needs time to
+observe "no change", a wedged feed can still hold the head for up to
+`latch_after_s` before the veto engages; the default is biased that way
+deliberately, since a false latch would silence a working sense.
+
+Both edges are greppable in the journal:
+
+```bash
+journalctl --user -u reachy-runtime -f | grep 'stage=orient'
+# [SENSE stage=orient source=doa event=tier] NONE->SPEECH bearing=1.082rad
+# [SENSE stage=orient source=doa event=latch] dropped reason=latched-doa bearing=1.082rad frozen_for=8.0s
+```
+
 **It yields like anything else.** `orient-to-sound` is an ordinary `stoppable`
 channel owner: a pat reaction admitted while it is turning takes the head,
 antennas and body immediately, and any `stopping`/`unstoppable` behavior
@@ -1428,7 +1463,11 @@ active_mode = "calm"
 
 [[react]]
 id = "orient-to-speech"
-when = { field = "speech", op = "is_true" }
+# NOT `speech` — that flag reads true 45.8% of the time in a quiet room with
+# nobody speaking, so a rule on it fires on a coin flip. `transcript` is an
+# utterance that already cleared the engagement gate. `behavior rules check`
+# warns on the bare-`speech` form.
+when = { field = "transcript", op = "is_true" }
 run = "gaze-hold"
 params = { yaw = 20.0, pitch = 5.0 }
 cooldown_s = 3.0

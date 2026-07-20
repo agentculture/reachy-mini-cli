@@ -31,6 +31,7 @@ from reachy.behavior.model import Contribution, Lifetime, StopClass
 from reachy.behavior.orient import (
     ANTENNA_LEAN_S,
     CorroboratedGate,
+    LatchedDoaGuard,
     OrientParams,
     OrientTier,
     OrientToSound,
@@ -601,3 +602,155 @@ def test_orienting_contributes_a_complete_head_offset() -> None:
     assert heads
     assert all(set(h) == {"x", "y", "z", "roll", "pitch", "yaw"} for h in heads)
     assert all(isinstance(c, Contribution) for c in contribs)
+
+
+# --------------------------------------------------------------------------- #
+# 4. The latched-DoA guard (task t9)                                          #
+# --------------------------------------------------------------------------- #
+#
+# t8's `CorroboratedGate` already carries the DONOR's actual latched-angle
+# defence: `live = sound_present if sound_present is not None else (angle is not
+# None)` in `ListenProducer.update` is exactly "prefer live mic energy over the
+# latched angle", and `sound_present` is literally `rms > SnapDetector.min_rms`
+# (`_audio` in `reachy/cli/_commands/listen.py`). The gate's `rms >= rms_floor`
+# conjunct IS that check.
+#
+# What t8 could NOT close, and named in its own docstring, is the case its dwell
+# conjunct actively REWARDS: a bearing that never changes is maximally "steady",
+# so a wedged DoA feed inside a loud room votes YES on both conjuncts and parks
+# the robot in a stuck stare. `rms` (the held media client's mic) and `doa_angle`
+# (the daemon's HTTP route) are independent sources, so one can wedge while the
+# other stays live. The guard below removes that perverse incentive.
+
+
+def _cycle(fn, angles, *, speech=True, rms=LOUD, dt=0.02, t0=0.0):
+    """Drive a gate over a sequence of bearings, returning each verdict."""
+    return [
+        fn(_sense(angle=a, speech=speech, rms=rms), t0 + i * dt, OrientParams())
+        for i, a in enumerate(angles)
+    ]
+
+
+def test_a_frozen_bearing_is_refused_even_though_energy_and_dwell_both_pass() -> None:
+    """The gap t8 named. A bit-identical angle is maximally steady, so dwell
+    votes YES *because* of the fault; the guard must veto it anyway."""
+    params = OrientParams()
+    inner = CorroboratedGate()
+    guarded = LatchedDoaGuard(CorroboratedGate())
+    sense = _sense(angle=1.082, speech=True, rms=LOUD)
+    ticks = int((params.latch_after_s + 1.0) / 0.02)
+
+    inner_verdicts = [inner(sense, i * 0.02, params) for i in range(ticks)]
+    guarded_verdicts = [guarded(sense, i * 0.02, params) for i in range(ticks)]
+
+    assert OrientTier.SPEECH in inner_verdicts, "precondition: the inner gate admits"
+    assert guarded_verdicts[-1] is OrientTier.NONE
+    assert all(v is OrientTier.NONE for v in guarded_verdicts[-10:])
+
+
+def test_the_guard_never_weakens_the_inner_gate() -> None:
+    """Wrapping must be a pure narrowing: whatever the inner gate refuses stays
+    refused, and no tier is ever raised."""
+    params = OrientParams()
+    inner = CorroboratedGate()
+    guarded = LatchedDoaGuard(CorroboratedGate())
+    angles = [0.3 + 0.05 * i for i in range(200)]  # never latches
+    for i, angle in enumerate(angles):
+        sense = _sense(angle=angle, speech=True, rms=QUIET)  # quiet: inner says NONE
+        assert inner(sense, i * 0.02, params) is OrientTier.NONE
+        assert guarded(sense, i * 0.02, params) is OrientTier.NONE
+
+
+def test_a_steady_bearing_that_still_jitters_is_not_latched() -> None:
+    """Steady is not frozen — the distinction the whole guard turns on. A real
+    talker holds a bearing within the dwell tolerance while the mic array's own
+    noise keeps the exact value moving, so admission must survive."""
+    guarded = LatchedDoaGuard(CorroboratedGate())
+    # ±0.005 rad of jitter: far inside dwell_tol_rad (0.12), never bit-identical.
+    angles = [1.05 + 0.005 * ((i % 3) - 1) for i in range(int(30.0 / 0.02))]
+    verdicts = _cycle(guarded, angles)
+    assert verdicts[-1] is OrientTier.SPEECH
+    assert all(v is not OrientTier.NONE for v in verdicts[-100:])
+
+
+def test_the_measured_at_rest_trace_never_latches_this_guard() -> None:
+    """The honesty test, and the reason this guard is small.
+
+    The measured at-rest feed (120 samples / 60 s, quiet room —
+    ``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 2)
+    showed **35 distinct angles**: the exact value changes constantly, so on the
+    daemon build we can actually observe, this guard NEVER fires. It defends a
+    wedged feed, which is a state this build does not currently produce. Said
+    plainly here rather than hidden, so nobody mistakes it for the thing that
+    keeps a quiet room still — ``rms`` is what does that.
+    """
+    guarded = LatchedDoaGuard(CorroboratedGate())
+    # 35 distinct values spanning the measured 0.000-3.124 rad range, cycled at
+    # the DoA poll rate (5 Hz) across a multi-minute window.
+    distinct = [3.124 * i / 34.0 for i in range(35)]
+    angles = [distinct[(i // 10) % 35] for i in range(int(180.0 / 0.02))]
+    verdicts = _cycle(guarded, angles)
+    assert all(v is not OrientTier.NONE for v in verdicts if v is not None)
+    assert not guarded.latched
+
+
+def test_a_missing_bearing_clears_the_latch_rather_than_holding_it() -> None:
+    params = OrientParams()
+    guarded = LatchedDoaGuard(CorroboratedGate())
+    sense = _sense(angle=1.082, speech=True, rms=LOUD)
+    for i in range(int((params.latch_after_s + 1.0) / 0.02)):
+        guarded(sense, i * 0.02, params)
+    assert guarded.latched
+    guarded(_sense(angle=None, rms=LOUD), 100.0, params)
+    assert not guarded.latched
+
+
+def test_a_raising_inner_gate_leaves_the_robot_still_rather_than_killing_the_tick() -> None:
+    def boom(sense, now, params):
+        raise RuntimeError("inner gate on fire")
+
+    guarded = LatchedDoaGuard(boom)
+    verdicts = _cycle(guarded, [0.1 * i for i in range(20)])
+    assert all(v is OrientTier.NONE for v in verdicts)
+
+
+def test_a_non_tier_inner_verdict_is_treated_as_no_reading() -> None:
+    guarded = LatchedDoaGuard(lambda sense, now, params: "SPEECH")
+    assert guarded(_sense(angle=0.5, rms=LOUD), 0.0, OrientParams()) is OrientTier.NONE
+
+
+def test_the_latch_is_logged_on_entry_and_release_and_never_per_tick(caplog) -> None:
+    """A 50 Hz guard that logged every latched tick would bury the journal, and
+    a latch that logged nothing would be the silent no-op the senselog
+    discipline exists to prevent. Exactly one line per EDGE."""
+    params = OrientParams()
+    guarded = LatchedDoaGuard(CorroboratedGate())
+    sense = _sense(angle=1.082, speech=True, rms=LOUD)
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        for i in range(int((params.latch_after_s + 4.0) / 0.02)):
+            guarded(sense, i * 0.02, params)
+        latched_lines = [r for r in caplog.records if "latched-doa" in r.getMessage()]
+        assert len(latched_lines) == 1
+        assert "reason=latched-doa" in latched_lines[0].getMessage()
+        assert "stage=orient" in latched_lines[0].getMessage()
+        caplog.clear()
+        guarded(_sense(angle=2.0, speech=True, rms=LOUD), 100.0, params)
+    released = [r for r in caplog.records if "latched-doa" in r.getMessage()]
+    assert len(released) == 1
+    assert "released" in released[0].getMessage()
+
+
+def test_the_shipped_gate_is_the_guard_wrapping_the_corroborated_gate() -> None:
+    """The guard must actually SHIP — a defence wired into nothing is a note."""
+    fn = make_orient_to_sound()
+    gate = fn._gate  # noqa: SLF001 - pinning the composed default is the point
+    assert isinstance(gate, LatchedDoaGuard)
+    assert isinstance(gate.inner, CorroboratedGate)
+
+
+def test_a_frozen_bearing_never_reaches_the_head_through_the_shipped_behavior() -> None:
+    """End to end: the wedged-feed stuck-stare the guard exists to prevent."""
+    fn = make_orient_to_sound()
+    sense = _sense(angle=0.0, speech=True, rms=LOUD)
+    contribs = [fn(i * 0.02, {}, sense) for i in range(int(40.0 / 0.02))]
+    assert all(c.head is None for c in contribs[-200:])

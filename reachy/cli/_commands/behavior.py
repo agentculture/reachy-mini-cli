@@ -540,6 +540,60 @@ def _unfed_field_warnings(config: rules_mod.RulesConfig) -> list[str]:
     return warnings
 
 
+def _uncorroborated_field_warnings(config: rules_mod.RulesConfig) -> list[str]:
+    """Warn on every rule keyed on a sense field too noisy to stand alone.
+
+    The sibling of ``_unfed_field_warnings``, and the same class of finding: a
+    rule that is schema-valid and yet empirically wrong. Where that one catches
+    a predicate that can NEVER fire, this catches one that fires far too OFTEN —
+    ``speech_detected`` measured true 45.8 % of the time in a quiet room with
+    nobody speaking, with an uncorrelated bearing
+    (``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 2).
+    ``reachy.behavior.rules.UNCORROBORATED_SENSE_FIELDS`` is the one declared
+    source of truth this reads.
+
+    Why a WARNING and not a fail-closed refusal
+    ===========================================
+    The repo's refusal precedent (``goto_intent``'s out-of-range axis, a react
+    rule's unbounded looping lifetime) covers defects with a RUNAWAY actuator an
+    operator cannot recover from — the incident behind the bounded-lifetime rule
+    was a head that oscillated until stopped by hand. This is not that: a
+    ``speech``-keyed rule is already bounded twice over, by ``cooldown_s`` on
+    firing rate and by the ``duration_s`` the lifetime invariant forces onto any
+    looping behavior. The failure is a nuisance, not a runaway.
+
+    Against that, a load-time refusal would be actively unsafe HERE: rules are
+    loaded by the boot-persistent runtime, so shipping one would turn an
+    upgrade into a robot whose presence refuses to start over a rule that had
+    been working — failing closed on the whole presence to fix a noisy
+    predicate. And because a rule carries exactly one predicate, refusal would
+    be indistinguishable from removing ``speech`` from
+    ``reachy.behavior.rules.SENSE_FIELDS``; that is a product decision to take
+    deliberately, not a side effect of a lint.
+
+    The SHIPPED layer gets the hard treatment instead, where it belongs — it is
+    ours, it reaches every robot on upgrade, and no one runs a linter when it
+    does. ``tests/test_behavior_rules_cli.py`` pins it, so a future task that
+    ships such a rule fails CI rather than a deployment.
+    """
+    warnings: list[str] = []
+    sections = ((rules_mod.KIND_REACT, config.react), (rules_mod.KIND_INHIBIT, config.inhibit))
+    for kind, rules in sections:
+        for index, rule in enumerate(rules):
+            field = rule.when.field
+            if field not in rules_mod.UNCORROBORATED_SENSE_FIELDS:
+                continue
+            warnings.append(
+                f"{kind}[{index}] (id={rule.id!r}) is keyed on bare sense field {field!r}, "
+                f"which measured true {rules_mod.UNCORROBORATED_AT_REST_RATE} at rest — "
+                "this rule will validate cleanly and then fire on roughly a coin flip. "
+                "A rule carries exactly one predicate, so pair it with a corroborating "
+                "signal instead by keying on one of: "
+                f"{', '.join(rules_mod.CORROBORATING_SENSE_FIELDS)}"
+            )
+    return warnings
+
+
 def _rules_check_payload(
     path: Path, *, reader: Callable[[Path], str] | None = None
 ) -> dict[str, object]:
@@ -589,7 +643,7 @@ def _rules_check_payload(
             "reasons": [err.message],
             "warnings": [],
         }
-    warnings = _unfed_field_warnings(config)
+    warnings = _unfed_field_warnings(config) + _uncorroborated_field_warnings(config)
     return {
         "ok": not warnings,
         "path": str(path),
@@ -639,6 +693,9 @@ def cmd_rules_overview(args: argparse.Namespace) -> int:
                     "still exits 0; only an unreadable path is a clean exit-2",
                     "'rules check' also warns (ok=false, exit 0) on a rule keyed to a "
                     "sense field nothing currently feeds — it validates but can never fire",
+                    "'rules check' likewise warns on a rule keyed on bare 'speech', which "
+                    "measured 45.8% true in a quiet room — pair it with a corroborating "
+                    "signal (transcript/rms/pat/face) instead",
                 ],
             },
         ],
