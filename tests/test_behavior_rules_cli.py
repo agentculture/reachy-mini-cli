@@ -40,7 +40,7 @@ duration_s = 30.0
 
 [[inhibit]]
 id = "i1"
-when = { field = "rms", op = "gt", value = 0.5 }
+when = { field = "doa", op = "gt", value = 0.5 }
 disable = ["speak"]
 
 [modes.calm]
@@ -169,6 +169,7 @@ def test_rules_check_missing_file_ok_true_json(capsys) -> None:
     assert payload["ok"] is True
     assert payload["exists"] is False
     assert payload["reasons"] == []
+    assert payload["warnings"] == []
     assert payload["counts"] == {"react": 0, "inhibit": 0, "modes": 0}
 
 
@@ -180,6 +181,7 @@ def test_rules_check_valid_file_ok_true_with_counts(capsys) -> None:
     assert payload["ok"] is True
     assert payload["exists"] is True
     assert payload["reasons"] == []
+    assert payload["warnings"] == []
     assert payload["counts"] == {"react": 1, "inhibit": 1, "modes": 1}
 
 
@@ -193,6 +195,7 @@ def test_rules_check_malformed_file_still_exits_zero(capsys) -> None:
     assert len(payload["reasons"]) == 1
     assert "mystery" in payload["reasons"][0]
     assert "another_bad" in payload["reasons"][0]
+    assert payload["warnings"] == []
     assert "counts" not in payload
 
 
@@ -202,6 +205,97 @@ def test_rules_check_malformed_file_text_mode_still_exits_zero(capsys) -> None:
     assert rc == 0
     out = capsys.readouterr().out
     assert "mystery" in out or "false" in out.lower() or "ok" in out.lower()
+
+
+# --------------------------------------------------------------------------- #
+# behavior rules check — unfed sense-field warnings (t16, issue: silent no-op #
+# rules that validate cleanly but can never fire)                            #
+# --------------------------------------------------------------------------- #
+
+# `rms` is a schema-valid predicate field (reachy.behavior.rules.SENSE_FIELDS)
+# but no provider feeds it in the current engine composition
+# (reachy.behavior.sense.FED_SENSE_FIELDS) — this rule validates cleanly and
+# then can never fire.
+UNFED_FIELD_TOML = """\
+[[inhibit]]
+id = "i-rms"
+when = { field = "rms", op = "gt", value = 0.5 }
+disable = ["speak"]
+"""
+
+# `doa` IS fed (the base DoA/speech leg is unconditional) — a control fixture
+# proving a rule on a fed field never warns.
+FED_FIELD_TOML = """\
+[[react]]
+id = "r-doa"
+when = { field = "doa", op = "is_true" }
+run = "nod"
+duration_s = 5.0
+"""
+
+# One rule on a fed field ("doa") and one on an unfed field ("face") in the
+# same file — only the unfed one should be reported.
+MIXED_FIELD_TOML = """\
+[[react]]
+id = "r-doa"
+when = { field = "doa", op = "is_true" }
+run = "nod"
+duration_s = 5.0
+
+[[inhibit]]
+id = "i-face"
+when = { field = "face", op = "eq", value = "Ada" }
+disable = ["speak"]
+"""
+
+
+def test_rules_check_warns_on_a_rule_keyed_to_an_unfed_field_json(capsys) -> None:
+    _write_rules(UNFED_FIELD_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0  # a warning, not a failure
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False  # mirrors 'think expressions check': ok := no warnings
+    assert payload["reasons"] == []  # not a schema/validation error
+    assert len(payload["warnings"]) == 1
+    warning = payload["warnings"][0]
+    # names the field ...
+    assert "rms" in warning
+    # ... and the offending rule ...
+    assert "i-rms" in warning
+    # ... and WHY it cannot fire.
+    assert "never fire" in warning or "cannot fire" in warning
+    # the file itself is still perfectly valid TOML/schema — counts are present.
+    assert payload["counts"] == {"react": 0, "inhibit": 1, "modes": 0}
+
+
+def test_rules_check_warns_on_a_rule_keyed_to_an_unfed_field_text_mode(capsys) -> None:
+    _write_rules(UNFED_FIELD_TOML)
+    rc = main(["behavior", "rules", "check"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "rms" in out
+    assert "i-rms" in out
+
+
+def test_rules_check_a_rule_on_a_fed_field_never_warns(capsys) -> None:
+    _write_rules(FED_FIELD_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["warnings"] == []
+
+
+def test_rules_check_only_the_unfed_rule_is_flagged_in_a_mixed_file(capsys) -> None:
+    _write_rules(MIXED_FIELD_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert len(payload["warnings"]) == 1
+    assert "face" in payload["warnings"][0]
+    assert "i-face" in payload["warnings"][0]
+    assert "r-doa" not in payload["warnings"][0]
 
 
 def test_rules_check_payload_unreadable_path_raises_env_error(tmp_path) -> None:

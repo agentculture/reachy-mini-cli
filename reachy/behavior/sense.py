@@ -234,6 +234,53 @@ class SenseProviders:
     pat_state: PatStateProvider | None = None
 
 
+#: Predicate-field names (the ``Predicate.field`` vocabulary validated against
+#: ``reachy.behavior.rules.SENSE_FIELDS``) that the base DoA/speech leg feeds
+#: UNCONDITIONALLY. Every composition builds a :class:`DoaPoller` regardless of
+#: which optional :class:`SenseProviders` fields it wires (see
+#: :func:`read_perception`'s ``base`` argument) — a mic-less box degrades the
+#: *reading* to "no reading", never the *wiring* to "no provider" — so these
+#: two never depend on any ``SenseProviders`` field being set.
+_ALWAYS_FED_FIELDS: frozenset[str] = frozenset({"doa", "speech"})
+
+#: Maps each optional :class:`SenseProviders` attribute to the predicate-field
+#: name it feeds once a real callable is wired into it.
+_PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
+    "rms": "rms",
+    "pat_event": "pat",
+    "face": "face",
+    "frame_available": "frame_available",
+}
+
+#: Which of the optional :class:`SenseProviders` attributes the CURRENT engine
+#: composition (``_compose_run_seam`` in ``reachy.cli._commands.behavior``)
+#: actually wires a live provider for. Today only ``pat_event``/``pat_state``
+#: (the folded pat-sense driver) are ever passed a real callable there —
+#: ``rms``/``face``/``frame_available`` have no provider yet, so nothing feeds
+#: them.
+#:
+#: THIS SET IS THE ONE DECLARED SOURCE OF TRUTH ``behavior rules check``
+#: (``reachy.cli._commands.behavior._unfed_field_warnings``) reads to warn on a
+#: rule predicate keyed to a sense field nothing feeds. A predicate field can
+#: be a valid, schema-accepted ``rules.toml`` value (see
+#: ``reachy.behavior.rules.SENSE_FIELDS``) while still being unfed here — that
+#: gap is exactly what the check surfaces. When a future composition wires a
+#: new provider (e.g. rms/face/frame_available/transcript), add its predicate
+#: field to :data:`FED_SENSE_FIELDS` (via this set, or directly) in the SAME
+#: change that wires the provider — this is the only place that needs
+#: updating; nothing else duplicates this list, so the check can never drift
+#: from reality by forgetting a second copy.
+_COMPOSED_PROVIDER_FIELDS: frozenset[str] = frozenset({"pat_event"})
+
+#: The full set of predicate fields (``Predicate.field`` values) the current
+#: composition feeds a live reading for. A predicate keyed on any field
+#: outside this set will validate cleanly (it is schema-valid) and then
+#: silently never fire — see ``behavior rules check``'s unfed-field warning.
+FED_SENSE_FIELDS: frozenset[str] = _ALWAYS_FED_FIELDS | frozenset(
+    _PROVIDER_PREDICATE_FIELDS[name] for name in _COMPOSED_PROVIDER_FIELDS
+)
+
+
 #: A :class:`SenseProviders` with every field unset — "no providers wired".
 #: Plays the same role for providers that :data:`EMPTY_SENSE` plays for
 #: readings: ``read_perception(NO_PROVIDERS)`` always returns a snapshot with

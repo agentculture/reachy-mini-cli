@@ -483,7 +483,11 @@ the daemon's smooth minjerk `goto` planner.
   the file directly — no running engine needed.
 - `reachy-mini-cli behavior rules check` — validate `rules.toml` as a linter:
   a malformed file reports `ok=false` with reasons but still exits 0; only an
-  unreadable path (permissions, a vanished mount, ...) is a clean exit-2.
+  unreadable path (permissions, a vanished mount, ...) is a clean exit-2. Also
+  warns (`ok=false`, still exit 0) on any rule keyed to a sense field nothing
+  in the current composition feeds (see `reachy.behavior.sense
+  .FED_SENSE_FIELDS`) — such a rule validates cleanly and then silently never
+  fires, so the linter names the field, the rule, and why.
 - `reachy-mini-cli behavior expressions` (alias `expressions list`) — list the
   expression pose catalog, each emoji with a generated pose descriptor (see
   "Expressions" below).

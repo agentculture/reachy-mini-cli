@@ -75,7 +75,13 @@ from reachy.behavior.pose_feed import LastPoseHolder
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
-from reachy.behavior.sense import DoaPoller, SenseProviders, read_doa, read_perception
+from reachy.behavior.sense import (
+    FED_SENSE_FIELDS,
+    DoaPoller,
+    SenseProviders,
+    read_doa,
+    read_perception,
+)
 from reachy.behavior.tick_metrics import TickMetrics, budget_from_hz
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
@@ -484,10 +490,45 @@ def cmd_rules_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _unfed_field_warnings(config: rules_mod.RulesConfig) -> list[str]:
+    """Warn on every rule predicate keyed to a sense field nothing feeds.
+
+    ``reachy.behavior.rules.SENSE_FIELDS`` accepts more predicate fields than
+    the current engine composition (``_compose_run_seam``, above) actually
+    wires a live provider for — see
+    ``reachy.behavior.sense.FED_SENSE_FIELDS``, the one declared source of
+    truth this function reads. A rule keyed on a field outside that set
+    validates cleanly (the schema only checks the field NAME is a known one)
+    and then silently never fires — exactly the class of silent no-op
+    ``reachy.senselog``'s "a drop always names its reason" discipline exists
+    to prevent. This is a LINT finding, not a validation failure: the rule is
+    well-formed, just currently inert, so it is reported as a warning (see
+    ``cmd_rules_check``) and never a reason to reject the file.
+
+    Checks both react and inhibit rules, in file order, so an operator sees
+    every offending rule at once rather than one-at-a-time across repeated
+    edits.
+    """
+    warnings: list[str] = []
+    sections = ((rules_mod.KIND_REACT, config.react), (rules_mod.KIND_INHIBIT, config.inhibit))
+    for kind, rules in sections:
+        for index, rule in enumerate(rules):
+            field = rule.when.field
+            if field in FED_SENSE_FIELDS:
+                continue
+            warnings.append(
+                f"{kind}[{index}] (id={rule.id!r}) is keyed on sense field {field!r}, but "
+                "nothing in the current composition feeds it — this rule will validate "
+                "cleanly but can never fire (fields currently fed: "
+                f"{', '.join(sorted(FED_SENSE_FIELDS))})"
+            )
+    return warnings
+
+
 def _rules_check_payload(
     path: Path, *, reader: Callable[[Path], str] | None = None
 ) -> dict[str, object]:
-    """Validate *path*; returns ``{ok, path, exists, reasons, counts}`` — a report.
+    """Validate *path*; returns ``{ok, path, exists, reasons, warnings, counts}``.
 
     Mirrors ``think expressions check``'s exit-0-warnings idiom: a malformed or
     missing rules file is a CONTENT problem, not an I/O failure — missing
@@ -499,6 +540,14 @@ def _rules_check_payload(
     — this is a linter, not a gate, so content issues never abort the command,
     but the file being physically unreadable is an environment fact, not a
     content one.
+
+    ``warnings`` (t16) additively reports every rule keyed to a sense field
+    nothing currently feeds (see ``_unfed_field_warnings``) — a rule can be
+    schema-valid (``reasons`` empty) yet still earn a warning, since "well
+    formed" and "wired to something live" are different questions. ``ok`` folds
+    BOTH signals, mirroring ``think expressions check``'s ``ok = not flagged``:
+    ``True`` only when the file is both valid and every predicate is fed. This
+    never changes the exit code — a warning is a warning, not a gate.
 
     ``reader`` is an injection seam for tests (default: ``Path.read_text``) so
     an I/O failure can be simulated deterministically with no OS-level
@@ -518,12 +567,20 @@ def _rules_check_payload(
     try:
         config = rules_mod.load_rules(path)
     except CliError as err:
-        return {"ok": False, "path": str(path), "exists": exists, "reasons": [err.message]}
+        return {
+            "ok": False,
+            "path": str(path),
+            "exists": exists,
+            "reasons": [err.message],
+            "warnings": [],
+        }
+    warnings = _unfed_field_warnings(config)
     return {
-        "ok": True,
+        "ok": not warnings,
         "path": str(path),
         "exists": exists,
         "reasons": [],
+        "warnings": warnings,
         "counts": {
             "react": len(config.react),
             "inhibit": len(config.inhibit),
@@ -533,10 +590,10 @@ def _rules_check_payload(
 
 
 def cmd_rules_check(args: argparse.Namespace) -> int:
-    """Lint ``rules.toml``: a malformed file reports ``ok=False`` but still exits 0
-    (a warning, not a gate — mirrors ``think expressions check``). Only an actual
-    I/O failure on an existing path is a clean exit-2 (via ``CliError``, handled
-    by ``_dispatch``).
+    """Lint ``rules.toml``: a malformed file, or a rule keyed to a sense field
+    nothing feeds, reports ``ok=False`` but still exits 0 (a warning, not a gate
+    — mirrors ``think expressions check``). Only an actual I/O failure on an
+    existing path is a clean exit-2 (via ``CliError``, handled by ``_dispatch``).
     """
     json_mode = bool(getattr(args, "json", False))
     payload = _rules_check_payload(rules_mod.default_rules_path())
@@ -565,6 +622,8 @@ def cmd_rules_overview(args: argparse.Namespace) -> int:
                     "a missing rules file is not an error — 'no rules configured yet'",
                     "'rules check' is a linter: a malformed file reports ok=false but "
                     "still exits 0; only an unreadable path is a clean exit-2",
+                    "'rules check' also warns (ok=false, exit 0) on a rule keyed to a "
+                    "sense field nothing currently feeds — it validates but can never fire",
                 ],
             },
         ],
