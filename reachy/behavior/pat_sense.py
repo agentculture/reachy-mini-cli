@@ -408,6 +408,9 @@ class PatSenseDriver:
         #: One contiguous unsafe observation interval. Interaction state is
         #: cleared exactly once when this opens; recovery only reseeds filters.
         self._gap_active = False
+        #: When the current gap opened, so a SUSPENDED interaction can charge
+        #: the blind stretch to its release budget on recovery.
+        self._gap_started_at: float | None = None
         self._state = UNAVAILABLE_PAT_STATE
         self._seen_press_at: float | None = None
         self._active_contact_s = 0.0
@@ -492,6 +495,16 @@ class PatSenseDriver:
         # ended, but its interaction was already cleared at entry.
         recovered_gap = self._gap_active
         self._gap_active = False
+        # A SUSPENDED interaction survived this gap (see `_begin_gap`). Charge the
+        # blind stretch to its release budget by measuring the quiet run from when
+        # the gap OPENED, not from now: the reaction's own ~1.24 s blind window
+        # stays comfortably inside the 2.5 s budget and keeps laddering, while a
+        # long blackout can no longer masquerade as a hand that never left.
+        if recovered_gap and self._state.contact and self._gap_started_at is not None:
+            if self._no_fresh_since is None or self._no_fresh_since > self._gap_started_at:
+                self._no_fresh_since = self._gap_started_at
+        if not recovered_gap:
+            self._gap_started_at = None
 
         # Policy time only advances across successful observations. A blocked
         # command or unavailable reader must never masquerade as contact time,
@@ -644,8 +657,70 @@ class PatSenseDriver:
             phase_started_at=now,
         )
 
+    def _suspend_interaction(self, availability: str) -> None:
+        """Pause a LIVE interaction across a gap without ending it.
+
+        The split from :meth:`_end_interaction` is the whole point: every
+        DETECTOR-level safety still fires, and only the PERSISTENT ladder is
+        preserved.
+
+        * ``detector.clear_interaction()`` still runs, so press edges either
+          side of a gap can never pair into a level2 that was never physically
+          sustained (the #66/#79 guarantee, and the reason a naive "just don't
+          clear anything" version of this fix broke nine safety tests).
+        * ``_active_contact_s`` and the phase survive, so a pet that spans the
+          reaction's own motion keeps laddering instead of restarting.
+        * ``_last_available_at = None`` freezes CONTACT accrual, so unobserved
+          blind time is never banked as contact time.
+        """
+        self.detector.clear_interaction()
+        self._seen_press_at = None
+        self._last_available_at = None
+        self._state = replace(self._state, availability=availability)
+
     def _begin_gap(self, availability: str, now: float | None) -> None:
-        """Open or update one unsafe interval without repeated clear churn."""
+        """Open or update one unsafe interval without repeated clear churn.
+
+        A gap means "cannot sense right now", which is NOT the same as "the
+        interaction is over". While contact is LIVE the ladder is therefore
+        SUSPENDED rather than cleared.
+
+        Why this matters (the sustain bug, 2026-07-20): admitting a reaction
+        immediately moves the head, which closes the stillness gate, which used
+        to land here and ``_end_interaction`` the very contact the reaction was
+        admitted for. A continuous pet was chopped into repeated level1s that
+        never laddered ``receptive`` -> ``contentment``, and the robot dropped
+        back to idle motion under the operator's still-moving hand.
+
+        Suspending is safe against the #66/#79 ghost class because reactions are
+        admitted on the one-tick ``pat_event`` latch, never on ``contact``.
+        Preserving contact keeps the PHASE ladder alive; it cannot manufacture a
+        new event, so it cannot self-retrigger.
+
+        Release is still charged real time across the gap (``_no_fresh_since`` is
+        deliberately NOT reset here), so letting go during a blind window still
+        ends the interaction. That knowingly departs from the "policy time only
+        advances across successful observations" rule for this one clock, in the
+        conservative direction — it can only end contact earlier, never invent
+        it — and the arithmetic has margin: the reaction's blind window is entry
+        slew + gate re-arm (~1.24 s) against a 2.5 s ``RELEASE_AFTER_S``.
+        """
+        # `enough` is the one live-contact phase that must still END here: it is
+        # the interaction deliberately concluding, and `_end_interaction` is what
+        # arms the lifecycle cooldown. Suspending it would drop that cooldown and
+        # let a robot that has had enough be re-engaged immediately.
+        if self._state.contact and self._state.phase != "enough":
+            # Entry only — suspending re-clears the DETECTOR, so doing it every
+            # blocked tick would be exactly the clear churn this method exists
+            # to avoid (and would reset the escalation guard repeatedly).
+            if not self._gap_active:
+                self._gap_started_at = now
+                self._suspend_interaction(availability)
+                self._gap_active = True
+                return
+            self._state = replace(self._state, availability=availability)
+            self._last_available_at = None
+            return
         if not self._gap_active:
             self._end_interaction(now, availability=availability)
             self._gap_active = True
