@@ -10,10 +10,16 @@ validator (:mod:`reachy.forge.validator`) has returned ``ok`` for its folder.
 The four moving parts
 ---------------------
 * :class:`ForgedSkillContext` — the restricted ``ctx`` a forged ``execute(params, ctx)``
-  is handed. It exposes EXACTLY the sanctioned reaction seams the validator allow-lists
-  (``speak`` / ``harmonics`` / ``express`` / ``state_get`` / ``state_update``) as thin,
-  defensive delegations to the same injected callables the built-in agent tools use.
-  Nothing else is reachable — no engine, no buffer, no transport.
+  is handed. It exposes EXACTLY the sanctioned seams the validator allow-lists
+  (``speak`` / ``harmonics`` / ``express`` / ``state_get`` / ``state_update`` /
+  ``run_behavior``) as thin, defensive delegations to the same injected callables the
+  built-in agent tools use. Nothing else is reachable — no engine, no buffer, no
+  transport. ``run_behavior`` is the one ACTUATOR on that surface, and it does not
+  move the robot directly either: it submits a bounded ``run_behavior`` INTENT through
+  the same admission path the agent's own tool uses, which the symbolic runtime then
+  executes (see the method, and
+  :data:`reachy.forge.validator.DEFAULT_ALLOWED_CTX_ATTRS` for why the intents spool's
+  other three kinds are deliberately NOT on the surface).
 * :func:`import_forged_execute` — imports a validated ``executor.py`` via
   ``importlib.util.spec_from_file_location`` and *never* registers it in
   :data:`sys.modules`, so one forged skill's module can never shadow or leak into
@@ -98,9 +104,11 @@ class ForgedSkillContext:
     A forged skill is runtime-generated code that only ever passed *static* analysis
     (:mod:`reachy.forge.validator`), never a human review — so it NEVER receives an
     engine, a buffer, a transport, or any other live subsystem. It gets exactly the
-    sanctioned reaction primitives the validator allow-lists
+    sanctioned primitives the validator allow-lists
     (:data:`~reachy.forge.validator.DEFAULT_ALLOWED_CTX_ATTRS`): ``speak``, ``harmonics``,
-    ``express``, ``state_get``, ``state_update`` — and nothing else is reachable.
+    ``express``, ``state_get``, ``state_update``, ``run_behavior`` — and nothing else is
+    reachable. ``tests/test_forge_intent_effector.py`` pins this class's public surface
+    against that allow-list in both directions, so the two cannot drift.
 
     Each method is a thin, defensive delegation to the injected seam (the SAME callables
     the built-in agent tools use). When the seam is absent or raises, the method logs a
@@ -115,11 +123,13 @@ class ForgedSkillContext:
         speak: Callable[[str], object] | None = None,
         harmonics: Callable[[str], object] | None = None,
         express: Callable[[str], object] | None = None,
+        run_behavior: Callable[..., object] | None = None,
         state: MutableMapping | None = None,
     ) -> None:
         self._speak = speak
         self._harmonics = harmonics
         self._express = express
+        self._run_behavior = run_behavior
         self._state: MutableMapping = state if state is not None else {}
 
     def speak(self, text: str) -> str:
@@ -142,6 +152,38 @@ class ForgedSkillContext:
         except Exception as err:  # noqa: BLE001 - a forged skill must never crash the loop
             logger.warning("ForgedSkillContext.express failed: %s", err)
             return f"[express error: {err}]"
+
+    def run_behavior(self, name: str, params: dict | None = None, duration: float | None = None):
+        """Ask the runtime to run a named body behavior once — the skill's ONE actuator.
+
+        This does not move the robot directly: it submits a ``run_behavior`` INTENT to
+        the runtime's command spool, which the symbolic behavior engine drains and
+        admits on its next tick. That indirection is the whole point — a forged skill
+        reaches the robot the same sanctioned way every other agent action does, through
+        an admission path that validates it and can refuse it, rather than around it.
+
+        The injected seam is :func:`reachy.speech.intent_tools.make_run_behavior_effector`'s
+        callable, a thin adapter over the SAME handler the agent's own ``run_behavior``
+        tool uses — so a forged skill can never submit an intent shape a normal agent
+        tool could not. In particular the bounded-lifetime invariant still holds: an
+        admission that would resolve to ``looping=True`` with no duration (a permanent
+        channel hold) is refused engine-side, whether it came from this surface or the
+        tool. There is deliberately NO ``loop`` argument here (see the effector's
+        docstring), and no forged access to the spool's other three intent kinds.
+
+        Returns the runtime's JSON result string, or — like every method on this ctx —
+        a bracketed status string when the seam is missing or the call is refused, so a
+        forged ``execute`` never crashes on a rejection.
+        """
+        seam = self._run_behavior
+        if seam is None:
+            logger.warning("ForgedSkillContext.run_behavior: no run_behavior seam available")
+            return "[run_behavior unavailable]"
+        try:
+            return str(seam(name, params=params, duration=duration))
+        except Exception as err:  # noqa: BLE001 - a refusal must never crash forged code
+            logger.warning("ForgedSkillContext.run_behavior refused %r: %s", name, err)
+            return f"[run_behavior refused: {err}]"
 
     def state_get(self, key: str):
         """Read one field from the forged-skill scratch state (``None`` if unset)."""
@@ -467,6 +509,7 @@ def build_ctx_seams(
     harmonic_engine,
     play,
     express,
+    run_behavior=None,
 ) -> ForgedSkillContext:
     """Build a :class:`ForgedSkillContext` over the SAME seams the built-in tools use.
 
@@ -474,10 +517,14 @@ def build_ctx_seams(
     objects and ``play`` is the ``play(pcm, *, samplerate=...)`` seam — the exact trio the
     ``speak`` / ``harmonics`` tools synthesize + play through — so a forged skill's
     ``ctx.speak`` / ``ctx.harmonics`` render identically. ``express`` is the
-    ``ExpressionProducer.express`` seam (as the ``apply_pose`` tool uses). A fresh scratch
-    dict backs ``state_get`` / ``state_update``. Kept here (not in composition) so the
-    voice-seam wiring stays with the ctx it feeds, but it takes only plain objects — this
-    module still imports neither voice nor motion.
+    ``ExpressionProducer.express`` seam (as the ``apply_pose`` tool uses). ``run_behavior``
+    is the intent effector (:func:`reachy.speech.intent_tools.make_run_behavior_effector`)
+    — the skill's one actuator; ``None`` leaves ``ctx.run_behavior`` reporting
+    "unavailable" rather than silently doing nothing, which is what a host that cannot
+    reach the intents spool should present. A fresh scratch dict backs ``state_get`` /
+    ``state_update``. Kept here (not in composition) so the seam wiring stays with the ctx
+    it feeds, but it takes only plain objects/callables — this module still imports
+    neither voice, nor motion, nor the intent stack.
     """
 
     def _speak(text: str) -> None:
@@ -486,7 +533,13 @@ def build_ctx_seams(
     def _harmonics(text: str) -> None:
         play(harmonic_engine.synthesize(text), samplerate=harmonic_engine.samplerate)
 
-    return ForgedSkillContext(speak=_speak, harmonics=_harmonics, express=express, state={})
+    return ForgedSkillContext(
+        speak=_speak,
+        harmonics=_harmonics,
+        express=express,
+        run_behavior=run_behavior,
+        state={},
+    )
 
 
 __all__ = [

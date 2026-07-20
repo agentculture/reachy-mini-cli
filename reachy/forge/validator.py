@@ -34,6 +34,29 @@ ALLOWED_IMPORTS = {"numpy", "math", "time", "typing", "dataclasses"}
 
 #: The default sanctioned reaction surface on the injected ``ctx`` object. This is a
 #: DEFAULT only — the caller injects the real surface (t13); see module docstring.
+#:
+#: WIDENING THIS SET IS A SECURITY DECISION. Every name here is an attribute
+#: runtime-GENERATED code may call, so an addition must be argued, not assumed —
+#: ``tests/test_forge_intent_effector.py`` pins the set against
+#: :class:`~reachy.forge.activate.ForgedSkillContext`'s public surface in BOTH
+#: directions, so neither side can drift without a deliberate, reviewable edit here.
+#:
+#: ``run_behavior`` (added t29) is the one ACTUATOR on the surface, and the reasoning
+#: for admitting exactly it is worth keeping next to the constant. Once the forge was
+#: re-homed from ``listen --live`` onto ``agent attach`` (t17), the external attach
+#: client stopped opening the robot's SDK by design, so ``speak``/``harmonics``/
+#: ``express`` became publish-only no-ops and a forged skill could no longer reach the
+#: robot at all. ``run_behavior`` restores that reach the SANCTIONED way — by submitting
+#: an intent to the runtime spool the symbolic engine drains, through the very handler
+#: :mod:`reachy.speech.intent_tools` uses for the agent's own ``run_behavior`` tool. It
+#: is a ONE-TIME, BOUNDED admission with a natural end, so the bounded-lifetime
+#: invariant (``reachy.behavior.intents._validated_lifetime``) still applies unchanged.
+#: The intents spool's three OTHER kinds are deliberately NOT here:
+#: ``declare_goal`` (a standing, deliberately-indefinite admission that outlives the
+#: skill and re-admits itself forever), ``set_inhibition`` (replaces the whole inhibited
+#: set with no natural expiry) and ``set_mode`` (a global rules-config swap) each hand
+#: generated code an open-ended or process-wide effect, which is exactly what the
+#: bounded-lifetime invariant exists to prevent.
 DEFAULT_ALLOWED_CTX_ATTRS = frozenset(
     {
         "speak",
@@ -41,6 +64,7 @@ DEFAULT_ALLOWED_CTX_ATTRS = frozenset(
         "express",
         "state_get",
         "state_update",
+        "run_behavior",
     }
 )
 

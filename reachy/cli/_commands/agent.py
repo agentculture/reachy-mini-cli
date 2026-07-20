@@ -363,6 +363,7 @@ def _activate_forge(
     speak_engine: object,
     harmonic_engine: object,
     play: Callable[..., None],
+    run_behavior: Callable[..., str],
     client_factory: Callable[[Callable[[str, dict], None]], object] | None = None,
 ) -> None:
     """Wire the forge auto-activation subsystem for the agent registry (best-effort).
@@ -375,6 +376,14 @@ def _activate_forge(
     on ``forge/staged`` + boot reload of ``active/``), and a
     :class:`~reachy.forge.ForgeClient` whose ``publish`` IS the activator. Finally arms
     the late-bound dispatch seam by appending the client to ``holder``.
+
+    ``run_behavior`` is the ctx's one non-inert seam. Because this client is
+    publish-only by design, a forged skill's ``ctx.speak`` / ``ctx.harmonics`` /
+    ``ctx.express`` render nothing — so without an actuator the forge's own premise
+    ("the robot gains a new callable tool") would be only half true here. The seam is
+    :func:`reachy.speech.intent_tools.make_run_behavior_effector`'s callable: the forged
+    skill reaches the robot exactly as this noun's own tools do, by submitting a bounded
+    intent to the spool the running engine drains — never by touching the SDK.
 
     The ``announce`` seam is the cue buffer's :meth:`_RuntimeCueBuffer.feed_forge` — kept
     a plain callable, so the forge modules never import the event bus. A failure disables
@@ -396,6 +405,7 @@ def _activate_forge(
             harmonic_engine=harmonic_engine,
             play=play,
             express=express,
+            run_behavior=run_behavior,
         )
         announce = getattr(buffer, "feed_forge", None)
         activator = ForgeActivator(register=_register, ctx=ctx, announce=announce)
@@ -454,7 +464,7 @@ def _build_default_engine(
     ever hit. Lazy-imported so registering the noun stays cheap.
     """
     from reachy.speech.agent_turn import AgentTurnEngine
-    from reachy.speech.intent_tools import register_intent_tools
+    from reachy.speech.intent_tools import make_run_behavior_effector, register_intent_tools
     from reachy.speech.tools import ToolRegistry
     from reachy.speech.voice import VoiceEngine
 
@@ -516,6 +526,12 @@ def _build_default_engine(
                 speak_engine=speak_engine,
                 harmonic_engine=harmonic_engine,
                 play=_no_play,
+                # The forged skill's ONE actuator: the same bounded, validated
+                # run_behavior admission the registry's own intent tool submits, over
+                # the same spool — never a second path to the robot.
+                run_behavior=make_run_behavior_effector(
+                    spool_dir=spool_dir, await_timeout=await_timeout
+                ),
                 client_factory=forge_client_factory,
             )
         except Exception:  # noqa: BLE001

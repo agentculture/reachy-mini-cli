@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from reachy.behavior import control as control_mod
 from reachy.behavior import library
@@ -55,6 +55,14 @@ from reachy.speech.tools import Handler, Tool, ToolRegistry, function_tool
 #: before degrading to a "submitted, unconfirmed" result (mirrors the CLI's
 #: ``--await-timeout`` on ``behavior run``/``behavior stop``).
 DEFAULT_AWAIT_TIMEOUT = 1.0
+
+#: The intent kinds a RUNTIME-GENERATED (forged) skill may submit — deliberately just
+#: ``run_behavior``, the one BOUNDED, one-time kind. ``declare_goal`` (standing +
+#: indefinite by design), ``set_inhibition`` (replaces the whole inhibited set, no
+#: natural expiry) and ``set_mode`` (a global rules-config swap) are open-ended or
+#: process-wide effects and stay agent-only. See :func:`make_run_behavior_effector` and
+#: :data:`reachy.forge.validator.DEFAULT_ALLOWED_CTX_ATTRS`.
+FORGED_INTENT_KINDS = frozenset({RUN_BEHAVIOR})
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +321,62 @@ def _set_inhibition_tool(spool_dir: Path | None, timeout: float, catalog: Mappin
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
+
+def make_run_behavior_effector(
+    *,
+    spool_dir: Path | None = None,
+    await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
+    catalog: Mapping | None = None,
+) -> Callable[..., str]:
+    """Build a bare ``run_behavior(name, params=None, duration=None) -> str`` callable.
+
+    The same capability as the :func:`register_intent_tools` ``run_behavior`` tool, minus
+    the JSON-schema tool wrapper — for a caller that needs the ACTION as a plain injected
+    seam rather than something an LLM selects by name. Its one consumer today is the
+    forge: :class:`reachy.forge.activate.ForgedSkillContext` binds it as ``ctx.run_behavior``,
+    the single actuator a runtime-generated skill gets (:data:`FORGED_INTENT_KINDS`).
+
+    SAME ADMISSION PATH, not a parallel one
+    ---------------------------------------
+    The returned callable is a thin adapter over :func:`_make_run_behavior_handler` — the
+    exact handler :func:`_run_behavior_tool` installs — so the pre-flight validation
+    (unknown behavior name / unknown param / non-numeric value, each refused BEFORE the
+    spool write with the valid keys named), the atomic namespaced-spool submit, and the
+    engine-side :class:`~reachy.behavior.intents.IntentDriver` admission (including
+    ``_validated_lifetime``'s refusal of an unbounded ``looping=True, duration=None``
+    result) are literally the same code. A caller of this effector therefore cannot
+    submit an intent shape the agent's own tool could not.
+
+    NARROWER on purpose: no ``loop``
+    --------------------------------
+    The tool accepts a ``loop`` boolean; this effector does not, so the parameter is not
+    merely rejected but unreachable. ``loop=True`` with no duration is the one argument
+    combination that BUILDS the unbounded shape deliberately (rather than inheriting it
+    from a looping-default library entry), and generated code has no business asking for
+    it. Omitting a duration on a looping-default entry still resolves to that unbounded
+    shape and is still refused engine-side, exactly as it is for the tool.
+
+    Returns the handler's JSON result string, so the caller sees the real outcome
+    (``{"ok": true, ...}`` admitted, ``{"ok": null, "submitted": ...}`` when no engine is
+    draining yet, ``{"ok": false, "error": ...}`` refused). Raises ``ValueError`` on a
+    rejected argument, like the tool handler — :class:`ForgedSkillContext` catches it and
+    degrades to a bracketed error string rather than letting it escape into forged code.
+    """
+    lib = catalog if catalog is not None else library.LIBRARY
+    handler = _make_run_behavior_handler(spool_dir, await_timeout, lib)
+
+    def run_behavior(name, params=None, duration=None) -> str:
+        arguments: dict = {"name": name}
+        if params is not None:
+            arguments["params"] = params
+        if duration is not None:
+            arguments["duration"] = duration
+        # Note the absence of a "loop" key — see the docstring. The handler falls back to
+        # the library entry's own `looping` default exactly as it does for the tool.
+        return handler(arguments)
+
+    return run_behavior
 
 
 def register_intent_tools(
