@@ -19,7 +19,120 @@
 # Editing THIS file on a robot has no lasting effect: the next upgrade replaces
 # it. Put every box-local change in the overlay instead.
 #
-# The rule CONTENT shipped by default is deliberately empty for now — this file
-# exists so the two-layer mechanism (and its packaging) is real and exercised.
-# Adding a rule here changes the out-of-the-box behavior of every deployed
-# robot on its next upgrade, so treat it as a product decision, not a tweak.
+# ===========================================================================
+# What ships here, and why it is only three rules
+# ===========================================================================
+#
+# These rules run on EVERY deployed robot with no operator-authored config at
+# all, so the bar is "obviously correct in an arbitrary room", not "impressive
+# in a demo". A robot that twitches at everything is worse than one that does
+# three things well, so the shipped set is deliberately small: it acknowledges
+# TOUCH, it turns toward SOUND, and it answers when it is ADDRESSED. Anything
+# more speculative belongs in an operator's overlay, where the person who has
+# to live with it can tune or tombstone it.
+#
+# THE RULE IDS BELOW ARE A PUBLIC INTERFACE. An operator overrides or disables
+# a shipped rule *by id*, so renaming one silently orphans every box-local
+# override of it. `tests/test_behavior_default_rules.py` pins the id list for
+# exactly that reason — a rename must be a deliberate, visible edit.
+#
+# CORROBORATION (c32). No rule here keys on bare `speech`. Measured on the
+# deployed robot in a quiet room with nobody speaking, `speech_detected` read
+# true 45.8 % of the time (55/120 samples) while the bearing wandered across
+# essentially the full acoustic range — see
+# `docs/verification/2026-07-20-retire-old-flow-baseline.md` section 2. A rule
+# on that flag fires on roughly a coin flip, pointed at nothing.
+#
+# A rule carries exactly ONE `when` predicate — the schema has no conjunction —
+# so "corroborated" cannot mean ANDing two predicates together. It means keying
+# on a field that is corroborated IN ITSELF, and each rule below does that a
+# different way: `pat` is a physical proprioceptive measurement, `rms` is
+# measured mic energy (and is handed to a behavior whose own gate corroborates
+# it further), and `transcript` is an utterance that already cleared the
+# layered engagement gate.
+
+# --------------------------------------------------------------------------- #
+# TOUCH — the least ambiguous input the robot has                             #
+# --------------------------------------------------------------------------- #
+#
+# A pat is deliberate, physical, and impossible to trigger by accident from
+# across the room, which makes it the one reaction that is safe to ship at full
+# confidence. `pet-reaction` is self-completing with a finite outer backstop
+# (`library.LIBRARY["pet-reaction"].default_duration`), so it needs no
+# `duration_s` of its own.
+#
+# The id is `pat-acknowledge` because that name is ALREADY the deployed one:
+# the repository fixtures (`docs/fixtures/behavior-rules/`), the operating
+# guide, and the box's own overlay all use it. Shipping under any other name
+# would leave a robot running this rule AND its box-local twin at once.
+[[react]]
+id = "pat-acknowledge"
+when = { field = "pat", op = "is_true" }
+run = "pet-reaction"
+cooldown_s = 5.0
+
+# --------------------------------------------------------------------------- #
+# SOUND — turn toward it, on measured energy rather than a flag               #
+# --------------------------------------------------------------------------- #
+#
+# Keyed on `rms`, not `speech`: loudness is a physical measurement of the mic,
+# so it works on a bare box with nothing else installed and no external service
+# reachable — which is exactly the fresh-install case these defaults exist for.
+# (`transcript` would be the stronger signal, but it needs a reachable STT
+# service; a default that silently does nothing without one is not a default.)
+#
+# The `value` below is `OrientParams.rms_floor` — the same number
+# `orient-to-sound`'s OWN admission gate uses, itself the donor's
+# `SnapDetector.min_rms` "sound is present" floor. Stating it once here means
+# the rule never admits a behavior whose gate would immediately close again;
+# `tests/test_behavior_default_rules.py` pins the two together so the copy in
+# this file cannot drift from the behavior's default.
+#
+# Admission is cheap even when it is wrong: with no credible sound
+# `orient-to-sound` ABSTAINS rather than freezing, so `feel-alive` keeps
+# breathing through it and the head never moves. The behavior's own graded
+# ladder (`CorroboratedGate` + `LatchedDoaGuard`) decides whether anything
+# actually turns — antenna lean, a bounded head nudge, or the deliberate turn.
+#
+# `duration_s = 12` is derived, not chosen by feel: a full cycle is at most
+# `max_dur` (4 s) turning + `hold` (3 s) + `recenter_after` (4 s) easing home =
+# 11 s, plus a second of margin. Cutting the window shorter would evict the
+# behavior mid-turn and SNAP the head back to base presence; longer would keep
+# a non-base behavior on the head for no reason, and the pat sense's stillness
+# gate stays shut while the head is being driven.
+[[react]]
+id = "look-toward-sound"
+when = { field = "rms", op = "ge", value = 0.02 }
+run = "orient-to-sound"
+duration_s = 12.0
+cooldown_s = 2.0
+
+# --------------------------------------------------------------------------- #
+# WORDS — acknowledge being addressed, once, and then stop                    #
+# --------------------------------------------------------------------------- #
+#
+# `transcript` is the strongest corroboration in the runtime: an utterance only
+# reaches this field after clearing the layered engagement gate (fuzzy name
+# match, else a single-shot LLM "was this addressed to the robot?" judgement),
+# so this cannot fire on ambient human-to-human chatter.
+#
+# `run = "speak"` + `say = "..."` is the sanctioned pairing — the visible and
+# audible halves of one reaction. The words are rendered off the tick thread by
+# `SpeechActuator`, whose default voice is the in-process, offline `harmonic`
+# engine, so this speaks on a box with nothing reachable.
+#
+# This is an ACKNOWLEDGEMENT ("I heard you"), not an answer — answering is the
+# cognition layer's job. So it is deliberately terse, and `cooldown_s` matches
+# the orienting window above: at most one acknowledgement per engagement, and a
+# continuing conversation gets silence rather than a chirp per sentence.
+#
+# It is a SEPARATE rule from the two above on purpose. Rule ids are the
+# override surface, so folding the voice into `pat-acknowledge` would deny an
+# operator the ability to mute the robot without also losing its pat reaction.
+[[react]]
+id = "greet-when-addressed"
+when = { field = "transcript", op = "is_true" }
+run = "speak"
+duration_s = 1.6
+cooldown_s = 12.0
+say = "I'm here."

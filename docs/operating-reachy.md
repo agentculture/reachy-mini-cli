@@ -996,10 +996,55 @@ an already-deployed robot. Precedence is per rule `id`:
   longer exists is inert, not an error.
 
 A MISSING overlay is not an error: it resolves to the shipped layer alone ("no
-local rules configured yet"). With both layers empty the engine runs on
-`feel-alive` alone. The shipped layer ships no rule content today — it exists
-so the mechanism is real; adding a rule to it changes the out-of-the-box
-behavior of every robot on its next upgrade.
+local rules configured yet") — which is how a robot with no config of yours at
+all still reacts to being touched, to sound, and to being spoken to. See
+[what the release ships](#what-the-release-ships-by-default) below for the
+three rules that gives you.
+
+#### What the release ships by default
+
+`reachy/behavior/default_rules.toml` carries **three** react rules. They run on
+every robot with no configuration from you, so they are deliberately few and
+calm rather than a demo reel:
+
+| id | fires on | does | bounded by |
+|---|---|---|---|
+| `pat-acknowledge` | `pat` — a proprioceptive touch | `pet-reaction` — settle into the petting, then signal release | self-completing, finite backstop |
+| `look-toward-sound` | `rms >= 0.02` — measured mic energy | `orient-to-sound` — the graded antenna/head/body ladder | `duration_s = 12`, `cooldown_s = 2` |
+| `greet-when-addressed` | `transcript` — an utterance that cleared the engagement gate | `speak` head-bob, and says *"I'm here."* | `duration_s = 1.6`, `cooldown_s = 12` |
+
+Three things worth knowing about that set:
+
+- **None of them keys on bare `speech`** — that flag reads true 45.8 % of the
+  time in a quiet room with nobody speaking. `pat` is a physical measurement,
+  `rms` is measured energy handed to a behavior that corroborates it *again*
+  with its own dwell and latch guards, and `transcript` has already cleared the
+  layered engagement gate. A rule carries exactly one predicate, so the
+  corroboration has to live inside the field it keys on.
+- **`look-toward-sound` admits far more often than the robot actually moves.**
+  With no credible bearing `orient-to-sound` abstains, so `feel-alive` keeps
+  breathing through it and the head stays put. Admission is cheap; turning is
+  what is gated.
+- **They are yours to override.** Each `id` above is the handle: put an entry
+  of the same `id` in your overlay to replace it wholesale, or `enabled = false`
+  to tombstone it. `greet-when-addressed` is a separate rule from the other two
+  precisely so you can mute the robot without losing its pat reaction:
+
+  ```toml
+  [[react]]
+  id = "greet-when-addressed"
+  enabled = false
+  ```
+
+Each shipped rule announces itself in the journal, so confirming one on a real
+robot is a grep:
+
+```bash
+journalctl --user -u reachy-runtime -f | grep 'stage=rule'
+# [SENSE stage=rule source=pat event=pat-acknowledge] fired kind=react run=pet-reaction
+# [SENSE stage=rule source=rms event=look-toward-sound] fired kind=react run=orient-to-sound
+# [SENSE stage=rule source=transcript event=greet-when-addressed] fired kind=react run=speak say="I'm here."
+```
 
 **A complete example** — react rules keyed on speech, on loudness, and on
 "quiet since boot"; one inhibit rule; and two named modes (the sense fields
@@ -1069,26 +1114,38 @@ clobbers a previously-good running config — it only records why the candidate
 was rejected. A successful reload swaps in immediately, with no restart, and
 reports `{"ok": true, "path": ..., "react": <n>, "inhibit": <m>}`.
 
-**Boot resilience.** A PRESENT but malformed rules file at boot is rejected
-*without crashing the process*: the engine falls back to bare base presence
-(`feel-alive` only, no rule seam at all) and logs exactly one
+**Boot resilience.** A PRESENT but malformed overlay at boot is rejected
+*without crashing the process*. It logs exactly one
 `[SENSE stage=rule source=rules event=boot] dropped reason=...` line (via
 `reachy.senselog`) naming every problem the validator found, plus a
-WARNING-level line from the loader itself. Verified directly — pointing
-`behavior engine run` at a rules file that names an unknown behavior prints,
-with no logging configuration at all:
+WARNING-level line from the loader itself — and then **degrades only as far as
+it must**. You broke your file; the shipped rules are still perfectly valid, so
+taking those away too would punish one typo twice:
+
+- **the shipped rules stay in force** — the loader's fallback floor is the
+  shipped layer, so a robot with a fumbled overlay still acknowledges a pat,
+  still turns toward sound, and still answers when addressed. Only your own
+  edits are lost;
+- **bare base presence** (`feel-alive` only, no rule seam at all) is the floor
+  of *last* resort — reached only when there is genuinely nothing else to run.
+
+This holds for every way an overlay can be malformed: unparseable TOML, an
+unknown field, an unknown behavior name, or a react rule that would admit an
+unbounded looping behavior. Pointing `behavior engine run` at a rules file that
+names an unknown behavior prints, with no logging configuration at all:
 
 ```text
 rules reload: keeping last-good config for <state_dir>/behavior/rules.toml (react[0].run: unknown behavior 'not-a-real-behavior')
-[behavior] engine live: 50 Hz via http + base layer (rules rejected — base presence only); Ctrl-C to stop
+[behavior] engine live: 50 Hz via http + base layer + shipped rules (your overlay was rejected); Ctrl-C to stop
 ```
 
+The banner names the rejection rather than saying a plain `+ rules`, because
+"the shipped rules are running" and "your file loaded" are different facts and
+you are the one person who needs to know which happened. Only when there is
+nothing left at all does it read `(rules rejected — base presence only)`.
+
 The process keeps running (exit 0 on a clean stop) — an operator's typo in
-`rules.toml` can never trip a systemd `Restart=on-failure` crash loop. A
-malformed overlay also degrades only as far as it must: the loader's fallback
-floor is the **shipped layer**, so when the release ships rules the robot keeps
-those and loses only your overlay's edits; base presence alone is the floor
-only when there is genuinely nothing else to run. Like
+`rules.toml` can never trip a systemd `Restart=on-failure` crash loop. Like
 `listen run`/`think run`/`sleep run`, `behavior engine run` calls
 `reachy.cli._logging.install_logging` at entry (level from `--log-level` /
 `REACHY_LOG_LEVEL`, default `INFO`), so the underlying

@@ -28,6 +28,22 @@ from reachy.cli._commands import behavior as behavior_cmd
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.explain import known_paths
 
+
+@pytest.fixture(autouse=True)
+def _no_shipped_rules(monkeypatch):
+    """Blank the SHIPPED rules layer for this module.
+
+    These tests exercise the box-local OVERLAY and the loader/CLI mechanics
+    around it, not the product decision of what the release ships. Pinning them
+    to whatever ``reachy/behavior/default_rules.toml`` happens to contain would
+    churn them on every change to the shipped defaults while testing nothing
+    about the mechanism. The real shipped content is asserted in
+    ``tests/test_behavior_default_rules.py``; the two-layer merge itself in
+    ``tests/test_behavior_rules_layering.py``.
+    """
+    monkeypatch.setattr(rules_mod, "shipped_rules_text", lambda: None)
+
+
 GOOD_TOML = """\
 active_mode = "calm"
 
