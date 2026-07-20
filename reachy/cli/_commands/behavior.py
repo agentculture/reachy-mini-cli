@@ -587,23 +587,29 @@ def _rules_no_verb(args: argparse.Namespace) -> int:
 def _boot_tick_seam() -> reload_driver.ReloadDriver | None:
     """Build the ``behavior engine run`` tick seam, resiliently.
 
-    Loads the default rules file (``RulesLoader.reload()``, see
-    ``reachy.behavior.rules``) exactly once at boot. ``RulesLoader.reload()``
-    never raises a ``CliError`` itself — a MISSING rules file resolves to an
-    empty, inert config (nothing configured yet, not a rejection) — but on a
-    PRESENT, malformed file it keeps the loader's last-good config (here: the
-    all-empty default, since this is the first load) and records why in
+    Loads the rules (``RulesLoader.reload()``, see ``reachy.behavior.rules``)
+    exactly once at boot — both layers: the SHIPPED package resource and the
+    box-local overlay layered over it. ``RulesLoader.reload()`` never raises a
+    ``CliError`` itself — a MISSING overlay resolves to the shipped layer alone
+    (nothing configured locally yet, not a rejection) — but on a PRESENT,
+    malformed overlay it keeps the loader's last-good config (here: the shipped
+    layer, since this is the first load) and records why in
     ``loader.last_error``.
 
     On a rejection this logs exactly one ``[SENSE stage=rule source=rules
     event=boot]`` drop line naming every reason (the validator's own message,
-    which itself enumerates every offending field/id/value it found) and
-    returns ``None`` — the caller installs NO tick seam at all, so the engine
-    runs bare base presence (``feel-alive`` only, no rule seam): an operator's
-    typo in ``rules.toml`` must degrade gracefully, never crash the process
-    (which would otherwise feed a systemd ``Restart=on-failure`` crash loop).
+    which itself enumerates every offending field/id/value it found), and then
+    degrades as far as it can — never crashing the process (which would
+    otherwise feed a systemd ``Restart=on-failure`` crash loop):
 
-    On success (including "no rules file yet") returns a ready
+    * when the fallback config still holds rules (the shipped layer), the seam
+      IS installed and the robot keeps its shipped reactions — an operator's
+      typo in their own overlay must not cost them the defaults as well;
+    * when there is genuinely nothing left to run, this returns ``None`` and
+      the caller installs NO tick seam at all, so the engine runs bare base
+      presence (``feel-alive`` only, no rule seam).
+
+    On success (including "no overlay yet") returns a ready
     :class:`~reachy.behavior.reload_driver.ReloadDriver`, which serves both rule
     evaluation and any later ``behavior reload`` for the life of this run.
     """
@@ -611,7 +617,8 @@ def _boot_tick_seam() -> reload_driver.ReloadDriver | None:
     loader.reload()
     if loader.last_error is not None:
         senselog.drop(RULE_STAGE, "rules", "boot", loader.last_error)
-        return None
+        if not (loader.current.react or loader.current.inhibit):
+            return None
     return reload_driver.ReloadDriver(loader)
 
 

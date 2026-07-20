@@ -590,6 +590,7 @@ def test_module_imports_stdlib_and_reachy_only():
         "tomllib",
         "collections",
         "dataclasses",
+        "importlib",  # importlib.resources — reads the shipped layer, zip-safe
         "pathlib",
         "reachy",
     }

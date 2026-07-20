@@ -972,12 +972,33 @@ smelling of code (an unknown field, a non-JSON value, an unknown
 behavior/mode name) is refused with a specific, actionable message — there is
 no `fn`/`code`/`exec` escape hatch anywhere in this file format.
 
-**Where it lives:** `<state_dir>/behavior/rules.toml` —
-`reachy.behavior.rules.default_rules_path()`, i.e.
-`$XDG_STATE_HOME/reachy/behavior/rules.toml` (`~/.local/state/reachy/behavior/rules.toml`
-by default, or under `$REACHY_STATE_DIR` if set). A MISSING file is not an
-error: it resolves to an empty, inert config ("no rules configured yet") and
-the engine runs on `feel-alive` alone.
+**Where it lives — two layers.** Rules are read from a shipped layer and from
+your own overlay, and the overlay **overrides** the shipped layer rather than
+replacing it:
+
+| Layer | Location | Who owns it |
+|---|---|---|
+| shipped defaults | `reachy/behavior/default_rules.toml`, inside the installed package | the release — read-only, replaced on every upgrade |
+| box-local overlay | `<state_dir>/behavior/rules.toml` (`reachy.behavior.rules.default_rules_path()`) — `$XDG_STATE_HOME/reachy/behavior/rules.toml`, i.e. `~/.local/state/reachy/behavior/rules.toml` by default, or under `$REACHY_STATE_DIR` if set | you — never written by an install or an upgrade |
+
+That split is what makes an upgrade safe in both directions: your tuned
+overlay is never overwritten, and rules newly shipped in a release still reach
+an already-deployed robot. Precedence is per rule `id`:
+
+- an `id` in **both** layers → your entry wins **wholesale** (never a
+  field-by-field blend), keeping the shipped rule's ordering position;
+- an `id` only in the **shipped** layer → in force, so an upgrade adds it;
+- an `id` only in **your overlay** → in force, untouched;
+- an entry carrying **`enabled = false`** → a tombstone: it disables the
+  shipped rule of that `id`. `id` is the only field it needs, so you can copy
+  a shipped stanza and flip one line. A tombstone naming an `id` that no
+  longer exists is inert, not an error.
+
+A MISSING overlay is not an error: it resolves to the shipped layer alone ("no
+local rules configured yet"). With both layers empty the engine runs on
+`feel-alive` alone. The shipped layer ships no rule content today — it exists
+so the mechanism is real; adding a rule to it changes the out-of-the-box
+behavior of every robot on its next upgrade.
 
 **A complete example** — react rules keyed on speech, on loudness, and on
 "quiet since boot"; one inhibit rule; and two named modes (the sense fields
@@ -1058,7 +1079,11 @@ rules reload: keeping last-good config for <state_dir>/behavior/rules.toml (reac
 ```
 
 The process keeps running (exit 0 on a clean stop) — an operator's typo in
-`rules.toml` can never trip a systemd `Restart=on-failure` crash loop. Like
+`rules.toml` can never trip a systemd `Restart=on-failure` crash loop. A
+malformed overlay also degrades only as far as it must: the loader's fallback
+floor is the **shipped layer**, so when the release ships rules the robot keeps
+those and loses only your overlay's edits; base presence alone is the floor
+only when there is genuinely nothing else to run. Like
 `listen run`/`think run`/`sleep run`, `behavior engine run` calls
 `reachy.cli._logging.install_logging` at entry (level from `--log-level` /
 `REACHY_LOG_LEVEL`, default `INFO`), so the underlying

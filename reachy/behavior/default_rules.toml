@@ -1,0 +1,25 @@
+# Reachy Mini — SHIPPED default behavior rules (read-only package resource).
+#
+# This file is the LOWER of the two rule layers. It ships inside the wheel and
+# is never written to on a robot. The UPPER layer is the box-local overlay at
+# `<state_dir>/behavior/rules.toml` (see `reachy.behavior.rules
+# .default_rules_path`), which an operator owns and tunes.
+#
+# How the two combine (see `reachy.behavior.rules.merge_rules`):
+#
+#   * precedence is per RULE ID — a box-local entry whose `id` matches an entry
+#     here REPLACES it wholesale (never a field-by-field merge), keeping this
+#     file's ordering position;
+#   * an id present only here stays in force, so a box that upgrades gains
+#     newly shipped rules WITHOUT losing its own tuning;
+#   * an id present only in the overlay is appended, untouched;
+#   * a box-local entry carrying `enabled = false` DISABLES the shipped rule of
+#     that id (a tombstone — `id` is the only field it needs).
+#
+# Editing THIS file on a robot has no lasting effect: the next upgrade replaces
+# it. Put every box-local change in the overlay instead.
+#
+# The rule CONTENT shipped by default is deliberately empty for now — this file
+# exists so the two-layer mechanism (and its packaging) is real and exercised.
+# Adding a rule here changes the out-of-the-box behavior of every deployed
+# robot on its next upgrade, so treat it as a product decision, not a tweak.

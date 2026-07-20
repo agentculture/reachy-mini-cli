@@ -1,8 +1,21 @@
 """The behavior-rules schema — data-only react/inhibit rules + modes, never code.
 
-A rules file (``rules.toml``, by default under
-``<state_dir>/behavior/rules.toml`` — see :func:`default_rules_path`) has three
-sections:
+Rules are read in TWO LAYERS (see :func:`load_rules` / :func:`merge_rules`):
+
+* the **shipped layer** — ``reachy/behavior/default_rules.toml``, a read-only
+  package resource read through :mod:`importlib.resources` (so it resolves
+  identically from a source checkout and an installed wheel);
+* the **box-local overlay** — ``<state_dir>/behavior/rules.toml`` (see
+  :func:`default_rules_path`), the file an operator owns and tunes.
+
+The overlay OVERRIDES the shipped layer **per rule id**; it does not replace it.
+That is the only arrangement where an operator's tuning survives an upgrade AND
+newly shipped rules reach an already-deployed box. Writing defaults into the
+box-local path at install time would do the first badly (it overwrites tuning);
+refusing to write them would do the second badly (upgraded boxes silently get
+none of the new rules).
+
+A rules file — either layer — has three sections:
 
 * **react rules** (``[[react]]``) — ``when`` a :class:`Predicate` over the live
   sense snapshot holds, ``run`` a named :data:`reachy.behavior.library.LIBRARY`
@@ -11,6 +24,13 @@ sections:
   named set of behaviors;
 * **modes** (``[modes.<name>]``) — named, purely declarative parameter sets, one
   of which may be selected as the file's ``active_mode``.
+
+A rule entry may carry ``enabled = false``, which makes it a **tombstone**: it
+contributes no rule of its own and DISABLES the rule of that id contributed by
+a lower layer. ``id`` is the only field a tombstone needs (the rest of a copied
+stanza may stay, and is ignored), so disabling a shipped rule is a one-line
+edit in the overlay rather than a fork of its body. ``enabled = true`` is the
+implicit default and a plain no-op.
 
 Every rule (react or inhibit) is uniquely ``id``-entified and carries
 ``cooldown_s`` (minimum seconds between firings, default 5.0) and ``hysteresis``
@@ -59,12 +79,15 @@ This module deliberately reuses :class:`CliError` rather than introducing a
 parallel ``RulesError`` taxonomy, exactly mirroring the stash record's choice.
 
 Loading (:func:`load_rules`, :class:`RulesLoader`) is stdlib-only
-(:mod:`tomllib`, read-only in the standard library). A missing rules file is
-NOT an error — it resolves to an empty, inert :class:`RulesConfig` ("no rules
-configured yet"). :class:`RulesLoader` additionally keeps the *last good*
-config in memory: a candidate reload that fails to parse or validate never
-clobbers a previously good config, it only records why the candidate was
-rejected (:attr:`RulesLoader.last_error`).
+(:mod:`tomllib` + :mod:`importlib.resources`, both read-only in the standard
+library). A missing overlay is NOT an error — it resolves to the shipped layer
+alone ("no local rules configured yet"). :class:`RulesLoader` additionally
+keeps the *last good* config in memory: a candidate reload that fails to parse
+or validate never clobbers a previously good config, it only records why the
+candidate was rejected (:attr:`RulesLoader.last_error`). That retention now
+spans both layers — the loader's floor before any successful reload is the
+SHIPPED layer, so a malformed overlay degrades to the shipped rules rather than
+to nothing.
 
 This module is intentionally PURE: parsing, validation, and dataclasses only.
 It has no engine coupling and no evaluation logic — *interpreting* a
@@ -80,6 +103,7 @@ import math
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
 
 from reachy.behavior import library as behavior_library
@@ -94,6 +118,12 @@ logger = logging.getLogger(__name__)
 
 RULES_SUBDIR = "behavior"
 RULES_FILENAME = "rules.toml"
+
+#: Where the SHIPPED layer lives, addressed as a package resource (never as a
+#: filesystem path relative to ``__file__`` — that only works from a source
+#: checkout, and would silently ship nothing from a wheel).
+SHIPPED_RULES_PACKAGE = "reachy.behavior"
+SHIPPED_RULES_RESOURCE = "default_rules.toml"
 
 #: The Sense-snapshot fields a predicate may test. Deliberately small and
 #: hand-picked to match the live perception fields the sense pipeline actually
@@ -120,8 +150,10 @@ DEFAULT_HYSTERESIS = 0.0
 
 _PREDICATE_FIELDS = frozenset({"field", "op", "value"})
 _TOP_LEVEL_FIELDS = frozenset({"active_mode", "react", "inhibit", "modes"})
-_REACT_FIELDS = frozenset({"id", "when", "run", "params", "cooldown_s", "hysteresis", "duration_s"})
-_INHIBIT_FIELDS = frozenset({"id", "when", "disable", "cooldown_s", "hysteresis"})
+_REACT_FIELDS = frozenset(
+    {"id", "enabled", "when", "run", "params", "cooldown_s", "hysteresis", "duration_s"}
+)
+_INHIBIT_FIELDS = frozenset({"id", "enabled", "when", "disable", "cooldown_s", "hysteresis"})
 _REACT_REQUIRED = frozenset({"id", "when", "run"})
 _INHIBIT_REQUIRED = frozenset({"id", "when", "disable"})
 
@@ -130,9 +162,39 @@ _INHIBIT_REQUIRED = frozenset({"id", "when", "disable"})
 _JSON_SCALARS = (str, int, float, type(None))
 
 
-def default_rules_path() -> Path:
-    """The default rules-file location: ``<state_dir>/behavior/rules.toml``."""
+def overlay_rules_path() -> Path:
+    """The BOX-LOCAL overlay's location: ``<state_dir>/behavior/rules.toml``.
+
+    This is the operator's own file — the upper of the two layers. The shipped
+    DEFAULTS are not here; they are a package resource
+    (:data:`SHIPPED_RULES_RESOURCE`), deliberately, so an upgrade can never
+    overwrite what is written at this path.
+    """
     return state_dir() / RULES_SUBDIR / RULES_FILENAME
+
+
+#: Long-standing alias for :func:`overlay_rules_path` — kept because it is the
+#: name the CLI verbs, the engine composition, and the docs already use. The
+#: newer name says which of the two layers it means.
+default_rules_path = overlay_rules_path
+
+
+def shipped_rules_text() -> str | None:
+    """Read the SHIPPED layer's TOML text, or ``None`` if it is not present.
+
+    Goes through :mod:`importlib.resources`, so it resolves identically from a
+    source checkout and from an installed wheel (where the file may live inside
+    a zip and have no filesystem path at all). A missing/unreadable resource is
+    not an error here — it degrades to "no shipped rules"; see
+    :func:`load_shipped_rules`.
+    """
+    try:
+        handle = resources.files(SHIPPED_RULES_PACKAGE).joinpath(SHIPPED_RULES_RESOURCE)
+        if not handle.is_file():
+            return None
+        return handle.read_text(encoding="utf-8")
+    except (ModuleNotFoundError, FileNotFoundError, OSError):  # pragma: no cover - defensive
+        return None
 
 
 def _error(message: str, remediation: str = "") -> CliError:
@@ -286,14 +348,21 @@ class RulesConfig:
 
     Construct via :meth:`from_dict` (never directly) so every instance is
     guaranteed to have passed schema validation. The all-empty default is
-    exactly what :func:`load_rules` returns for a not-yet-created rules file —
-    "no rules configured" is a valid, inert state, not an error.
+    exactly what :func:`load_rules` returns for a not-yet-created rules file
+    with an empty shipped layer — "no rules configured" is a valid, inert
+    state, not an error.
+
+    :attr:`disabled` carries the ids this layer TOMBSTONED (``enabled =
+    false``). Within a single layer a tombstone simply means "this rule is not
+    in force"; across layers :func:`merge_rules` uses it to remove the rule of
+    that id contributed by a lower layer.
     """
 
     react: tuple[Rule, ...] = ()
     inhibit: tuple[Rule, ...] = ()
     modes: dict[str, Mode] = field(default_factory=dict)
     active_mode: str | None = None
+    disabled: frozenset[str] = frozenset()
 
     @classmethod
     def from_dict(cls, data: object) -> "RulesConfig":
@@ -325,10 +394,15 @@ class RulesConfig:
         if not isinstance(inhibit_raw, list):
             raise _error(f"'inhibit' must be a list of rule tables (got {inhibit_raw!r})")
 
-        react_rules = tuple(_validate_react_rule(r, index=i) for i, r in enumerate(react_raw))
-        inhibit_rules = tuple(_validate_inhibit_rule(r, index=i) for i, r in enumerate(inhibit_raw))
+        react_rules, react_off = _partition_entries(
+            react_raw, kind=KIND_REACT, validate=_validate_react_rule
+        )
+        inhibit_rules, inhibit_off = _partition_entries(
+            inhibit_raw, kind=KIND_INHIBIT, validate=_validate_inhibit_rule
+        )
+        disabled = react_off | inhibit_off
 
-        all_ids = [r.id for r in react_rules] + [r.id for r in inhibit_rules]
+        all_ids = [r.id for r in react_rules] + [r.id for r in inhibit_rules] + sorted(disabled)
         duplicates = sorted({rule_id for rule_id in all_ids if all_ids.count(rule_id) > 1})
         if duplicates:
             raise _error(
@@ -340,7 +414,13 @@ class RulesConfig:
         modes = _validate_modes(data.get("modes"))
         active_mode = _validate_active_mode(data.get("active_mode"), modes)
 
-        return cls(react=react_rules, inhibit=inhibit_rules, modes=modes, active_mode=active_mode)
+        return cls(
+            react=react_rules,
+            inhibit=inhibit_rules,
+            modes=modes,
+            active_mode=active_mode,
+            disabled=disabled,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -447,6 +527,52 @@ def _validate_disable(raw: object, *, path: str) -> frozenset[str]:
             )
         names.add(item)
     return frozenset(names)
+
+
+def _is_tombstone(raw: Mapping, *, path: str) -> bool:
+    """Is this entry a ``enabled = false`` tombstone? Validates the flag's type."""
+    if "enabled" not in raw:
+        return False  # absent flag: enabled, the default
+    enabled = raw["enabled"]
+    if not isinstance(enabled, bool):
+        raise _error(
+            f"{path}.enabled must be a boolean (got {enabled!r})",
+            remediation="use enabled = false to disable a rule of this id from a lower layer",
+        )
+    return not enabled
+
+
+def _partition_entries(
+    raw_entries: list, *, kind: str, validate
+) -> tuple[tuple[Rule, ...], frozenset[str]]:
+    """Split a ``[[react]]``/``[[inhibit]]`` list into live rules and tombstones.
+
+    A tombstone (``enabled = false``) contributes no :class:`Rule` — only its
+    id, which :func:`merge_rules` uses to remove a lower layer's rule of that
+    id. It is validated only for the things that still mean something on a
+    disabled entry: an ``id``, and no unknown fields (so a typo is still
+    caught). The rest of a copied-and-disabled stanza is deliberately NOT
+    semantically validated — it is inert data the operator kept for reference,
+    and refusing it would make disabling a shipped rule harder than writing it.
+    """
+    allowed = _REACT_FIELDS if kind == KIND_REACT else _INHIBIT_FIELDS
+    rules: list[Rule] = []
+    disabled: set[str] = set()
+    for index, raw in enumerate(raw_entries):
+        path = f"{kind}[{index}]"
+        if not isinstance(raw, Mapping):
+            raise _error(f"{path} must be an object (got {raw!r})")
+        unknown = set(raw) - allowed
+        if unknown:
+            raise _error(
+                f"{path} has unexpected field(s) {sorted(unknown)}",
+                remediation=f"allowed fields: {', '.join(sorted(allowed))}",
+            )
+        if _is_tombstone(raw, path=path):
+            disabled.add(_require_str(raw, "id", path=path))
+            continue
+        rules.append(validate(raw, index=index))
+    return tuple(rules), frozenset(disabled)
 
 
 def _validate_react_rule(raw: object, *, index: int) -> Rule:
@@ -581,17 +707,117 @@ def _validate_active_mode(raw: object, modes: dict[str, Mode]) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
-def load_rules(path: Path | None = None) -> RulesConfig:
-    """Read + validate a rules TOML file at *path* (default :func:`default_rules_path`).
+def _parse_rules_text(text: str, *, origin: str) -> RulesConfig:
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as err:
+        raise _error(
+            f"rules file {origin} is not valid TOML: {err}",
+            remediation="fix the TOML syntax",
+        ) from err
+    return RulesConfig.from_dict(data)
 
-    A MISSING file is NOT an error — it resolves to an empty
-    :class:`RulesConfig` ("no rules configured yet"). A PRESENT but malformed
-    file (bad TOML syntax, or content failing :meth:`RulesConfig.from_dict`)
-    raises :class:`~reachy.cli._errors.CliError` naming the problem.
+
+def load_shipped_rules() -> RulesConfig:
+    """Read + validate the SHIPPED layer (the read-only package resource).
+
+    An ABSENT resource resolves to an empty :class:`RulesConfig`; malformed
+    shipped content raises :class:`~reachy.cli._errors.CliError`, so a
+    packaging/content regression fails loudly in CI. At runtime the raise is
+    caught one level up (:func:`_shipped_layer`) — a defect in what WE ship
+    must never make an operator's own rules unloadable.
     """
+    text = shipped_rules_text()
+    if text is None:
+        return RulesConfig()
+    return _parse_rules_text(text, origin=f"{SHIPPED_RULES_PACKAGE}/{SHIPPED_RULES_RESOURCE}")
+
+
+def _shipped_layer() -> RulesConfig:
+    """:func:`load_shipped_rules`, degrading to empty (with one warning) on failure."""
+    try:
+        return load_shipped_rules()
+    except CliError as err:
+        logger.warning(
+            "shipped rules layer (%s/%s) is unusable, ignoring it: %s",
+            SHIPPED_RULES_PACKAGE,
+            SHIPPED_RULES_RESOURCE,
+            err.message,
+        )
+        return RulesConfig()
+
+
+def merge_rules(base: RulesConfig, overlay: RulesConfig) -> RulesConfig:
+    """Layer *overlay* over *base*, resolving collisions per RULE ID.
+
+    Precedence rules, all keyed on the rule ``id`` (which is already unique
+    across react + inhibit within one layer):
+
+    * an id in BOTH layers → the overlay's entry wins **wholesale**, keeping
+      the base's ordering position. Whole-entry replacement, never a
+      field-by-field merge: a rule's ``when``/``run``/``params`` are one
+      thought, and a half-shipped/half-local hybrid would be a rule nobody
+      wrote and no one can reason about. (The overlay may therefore also change
+      an id's kind from react to inhibit or back.)
+    * an id only in *base* → carried through untouched. This is what lets an
+      upgraded box gain newly shipped rules without touching its own file.
+    * an id only in *overlay* → appended after the base's entries.
+    * an id in ``overlay.disabled`` (an ``enabled = false`` tombstone) → removed
+      entirely. A tombstone naming an id no layer defines is inert, not an
+      error: a rule REMOVED upstream must not brick a box that had disabled it.
+
+    Modes merge by name (overlay wins per name), and the overlay's
+    ``active_mode`` wins only if it selects one.
+    """
+    overlay_by_id = {rule.id: rule for rule in (*overlay.react, *overlay.inhibit)}
+    disabled = base.disabled | overlay.disabled
+
+    ordered: list[Rule] = []
+    seen: set[str] = set()
+    for rule in (*base.react, *base.inhibit, *overlay.react, *overlay.inhibit):
+        if rule.id in seen:
+            continue
+        seen.add(rule.id)
+        winner = overlay_by_id.get(rule.id, rule)
+        if winner.id in disabled and winner.id not in overlay_by_id:
+            continue
+        ordered.append(winner)
+
+    modes = {**base.modes, **overlay.modes}
+    active_mode = overlay.active_mode if overlay.active_mode is not None else base.active_mode
+    if active_mode is not None and active_mode not in modes:  # pragma: no cover - defensive
+        active_mode = None
+
+    return RulesConfig(
+        react=tuple(r for r in ordered if r.kind == KIND_REACT),
+        inhibit=tuple(r for r in ordered if r.kind == KIND_INHIBIT),
+        modes=modes,
+        active_mode=active_mode,
+        disabled=frozenset(rule_id for rule_id in disabled if rule_id not in overlay_by_id),
+    )
+
+
+def load_rules(path: Path | None = None, *, include_shipped: bool = True) -> RulesConfig:
+    """Read + validate the rules for this box: shipped layer ⊕ box-local overlay.
+
+    *path* is the OVERLAY (default :func:`default_rules_path`). A MISSING
+    overlay is NOT an error — it resolves to the shipped layer alone ("no local
+    rules configured yet"). A PRESENT but malformed overlay (bad TOML syntax,
+    or content failing :meth:`RulesConfig.from_dict`) raises
+    :class:`~reachy.cli._errors.CliError` naming the problem — unchanged, so
+    ``behavior rules check`` still reports an operator's typo instead of
+    quietly hiding it behind the shipped layer. Degrading to the shipped layer
+    on a bad overlay is :class:`RulesLoader`'s job, where "keep serving
+    something" is the contract.
+
+    ``include_shipped=False`` reads the overlay alone — for tooling that needs
+    to see exactly what the box-local file says.
+    """
+    base = _shipped_layer() if include_shipped else RulesConfig()
+
     target = path if path is not None else default_rules_path()
     if not target.is_file():
-        return RulesConfig()
+        return base
 
     try:
         raw_text = target.read_text(encoding="utf-8")
@@ -601,34 +827,42 @@ def load_rules(path: Path | None = None) -> RulesConfig:
             remediation="check file permissions",
         ) from err
 
-    try:
-        data = tomllib.loads(raw_text)
-    except tomllib.TOMLDecodeError as err:
-        raise _error(
-            f"rules file {target} is not valid TOML: {err}",
-            remediation="fix the TOML syntax",
-        ) from err
-
-    return RulesConfig.from_dict(data)
+    overlay = _parse_rules_text(raw_text, origin=str(target))
+    return merge_rules(base, overlay)
 
 
 class RulesLoader:
     """A stateful :func:`load_rules` wrapper with last-good retention.
 
-    :meth:`reload` re-reads and re-validates the rules file. On success the new
-    config becomes :attr:`current` and :attr:`last_error` is cleared. On any
-    failure — bad TOML syntax, a schema-validation rejection, or an unreadable
-    file — :attr:`current` is left untouched (the previously good config, or
-    the all-empty default if there has never been a good one yet) and
-    :attr:`last_error` records why the candidate was rejected. ``reload`` never
-    raises, so a caller (e.g. a live-running engine) can poll it on an interval
-    without a momentarily-broken rules file ever taking rules away.
+    :meth:`reload` re-reads and re-validates BOTH layers (shipped ⊕ overlay).
+    On success the merged config becomes :attr:`current` and
+    :attr:`last_error` is cleared. On any failure — bad TOML syntax, a
+    schema-validation rejection, or an unreadable overlay — :attr:`current` is
+    left untouched and :attr:`last_error` records why the candidate was
+    rejected. ``reload`` never raises, so a caller (e.g. a live-running engine)
+    can poll it on an interval without a momentarily-broken rules file ever
+    taking rules away.
+
+    The two-layer model moves the FLOOR of that retention: :attr:`current`
+    starts at the SHIPPED layer, not at the all-empty config. So a box whose
+    overlay is malformed on the very first load — nothing good to fall back to
+    — still runs the shipped rules rather than nothing at all.
+
+    The shipped layer is read once, at construction: it is packaged data that
+    cannot change under a running process. The overlay is re-read on every
+    :meth:`reload`, which is the thing an operator actually edits live.
     """
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path if path is not None else default_rules_path()
-        self._current: RulesConfig = RulesConfig()
+        self._shipped: RulesConfig = _shipped_layer()
+        self._current: RulesConfig = self._shipped
         self._last_error: str | None = None
+
+    @property
+    def shipped(self) -> RulesConfig:
+        """The shipped layer alone — this loader's fallback floor."""
+        return self._shipped
 
     @property
     def path(self) -> Path:
@@ -637,8 +871,8 @@ class RulesLoader:
 
     @property
     def current(self) -> RulesConfig:
-        """The last successfully validated config (the all-empty default until
-        the first successful :meth:`reload`)."""
+        """The last successfully validated config (the SHIPPED layer until the
+        first successful :meth:`reload`)."""
         return self._current
 
     @property
@@ -648,12 +882,14 @@ class RulesLoader:
         return self._last_error
 
     def reload(self) -> RulesConfig:
-        """(Re)load :attr:`path`, keeping the last-good config on any failure.
+        """(Re)load both layers, keeping the last-good config on any failure.
 
         Returns the resulting :attr:`current` config either way — never raises.
+        A rejected candidate leaves the previously good merged config in force,
+        or — if none was ever good — the shipped layer.
         """
         try:
-            candidate = load_rules(self._path)
+            candidate = merge_rules(self._shipped, load_rules(self._path, include_shipped=False))
         except CliError as err:
             self._last_error = err.message
             logger.warning(
