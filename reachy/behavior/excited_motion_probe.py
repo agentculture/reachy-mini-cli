@@ -18,6 +18,17 @@ MODES = ("unheld", "held")
 CUES = {"unheld": "HANDS OFF", "held": "START HOLD"}
 SETTLED_EDGE_S = 0.5
 ARM_TIMEOUT_S = 18.0
+#: Arm anyway after this long with no settled edge, and capture a fixed window
+#: instead of an episode. Idle motion is CONTINUOUS since the dead-still hold was
+#: removed from feel-alive, so a settled edge may never arrive: measured against
+#: the shipped profile, the longest window with per-tick change below even
+#: 0.08 deg (a third of peak velocity) is 0.60 s against the 0.50 s this arming
+#: needs — too fragile to rely on. Falling back on elapsed time keeps the probe
+#: usable without pretending a still point exists.
+ARM_FALLBACK_S = 3.0
+#: How long a fallback-armed (continuous-motion) capture records before closing
+#: itself cleanly. Without a settled edge there is no episode end to wait for.
+CONTINUOUS_CAPTURE_S = 10.0
 MOTION_TIMEOUT_S = 13.0
 MAX_TICK_GAP_S = 0.1
 HEAD_AXES = ("x", "y", "z", "roll", "pitch", "yaw")
@@ -202,6 +213,9 @@ class ProbeDriver:
         self._previous: float | None = None
         self._samples = 0
         self._terminal = False
+        #: Armed on elapsed time rather than a settled edge (continuous idle
+        #: motion never provides one). Such a capture closes on duration.
+        self._continuous = False
 
     def __call__(self, ctx) -> None:  # type: ignore[no-untyped-def]
         """Observe one engine tick, walking the probe's fixed stage order.
@@ -305,8 +319,27 @@ class ProbeDriver:
             return None
         if not self._armed:
             self._try_arm(timestamp, vector, owner)
+            if not self._armed and timestamp - self._observation_start >= ARM_FALLBACK_S:
+                # No settled edge arrived. Idle motion is continuous since the
+                # dead-still hold was removed, so one may never arrive; arm on
+                # elapsed time and capture a fixed window instead of an episode.
+                self._continuous = True
+                self._armed = True
+                self._emit(
+                    {
+                        "schema": SCHEMA,
+                        "type": "probe_armed",
+                        "label": self._mode,
+                        "phase": "armed",
+                        "timestamp_s": timestamp,
+                        "owner": owner,
+                        "armed_on": "continuous_motion",
+                    }
+                )
             return None
         if vector == self._last_command:
+            # Under continuous motion the vector changes every tick, so this
+            # only holds for a genuinely still command — wait for real onset.
             return None
         self._motion_start = timestamp
         self._last_command = vector
@@ -386,6 +419,23 @@ class ProbeDriver:
         )
         self._previous = timestamp
         self._samples += 1
+
+        if self._continuous and elapsed >= CONTINUOUS_CAPTURE_S:
+            # No settled edge will come; close the fixed window cleanly rather
+            # than running to the motion timeout and reporting a refusal.
+            self._emit(
+                {
+                    "schema": SCHEMA,
+                    "type": "probe_end",
+                    "label": self._mode,
+                    "phase": "continuous",
+                    "timestamp_s": timestamp,
+                    "elapsed_s": elapsed,
+                    "samples": self._samples,
+                }
+            )
+            self._terminal = True
+            return
 
         if (
             phase == "settled"

@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 from reachy.behavior.excited_motion_probe import (
+    ARM_FALLBACK_S,
     ARM_TIMEOUT_S,
+    CONTINUOUS_CAPTURE_S,
     CUES,
     HEAD_AXES,
     MAX_TICK_GAP_S,
@@ -729,3 +731,52 @@ def test_invalid_mode_is_rejected_without_a_read() -> None:
     with pytest.raises(ValueError, match="mode"):
         ProbeDriver("unknown", reader, emit=lambda _record: None)
     assert source.calls == 0
+
+
+def test_continuous_motion_arms_on_fallback_and_closes_on_duration() -> None:
+    """The probe must still work now that idle motion never holds still.
+
+    Its original arming waited for the command vector to hold EXACTLY constant
+    across ``SETTLED_EDGE_S`` — a dead-still hold that feel-alive no longer
+    produces. Measured against the shipped profile, the longest window below a
+    third of peak velocity is 0.60 s, so no velocity threshold reliably yields
+    the 0.50 s that arming needed. It therefore arms on elapsed time instead and
+    captures a fixed window rather than an episode.
+    """
+    source = _Reader()
+    records: list[dict] = []
+    driver = _driver("held", SharedPoseReader(source), emit=records.append)
+
+    # Continuously moving command: a new pose every tick, forever.
+    t = 0.0
+    while t < ARM_FALLBACK_S + CONTINUOUS_CAPTURE_S + 2.0:
+        driver(_ctx(t, pitch=t * 0.7))
+        t += 0.02
+
+    armed = [r for r in records if r["type"] == "probe_armed"]
+    assert armed, "the probe never armed under continuous motion"
+    assert armed[0]["armed_on"] == "continuous_motion"
+
+    assert any(r["type"] == "sample" for r in records), "armed but never sampled"
+    assert source.calls > 0, "armed but never read the actual pose"
+
+    ends = [r for r in records if r["type"] == "probe_end"]
+    assert ends, "a continuous capture never closed"
+    assert ends[0]["phase"] == "continuous"
+    assert ends[0]["elapsed_s"] >= CONTINUOUS_CAPTURE_S
+    assert not any(r["type"] == "probe_refused" for r in records), "closed as a refusal"
+
+
+def test_a_settled_edge_still_wins_when_one_exists() -> None:
+    """The fallback must not pre-empt the original, more precise arming path."""
+    source = _Reader()
+    records: list[dict] = []
+    driver = _driver("held", SharedPoseReader(source), emit=records.append)
+
+    # A genuinely still command, well inside the fallback window.
+    for t in (0.0, 0.2, 0.4, SETTLED_EDGE_S + 0.1):
+        driver(_ctx(t, pitch=3.0))
+
+    armed = [r for r in records if r["type"] == "probe_armed"]
+    assert armed, "a settled edge failed to arm the probe"
+    assert "armed_on" not in armed[0], "a settled edge was misreported as a fallback arm"

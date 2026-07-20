@@ -169,13 +169,16 @@ def _run_side(
             baseline_alpha=0.0,
             level2_threshold_fn=lambda: 100.0,
         )
+        # `kwargs` already carries `still_hold_s`/`still_eps` from
+        # `_compose_run_seam` (t2's tuning surface) — with no env override that
+        # resolves to today's shipped default (0.5 / 0.01), same as this test
+        # relied on before, so no explicit override is needed here anymore.
         return RealPatSenseDriver(
             **kwargs,
             detector=detector,
             lag_tau=0.0,
             hp_tau=0.0,
             warmup_s=0.0,
-            still_hold_s=0.5,
             enough_after_fn=lambda: 9.0,
         )
 
