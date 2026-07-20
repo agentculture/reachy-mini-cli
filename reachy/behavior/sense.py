@@ -11,12 +11,12 @@ behavior reads "no reading" and yields rather than crashing.
 
 :class:`SenseProviders` + :func:`read_perception` are the seam for the other
 cues: a small, duck-typed bundle of injected zero-arg PEEK callables (never
-consuming reads) that a future engine composition can wire to the same shared
-per-tick sources the folded ``listen`` hooks already use (``PatHook``,
-``VisionHook``, ``FaceHook`` — see ``reachy/motion/listen_*.py``), so multiple
-consumers reading the same tick's sample never race or steal from one another.
-Not wired into :mod:`reachy.behavior.engine` yet — this module only defines the
-snapshot shape and the provider contract.
+consuming reads) wired to shared per-tick sources, so multiple consumers reading
+the same tick's sample never race or steal from one another. This module only
+defines the snapshot shape and the provider contract; the composition root
+(``_compose_run_seam`` in ``reachy.cli._commands.behavior``) is what supplies
+the concrete callables — today for every optional field (see
+:data:`_COMPOSED_PROVIDER_FIELDS`).
 
 Stdlib only, and it imports neither the transport nor the model package (it
 duck-types the transport's ``doa`` method, and every provider callable) so it
@@ -261,14 +261,23 @@ _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
     "pat_event": "pat",
     "face": "face",
     "frame_available": "frame_available",
+    "transcript": "transcript",
 }
 
 #: Which of the optional :class:`SenseProviders` attributes the CURRENT engine
 #: composition (``_compose_run_seam`` in ``reachy.cli._commands.behavior``)
-#: actually wires a live provider for. Today only ``pat_event``/``pat_state``
-#: (the folded pat-sense driver) are ever passed a real callable there —
-#: ``rms``/``face``/``frame_available`` have no provider yet, so nothing feeds
-#: them.
+#: actually wires a live provider for. Since t28 that is EVERY optional field:
+#: ``pat_event``/``pat_state`` (the folded pat-sense driver), ``rms`` (the shared
+#: per-tick mic chunk), ``transcript`` (the transcript driver's one-tick latch of
+#: an addressed utterance) and ``face``/``frame_available`` (the face driver's
+#: name latch and TTL-held camera condition).
+#:
+#: "Wired" is about the COMPOSITION, not the hardware: a box with no ``[sdk]``
+#: extra, no camera or no reachable STT still has these providers wired and
+#: simply reads "no reading" through them — the same distinction
+#: :data:`_ALWAYS_FED_FIELDS` draws for a mic-less box's DoA leg. A rule keyed
+#: on one of these is therefore live code, not a silent no-op, which is exactly
+#: what this set is asked to declare.
 #:
 #: THIS SET IS THE ONE DECLARED SOURCE OF TRUTH ``behavior rules check``
 #: (``reachy.cli._commands.behavior._unfed_field_warnings``) reads to warn on a
@@ -281,7 +290,9 @@ _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
 #: change that wires the provider — this is the only place that needs
 #: updating; nothing else duplicates this list, so the check can never drift
 #: from reality by forgetting a second copy.
-_COMPOSED_PROVIDER_FIELDS: frozenset[str] = frozenset({"pat_event"})
+_COMPOSED_PROVIDER_FIELDS: frozenset[str] = frozenset(
+    {"pat_event", "rms", "face", "frame_available", "transcript"}
+)
 
 #: The full set of predicate fields (``Predicate.field`` values) the current
 #: composition feeds a live reading for. A predicate keyed on any field

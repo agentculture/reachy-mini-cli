@@ -173,7 +173,7 @@ transport. Deep notes for the non-trivial nouns follow in
 | `daemon` | `_commands/daemon.py` | `reachy/daemon.py` (process mgmt, `is_robot_live`) | none |
 | `device`/`app`/`move` | `_commands/{device,app,move}.py` | `reachy/robot/*` transports | `http` default |
 | `demo-mode` | `_commands/demo_mode.py` | `reachy/alive.py`, `reachy/motion/idle.py`, `demo_config.py`, `demo_service.py` | `sdk`/`http` |
-| `behavior` | `_commands/behavior.py` | 50 Hz engine (`behavior/engine.py`) + rules/intents (`rules.py`/`rule_engine.py`/`intents.py`/`control.py`); composes proprioceptive pat sense (`pat_sense.py` + `robot/state_reader.py`) and a fail-closed live `goto` (`goto_intent.py` + `goto_lane.py`, seeded via `pose_feed.py`) onto the same tick seam | `sdk`/`http` |
+| `behavior` | `_commands/behavior.py` | 50 Hz engine (`behavior/engine.py`) + rules/intents (`rules.py`/`rule_engine.py`/`intents.py`/`control.py`); composes the full sense stack — proprioceptive pat (`pat_sense.py` + `robot/state_reader.py`), loudness (`rms_sense.py`), heard words (`transcript_sense.py`), face + frame availability (`face_sense.py`), all reading the one held `robot/media_client.py` — and a fail-closed live `goto` (`goto_intent.py` + `goto_lane.py`, seeded via `pose_feed.py`) onto the same tick seam | `sdk`/`http` |
 | `listen` | `_commands/listen.py` | `reachy/motion/listen.py` `ListenProducer`, `snap.py`, `listen_pat.py` `PatHook` (#43); `--live`: `listen_hooks.py` `HookChain` + `sense_sample.py` + `listen_{think,vision,sleep}.py` + `speech/voice.py` (`--voice-engine`, `--live` only) + `speech/agent_turn.py` `AgentTurnEngine` + `speech/tools.py` `ToolRegistry` (`--cognition agent`, `--live` only); `motion/supervisor.py` | `sdk` default |
 | `vision` | `_commands/vision.py` | pixel motion/light detectors, serial MotionQueue | `sdk` default |
 | `say` | `_commands/say.py` | `reachy/speech/{tts,harmonic,voice,playback}.py` | `sdk` default |
@@ -202,10 +202,42 @@ daemon restart (fixes issue #21).
 
 `reachy/cli/_commands/behavior.py::_compose_run_seam` composes every runtime
 sense/act piece onto the engine's ONE `TickBus`: `[rules_driver,
-intent_driver, pat_driver, holder, goto_lane]` (plus a `SenseSnapshotDriver`
-when exporting). Every piece below is import-safe without `reachy_mini` and
-composed UNCONDITIONALLY — a bare box (no `[sdk]` extra) runs unchanged
-except for an always-`None` pat field.
+intent_driver, pat_driver, transcript_driver, face_driver, holder, goto_lane]`
+(plus a `SenseSnapshotDriver` when exporting). Every piece below is import-safe
+without `reachy_mini` and composed UNCONDITIONALLY — a bare box (no `[sdk]` /
+`[vision]` extra) runs unchanged except for permanently-quiet sense fields.
+
+**The two held clients, and the warm-up pair.** The runtime process owns
+exactly TWO SDK clients (the single-SDK-owner model): `HeldStateReader`
+(`ReachyMini(media_backend='no_media')`, the pose read-back) and
+`HeldMediaClient` (the default profile — mic + camera, `reachy/robot/
+media_client.py`). Both are built with `allow_inline_connect=False` and warmed
+synchronously **during composition, before the first tick** — a pair that must
+never be split, because construction blocks for **425-1213 ms** and charging
+that to the tick thread is a measured 21x-61x tick-budget overrun on every
+runtime start (`docs/verification/2026-07-20-retire-old-flow-baseline.md`
+section 3). The flag alone silently disables the sense (reads never construct);
+the warm-up alone leaves a mid-run fault free to rebuild inline and reproduce
+the stall later. Warming on a background thread *after* ticking starts only
+relocates the stall. A failed warm is a NORMAL daemon-not-up-yet outcome, so
+`_HolderKeeper` (a background daemon thread) polls each holder's free
+`connected` predicate and re-warms off-thread for the life of the run — the
+tick thread never constructs. `_RuntimeResources` is what `cmd_engine_run`
+closes at shutdown (both clients + the worker-owning sense drivers); an
+unclosed client hangs the process at interpreter exit.
+
+**Sense providers — all six wired.** `SenseProviders` carries `pat_event` /
+`pat_state` (two peeks of the ONE `PatSenseDriver`), `rms`
+(`behavior/rms_sense.py`), `transcript` (`behavior/transcript_sense.py`, a
+background STT worker + the #54/#56 engagement gate) and `face` /
+`frame_available` (`behavior/face_sense.py`, a background YuNet/SFace worker).
+`rms` and the transcript driver are two consumers of ONE *consuming*
+`media.audio()` read, so `_AudioTap` pulls the chunk once per tick (at the top
+of `sense_reader`) and fans it out — reading it twice would hand each consumer
+half the audio. **When you wire a new provider here you MUST extend
+`reachy/behavior/sense.py`'s `_COMPOSED_PROVIDER_FIELDS` in the same change** —
+it is the one declared source of truth `behavior rules check` lints against, so
+a stale value makes the linter lie in one direction or the other.
 
 - **Pat sense** — `reachy/robot/state_reader.py` `HeldStateReader` holds ONE
   `ReachyMini(media_backend='no_media')` client for the process lifetime

@@ -213,9 +213,14 @@ def test_rules_check_malformed_file_text_mode_still_exits_zero(capsys) -> None:
 # --------------------------------------------------------------------------- #
 
 # `rms` is a schema-valid predicate field (reachy.behavior.rules.SENSE_FIELDS)
-# but no provider feeds it in the current engine composition
-# (reachy.behavior.sense.FED_SENSE_FIELDS) — this rule validates cleanly and
-# then can never fire.
+# that a composition may or may not feed (reachy.behavior.sense.FED_SENSE_FIELDS).
+#
+# Since t28 wired the last providers, EVERY schema-valid field is fed, so no real
+# field reproduces the unfed case any more — the tests below shrink
+# `FED_SENSE_FIELDS` to simulate one. That is precisely the drift the warning now
+# guards against: a field added to `SENSE_FIELDS` with no provider wired for it
+# in the composition root, leaving a rule that validates cleanly and can never
+# fire.
 UNFED_FIELD_TOML = """\
 [[inhibit]]
 id = "i-rms"
@@ -249,7 +254,22 @@ disable = ["speak"]
 """
 
 
-def test_rules_check_warns_on_a_rule_keyed_to_an_unfed_field_json(capsys) -> None:
+def _simulate_unfed(monkeypatch, *fields: str) -> None:
+    """Pretend the composition feeds everything EXCEPT *fields*.
+
+    ``_unfed_field_warnings`` reads the module-global ``FED_SENSE_FIELDS``, so
+    shrinking it here exercises the real linter against the real rules file.
+    """
+    from reachy.behavior.sense import FED_SENSE_FIELDS
+
+    monkeypatch.setattr(
+        "reachy.cli._commands.behavior.FED_SENSE_FIELDS",
+        FED_SENSE_FIELDS - frozenset(fields),
+    )
+
+
+def test_rules_check_warns_on_a_rule_keyed_to_an_unfed_field_json(capsys, monkeypatch) -> None:
+    _simulate_unfed(monkeypatch, "rms")
     _write_rules(UNFED_FIELD_TOML)
     rc = main(["behavior", "rules", "check", "--json"])
     assert rc == 0  # a warning, not a failure
@@ -268,7 +288,8 @@ def test_rules_check_warns_on_a_rule_keyed_to_an_unfed_field_json(capsys) -> Non
     assert payload["counts"] == {"react": 0, "inhibit": 1, "modes": 0}
 
 
-def test_rules_check_warns_on_a_rule_keyed_to_an_unfed_field_text_mode(capsys) -> None:
+def test_rules_check_warns_on_a_rule_keyed_to_an_unfed_field_text_mode(capsys, monkeypatch) -> None:
+    _simulate_unfed(monkeypatch, "rms")
     _write_rules(UNFED_FIELD_TOML)
     rc = main(["behavior", "rules", "check"])
     assert rc == 0
@@ -286,7 +307,8 @@ def test_rules_check_a_rule_on_a_fed_field_never_warns(capsys) -> None:
     assert payload["warnings"] == []
 
 
-def test_rules_check_only_the_unfed_rule_is_flagged_in_a_mixed_file(capsys) -> None:
+def test_rules_check_only_the_unfed_rule_is_flagged_in_a_mixed_file(capsys, monkeypatch) -> None:
+    _simulate_unfed(monkeypatch, "face")
     _write_rules(MIXED_FIELD_TOML)
     rc = main(["behavior", "rules", "check", "--json"])
     assert rc == 0
