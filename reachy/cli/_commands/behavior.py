@@ -39,8 +39,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -58,6 +60,7 @@ from reachy.behavior.excited_motion_probe import (
     ProbeNamespaceGuard,
     SharedPoseReader,
 )
+from reachy.behavior.face_sense import FaceSenseDriver, build_face_recognition
 from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
 from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
@@ -72,6 +75,7 @@ from reachy.behavior.pat_sense import (
     PatSenseDriver,
 )
 from reachy.behavior.pose_feed import LastPoseHolder
+from reachy.behavior.rms_sense import make_rms_provider
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
@@ -83,6 +87,7 @@ from reachy.behavior.sense import (
     read_perception,
 )
 from reachy.behavior.tick_metrics import TickMetrics, budget_from_hz
+from reachy.behavior.transcript_sense import TranscriptSenseDriver
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
@@ -92,9 +97,12 @@ from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.runtime import SenseSnapshotDriver
 from reachy.motion.pat import PatDetector
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, INTERPOLATIONS
+from reachy.robot.media_client import HeldMediaClient
 from reachy.robot.state_reader import HeldStateReader
 from reachy.speech.distinctness import find_too_similar as _find_too_similar
 from reachy.speech.expressions import NEUTRAL_KEY, Catalog
+
+logger = logging.getLogger(__name__)
 
 _JSON_HELP = "Emit structured JSON."
 _EMPTY_SUBMITTED = "(submitted)"
@@ -1049,25 +1057,295 @@ def _pat_detector() -> PatDetector | None:
     )
 
 
+#: How often the background keeper re-checks each held client's free
+#: :attr:`connected` predicate (seconds). Deliberately faster than the holders'
+#: own 5 s retry backoff: the poll itself costs nothing (a pure attribute read),
+#: and the backoff — not this period — is what throttles actual reconnect
+#: attempts, so a shorter period only shortens the window between a daemon
+#: coming up and the sense noticing.
+HOLDER_KEEPER_PERIOD_S = 2.0
+
+#: Bounded join for the keeper thread at teardown.
+_KEEPER_JOIN_TIMEOUT_S = 2.0
+
+_WARM_STAGE = "warmup"
+
+
 def _make_state_reader() -> HeldStateReader:
     """Build the held, media-free SDK pose reader — a test-injection seam.
 
     Isolated as a module-level factory so a composition test can inject a fake
-    reader (recording ``read``/``close``) via ``monkeypatch.setattr`` without a
-    real SDK. In production it returns a bare
+    reader (recording ``warm_up``/``read``/``close``) via ``monkeypatch.setattr``
+    without a real SDK. In production it returns a
     :class:`~reachy.robot.state_reader.HeldStateReader`, which itself degrades to
     a permanently-``None`` reader (one logged warning, then no reading) when the
     ``[sdk]`` extra is absent — which is why :func:`_compose_run_seam` composes
     the enabled pat stack without gating on an SDK-import probe.
+
+    ``allow_inline_connect=False`` closes the on-tick-thread construction door,
+    and it is HALF of a pair that must never be split: with the door closed a
+    read can never construct, so a holder nobody warms is a silently DEAD sense.
+    :func:`_warm_holder` (at setup) and :class:`_HolderKeeper` (for a mid-run
+    drop) are the other half. Together they are what actually fixes the measured
+    425-1213 ms startup tick overruns — the connect is charged to setup, where
+    there is no 20 ms budget to blow.
     """
-    return HeldStateReader()
+    return HeldStateReader(allow_inline_connect=False)
+
+
+def _make_media_client() -> HeldMediaClient:
+    """Build the ONE held media client (mic + camera) — a test-injection seam.
+
+    The media-side sibling of :func:`_make_state_reader`, with the same
+    inline-connect discipline and for a stronger reason: the full media profile
+    warms SLOWER than the ``no_media`` pose handle, so an inline connect on the
+    tick thread would add a second, larger stall on top of the one t27/t28 exist
+    to remove.
+
+    This is the runtime's single media owner (the single-SDK-owner model in
+    ``CLAUDE.md``): the rms, transcript, face and frame-available senses all read
+    through THIS object, never their own client. It degrades to permanently-quiet
+    on a bare box (no ``[sdk]`` extra), so it is composed unconditionally.
+    """
+    return HeldMediaClient(allow_inline_connect=False)
+
+
+def _warm_holder(holder, *, label: str) -> bool:
+    """Construct *holder*'s client NOW, on the caller's (setup) thread.
+
+    Returns whether a live client is held. A ``False`` is a NORMAL outcome, not a
+    fault: the daemon may simply not be up yet (systemd orders the daemon unit
+    before a presence unit but does not wait for its readiness), so it is logged
+    as a named drop and left to :class:`_HolderKeeper` to retry.
+
+    The two failure modes are deliberately NOT treated alike. A holder that
+    *fails* to warm degrades quietly (above); a holder with no ``warm_up`` at all
+    is a WIRING bug — no runtime condition can produce one — so the attribute
+    lookup sits outside the guard and its ``AttributeError`` propagates. A
+    swallowed one would silently skip the warm-up on a holder built with
+    ``allow_inline_connect=False``, which is precisely the dead-sense/stalled-tick
+    pair this function exists to prevent.
+    """
+    warm_up = holder.warm_up
+    try:
+        warmed = bool(warm_up())
+    except Exception as err:  # noqa: BLE001 — a warm-up fault must not block boot
+        logger.warning("behavior: %s holder warm-up raised (%s); sense degraded", label, err)
+        senselog.drop(_WARM_STAGE, label, "setup", f"warm-up raised ({err}); keeper will retry")
+        return False
+    if warmed:
+        senselog.stage(_WARM_STAGE, label, "setup", "warmed before the first tick")
+    else:
+        # Never a fault — see the docstring. Named, so it is never a silent no-op.
+        senselog.drop(
+            _WARM_STAGE, label, "setup", "no client yet (daemon not up?); keeper will retry"
+        )
+    return warmed
+
+
+class _HolderKeeper:
+    """Re-warm a dropped held client OFF the tick thread, for the run's lifetime.
+
+    The explicit answer to "what happens when a warm-up fails, or a live client
+    drops mid-run?". With ``allow_inline_connect=False`` a read can never rebuild
+    the client, so without this the first failure would mean a DEAD sense for the
+    rest of the run — on a boot-persistent presence unit that starts alongside
+    the daemon, that is the common case, not the rare one, and it would leave a
+    rebooted robot deaf and blind until a human restarted it.
+
+    The policy is therefore: poll each holder's free :attr:`connected` predicate
+    on a background daemon thread and call ``warm_up()`` only when it reads
+    ``False``. Two properties make that safe against the holders' documented
+    "not thread-safe" note:
+
+    * a DISCONNECTED holder is inert on the tick thread — with the inline door
+      closed, a read only observes ``_client is None`` and returns "no reading";
+      it mutates nothing — so the only thread mutating the holder is this one;
+    * ``warm_up`` is idempotent, never raises, and its own retry backoff
+      throttles the real reconnect attempts, so a fast poll cannot storm.
+
+    Every probe is guarded: a raising holder is logged and polled again, never
+    fatal to the keeper.
+    """
+
+    def __init__(
+        self,
+        holders,
+        *,
+        period: float = HOLDER_KEEPER_PERIOD_S,
+        join_timeout: float = _KEEPER_JOIN_TIMEOUT_S,
+    ) -> None:
+        self._holders = [(label, holder) for label, holder in holders if holder is not None]
+        self._period = max(0.0, float(period))
+        self._join_timeout = max(0.0, float(join_timeout))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Spawn the keeper thread. A no-op when there is nothing to keep."""
+        if self._thread is not None or not self._holders:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="behavior-holder-keeper", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the keeper with a bounded join. Idempotent."""
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self._join_timeout)
+
+    def poll_once(self) -> None:
+        """One sweep: re-warm every holder that is not currently connected."""
+        for label, holder in self._holders:
+            if self._stop.is_set():
+                return
+            try:
+                if holder.connected:
+                    continue
+            except Exception as err:  # noqa: BLE001 — a raising probe is not a verdict
+                logger.debug("behavior: %s liveness probe raised (%s)", label, err)
+                continue
+            if _warm_holder(holder, label=label):
+                senselog.stage(_WARM_STAGE, label, "keeper", "re-warmed after a drop")
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.poll_once()
+            except Exception:  # noqa: BLE001 — the keeper must outlive any single sweep
+                logger.warning("behavior: holder keeper sweep raised; continuing", exc_info=True)
+            self._stop.wait(self._period)
+
+
+class _AudioTap:
+    """ONE mic read per tick, fanned out to every audio consumer.
+
+    ``HeldMediaClient.audio()`` is a CONSUMING read of the single-consumer media
+    subsystem: calling it twice in a tick would hand each consumer half the
+    audio. Two consumers need it — the ``rms`` provider (read at the START of the
+    tick, when perception is composed) and the transcript driver (which runs at
+    the END of the tick) — so composition, not either module, owns the fan-out.
+    This is the ``SenseSample`` pattern the folded ``listen`` loop already uses,
+    restated for the engine's tick seam.
+
+    :meth:`pull` is called once per tick from the sense reader and is idempotent
+    within a tick (guarded on the tick's clock value), so a second perception
+    read in the same tick cannot steal a chunk. Both consumers then see the
+    identical chunk via :meth:`audio`. Also duck-types ``samplerate`` /
+    ``channels`` so it can be injected wherever the media client itself would be
+    for an audio-only consumer.
+    """
+
+    def __init__(self, media) -> None:
+        self._media = media
+        self._chunk = None
+        self._pulled_at: float | None = None
+
+    def pull(self, t: float | None = None) -> None:
+        """Read this tick's chunk once. Never raises — a fault is "no audio"."""
+        if t is not None and t == self._pulled_at:
+            return
+        self._pulled_at = t
+        try:
+            self._chunk = self._media.audio()
+        except Exception as err:  # noqa: BLE001 — a read fault degrades to no audio
+            logger.debug("behavior: mic read raised (%s); no audio this tick", err)
+            self._chunk = None
+
+    def audio(self):
+        """This tick's mic chunk (or ``None``) — a non-consuming PEEK."""
+        return self._chunk
+
+    @property
+    def samplerate(self):
+        return getattr(self._media, "samplerate", None)
+
+    @property
+    def channels(self):
+        return getattr(self._media, "channels", None)
+
+
+class _RuntimeResources:
+    """Everything :func:`_compose_run_seam` opened that the caller MUST release.
+
+    ``cmd_engine_run`` used to close a single held pose reader; the runtime now
+    owns two held SDK clients plus two driver-owned worker threads, so the
+    teardown travels as one object rather than a growing tuple. ``close()`` is
+    idempotent, releases in reverse dependency order (keeper, then drivers that
+    READ the holders, then the holders themselves), and never raises — a failing
+    teardown step must not stop the remaining ones, because an unclosed client
+    hangs the process at interpreter exit.
+    """
+
+    def __init__(self, *, pose_reader=None, media=None, drivers=(), keeper=None) -> None:
+        self.pose_reader = pose_reader
+        self.media = media
+        self.drivers = tuple(driver for driver in drivers if driver is not None)
+        self.keeper = keeper
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.keeper is not None:
+            self._release(self.keeper.stop, "holder keeper")
+        for driver in self.drivers:
+            self._release(driver.close, f"{type(driver).__name__}")
+        if self.media is not None:
+            self._release(self.media.close, "media client")
+        if self.pose_reader is not None:
+            self._release(self.pose_reader.close, "pose reader")
+
+    @staticmethod
+    def _release(close, what: str) -> None:
+        try:
+            close()
+        except Exception:  # noqa: BLE001 — one failing teardown must not skip the rest
+            logger.warning("behavior: closing the %s raised; continuing", what, exc_info=True)
+
+
+def _engagement_classifier():
+    """The transcript gate's optional LLM classifier, or ``None``.
+
+    Mirrors ``listen --live --transcribe``'s own builder so the symbolic runtime
+    applies the SAME layered engagement gate the retiring loop applied: name
+    fast-path, then one "is this addressed to me, in context?" call, then a
+    heuristic fallback. Imported lazily and built defensively — construction does
+    no network I/O, and a build fault leaves the gate on the pure heuristic
+    rather than disabling hearing.
+
+    ``REACHY_ENGAGE_HEURISTIC`` short-circuits it entirely: the driver would
+    ignore an injected classifier anyway, so no classifier is built at all.
+    """
+    from reachy.behavior.transcript_sense import _env_truthy  # local: stdlib-only helper
+
+    if _env_truthy(os.environ.get("REACHY_ENGAGE_HEURISTIC")):
+        return None
+    try:
+        from reachy.speech.engagement import EngagementClassifier
+
+        # No base_url/model/api_key overrides — llm.complete resolves the one
+        # REACHY_OPENAI_* endpoint, the same backend any external cognition uses.
+        return EngagementClassifier()
+    except Exception:  # noqa: BLE001 — a build fault must not disable hearing
+        logger.warning(
+            "behavior: engagement classifier unavailable; the transcript gate "
+            "stays on the heuristic",
+            exc_info=True,
+        )
+        return None
 
 
 def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer, probe=None):
-    """Build ``behavior engine run``'s sense reader + tick seam + held pose reader.
+    """Build ``behavior engine run``'s sense reader + tick seam + owned resources.
 
     Composes runtime sense/act pieces onto the engine's ONE per-tick seam and
-    returns ``(sense_reader, tick_seam, reader)``. Everything rides ONE
+    returns ``(sense_reader, tick_seam, resources)``. Everything rides ONE
     :class:`TickBus` wrapped in :class:`TickMetrics`, so a tick-budget breach
     surfaces as a ``[SENSE ... event=overrun]`` line (c22).
 
@@ -1080,31 +1358,72 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     Perception (``sense_reader``)
     -----------------------------
     Each tick's :class:`~reachy.behavior.sense.Sense` is
-    ``read_perception(SenseProviders(pat_event=..., pat_state=...),
-    base=doa_poller(t))``: the
+    ``read_perception(providers, base=doa_poller(t))``: the
     :class:`~reachy.behavior.sense.DoaPoller` supplies the throttled DoA/speech
-    leg (its own low-rate polling + failure-swallowing preserved), while the pat
-    legacy cue is a non-consuming PEEK of the pat driver's one-tick latch, while
-    the persistent state is a second PEEK of that same driver — so both views
-    describe one held reader and detector. A mic-less box reads EMPTY_SENSE for
-    the DoA leg exactly as before.
+    leg (its own low-rate polling + failure-swallowing preserved), and every
+    other field is a non-consuming PEEK of a driver's one-tick latch or held
+    condition. A mic-less box reads EMPTY_SENSE for the DoA leg exactly as
+    before. Six providers are wired, from four producers:
 
-    Degrade contract (no ``[sdk]`` extra)
-    -------------------------------------
-    The SDK sense stack (:class:`HeldStateReader` + :class:`PatDetector` +
-    :class:`PatSenseDriver` + :class:`LastPoseHolder`) is ALWAYS composed: every
-    piece is import-safe without ``reachy_mini``, and :class:`HeldStateReader`
-    degrades internally to permanently-``None`` when the extra is absent (one
-    logged warning, then no reading). So on a bare box the engine behaves exactly
-    as before EXCEPT for a few inert drivers — the pat driver reads ``None`` every
-    tick (no pat events, no errors), the holder harmlessly stashes each pose, and
-    an empty goto lane is a per-tick no-op — i.e. DoA-only sense, no pat, no
-    exceptions. The goto path itself needs no SDK, so it still works.
+    * ``pat_event`` / ``pat_state`` — two PEEKs of the ONE
+      :class:`PatSenseDriver`, so both views describe one held reader and
+      detector;
+    * ``rms`` — :func:`~reachy.behavior.rms_sense.make_rms_provider` over this
+      tick's shared mic chunk;
+    * ``transcript`` — the :class:`TranscriptSenseDriver`'s one-tick latch of an
+      ADDRESSED utterance (its STT round trip and engagement gate run on the
+      driver's own worker thread, never here);
+    * ``face`` / ``frame_available`` — the :class:`FaceSenseDriver`'s one-tick
+      name latch and TTL-held camera condition (detection likewise runs on that
+      driver's worker).
+
+    Wiring these is what makes ``rms``/``face``/``frame_available``/``transcript``
+    FED fields: before this, each was a schema-valid ``rules.toml`` predicate
+    that validated cleanly and then silently never fired. The declared truth
+    ``behavior rules check`` lints against
+    (:data:`reachy.behavior.sense.FED_SENSE_FIELDS`) moves in lockstep with this
+    function — see that module's contract note.
+
+    ONE mic read per tick
+    ---------------------
+    ``rms`` and the transcript driver are two consumers of the SAME consuming
+    ``media.audio()`` read, so :class:`_AudioTap` pulls it ONCE at the top of the
+    tick (in ``sense_reader``) and both read that chunk. Neither module opens a
+    media source of its own; both take an injected one, and this is the only
+    place that decides there is exactly one.
+
+    Held clients: warmed HERE, before the first tick
+    ------------------------------------------------
+    Both holders — the ``no_media`` pose reader and the media client — are
+    constructed with ``allow_inline_connect=False`` and warmed synchronously
+    during composition, which runs before ``engine_run`` ticks anything. That
+    ordering IS the fix for the reproducible 425-1213 ms startup tick overruns
+    (21x-61x over a 20 ms budget, measured on every runtime start —
+    ``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 3): the
+    blocking connect is charged to setup, which has no tick budget. Warming them
+    on a background thread *after* ticking begins would merely relocate the
+    stall, and warming without the flag would leave a mid-run fault free to
+    reconstruct inline and reproduce it later in the run. A failed warm is normal
+    (the daemon may still be starting); :class:`_HolderKeeper` re-warms off-thread
+    for the life of the run.
+
+    Degrade contract (no ``[sdk]``/``[vision]`` extra)
+    --------------------------------------------------
+    The whole sense stack is composed UNCONDITIONALLY: every piece is import-safe
+    without ``reachy_mini`` and ``cv2``, and each holder degrades internally to
+    permanently-quiet when its extra is absent (one logged warning, then no
+    reading). So on a bare box the engine behaves exactly as before EXCEPT for a
+    few inert drivers — the pat driver reads ``None`` every tick, the mic chunk is
+    always ``None`` (no rms, no utterances, no STT request ever made), the camera
+    condition stays ``False`` and :func:`build_face_recognition` returns ``None``
+    so the face driver starts no worker — i.e. DoA-only sense, no exceptions. The
+    goto path needs no SDK, so it still works.
 
     Act-in seams (the ONE TickBus, in driver order)
     -----------------------------------------------
-    ``[rules_driver, intent_driver, pat_driver, holder, goto_lane]`` (with a
-    :class:`SenseSnapshotDriver` appended when exporting):
+    ``[rules_driver, intent_driver, pat_driver, transcript_driver, face_driver,
+    holder, goto_lane]`` (with a :class:`SenseSnapshotDriver` appended when
+    exporting):
 
     * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
       decisions (admit/evict, drain the intent + goto command spools). The GOTO
@@ -1122,6 +1441,12 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       shared engine state and only latches, so its position among the readers is
       immaterial to correctness; it sits after the symbolic drivers by
       convention.
+    * ``transcript_driver`` / ``face_driver`` — the other two latching sense
+      drivers, grouped with the pat driver for the same reason: each clears its
+      latch, does bounded O(1) tick-thread work, and latches for the NEXT tick's
+      sense read. Neither mutates engine state, so their order among themselves
+      is immaterial; they are ordered after the pat driver by convention, and
+      before the pose holder so the act-in half of the seam stays contiguous.
     * ``holder`` BEFORE ``goto_lane`` — the holder stashes this tick's streamed
       ``ctx.pose``; the goto lane's ``start_pose_provider`` peeks that stash when
       it admits a goto. Running the holder first means a goto admitted THIS tick
@@ -1131,14 +1456,19 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       snapshot on change; it reads the fixed ``ctx.sense`` so its position is
       immaterial, appended last so the sense block trails the decisions.
 
-    The returned ``reader`` is the held SDK client the caller MUST ``close()`` at
-    shutdown (an unclosed ``no_media`` client hangs the process at interpreter
-    exit — see :mod:`reachy.robot.state_reader`).
+    The returned ``resources`` bundles every held client and worker-owning driver
+    the caller MUST ``close()`` at shutdown (an unclosed client hangs the process
+    at interpreter exit, whatever its profile — see
+    :mod:`reachy.robot.state_reader`).
     """
     doa_poller = DoaPoller(lambda: read_doa(transport))
 
     if probe is not None:
+        # Observation-only: no media owner, no sense providers, no acting
+        # drivers. The pose reader is still warmed at setup — the probe ticks at
+        # the same 50 Hz and would take the same startup overrun otherwise.
         reader = _make_state_reader()
+        _warm_holder(reader, label="state")
         shared_reader = SharedPoseReader(reader.read)
         mode, probe_emit = probe
         providers = SenseProviders()
@@ -1155,10 +1485,12 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             drivers.append(SenseSnapshotDriver())
             consumers.append(runtime_consumer)
         bus = TickBus(drivers=drivers, consumers=consumers)
+        keeper = _HolderKeeper([("state", reader)])
+        keeper.start()
         return (
             probe_sense_reader,
             TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)),
-            reader,
+            _RuntimeResources(pose_reader=reader, keeper=keeper),
         )
 
     # The pat sense stack ships ON after the hands-on #80 gate finding: the
@@ -1189,16 +1521,50 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         if release_after is not None:
             pat_kwargs["release_after_s"] = release_after
         pat_driver = PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
+
+    # The ONE media owner, and the two senses that read through it. Composed
+    # unconditionally: both degrade to permanently-quiet without their extras.
+    media = _make_media_client()
+    audio_tap = _AudioTap(media)
+    transcript_driver = TranscriptSenseDriver(
+        media=audio_tap,  # the shared per-tick chunk, never a second mic read
+        classifier=_engagement_classifier(),
+    )
+    recognition = build_face_recognition()
+    face_driver = FaceSenseDriver(
+        media=media,
+        engine=recognition[0] if recognition is not None else None,
+        store=recognition[1] if recognition is not None else None,
+    )
+
+    # Warm BOTH held clients here, on the setup thread, before anything ticks.
+    # Sequential and in this order on purpose: the ``no_media`` pose handle is
+    # the cheaper of the two to bring up, so the shipped, load-bearing pat sense
+    # is live soonest. They are NOT warmed in parallel — two concurrent SDK
+    # client constructions is an unverified claim about the SDK, and setup has no
+    # tick budget to protect, so there is nothing to buy with the risk.
+    if reader is not None:
+        _warm_holder(reader, label="state")
+    _warm_holder(media, label="media")
+    keeper = _HolderKeeper([("state", reader), ("media", media)])
+    keeper.start()
+
     holder = LastPoseHolder()
     providers = SenseProviders(
         pat_event=pat_driver.as_provider() if pat_driver is not None else None,
         pat_state=pat_driver.as_state_provider() if pat_driver is not None else None,
+        rms=make_rms_provider(audio_tap.audio),
+        transcript=transcript_driver.as_provider(),
+        face=face_driver.as_face_provider(),
+        frame_available=face_driver.as_frame_available_provider(),
     )
 
     def sense_reader(t):
-        # DoA (throttled by the poller) as the base; the pat cue (when the
-        # enabled stack is composed) is peeked in legacy-event and persistent-
-        # state forms from the same driver.
+        # Take the tick's ONE mic read first, so the rms provider below and the
+        # transcript driver later in this same tick share the identical chunk.
+        audio_tap.pull(t)
+        # DoA (throttled by the poller) as the base; every other field is a
+        # non-consuming peek of a driver's latch or held condition.
         return read_perception(providers, base=doa_poller(t))
 
     goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
@@ -1211,14 +1577,30 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
 
     drivers = [
-        d for d in (rules_driver, intent_driver, pat_driver, holder, goto_lane) if d is not None
+        d
+        for d in (
+            rules_driver,
+            intent_driver,
+            pat_driver,
+            transcript_driver,
+            face_driver,
+            holder,
+            goto_lane,
+        )
+        if d is not None
     ]
     consumers = []
     if runtime_consumer is not None:
         drivers.append(SenseSnapshotDriver())
         consumers.append(runtime_consumer)
     bus = TickBus(drivers=drivers, consumers=consumers)
-    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), reader
+    resources = _RuntimeResources(
+        pose_reader=reader,
+        media=media,
+        drivers=(transcript_driver, face_driver),
+        keeper=keeper,
+    )
+    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), resources
 
 
 def _probe_engine_is_fresh() -> bool:
@@ -1326,7 +1708,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     rules_driver = None if probe_mode is not None else _boot_tick_seam()
     engine_control = ProbeCommandGuard(spool) if probe_mode is not None else spool
     probe_stream = None
-    reader = None
+    resources = None
     runtime_consumer = None
     try:
         probe = None
@@ -1342,7 +1724,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         # Runtime-events export sink (None unless --export -); this remains
         # separate from the cognition feed and carries runtime events only.
         runtime_consumer = build_runtime_export_consumer(args)
-        sense_reader, tick_seam, reader = _compose_run_seam(
+        sense_reader, tick_seam, resources = _compose_run_seam(
             transport, config, rules_driver, runtime_consumer, probe=probe
         )
 
@@ -1362,8 +1744,10 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         )
     finally:
         # Covers output-open, export setup, seam composition, and engine_run.
-        if reader is not None:
-            reader.close()
+        # `resources` owns BOTH held SDK clients plus the worker-owning sense
+        # drivers; an unclosed client hangs the process at interpreter exit.
+        if resources is not None:
+            resources.close()
         if probe_stream is not None:
             probe_stream.close()
     if runtime_consumer is not None:

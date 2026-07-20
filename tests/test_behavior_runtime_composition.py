@@ -74,16 +74,31 @@ class _SpeechTransport(_QuietTransport):
 class _ScriptedReader:
     """A fake HeldStateReader: ``read()`` walks a scripted ``(pitch, yaw)`` list.
 
-    Duck-types the two methods the composition uses — ``read`` (the pat driver's
-    actual-pose source) and ``close`` (the shutdown teardown) — and records both
-    so a test can assert the reader was consulted and released.
+    Duck-types the members the composition uses — ``warm_up`` (t28's setup-thread
+    connect), ``connected`` (what the holder keeper polls), ``read`` (the pat
+    driver's actual-pose source) and ``close`` (the shutdown teardown) — and
+    records them so a test can assert the reader was warmed, consulted and
+    released.
+
+    ``warm_up``/``connected`` are here rather than guarded at the call site
+    deliberately: the composition warms its holders UNCONDITIONALLY, so a
+    ``getattr``-guarded call would let a real holder that silently lost its
+    warm-up slip through unnoticed — reintroducing exactly the 425-1213 ms
+    startup overrun t28 exists to remove. The fake models the real shape instead.
     """
 
     def __init__(self, script):
         self._script = list(script)
         self._i = 0
         self.reads = 0
+        self.warm_calls = 0
+        self.connected = False
         self.closed = False
+
+    def warm_up(self):
+        self.warm_calls += 1
+        self.connected = True
+        return True
 
     def read(self):
         self.reads += 1
@@ -466,12 +481,17 @@ def test_still_tuning_env_vars_do_not_enable_pat_sense_when_toggle_is_off(_isola
 
     transport = _QuietTransport()
     config = EngineConfig(compose_hz=50, base_layer=False, settle=False)
-    _sense_reader, _tick_seam, reader = behavior_mod._compose_run_seam(
+    _sense_reader, _tick_seam, resources = behavior_mod._compose_run_seam(
         transport, config, None, None
     )
+    resources.close()
 
     assert calls == [], "PatSenseDriver must not be constructed when REACHY_PAT_SENSE is off"
-    assert reader is None
+    # The pose reader is the pat sense's own holder, so it is not opened at all;
+    # the media client is a separate, unconditional resource (t28), which is why
+    # the seam now returns a resource bundle rather than the bare reader.
+    assert resources.pose_reader is None
+    assert resources.media is not None
 
 
 @pytest.mark.parametrize(

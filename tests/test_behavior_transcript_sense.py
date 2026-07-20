@@ -160,15 +160,34 @@ def _driver(media: _Media, **kw) -> TranscriptSenseDriver:
 
 
 def _speak(driver, media: _Media, t: float, *, chunks: int = 6, doa: float | None = None) -> float:
-    """Drive ``chunks`` loud ticks then enough quiet ticks to endpoint the utterance."""
+    """Drive ``chunks`` loud ticks then enough quiet ticks to endpoint the utterance.
+
+    Stops the moment the utterance reaches the worker (``submitted`` advances).
+    That closes a genuine race rather than papering over one: the one-tick latch
+    is written by whichever tick drains the ready queue, so ANY tick driven here
+    after the handoff can adopt the transcript — and the tick after that clears
+    it again. Callers wait for the worker and then drive one explicit tick to
+    observe the latch, so if this helper kept ticking past the handoff, a worker
+    that finished early (a scheduling accident, far likelier under parallel load)
+    could consume the transcript inside the helper and leave the caller peeking
+    at an already-cleared latch. With the shipped test tuning submission lands on
+    the 3rd of 5 quiet ticks, leaving exactly two such ticks — the shape of the
+    ~6%, load-only flake seen in
+    ``test_the_direction_of_the_utterance_is_latched_alongside_the_words``.
+
+    A sub-floor blip never submits, so those tests still get all five quiet ticks.
+    """
     for _ in range(chunks):
         media.next_chunk = _loud()
         driver(_ctx(t, doa))
         t += DT
+    submitted_before = driver.submitted
     for _ in range(5):
         media.next_chunk = _quiet()
         driver(_ctx(t, doa))
         t += DT
+        if driver.submitted > submitted_before:
+            break
     return t
 
 
@@ -297,7 +316,9 @@ def test_an_unreachable_stt_leaves_the_field_none_and_drops_no_ticks() -> None:
         assert driver.peek() is None
         assert driver.transcripts == 0
         assert driver.ticks == media.calls  # every tick ran; none dropped
-        assert driver.ticks == 4 * 11 + 20
+        # 6 loud + 3 quiet ticks per utterance: `_speak` stops at the handoff
+        # (the 3rd quiet tick is the one that endpoints and submits).
+        assert driver.ticks == 4 * 9 + 20
     finally:
         driver.close()
 

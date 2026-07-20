@@ -284,14 +284,18 @@ def test_pat_is_fed_by_the_current_composition() -> None:
     assert "pat" in FED_SENSE_FIELDS
 
 
-def test_rms_and_face_are_not_yet_fed_by_any_composition() -> None:
-    """Nothing in ``_compose_run_seam`` wires an ``rms``/``face`` provider
-    today (see ``reachy.cli._commands.behavior._compose_run_seam`` — only
-    ``pat_event``/``pat_state`` are ever passed to ``SenseProviders``). A rule
-    keyed on either field validates cleanly and then never fires — exactly the
-    silent no-op ``behavior rules check`` now warns about. This test is a
-    canary: when a future composition wires a real provider for one of these
-    (t11/t12/t13 -> t28), update ``FED_SENSE_FIELDS`` in the SAME change, which
-    will flip this assertion — that is the intended, single-place update.
+def test_every_sense_field_is_fed_by_the_current_composition() -> None:
+    """t28 wired the last unfed providers, and this canary flipped as designed.
+
+    It previously asserted the opposite — that ``rms``/``face`` had no provider
+    and a rule keyed on either validated cleanly and then never fired. t28's
+    composition root now wires ``rms`` (the shared per-tick mic chunk),
+    ``transcript``, ``face`` and ``frame_available``, so every predicate field
+    ``rules.py`` accepts is genuinely fed and ``behavior rules check`` has
+    nothing left to warn about. The assertion stays in place inverted, so the
+    NEXT drift (a new predicate field added to ``SENSE_FIELDS`` with nothing
+    feeding it) is caught here rather than discovered as a silently dead rule.
     """
-    assert not ({"rms", "face"} & FED_SENSE_FIELDS)
+    from reachy.behavior.rules import SENSE_FIELDS
+
+    assert FED_SENSE_FIELDS == SENSE_FIELDS

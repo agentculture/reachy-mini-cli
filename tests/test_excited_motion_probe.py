@@ -364,7 +364,12 @@ def test_cli_engine_run_wires_passive_probe_without_extra_sends(
     class Held:
         def __init__(self) -> None:
             self.calls = 0
+            self.connected = False
             self.closed = False
+
+        def warm_up(self) -> bool:
+            self.connected = True
+            return True
 
         def read(self):  # type: ignore[no-untyped-def]
             self.calls += 1
@@ -466,7 +471,12 @@ cooldown_s = 0.0
             self.samples = iter([(-3.0, 0.0), (0.0, 0.0), (-3.0, 0.0)])
             self.last = (0.0, 0.0)
             self.calls = 0
+            self.connected = False
             self.closed = False
+
+        def warm_up(self) -> bool:
+            self.connected = True
+            return True
 
         def read(self):  # type: ignore[no-untyped-def]
             self.calls += 1
