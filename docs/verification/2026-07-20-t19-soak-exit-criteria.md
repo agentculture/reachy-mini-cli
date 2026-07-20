@@ -219,8 +219,8 @@ Filled in as the gate is executed. A dash means not yet run.
 
 | Check | Result | Evidence |
 |---|---|---|
-| C1 media acquired | — | |
-| C2 quiet room | — | |
+| C1 media acquired | **PASS** (2026-07-20 + re-verified on every 07-21 restart) | `available: true, released: false` with the runtime active; journal `media acquired from the daemon` → `connected (default media profile, recording)` |
+| C2 quiet room | **PASS** (formal, 2026-07-21 ~02:05, 5 min, empty room) | 0 `->SPEECH`, 0 `->ENGAGED`, 0 latch lines. Residual NOISE-tier antenna blinks traced to the drifting mic background — see `2026-07-21-live-verification-night.md` §3–4 and #102 (t36) |
 | C3 pat | — | |
 | C4 words + audible | — | |
 | C5 sound + orient | — | |
