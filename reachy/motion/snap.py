@@ -6,7 +6,9 @@ dependencies beyond ``numpy`` and the standard library.
 
 Algorithm:
 - Maintain a rolling window (deque, maxlen=*history*) of recent per-chunk RMS values.
-- Per chunk: ``rms = sqrt(mean(audio**2))``.
+- Per chunk: ``rms = sqrt(mean(audio**2))`` — via :func:`reachy.motion.rms.compute_rms`,
+  the one shared definition of loudness (also reused by
+  :mod:`reachy.behavior.rms_sense`'s symbolic-runtime sense provider, task t12).
 - ``rolling_avg = mean(history[:-1])``; skip if too few samples or rolling_avg ≈ 0.
 - Fire when ``rms > ratio * rolling_avg AND rms > min_rms AND prev_chunk_low``
   (edge-triggered — won't re-fire while the signal stays loud).
@@ -18,6 +20,8 @@ from __future__ import annotations
 from collections import deque
 
 import numpy as np
+
+from reachy.motion.rms import compute_rms
 
 
 class SnapDetector:
@@ -69,7 +73,7 @@ class SnapDetector:
         if audio is None or len(audio) == 0:
             return False
 
-        rms: float = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+        rms: float = compute_rms(audio)
         self._history.append(rms)
 
         # Need at least 5 samples to form a meaningful rolling average
