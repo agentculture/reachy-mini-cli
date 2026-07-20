@@ -19,6 +19,9 @@ pytestmark = pytest.mark.offline
 
 DT = 0.02
 REACTION_PREFIX = "rule:pat-to-pet-reaction:"
+#: The react rule's cooldown, defined once and used both to build the rules
+#: config below and to assert the spacing between repeat admissions.
+RULE_COOLDOWN_S = 5.0
 
 
 class _TrackingSink:
@@ -112,7 +115,7 @@ class _StaticRules:
                         "id": "pat-to-pet-reaction",
                         "when": {"field": "pat", "op": "is_true"},
                         "run": "pet-reaction",
-                        "cooldown_s": 5.0,
+                        "cooldown_s": RULE_COOLDOWN_S,
                     }
                 ]
             }
@@ -245,7 +248,22 @@ def test_labelled_side_trace_reacts_holds_reacquires_and_completes(monkeypatch, 
     assert all(state["yaw_deg"] * sign > 0.0 for state in signed_states)
 
     rule_fires = [event for event in run.events if event.get("type") == "rule.fire"]
-    assert [event.get("behavior") for event in rule_fires] == ["pet-reaction"]
+    # Only pet-reaction is ever admitted, and repeat admissions are COOLDOWN-SPACED.
+    #
+    # This previously asserted exactly one fire, which was an artifact of the old
+    # SIDE_HEAD_GAIN: raising it lengthened the reaction's slew and shifted where
+    # the trace's continuing injected presses land, yielding a second legitimate
+    # admission inside these 19.2 s. Pinning the count made a gain change look
+    # like a regression. The cooldown is the actual contract, so assert that.
+    #
+    # This can never mask the #66 self-retrigger class: _MirroredPatReader tracks
+    # the commanded pose EXACTLY, so the robot's own reaction motion contributes
+    # zero deviation by construction. A runaway would also violate the spacing.
+    assert rule_fires, "the pat never admitted a reaction"
+    assert {event.get("behavior") for event in rule_fires} == {"pet-reaction"}
+    fire_times = [event["ts"] for event in rule_fires]
+    gaps = [later - earlier for earlier, later in zip(fire_times, fire_times[1:])]
+    assert all(gap >= RULE_COOLDOWN_S for gap in gaps), fire_times
 
     ownership = [tick["ownership"]["head"] for tick in run.ticks]
     reaction_ticks = [
