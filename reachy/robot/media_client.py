@@ -545,8 +545,9 @@ class HeldMediaClient:
         """The gate proper: probe, acquire when released, confirm availability.
 
         Fail-OPEN on absence of information (unreachable daemon, unparseable
-        payload, a build with no acquire route): those must behave exactly as the
-        holder did before this gate existed. Fail-CLOSED on the one definitive
+        payload, a status payload that omits ``released``, a build with no
+        acquire route): those must behave exactly as the holder did before this
+        gate existed. Fail-CLOSED on the one definitive
         negative — another consumer already holding the single-consumer
         subsystem — because that is precisely the state in which construction was
         measured to HANG rather than refuse, and the composition root warms this
@@ -558,8 +559,16 @@ class HeldMediaClient:
             return True  # no information — behave as if there were no gate
         if status.get("no_media"):
             return True  # a media-less daemon has nothing to acquire
+        if "released" not in status:
+            # A payload that never mentions ``released`` reports ABSENCE of
+            # information, not a negative — a daemon build without the field
+            # is not telling us someone holds media. Defaulting the missing key
+            # to False would collapse "unknown" into "contended" and defer
+            # FOREVER, which is the permanently-dormant-senses failure this
+            # gate exists to remove, wearing a different hat.
+            return True
 
-        if not status.get("released", False):
+        if not status["released"]:
             # Someone holds it. Refuse rather than contend: the media subsystem
             # is single-consumer, and contending is what hangs.
             logger.warning(

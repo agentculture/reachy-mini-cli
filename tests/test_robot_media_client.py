@@ -1701,3 +1701,29 @@ def test_offline_lane_degrades_to_plain_construction(monkeypatch) -> None:
     assert holder.warm_up() is True
     assert len(fake_cls.instances) == 1
     holder.close()
+
+
+def test_status_without_a_released_key_falls_open(monkeypatch) -> None:
+    """A payload that never mentions ``released`` is ABSENCE of information.
+
+    The gate's stated contract is fail-OPEN on absence of information and
+    fail-CLOSED only on the one definitive negative — another consumer holding
+    the subsystem. A daemon build whose status route omits ``released``
+    entirely reports no such negative: it reports nothing on the question.
+
+    Read naively, ``status.get("released", False)`` collapses "the key is
+    missing" into "released is false" and therefore into "someone holds it", so
+    the holder would defer FOREVER against such a daemon — reproducing exactly
+    the permanently-dormant-senses failure this gate exists to remove, just
+    with a different cause and no acquire attempt in the log to explain it.
+
+    The live box's payload does carry ``released`` (verified by hand), so this
+    is a contract bug rather than an outage — but the contract is what future
+    daemon builds will be read against, so it is pinned here.
+    """
+    daemon = _patch_daemon(monkeypatch, _FakeDaemon(status={"available": False}))
+    _patch_import(monkeypatch, _FakeMiniCls())
+    holder = HeldMediaClient(now=_FakeClock(0.0), base_url=_BASE)
+
+    assert holder.warm_up() is True, "a status payload with no 'released' key must fall open"
+    assert daemon.count("POST", MEDIA_ACQUIRE_PATH) == 0, "nothing said media was released"
