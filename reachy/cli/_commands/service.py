@@ -39,6 +39,7 @@ import subprocess  # nosec B404 - only ever runs the resolved systemctl binary
 from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
+from reachy.service import units as units_mod
 from reachy.service.manager import ServiceManager, _default_unit_dir
 from reachy.service.units import (
     DAEMON_UNIT,
@@ -206,23 +207,43 @@ def _require(args: list[str], action: str) -> None:
 
 
 def cmd_service_install(args: argparse.Namespace) -> int:
-    """Write all four unit files + daemon-reload, WITHOUT enabling anything."""
+    """Write all four unit files + daemon-reload, WITHOUT enabling anything.
+
+    Also purges any since-retired unit first (see
+    :meth:`ServiceManager.cleanup_retired_units`) — an upgrade rewrites nothing
+    on its own, so the ordinary service verbs are the migration's only trigger.
+    """
     unit_dir = _default_unit_dir()
     unit_dir.mkdir(parents=True, exist_ok=True)
+    retired_removed = _manager().cleanup_retired_units()
+    # RETIRED_UNITS is authoritative over _ALL_UNITS: never re-write a name the
+    # cleanup above just removed, even if a catalog entry for it still lingers.
+    retired = frozenset(units_mod.RETIRED_UNITS)
     written: dict[str, str] = {}
     for unit, render in _ALL_UNITS:
+        if unit in retired:
+            continue
         path = unit_dir / unit
         path.write_text(render(), encoding="utf-8")
         written[unit] = str(path)
     _require(["--user", "daemon-reload"], "reload the systemd user manager")
-    data = {"status": "installed", "unit_paths": written}
+    data = {
+        "status": "installed",
+        "unit_paths": written,
+        "retired_removed": retired_removed,
+    }
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
 
 
 def cmd_service_uninstall(args: argparse.Namespace) -> int:
-    """Remove all four unit files + daemon-reload (best-effort, idempotent)."""
+    """Remove all four unit files + daemon-reload (best-effort, idempotent).
+
+    Retired unit names are purged too — "remove everything this CLI installed"
+    must include what it installed under a name it no longer uses.
+    """
     unit_dir = _default_unit_dir()
+    retired_removed = _manager().cleanup_retired_units()
     removed: list[str] = []
     for unit, _render in _ALL_UNITS:
         path = unit_dir / unit
@@ -231,8 +252,9 @@ def cmd_service_uninstall(args: argparse.Namespace) -> int:
             removed.append(unit)
     _require(["--user", "daemon-reload"], "reload the systemd user manager")
     data = {
-        "status": "uninstalled" if removed else "not-installed",
+        "status": "uninstalled" if removed or retired_removed else "not-installed",
         "removed": removed,
+        "retired_removed": retired_removed,
     }
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
