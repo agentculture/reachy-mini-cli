@@ -77,6 +77,13 @@ has CHANGED at all. Read that class's docstring for what it does and does not
 defend; notably, on the daemon build actually measured it never fires, and
 ``rms`` remains the conjunct that keeps a quiet room still.
 
+The NOISE tier additionally carries an attack/release envelope
+(:class:`_NoiseEnvelope`): live-verified, a keyboard-click train flapped the
+bare per-tick predicate at tick rate (22 ``NONE->NOISE`` opens in 1.3 s), so
+NOISE now opens only after ``noise_attack_ticks`` consecutive loud reads and
+closes only after ``noise_release_s`` of continuous quiet — see that class's
+docstring for the measured burst and the timing contract.
+
 Pure standard library plus in-package value types. No transport, no
 ``reachy_mini``, no :mod:`reachy.motion` import.
 """
@@ -137,6 +144,8 @@ class OrientParams:
     dwell_s: float = 0.6  # the bearing must hold this long before the head moves
     dwell_tol_rad: float = 0.12  # how far the bearing may move and still count as held
     latch_after_s: float = 8.0  # a BIT-IDENTICAL bearing this long is a wedged feed
+    noise_attack_ticks: int = 2  # consecutive loud reads before the NOISE tier opens
+    noise_release_s: float = 0.7  # continuous quiet before an open NOISE tier closes
 
 
 #: The library entry's parameter names, in declaration order — every
@@ -330,52 +339,142 @@ def _escalate(
 # --------------------------------------------------------------------------- #
 
 
+class _NoiseEnvelope:
+    """Attack/release timing for the NOISE tier — the anti-flap envelope.
+
+    Measured on the deployed robot (journal, 2026-07-21 01:25): a transient
+    train (keyboard clicks) drove **22 ``NONE->NOISE`` opens in 1.3 s** — one
+    open/close per ~22 ms tick — with the #95 moving-floor gate CLOSED
+    throughout, because the rms reading genuinely alternates loud/quiet per
+    tick on clicky sound. Every open commanded an antenna lean and every close
+    removed it, so the operator saw sharp per-tick antenna twitching. The NOISE
+    tier was a bare per-tick predicate (doa finite AND ``rms >= rms_floor``)
+    with zero temporal smoothing — SPEECH has an angular dwell, NOISE had
+    nothing. This envelope is that missing smoothing:
+
+    * **Attack** — the loud condition must hold on ``noise_attack_ticks``
+      CONSECUTIVE decision calls before NOISE opens, so a single one-tick
+      click never opens the tier at all.
+    * **Release** — once NOISE (or a higher tier) is open, a quiet reading
+      does not close it: the tier holds through gaps and closes only after
+      ``noise_release_s`` of CONTINUOUS quiet. A fresh loud reading during
+      the hold resets the quiet timer.
+
+    A worthwhile side effect, intended: while the robot's own lean runs, the
+    #95 moving-floor gate reports rms 0.0 — simply "quiet" riding the release
+    hold — so the tier no longer collapses ~20 ms after its own lean starts.
+    One lean per sound episode, held up to the release window.
+
+    Stateful in three scalars, O(1) per call; the clock is the ``now`` already
+    flowing through :meth:`CorroboratedGate._decide`, so it is deterministic
+    under an injected clock. It emits no log lines of its own — the tier
+    transitions :class:`OrientToSound` already logs are the observable trace,
+    and this envelope is exactly what bounds them to ~2 per episode.
+    """
+
+    def __init__(self) -> None:
+        self._streak = 0
+        self._open = False
+        self._quiet_since: float | None = None
+
+    def loud(self, params: OrientParams) -> bool:
+        """Record a loud read; return whether NOISE is open after it."""
+        self._quiet_since = None
+        if not self._open:
+            self._streak += 1
+            if self._streak >= max(1, int(params.noise_attack_ticks)):
+                self._open = True
+        return self._open
+
+    def force_open(self) -> None:
+        """A higher tier (SPEECH/ENGAGED) is live: the envelope opens by fiat."""
+        self._streak = 0
+        self._quiet_since = None
+        self._open = True
+
+    def quiet(self, now: float, params: OrientParams) -> bool:
+        """Record a quiet read; return whether the release hold keeps NOISE open."""
+        self._streak = 0
+        if not self._open:
+            return False
+        if self._quiet_since is None:
+            self._quiet_since = now
+        if (now - self._quiet_since) >= float(params.noise_release_s):
+            self.reset()
+        return self._open
+
+    def reset(self) -> None:
+        self._streak = 0
+        self._open = False
+        self._quiet_since = None
+
+
 class CorroboratedGate:
     """The interim admission rule: energy, then a steady bearing, then words.
 
     See the module docstring for the measured evidence behind each conjunct and
-    for what this deliberately does NOT close (which is t9's job). Stateful
-    only in the dwell tracker — a running reference bearing plus the time it was
-    adopted — so it is O(1) per tick and deterministic under an injected clock.
+    for what this deliberately does NOT close (which is t9's job). Stateful in
+    the dwell tracker — a running reference bearing plus the time it was
+    adopted — and in the owned :class:`_NoiseEnvelope`'s three scalars, so it
+    is O(1) per tick and deterministic under an injected clock.
+
+    The envelope governs only the NOISE tier's open/close TIMING. The
+    transcript ENGAGED fast-path stays immediate, SPEECH escalation (dwell +
+    ``speech_detected``) evaluates exactly as before, and during the release
+    hold the gate reports NOISE — a quiet gap has no meaningful bearing, so
+    the lean relaxes when the tier actually closes, exactly once.
 
     Never raises: a hostile or partially-shaped snapshot resolves to
-    :data:`OrientTier.NONE`, mirroring
-    :class:`reachy.behavior.sense.DoaPoller`'s "any failure means no reading"
-    contract. A sense that cannot be read must leave the robot still.
+    :data:`OrientTier.NONE` (dropping any release hold — fail closed),
+    mirroring :class:`reachy.behavior.sense.DoaPoller`'s "any failure means no
+    reading" contract. A sense that cannot be read must leave the robot still.
     """
 
     def __init__(self) -> None:
         self._ref_angle: float | None = None
         self._ref_since: float = 0.0
+        self._envelope = _NoiseEnvelope()
 
     def __call__(self, sense: Sense, now: float, params: OrientParams) -> OrientTier:
         try:
             return self._decide(sense, now, params)
         except Exception:  # noqa: BLE001 - an unreadable sense must never steer or raise
             self._ref_angle = None
+            self._envelope.reset()
             return OrientTier.NONE
 
     def _decide(self, sense: Sense, now: float, params: OrientParams) -> OrientTier:
         angle = sense.doa_angle
         if angle is None or not math.isfinite(float(angle)):
             self._ref_angle = None  # no bearing: the dwell clock restarts from scratch
-            return OrientTier.NONE
+            return self._quiet(now, params)
 
         # An ADDRESSED utterance already cleared the layered engagement gate, so it
-        # is corroboration in its own right — no dwell, no loudness threshold.
+        # is corroboration in its own right — no dwell, no loudness threshold, and
+        # no attack debounce (the fast-path stays immediate).
         if sense.transcript is not None:
             self._adopt(float(angle), now)
+            self._envelope.force_open()
             return OrientTier.ENGAGED
 
         rms = sense.rms
         if rms is None or not (float(rms) >= params.rms_floor):
             self._ref_angle = None
-            return OrientTier.NONE
+            return self._quiet(now, params)
 
         held_for = self._adopt(float(angle), now, tol=params.dwell_tol_rad)
+        noise_open = self._envelope.loud(params)
         if sense.speech_detected and held_for >= params.dwell_s:
+            # The envelope governs only NOISE timing; escalation is untouched.
+            self._envelope.force_open()
             return OrientTier.SPEECH
-        return OrientTier.NOISE
+        return OrientTier.NOISE if noise_open else OrientTier.NONE
+
+    def _quiet(self, now: float, params: OrientParams) -> OrientTier:
+        """A quiet or bearing-less read: NONE, unless the release hold rides it out."""
+        if self._envelope.quiet(now, params):
+            return OrientTier.NOISE
+        return OrientTier.NONE
 
     def _adopt(self, angle: float, now: float, *, tol: float = 0.0) -> float:
         """Track the dwell reference; return how long the bearing has held."""
