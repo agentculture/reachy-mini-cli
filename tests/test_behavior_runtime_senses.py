@@ -188,6 +188,32 @@ class _FakeMedia:
         return self.connected and self._camera
 
 
+class _SyncPump:
+    """A pump-shaped SYNCHRONOUS stand-in: ``take()`` pulls the source once.
+
+    The staged tests below script the mic BY READ COUNT ("chunk *n* is loud"),
+    which needs the deterministic one-read-per-tick pacing the pre-#100 tap
+    had; the real :class:`~reachy.behavior.audio_pump.AudioPump` reads on its
+    own thread at its own rate, which would race those stage directions. The
+    pump's own live behavior (backlog discard, exactly-once delivery, beat
+    pacing, close) is covered by ``tests/test_behavior_audio_pump.py``; the
+    real-pump wiring is pinned by
+    ``test_the_run_composes_a_started_pump_and_closes_it`` below.
+    """
+
+    def __init__(self, media, **_kwargs) -> None:
+        self._media = media
+
+    def start(self) -> None:
+        """No thread: reads happen inside ``take()``, on the caller's cadence."""
+
+    def take(self):
+        return self._media.audio()
+
+    def close(self) -> None:
+        """Nothing to join."""
+
+
 class _StepClock:
     def __init__(self, dt: float = 0.02) -> None:
         self.t = 0.0
@@ -273,6 +299,28 @@ def _isolated(monkeypatch, tmp_path):
 def _inject_holders(monkeypatch, pose, media) -> None:
     monkeypatch.setattr(behavior_mod, "_make_state_reader", lambda: pose)
     monkeypatch.setattr(behavior_mod, "_make_media_client", lambda: media)
+
+
+def _spy_pumps(monkeypatch, recorder: _Recorder | None = None) -> list:
+    """Swap the composed ``AudioPump`` for a spying subclass; return the builds."""
+    built: list = []
+    real_pump = behavior_mod.AudioPump
+
+    class _SpyPump(real_pump):  # type: ignore[misc,valid-type]
+        def __init__(self, media, **kwargs):
+            super().__init__(media, **kwargs)
+            self.media_arg = media
+            self.started = 0
+            built.append(self)
+
+        def start(self):
+            self.started += 1
+            if recorder is not None:
+                recorder.add("start:pump")
+            super().start()
+
+    monkeypatch.setattr(behavior_mod, "AudioPump", _SpyPump)
+    return built
 
 
 def _run_seam(rules_driver, *, events: list[dict], max_ticks: int, sleep=None, dt: float = 0.02):
@@ -379,6 +427,7 @@ def test_both_holders_are_closed_when_composition_itself_raises(_isolated, monke
     pose = _FakePoseReader()
     media = _FakeMedia()
     _inject_holders(monkeypatch, pose, media)
+    pumps = _spy_pumps(monkeypatch)
 
     def _boom(*_a, **_k):
         raise RuntimeError("goto lane exploded")
@@ -389,6 +438,7 @@ def test_both_holders_are_closed_when_composition_itself_raises(_isolated, monke
     assert main(["behavior", "engine", "run", "--max-ticks", "3", "--json"]) != 0
     assert pose.closed, "a mid-composition fault stranded the pose reader"
     assert media.closed, "a mid-composition fault stranded the media client"
+    assert pumps and pumps[0].closed, "a mid-composition fault stranded the audio pump thread"
 
 
 # --------------------------------------------------------------------------- #
@@ -576,6 +626,28 @@ def test_the_run_composes_a_started_keeper_over_both_holders(_isolated, monkeypa
     assert set(built[0]) == {"state", "media"}
 
 
+def test_the_run_composes_a_started_pump_and_closes_it(_isolated, monkeypatch):
+    """#100 wiring: the composed run starts ONE background audio pump over the
+    held media client — strictly AFTER the media warm-up, so the drain measures
+    a real backlog rather than a cold holder — and closes it at teardown (an
+    unclosed pump thread must not outlive the run)."""
+    recorder = _Recorder()
+    media = _FakeMedia(recorder=recorder, chunk=np.zeros(320, dtype=np.float32))
+    _inject_holders(monkeypatch, _FakePoseReader(recorder=recorder), media)
+    pumps = _spy_pumps(monkeypatch, recorder)
+
+    assert main(["behavior", "engine", "run", "--max-ticks", "3", "--json"]) == 0
+
+    assert len(pumps) == 1, "expected exactly ONE composed audio pump"
+    pump = pumps[0]
+    assert pump.media_arg is media, "the pump must ride the ONE held media client"
+    assert pump.started == 1
+    assert pump.closed, "shutdown did not close the pump"
+    assert recorder.index("warm:media") < recorder.index(
+        "start:pump"
+    ), "the pump started before the media warm-up"
+
+
 # --------------------------------------------------------------------------- #
 # 4. All four providers are composed into _compose_run_seam                    #
 # --------------------------------------------------------------------------- #
@@ -613,29 +685,34 @@ def test_compose_run_seam_wires_every_sense_provider(_isolated, monkeypatch):
         assert fields.get(name) is not None, f"no provider wired for {name!r}"
 
 
-def test_only_one_audio_read_happens_per_tick(_isolated, monkeypatch):
-    """The rms provider and the transcript driver are two consumers of ONE mic
-    read. ``media.audio()`` is a CONSUMING read of the shared single-consumer
-    media session, so composition taps it once per tick and fans the chunk out —
-    reading it twice would hand each consumer half the audio."""
+def test_the_tick_thread_never_reads_the_mic(_isolated, monkeypatch):
+    """#100: ALL audio acquisition lives on the background pump thread; the tick
+    side is a pure latch peek (``AudioPump.take``). The SDK's audio appsink is a
+    ``drop=True, max-buffers=500`` FIFO whose ``get_sample`` blocks up to 20 ms
+    when empty — both the seconds-stale backlog and the block ride wherever
+    ``audio()`` is called, and neither belongs on a 20 ms tick budget. The
+    engine loop runs on THIS thread, so no ``audio()`` call may carry its id."""
     media = _FakeMedia(chunk=np.zeros(320, dtype=np.float32))
     _inject_holders(monkeypatch, _FakePoseReader(), media)
 
     assert main(["behavior", "engine", "run", "--max-ticks", "10", "--json"]) == 0
-    assert media.audio_calls == 10, f"expected one mic read per tick, got {media.audio_calls}"
+    assert media.audio_calls >= 1, "the pump never read the mic at all"
+    assert threading.get_ident() not in media.audio_threads, "the tick thread touched the mic"
 
 
 def test_no_sense_work_runs_on_the_tick_thread_that_needs_a_socket(_isolated, monkeypatch):
-    """The threading contract at the composition layer: the tick thread reads the
-    already-held client and nothing else. Any SDK construction, STT round trip or
-    face detection belongs to setup or a worker thread."""
+    """The threading contract at the composition layer: the tick thread reads
+    latches and the already-held pose client, nothing else. Any SDK
+    construction, mic I/O (#100), STT round trip or face detection belongs to
+    setup or a worker thread."""
     media = _FakeMedia(chunk=np.zeros(320, dtype=np.float32))
     _inject_holders(monkeypatch, _FakePoseReader(), media)
 
     assert main(["behavior", "engine", "run", "--max-ticks", "6", "--json"]) == 0
     assert media.warm_threads, "the media client was never warmed"
-    # Every per-tick read happened on ONE thread, and warming happened before it.
+    # Every mic read happened on ONE (pump) thread — never the tick thread.
     assert len(set(media.audio_threads)) == 1
+    assert threading.get_ident() not in media.audio_threads
 
 
 # --------------------------------------------------------------------------- #
@@ -646,6 +723,7 @@ def test_no_sense_work_runs_on_the_tick_thread_that_needs_a_socket(_isolated, mo
 def test_a_rule_keyed_on_rms_fires_through_the_composed_seam(_isolated, monkeypatch):
     """t12's provider, live: a mic chunk becomes ``Sense.rms`` and a rule keyed on
     ``rms`` fires. Before t28 this rule validated cleanly and never fired."""
+    monkeypatch.setattr(behavior_mod, "AudioPump", _SyncPump)
     media = _FakeMedia(chunk=np.full(320, 0.25, dtype=np.float32))
     _inject_holders(monkeypatch, _FakePoseReader(), media)
 
@@ -744,6 +822,7 @@ def test_the_moving_floor_quiets_rms_through_the_composed_seam(_isolated, monkey
     The loud audio is staged from tick 100 (``t=2 s``, mid fast-swing, latch
     long engaged) to keep clear of the boot ticks where the latch has not yet
     seen two poses."""
+    monkeypatch.setattr(behavior_mod, "AudioPump", _SyncPump)
     loud = np.full(320, 0.25, dtype=np.float32)
     quiet = np.zeros(320, dtype=np.float32)
     media = _FakeMedia(chunk=lambda n: loud if n > 100 else quiet)
@@ -781,6 +860,7 @@ def test_a_rule_keyed_on_transcript_fires_through_the_composed_seam(_isolated, m
         return driver
 
     monkeypatch.setattr(behavior_mod, "TranscriptSenseDriver", _make)
+    monkeypatch.setattr(behavior_mod, "AudioPump", _SyncPump)
 
     loud = np.full(320, 0.3, dtype=np.float32)
     quiet = np.zeros(320, dtype=np.float32)

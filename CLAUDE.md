@@ -223,8 +223,8 @@ relocates the stall. A failed warm is a NORMAL daemon-not-up-yet outcome, so
 `_HolderKeeper` (a background daemon thread) polls each holder's free
 `connected` predicate and re-warms off-thread for the life of the run — the
 tick thread never constructs. `_RuntimeResources` is what `cmd_engine_run`
-closes at shutdown (both clients + the worker-owning sense drivers); an
-unclosed client hangs the process at interpreter exit.
+closes at shutdown (both clients + the worker-owning sense drivers + the
+audio pump); an unclosed client hangs the process at interpreter exit.
 
 **Sense providers — all six wired.** `SenseProviders` carries `pat_event` /
 `pat_state` (two peeks of the ONE `PatSenseDriver`), `rms`
@@ -232,9 +232,14 @@ unclosed client hangs the process at interpreter exit.
 background STT worker + the #54/#56 engagement gate) and `face` /
 `frame_available` (`behavior/face_sense.py`, a background YuNet/SFace worker).
 `rms` and the transcript driver are two consumers of ONE *consuming*
-`media.audio()` read, so `_AudioTap` pulls the chunk once per tick (at the top
-of `sense_reader`) and fans it out — reading it twice would hand each consumer
-half the audio. **When you wire a new provider here you MUST extend
+audio read. Since #100 that read is `AudioPump.take()` — a background daemon
+thread (`behavior/audio_pump.py`) owns ALL `media.audio()` I/O, drains the
+SDK appsink's `drop=True, max-buffers=500` FIFO at production pace, and
+discards any standing backlog before going live (pulled at tick rate that
+FIFO serves seconds-stale audio, and its empty-queue `get_sample` blocks
+20 ms on the tick thread). `_AudioTap` swaps the pump's latch once per tick
+(at the top of `sense_reader`) and fans the concatenated chunk out — taking
+it twice would hand each consumer half the audio. **When you wire a new provider here you MUST extend
 `reachy/behavior/sense.py`'s `_COMPOSED_PROVIDER_FIELDS` in the same change** —
 it is the one declared source of truth `behavior rules check` lints against, so
 a stale value makes the linter lie in one direction or the other.

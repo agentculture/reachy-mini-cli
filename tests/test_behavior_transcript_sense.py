@@ -566,6 +566,37 @@ def test_a_blip_shorter_than_min_utterance_is_dropped() -> None:
         driver.close()
 
 
+def test_a_pump_concatenated_multi_chunk_tick_is_transparent() -> None:
+    """#100: the audio feed is now the pump's per-tick latch — ONE array
+    concatenating every chunk produced since the last tick. The driver
+    accumulates raw samples (utterance sizes, ring trimming and the VAD all
+    count samples, never chunks), so a concatenation behaves exactly like one
+    big chunk: a SINGLE loud tick carrying four chunks' worth of samples clears
+    the 320-sample min-utterance floor that one 160-sample chunk (the blip test
+    above) cannot."""
+    transcriber = _Transcriber()
+    media = _Media()
+    driver = _driver(media, transcriber=transcriber)
+    try:
+        t = T0
+        media.next_chunk = np.concatenate([_loud() for _ in range(4)])  # 640 samples
+        driver(_ctx(t))
+        t += DT
+        for _ in range(5):  # quiet ticks endpoint the utterance on the pause
+            media.next_chunk = _quiet()
+            driver(_ctx(t))
+            t += DT
+            if driver.submitted:
+                break
+        assert driver.submitted == 1
+        assert _await(lambda: driver.transcripts == 1)
+        media.next_chunk = _quiet()
+        driver(_ctx(t))
+        assert driver.peek() == NAMED
+    finally:
+        driver.close()
+
+
 def test_the_pre_roll_ring_keeps_audio_from_before_the_speech_onset() -> None:
     """The whole utterance reaches STT, lead-in included, in a single call."""
     seen: list[int] = []
