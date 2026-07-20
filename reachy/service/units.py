@@ -71,6 +71,36 @@ RUNTIME_UNIT = "reachy-runtime.service"
 # nothing. It is the reason this list exists.
 RETIRED_UNITS: tuple[str, ...] = ("reachy-listen.service",)
 
+# --------------------------------------------------------------------------- #
+# Runtime unit's explicit TTS route (task t7 / issue #70 arc, decision c27).  #
+# --------------------------------------------------------------------------- #
+#
+# The deployed box's ONLY ``REACHY_TTS_ROUTE`` configuration lives in
+# ``reachy-live.service.d/tts.conf`` -- a hand-authored drop-in belonging to
+# :data:`LIVE_UNIT`, a unit this arc deletes. That drop-in's own comment
+# documents WHY it exists: the default route ("chatterbox") POSTs to
+# ``REACHY_TTS_URL`` (default ``http://localhost:9000``), but model-gear's
+# chatterbox container is EXPOSE-only, never published to the host -- so the
+# default route is connection-refused on this box. Combined with
+# ``audio_optional=True``-style silent degradation (here,
+# :class:`reachy.behavior.speech_act.SpeechActuator`'s failure latch), a
+# runtime unit with no route configured would fail a live TTS check in total
+# silence, with nothing in the log to say why.
+#
+# So :data:`RUNTIME_UNIT` sets its route EXPLICITLY, baked into its own unit
+# text via an ``Environment=`` directive, rather than inheriting a sibling
+# unit's drop-in that is about to disappear. The value routes through the
+# lobes gateway's ``/v1/audio/speech`` leg (``REACHY_OPENAI_URL_BASE``,
+# already set process-wide via ``environment.d`` -- see ``reachy/speech/tts.py``)
+# instead of the broken default port. This is a TTS route, not an LLM call:
+# the runtime's DEFAULT voice
+# (:data:`reachy.behavior.speech_act.RUNTIME_DEFAULT_VOICE_ENGINE`) is
+# ``"harmonic"`` and needs no route at all, so this variable is INERT until an
+# operator opts into ``REACHY_VOICE_ENGINE=tts`` -- but when they do, it must
+# not silently hit a port that only a retiring sibling unit ever routed around.
+RUNTIME_TTS_ROUTE_ENV = "REACHY_TTS_ROUTE"
+DEFAULT_RUNTIME_TTS_ROUTE = "openai"
+
 
 def _unit_arg(value: str) -> str:
     """Quote/escape one ExecStart argument for the systemd unit grammar.
@@ -175,12 +205,16 @@ def _render(
     exec_start: str,
     requires: str | None = None,
     after_daemon: bool = False,
+    environment: dict[str, str] | None = None,
 ) -> str:
     """Assemble one ``--user`` unit from its parts (shared skeleton).
 
     All units share ``Type=simple`` + ``Restart=on-failure`` + ``RestartSec=5``
     + ``WantedBy=default.target``. Presence units additionally ``Requires=`` and
-    order ``After=`` the daemon unit so the daemon is up first.
+    order ``After=`` the daemon unit so the daemon is up first. *environment*
+    (optional) renders one ``Environment=KEY=VALUE`` directive per entry ahead
+    of ``ExecStart=`` -- baked into the unit's own text rather than requiring a
+    separate ``.d/`` drop-in (see :data:`RUNTIME_TTS_ROUTE_ENV`).
     """
     after = "network-online.target"
     if after_daemon:
@@ -188,6 +222,7 @@ def _render(
         # robot daemon it talks to is already running.
         after = f"{DAEMON_UNIT} network-online.target"
     requires_line = f"Requires={requires}\n" if requires else ""
+    environment_lines = "".join(f"Environment={k}={v}\n" for k, v in (environment or {}).items())
     return (
         "[Unit]\n"
         f"Description={description}\n"
@@ -196,6 +231,7 @@ def _render(
         "\n"
         "[Service]\n"
         "Type=simple\n"
+        f"{environment_lines}"
         f"ExecStart={exec_start}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
@@ -233,16 +269,28 @@ def live_unit_text(python: str | None = None) -> str:
     )
 
 
-def runtime_unit_text(python: str | None = None) -> str:
+def runtime_unit_text(python: str | None = None, tts_route: str | None = None) -> str:
     """Render ``reachy-runtime.service`` — the AI-agnostic symbolic runtime presence.
 
     Boot default per c19: the deterministic ``behavior engine run`` loop (rules,
     reflexes, sustained intents) with zero external AI services required; an
     agent attaches externally afterwards, never wired into this unit.
+
+    Sets ``REACHY_TTS_ROUTE`` EXPLICITLY (*tts_route*, defaulting to
+    :data:`DEFAULT_RUNTIME_TTS_ROUTE`) as an ``Environment=`` directive baked
+    into this unit's own text, rather than depending on
+    ``reachy-live.service.d/tts.conf`` — a drop-in that belongs to
+    :data:`LIVE_UNIT`, a unit this arc retires (task t7, decision c27). See the
+    module-level comment above :data:`RUNTIME_TTS_ROUTE_ENV` for why the
+    default route would otherwise be silently connection-refused on the
+    deployed box. This is a TTS route, not an LLM endpoint — it stays inert
+    under the shipped ``harmonic`` default voice and only matters once an
+    operator opts into ``REACHY_VOICE_ENGINE=tts``.
     """
     return _render(
         description="Reachy Mini symbolic runtime (AI-agnostic rules + reflex presence)",
         exec_start=runtime_exec_start(python),
         requires=DAEMON_UNIT,
         after_daemon=True,
+        environment={RUNTIME_TTS_ROUTE_ENV: tts_route or DEFAULT_RUNTIME_TTS_ROUTE},
     )
