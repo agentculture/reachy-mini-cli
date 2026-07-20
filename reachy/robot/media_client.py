@@ -44,6 +44,57 @@ The class stays PASSIVE: it spawns no thread of its own to do this (that would
 re-introduce the interpreter-exit hazard :meth:`close` exists to avoid). It only
 stops forcing the caller to construct on whatever thread happens to read first.
 
+**ACQUIRE the daemon's media subsystem before constructing.** Diagnosed on the
+live robot: the lazy retry loop below could never succeed on the deployed box,
+because the daemon had RELEASED media —
+
+.. code-block:: text
+
+    GET /api/media/status  -> {"available": false, "released": true,
+                               "no_media": false}
+    GET /api/daemon/status ->  "media_released": true
+
+— so nothing was listening and a bare ``ReachyMini()`` raised
+``ConnectionRefusedError: [Errno 111] Connection refused``, for ever. Hand
+verification: ``POST /api/media/acquire`` returns ``{"status":"ok"}``, status
+flips to ``{"available": true, "released": false}``, and the same construction
+then completes in **0.9 s** and disconnects cleanly. Media goes back to
+``released: true`` once the last consumer lets go, so ``released: true`` is the
+ordinary RESTING state of any box, not a misconfiguration. Left unfixed, every
+sense that reads through this holder (transcript, rms, face, frame-available) is
+wired but permanently dormant, and rules keyed on them validate and never fire.
+
+The gate therefore lives HERE, not at the composition root, for three reasons:
+
+* **Symmetry.** :meth:`close` must release what was acquired, and so must every
+  mid-run drop/reconnect cycle. Acquisition is paired with *construction*, not
+  with process lifetime, and only this class knows when it constructs.
+* **Politeness.** We release only a subsystem we ourselves acquired — a single
+  boolean, not a reference count (the daemon already refcounts; this process is
+  the single media owner by construction). A consumer that got there first is
+  never released out from under.
+* **Boundedness.** Every leg is a bounded stdlib ``urllib`` request
+  (:data:`DEFAULT_GATE_TIMEOUT`), and a probe reporting the subsystem already
+  held makes us DEFER rather than contend — which matters because contending is
+  what was measured to hang. With media acquired and ``reachy-runtime.service``
+  running, the same bare construction produced no output under ``python -u`` and
+  was killed at 90 s. The composition root warms this holder SYNCHRONOUSLY
+  during setup, so a construction that blocks indefinitely hangs unit startup
+  with no error and no restart (``Restart=on-failure`` cannot fire on a merely
+  stuck process). A ``warm_up()`` returning ``False`` is designed degradation.
+
+The gate is deliberately **fail-open on absence of information** — an
+unreachable daemon, an unparseable payload, a build without the route — so it can
+never leave the holder more broken than it was without a gate. It is
+fail-**closed** only on the one definitive negative: another consumer holding the
+single-consumer subsystem.
+
+Honest limit: the gate bounds the *readiness check*, not the SDK constructor
+call, which is uninterruptible without a worker thread or a signal handler —
+both of which this class forbids (see the passivity note above; a thread would
+re-introduce the interpreter-exit hazard :meth:`close` exists to avoid). What the
+gate does is make the one state in which the hang was observed unreachable.
+
 Discipline this class inherits from :class:`HeldStateReader`, point for point:
 
 * **Construct once, never per read**: opening the media chain per tick is both
@@ -76,12 +127,16 @@ composition root, which is what guarantees a single instance exists; nothing in
 
 from __future__ import annotations
 
+import json
 import logging
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from typing import Any, Callable
 
 from reachy import senselog
+from reachy.robot.transport import DEFAULT_BASE_URL
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +146,59 @@ logger = logging.getLogger(__name__)
 #: two holders in one process back off on the same cadence.
 DEFAULT_RETRY_BACKOFF = 5.0
 
+#: The daemon's media-lifecycle routes (see the module docstring's "acquire
+#: before constructing" note). Plain HTTP against the local daemon, exactly like
+#: ``reachy.daemon.health_ok`` — stdlib ``urllib``, no new dependency.
+MEDIA_STATUS_PATH = "/api/media/status"
+MEDIA_ACQUIRE_PATH = "/api/media/acquire"
+MEDIA_RELEASE_PATH = "/api/media/release"
+
+#: Seconds any single readiness-gate request may take. Every leg is a loopback
+#: call measured in milliseconds, so this is ~3 orders of magnitude of headroom;
+#: it is also the same order as the 0.9 s clean construction it guards, so the
+#: gate can never dominate the cost of the thing it protects. The gate makes at
+#: most three requests, so warm-up's bounded portion is capped near 6 s.
+DEFAULT_GATE_TIMEOUT = 2.0
+
 _STAGE = "media"
 _SOURCE = "held_client"
+
+
+def _http(url: str, timeout: float, method: str) -> bytes | None:
+    """Make one bounded request to the daemon; return the body, or ``None``.
+
+    Never raises — not for a refused connection, not for a timeout, not for a
+    malformed URL, not even for an ``AssertionError`` from the test suite's
+    offline socket guard. The holder's whole contract is that no public method
+    raises, and the readiness gate is a best-effort probe: a daemon that cannot
+    answer is treated as "no information", never as a fault. The scheme check
+    mirrors :func:`reachy.daemon.health_ok` so a stray ``file://`` base URL can
+    never reach ``urlopen``.
+    """
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        return None
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+            return resp.read()
+    except Exception:  # noqa: BLE001 - a probe must degrade, never raise
+        return None
+
+
+def _get_json(url: str, timeout: float) -> Any | None:
+    """GET *url* and parse the JSON body. ``None`` on any failure whatsoever."""
+    raw = _http(url, timeout, "GET")
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001 - an unparseable body is "no information"
+        return None
+
+
+def _post_ok(url: str, timeout: float) -> bool:
+    """POST *url* with an empty body; return whether the daemon accepted it."""
+    return _http(url, timeout, "POST") is not None
 
 
 class HeldMediaClient:
@@ -133,10 +239,15 @@ class HeldMediaClient:
         retry_backoff: float = DEFAULT_RETRY_BACKOFF,
         now: Callable[[], float] = time.monotonic,
         allow_inline_connect: bool = True,
+        base_url: str | None = DEFAULT_BASE_URL,
+        gate_timeout: float = DEFAULT_GATE_TIMEOUT,
     ) -> None:
         self._retry_backoff = retry_backoff
         self._now = now
         self._allow_inline_connect = allow_inline_connect
+        self._base_url = base_url.rstrip("/") if base_url else None
+        self._gate_timeout = gate_timeout
+        self._media_acquired = False
         self._client: Any | None = None
         self._media: Any | None = None
         self._samplerate: int | None = None
@@ -364,6 +475,12 @@ class HeldMediaClient:
             self._log_transition("sdk-absent: reachy_mini is not installed; media disabled")
             return
 
+        if not self._acquire_media():
+            # The subsystem is not ours to use right now. Back off and retry: the
+            # other consumer letting go is exactly what the next window catches.
+            self._next_attempt_t = now + self._retry_backoff
+            return
+
         client = None
         try:
             client = reachy_mini_cls()
@@ -378,6 +495,9 @@ class HeldMediaClient:
         # A construction fault must degrade, not raise.
         except Exception as err:  # noqa: BLE001
             self._release_raw(client)
+            # We acquired media and then could not use it — hand it straight back
+            # rather than sit on a single-consumer resource for the whole backoff.
+            self._release_media()
             self._next_attempt_t = now + self._retry_backoff
             logger.warning("HeldMediaClient: construction failed (%s); will retry", err)
             self._log_transition(
@@ -391,6 +511,102 @@ class HeldMediaClient:
         self._channels = channels
         self._next_attempt_t = None
         self._log_transition("connected (default media profile, recording)")
+
+    # ------------------------------------------------------------------
+    # the daemon media-lifecycle gate (acquire before constructing)
+    # ------------------------------------------------------------------
+
+    def _acquire_media(self) -> bool:
+        """Make the daemon's media subsystem ours, and say whether to construct.
+
+        ``True`` means "go ahead and construct"; ``False`` means "not now, back
+        off". Never raises: an exploding probe falls open, because the gate must
+        never make the holder *more* broken than it was without one.
+
+        Idempotent by a single flag rather than a reference count. A reference
+        count would be answering a question we do not own: the daemon already
+        refcounts (media returns to ``released: true`` when the LAST consumer
+        disconnects), and this process is the single media owner by construction,
+        so our side of the ledger is exactly one bit — "did *we* acquire it?".
+        That bit is what makes :meth:`_release_media` safe: we release only what
+        we took, never a subsystem another consumer acquired first.
+        """
+        if self._media_acquired:
+            return True  # already ours; reads never re-probe
+        if not self._base_url:
+            return True  # gate disabled by configuration
+        try:
+            return self._run_media_gate()
+        except Exception as err:  # noqa: BLE001 - the gate must never raise
+            logger.warning("HeldMediaClient: media gate failed (%s); constructing anyway", err)
+            return True
+
+    def _run_media_gate(self) -> bool:
+        """The gate proper: probe, acquire when released, confirm availability.
+
+        Fail-OPEN on absence of information (unreachable daemon, unparseable
+        payload, a build with no acquire route): those must behave exactly as the
+        holder did before this gate existed. Fail-CLOSED on the one definitive
+        negative — another consumer already holding the single-consumer
+        subsystem — because that is precisely the state in which construction was
+        measured to HANG rather than refuse, and the composition root warms this
+        holder synchronously during setup.
+        """
+        base = self._base_url or ""
+        status = _get_json(base + MEDIA_STATUS_PATH, self._gate_timeout)
+        if not isinstance(status, dict):
+            return True  # no information — behave as if there were no gate
+        if status.get("no_media"):
+            return True  # a media-less daemon has nothing to acquire
+
+        if not status.get("released", False):
+            # Someone holds it. Refuse rather than contend: the media subsystem
+            # is single-consumer, and contending is what hangs.
+            logger.warning(
+                "HeldMediaClient: daemon media is held by another consumer; deferring connect"
+            )
+            self._log_transition("contended: daemon media not released by its current owner")
+            return False
+
+        if not _post_ok(base + MEDIA_ACQUIRE_PATH, self._gate_timeout):
+            logger.warning("HeldMediaClient: media acquire was refused; constructing anyway")
+            return True  # fail-open: a daemon without the route must still work
+        self._media_acquired = True
+
+        confirm = _get_json(base + MEDIA_STATUS_PATH, self._gate_timeout)
+        if isinstance(confirm, dict) and not confirm.get("available", False):
+            # "We asked" is not "it is ready". The hand-verified precondition for
+            # the 0.9 s clean construction is available=true; anything else is an
+            # unbounded gamble, so give it back and retry next window.
+            logger.warning("HeldMediaClient: media did not come up after acquire; will retry")
+            self._log_transition("not-ready: acquire returned ok but media is still unavailable")
+            self._release_media()
+            return False
+
+        self._log_transition("media acquired from the daemon (was released)")
+        return True
+
+    def _release_media(self) -> None:
+        """Give the daemon's media subsystem back — but only if we took it.
+
+        Called after our own client has let go, so we never pull the subsystem
+        out from under ourselves. The flag is cleared unconditionally: our client
+        is already disconnected, and the daemon self-releases on last-consumer
+        disconnect, so a refused release is a log line, not a retry loop.
+        """
+        if not self._media_acquired:
+            return
+        self._media_acquired = False
+        if not self._base_url:
+            return
+        try:
+            if not _post_ok(self._base_url + MEDIA_RELEASE_PATH, self._gate_timeout):
+                logger.warning("HeldMediaClient: media release was refused by the daemon")
+                return
+        except Exception as err:  # noqa: BLE001 - teardown must never raise
+            logger.warning("HeldMediaClient: media release failed (%s)", err)
+            return
+        self._log_transition("media released back to the daemon")
 
     def _ensure_camera(self) -> bool:
         """Resolve the camera once per client, honoring ``acquire_media``.
@@ -453,6 +669,10 @@ class HeldMediaClient:
                     # interpreter exit if left open).
                     logger.warning("HeldMediaClient: stop_recording() raised during release")
         self._release_raw(client)
+        # Strictly after our own client has disconnected: releasing the subsystem
+        # while we are still attached to it would be pulling the rug out from
+        # under ourselves.
+        self._release_media()
 
     @staticmethod
     def _release_raw(client: Any | None) -> None:
