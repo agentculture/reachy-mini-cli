@@ -1,0 +1,674 @@
+"""``face`` + ``frame_available`` sense providers for the symbolic behavior runtime.
+
+These tests pin the three acceptance criteria for
+:mod:`reachy.behavior.face_sense`:
+
+1. A react rule keyed on ``face`` and a react rule keyed on ``frame_available``
+   each FIRE, driven end-to-end through the real seam the runtime uses —
+   ``FaceSenseDriver`` -> :func:`reachy.behavior.sense.read_perception` ->
+   :class:`reachy.behavior.rule_engine.RuleEngine`. Before this module existed
+   both fields were declared on :class:`~reachy.behavior.sense.Sense` with
+   nothing feeding them, so such a rule validated and then silently never fired.
+2. A missing ``[vision]`` extra (opencv) is ONE logged warning, never a crash:
+   the recognizer factory degrades to ``None`` and the driver still runs, still
+   reporting ``frame_available`` — only the ``face`` field goes permanently
+   quiet.
+3. A ``None`` or degenerate frame is SKIPPED, never raised on — the issue #73
+   fix shape, where a fresh-client-per-frame path returned ``None`` on every
+   read and ``np.asarray(None).shape == ()`` reached the grey/luma conversion
+   in :meth:`reachy.vision.motion.MotionDetector._to_grey` and raised
+   ``ValueError: Unsupported frame shape: ()``.
+
+Everything here runs WITHOUT the ``[vision]`` extra: cv2 is not installed in
+this environment, and none of these tests may require it. The engine/store are
+injected fakes, the media client is a fake exposing only ``HeldMediaClient``'s
+``frame()`` / ``camera_available`` surface, and the cv2 probe is an injected
+seam so the missing-extra path is exercised deterministically either way.
+"""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import threading
+
+import numpy as np
+import pytest
+
+from reachy.behavior import face_sense as FS
+from reachy.behavior.face_sense import FaceSenseDriver, build_face_recognition
+from reachy.behavior.rule_engine import RuleEngine
+from reachy.behavior.rules import SENSE_FIELDS, RulesConfig
+from reachy.behavior.sense import SenseProviders, read_perception
+
+# --------------------------------------------------------------------------- #
+# Fakes                                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def _frame(width: int = 8, height: int = 6) -> np.ndarray:
+    """A plausible BGR camera frame (what ``HeldMediaClient.frame()`` returns)."""
+    return np.zeros((height, width, 3), dtype=np.uint8)
+
+
+class _FakeMedia:
+    """The narrow ``HeldMediaClient`` surface this driver consumes.
+
+    ``frames`` is a script: each ``frame()`` call pops the next entry (an
+    ndarray, ``None``, or an exception INSTANCE to raise), and the last entry
+    repeats once the script runs dry — so a test can drive many ticks off a
+    one-entry script.
+    """
+
+    def __init__(self, frames, *, camera_available: bool = True) -> None:
+        self._frames = list(frames)
+        self.camera_available = camera_available
+        self.calls = 0
+
+    def frame(self):
+        self.calls += 1
+        value = self._frames[0] if len(self._frames) == 1 else self._frames.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+class _FakeDetection:
+    def __init__(self, embedding) -> None:
+        self.embedding = embedding
+
+
+class _FakeMatch:
+    def __init__(self, name) -> None:
+        self.name = name
+
+
+class _FakeEngine:
+    """A ``FaceEngine``-shaped detector recording the thread it ran on."""
+
+    def __init__(self, detection=None, *, raises=None) -> None:
+        self._detection = detection if detection is not None else _FakeDetection([0.1, 0.2])
+        self._raises = raises
+        self.frames = []
+        self.threads = []
+        self.ran = threading.Event()
+
+    def detect(self, frame):
+        self.frames.append(frame)
+        self.threads.append(threading.get_ident())
+        self.ran.set()
+        if self._raises is not None:
+            raise self._raises
+        return self._detection
+
+
+class _FakeStore:
+    """A ``FaceStore``-shaped matcher."""
+
+    def __init__(self, match=None, *, raises=None) -> None:
+        self._match = match
+        self._raises = raises
+
+    def match(self, embedding):  # noqa: ARG002
+        if self._raises is not None:
+            raise self._raises
+        return self._match
+
+
+class _Ctx:
+    """A duck-typed ``TickContext`` — the driver only reads ``now``."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+
+def _drive(driver: FaceSenseDriver, *, ticks: int = 1, start: float = 0.0, dt: float = 0.02):
+    """Run *ticks* driver invocations on a fixed-step clock; return the last ctx."""
+    ctx = _Ctx(start)
+    for i in range(ticks):
+        ctx = _Ctx(round(start + i * dt, 10))
+        driver(ctx)
+    return ctx
+
+
+def _sense(driver: FaceSenseDriver):
+    """Compose the tick's Sense exactly as the runtime's composition root will."""
+    return read_perception(
+        SenseProviders(
+            face=driver.as_face_provider(),
+            frame_available=driver.as_frame_available_provider(),
+        )
+    )
+
+
+def _react(rule_id: str, field: str, op: str, run: str, *, duration_s: float = 60.0) -> dict:
+    return {
+        "id": rule_id,
+        "when": {"field": field, "op": op},
+        "run": run,
+        "cooldown_s": 5.0,
+        "hysteresis": 0.0,
+        "duration_s": duration_s,
+    }
+
+
+class _RecordingCtx:
+    """A duck-typed ``TickContext`` recording what the rule engine admitted."""
+
+    def __init__(self, now: float, sense) -> None:
+        self.now = now
+        self.tick = 1
+        self.sense = sense
+        self.ownership: dict = {}
+        self.admits: list = []
+        self.evicts: list = []
+        self.events: list = []
+
+    def emit(self, event: dict) -> None:
+        self.events.append(event)
+
+    def admit(self, behavior):
+        self.admits.append(behavior)
+        return {"ok": True, "op": "add", "id": behavior.id, "name": behavior.name}
+
+    def evict(self, name: str):
+        self.evicts.append(name)
+        return {"ok": True, "op": "stop", "target": name}
+
+    def active_names(self) -> set:
+        return set()
+
+
+# --------------------------------------------------------------------------- #
+# Criterion 1 — a rule keyed on face, and one keyed on frame_available, FIRE  #
+# --------------------------------------------------------------------------- #
+
+
+def test_face_is_a_valid_rule_field_and_frame_available_is_too() -> None:
+    """Both fields must be addressable by a predicate, or no rule can key on them."""
+    assert "face" in SENSE_FIELDS
+    assert "frame_available" in SENSE_FIELDS
+
+
+def test_face_rule_fires_end_to_end_from_the_driver() -> None:
+    """Criterion 1a: driver -> read_perception -> RuleEngine admits the behavior."""
+    media = _FakeMedia([_frame()])
+    engine = _FakeEngine()
+    driver = FaceSenseDriver(
+        media=media,
+        engine=engine,
+        store=_FakeStore(match=_FakeMatch("ada")),
+        start_worker=False,
+    )
+    # tick 1: the tick thread publishes the frame for the worker
+    _drive(driver, ticks=1, start=0.0)
+    driver._worker_tick()  # the heavy leg, run deterministically
+    # tick 2: the tick thread drains the worker's result and latches it
+    _drive(driver, ticks=1, start=0.02)
+
+    sense = _sense(driver)
+    assert sense.face == "ada"
+
+    rules = RulesConfig.from_dict({"react": [_react("greet", "face", "is_true", "nod")]})
+    rule_engine = RuleEngine(rules)
+    ctx = _RecordingCtx(now=0.02, sense=sense)
+    rule_engine.on_tick(ctx)
+
+    assert [b.name for b in ctx.admits] == ["nod"]
+
+
+def test_frame_available_rule_fires_end_to_end_from_the_driver() -> None:
+    """Criterion 1b: the same path, keyed on the frame-availability condition."""
+    driver = FaceSenseDriver(media=_FakeMedia([_frame()]), start_worker=False)
+    _drive(driver, ticks=1)
+
+    sense = _sense(driver)
+    assert sense.frame_available is True
+
+    rules = RulesConfig.from_dict({"react": [_react("look", "frame_available", "is_true", "nod")]})
+    rule_engine = RuleEngine(rules)
+    ctx = _RecordingCtx(now=0.0, sense=sense)
+    rule_engine.on_tick(ctx)
+
+    assert [b.name for b in ctx.admits] == ["nod"]
+
+
+def test_frame_available_rule_does_not_fire_without_frames() -> None:
+    """The negative half of criterion 1b — no frames means no fire."""
+    driver = FaceSenseDriver(media=_FakeMedia([None]), start_worker=False)
+    _drive(driver, ticks=3)
+
+    sense = _sense(driver)
+    assert sense.frame_available is False
+
+    rules = RulesConfig.from_dict({"react": [_react("look", "frame_available", "is_true", "nod")]})
+    ctx = _RecordingCtx(now=0.0, sense=sense)
+    RuleEngine(rules).on_tick(ctx)
+
+    assert ctx.admits == []
+
+
+# --------------------------------------------------------------------------- #
+# Criterion 2 — a missing [vision] extra is ONE logged warning, not a crash   #
+# --------------------------------------------------------------------------- #
+
+
+def test_build_face_recognition_without_cv2_returns_none_and_warns_once(
+    monkeypatch, caplog
+) -> None:
+    """Criterion 2: absent opencv degrades to ``None`` after exactly one warning."""
+    monkeypatch.setattr(FS, "_VISION_WARNED", False)
+    monkeypatch.setattr(FS, "_find_spec", lambda name: None)
+
+    with caplog.at_level(logging.WARNING, logger="reachy.behavior.face_sense"):
+        first = build_face_recognition()
+        second = build_face_recognition()
+        third = build_face_recognition()
+
+    assert first is None and second is None and third is None
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "[vision]" in warnings[0].getMessage()
+
+
+def test_build_face_recognition_on_this_environment_never_raises() -> None:
+    """The real probe, unmocked: cv2 is genuinely absent here, and that is fine."""
+    result = build_face_recognition()
+    assert result is None or (isinstance(result, tuple) and len(result) == 2)
+
+
+def test_driver_without_a_recognizer_still_reports_frame_available() -> None:
+    """A cv2-less box keeps the frame condition; only ``face`` goes quiet."""
+    driver = FaceSenseDriver(media=_FakeMedia([_frame()]), engine=None, store=None)
+    try:
+        _drive(driver, ticks=3)
+        sense = _sense(driver)
+        assert sense.frame_available is True
+        assert sense.face is None
+    finally:
+        driver.close()
+
+
+def test_driver_without_a_recognizer_starts_no_worker_thread() -> None:
+    """No engine means no heavy leg to run — so no thread is spawned at all."""
+    before = threading.active_count()
+    driver = FaceSenseDriver(media=_FakeMedia([_frame()]), engine=None, store=None)
+    try:
+        assert threading.active_count() == before
+        assert driver.worker_alive is False
+    finally:
+        driver.close()
+
+
+def test_module_does_not_import_cv2_at_module_scope() -> None:
+    """The provider module must stay importable on a bare install."""
+    for line in inspect.getsource(FS).splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("import ", "from ")):
+            assert "cv2" not in stripped, f"face_sense must not import cv2: {line}"
+
+
+# --------------------------------------------------------------------------- #
+# Criterion 3 — a None / degenerate frame is skipped, never raised on (#73)   #
+# --------------------------------------------------------------------------- #
+
+
+def test_none_frame_is_skipped_not_raised() -> None:
+    """Criterion 3: the ordinary "nothing ready this instant" case is not a fault."""
+    media = _FakeMedia([None])
+    engine = _FakeEngine()
+    driver = FaceSenseDriver(media=media, engine=engine, store=_FakeStore(), start_worker=False)
+
+    _drive(driver, ticks=5)
+    driver._worker_tick()
+
+    assert driver.peek_frame_available() is False
+    assert driver.peek_face() is None
+    assert engine.frames == []  # a None frame NEVER reaches the heavy leg
+
+
+@pytest.mark.parametrize(
+    "degenerate",
+    [
+        pytest.param(np.asarray(None), id="zero-d-object-array"),  # the #73 shape exactly
+        pytest.param(np.zeros((0, 0, 3), dtype=np.uint8), id="empty"),
+        pytest.param(np.zeros((4,), dtype=np.uint8), id="one-d"),
+        pytest.param(np.zeros((2, 2, 2, 3), dtype=np.uint8), id="four-d"),
+        pytest.param(np.zeros((4, 4, 7), dtype=np.uint8), id="bad-channel-count"),
+        pytest.param("not-a-frame", id="not-an-array"),
+        pytest.param(object(), id="unconvertible"),
+    ],
+)
+def test_degenerate_frame_is_skipped_not_raised(degenerate) -> None:
+    """Criterion 3: anything that is not a usable image is dropped BEFORE any consumer.
+
+    ``np.asarray(None)`` is the concrete issue-#73 value: a 0-d object array
+    whose ``.shape`` is ``()``. Reaching a luma conversion with it raises
+    ``ValueError: Unsupported frame shape: ()``. It must never get that far.
+    """
+    engine = _FakeEngine()
+    driver = FaceSenseDriver(
+        media=_FakeMedia([degenerate]),
+        engine=engine,
+        store=_FakeStore(),
+        start_worker=False,
+    )
+
+    _drive(driver, ticks=3)
+    driver._worker_tick()
+
+    assert driver.peek_frame_available() is False
+    assert engine.frames == []
+
+
+def test_a_raising_frame_read_degrades_to_no_frame() -> None:
+    driver = FaceSenseDriver(media=_FakeMedia([RuntimeError("camera exploded")]))
+    try:
+        _drive(driver, ticks=3)
+        assert driver.peek_frame_available() is False
+    finally:
+        driver.close()
+
+
+def test_no_camera_short_circuits_without_reading_frames() -> None:
+    media = _FakeMedia([_frame()], camera_available=False)
+    driver = FaceSenseDriver(media=media, start_worker=False)
+
+    _drive(driver, ticks=3)
+
+    assert driver.peek_frame_available() is False
+    assert media.calls == 0  # the pollable predicate is the cheap negative
+
+
+def test_a_cold_client_is_never_touched_on_the_tick_thread() -> None:
+    """``connected`` is the one FREE probe; the others may block on a lazy connect.
+
+    On a cold ``HeldMediaClient`` both ``camera_available`` and ``frame()`` can
+    trigger construction of the full media chain — the 425-1213 ms tick-overrun
+    class. So a disconnected client must be skipped without touching either.
+    """
+    touched: list[str] = []
+
+    class _ColdClient:
+        connected = False
+
+        @property
+        def camera_available(self):
+            touched.append("camera_available")
+            return True
+
+        def frame(self):
+            touched.append("frame")
+            return _frame()
+
+    driver = FaceSenseDriver(media=_ColdClient(), start_worker=False)
+    _drive(driver, ticks=5)
+
+    assert driver.peek_frame_available() is False
+    assert touched == []
+
+
+def test_a_reconnected_client_resumes_reporting_frames() -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.connected = False
+
+        def frame(self):
+            return _frame()
+
+    media = _Client()
+    driver = FaceSenseDriver(media=media, start_worker=False)
+    driver(_Ctx(0.0))
+    assert driver.peek_frame_available() is False
+
+    media.connected = True
+    driver(_Ctx(0.02))
+    assert driver.peek_frame_available() is True
+
+
+def test_a_raising_media_object_never_breaks_the_tick() -> None:
+    class _Exploding:
+        @property
+        def camera_available(self):
+            raise RuntimeError("boom")
+
+        def frame(self):
+            raise RuntimeError("boom")
+
+    driver = FaceSenseDriver(media=_Exploding(), start_worker=False)
+    _drive(driver, ticks=3)
+    assert driver.peek_frame_available() is False
+
+
+def test_a_missing_media_client_is_a_permanent_no_reading() -> None:
+    driver = FaceSenseDriver(media=None, start_worker=False)
+    _drive(driver, ticks=3)
+    assert driver.peek_frame_available() is False
+    assert driver.peek_face() is None
+
+
+# --------------------------------------------------------------------------- #
+# frame_available freshness — a condition, not a per-tick event               #
+# --------------------------------------------------------------------------- #
+
+
+def test_frame_available_holds_across_a_frameless_tick_inside_the_ttl() -> None:
+    """The camera runs slower than the 50 Hz tick, so the condition is TTL-held."""
+    media = _FakeMedia([_frame(), None, None, None])
+    driver = FaceSenseDriver(media=media, frame_ttl_s=1.0, start_worker=False)
+
+    _drive(driver, ticks=4, start=0.0, dt=0.02)
+
+    assert driver.peek_frame_available() is True
+
+
+def test_frame_available_clears_once_the_ttl_lapses() -> None:
+    media = _FakeMedia([_frame(), None])
+    driver = FaceSenseDriver(media=media, frame_ttl_s=0.5, start_worker=False)
+
+    driver(_Ctx(0.0))
+    assert driver.peek_frame_available() is True
+    driver(_Ctx(2.0))
+    assert driver.peek_frame_available() is False
+
+
+# --------------------------------------------------------------------------- #
+# face latch semantics — one tick, mirroring PatSenseDriver                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_face_latch_lasts_exactly_one_tick() -> None:
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_FakeEngine(),
+        store=_FakeStore(match=_FakeMatch("ada")),
+        start_worker=False,
+    )
+    driver(_Ctx(0.0))
+    driver._worker_tick()
+    driver(_Ctx(0.02))
+    assert driver.peek_face() == "ada"
+    # A peek is non-consuming: the same tick reads the same value twice.
+    assert driver.peek_face() == "ada"
+    driver(_Ctx(0.04))
+    assert driver.peek_face() is None
+
+
+def test_a_lingering_face_is_re_announced_at_most_once_per_cooldown() -> None:
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_FakeEngine(),
+        store=_FakeStore(match=_FakeMatch("ada")),
+        reannounce_cooldown=30.0,
+        start_worker=False,
+    )
+    seen = []
+    for i in range(6):
+        driver(_Ctx(round(i * 0.02, 10)))
+        driver._worker_tick()
+        driver._output.publish("ada")  # the worker keeps matching the same face
+        driver(_Ctx(round(i * 0.02 + 0.01, 10)))
+        seen.append(driver.peek_face())
+
+    assert seen.count("ada") == 1
+    assert driver.events == 1
+
+
+def test_a_different_face_is_announced_despite_another_names_cooldown() -> None:
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_FakeEngine(),
+        store=_FakeStore(),
+        reannounce_cooldown=30.0,
+        start_worker=False,
+    )
+    driver._output.publish("ada")
+    driver(_Ctx(0.0))
+    assert driver.peek_face() == "ada"
+
+    driver._output.publish("bo")
+    driver(_Ctx(0.02))
+    assert driver.peek_face() == "bo"
+
+
+def test_an_unnamed_or_unmatched_face_never_becomes_a_cue() -> None:
+    for store in (_FakeStore(match=None), _FakeStore(match=_FakeMatch("   "))):
+        driver = FaceSenseDriver(
+            media=_FakeMedia([_frame()]),
+            engine=_FakeEngine(),
+            store=store,
+            start_worker=False,
+        )
+        driver(_Ctx(0.0))
+        driver._worker_tick()
+        driver(_Ctx(0.02))
+        assert driver.peek_face() is None
+
+
+def test_a_raising_engine_or_store_degrades_to_no_match() -> None:
+    raising_engine = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_FakeEngine(raises=RuntimeError("cv2 blew up")),
+        store=_FakeStore(match=_FakeMatch("ada")),
+        start_worker=False,
+    )
+    raising_engine(_Ctx(0.0))
+    raising_engine._worker_tick()
+    raising_engine(_Ctx(0.02))
+    assert raising_engine.peek_face() is None
+
+    raising_store = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_FakeEngine(),
+        store=_FakeStore(raises=RuntimeError("index corrupt")),
+        start_worker=False,
+    )
+    raising_store(_Ctx(0.0))
+    raising_store._worker_tick()
+    raising_store(_Ctx(0.02))
+    assert raising_store.peek_face() is None
+
+
+def test_providers_never_raise_and_read_perception_folds_them() -> None:
+    driver = FaceSenseDriver(media=_FakeMedia([_frame()]), start_worker=False)
+    driver(_Ctx(0.0))
+    sense = read_perception(
+        SenseProviders(
+            face=driver.as_face_provider(),
+            frame_available=driver.as_frame_available_provider(),
+        )
+    )
+    assert sense.frame_available is True and sense.face is None
+
+
+# --------------------------------------------------------------------------- #
+# Threading — the heavy leg NEVER runs on the tick thread                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_detection_runs_off_the_tick_thread() -> None:
+    """A 425-1213 ms tick overrun against a 20 ms budget is what inline detection costs."""
+    engine = _FakeEngine()
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=engine,
+        store=_FakeStore(match=_FakeMatch("ada")),
+        detect_interval=0.0,
+    )
+    try:
+        tick_thread = threading.get_ident()
+        for i in range(10):
+            driver(_Ctx(round(i * 0.02, 10)))
+        assert engine.ran.wait(timeout=5.0), "detection worker never ran"
+        assert engine.threads, "no detection recorded"
+        assert all(ident != tick_thread for ident in engine.threads)
+    finally:
+        driver.close()
+
+
+def test_a_slow_detector_never_blocks_the_tick() -> None:
+    """The tick publishes into a latest-wins slot; it never waits for a result."""
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowEngine(_FakeEngine):
+        def detect(self, frame):
+            started.set()
+            release.wait(timeout=5.0)
+            return super().detect(frame)
+
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_SlowEngine(),
+        store=_FakeStore(match=_FakeMatch("ada")),
+        detect_interval=0.0,
+    )
+    try:
+        driver(_Ctx(0.0))
+        assert started.wait(timeout=5.0), "worker never picked up the frame"
+        # The detector is parked mid-detection; ticks must still complete.
+        for i in range(1, 20):
+            driver(_Ctx(round(i * 0.02, 10)))
+        assert driver.peek_frame_available() is True
+    finally:
+        release.set()
+        driver.close()
+
+
+def test_close_is_idempotent_and_stops_the_worker() -> None:
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_FakeEngine(),
+        store=_FakeStore(),
+    )
+    assert driver.worker_alive is True
+    driver.close()
+    driver.close()
+    assert driver.worker_alive is False
+
+
+def test_ticking_after_close_is_inert_not_an_error() -> None:
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_FakeEngine(),
+        store=_FakeStore(),
+    )
+    driver.close()
+    _drive(driver, ticks=3)
+    assert driver.peek_face() is None
+    assert driver.peek_frame_available() is False
+
+
+# --------------------------------------------------------------------------- #
+# Composition boundary — this task ships providers, not the wiring            #
+# --------------------------------------------------------------------------- #
+
+
+def test_driver_never_constructs_its_own_media_client() -> None:
+    """The media client is the composition root's single owner — always injected."""
+    source = inspect.getsource(FS)
+    assert "HeldMediaClient(" not in source
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("import ", "from ")):
+            assert "media_client" not in stripped, f"face_sense must not import it: {line}"
