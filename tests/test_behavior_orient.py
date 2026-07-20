@@ -128,7 +128,8 @@ def test_gate_reaches_the_speech_tier_once_the_bearing_holds_still() -> None:
     gate = CorroboratedGate()
     params = OrientParams()
     seen = [gate(_sense(angle=0.5, speech=True, rms=LOUD), t, params) for t in (0.0, 0.2, 0.4)]
-    assert seen[0] is OrientTier.NOISE  # dwell not yet earned
+    assert seen[0] is OrientTier.NONE  # the NOISE attack not yet earned (t35's envelope)
+    assert seen[1] is OrientTier.NOISE  # dwell not yet earned
     late = gate(_sense(angle=0.5, speech=True, rms=LOUD), params.dwell_s + 0.1, params)
     assert late is OrientTier.SPEECH
 
@@ -184,12 +185,14 @@ def test_every_tier_transition_is_logged_once_and_never_per_tick(caplog) -> None
         _drive(fn, _sense(angle=0.5, speech=True, rms=LOUD), ticks=50)  # NONE -> NOISE
         _drive(fn, _sense(rms=QUIET), ticks=50, t0=1.0)  # NOISE -> NONE
     lines = [r.getMessage() for r in caplog.records if "stage=orient" in r.getMessage()]
-    # Three genuine transitions across 100 ticks: the ladder climbing once the
-    # bearing earns its dwell, then closing when the room goes quiet.
-    assert len(lines) == 3, lines
+    # Four genuine transitions across 100 ticks: the ladder climbing once the
+    # attack then the dwell are earned, demoting to the lean-only tier while the
+    # release hold rides out the quiet, then closing when the hold expires.
+    assert len(lines) == 4, lines
     assert "NONE->NOISE" in lines[0] and "bearing=0.500rad" in lines[0]
     assert "NOISE->SPEECH" in lines[1]
-    assert "closed from=SPEECH" in lines[2]
+    assert "SPEECH->NOISE" in lines[2]  # the release hold keeps the lean, not the head tier
+    assert "closed from=NOISE" in lines[3]
 
 
 # --------------------------------------------------------------------------- #
@@ -690,7 +693,9 @@ def test_the_measured_at_rest_trace_never_latches_this_guard() -> None:
     distinct = [3.124 * i / 34.0 for i in range(35)]
     angles = [distinct[(i // 10) % 35] for i in range(int(180.0 / 0.02))]
     verdicts = _cycle(guarded, angles)
-    assert all(v is not OrientTier.NONE for v in verdicts if v is not None)
+    # The first call abstains while the NOISE attack is earned (t35's envelope);
+    # from then on the guard never vetoes this trace.
+    assert all(v is not OrientTier.NONE for v in verdicts[1:] if v is not None)
     assert not guarded.latched
 
 
@@ -754,3 +759,212 @@ def test_a_frozen_bearing_never_reaches_the_head_through_the_shipped_behavior() 
     sense = _sense(angle=0.0, speech=True, rms=LOUD)
     contribs = [fn(i * 0.02, {}, sense) for i in range(int(40.0 / 0.02))]
     assert all(c.head is None for c in contribs[-200:])
+
+
+# --------------------------------------------------------------------------- #
+# 6. The NOISE attack/release envelope (task t35)                             #
+# --------------------------------------------------------------------------- #
+#
+# Live-verified defect (journal, 2026-07-21 01:25): a transient train (keyboard
+# clicks) made the NOISE tier flap at tick rate — 22 `NONE->NOISE` opens in
+# 1.3 s, one open/close per ~22 ms tick, with the #95 moving-floor gate CLOSED
+# throughout. The rms reading genuinely alternates loud/quiet per tick on
+# clicky sound, and the bare per-tick predicate (`doa finite AND rms >=
+# rms_floor`) had zero temporal smoothing — SPEECH has an angular dwell, NOISE
+# had nothing. The envelope under test adds the missing attack (consecutive
+# loud calls before the tier opens) and release (continuous quiet before it
+# closes) timing.
+
+#: The tick period the 50 Hz engine calls the gate at (the measured burst's
+#: ~22 ms open/close cadence).
+TICK_S = 0.02
+
+
+def test_the_envelope_knobs_ship_with_the_defect_derived_defaults() -> None:
+    params = OrientParams()
+    assert params.noise_attack_ticks == 2
+    assert params.noise_release_s == pytest.approx(0.7)
+
+
+def test_a_single_one_tick_click_never_opens_the_noise_tier() -> None:
+    """One loud tick followed by quiet — the sharpest keyboard click — must
+    never open the tier at all: the attack needs consecutive loud calls."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    verdicts = [gate(_sense(angle=0.5, rms=LOUD), 0.0, params)]
+    for i in range(1, 50):
+        verdicts.append(gate(_sense(rms=QUIET), i * TICK_S, params))
+    assert set(verdicts) == {OrientTier.NONE}
+
+
+def test_sustained_sound_opens_noise_on_the_attack_tick_and_not_before() -> None:
+    gate = CorroboratedGate()
+    params = OrientParams()
+    verdicts = [gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params) for i in range(10)]
+    n = params.noise_attack_ticks
+    assert all(v is OrientTier.NONE for v in verdicts[: n - 1])
+    assert all(v is OrientTier.NOISE for v in verdicts[n - 1 :])
+
+
+def test_a_per_tick_alternating_rms_train_opens_noise_once_and_holds() -> None:
+    """The measured burst, replayed: an rms train alternating loud/quiet per
+    tick opens NOISE at most ONCE and holds it through every sub-release gap —
+    against the live robot's 22 opens in the same 1.3 s."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    # Two loud ticks light the attack, then the per-tick alternation the click
+    # train produced, for the rest of the measured 1.3 s burst.
+    train = [LOUD, LOUD] + [QUIET if i % 2 else LOUD for i in range(63)]
+    verdicts = [gate(_sense(angle=0.5, rms=rms), i * TICK_S, params) for i, rms in enumerate(train)]
+    opens = sum(
+        1
+        for prev, cur in zip([OrientTier.NONE, *verdicts], verdicts)
+        if prev is OrientTier.NONE and cur is not OrientTier.NONE
+    )
+    assert opens == 1
+    first_open = next(i for i, v in enumerate(verdicts) if v is not OrientTier.NONE)
+    assert all(v is OrientTier.NOISE for v in verdicts[first_open:])
+
+
+def test_the_release_hold_closes_exactly_once_after_continuous_quiet() -> None:
+    """After the sound ends the tier closes exactly once, ``noise_release_s``
+    of CONTINUOUS quiet later — never on the first quiet tick."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    for i in range(10):
+        assert gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params) in (
+            OrientTier.NONE,
+            OrientTier.NOISE,
+        )
+    quiet_start = 10 * TICK_S
+    times = [quiet_start + j * TICK_S for j in range(100)]
+    verdicts = [gate(_sense(rms=QUIET), t, params) for t in times]
+    closes = sum(
+        1
+        for prev, cur in zip(verdicts, verdicts[1:])
+        if prev is not OrientTier.NONE and cur is OrientTier.NONE
+    )
+    assert closes == 1
+    closed_at = next(t for t, v in zip(times, verdicts) if v is OrientTier.NONE)
+    assert closed_at - quiet_start >= params.noise_release_s - 1e-9
+    assert closed_at - quiet_start < params.noise_release_s + 3 * TICK_S
+    first_none = verdicts.index(OrientTier.NONE)
+    assert all(v is OrientTier.NOISE for v in verdicts[:first_none])
+    assert all(v is OrientTier.NONE for v in verdicts[first_none:])
+
+
+def test_a_fresh_loud_reading_during_the_hold_resets_the_quiet_timer() -> None:
+    gate = CorroboratedGate()
+    params = OrientParams()
+    now = 0.0
+    for i in range(5):
+        now = i * TICK_S
+        gate(_sense(angle=0.5, rms=LOUD), now, params)  # opens on the attack tick
+    base = now
+    for j in range(1, 30):  # 0.58 s of quiet — inside the release window
+        assert gate(_sense(rms=QUIET), base + j * TICK_S, params) is OrientTier.NOISE
+    now = base + 30 * TICK_S
+    # One fresh loud tick: still NOISE, and the quiet timer starts over (the
+    # bearing may update exactly as it does today).
+    assert gate(_sense(angle=0.6, rms=LOUD), now, params) is OrientTier.NOISE
+    quiet_start = now + TICK_S
+    for k in range(34):  # another 0.66 s of quiet: inside a FRESH window
+        assert gate(_sense(rms=QUIET), quiet_start + k * TICK_S, params) is OrientTier.NOISE
+    late = quiet_start + params.noise_release_s + TICK_S
+    assert gate(_sense(rms=QUIET), late, params) is OrientTier.NONE
+
+
+def test_the_release_hold_reports_noise_not_the_higher_tier_it_fell_from() -> None:
+    """A quiet gap has no meaningful bearing, so the hold keeps only the
+    lean-only tier — a SPEECH nudge must not survive on silence."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    verdict = OrientTier.NONE
+    t = 0.0
+    for i in range(50):
+        t = i * TICK_S
+        verdict = gate(_sense(angle=0.5, speech=True, rms=LOUD), t, params)
+    assert verdict is OrientTier.SPEECH
+    assert gate(_sense(rms=QUIET), t + TICK_S, params) is OrientTier.NOISE
+
+
+def test_engagement_stays_immediate_even_from_a_cold_envelope() -> None:
+    """The transcript fast-path takes no attack debounce: the very first call
+    ENGAGEs, and a quiet tick right after rides the release hold."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    assert gate(_sense(angle=0.5, transcript="hey reachy"), 0.0, params) is OrientTier.ENGAGED
+    assert gate(_sense(rms=QUIET), TICK_S, params) is OrientTier.NOISE
+
+
+def test_speech_escalation_is_unchanged_while_the_envelope_holds() -> None:
+    """The envelope governs only NOISE open/close timing: a bearing that earns
+    its dwell under sustained speech still escalates, hold or no hold."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    for i in range(5):
+        gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params)  # open the envelope
+    base = 5 * TICK_S
+    for j in range(10):  # a sub-release quiet gap, riding the hold
+        assert gate(_sense(rms=QUIET), base + j * TICK_S, params) is OrientTier.NOISE
+    t0 = base + 10 * TICK_S
+    ticks = int(params.dwell_s / TICK_S) + 2
+    verdicts = [
+        gate(_sense(angle=1.0, speech=True, rms=LOUD), t0 + k * TICK_S, params)
+        for k in range(ticks)
+    ]
+    assert verdicts[0] is OrientTier.NOISE  # held open — no re-attack after a gap
+    assert verdicts[-1] is OrientTier.SPEECH  # the dwell evaluates exactly as today
+
+
+def test_the_moving_floor_gated_zero_rms_rides_the_release_hold() -> None:
+    """#95's moving-floor gate reports rms 0.0 while the robot's own lean runs.
+    That is simply "quiet" riding the release hold, so the tier no longer
+    collapses ~20 ms after its own lean starts — one lean per sound episode,
+    held up to the release window."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    for i in range(3):
+        gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params)  # open
+    verdict = gate(_sense(angle=0.5, rms=0.0), 3 * TICK_S, params)
+    assert verdict is OrientTier.NOISE
+
+
+def test_tier_transitions_drop_from_per_tick_to_per_episode_on_a_click_train() -> None:
+    """The journal defect measured ~2 transitions per TICK (22 opens plus their
+    closes in 1.3 s). Through the SHIPPED gate stack the same train yields
+    exactly one open and one close — ~2 transitions per EPISODE — asserted via
+    the verdict-transition count, not log scraping."""
+    gate = LatchedDoaGuard(CorroboratedGate())
+    params = OrientParams()
+    train = [LOUD, LOUD] + [QUIET if i % 2 else LOUD for i in range(63)]
+    train += [QUIET] * 60  # the episode ends: > noise_release_s of continuous quiet
+    # The bearing wanders a little tick to tick (as the real feed does), so the
+    # latched-DoA guard never reads it as frozen.
+    verdicts = [
+        gate(_sense(angle=0.5 + 0.001 * (i % 5), rms=rms), i * TICK_S, params)
+        for i, rms in enumerate(train)
+    ]
+    transitions = sum(1 for a, b in zip(verdicts, verdicts[1:]) if a is not b)
+    assert transitions == 2  # NONE->NOISE once, NOISE->NONE once
+    assert verdicts[0] is OrientTier.NONE
+    assert verdicts[-1] is OrientTier.NONE
+
+
+def test_a_hostile_snapshot_mid_hold_fails_closed_and_resets_the_envelope() -> None:
+    """The gate's never-raise contract extends to the envelope: an unreadable
+    sense drops the hold outright rather than steering on stale state."""
+
+    class Boom:
+        doa_angle = property(lambda self: (_ for _ in ()).throw(RuntimeError("on fire")))
+        transcript = None
+        rms = None
+        speech_detected = False
+
+    gate = CorroboratedGate()
+    params = OrientParams()
+    for i in range(5):
+        gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params)  # open
+    assert gate(Boom(), 5 * TICK_S, params) is OrientTier.NONE  # type: ignore[arg-type]
+    # ... and the hold did not survive the fault: the next quiet tick is NONE.
+    assert gate(_sense(rms=QUIET), 6 * TICK_S, params) is OrientTier.NONE
