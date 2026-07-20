@@ -70,3 +70,36 @@ def _offline_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(socket, "create_connection", _deny_network)
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_reachy_logging():
+    """Never let one test's installed log handler outlive it.
+
+    ``reachy.cli._logging.install_logging`` attaches ONE handler to the
+    ``"reachy"`` logger and keeps it for the process lifetime — deliberately, so
+    repeat calls in a long-running loop cannot duplicate log lines. That design
+    is right for production and wrong for a test process, where it makes the
+    handler shared mutable state: any test that installs it leaves every later
+    test in the same worker logging through it.
+
+    The failure that motivated this fixture: a test asserting ``err == ""``
+    began failing once an unrelated code path started emitting a ``[SENSE]``
+    line, because a *different* test earlier in the same ``pytest -n auto``
+    worker had installed the handler. Which tests share a worker varies per run,
+    so it presented as an order-dependent flake (6 of 8 runs) rather than a
+    reproducible failure — and the emitting code was blameless.
+
+    Snapshot the handlers and the level, restore both afterwards. Cheap, and it
+    makes "does this code log?" a local question again.
+    """
+    import logging as _logging
+
+    logger = _logging.getLogger("reachy")
+    saved_handlers = list(logger.handlers)
+    saved_level = logger.level
+    try:
+        yield
+    finally:
+        logger.handlers[:] = saved_handlers
+        logger.setLevel(saved_level)
