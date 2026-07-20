@@ -323,6 +323,27 @@ def test_rules_check_a_rule_on_a_fed_field_never_warns(capsys) -> None:
     assert payload["warnings"] == []
 
 
+# `self_moving` (#95): the composition wires the SelfMotionDriver latch as a
+# provider, and `_COMPOSED_PROVIDER_FIELDS` was extended in the SAME change, so
+# a rule keyed on it must be accepted with no dormant-predicate warning.
+SELF_MOVING_FIELD_TOML = """\
+[[inhibit]]
+id = "i-self-moving"
+when = { field = "self_moving", op = "is_true" }
+disable = ["speak"]
+"""
+
+
+def test_rules_check_a_rule_keyed_on_self_moving_never_warns(capsys) -> None:
+    _write_rules(SELF_MOVING_FIELD_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["warnings"] == []
+    assert payload["counts"] == {"react": 0, "inhibit": 1, "modes": 0}
+
+
 def test_rules_check_only_the_unfed_rule_is_flagged_in_a_mixed_file(capsys, monkeypatch) -> None:
     _simulate_unfed(monkeypatch, "face")
     _write_rules(MIXED_FIELD_TOML)

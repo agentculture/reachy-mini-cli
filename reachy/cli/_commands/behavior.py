@@ -75,10 +75,19 @@ from reachy.behavior.pat_sense import (
     PatSenseDriver,
 )
 from reachy.behavior.pose_feed import LastPoseHolder
-from reachy.behavior.rms_sense import make_rms_provider
+from reachy.behavior.rms_sense import DEFAULT_MOVING_FLOOR, MOVING_FLOOR_ENV, make_rms_provider
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
+from reachy.behavior.self_motion import (
+    DEFAULT_EPS_DEG,
+    DEFAULT_EPS_MM,
+    DEFAULT_TAIL_S,
+    EPS_DEG_ENV,
+    EPS_MM_ENV,
+    TAIL_S_ENV,
+    SelfMotionDriver,
+)
 from reachy.behavior.sense import (
     FED_SENSE_FIELDS,
     DoaPoller,
@@ -1130,6 +1139,53 @@ def _pat_detector() -> PatDetector | None:
     )
 
 
+def _make_self_motion() -> SelfMotionDriver:
+    """Build the self-motion latch (#95), honouring its env tuning.
+
+    Reads :data:`~reachy.behavior.self_motion.TAIL_S_ENV` /
+    :data:`~reachy.behavior.self_motion.EPS_DEG_ENV` /
+    :data:`~reachy.behavior.self_motion.EPS_MM_ENV` at composition time — the
+    same read-at-composition pattern as the ``REACHY_PAT_*`` knobs above — so
+    an operator who never sets any of them composes a driver at the shipped
+    defaults, and the driver module itself stays environment-free.
+    """
+    return SelfMotionDriver(
+        eps_deg=_pat_float_env(EPS_DEG_ENV, DEFAULT_EPS_DEG),
+        eps_mm=_pat_float_env(EPS_MM_ENV, DEFAULT_EPS_MM),
+        tail_s=_pat_float_env(TAIL_S_ENV, DEFAULT_TAIL_S),
+    )
+
+
+def _rms_moving_floor() -> float:
+    """Resolve the moving rms floor (#95), or its infinite shipped default.
+
+    Deliberately NOT :func:`_pat_float_env`: that helper refuses ``inf`` (a
+    non-finite tuning value is never valid for the pat filters), while here
+    INFINITY is the shipped default — full suppression while moving — and the
+    string ``"inf"`` must round-trip as an explicit operator choice. Only
+    ``nan`` and negatives are refused (fail-closed as a clean user error,
+    matching the CLI's malformed-env contract).
+    """
+    raw = os.environ.get(MOVING_FLOOR_ENV)
+    if raw is None:
+        return DEFAULT_MOVING_FLOOR
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid {MOVING_FLOOR_ENV}={raw!r} (expected a number or 'inf')",
+            remediation=f"set {MOVING_FLOOR_ENV} to a number or 'inf', or unset it",
+        ) from exc
+    if math.isnan(value) or value < 0.0:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid {MOVING_FLOOR_ENV}={raw!r} (expected a non-negative number)",
+            remediation=f"set {MOVING_FLOOR_ENV} to zero or more (or 'inf'), or unset it",
+        )
+    return value
+
+
 #: How often the background keeper re-checks each held client's free
 #: :attr:`connected` predicate (seconds). Deliberately faster than the holders'
 #: own 5 s retry backoff: the poll itself costs nothing (a pure attribute read),
@@ -1461,26 +1517,32 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     leg (its own low-rate polling + failure-swallowing preserved), and every
     other field is a non-consuming PEEK of a driver's one-tick latch or held
     condition. A mic-less box reads EMPTY_SENSE for the DoA leg exactly as
-    before. Six providers are wired, from four producers:
+    before. Seven providers are wired, from five producers:
 
     * ``pat_event`` / ``pat_state`` — two PEEKs of the ONE
       :class:`PatSenseDriver`, so both views describe one held reader and
       detector;
     * ``rms`` — :func:`~reachy.behavior.rms_sense.make_rms_provider` over this
-      tick's shared mic chunk;
+      tick's shared mic chunk, gated by the self-motion latch below (#95): while
+      the engine commands motion and the measured rms sits under the moving
+      floor (:func:`_rms_moving_floor`), the reading reports quiet (0.0) so the
+      robot's own actuator noise can never re-admit ``look-toward-sound``;
     * ``transcript`` — the :class:`TranscriptSenseDriver`'s one-tick latch of an
       ADDRESSED utterance (its STT round trip and engagement gate run on the
       driver's own worker thread, never here);
     * ``face`` / ``frame_available`` — the :class:`FaceSenseDriver`'s one-tick
       name latch and TTL-held camera condition (detection likewise runs on that
-      driver's worker).
+      driver's worker);
+    * ``self_moving`` — the :class:`SelfMotionDriver`'s held latch (the same
+      peek the rms gate consults), so a rule can key on "am I commanding
+      motion" directly.
 
-    Wiring these is what makes ``rms``/``face``/``frame_available``/``transcript``
-    FED fields: before this, each was a schema-valid ``rules.toml`` predicate
-    that validated cleanly and then silently never fired. The declared truth
-    ``behavior rules check`` lints against
-    (:data:`reachy.behavior.sense.FED_SENSE_FIELDS`) moves in lockstep with this
-    function — see that module's contract note.
+    Wiring these is what makes ``rms``/``face``/``frame_available``/
+    ``transcript``/``self_moving`` FED fields: before this, each was a
+    schema-valid ``rules.toml`` predicate that validated cleanly and then
+    silently never fired. The declared truth ``behavior rules check`` lints
+    against (:data:`reachy.behavior.sense.FED_SENSE_FIELDS`) moves in lockstep
+    with this function — see that module's contract note.
 
     ONE mic read per tick
     ---------------------
@@ -1520,8 +1582,8 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     Act-in seams (the ONE TickBus, in driver order)
     -----------------------------------------------
     ``[rules_driver, intent_driver, pat_driver, transcript_driver, face_driver,
-    holder, goto_lane]`` (with a :class:`SenseSnapshotDriver` appended when
-    exporting):
+    self_motion, holder, goto_lane]`` (with a :class:`SenseSnapshotDriver`
+    appended when exporting):
 
     * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
       decisions (admit/evict, drain the intent + goto command spools). The GOTO
@@ -1539,12 +1601,16 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       shared engine state and only latches, so its position among the readers is
       immaterial to correctness; it sits after the symbolic drivers by
       convention.
-    * ``transcript_driver`` / ``face_driver`` — the other two latching sense
-      drivers, grouped with the pat driver for the same reason: each clears its
-      latch, does bounded O(1) tick-thread work, and latches for the NEXT tick's
-      sense read. Neither mutates engine state, so their order among themselves
-      is immaterial; they are ordered after the pat driver by convention, and
-      before the pose holder so the act-in half of the seam stays contiguous.
+    * ``transcript_driver`` / ``face_driver`` / ``self_motion`` — the other
+      latching sense drivers, grouped with the pat driver for the same reason:
+      each clears/updates its latch, does bounded O(1) tick-thread work, and
+      latches for the NEXT tick's sense read (``self_motion`` mirrors the pat
+      driver's end-of-tick cadence exactly: it deltas THIS tick's streamed
+      ``ctx.pose``, so the rms provider's read at the start of the next tick
+      consults a latch that already reflects this tick's command). None mutates
+      engine state, so their order among themselves is immaterial; they are
+      ordered after the pat driver by convention, and before the pose holder so
+      the act-in half of the seam stays contiguous.
     * ``holder`` BEFORE ``goto_lane`` — the holder stashes this tick's streamed
       ``ctx.pose``; the goto lane's ``start_pose_provider`` peeks that stash when
       it admits a goto. Running the holder first means a goto admitted THIS tick
@@ -1671,13 +1737,22 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         keeper.start()
 
         holder = LastPoseHolder()
+        # The self-motion latch (#95): composed UNCONDITIONALLY (it reads only
+        # ctx.pose — no SDK, no extra), consulted by the rms provider at read
+        # time so the robot's own actuator noise reads quiet while it moves.
+        self_motion = _make_self_motion()
         providers = SenseProviders(
             pat_event=pat_driver.as_provider() if pat_driver is not None else None,
             pat_state=pat_driver.as_state_provider() if pat_driver is not None else None,
-            rms=make_rms_provider(audio_tap.audio),
+            rms=make_rms_provider(
+                audio_tap.audio,
+                moving=self_motion.is_moving,
+                moving_floor=_rms_moving_floor(),
+            ),
             transcript=transcript_driver.as_provider(),
             face=face_driver.as_face_provider(),
             frame_available=face_driver.as_frame_available_provider(),
+            self_moving=self_motion.is_moving,
         )
 
         def sense_reader(t):
@@ -1712,6 +1787,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
                 pat_driver,
                 transcript_driver,
                 face_driver,
+                self_motion,
                 holder,
                 goto_lane,
             )
