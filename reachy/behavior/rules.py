@@ -49,6 +49,15 @@ behavior admitted by a rule stops on its own after ``duration_s`` seconds
 instead of running until something else evicts it (see
 :meth:`reachy.behavior.rule_engine.RuleEngine._build`).
 
+A REACT rule may also carry ``say`` (react-only, a non-empty string of at most
+:data:`MAX_SAY_CHARS` characters): TEXT the robot speaks aloud when the rule
+fires. ``run`` names what the robot *does*; ``say`` names what it *says*, and
+the two are independent halves of one reaction — pairing ``say`` with the
+library's ``speak`` head-bob is what "the robot is talking" looks like. The
+words are plain data; rendering them is
+:class:`reachy.behavior.speech_act.SpeechActuator`'s job, on a background
+worker, and this module knows nothing about voices, audio, or threads.
+
 :meth:`RulesConfig.from_dict` is the single validation gate, mirroring
 :meth:`reachy.stash.record.StashRecord.from_dict`. It refuses:
 
@@ -66,6 +75,8 @@ instead of running until something else evicts it (see
 * a negative ``cooldown_s``/``hysteresis``, or a duplicate rule ``id``;
 * a react rule's ``duration_s`` that is not a positive number (``<= 0``,
   non-numeric, or a ``bool``);
+* a react rule's ``say`` that is not a non-empty string, or that exceeds
+  :data:`MAX_SAY_CHARS` — refused fail-closed, never truncated;
 * a react rule that targets a library entry which is looping with no
   ``default_duration`` (an unbounded-looping default) and carries no
   ``duration_s`` of its own — refused FAIL-CLOSED so an admitted behavior can
@@ -155,10 +166,20 @@ KIND_INHIBIT = "inhibit"
 DEFAULT_COOLDOWN_S = 5.0
 DEFAULT_HYSTERESIS = 0.0
 
+#: Hard ceiling on a react rule's ``say`` text, in characters. Bounded
+#: FAIL-CLOSED (refused, never truncated) for the same reason
+#: :mod:`reachy.behavior.goto_intent` caps a goto's duration: a rules file is
+#: operator data, and an actuator with a real-world cost — here, seconds of the
+#: robot holding the room — must not be handed an unbounded one. This is also
+#: the bound :class:`reachy.behavior.speech_act.SpeechActuator` re-checks (it
+#: imports THIS constant, so there is one number), because a rule is not its
+#: only caller.
+MAX_SAY_CHARS = 500
+
 _PREDICATE_FIELDS = frozenset({"field", "op", "value"})
 _TOP_LEVEL_FIELDS = frozenset({"active_mode", "react", "inhibit", "modes"})
 _REACT_FIELDS = frozenset(
-    {"id", "enabled", "when", "run", "params", "cooldown_s", "hysteresis", "duration_s"}
+    {"id", "enabled", "when", "run", "params", "cooldown_s", "hysteresis", "duration_s", "say"}
 )
 _INHIBIT_FIELDS = frozenset({"id", "enabled", "when", "disable", "cooldown_s", "hysteresis"})
 _REACT_REQUIRED = frozenset({"id", "when", "run"})
@@ -336,6 +357,16 @@ class Rule:
     duration. See :meth:`RulesConfig.from_dict`'s fail-closed refusal of a
     react rule that targets an unbounded-looping entry with no
     :attr:`duration_s`.
+
+    :attr:`say` is likewise REACT-ONLY: optional TEXT the robot speaks aloud
+    when the rule fires, at most :data:`MAX_SAY_CHARS` characters. It is the
+    AUDIBLE half of a reaction, dispatched to an injected speech seam by
+    :class:`reachy.behavior.rule_engine.RuleEngine` and rendered off the tick
+    thread by :class:`reachy.behavior.speech_act.SpeechActuator`; :attr:`behavior`
+    remains the visible half (pair it with the library's ``speak`` head-bob to
+    get a robot that looks like it is talking). It is plain data — a string in
+    a TOML file, never a template, an expression, or a path to code — exactly
+    like every other field here.
     """
 
     id: str
@@ -347,6 +378,7 @@ class Rule:
     params: dict[str, float] = field(default_factory=dict)
     disable: frozenset[str] = field(default_factory=frozenset)
     duration_s: float | None = None
+    say: str | None = None
 
 
 @dataclass(frozen=True)
@@ -492,6 +524,32 @@ def _validate_predicate_value(raw: Mapping, *, op: str, path: str) -> object:
     return value
 
 
+def _validate_say(raw: object, *, path: str) -> str | None:
+    """Validate an optional react-rule ``say``: ``None`` when absent.
+
+    A rule that carries the field at all must carry real, bounded text — a
+    blank string, a number, a list, or anything over :data:`MAX_SAY_CHARS` is
+    REFUSED rather than coerced or truncated, matching this module's posture on
+    every other optional field (and ``goto``'s fail-closed axis bounds).
+    ``bool`` is rejected explicitly: ``say = true`` is a mistake, not an
+    utterance, and would otherwise slip through a bare ``isinstance(str)``
+    check unnoticed only because TOML has no such coercion.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, str) or not raw.strip():
+        raise _error(
+            f"{path}.say must be a non-empty string (got {raw!r})",
+            remediation="give say the words to speak, or remove the field entirely",
+        )
+    if len(raw) > MAX_SAY_CHARS:
+        raise _error(
+            f"{path}.say is {len(raw)} characters, over the {MAX_SAY_CHARS}-character limit",
+            remediation=f"shorten the utterance to at most {MAX_SAY_CHARS} characters",
+        )
+    return raw
+
+
 def _validate_behavior_name(name: object, *, path: str) -> str:
     if not isinstance(name, str) or name not in behavior_library.LIBRARY:
         raise _error(
@@ -608,6 +666,7 @@ def _validate_react_rule(raw: object, *, index: int) -> Rule:
         raw.get("hysteresis"), name="hysteresis", path=path, default=DEFAULT_HYSTERESIS
     )
     duration_s = _validate_positive_float(raw.get("duration_s"), name="duration_s", path=path)
+    say = _validate_say(raw.get("say"), path=path)
 
     if duration_s is None and entry.looping and entry.default_duration is None:
         raise _error(
@@ -627,6 +686,7 @@ def _validate_react_rule(raw: object, *, index: int) -> Rule:
         params=params,
         disable=frozenset(),
         duration_s=duration_s,
+        say=say,
     )
 
 

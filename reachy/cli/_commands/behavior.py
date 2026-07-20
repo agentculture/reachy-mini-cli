@@ -86,6 +86,7 @@ from reachy.behavior.sense import (
     read_doa,
     read_perception,
 )
+from reachy.behavior.speech_act import SpeechActuator
 from reachy.behavior.tick_metrics import TickMetrics, budget_from_hz
 from reachy.behavior.transcript_sense import TranscriptSenseDriver
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
@@ -461,6 +462,12 @@ def _rule_payload(rule: rules_mod.Rule) -> dict[str, object]:
     if rule.kind == rules_mod.KIND_REACT:
         data["run"] = rule.behavior
         data["params"] = dict(rule.params)
+        # Both react-only fields, reported even when unset (a stable key set
+        # beats a shape that changes per rule). `say` especially: an operator
+        # reading this verb is asking "what will my robot do", and the words it
+        # is about to speak are the loudest part of that answer.
+        data["duration_s"] = rule.duration_s
+        data["say"] = rule.say
     else:
         data["disable"] = sorted(rule.disable)
     return data
@@ -1093,6 +1100,22 @@ def _make_state_reader() -> HeldStateReader:
     return HeldStateReader(allow_inline_connect=False)
 
 
+def _make_speech_actuator() -> SpeechActuator:
+    """Build the runtime's ONE voice — a test-injection seam.
+
+    Everything about WHICH voice and WHICH speaker is resolved inside
+    :class:`~reachy.behavior.speech_act.SpeechActuator` from the environment
+    (``REACHY_VOICE_ENGINE``, ``REACHY_SPEECH_TRANSPORT``), so this stays a bare
+    constructor call and a malformed variable fails at SETUP with a clean
+    ``CliError`` rather than mid-utterance on the worker thread.
+
+    Unlike the two held SDK clients, the actuator is composed with no degrade
+    path to worry about: its shipped voice is the in-process harmonic synth, so
+    a box with no ``[sdk]`` extra, no network and no TTS still has one.
+    """
+    return SpeechActuator()
+
+
 def _make_media_client() -> HeldMediaClient:
     """Build the ONE held media client (mic + camera) — a test-injection seam.
 
@@ -1273,19 +1296,26 @@ class _RuntimeResources:
     """Everything :func:`_compose_run_seam` opened that the caller MUST release.
 
     ``cmd_engine_run`` used to close a single held pose reader; the runtime now
-    owns two held SDK clients plus two driver-owned worker threads, so the
-    teardown travels as one object rather than a growing tuple. ``close()`` is
-    idempotent, releases in reverse dependency order (keeper, then drivers that
-    READ the holders, then the holders themselves), and never raises — a failing
-    teardown step must not stop the remaining ones, because an unclosed client
-    hangs the process at interpreter exit.
+    owns two held SDK clients, two driver-owned worker threads and the speech
+    actuator's worker, so the teardown travels as one object rather than a
+    growing tuple. ``close()`` is idempotent, releases in reverse dependency
+    order (keeper, then the voice, then drivers that READ the holders, then the
+    holders themselves), and never raises — a failing teardown step must not
+    stop the remaining ones, because an unclosed client hangs the process at
+    interpreter exit.
+
+    The speech actuator is released BEFORE the sense drivers on purpose: it is
+    the only piece that can still be mid-I/O when the loop ends, and its join is
+    bounded, so draining it first keeps the shutdown ordering honest rather than
+    racing a half-played clip against a closing media client.
     """
 
-    def __init__(self, *, pose_reader=None, media=None, drivers=(), keeper=None) -> None:
+    def __init__(self, *, pose_reader=None, media=None, drivers=(), keeper=None, speech=None):
         self.pose_reader = pose_reader
         self.media = media
         self.drivers = tuple(driver for driver in drivers if driver is not None)
         self.keeper = keeper
+        self.speech = speech
         self._closed = False
 
     def close(self) -> None:
@@ -1294,6 +1324,8 @@ class _RuntimeResources:
         self._closed = True
         if self.keeper is not None:
             self._release(self.keeper.stop, "holder keeper")
+        if self.speech is not None:
+            self._release(self.speech.close, "speech actuator")
         for driver in self.drivers:
             self._release(driver.close, f"{type(driver).__name__}")
         if self.media is not None:
@@ -1504,8 +1536,14 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     # hangs the process at interpreter exit — turning a clean structured failure
     # into a wedged unit that `Restart=on-failure` never restarts. So the whole
     # construction is guarded and releases what it opened before re-raising.
-    reader = media = transcript_driver = face_driver = keeper = None
+    reader = media = transcript_driver = face_driver = keeper = speech = None
     try:
+        # The voice, first: built and STARTED here on the setup thread so no tick
+        # ever pays for thread creation, and so a malformed REACHY_VOICE_ENGINE /
+        # REACHY_SPEECH_TRANSPORT is a clean startup error. `say()` is O(1) and
+        # non-blocking; every slow leg (synthesis, playback) runs on its worker.
+        speech = _make_speech_actuator()
+        speech.start()
         # The pat sense stack ships ON after the hands-on #80 gate finding: the
         # complete command must hold still before sensing, which removes wander
         # ghosts structurally while allowing a settled reaction owner to keep
@@ -1541,6 +1579,11 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         transcript_driver = TranscriptSenseDriver(
             media=audio_tap,  # the shared per-tick chunk, never a second mic read
             classifier=_engagement_classifier(),
+            # Self-mute: the mic and the speaker share a room, so without this the
+            # runtime transcribes its OWN voice, the transcript fires a rule, the
+            # rule speaks, and the robot talks to itself forever. The actuator
+            # publishes the window its clip occupies; this closes the loop.
+            mute_until=speech.mute_until,
         )
         recognition = build_face_recognition()
         face_driver = FaceSenseDriver(
@@ -1579,6 +1622,13 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             # non-consuming peek of a driver's latch or held condition.
             return read_perception(providers, base=doa_poller(t))
 
+        # Give the rules layer its voice. The driver is built before this function
+        # runs (`_boot_tick_seam`, so a malformed rules file is reported before
+        # anything is opened), and it remembers the seam across a live reload — a
+        # rebuilt engine that silently stopped talking would be a nasty bug.
+        if rules_driver is not None:
+            rules_driver.set_speech(speech.say)
+
         goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
         intent_driver = IntentDriver(
             mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
@@ -1611,6 +1661,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             media=media,
             drivers=(transcript_driver, face_driver),
             keeper=keeper,
+            speech=speech,
         )
     except BaseException:
         _RuntimeResources(
@@ -1618,6 +1669,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             media=media,
             drivers=(transcript_driver, face_driver),
             keeper=keeper,
+            speech=speech,
         ).close()
         raise
     return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), resources

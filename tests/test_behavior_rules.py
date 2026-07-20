@@ -617,6 +617,7 @@ def test_rule_dataclass_has_declared_shape():
         "params",
         "disable",
         "duration_s",
+        "say",  # t6 — react-only utterance text: the audible half of a reaction
     }
 
 

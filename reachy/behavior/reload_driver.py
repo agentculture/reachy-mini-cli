@@ -155,11 +155,22 @@ class ReloadDriver:
     this class only handles *live* reloads, not the initial boot load.
     """
 
-    def __init__(self, loader: RulesLoader, *, id_prefix: str = "rule", lib=None) -> None:
+    def __init__(
+        self, loader: RulesLoader, *, id_prefix: str = "rule", lib=None, speech=None
+    ) -> None:
         self._loader = loader
         self._id_prefix = id_prefix
         self._lib = lib
-        self._engine = RuleEngine(loader.current, id_prefix=id_prefix, lib=lib)
+        #: The act-out speech seam (see :class:`RuleEngine`). Held HERE, not
+        #: only on the engine, so it survives a live reload — a rebuilt engine
+        #: that silently lost its voice would be the worst kind of reload bug:
+        #: the robot keeps reacting and just stops talking.
+        self._speech = speech
+        self._engine = self._build_engine(loader.current)
+
+    def _build_engine(self, config) -> RuleEngine:
+        """Mint a :class:`RuleEngine` over *config* with this driver's fixed wiring."""
+        return RuleEngine(config, id_prefix=self._id_prefix, lib=self._lib, speech=self._speech)
 
     @property
     def loader(self) -> RulesLoader:
@@ -174,6 +185,17 @@ class ReloadDriver:
         through this seam does not survive a subsequent reload (documented).
         """
         self._engine.set_active_mode(name)
+
+    def set_speech(self, speech) -> None:
+        """Wire the act-out speech seam onto the live engine AND every future one.
+
+        Both halves matter: the live engine gets a voice now, and ``_speech`` is
+        remembered so :meth:`_build_engine` re-wires it after a live reload. The
+        composition root calls this once — it builds the rules driver before it
+        opens any runtime resource, so the voice necessarily arrives second.
+        """
+        self._speech = speech
+        self._engine.set_speech(speech)
 
     def known_modes(self) -> tuple[str, ...]:
         """Mode names the current config declares (the intent seam's validator)."""
@@ -211,7 +233,7 @@ class ReloadDriver:
         error = self._loader.last_error
         if error is None:
             current = self._loader.current
-            self._engine = RuleEngine(current, id_prefix=self._id_prefix, lib=self._lib)
+            self._engine = self._build_engine(current)
             senselog.stage(
                 STAGE,
                 SOURCE,

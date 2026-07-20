@@ -90,6 +90,13 @@ REASON_COOLDOWN = "cooldown"
 REASON_REARMING = "rearming"
 REASON_INHIBITED = "inhibited"
 REASON_ALREADY_ACTIVE = "already-active"
+#: A rule carried ``say`` but no speech seam was wired into this engine — the
+#: words would go nowhere. Never a silent no-op (see the module docstring's
+#: observability contract).
+REASON_NO_SPEECH = "no-speech-actuator"
+#: The wired speech seam raised. The rule's MOTION half is already admitted by
+#: then and stays admitted; only the voice is lost for that firing.
+REASON_SPEECH_FAILED = "speech-dispatch-failed"
 
 
 # --------------------------------------------------------------------------- #
@@ -183,19 +190,32 @@ class RuleEngine:
     1. updates per-field last-seen clocks (for ``absent_for``);
     2. fires the inhibit rules that match (evicting their named behaviors),
        cooldown / hysteresis gated;
-    3. fires the react rules that match (admitting their library behavior),
-       suppressing any whose behavior a currently-matching inhibit rule blocks,
-       or that is cooling down, re-arming, or already active.
+    3. fires the react rules that match (admitting their library behavior, and
+       handing any ``say`` text to the injected ``speech`` seam), suppressing
+       any whose behavior a currently-matching inhibit rule blocks, or that is
+       cooling down, re-arming, or already active.
 
     Every fire and every suppression is logged and emitted; a no-match tick is
     silent. It is defensive: a per-rule failure is isolated and logged, never
     propagated into the engine loop.
     """
 
-    def __init__(self, config: RulesConfig, *, id_prefix: str = "rule", lib=None) -> None:
+    def __init__(
+        self, config: RulesConfig, *, id_prefix: str = "rule", lib=None, speech=None
+    ) -> None:
         self._config = config
         self._prefix = id_prefix
         self._lib = lib if lib is not None else behavior_library
+        #: ``speech(text) -> None`` — the ACT-OUT seam a firing rule's ``say``
+        #: is handed to, typically
+        #: :meth:`reachy.behavior.speech_act.SpeechActuator.say`. Injected, and
+        #: duck-typed, so this module never imports the audio stack: everything
+        #: here stays pure stdlib + in-package, and a rules engine in a test (or
+        #: on a mute box) simply has none. The seam is contracted to be O(1) and
+        #: non-blocking — it is called ON THE TICK THREAD, inside the 20 ms
+        #: budget, so anything slow behind it MUST be its own problem to
+        #: dispatch off-thread.
+        self._speech = speech
         self._state: dict[str, _RuleState] = {
             rule.id: _RuleState() for rule in (*config.react, *config.inhibit)
         }
@@ -244,6 +264,16 @@ class RuleEngine:
                 remediation=f"use one of: {valid}",
             )
         self._config = replace(self._config, active_mode=name)
+
+    def set_speech(self, speech) -> None:
+        """Wire (or replace) the act-out speech seam at runtime.
+
+        Purely additive, mirroring :meth:`set_active_mode`: the composition root
+        builds the rules driver before it opens the runtime's resources (so a
+        malformed rules file is reported before anything is constructed), which
+        means the voice necessarily arrives after this engine does.
+        """
+        self._speech = speech
 
     # -- presence tracking (absent_for) ------------------------------------ #
 
@@ -374,9 +404,34 @@ class RuleEngine:
             self._emit_suppress(ctx, rule, REASON_ALREADY_ACTIVE)
             return False
         ctx.admit(self._build(rule))
+        self._speak(rule)
         self._mark_fired(rule, now)
         self._emit_fire(ctx, rule, run=rule.behavior)
         return True
+
+    def _speak(self, rule) -> None:
+        """Hand a firing rule's ``say`` text to the injected speech seam.
+
+        Runs AFTER admission on purpose: the motion half is the reaction's
+        reliable part, so a missing or broken voice never costs the robot its
+        visible response. Both failure modes are named drops, never silence
+        without a reason.
+        """
+        if not rule.say:
+            return
+        if self._speech is None:
+            senselog.drop(STAGE, rule.when.field, rule.id, REASON_NO_SPEECH)
+            return
+        try:
+            self._speech(rule.say)
+        except Exception as err:  # noqa: BLE001 - a voice fault never breaks the tick
+            logger.warning("react rule %r: speech dispatch raised", rule.id, exc_info=True)
+            senselog.drop(
+                STAGE,
+                rule.when.field,
+                rule.id,
+                f"{REASON_SPEECH_FAILED} ({type(err).__name__}: {err})",
+            )
 
     def _build(self, rule: Rule):
         """Realise a react rule via the vetted library.build path (mode-swapped).
@@ -418,6 +473,8 @@ class RuleEngine:
             detail += f" run={run}"
         if disabled is not None:
             detail += f" disable={disabled}"
+        if rule.say:
+            detail += f" say={rule.say!r}"
         senselog.stage(STAGE, rule.when.field, rule.id, detail)
         ctx.emit(
             {
@@ -427,6 +484,7 @@ class RuleEngine:
                 "field": rule.when.field,
                 "op": rule.when.op,
                 "behavior": run,
+                "say": rule.say,
                 "disable": disabled or [],
                 "reason": REASON_FIRED,
                 "ts": ctx.now,
@@ -500,15 +558,19 @@ class TickBus:
                 logger.exception("event consumer %r raised", consumer)
 
 
-def compose_rule_seam(config: RulesConfig, *, drivers=(), consumers=(), id_prefix="rule", lib=None):
+def compose_rule_seam(
+    config: RulesConfig, *, drivers=(), consumers=(), id_prefix="rule", lib=None, speech=None
+):
     """Build a :class:`TickBus` seam that drives *config*'s rules plus any riders.
 
     The returned bus has a :class:`RuleEngine` driver first, then any extra
     *drivers* (e.g. a goto lane), and fans emitted events out to *consumers*
-    (e.g. an export sink). Pass it as ``engine.run(tick_seam=...)``.
+    (e.g. an export sink). Pass it as ``engine.run(tick_seam=...)``. ``speech``
+    is the optional act-out seam a firing rule's ``say`` is handed to (see
+    :class:`RuleEngine`).
     """
     bus = TickBus(consumers=consumers)
-    bus.add_driver(RuleEngine(config, id_prefix=id_prefix, lib=lib))
+    bus.add_driver(RuleEngine(config, id_prefix=id_prefix, lib=lib, speech=speech))
     for driver in drivers:
         bus.add_driver(driver)
     return bus

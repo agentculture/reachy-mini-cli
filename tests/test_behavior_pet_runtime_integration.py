@@ -135,6 +135,9 @@ class _StaticRules:
     def set_active_mode(self, name: str | None) -> None:
         self._engine.set_active_mode(name)
 
+    def set_speech(self, speech) -> None:
+        self._engine.set_speech(speech)
+
     @staticmethod
     def known_modes() -> tuple[str, ...]:
         return ()
