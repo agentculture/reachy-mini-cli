@@ -8,7 +8,8 @@ that must survive with every network leg pointed nowhere:
     boot            -> test_boot_behavior_engine_composes_with_a_rules_file
     breathe         -> test_breathe_feel_alive_contributes_a_moving_pose_over_time
                        test_breathe_owns_head_every_tick_of_a_bounded_engine_run
-    orient-to-sound -> test_orient_to_sound_listen_producer_commits_a_turn_on_speech
+    orient-to-sound -> test_orient_to_sound_runtime_behavior_turns_toward_an_addressed_voice
+                       test_orient_to_sound_listen_producer_commits_a_turn_on_speech
     pat             -> test_pat_detect_then_react_enqueues_lean_nuzzle_settle
     sleep/wake      -> test_sleep_wake_demo_walks_the_full_arc_with_no_robot
     rules           -> test_rules_file_changes_robot_behavior_in_a_bounded_run
@@ -226,6 +227,45 @@ def test_breathe_owns_head_every_tick_of_a_bounded_engine_run() -> None:
 # --------------------------------------------------------------------------- #
 # orient-to-sound — ListenProducer commits a head turn toward off-axis speech #
 # --------------------------------------------------------------------------- #
+
+
+def test_orient_to_sound_runtime_behavior_turns_toward_an_addressed_voice() -> None:
+    """Mirrors test_behavior_orient.py's engine-level cases:
+
+    the RUNTIME equivalent of the ``ListenProducer`` path below — the
+    ``orient-to-sound`` library behavior admitted onto a real ``Engine``,
+    turning toward an addressed utterance's bearing with no transport, no
+    daemon, no STT and no LLM. This is the coverage that survives the removal
+    of the donor producer.
+    """
+    engine = Engine()
+    engine.seed_base_layer(now=0.0, energy=1.0)
+    entry = library.get("orient-to-sound")
+    engine.admit_behavior(
+        library.build(
+            "orient-to-sound",
+            entry.default_params(),
+            entry.default_class,
+            Lifetime(looping=True, duration=None),
+            "orient-1",
+        ),
+        now=0.0,
+    )
+    # doa 0.0 rad = hard left; a transcript is an utterance that already cleared
+    # the engagement gate, so this is the deliberate-turn tier.
+    heard = Sense(doa_angle=0.0, speech_detected=True, rms=0.2, transcript="hey reachy")
+    for i in range(200):
+        tick = engine.compose_tick(i * 0.02, sense=heard)
+    assert tick["ownership"]["head"] == "orient-1"
+    assert tick["pose"]["head"]["yaw"] > 0.0  # + yaw = toward the left-hand source
+    assert tick["pose"]["body_yaw"] > 0.0  # ... escalated to the body, being far off-axis
+
+    # A quiet room: no energy to corroborate the daemon's flickering speech flag,
+    # so the base layer keeps the head and the robot never swivels at nothing.
+    quiet = Sense(doa_angle=1.08, speech_detected=True, rms=0.001)
+    for i in range(200, 600):
+        tick = engine.compose_tick(i * 0.02, sense=quiet)
+    assert tick["ownership"]["head"] == "feel-alive-1"
 
 
 def test_orient_to_sound_listen_producer_commits_a_turn_on_speech() -> None:
