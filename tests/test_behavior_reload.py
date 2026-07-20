@@ -393,8 +393,16 @@ def test_engine_run_survives_a_broken_rules_file(monkeypatch, capsys, caplog) ->
     monkeypatch.setattr("reachy.cli._commands.behavior.get_transport", lambda args: tr)
     monkeypatch.setattr("time.sleep", lambda *_: None)
 
-    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
-        rc = main(["behavior", "engine", "run", "--json", "--max-ticks", "3"])
+    # #96: install_logging (run entry) severs propagation past "reachy", so
+    # caplog's ROOT-logger capture handler no longer sees reachy.sense records
+    # — attach that same handler to the sense logger itself for the call.
+    sense_logger = logging.getLogger(SENSE_LOGGER)
+    sense_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+            rc = main(["behavior", "engine", "run", "--json", "--max-ticks", "3"])
+    finally:
+        sense_logger.removeHandler(caplog.handler)
 
     assert rc == 0  # exit-0: no crash, no exception ever raised out of the loop
     events = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.strip()]

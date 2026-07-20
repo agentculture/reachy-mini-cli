@@ -1828,7 +1828,10 @@ print("zero-token proof holds — block types seen:", sorted(types))
 
 The exported feed is the always-available proof precisely because it needs no
 logging configuration: `reachy.senselog` also emits one INFO-level
-`[SENSE stage=rule ...]` line per fire/suppress decision, the same
+`[SENSE stage=rule ...]` line per fire — and, since #99, per suppression
+*episode* (a gated streak logs one entry line, one line per mid-streak reason
+change, and one `suppressed N ticks` summary at release, instead of one line
+per gated tick at the ~23 Hz tick rate) — the same
 grep-able grammar `listen`/`think`/`sleep run` use, but — see the [boot
 resilience](#the-rulestoml-walkthrough) note above — `behavior engine run`
 does not yet wire a logging handler at entry the way those three do, so that

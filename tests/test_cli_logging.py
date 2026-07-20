@@ -15,7 +15,13 @@ three long-running foreground loops (``listen run`` / ``think run`` /
 * a second call is a no-op for the handler — no duplicate handler object, no
   duplicate log lines;
 * the handler is stderr-only, by construction, so ``listen run --live
-  --export -``'s stdout stays pure JSONL.
+  --export -``'s stdout stays pure JSONL;
+* it severs propagation past the ``"reachy"`` logger (``propagate = False``,
+  on the fresh AND the reuse path), so a foreign root handler — the unlocated
+  basicConfig-style one some transitive library attaches during SDK media
+  construction, which doubled every line (~83 lines/s) in the live journal as
+  an ``INFO:reachy.sense:``-prefixed twin (#96) — receives ZERO ``reachy.*``
+  records, culprit-independent.
 
 This file also covers the CLI wiring: ``listen run`` / ``think run`` /
 ``sleep run`` each expose ``--log-level`` and call :func:`install_logging` at
@@ -118,6 +124,59 @@ def test_triple_install_still_a_single_handler() -> None:
         install_logging("DEBUG", stream=stream)
     logger = logging.getLogger(_LOGGER_NAME)
     assert len(logger.handlers) == 1
+
+
+# --- #96: propagation to foreign root handlers is severed --------------------
+
+
+class _CollectingHandler(logging.Handler):
+    """A basicConfig-style root handler standing in for #96's foreign one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def test_root_handler_receives_zero_reachy_records_after_install() -> None:
+    """The #96 duplicate-line defect: a foreign root handler (attached
+    basicConfig-style by some transitive library during SDK media construction)
+    re-emitted every propagated ``reachy.*`` record — ~83 lines/s doubled in
+    the live journal. The fix is culprit-independent: ``install_logging`` cuts
+    propagation at the ``"reachy"`` logger, so root handlers see nothing while
+    our own handler still emits every line."""
+    foreign = _CollectingHandler()
+    root = logging.getLogger()
+    root.addHandler(foreign)
+    try:
+        ours = io.StringIO()
+        install_logging("INFO", stream=ours)
+        logging.getLogger("reachy.sense").info("only-one-copy")
+        reachy_records = [r for r in foreign.records if r.name.startswith("reachy")]
+        assert reachy_records == []  # the foreign root handler got nothing
+        assert "only-one-copy" in ours.getvalue()  # ours still emitted it
+    finally:
+        root.removeHandler(foreign)
+
+
+def test_install_logging_disables_propagation() -> None:
+    install_logging("INFO", stream=io.StringIO())
+    assert logging.getLogger(_LOGGER_NAME).propagate is False
+
+
+def test_reinstall_keeps_propagation_disabled() -> None:
+    """The reuse path must never re-enable propagation — a second call at
+    another entry point (or after something flipped it back on) still leaves
+    reachy.* records unreachable from root handlers."""
+    stream = io.StringIO()
+    install_logging("INFO", stream=stream)
+    logging.getLogger(_LOGGER_NAME).propagate = True  # simulate outside meddling
+    install_logging("INFO", stream=stream)
+    logger = logging.getLogger(_LOGGER_NAME)
+    assert logger.propagate is False
+    assert len(logger.handlers) == 1  # the reuse contract is intact
 
 
 # --- level resolution: flag > env > default ---------------------------------
