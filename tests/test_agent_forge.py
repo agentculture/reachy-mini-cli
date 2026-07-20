@@ -259,7 +259,7 @@ def test_forged_skill_via_attach_is_validated_activated_and_callable_next_turn(t
 def test_forged_ctx_is_built_over_agent_attachs_own_publish_only_seams(tmp_path, monkeypatch):
     """The forged skill's ctx is built from the SAME publish-only seams `agent attach`'s
     built-in speak/harmonics/apply_pose tools use — the external client never opens the
-    robot's SDK — and exposes exactly speak/harmonics/express/state_get/state_update."""
+    robot's SDK — and exposes exactly the validator's sanctioned surface."""
     import reachy.forge as forge_pkg
     from reachy.forge.validator import DEFAULT_ALLOWED_CTX_ATTRS
 
@@ -285,17 +285,61 @@ def test_forged_ctx_is_built_over_agent_attachs_own_publish_only_seams(tmp_path,
             forge_client_factory=_inline_forge_factory(_reply(SKILL_MD, SAFE_EXECUTOR)),
         ),
     )
-    assert set(seen) == {"speak_engine", "harmonic_engine", "play", "express"}
+    assert set(seen) == {"speak_engine", "harmonic_engine", "play", "express", "run_behavior"}
     # Publish-only: the voice seams synthesize nothing and playback is a no-op, exactly
     # like the built-in speak/harmonics tools on this noun.
     assert seen["speak_engine"].synthesize("hi") == b""
     assert seen["harmonic_engine"].synthesize("hi") == b""
     assert seen["play"](b"", samplerate=1) is None
     assert seen["express"]("blush") is None
+    # ...and exactly ONE seam that is NOT inert: the intent effector — the sanctioned way
+    # a forged skill still reaches the robot now that the publish-only seams cannot.
+    # See tests/test_forge_intent_effector.py for its full contract.
+    assert callable(seen["run_behavior"])
 
     ctx = real_build(**seen)
     public = {n for n in dir(ctx) if not n.startswith("_")}
     assert public == set(DEFAULT_ALLOWED_CTX_ATTRS)
+
+
+MOVING_EXECUTOR = textwrap.dedent("""
+    def execute(params, ctx):
+        return ctx.run_behavior("gaze-hold", duration=2.0)
+    """).strip()
+
+
+def test_a_forged_skill_reaches_the_robot_through_the_intent_spool(tmp_path):
+    """The t29 fix, end to end through the REAL host: a forged skill that calls
+    ``ctx.run_behavior`` lands an atomic ``run_behavior`` command in the intents spool
+    the running engine drains — so "the robot gains a new callable tool" is true again,
+    without the external attach client ever opening the SDK."""
+    import json as _json
+
+    from reachy.behavior.intents import INTENT_NAMESPACE
+
+    turn_fn = _scripted_turn_fn(
+        TurnResult(content="", tool_calls=[_call("forge", goal="look at people")]),
+        TurnResult(content="", tool_calls=[_call("greet-back")]),
+    )
+    args = _make_attach_args(spool_dir=str(tmp_path), max_events=2)
+    rc = cmd_agent_attach(
+        args,
+        lines=[_sense_line(), _sense_line()],
+        engine_factory=_engine_factory(
+            turn_fn,
+            tmp_path,
+            forge_client_factory=_inline_forge_factory(_reply(SKILL_MD, MOVING_EXECUTOR)),
+        ),
+    )
+    assert rc == 0
+
+    spool = tmp_path / "behavior" / INTENT_NAMESPACE / "commands"
+    commands = [_json.loads(p.read_text()) for p in sorted(spool.iterdir())]
+    assert commands, "the forged skill's ctx.run_behavior never reached the intent spool"
+    cmd = commands[-1]
+    assert cmd["op"] == "run_behavior"
+    assert cmd["name"] == "gaze-hold"
+    assert cmd["lifetime"] == {"looping": False, "duration": 2.0}
 
 
 def test_forge_announces_the_new_skill_into_the_cue_buffer(tmp_path):
