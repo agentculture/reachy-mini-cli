@@ -910,6 +910,31 @@ upstream into guildmaster and re-vendor. Most relevant for day-to-day work:
 
 ## Conventions and workflow
 
+**Git worktrees live in `../.worktrees.reachy-mini-cli/<name>/`.** ALL
+worktrees of this repo, without exception — workforce fan-out lanes,
+`ask-colleague` throwaways, scratch checkouts — go in that one repo-named
+directory beside the checkout, one subfolder per worktree. Never `/tmp`, never
+a shared sibling folder, never anywhere else; `git worktree list` should show
+the main checkout and nothing outside this directory:
+
+```bash
+git worktree add ../.worktrees.reachy-mini-cli/<name> -b <branch>
+```
+
+Do **not** use a shared `../worktrees/` directory. This workspace holds many
+sibling projects, and a generic shared folder accumulates orphaned trees from
+several repos at once with nothing indicating who owns which — someone
+clearing stale trees cannot tell yours from junk, and a `rm -rf` on the shared
+folder takes your lane with it. (This is not hypothetical: it happened during
+the retire-old-flow fan-out.) The repo-named, dot-prefixed folder makes
+ownership unambiguous and keeps the sweep-up safe. An unowned worktree is a
+stale worktree — so make sure the name says who the owner is.
+
+Use a branch prefix scoped to the work (`retire/t2`, not `agent/t2`): plain
+`agent/*` names collide with leftovers from earlier fan-outs and `git worktree
+add -b` fails on an existing branch. Prune with `git worktree prune` (which is
+safe and sufficient); never `rm -rf` a worktree directory you did not create.
+
 **Memory discipline — recall before, remember after.** This repo keeps its
 eidetic memory **in-repo and public**: records resolve to
 `<repo-root>/.eidetic/memory` — committed, and shared with the team and mesh
