@@ -41,12 +41,11 @@ import argparse
 import json
 import math
 import os
-import time
 from pathlib import Path
 from typing import Callable
 
 from reachy import senselog
-from reachy.behavior import control, library, reload_driver
+from reachy.behavior import control, library, liveness, reload_driver
 from reachy.behavior import rules as rules_mod
 from reachy.behavior import supervisor
 from reachy.behavior.engine import EngineConfig
@@ -93,12 +92,9 @@ _JSON_HELP = "Emit structured JSON."
 _EMPTY_SUBMITTED = "(submitted)"
 _AWAIT_TIMEOUT_HELP = "Seconds to wait for the engine to confirm (default: 1.0)."
 _CLASSES = tuple(c.value for c in StopClass)
-_PROBE_HEARTBEAT_TTL_S = 2.0
-#: How far into the future a heartbeat may sit and still count as live. Engine
-#: writes `round(now, 3)`, so a stamp read back microseconds later can be up to
-#: 0.5ms ahead; this window absorbs that (and any small cross-process jitter)
-#: without letting a monotonic-clock reset masquerade as a live engine.
-_PROBE_HEARTBEAT_SKEW_S = 1.0
+#: The heartbeat freshness/skew windows now live in
+#: :mod:`reachy.behavior.liveness`, shared with the foreground ``pat run`` /
+#: ``sleep run`` refusal, so both surfaces agree on when an engine is live.
 
 #: The six head axes a goto may target, in the order ``goto_intent.HEAD_AXES`` /
 #: ``move goto``'s own ``_HEAD_KEYS`` use — flag names match the GotoSpec payload's
@@ -1026,25 +1022,15 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
 
 
 def _probe_engine_is_fresh() -> bool:
-    """Whether state.json proves another CLI engine heartbeat is still live."""
-    state = control.read_state()
-    updated = state.get("updated") if isinstance(state, dict) else None
-    if isinstance(updated, bool) or not isinstance(updated, (int, float)):
-        return False
-    updated = float(updated)
-    if not math.isfinite(updated):
-        return False
-    age = time.monotonic() - updated
-    if age < 0.0:
-        # Fail CLOSED on a marginally future heartbeat: Engine.state() rounds
-        # `updated` to milliseconds and can round UP, so a genuinely live engine
-        # can read back a hair ahead of us. Treating that as "not fresh" would
-        # let a probe start beside it — the exact race this refusal exists to
-        # prevent. A stamp far in the future is instead a state.json left over
-        # from before a monotonic-clock reset (a reboot), which is stale, not
-        # live, so it must not lock probes out forever.
-        return age >= -_PROBE_HEARTBEAT_SKEW_S
-    return age <= _PROBE_HEARTBEAT_TTL_S
+    """Whether state.json proves another CLI engine heartbeat is still live.
+
+    Delegates to :func:`reachy.behavior.liveness.engine_is_live` — the ONE
+    definition of "an engine is driving the head", shared with the foreground
+    ``pat run`` / ``sleep run`` refusal. Two independently-drifting answers to
+    that question is precisely the defect the shared module exists to prevent;
+    see its docstring for the freshness/skew rationale that used to live here.
+    """
+    return liveness.engine_is_live()
 
 
 def _open_probe_output(path: Path):  # type: ignore[no-untyped-def]
