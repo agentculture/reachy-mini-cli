@@ -267,6 +267,88 @@ def test_unreachable_playback_degrades_to_silence_and_keeps_the_worker_alive():
         actuator.close()
 
 
+# --------------------------------------------------------------------------- #
+# Task t7 — a failed clip's SENSE line NAMES THE REASON (silence != success)  #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_failed_synthesis_emits_a_sense_drop_line_naming_the_reason(caplog):
+    """The near-miss this guards against: a wedged/unreachable TTS degrades to
+    silence with nothing in the log to say why — indistinguishable from a
+    successful (silent) no-op utterance. The drop must NAME the reason, per
+    ``reachy.senselog``'s "a drop always names its reason" discipline (the
+    same grammar ``self-mute``/``cooldown``/``vlm-unreachable`` already use).
+    """
+
+    def unreachable(text, **_kw):
+        raise ConnectionRefusedError("[Errno 111] Connection refused")
+
+    actuator = SpeechActuator(synthesize=unreachable, play=lambda pcm, *, samplerate: None)
+    try:
+        with caplog.at_level("INFO", logger="reachy.sense"):
+            actuator.start()
+            actuator.say("anything")
+            _drain(actuator)
+        text = caplog.text
+        assert "stage=speech" in text
+        assert "source=say" in text
+        assert "reason=synthesize-failed" in text
+        assert actuator.failures == 1
+    finally:
+        actuator.close()
+
+
+def test_a_failed_playback_emits_a_sense_drop_line_naming_the_reason(caplog):
+    def unreachable_play(pcm, *, samplerate):
+        raise ConnectionRefusedError("[Errno 111] Connection refused")
+
+    actuator = SpeechActuator(
+        synthesize=lambda text, **_kw: b"\x01\x00" * 100, play=unreachable_play
+    )
+    try:
+        with caplog.at_level("INFO", logger="reachy.sense"):
+            actuator.start()
+            actuator.say("hello")
+            _drain(actuator)
+        text = caplog.text
+        assert "stage=speech" in text
+        assert "reason=playback-failed" in text
+        assert actuator.failures == 1
+    finally:
+        actuator.close()
+
+
+def test_the_sink_latching_off_emits_its_own_named_sense_drop_line(caplog):
+    """The sink latching off after repeated failures is its OWN named event,
+    distinct from the per-utterance failure that triggered it — an operator
+    reading the log sees why the sink went quiet, not just that one clip
+    failed."""
+    clock = {"t": 100.0}
+
+    def dead(text, **_kw):
+        raise OSError("down")
+
+    actuator = SpeechActuator(
+        synthesize=dead,
+        play=lambda pcm, *, samplerate: None,
+        failure_latch=2,
+        retry_after_s=30.0,
+        clock=lambda: clock["t"],
+    )
+    try:
+        with caplog.at_level("INFO", logger="reachy.sense"):
+            actuator.start()
+            for i in range(2):
+                actuator.say(f"try {i}")
+                _drain(actuator)
+        text = caplog.text
+        assert text.count("reason=synthesize-failed") == 2
+        assert "reason=sink-latched-off" in text
+        assert "retry_after_s=30" in text
+    finally:
+        actuator.close()
+
+
 def test_a_persistently_dead_backend_latches_the_sink_off_then_retries_later():
     """A hard-down backend must not be re-dialled on every utterance forever.
 
