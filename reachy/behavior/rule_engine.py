@@ -100,11 +100,15 @@ REASON_ALREADY_ACTIVE = "already-active"
 def _field_present(sense: Sense, field: str) -> bool:
     """Whether the cue *field* has a reading this tick (the ``is_true`` sense).
 
-    Presence is "the cue fired": ``speech`` uses its boolean flag directly; every
-    other field is present when its snapshot attribute is not ``None``.
+    Presence is "the cue fired": ``speech`` and ``frame_available`` use their
+    boolean flags directly (they are CONDITIONS — always-populated booleans, never
+    ``None``); every other field is present when its snapshot attribute is not
+    ``None``.
     """
     if field == "speech":
         return bool(sense.speech_detected)
+    if field == "frame_available":
+        return bool(sense.frame_available)
     if field == "doa":
         return sense.doa_angle is not None
     if field == "rms":
@@ -124,6 +128,7 @@ def _field_value(sense: Sense, field: str):
         "rms": sense.rms,
         "pat": sense.pat_event,
         "face": sense.face,
+        "frame_available": sense.frame_available,
     }.get(field)
 
 
