@@ -1468,138 +1468,158 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         # drivers. The pose reader is still warmed at setup — the probe ticks at
         # the same 50 Hz and would take the same startup overrun otherwise.
         reader = _make_state_reader()
-        _warm_holder(reader, label="state")
-        shared_reader = SharedPoseReader(reader.read)
-        mode, probe_emit = probe
-        providers = SenseProviders()
+        keeper = None
+        try:  # release the held client if composition fails — see the note below
+            _warm_holder(reader, label="state")
+            shared_reader = SharedPoseReader(reader.read)
+            mode, probe_emit = probe
+            providers = SenseProviders()
 
-        def probe_sense_reader(t):
-            return read_perception(providers, base=doa_poller(t))
+            def probe_sense_reader(t):
+                return read_perception(providers, base=doa_poller(t))
 
-        drivers = [
-            ProbeNamespaceGuard(control.CommandSpool(namespace=INTENT_NAMESPACE)),
-            ProbeDriver(mode, shared_reader, emit=probe_emit),
-        ]
-        consumers = []
-        if runtime_consumer is not None:
-            drivers.append(SenseSnapshotDriver())
-            consumers.append(runtime_consumer)
-        bus = TickBus(drivers=drivers, consumers=consumers)
-        keeper = _HolderKeeper([("state", reader)])
-        keeper.start()
+            drivers = [
+                ProbeNamespaceGuard(control.CommandSpool(namespace=INTENT_NAMESPACE)),
+                ProbeDriver(mode, shared_reader, emit=probe_emit),
+            ]
+            consumers = []
+            if runtime_consumer is not None:
+                drivers.append(SenseSnapshotDriver())
+                consumers.append(runtime_consumer)
+            bus = TickBus(drivers=drivers, consumers=consumers)
+            keeper = _HolderKeeper([("state", reader)])
+            keeper.start()
+        except BaseException:
+            _RuntimeResources(pose_reader=reader, keeper=keeper).close()
+            raise
         return (
             probe_sense_reader,
             TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)),
             _RuntimeResources(pose_reader=reader, keeper=keeper),
         )
 
-    # The pat sense stack ships ON after the hands-on #80 gate finding: the
-    # complete command must hold still before sensing, which removes wander
-    # ghosts structurally while allowing a settled reaction owner to keep
-    # sensing. REACHY_PAT_SENSE=0 is the explicit sensing rollback.
-    reader = None
-    pat_driver = None
-    if _pat_sense_enabled():
-        reader = _make_state_reader()
-        still_hold_s, still_eps = _pat_still_tuning()
-        pat_kwargs: dict = {
-            "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
-            "still_eps": still_eps,  # REACHY_PAT_STILL_EPS override (t2)
-        }
-        # `detector` and `hp_tau` are passed ONLY when actually overridden.
-        # Occupying a keyword with its own default looks like a no-op but is
-        # not: a caller injecting its own detector or high-pass (every
-        # pet-runtime integration test does) would collide on it. Env overrides
-        # must be additive — absent env leaves the driver's own defaults alone.
-        override = _pat_detector()
-        if override is not None:
-            pat_kwargs["detector"] = override  # REACHY_PAT_*_PRESS_DEG overrides
-        hp_tau = _pat_float_override(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
-        if hp_tau is not None:
-            pat_kwargs["hp_tau"] = hp_tau
-        release_after = _pat_float_override(_RELEASE_AFTER_ENV, RELEASE_AFTER_S)
-        if release_after is not None:
-            pat_kwargs["release_after_s"] = release_after
-        pat_driver = PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
+    # Everything below OPENS resources (two held SDK clients, two worker-owning
+    # drivers, the keeper thread). A raise part-way through would strand them:
+    # `cmd_engine_run` only closes what it was RETURNED, and an unclosed client
+    # hangs the process at interpreter exit — turning a clean structured failure
+    # into a wedged unit that `Restart=on-failure` never restarts. So the whole
+    # construction is guarded and releases what it opened before re-raising.
+    reader = media = transcript_driver = face_driver = keeper = None
+    try:
+        # The pat sense stack ships ON after the hands-on #80 gate finding: the
+        # complete command must hold still before sensing, which removes wander
+        # ghosts structurally while allowing a settled reaction owner to keep
+        # sensing. REACHY_PAT_SENSE=0 is the explicit sensing rollback.
+        pat_driver = None
+        if _pat_sense_enabled():
+            reader = _make_state_reader()
+            still_hold_s, still_eps = _pat_still_tuning()
+            pat_kwargs: dict = {
+                "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
+                "still_eps": still_eps,  # REACHY_PAT_STILL_EPS override (t2)
+            }
+            # `detector` and `hp_tau` are passed ONLY when actually overridden.
+            # Occupying a keyword with its own default looks like a no-op but is
+            # not: a caller injecting its own detector or high-pass (every
+            # pet-runtime integration test does) would collide on it. Env overrides
+            # must be additive — absent env leaves the driver's own defaults alone.
+            override = _pat_detector()
+            if override is not None:
+                pat_kwargs["detector"] = override  # REACHY_PAT_*_PRESS_DEG overrides
+            hp_tau = _pat_float_override(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
+            if hp_tau is not None:
+                pat_kwargs["hp_tau"] = hp_tau
+            release_after = _pat_float_override(_RELEASE_AFTER_ENV, RELEASE_AFTER_S)
+            if release_after is not None:
+                pat_kwargs["release_after_s"] = release_after
+            pat_driver = PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
 
-    # The ONE media owner, and the two senses that read through it. Composed
-    # unconditionally: both degrade to permanently-quiet without their extras.
-    media = _make_media_client()
-    audio_tap = _AudioTap(media)
-    transcript_driver = TranscriptSenseDriver(
-        media=audio_tap,  # the shared per-tick chunk, never a second mic read
-        classifier=_engagement_classifier(),
-    )
-    recognition = build_face_recognition()
-    face_driver = FaceSenseDriver(
-        media=media,
-        engine=recognition[0] if recognition is not None else None,
-        store=recognition[1] if recognition is not None else None,
-    )
-
-    # Warm BOTH held clients here, on the setup thread, before anything ticks.
-    # Sequential and in this order on purpose: the ``no_media`` pose handle is
-    # the cheaper of the two to bring up, so the shipped, load-bearing pat sense
-    # is live soonest. They are NOT warmed in parallel — two concurrent SDK
-    # client constructions is an unverified claim about the SDK, and setup has no
-    # tick budget to protect, so there is nothing to buy with the risk.
-    if reader is not None:
-        _warm_holder(reader, label="state")
-    _warm_holder(media, label="media")
-    keeper = _HolderKeeper([("state", reader), ("media", media)])
-    keeper.start()
-
-    holder = LastPoseHolder()
-    providers = SenseProviders(
-        pat_event=pat_driver.as_provider() if pat_driver is not None else None,
-        pat_state=pat_driver.as_state_provider() if pat_driver is not None else None,
-        rms=make_rms_provider(audio_tap.audio),
-        transcript=transcript_driver.as_provider(),
-        face=face_driver.as_face_provider(),
-        frame_available=face_driver.as_frame_available_provider(),
-    )
-
-    def sense_reader(t):
-        # Take the tick's ONE mic read first, so the rms provider below and the
-        # transcript driver later in this same tick share the identical chunk.
-        audio_tap.pull(t)
-        # DoA (throttled by the poller) as the base; every other field is a
-        # non-consuming peek of a driver's latch or held condition.
-        return read_perception(providers, base=doa_poller(t))
-
-    goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
-    intent_driver = IntentDriver(
-        mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
-        known_modes=rules_driver.known_modes if rules_driver is not None else None,
-    )
-    # Register the GOTO kind into the intent driver's OWN registry (which already
-    # carries the four intent defaults) so all five kinds share one registry.
-    intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
-
-    drivers = [
-        d
-        for d in (
-            rules_driver,
-            intent_driver,
-            pat_driver,
-            transcript_driver,
-            face_driver,
-            holder,
-            goto_lane,
+        # The ONE media owner, and the two senses that read through it. Composed
+        # unconditionally: both degrade to permanently-quiet without their extras.
+        media = _make_media_client()
+        audio_tap = _AudioTap(media)
+        transcript_driver = TranscriptSenseDriver(
+            media=audio_tap,  # the shared per-tick chunk, never a second mic read
+            classifier=_engagement_classifier(),
         )
-        if d is not None
-    ]
-    consumers = []
-    if runtime_consumer is not None:
-        drivers.append(SenseSnapshotDriver())
-        consumers.append(runtime_consumer)
-    bus = TickBus(drivers=drivers, consumers=consumers)
-    resources = _RuntimeResources(
-        pose_reader=reader,
-        media=media,
-        drivers=(transcript_driver, face_driver),
-        keeper=keeper,
-    )
+        recognition = build_face_recognition()
+        face_driver = FaceSenseDriver(
+            media=media,
+            engine=recognition[0] if recognition is not None else None,
+            store=recognition[1] if recognition is not None else None,
+        )
+
+        # Warm BOTH held clients here, on the setup thread, before anything ticks.
+        # Sequential and in this order on purpose: the ``no_media`` pose handle is
+        # the cheaper of the two to bring up, so the shipped, load-bearing pat sense
+        # is live soonest. They are NOT warmed in parallel — two concurrent SDK
+        # client constructions is an unverified claim about the SDK, and setup has no
+        # tick budget to protect, so there is nothing to buy with the risk.
+        if reader is not None:
+            _warm_holder(reader, label="state")
+        _warm_holder(media, label="media")
+        keeper = _HolderKeeper([("state", reader), ("media", media)])
+        keeper.start()
+
+        holder = LastPoseHolder()
+        providers = SenseProviders(
+            pat_event=pat_driver.as_provider() if pat_driver is not None else None,
+            pat_state=pat_driver.as_state_provider() if pat_driver is not None else None,
+            rms=make_rms_provider(audio_tap.audio),
+            transcript=transcript_driver.as_provider(),
+            face=face_driver.as_face_provider(),
+            frame_available=face_driver.as_frame_available_provider(),
+        )
+
+        def sense_reader(t):
+            # Take the tick's ONE mic read first, so the rms provider below and the
+            # transcript driver later in this same tick share the identical chunk.
+            audio_tap.pull(t)
+            # DoA (throttled by the poller) as the base; every other field is a
+            # non-consuming peek of a driver's latch or held condition.
+            return read_perception(providers, base=doa_poller(t))
+
+        goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
+        intent_driver = IntentDriver(
+            mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
+            known_modes=rules_driver.known_modes if rules_driver is not None else None,
+        )
+        # Register the GOTO kind into the intent driver's OWN registry (which already
+        # carries the four intent defaults) so all five kinds share one registry.
+        intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
+
+        drivers = [
+            d
+            for d in (
+                rules_driver,
+                intent_driver,
+                pat_driver,
+                transcript_driver,
+                face_driver,
+                holder,
+                goto_lane,
+            )
+            if d is not None
+        ]
+        consumers = []
+        if runtime_consumer is not None:
+            drivers.append(SenseSnapshotDriver())
+            consumers.append(runtime_consumer)
+        bus = TickBus(drivers=drivers, consumers=consumers)
+        resources = _RuntimeResources(
+            pose_reader=reader,
+            media=media,
+            drivers=(transcript_driver, face_driver),
+            keeper=keeper,
+        )
+    except BaseException:
+        _RuntimeResources(
+            pose_reader=reader,
+            media=media,
+            drivers=(transcript_driver, face_driver),
+            keeper=keeper,
+        ).close()
+        raise
     return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), resources
 
 

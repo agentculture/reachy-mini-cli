@@ -348,6 +348,29 @@ def test_both_holders_are_closed_even_when_the_engine_loop_raises(_isolated, mon
     assert pose.closed and media.closed
 
 
+def test_both_holders_are_closed_when_composition_itself_raises(_isolated, monkeypatch):
+    """A raise PART-WAY through composition must still release what was opened.
+
+    ``cmd_engine_run`` can only close what it was returned, so a mid-composition
+    fault would otherwise strand two held clients — and an unclosed client hangs
+    the process at interpreter exit, turning a clean structured failure into a
+    wedged unit that ``Restart=on-failure`` never restarts.
+    """
+    pose = _FakePoseReader()
+    media = _FakeMedia()
+    _inject_holders(monkeypatch, pose, media)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("goto lane exploded")
+
+    # Fails after BOTH holders and both sense drivers are already constructed.
+    monkeypatch.setattr(behavior_mod, "GotoLane", _boom)
+
+    assert main(["behavior", "engine", "run", "--max-ticks", "3", "--json"]) != 0
+    assert pose.closed, "a mid-composition fault stranded the pose reader"
+    assert media.closed, "a mid-composition fault stranded the media client"
+
+
 # --------------------------------------------------------------------------- #
 # 3 + 6. Reads can never construct: allow_inline_connect=False at BOTH sites   #
 # --------------------------------------------------------------------------- #
@@ -376,7 +399,7 @@ def test_media_client_seam_forbids_inline_connect():
         media.close()
 
 
-def test_a_cold_state_reader_never_constructs_from_a_read():
+def test_a_cold_state_reader_never_constructs_from_a_read(monkeypatch):
     """The behavioural consequence of the flag: a read on a cold holder does not
     construct — it just reports "no reading" and leaves warming to the owner."""
     from reachy.robot.state_reader import HeldStateReader
@@ -393,17 +416,18 @@ def test_a_cold_state_reader_never_constructs_from_a_read():
         def close(self):
             pass
 
+    # monkeypatch (not a bare class assignment) so the SDK import seam is
+    # restored for every sibling test in this worker.
+    monkeypatch.setattr(HeldStateReader, "_import", staticmethod(lambda: _Client))
+
     reader = behavior_mod._make_state_reader()
     try:
-        object.__setattr__(reader, "_import", staticmethod(lambda: _Client))
-        HeldStateReader._import = staticmethod(lambda: _Client)  # type: ignore[method-assign]
         assert reader.read() is None
         assert constructed == [], "a tick-thread read constructed the SDK client inline"
         assert reader.warm_up() is True
         assert constructed == [1], "warm_up did not construct the client"
     finally:
         reader.close()
-        del HeldStateReader._import  # restore the class's own staticmethod
 
 
 # --------------------------------------------------------------------------- #
