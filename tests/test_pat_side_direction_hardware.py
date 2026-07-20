@@ -23,7 +23,11 @@ from pathlib import Path
 
 import pytest
 
-from reachy.behavior.pat_sense import PatSenseDriver
+from reachy.behavior.pat_sense import (
+    DEFAULT_STILL_HOLD_S,
+    RELEASE_AFTER_S,
+    PatSenseDriver,
+)
 from reachy.motion.pat import PatDetector
 
 pytestmark = pytest.mark.offline
@@ -33,8 +37,12 @@ LEFT_LABEL = "robot_left_side__operator_right_when_facing"
 RIGHT_LABEL = "robot_right_side__operator_left_when_facing"
 ENTRY_START_S = 4.0
 ENTRY_DURATION_S = 0.6
-SAFE_HOLD_S = 0.5
-RELEASE_BUDGET_S = 1.0
+# Tracked against the shipped constants rather than copied, so retuning the gate
+# or the release budget cannot silently invalidate the timing assertions below.
+# (v0.41.0 moved the hold 0.5 -> 1.0 s and the budget 1.0 -> 2.5 s for the
+# swinging idle; both were stale literals here before that.)
+SAFE_HOLD_S = DEFAULT_STILL_HOLD_S
+RELEASE_BUDGET_S = RELEASE_AFTER_S
 
 _POSE_COLUMNS = {
     "cmd_x_m",
@@ -246,11 +254,26 @@ def test_entry_plus_safe_hold_reacquires_inside_release_budget() -> None:
     entry_end = ENTRY_START_S + ENTRY_DURATION_S
     reopen = min(now for now in read_times if now >= entry_end)
 
-    # The commanded pose has to remain exactly constant for the complete 0.5 s
-    # safe hold before the actual-pose reader is touched again.
-    assert reopen >= entry_end + SAFE_HOLD_S
+    # The commanded pose has to stay SLOW for the complete safe hold before the
+    # actual-pose reader is touched again. Note "slow", not "exactly constant":
+    # ``still_eps`` is a per-tick velocity tolerance, so a minjerk entry's
+    # deceleration tail drops below it shortly BEFORE the move nominally ends and
+    # the hold starts accruing there. At the pre-v0.41.0 eps of 0.01 that tail was
+    # under a tick and the distinction was invisible; at 0.035 it is ~2 ticks, and
+    # that early-open IS the swing's slow window doing its job (#82). Allowing the
+    # tail is therefore correct — but it is bounded, so a gate that opened
+    # arbitrarily early during motion still fails.
+    DECEL_TAIL_ALLOWANCE_S = 0.06  # ~3 ticks at 50 Hz
+    assert reopen >= entry_end + SAFE_HOLD_S - DECEL_TAIL_ALLOWANCE_S
     assert reopen < entry_end + SAFE_HOLD_S + 0.06
 
     first_fresh_edge = min(edge for edge in detector.edge_times if edge >= reopen)
+    # The contract this test NAMES: contact is reacquired within the release
+    # budget, so a sustained pet survives the reaction's blind window.
     assert first_fresh_edge - reopen < RELEASE_BUDGET_S
-    assert first_fresh_edge - reopen == pytest.approx(0.0802, abs=0.01)
+    # A tighter pin on the observed reacquire latency, kept as a drift detector.
+    # It is tuning-DEPENDENT, not a contract: 0.0802 s under the pre-v0.41.0 gate
+    # (0.5 / 0.01), 0.240 s under the shipped swing-era gate (1.0 / 0.035), which
+    # reopens earlier into the deceleration tail and re-baselines the detector
+    # there. Re-measure and restate it when the gate moves; do not delete it.
+    assert first_fresh_edge - reopen == pytest.approx(0.240, abs=0.01)

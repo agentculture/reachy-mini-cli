@@ -26,7 +26,7 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 
-from reachy.behavior.pat_sense import PatSenseDriver
+from reachy.behavior.pat_sense import DEFAULT_STILL_HOLD_S, PatSenseDriver
 from reachy.behavior.sense import SenseProviders, read_perception
 from reachy.motion.pat import PatDetector
 
@@ -686,12 +686,16 @@ def test_wander_then_still_then_pat_is_detected() -> None:
     assert driver.events == 0
     assert driver._stillness_blocked is True
 
-    # Settle: commanded holds constant long enough to earn the gate.
+    # Settle: commanded holds constant long enough to earn the gate. Derived from
+    # the shipped hold (+2 ticks of slack) rather than a literal tick count, so
+    # retuning DEFAULT_STILL_HOLD_S cannot silently turn this into a test that
+    # settles for LESS than the gate requires and then asserts the gate opened.
     settle = T0 + 60 * 0.02
-    for i in range(40):
+    settle_ticks = int(DEFAULT_STILL_HOLD_S / 0.02) + 2
+    for i in range(settle_ticks):
         _drive(driver, reader, (0.0, 0.0), settle + i * 0.02)
     assert driver._stillness_blocked is False
 
     # Petted while still -> detected.
-    _scratch_sequence(driver, reader, settle + 40 * 0.02)
+    _scratch_sequence(driver, reader, settle + settle_ticks * 0.02)
     assert driver.events == 1

@@ -169,10 +169,14 @@ def _run_side(
             baseline_alpha=0.0,
             level2_threshold_fn=lambda: 100.0,
         )
-        # `kwargs` already carries `still_hold_s`/`still_eps` from
-        # `_compose_run_seam` (t2's tuning surface) — with no env override that
-        # resolves to today's shipped default (0.5 / 0.01), same as this test
-        # relied on before, so no explicit override is needed here anymore.
+        # `kwargs` carries `still_hold_s`/`still_eps` from `_compose_run_seam`
+        # (t2's tuning surface). This test is about the REACTION chain and side
+        # direction, not about whichever gate tuning happens to ship, so pin the
+        # gate explicitly instead of inheriting it: the synthetic trace below is
+        # timed against a 0.5 s hold, and inheriting the v0.41.0 swing-era
+        # defaults (1.0 / 0.035) silently retimed it until nothing was admitted
+        # at all. Pinning keeps this test measuring what it names.
+        kwargs = {**kwargs, "still_hold_s": 0.5, "still_eps": 0.01}
         return RealPatSenseDriver(
             **kwargs,
             detector=detector,

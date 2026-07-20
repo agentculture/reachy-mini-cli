@@ -204,6 +204,15 @@ DEFAULT_LAG_TAU = 0.3
 #: commanded-vs-actual recording from the real robot (see issue #79): the
 #: viable band was hp_tau 0.5-0.8 x press 1.8-2.2, and (0.8, 2.0) sits centred
 #: in it (zero ghost fires on the recording, 6/6 synthetic pats detected).
+#:
+#: DELIBERATELY UNCHANGED at 0.8, and the one value a deployed box must not
+#: override downward. A box-local drop-in setting 0.08 silenced the pat sense
+#: entirely (2026-07-20): tau is a high-pass TIME CONSTANT, so 0.08 s passes
+#: only fast transients while a pet is a SUSTAINED push lasting ~0.5-2 s. The
+#: failure is quiet and easy to misread — the stillness gate opens normally and
+#: the detector simply never sees the press, so the journal shows a bare
+#: ``Pat level1!`` with no rule fire. Bisected on hardware: restoring 0.8 with
+#: every other value unchanged restored detection immediately.
 DEFAULT_HP_TAU = 0.8
 
 #: Runtime-tuned press/release thresholds (degrees) for the driver's DEFAULT
@@ -215,7 +224,14 @@ DEFAULT_HP_TAU = 0.8
 #: discriminator. Cost, stated plainly: very gentle pats (<~2 deg deflection)
 #: are missed; the hands-on tuning pass (issue #79 follow-up) refines with real
 #: pat data. Injected detectors (tests, listen-era callers) are unaffected.
-DEFAULT_PRESS_THRESHOLD = 0.5
+#:
+#: RAISED 0.5 -> 1.2 (2026-07-20), paired with the looser slow-window gate
+#: below. Sensing now happens inside the swing's slow window rather than at a
+#: dead stop, where the measured untouched residual is 0.70 deg (vs 0.07-0.11
+#: deg for a genuinely held head) and a pet peaks at 2.52 deg. 1.2 sits between
+#: them. This value and the gate are ONE operating point and must move together:
+#: the sensitive 0.5 belongs with a tight gate that only opens at a dead stop.
+DEFAULT_PRESS_THRESHOLD = 1.2
 DEFAULT_RELEASE_THRESHOLD = 0.2
 
 #: The STILLNESS GATE (issue #80). Detection runs only while the COMMANDED head
@@ -238,13 +254,28 @@ DEFAULT_RELEASE_THRESHOLD = 0.2
 #: sense, not a tuning knob: gating on it makes ghost fires structurally impossible
 #: while leaving a still robot fully pettable.
 #: Tolerance for "the commanded pose did not change" (degrees, per tick, per
-#: axis). A genuinely still command is EXACTLY constant, so this only needs to
-#: absorb float noise — it must stay well under the per-tick change of the idle
-#: wander (~0.03-0.06 deg/tick at 50 Hz), or the gate creeps open at the wander's
-#: turning points where velocity momentarily crosses zero while the plant is
-#: still ringing from the preceding swing.
-DEFAULT_STILL_EPS = 0.01
-DEFAULT_STILL_HOLD_S = 0.5  # commanded must be quiet this long before sensing
+#: axis) — really a per-tick VELOCITY threshold, so the gate opens after
+#: :data:`DEFAULT_STILL_HOLD_S` below it. It was always a sustained-SLOW gate;
+#: it merely looked like a stillness gate while the idle behaviour froze.
+#:
+#: RAISED 0.01 -> 0.035 and the hold 0.5 -> 1.0 (2026-07-20). The reasoning
+#: above this line was written for the FROZEN idle and inverts under v0.40.0's
+#: swinging ``feel-alive``: that commit measured the old 0.01 as opening the
+#: gate **0.0% of the time** under continuous motion at a 1.0 s hold, i.e. a
+#: robot that can never feel anything at all. It was deployed as a box-local
+#: systemd drop-in for months; shipping it makes a fresh box work unconfigured.
+#:
+#: 0.035 deg/tick sits inside the swing's decelerate-pause-accelerate window
+#: (~10-15% of the time) where the plant has stopped ringing. The old warning
+#: that this range "creeps open at the wander's turning points" was true of the
+#: WANDER, whose zero crossings are instantaneous; the swing's extremes hold a
+#: genuine ~3.4 s slow window, which is the whole point of #82. Measured there:
+#: untouched residual 0.70 deg vs petted 2.52 deg, hence the 1.2 press below.
+#:
+#: The longer 1.0 s hold is what buys the "plant has stopped ringing" part —
+#: shortening it back toward 0.5 s re-admits the ring at this looser tolerance.
+DEFAULT_STILL_EPS = 0.035
+DEFAULT_STILL_HOLD_S = 1.0  # commanded must be quiet this long before sensing
 
 #: Longest interval between logical observation ticks that can preserve an
 #: interaction. The 50 Hz engine normally supplies 0.02 s; ten missed ticks is
@@ -271,7 +302,12 @@ DEFAULT_WARMUP_S = 15.0
 CONTENTMENT_AFTER_S = 4.0
 WARNING_AFTER_S = 8.0
 ENOUGH_MAX_S = 12.0
-RELEASE_AFTER_S = 1.0
+#: RAISED 1.0 -> 2.5 (2026-07-20). Contact must survive the reaction's own blind
+#: window — the entry slew plus the 1.0 s gate re-arm — or a sustained pet dies
+#: and re-acquires as separate interactions instead of laddering receptive ->
+#: contentment (the t12 sustain bug). Must stay comfortably above
+#: DEFAULT_STILL_HOLD_S for that reason.
+RELEASE_AFTER_S = 2.5
 ENOUGH_COOLDOWN_S = 5.0
 _HEAD_AXES = ("x", "y", "z", "roll", "pitch", "yaw")
 

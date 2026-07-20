@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from reachy.behavior.pat_sense import PatSenseDriver
+from reachy.behavior.pat_sense import RELEASE_AFTER_S, PatSenseDriver
 from reachy.behavior.sense import PatState
 from reachy.motion.pat import PatDetector, PatEvidence
 
@@ -219,7 +219,13 @@ def test_incomplete_command_is_blocked_before_reader() -> None:
     assert reader.calls == 0
 
 
-def test_fresh_contact_then_one_second_observed_silence_releases() -> None:
+def test_fresh_contact_then_release_budget_of_observed_silence_releases() -> None:
+    """Contact survives silence up to ``RELEASE_AFTER_S``, then releases on it.
+
+    Timed against the constant rather than a literal so the budget can be
+    retuned (1.0 -> 2.5 s in v0.41.0, so a sustained pet outlives the reaction's
+    own blind window) without silently invalidating this test.
+    """
     reader = _Reader()
     driver = _driver(reader)
 
@@ -236,15 +242,15 @@ def test_fresh_contact_then_one_second_observed_silence_releases() -> None:
     )
 
     _tick(driver, reader, T0 + 0.1, (0.0, 0.0))
-    still_contact = _tick(driver, reader, T0 + 0.99, (0.0, 0.0))
+    still_contact = _tick(driver, reader, T0 + RELEASE_AFTER_S - 0.01, (0.0, 0.0))
     assert still_contact.contact is True
     assert still_contact.phase == "receptive"
 
-    released = _tick(driver, reader, T0 + 1.0, (0.0, 0.0))
+    released = _tick(driver, reader, T0 + RELEASE_AFTER_S, (0.0, 0.0))
     assert released.availability == "available"
     assert released.contact is False
     assert released.phase == "released"
-    assert released.phase_started_at == pytest.approx(T0 + 1.0)
+    assert released.phase_started_at == pytest.approx(T0 + RELEASE_AFTER_S)
     assert released.last_press_at == T0
 
 
