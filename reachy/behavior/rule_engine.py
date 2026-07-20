@@ -138,6 +138,8 @@ def _field_present(sense: Sense, field: str) -> bool:
         return bool(sense.speech_detected)
     if field == "frame_available":
         return bool(sense.frame_available)
+    if field == "self_moving":
+        return bool(sense.self_moving)
     if field == "doa":
         return sense.doa_angle is not None
     if field == "rms":
@@ -161,6 +163,7 @@ def _field_value(sense: Sense, field: str):
         "face": sense.face,
         "frame_available": sense.frame_available,
         "transcript": sense.transcript,
+        "self_moving": sense.self_moving,
     }.get(field)
 
 

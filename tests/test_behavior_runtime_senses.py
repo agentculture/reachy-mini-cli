@@ -206,15 +206,25 @@ class _StaticRules:
     the ``set_speech`` member composition wires the voice through (t6).
     """
 
-    def __init__(self, field: str, *, run: str = "pet-reaction") -> None:
+    def __init__(
+        self,
+        field: str,
+        *,
+        run: str = "pet-reaction",
+        op: str = "is_true",
+        value: object = None,
+    ) -> None:
         self.field = field
+        when: dict = {"field": field, "op": op}
+        if value is not None:
+            when["value"] = value
         self._engine = RuleEngine(
             RulesConfig.from_dict(
                 {
                     "react": [
                         {
                             "id": f"{field}-probe",
-                            "when": {"field": field, "op": "is_true"},
+                            "when": when,
                             "run": run,
                             "cooldown_s": 60.0,
                         }
@@ -237,9 +247,15 @@ class _StaticRules:
         return ()
 
 
-def _rules_driver(field: str, *, run: str = "pet-reaction") -> _StaticRules:
+def _rules_driver(
+    field: str,
+    *,
+    run: str = "pet-reaction",
+    op: str = "is_true",
+    value: object = None,
+) -> _StaticRules:
     """A one-rule rules driver keyed on *field* — the real rules path."""
-    return _StaticRules(field, run=run)
+    return _StaticRules(field, run=run, op=op, value=value)
 
 
 @pytest.fixture()
@@ -585,7 +601,15 @@ def test_compose_run_seam_wires_every_sense_provider(_isolated, monkeypatch):
 
     assert wired, "SenseProviders was never constructed"
     fields = wired[-1]
-    for name in ("rms", "face", "frame_available", "transcript", "pat_event", "pat_state"):
+    for name in (
+        "rms",
+        "face",
+        "frame_available",
+        "transcript",
+        "pat_event",
+        "pat_state",
+        "self_moving",
+    ):
         assert fields.get(name) is not None, f"no provider wired for {name!r}"
 
 
@@ -690,6 +714,45 @@ def test_a_rule_keyed_on_face_fires_through_the_composed_seam(_isolated, monkeyp
     _run_seam(_rules_driver("face"), events=events, max_ticks=10)
 
     assert _fired(events, "face"), "no rule.fire for face"
+
+
+def test_a_rule_keyed_on_self_moving_fires_through_the_composed_seam(_isolated, monkeypatch):
+    """#95's condition half, live: the base layer's own commanded motion latches
+    ``Sense.self_moving`` and a rule keyed on it fires. ``_run_seam`` composes
+    with ``base_layer=True``, so ``feel-alive`` is commanding real per-tick pose
+    deltas — exactly the self-motion the latch exists to observe. 200 ticks
+    (4 s of injected clock) because the swing-warped idle STARTS inside a deep
+    slow window (``d(warp)/dt = 0.05`` at ``t=0``) and only sweeps through its
+    fast mid-arc from ``t≈1.5 s`` on."""
+    _inject_holders(monkeypatch, _FakePoseReader(), _FakeMedia())
+
+    events: list[dict] = []
+    _run_seam(_rules_driver("self_moving"), events=events, max_ticks=200)
+
+    assert _fired(events, "self_moving"), "no rule.fire for self_moving"
+
+
+def test_the_moving_floor_quiets_rms_through_the_composed_seam(_isolated, monkeypatch):
+    """#95 end to end through the composed seam: a mic chunk loud enough to clear
+    the deployed 0.02 admission floor arrives only once the base layer's own
+    motion holds the self-motion latch — and the rms rule must NOT fire, because
+    the moving floor (default: infinity) reports the reading as quiet.
+
+    The rule mirrors the deployed ``look-toward-sound`` admission (``rms gt
+    0.02``) rather than ``is_true``: suppression reports 0.0 — a READING that is
+    deliberately not ``None`` — so only a thresholded rule can observe the gate.
+    The loud audio is staged from tick 100 (``t=2 s``, mid fast-swing, latch
+    long engaged) to keep clear of the boot ticks where the latch has not yet
+    seen two poses."""
+    loud = np.full(320, 0.25, dtype=np.float32)
+    quiet = np.zeros(320, dtype=np.float32)
+    media = _FakeMedia(chunk=lambda n: loud if n > 100 else quiet)
+    _inject_holders(monkeypatch, _FakePoseReader(), media)
+
+    events: list[dict] = []
+    _run_seam(_rules_driver("rms", op="gt", value=0.02), events=events, max_ticks=200)
+
+    assert not _fired(events, "rms"), "the moving floor failed to quiet self-noise rms"
 
 
 def test_a_rule_keyed_on_transcript_fires_through_the_composed_seam(_isolated, monkeypatch):

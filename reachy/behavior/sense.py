@@ -96,8 +96,8 @@ class Sense:
     (no mic, daemon error, or no sound). ``speech_detected`` is the daemon's
     speech-vs-any-sound flag for the same reading.
 
-    ``rms``, ``pat_event``, ``pat_state``, ``face``, ``frame_available``, and
-    ``transcript`` extend the
+    ``rms``, ``pat_event``, ``pat_state``, ``face``, ``frame_available``,
+    ``transcript``, and ``self_moving`` extend the
     snapshot with the folded-hook cues (mirroring ``listen``'s ``PatHook`` /
     ``VisionHook`` / ``FaceHook`` / ``TranscribeHook``) so a future sensor-driven behavior can read
     them the same way it reads ``doa_angle`` today. Each has a "no reading"
@@ -127,6 +127,12 @@ class Sense:
       :class:`reachy.behavior.transcript_sense.TranscriptSenseDriver`'s
       one-tick latch, the same cadence ``pat_event`` uses — so it is a cue
       ("this was just said"), never a standing value to poll.
+    - ``self_moving`` — whether the engine is currently COMMANDING motion (any
+      watched pose axis — head, ANTENNAS, body yaw — changed above eps within
+      the release tail; see :class:`reachy.behavior.self_motion.SelfMotionDriver`).
+      A CONDITION like ``frame_available`` (an always-populated boolean, never
+      ``None``), defaulting ``False``. It is both a rule predicate in its own
+      right and the latch behind the moving rms floor (#95).
     """
 
     doa_angle: float | None = None
@@ -137,6 +143,7 @@ class Sense:
     frame_available: bool = False
     pat_state: PatState = UNAVAILABLE_PAT_STATE
     transcript: str | None = None
+    self_moving: bool = False
 
 
 # The "no reading" snapshot — what behaviors get when nothing senses, the poll
@@ -219,6 +226,7 @@ PatStateProvider = Callable[[], PatState | None]
 FaceProvider = Callable[[], str | None]
 FrameAvailableProvider = Callable[[], bool]
 TranscriptProvider = Callable[[], str | None]
+SelfMovingProvider = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -243,6 +251,7 @@ class SenseProviders:
     frame_available: FrameAvailableProvider | None = None
     pat_state: PatStateProvider | None = None
     transcript: TranscriptProvider | None = None
+    self_moving: SelfMovingProvider | None = None
 
 
 #: Predicate-field names (the ``Predicate.field`` vocabulary validated against
@@ -262,15 +271,18 @@ _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
     "face": "face",
     "frame_available": "frame_available",
     "transcript": "transcript",
+    "self_moving": "self_moving",
 }
 
 #: Which of the optional :class:`SenseProviders` attributes the CURRENT engine
 #: composition (``_compose_run_seam`` in ``reachy.cli._commands.behavior``)
 #: actually wires a live provider for. Since t28 that is EVERY optional field:
 #: ``pat_event``/``pat_state`` (the folded pat-sense driver), ``rms`` (the shared
-#: per-tick mic chunk), ``transcript`` (the transcript driver's one-tick latch of
-#: an addressed utterance) and ``face``/``frame_available`` (the face driver's
-#: name latch and TTL-held camera condition).
+#: per-tick mic chunk, gated by the #95 moving floor), ``transcript`` (the
+#: transcript driver's one-tick latch of an addressed utterance),
+#: ``face``/``frame_available`` (the face driver's name latch and TTL-held
+#: camera condition) and ``self_moving`` (the self-motion driver's held latch
+#: over the commanded pose, #95).
 #:
 #: "Wired" is about the COMPOSITION, not the hardware: a box with no ``[sdk]``
 #: extra, no camera or no reachable STT still has these providers wired and
@@ -291,7 +303,7 @@ _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
 #: updating; nothing else duplicates this list, so the check can never drift
 #: from reality by forgetting a second copy.
 _COMPOSED_PROVIDER_FIELDS: frozenset[str] = frozenset(
-    {"pat_event", "rms", "face", "frame_available", "transcript"}
+    {"pat_event", "rms", "face", "frame_available", "transcript", "self_moving"}
 )
 
 #: The full set of predicate fields (``Predicate.field`` values) the current
@@ -352,6 +364,7 @@ def read_perception(
         frame_available=bool(_peek(providers.frame_available, False)),
         pat_state=pat_state if isinstance(pat_state, PatState) else UNAVAILABLE_PAT_STATE,
         transcript=_peek(providers.transcript, None),
+        self_moving=bool(_peek(providers.self_moving, False)),
     )
 
 

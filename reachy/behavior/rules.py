@@ -37,8 +37,8 @@ Every rule (react or inhibit) is uniquely ``id``-entified and carries
 (the anti-flap margin around a threshold, default 0.0) — both validated
 ``>= 0`` numbers. A :class:`Predicate` is DATA (``field``/``op``/``value``), never
 a string of code: ``field`` is one of :data:`SENSE_FIELDS`
-(``doa``/``speech``/``rms``/``pat``/``face``/``frame_available``/``transcript``)
-and ``op`` is one of
+(``doa``/``speech``/``rms``/``pat``/``face``/``frame_available``/``transcript``/
+``self_moving``) and ``op`` is one of
 :data:`COMPARATORS`.
 
 A REACT rule may additionally carry ``duration_s`` (a validated ``> 0`` number,
@@ -146,7 +146,7 @@ SHIPPED_RULES_RESOURCE = "default_rules.toml"
 #: smaller) subset actually wired today, and ``behavior rules check`` warns on
 #: any rule keyed outside it — see that module for why the two can differ.
 SENSE_FIELDS: frozenset[str] = frozenset(
-    {"doa", "speech", "rms", "pat", "face", "frame_available", "transcript"}
+    {"doa", "speech", "rms", "pat", "face", "frame_available", "transcript", "self_moving"}
 )
 
 #: Sense fields whose bare reading is measured to be too noisy to key a rule on
