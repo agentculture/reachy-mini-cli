@@ -36,6 +36,17 @@ YAW_DEADBAND_DEG = 0.75
 SIDE_HEAD_GAIN = 2.5
 SIDE_BODY_GAIN = 1.0
 
+#: Sign applied to the measured deviation when planning the side-pat lean.
+#:
+#: ``PatState.yaw_deg`` is the signed actual-minus-commanded deviation
+#: (:mod:`reachy.motion.pat`), so a hand resting on the robot's RIGHT pushes the
+#: head LEFT and the deviation carries the left sign. Seeking the hand therefore
+#: means moving OPPOSITE the deviation: ``-1`` presses the head back along the
+#: axis it was pushed, so it meets the palm and sustains contact — the
+#: "cat leaning into a scratch" read. ``+1`` (the behaviour through v0.40.0)
+#: continued WITH the push, which reads as yielding away from the hand.
+SIDE_SEEK_SIGN = -1.0
+
 HEAD_YAW_LIMIT_DEG = 12.0
 HEAD_PITCH_LIMIT_DEG = 12.0
 BODY_YAW_LIMIT_DEG = 6.0
@@ -53,8 +64,14 @@ HEAD_WIGGLE_DEG = 4.0
 PITCH_WIGGLE_DEG = 2.0
 BODY_WIGGLE_DEG = 2.5
 
-RECEPTIVE_ANTENNAS = (12.0, -12.0)
-CONTENTMENT_ANTENNAS = (17.0, -17.0)
+# Antisymmetric pairs draw the antennas TOGETHER: the right joint's sign is
+# mirrored from the left (reachy/motion/listen.py:154-157), hardware-verified
+# again on 2026-07-20 by holding (+12, -12) on the deployed robot. Amplitudes
+# raised from 12/17 after that check — the contraction was legible but
+# understated at 12 deg, and the ladder reads better with more range against
+# the 20 deg ANTENNA_LIMIT_DEG ceiling.
+RECEPTIVE_ANTENNAS = (15.0, -15.0)
+CONTENTMENT_ANTENNAS = (20.0, -20.0)
 WARNING_ANTENNAS = (-6.0, 6.0)
 DONE_ANTENNAS = (-10.0, -10.0)
 
@@ -221,8 +238,8 @@ class PetReaction:
         yaw = state.yaw_deg
         if yaw is None or not math.isfinite(yaw) or abs(yaw) <= YAW_DEADBAND_DEG:
             return
-        self._side_head_yaw = _clamp(yaw * SIDE_HEAD_GAIN, HEAD_YAW_LIMIT_DEG)
-        self._side_body_yaw = _clamp(yaw * SIDE_BODY_GAIN, BODY_YAW_LIMIT_DEG)
+        self._side_head_yaw = _clamp(yaw * SIDE_SEEK_SIGN * SIDE_HEAD_GAIN, HEAD_YAW_LIMIT_DEG)
+        self._side_body_yaw = _clamp(yaw * SIDE_SEEK_SIGN * SIDE_BODY_GAIN, BODY_YAW_LIMIT_DEG)
         self._direction_latched = True
 
     def _contact_target(self) -> Contribution:

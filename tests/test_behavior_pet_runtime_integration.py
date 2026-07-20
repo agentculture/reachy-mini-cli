@@ -252,8 +252,11 @@ def test_labelled_side_trace_reacts_holds_reacquires_and_completes(monkeypatch, 
     assert reaction_ticks
     reaction_poses = [run.targets[index] for index in reaction_ticks]
     settled = reaction_poses[40:]
-    assert max(pose["head"]["yaw"] * sign for pose in settled) > 2.0
-    assert max(pose["body_yaw"] * sign for pose in settled) > 1.0
+    # The SENSE carries the push direction (asserted above); the REACTION opposes
+    # it, pressing back toward the hand rather than following the shove. So the
+    # settled pose must land on the sign opposite the labelled trace's.
+    assert max(pose["head"]["yaw"] * -sign for pose in settled) > 2.0
+    assert max(pose["body_yaw"] * -sign for pose in settled) > 1.0
 
     states = [event.get("pat_state") for event in sense_events]
     phases = {state["phase"] for state in states if state is not None}

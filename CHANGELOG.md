@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] - 2026-07-20
+
+### Changed
+
+- `pet-reaction` now SEEKS the touching hand instead of yielding from it. `PatState.yaw_deg` is the signed actual-minus-commanded deviation, so a hand resting on the robot's right pushes the head left; the planner multiplied that by a positive gain and continued WITH the shove. A new `SIDE_SEEK_SIGN = -1.0` presses the head back along the axis it was pushed, so it meets the palm and sustains contact.
+- Antenna contraction amplitudes raised against the 20 deg `ANTENNA_LIMIT_DEG` ceiling: `RECEPTIVE_ANTENNAS` 12 -> 15 deg, `CONTENTMENT_ANTENNAS` 17 -> 20 deg. Hardware check on the deployed robot confirmed the antisymmetric pairs do draw the antennas together (`reachy/motion/listen.py`'s mirrored-sign convention is the true one), but the gesture read as understated at 12 deg.
+
+### Fixed
+
+- Diagnosed and fixed the pat-sense tuning trap that silenced the reaction on the deployed box, bisected to a single knob on hardware. The `REACHY_PAT_*` env vars were inert until v0.40.0 added the `_pat_float_env` surface that reads them, so a drop-in authored earlier only took effect at upgrade time. The culprit was `hp_tau` 0.8 -> 0.08: `tau` is a high-pass time constant, and at 0.08 s only fast transients survive, while a pet is a SUSTAINED push lasting ~0.5-2 s. The stillness gate opened normally; the detector simply never saw the press. Removing that one override — every other value unchanged — restored detection immediately (`Pat level1! type=side_pat` -> `pat-acknowledge fired run=pet-reaction`, reproduced twice), and the operator confirmed the robot visibly enjoying a scratch.
+- Recorded the counter-lesson for the deployed drop-in: reverting the whole block to shipped defaults is WRONG and is worse than the bug. v0.40.0's swinging idle means the shipped `still_eps=0.01` opens the stillness gate 0.0% of the time (measured in af87b1d), so shipped defaults leave the robot unable to feel anything at all. The gate loosening (`still_eps=0.035` + `still_hold_s=1.0`) is load-bearing under the swing and must be kept; tune `press_deg` against the measured residual instead.
+
 ## [0.40.0] - 2026-07-20
 
 ### Added

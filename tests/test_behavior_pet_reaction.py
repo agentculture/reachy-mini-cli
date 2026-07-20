@@ -64,16 +64,23 @@ def _assert_complete_pose(out: Contribution) -> None:
     assert isinstance(out.body_yaw, float)
 
 
-def test_side_pat_uses_signed_robot_yaw_and_clamps_opposite_targets() -> None:
-    left = _run(make_pet_reaction(), _state(yaw_deg=100.0))
-    right = _run(make_pet_reaction(), _state(yaw_deg=-100.0))
+def test_side_pat_seeks_the_hand_by_opposing_the_measured_deviation() -> None:
+    """The lean presses BACK along the axis the hand pushed, not with it.
 
-    _assert_complete_pose(left)
-    _assert_complete_pose(right)
-    assert left.head["yaw"] == pytest.approx(HEAD_YAW_LIMIT_DEG)
-    assert right.head["yaw"] == pytest.approx(-HEAD_YAW_LIMIT_DEG)
-    assert left.body_yaw == pytest.approx(BODY_YAW_LIMIT_DEG)
-    assert right.body_yaw == pytest.approx(-BODY_YAW_LIMIT_DEG)
+    ``yaw_deg`` is the signed actual-minus-commanded deviation, so a hand on the
+    robot's right pushes the head left and arrives here with the left sign.
+    Seeking that hand means turning right — opposite the deviation. Both axes
+    still saturate at their clamps on a large deviation.
+    """
+    pushed_left = _run(make_pet_reaction(), _state(yaw_deg=100.0))
+    pushed_right = _run(make_pet_reaction(), _state(yaw_deg=-100.0))
+
+    _assert_complete_pose(pushed_left)
+    _assert_complete_pose(pushed_right)
+    assert pushed_left.head["yaw"] == pytest.approx(-HEAD_YAW_LIMIT_DEG)
+    assert pushed_right.head["yaw"] == pytest.approx(HEAD_YAW_LIMIT_DEG)
+    assert pushed_left.body_yaw == pytest.approx(-BODY_YAW_LIMIT_DEG)
+    assert pushed_right.body_yaw == pytest.approx(BODY_YAW_LIMIT_DEG)
 
 
 def test_scratch_is_a_distinct_pitch_pose_independent_of_yaw_side() -> None:
@@ -146,15 +153,19 @@ def test_yaw_deadband_and_first_credible_direction_latch_prevent_chatter() -> No
             t += DT
     assert out.head["yaw"] == 0.0
 
+    # First credible deviation latches the direction. It is a push to the left,
+    # so the hand is on the right and the seeking lean turns right (negative).
     for _ in range(50):
         out = reaction(t, {}, _state(yaw_deg=4.0))
         t += DT
-    assert out.head["yaw"] > 0.0
+    assert out.head["yaw"] < 0.0
 
+    # A later opposite-signed deviation must NOT flip the lean — the latch is
+    # what stops the head chattering between sides mid-pat.
     for _ in range(50):
         out = reaction(t, {}, _state(yaw_deg=-10.0))
         t += DT
-    assert out.head["yaw"] > 0.0
+    assert out.head["yaw"] < 0.0
 
 
 def test_observed_release_starts_done_gesture_within_release_budget() -> None:
