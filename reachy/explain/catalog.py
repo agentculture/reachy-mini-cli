@@ -484,6 +484,11 @@ the daemon's smooth minjerk `goto` planner.
 - `reachy-mini-cli behavior rules check` — validate `rules.toml` as a linter:
   a malformed file reports `ok=false` with reasons but still exits 0; only an
   unreadable path (permissions, a vanished mount, ...) is a clean exit-2.
+- `reachy-mini-cli behavior expressions` (alias `expressions list`) — list the
+  expression pose catalog, each emoji with a generated pose descriptor (see
+  "Expressions" below).
+- `reachy-mini-cli behavior expressions check` — flag catalog poses too
+  similar to be meaningfully distinct; a warning, not a gate (always exits 0).
 - `reachy-mini-cli behavior engine start|stop|status|run` — manage the 50 Hz
   engine process (start/stop in the background, or `run` in the foreground).
 - `reachy-mini-cli behavior overview` — the verb summary.
@@ -537,6 +542,29 @@ during the CLI call. `behavior goto` waits up to `--await-timeout` (default
 A bare `behavior goto` (no channel flags at all) fails fast client-side,
 before ever touching the spool.
 
+## Expressions
+
+`reachy-mini-cli behavior expressions` inspects the emoji-keyed expression
+pose catalog (`reachy.speech.expressions`, backed by `expressions.toml`) and
+runs its geometric distinctness check (`reachy.speech.distinctness`). Neither
+is LLM-coupled — a TOML table and a distance function — so this catalog
+tooling lives here rather than in a cognition noun: it is the same catalog
+`agent attach`'s `apply_pose` tool drives, and (for now, while the `think`
+noun is mid-retirement) `think expressions` also still serves the identical
+data.
+
+- `reachy-mini-cli behavior expressions` (alias `expressions list`) — every
+  catalog emoji plus a generated pose descriptor: the pose's non-zero axes and
+  their signed magnitudes (`neutral` itself is excluded — it is the universal
+  fallback, not an expression).
+- `reachy-mini-cli behavior expressions check` — flag catalog pairs too
+  similar to be meaningfully distinct. A flagged pair is a warning, not an
+  error — the catalog still works — so the exit code stays 0; `--json`'s `ok`
+  field is the machine-readable signal.
+- `reachy-mini-cli behavior expressions overview` — this sub-noun's summary.
+
+These verbs read the catalog file directly — no running engine needed.
+
 {transports}
 
 ## Notes
@@ -558,6 +586,7 @@ before ever touching the spool.
     reachy-mini-cli behavior stop all
     reachy-mini-cli behavior reload                      # picks up an edited rules.toml
     reachy-mini-cli behavior goto --yaw 10 --duration 2 --json
+    reachy-mini-cli behavior expressions check --json    # lint the pose catalog
     reachy-mini-cli behavior engine stop                 # eases robot to neutral
 """.replace(_TRANSPORTS_SLOT, _TRANSPORTS)
 
@@ -1328,6 +1357,10 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("behavior", "rules", "list"): _BEHAVIOR,
     ("behavior", "rules", "check"): _BEHAVIOR,
     ("behavior", "rules", "overview"): _BEHAVIOR,
+    ("behavior", "expressions"): _BEHAVIOR,
+    ("behavior", "expressions", "list"): _BEHAVIOR,
+    ("behavior", "expressions", "check"): _BEHAVIOR,
+    ("behavior", "expressions", "overview"): _BEHAVIOR,
     ("behavior", "engine"): _BEHAVIOR,
     ("behavior", "engine", "overview"): _BEHAVIOR,
     ("behavior", "engine", "start"): _BEHAVIOR,
