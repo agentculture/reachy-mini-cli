@@ -5,8 +5,7 @@ until this module existed nothing ever attached a handler or called
 ``logging.basicConfig`` — so INFO-level traces were silently dropped by
 Python's "last resort" handler (WARNING+ only, see the stdlib docs for
 ``logging.Logger.callHandlers``). :func:`install_logging` fixes that for the
-three long-running foreground loops (``listen run`` / ``think run`` /
-``sleep run``):
+long-running foreground loops (``listen run`` / ``sleep run``):
 
 * it attaches exactly ONE ``StreamHandler(sys.stderr)`` to the ``"reachy"``
   logger (the common ancestor every ``reachy.*`` module logger propagates
@@ -23,9 +22,8 @@ three long-running foreground loops (``listen run`` / ``think run`` /
   an ``INFO:reachy.sense:``-prefixed twin (#96) — receives ZERO ``reachy.*``
   records, culprit-independent.
 
-This file also covers the CLI wiring: ``listen run`` / ``think run`` /
-``sleep run`` each expose ``--log-level`` and call :func:`install_logging` at
-run entry.
+This file also covers the CLI wiring: ``listen run`` / ``sleep run`` each
+expose ``--log-level`` and call :func:`install_logging` at run entry.
 """
 
 from __future__ import annotations
@@ -256,7 +254,7 @@ def test_add_log_level_arg_accepts_the_flag() -> None:
     assert args.log_level == "DEBUG"
 
 
-# --- wiring: listen / think / sleep run each expose --log-level ------------
+# --- wiring: listen / sleep run each expose --log-level -------------------
 
 
 def test_listen_run_parser_has_log_level_flag() -> None:
@@ -265,14 +263,6 @@ def test_listen_run_parser_has_log_level_flag() -> None:
     parser = _build_parser()
     args = parser.parse_args(["listen", "run", "--log-level", "DEBUG"])
     assert args.log_level == "DEBUG"
-
-
-def test_think_run_parser_has_log_level_flag() -> None:
-    from reachy.cli import _build_parser
-
-    parser = _build_parser()
-    args = parser.parse_args(["think", "run", "--log-level", "WARNING"])
-    assert args.log_level == "WARNING"
 
 
 def test_sleep_run_parser_has_log_level_flag() -> None:
@@ -320,46 +310,6 @@ def test_listen_run_installs_logging_at_the_resolved_level(
     assert rc == 0
     logger = logging.getLogger(_LOGGER_NAME)
     assert logger.level == logging.DEBUG
-    assert any(h.stream is sys.stderr for h in logger.handlers)
-
-
-class _ThinkRecorder:
-    def synth(self, text: str, **_kw: object) -> bytes:
-        return ("pcm:" + text).encode("utf-8")
-
-    def play(self, pcm: bytes, **_kw: object) -> None:
-        pass
-
-
-def test_think_run_installs_logging_at_the_resolved_level(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
-    monkeypatch.delenv("REACHY_BASE_URL", raising=False)
-    monkeypatch.delenv("REACHY_TRANSPORT", raising=False)
-    import reachy.cli._commands.think as think_mod
-
-    rec = _ThinkRecorder()
-
-    def fake_stream(messages: object, **_kw: object):
-        yield "Okay."
-
-    def fake_feed(buffer: object) -> None:
-        buffer.feed_doa(angle_rad=0.0, rms=0.2, is_speech=True)
-
-    monkeypatch.setattr(
-        think_mod, "_make_sense_feed", lambda args, buffer: lambda: fake_feed(buffer)
-    )
-    monkeypatch.setattr(think_mod, "_stream_sentences", fake_stream)
-    monkeypatch.setattr(think_mod, "_synthesize", rec.synth)
-    monkeypatch.setattr(think_mod, "_play_audio", rec.play)
-
-    from reachy.cli import main
-
-    rc = main(["think", "run", "--log-level", "WARNING", "--max-turns", "1"])
-    assert rc == 0
-    logger = logging.getLogger(_LOGGER_NAME)
-    assert logger.level == logging.WARNING
     assert any(h.stream is sys.stderr for h in logger.handlers)
 
 

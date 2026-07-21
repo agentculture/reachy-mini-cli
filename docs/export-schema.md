@@ -6,8 +6,8 @@ or any downstream tool). You need only this document — no Python import from
 the package is required to implement a compatible reader.
 
 There are **two, separate** feeds. This first half of the document covers the
-**cognition feed** (`thinking` / `message` / `emotion`, produced by `think run
---export -` and `listen run --live --export -`). The **runtime feed**
+**cognition feed** (`thinking` / `message` / `emotion`, produced by `listen run
+--live --export -` and `agent attach --export -`). The **runtime feed**
 (`sense` / `rule` / `intent` / `motion`, produced by `behavior engine run
 --export -`) has its own section below —
 [Runtime Event Feed (`behavior engine run --export -`)](#runtime-event-feed-behavior-engine-run---export--).

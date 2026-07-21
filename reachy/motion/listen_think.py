@@ -27,8 +27,7 @@ The LLM turn is slow and must never stall the 20 Hz motion loop. So the per-tick
 :meth:`__call__` does only cheap work — translate the sample's cues into the
 :class:`~reachy.speech.events.EventBuffer` and update the flag — and the actual
 :meth:`CognitionEngine.run` loop runs on a **start-once background worker**
-(mirroring how ``think run`` already runs cognition off-thread, see
-:mod:`reachy.cli._commands.think`). The worker is spawned the first time a sample
+(cognition never runs on the tick thread). The worker is spawned the first time a sample
 arrives and consumes the buffer the hook fills; subsequent ticks only top up the
 buffer. The ``spawn`` seam defaults to a real daemon thread but is injectable so
 tests run the worker synchronously with no real threads.

@@ -66,10 +66,10 @@ _CENTER = {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}
 
 # Self-mute window (seconds) after a spoken clip during which the TranscribeHook
 # discards captured audio, so the robot never transcribes its own TTS through the
-# shared USB audio device. Re-declares ``think``'s documented default
-# (``think._DEFAULT_MUTE_AFTER_SPEAK``) rather than importing it, keeping this
-# module free of a cross-command import that would pull the cognition stack at
-# import time; the two are intended to agree.
+# shared USB audio device. Declared locally rather than imported from a speech
+# module, keeping this module free of a cross-command import that would pull the
+# cognition stack at import time; the runtime's speech actuator carries the same
+# documented default and the two are intended to agree.
 _DEFAULT_MUTE_AFTER_SPEAK = 2.5
 
 # --cognition: which folded-live cognition engine drives thinking. ``marker`` is
@@ -1269,7 +1269,7 @@ def _make_self_mute_play_audio(
     The returned callable plays the PCM (via :func:`reachy.speech.playback.play_audio`)
     and then stamps ``mute["until"] = clock() + mute_after`` so the TranscribeHook
     (reading ``mute_until=lambda: mute["until"]``) drops any audio captured while —
-    and just after — the robot speaks. Mirrors ``think``'s ``_guarded_play``; the
+    and just after — the robot speaks. The
     default ``mute_after`` is the documented ``_DEFAULT_MUTE_AFTER_SPEAK`` (2.5 s).
 
     ``playback_transport`` (e.g. ``"http"``) is injected as ``transport=`` into the

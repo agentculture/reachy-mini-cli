@@ -1,21 +1,20 @@
 """Run the ``sleep`` loop as a tracked background process.
 
 The supervisor half of the ``sleep`` noun — a sibling of
-:mod:`reachy.motion.supervisor` (the ``listen`` loop's supervisor) and
-:mod:`reachy.speech.supervisor` (the ``think`` loop's supervisor), but for the
-sleep loop (``reachy sleep run``) instead. ``start`` / ``stop`` / ``restart`` /
+:mod:`reachy.motion.supervisor` (the ``listen`` loop's supervisor), but for
+the sleep loop (``reachy sleep run``) instead. ``start`` / ``stop`` / ``restart`` /
 ``status`` manage a detached background process tracked with a PID + log file
-under the same per-user state dir the daemon, demo-mode, listen, and think all
-use. ``start`` re-invokes this very CLI (``python -m reachy sleep run``) so the
+under the same per-user state dir the daemon, demo-mode and listen all use.
+``start`` re-invokes this very CLI (``python -m reachy sleep run``) so the
 loop keeps running after the launching command returns.
 
-This module deliberately does **not** import or reuse the listen or think
-supervisors: it owns its own ``sleep.pid`` / ``sleep.log`` filenames so the
-loops can run side-by-side, and it reuses only the *generic* process primitives
+This module deliberately does **not** import or reuse the listen supervisor:
+it owns its own ``sleep.pid`` / ``sleep.log`` filenames so the loops can run
+side-by-side, and it reuses only the *generic* process primitives
 from :mod:`reachy.daemon` (``state_dir`` / ``is_alive`` — PID-file location
 and liveness). The process-management mechanics (PID-file write/read, detached
 spawn, signal-based stop, PID-reuse guard) are kept self-contained here so
-editing the listen-owned or think-owned supervisors is never required.
+editing the listen-owned supervisor is never required.
 
 Pure standard library (``subprocess`` / ``signal`` / ``os``): the loop talks to
 the robot over the existing transport, so this adds **no** third-party runtime
@@ -34,7 +33,7 @@ from pathlib import Path
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 
 # Reuse the daemon's generic process primitives + state dir so the sleep loop,
-# the listen loop, think loop, demo-mode, and the daemon share one bookkeeping
+# the listen loop, demo-mode, and the daemon share one bookkeeping
 # location.
 from reachy.daemon import is_alive, state_dir
 from reachy.robot.transport import DEFAULT_BASE_URL, DEFAULT_TIMEOUT

@@ -17,15 +17,15 @@ and keep it "awake".  Four event kinds qualify:
 
 Self-mute exclusion
 -------------------
-While ``now < mute_until`` the sample is inside the self-mute window that
-:mod:`reachy.cli._commands.think` stamps after each playback clip.  Inside this
+While ``now < mute_until`` the sample is inside the self-mute window a
+speaking loop stamps after each playback clip.  Inside this
 window the robot's own voice is on the shared USB audio device and any acoustic
 cue (DoA shift, speech flag, snap) is almost certainly self-generated.  The
 function returns ``False`` for *any* event kind during this window — the robot
 cannot keep itself awake by speaking.
 
 Boundary: ``now == mute_until`` is treated as *expired* (not suppressed), matching
-the ``now < mute_until`` check in ``think``'s ``_guarded_feed``.
+the ``now < mute_until`` check the speaking loops' guarded sense feeds use.
 
 audio_wake flag
 ---------------

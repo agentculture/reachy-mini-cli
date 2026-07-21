@@ -426,3 +426,136 @@ def test_register_run_stdin_dash() -> None:
 
     args = parser.parse_args(["say", "run", "-"])
     assert args.text == "-"
+
+
+# ---------------------------------------------------------------------------
+# Dumb-pipe boundary, static import graph
+# ---------------------------------------------------------------------------
+#
+# Moved here from the retired ``tests/test_think_boundary.py`` (t20): the
+# assertion is about ``say``, which survives, so the coverage moves rather than
+# being dropped. It is broader than the two `does_not_import_*` tests above —
+# it also forbids the cognition engine and any motion module.
+
+
+def _imported_modules(module) -> set[str]:
+    """All dotted module names imported by *module* (Import + ImportFrom)."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(module))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name)
+    return names
+
+
+def test_say_remains_a_dumb_pipe() -> None:
+    """say must not import llm / events / motion / cognition — it stays dumb."""
+    imported = _imported_modules(say_mod)
+    for name in imported:
+        assert "speech.llm" not in name, f"say must not import the LLM client ({name!r})"
+        assert "speech.events" not in name, f"say must not import the event bus ({name!r})"
+        assert "speech.cognition" not in name, f"say must not import cognition ({name!r})"
+        assert not name.startswith("reachy.motion"), f"say must not drive motion ({name!r})"
+    assert "llm" not in say_mod.__dict__
+    assert "events" not in say_mod.__dict__
+
+
+# ---------------------------------------------------------------------------
+# End-to-end through the top-level CLI entry point
+# ---------------------------------------------------------------------------
+#
+# Moved here from the retired ``tests/test_say_think.py`` (t20), which paired
+# ``say`` and ``think`` E2E runs in one file. The ``think`` half went with the
+# noun; the ``say`` half drives the SAME path a real user takes (``main()``
+# rather than a hand-built Namespace), so it moves to ``say``'s own file.
+
+
+@pytest.fixture
+def _isolate_env(monkeypatch, tmp_path) -> None:  # type: ignore[return]
+    """Isolate state so the E2E runs below are xdist-safe."""
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("REACHY_BASE_URL", raising=False)
+    monkeypatch.delenv("REACHY_TRANSPORT", raising=False)
+
+
+def test_say_e2e_no_llm_no_senses_via_main(monkeypatch, _isolate_env) -> None:
+    """say run via main() touches neither reachy.speech.llm nor reachy.speech.events.
+
+    This is the dumb-pipe boundary test at the CLI level: we drive ``say run``
+    through the top-level :func:`main` entry point (same path a real user takes)
+    and confirm the LLM and events modules are not imported or called.
+    """
+    from reachy.cli import main
+
+    synth_calls: list[str] = []
+    play_calls: list[bytes] = []
+
+    monkeypatch.setattr(say_mod, "_synthesize", lambda t, **k: synth_calls.append(t) or b"pcm")
+    monkeypatch.setattr(say_mod, "_play_audio", lambda d, **k: play_calls.append(d))
+
+    # Remove any cached copies of llm / events so a fresh import would be detectable.
+    llm_key = "reachy.speech.llm"
+    events_key = "reachy.speech.events"
+    saved_llm = sys.modules.pop(llm_key, None)
+    saved_events = sys.modules.pop(events_key, None)
+
+    try:
+        rc = main(["say", "run", "hello robot"])
+    finally:
+        if saved_llm is not None:
+            sys.modules[llm_key] = saved_llm
+        if saved_events is not None:
+            sys.modules[events_key] = saved_events
+
+    assert rc == 0
+    assert synth_calls == ["hello robot"]
+    assert play_calls == [b"pcm"]
+    # Neither module was freshly imported during the say run.
+    assert llm_key not in sys.modules or sys.modules.get(llm_key) is saved_llm
+    assert events_key not in sys.modules or sys.modules.get(events_key) is saved_events
+
+
+def test_say_e2e_full_pipeline_via_main(monkeypatch, _isolate_env) -> None:
+    """say run: text passes through synthesize → play_audio via main()."""
+    from reachy.cli import main
+
+    synth_calls: list[str] = []
+    play_calls: list[bytes] = []
+
+    def _synth(text: str, **_kw) -> bytes:
+        synth_calls.append(text)
+        return b"audio:" + text.encode()
+
+    def _play(data: bytes, **_kw) -> None:
+        play_calls.append(data)
+
+    monkeypatch.setattr(say_mod, "_synthesize", _synth)
+    monkeypatch.setattr(say_mod, "_play_audio", _play)
+
+    rc = main(["say", "run", "speak this"])
+
+    assert rc == 0
+    assert synth_calls == ["speak this"]
+    assert play_calls == [b"audio:speak this"]
+
+
+def test_say_e2e_json_output_via_main(monkeypatch, capsys, _isolate_env) -> None:
+    """say run --json via main() emits structured JSON."""
+    from reachy.cli import main
+
+    monkeypatch.setattr(say_mod, "_synthesize", lambda t, **k: b"x" * 42)
+    monkeypatch.setattr(say_mod, "_play_audio", lambda d, **k: None)
+
+    rc = main(["say", "run", "--json", "hi"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["text"] == "hi"
+    assert payload["bytes"] == 42

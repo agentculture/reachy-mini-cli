@@ -14,8 +14,8 @@ decisions from the ``symbolic-runtime-70`` spec:
   only perception/decision events (``sense``/``rule``/``intent``/``motion`` — see
   :mod:`reachy.export.runtime`); it never carries a cognition block. The agent's
   *thinking/message/emotion* is a wholly separate feed, published here through the
-  **same** exporter ``think run --export -`` / ``listen run --live --export -``
-  use (:func:`reachy.cli._export.build_export_hook`), so the wire contract matches
+  **same** exporter ``listen run --live --export -`` uses
+  (:func:`reachy.cli._export.build_export_hook`), so the wire contract matches
   ``docs/export-schema.md``'s cognition feed exactly.
 
 Three composition seams (all injectable so tests need no live LLM, robot, or
@@ -644,7 +644,7 @@ def cmd_agent_attach(
     json_mode = bool(getattr(args, "json", False))
 
     # OUTPUT seam: the agent's OWN cognition feed (thinking/message/emotion), the
-    # SAME exporter think/listen use — the wire contract matches the schema doc.
+    # SAME exporter ``listen --live`` uses — the wire contract matches the schema doc.
     export_hook = build_export_hook(args, stream=stream)
 
     # INPUT seam: runtime-event JSONL lines (a stream/FIFO/file, or '-' for stdin).
