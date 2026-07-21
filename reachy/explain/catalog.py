@@ -883,26 +883,21 @@ _SERVICE = """\
 
 Make the robot boot-persistent in **exactly one** presence mode. The robot has a
 single presence at a time (the single-SDK-owner model): the idle `demo-mode`
-loop, the retiring folded live loop, or the AI-agnostic
-symbolic runtime (`behavior engine run`) — never more than one. This noun
-installs systemd `--user` units so that one chosen presence survives a reboot
-and auto-restarts on crash, and enabling one mode always disables BOTH siblings
-(the single-presence-owner invariant).
+loop or the AI-agnostic symbolic runtime (`behavior engine run`) — never both.
+This noun installs systemd `--user` units so that one chosen presence survives a
+reboot and auto-restarts on crash, and enabling one mode always disables EVERY
+sibling (the single-presence-owner invariant).
 
 Like `daemon`, `service` does **not** drive the robot through a transport — it
 talks to **systemd** (`systemctl --user`), so there is no `--transport` flag.
 
-## Four units
+## Three units
 
 - `reachy-daemon.service` — the local `reachy-mini-daemon` process. A boot
   dependency: every presence unit `Requires=` / `After=` it, so the daemon comes
   up first. `disable` leaves the daemon enabled deliberately (other clients of
   the robot depend on it).
 - `reachy-demo-mode.service` — the idle `demo-mode run` presence loop.
-- `reachy-live.service` — **retiring.** Its `ExecStart` names `listen run
-  --live`, a command that no longer exists, so enabling this mode would boot a
-  unit that exits immediately. Use `runtime` instead; the unit is removed in a
-  follow-up release.
 - `reachy-runtime.service` — the AI-agnostic symbolic runtime (`behavior engine
   run`, the boot default per decision c19): the deterministic 50 Hz engine loads
   `rules.toml`, ticks, and sustains declared intents with zero external AI
@@ -910,19 +905,36 @@ talks to **systemd** (`systemctl --user`), so there is no `--transport` flag.
   `REACHY_OPENAI_*` reference; an agent attaches to the running loop externally
   afterwards through the `agent` noun, with no unit edit and no loop restart.
 
+## The retired `live` unit
+
+`reachy-live.service` ran the folded `listen run --live` loop. That command no
+longer exists, so the unit is an argparse error every `RestartSec=5` — a crash
+loop, not a quiet no-op. There is no `enable live` any more: use `runtime`.
+
+An upgrade rewrites no unit files on its own, so a box that ran the live
+presence still carries it. **Every `service` verb** (`enable`, `install`,
+`uninstall`) now purges it on the way past — `disable --now`, unlink the unit,
+remove its `.d/` drop-in directory — and reports what it removed as
+`retired_removed`. `status` keeps probing the name too, so a box still carrying
+it reports `mode=retired` with a warning rather than a reassuring `mode=null`.
+
+That purge is **destructive and irreversible**: hand-authored drop-ins under
+`reachy-live.service.d/` are not reproducible from the repo. Back up
+`~/.config/systemd/user/reachy-*.service*` before running a `service` verb on a
+box you may need to roll back.
+
 ## Verbs
 
 - `reachy-mini-cli service enable demo` — boot-persist the idle demo-mode
-  presence; disables the live and runtime siblings.
-- `reachy-mini-cli service enable live` — **retiring**; its unit's `ExecStart`
-  names a removed command. Use `enable runtime`.
+  presence; disables the runtime sibling.
 - `reachy-mini-cli service enable runtime` — boot-persist the AI-agnostic
-  symbolic runtime; disables the demo and live siblings.
+  symbolic runtime; disables the demo sibling.
 - `reachy-mini-cli service disable` — disable whichever presence unit is enabled
   (the daemon is left enabled, reported as `daemon=left-enabled`).
 - `reachy-mini-cli service status` — which presence mode is enabled (or none) +
-  per-unit `is-enabled` / `is-active` + daemon health.
-- `reachy-mini-cli service install` — write all four unit files +
+  per-unit `is-enabled` / `is-active` + daemon health, plus any retired unit
+  still enabled.
+- `reachy-mini-cli service install` — write all three unit files +
   `daemon-reload`, WITHOUT enabling anything (a separate `enable` chooses the
   mode).
 - `reachy-mini-cli service uninstall` — remove the unit files + `daemon-reload`.
@@ -947,7 +959,6 @@ machine-reboot check is therefore a manual on-robot step.
 
     reachy-mini-cli service install                  # write the units, enable nothing
     reachy-mini-cli service enable runtime           # boot-persist the AI-agnostic runtime
-    reachy-mini-cli service enable live              # switch to the folded live loop
     reachy-mini-cli service enable demo              # switch to idle demo
     reachy-mini-cli service status --json            # enabled mode + daemon health
     reachy-mini-cli service disable                  # stop the presence (daemon stays up)

@@ -175,7 +175,8 @@ validated, only trusted — which is the point of doing it now.
 
 ```bash
 mkdir -p ~/reachy-rollback-2026-07-20
-cp -a ~/.config/systemd/user/reachy-*.service.d ~/reachy-rollback-2026-07-20/
+cp -a ~/.config/systemd/user/reachy-*.service   ~/reachy-rollback-2026-07-20/  # unit FILES
+cp -a ~/.config/systemd/user/reachy-*.service.d ~/reachy-rollback-2026-07-20/  # drop-in DIRS
 cp -a ~/.local/state/reachy/behavior/rules.toml ~/reachy-rollback-2026-07-20/
 systemctl --user list-unit-files 'reachy-*' > ~/reachy-rollback-2026-07-20/units.txt
 ```
@@ -189,6 +190,31 @@ the main unit. Losing these means re-deriving them from journal archaeology.
 > end-to-end.** As originally written it failed in four ways — the
 > corrections are inline below and the failures are recorded in §5.2, because
 > a runbook is only worth what its last rehearsal proved.
+>
+> **Amended 2026-07-21 by `t23`, which retired `reachy-live.service`.** Two
+> changes, both load-bearing:
+>
+> - **The first `cp -a` line above is new.** As written, §3.1 preserved only the
+>   drop-in *directories*; it never copied the unit **files**. That was safe
+>   while `reachy-live.service` was guaranteed to still be sitting on the box —
+>   §3.3 just re-enabled the one already there. It is no longer guaranteed (next
+>   point), so the unit file is now part of the backup and §3.3 restores it.
+> - **The destructive trigger is now an ordinary `service` verb.** `t23` moved
+>   `reachy-live.service` into `reachy/service/units.py`'s `RETIRED_UNITS`, so
+>   `service enable` / `service install` / `service uninstall` under the branch
+>   build each `disable --now` that unit, **unlink it, and `rmtree` its `.d/`
+>   directory** — reporting what it removed as `retired_removed`. That is the
+>   point (a unit whose `ExecStart` names the deleted `listen run --live` is an
+>   argparse error every `RestartSec=5`, not dead weight), but it means the
+>   backup above is the **only** copy of six irreproducible drop-ins. **Take the
+>   backup before running any `service` verb on this box.** No PR in this arc
+>   runs one, and the box stays on `reachy-runtime.service` throughout — but the
+>   window is a command away, not a deletion commit away.
+>
+> The rest of §3 is unchanged and still executable: §3.2 downgrades to released
+> 0.41.0 first, and *that* build has no `RETIRED_UNITS` at all, so the rollback
+> runs against a CLI that neither knows nor cares that the branch retired the
+> name.
 
 ### 3.2 Downgrade
 
@@ -217,7 +243,8 @@ rehearsal:
 ### 3.3 Restore the old presence
 
 ```bash
-cp -a ~/reachy-rollback-2026-07-20/reachy-live.service.d ~/.config/systemd/user/
+cp -a ~/reachy-rollback-2026-07-20/reachy-live.service   ~/.config/systemd/user/  # unit FILE
+cp -a ~/reachy-rollback-2026-07-20/reachy-live.service.d ~/.config/systemd/user/  # drop-ins
 systemctl --user daemon-reload
 systemctl --user disable --now reachy-runtime.service
 curl -s -X POST http://localhost:8000/api/media/acquire     # REQUIRED — see below

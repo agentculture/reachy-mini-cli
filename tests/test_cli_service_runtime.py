@@ -2,8 +2,12 @@
 
 Mirrors ``tests/test_cli_service.py``'s style (injected fake ``systemctl``
 runner + temp ``XDG_CONFIG_HOME``, driven through ``reachy.cli.main``) for the
-new ``service enable runtime`` verb and the now-four-unit ``install``/
-``uninstall``. No real systemctl runs and no real systemd unit is ever enabled.
+``service enable runtime`` verb and ``install`` / ``uninstall``. No real
+systemctl runs and no real systemd unit is ever enabled.
+
+Written when the catalog held four units; ``t23`` retired ``reachy-live.service``
+(its ``ExecStart`` named the removed ``listen run --live``), leaving three. The
+retirement itself is covered in ``tests/test_service_live_retirement.py``.
 """
 
 from __future__ import annotations
@@ -15,13 +19,7 @@ import pytest
 
 from reachy.cli import main
 from reachy.cli._commands import service as service_cmd
-from reachy.service.units import (
-    DAEMON_UNIT,
-    DEMO_UNIT,
-    LIVE_UNIT,
-    RETIRED_UNITS,
-    RUNTIME_UNIT,
-)
+from reachy.service.units import DAEMON_UNIT, DEMO_UNIT, RETIRED_UNITS, RUNTIME_UNIT
 
 
 class FakeSystemctl:
@@ -78,9 +76,8 @@ def test_enable_runtime_dispatches_through_manager(fake, capsys, tmp_path):
     enabled = fake.verbs_for("enable")
     assert ["--user", "enable", "--now", DAEMON_UNIT] in enabled
     assert ["--user", "enable", "--now", RUNTIME_UNIT] in enabled
-    # BOTH siblings disabled --now.
+    # EVERY sibling disabled --now.
     assert ["--user", "disable", "--now", DEMO_UNIT] in fake.calls
-    assert ["--user", "disable", "--now", LIVE_UNIT] in fake.calls
     assert "runtime" in out
     assert err == ""
     assert (_unit_dir(tmp_path) / DAEMON_UNIT).is_file()
@@ -95,7 +92,7 @@ def test_enable_runtime_json(fake, capsys):
     assert payload["status"] == "enabled"
     assert payload["mode"] == "runtime"
     assert payload["presence_unit"] == RUNTIME_UNIT
-    assert set(payload["disabled_siblings"]) == {DEMO_UNIT, LIVE_UNIT}
+    assert set(payload["disabled_siblings"]) == {DEMO_UNIT}
     assert err == ""
 
 
@@ -110,8 +107,8 @@ def test_enable_choices_include_runtime(fake, capsys):
 # --------------------------------------------------------------------------- #
 
 
-def test_switch_live_then_runtime_disables_both_others(fake, capsys):
-    rc1 = main(["service", "enable", "live"])
+def test_switch_demo_then_runtime_disables_the_sibling(fake, capsys):
+    rc1 = main(["service", "enable", "demo"])
     capsys.readouterr()
     assert rc1 == 0
     fake.calls.clear()
@@ -120,12 +117,11 @@ def test_switch_live_then_runtime_disables_both_others(fake, capsys):
     out, err = capsys.readouterr()
     assert rc2 == 0
     assert ["--user", "enable", "--now", RUNTIME_UNIT] in fake.calls
-    assert ["--user", "disable", "--now", LIVE_UNIT] in fake.calls
     assert ["--user", "disable", "--now", DEMO_UNIT] in fake.calls
     assert err == ""
 
 
-def test_switch_runtime_then_demo_disables_both_others(fake, capsys):
+def test_switch_runtime_then_demo_disables_the_sibling(fake, capsys):
     main(["service", "enable", "runtime"])
     capsys.readouterr()
     fake.calls.clear()
@@ -135,7 +131,6 @@ def test_switch_runtime_then_demo_disables_both_others(fake, capsys):
     assert rc == 0
     assert ["--user", "enable", "--now", DEMO_UNIT] in fake.calls
     assert ["--user", "disable", "--now", RUNTIME_UNIT] in fake.calls
-    assert ["--user", "disable", "--now", LIVE_UNIT] in fake.calls
     assert err == ""
 
 
@@ -148,7 +143,6 @@ def test_status_reports_runtime_mode(fake, capsys):
     fake.set_enabled(DAEMON_UNIT, "enabled")
     fake.set_enabled(RUNTIME_UNIT, "enabled")
     fake.set_enabled(DEMO_UNIT, "disabled")
-    fake.set_enabled(LIVE_UNIT, "disabled")
     rc = main(["service", "status", "--json"])
     out, err = capsys.readouterr()
     assert rc == 0
@@ -160,15 +154,15 @@ def test_status_reports_runtime_mode(fake, capsys):
 
 
 # --------------------------------------------------------------------------- #
-# install / uninstall — FOUR units, no enabling.
+# install / uninstall — every catalogued unit, no enabling.
 # --------------------------------------------------------------------------- #
 
 
-def test_install_writes_all_four_units_without_enabling(fake, capsys, tmp_path):
+def test_install_writes_every_unit_without_enabling(fake, capsys, tmp_path):
     rc = main(["service", "install"])
     out, err = capsys.readouterr()
     assert rc == 0
-    for unit in (DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT):
+    for unit in (DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT):
         assert (_unit_dir(tmp_path) / unit).is_file(), f"{unit} not written by install"
     assert ["--user", "daemon-reload"] in fake.calls
     assert fake.verbs_for("enable") == []
@@ -176,22 +170,22 @@ def test_install_writes_all_four_units_without_enabling(fake, capsys, tmp_path):
     # no unit in the CURRENT catalog is ever disabled by install.
     disabled = [c[-1] for c in fake.verbs_for("disable")]
     assert set(disabled) <= set(RETIRED_UNITS)
-    assert not {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT} & set(disabled)
+    assert not {DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT} & set(disabled)
     assert err == ""
     assert out != ""
 
 
-def test_install_json_reports_four_unit_paths(fake, capsys):
+def test_install_json_reports_every_unit_path(fake, capsys):
     rc = main(["service", "install", "--json"])
     out, err = capsys.readouterr()
     assert rc == 0
     payload = json.loads(out)
     assert payload["status"] == "installed"
-    assert set(payload["unit_paths"]) == {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT}
+    assert set(payload["unit_paths"]) == {DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT}
     assert err == ""
 
 
-def test_uninstall_removes_all_four_units(fake, capsys, tmp_path):
+def test_uninstall_removes_every_unit(fake, capsys, tmp_path):
     main(["service", "install"])
     capsys.readouterr()
     fake.calls.clear()
@@ -199,13 +193,13 @@ def test_uninstall_removes_all_four_units(fake, capsys, tmp_path):
     rc = main(["service", "uninstall"])
     out, err = capsys.readouterr()
     assert rc == 0
-    for unit in (DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT):
+    for unit in (DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT):
         assert not (_unit_dir(tmp_path) / unit).is_file()
     assert ["--user", "daemon-reload"] in fake.calls
     assert err == ""
 
 
-def test_uninstall_json_reports_four_removed(fake, capsys):
+def test_uninstall_json_reports_every_removed(fake, capsys):
     main(["service", "install"])
     capsys.readouterr()
     rc = main(["service", "uninstall", "--json"])
@@ -213,7 +207,7 @@ def test_uninstall_json_reports_four_removed(fake, capsys):
     assert rc == 0
     payload = json.loads(out)
     assert payload["status"] == "uninstalled"
-    assert set(payload["removed"]) == {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT}
+    assert set(payload["removed"]) == {DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT}
     assert err == ""
 
 
