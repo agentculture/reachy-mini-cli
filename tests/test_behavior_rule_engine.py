@@ -732,3 +732,80 @@ def test_a_raising_rule_build_never_escapes_on_tick(monkeypatch) -> None:
     ctx = _RecordingCtx(now=0.25, tick=1, sense=Sense(speech_detected=True))
     re.on_tick(ctx)  # must not raise
     assert ctx.admits == []
+
+
+# --------------------------------------------------------------------------- #
+# Composition-time param overrides (the REACHY_ORIENT_* seam, d6)             #
+# --------------------------------------------------------------------------- #
+#
+# The d6 admission knobs (`rms_ratio`, `rms_ratio_loud`, `sustain_s`) have to be
+# tunable on a deployed box the way `REACHY_PAT_*` and `REACHY_SELF_MOVING_*`
+# already are — a systemd drop-in, no file edit, no rebuild. A behavior is minted
+# from the library catalog on ADMISSION, so `_build` is the only place an
+# environment value can reach one; this overlay is that seam, injected by the CLI
+# (which does the env reading) so this module stays environment-free.
+
+
+def _orient_rule() -> RulesConfig:
+    return RulesConfig.from_dict(
+        {
+            "react": [
+                {
+                    "id": "sound",
+                    "when": {"field": "rms_ratio", "op": "ge", "value": 5.0},
+                    "run": "orient-to-sound",
+                    "duration_s": 12.0,
+                }
+            ]
+        }
+    )
+
+
+def _admit_once(engine: RuleEngine):
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=Sense(doa_angle=1.0, rms_ratio=9.0))
+    engine.on_tick(ctx)
+    assert ctx.admits, "the rule should have fired"
+    return ctx.admits[0]
+
+
+def test_a_param_overlay_moves_a_catalog_default() -> None:
+    engine = RuleEngine(_orient_rule(), param_overrides={"orient-to-sound": {"sustain_s": 4.0}})
+    assert _admit_once(engine).params["sustain_s"] == pytest.approx(4.0)
+
+
+def test_with_no_overlay_the_catalog_default_is_untouched() -> None:
+    from reachy.behavior.orient import OrientParams
+
+    assert _admit_once(RuleEngine(_orient_rule())).params["sustain_s"] == pytest.approx(
+        OrientParams().sustain_s
+    )
+
+
+def test_a_rules_file_param_beats_the_overlay() -> None:
+    """Precedence, and it is a product decision: a rules file is a
+    version-controlled statement about this robot, an env var is something
+    somebody exported once. The file wins."""
+    config = RulesConfig.from_dict(
+        {
+            "react": [
+                {
+                    "id": "sound",
+                    "when": {"field": "rms_ratio", "op": "ge", "value": 5.0},
+                    "run": "orient-to-sound",
+                    "duration_s": 12.0,
+                    "params": {"sustain_s": 0.5},
+                }
+            ]
+        }
+    )
+    engine = RuleEngine(config, param_overrides={"orient-to-sound": {"sustain_s": 4.0}})
+    assert _admit_once(engine).params["sustain_s"] == pytest.approx(0.5)
+
+
+def test_an_unknown_overlay_key_is_ignored_rather_than_refused() -> None:
+    """A stale exported variable must not stop a robot from booting."""
+    engine = RuleEngine(
+        _orient_rule(),
+        param_overrides={"orient-to-sound": {"not_a_knob": 1.0}, "no-such-behavior": {"x": 1.0}},
+    )
+    assert "not_a_knob" not in _admit_once(engine).params

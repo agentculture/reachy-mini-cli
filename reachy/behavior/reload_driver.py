@@ -156,11 +156,22 @@ class ReloadDriver:
     """
 
     def __init__(
-        self, loader: RulesLoader, *, id_prefix: str = "rule", lib=None, speech=None
+        self,
+        loader: RulesLoader,
+        *,
+        id_prefix: str = "rule",
+        lib=None,
+        speech=None,
+        param_overrides: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self._loader = loader
         self._id_prefix = id_prefix
         self._lib = lib
+        #: The composition-time param overlay (see :class:`RuleEngine`). Held
+        #: HERE for the same reason ``speech`` is: it must survive a live
+        #: reload, or a reloaded rules file would silently drop the box's own
+        #: env tuning.
+        self._param_overrides = param_overrides
         #: The act-out speech seam (see :class:`RuleEngine`). Held HERE, not
         #: only on the engine, so it survives a live reload — a rebuilt engine
         #: that silently lost its voice would be the worst kind of reload bug:
@@ -170,7 +181,13 @@ class ReloadDriver:
 
     def _build_engine(self, config) -> RuleEngine:
         """Mint a :class:`RuleEngine` over *config* with this driver's fixed wiring."""
-        return RuleEngine(config, id_prefix=self._id_prefix, lib=self._lib, speech=self._speech)
+        return RuleEngine(
+            config,
+            id_prefix=self._id_prefix,
+            lib=self._lib,
+            speech=self._speech,
+            param_overrides=self._param_overrides,
+        )
 
     @property
     def loader(self) -> RulesLoader:

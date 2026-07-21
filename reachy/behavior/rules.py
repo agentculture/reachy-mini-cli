@@ -37,8 +37,8 @@ Every rule (react or inhibit) is uniquely ``id``-entified and carries
 (the anti-flap margin around a threshold, default 0.0) — both validated
 ``>= 0`` numbers. A :class:`Predicate` is DATA (``field``/``op``/``value``), never
 a string of code: ``field`` is one of :data:`SENSE_FIELDS`
-(``doa``/``speech``/``rms``/``pat``/``face``/``frame_available``/``transcript``/
-``self_moving``) and ``op`` is one of
+(``doa``/``speech``/``rms``/``rms_ratio``/``pat``/``face``/``frame_available``/
+``transcript``/``self_moving``) and ``op`` is one of
 :data:`COMPARATORS`.
 
 A REACT rule may additionally carry ``duration_s`` (a validated ``> 0`` number,
@@ -146,7 +146,17 @@ SHIPPED_RULES_RESOURCE = "default_rules.toml"
 #: smaller) subset actually wired today, and ``behavior rules check`` warns on
 #: any rule keyed outside it — see that module for why the two can differ.
 SENSE_FIELDS: frozenset[str] = frozenset(
-    {"doa", "speech", "rms", "pat", "face", "frame_available", "transcript", "self_moving"}
+    {
+        "doa",
+        "speech",
+        "rms",
+        "rms_ratio",
+        "pat",
+        "face",
+        "frame_available",
+        "transcript",
+        "self_moving",
+    }
 )
 
 #: Sense fields whose bare reading is measured to be too noisy to key a rule on
@@ -173,8 +183,13 @@ UNCORROBORATED_AT_REST_RATE = "45.8% (55/120 samples, quiet room, nobody speakin
 
 #: Fields that DO carry corroboration, named in the warning as the fix. Each is
 #: either already gated (``transcript`` is an utterance that cleared the layered
-#: engagement gate) or a physical measurement (``rms``/``pat``/``face``).
-CORROBORATING_SENSE_FIELDS: tuple[str, ...] = ("transcript", "rms", "pat", "face")
+#: engagement gate) or a physical measurement (``rms_ratio``/``rms``/``pat``/
+#: ``face``). ``rms_ratio`` leads the loudness pair deliberately: an absolute
+#: ``rms`` threshold is corroborating only in the room it was calibrated in —
+#: the deployed 0.02 sat under the measured NIGHT background, where 99.1 % of
+#: still-room samples cleared it (issue #102) — while a ratio over the rolling
+#: background means the same thing in every room.
+CORROBORATING_SENSE_FIELDS: tuple[str, ...] = ("transcript", "rms_ratio", "rms", "pat", "face")
 
 #: Ordered numeric comparators — require a numeric ``value``.
 _ORDERED_OPS: frozenset[str] = frozenset({"lt", "gt", "ge", "le"})

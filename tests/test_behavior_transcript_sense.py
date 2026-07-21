@@ -714,3 +714,92 @@ def test_transcript_is_a_rule_testable_sense_field() -> None:
         }
     )
     assert config.react[0].when.field == "transcript"
+
+
+# --------------------------------------------------------------------------- #
+# The capture gate is RELATIVE to the room (#102 / d6)                        #
+# --------------------------------------------------------------------------- #
+#
+# `DEFAULT_SPEECH_RMS = 0.02` had the same drift defect as the orienting floor,
+# and the same live evidence: with the measured night background at p50 0.034
+# the absolute gate is PERMANENTLY OPEN, and the deployed journal filled with
+# `utterance start` -> `dropped reason=stt-empty` — the runtime recording
+# silence and POSTing it to the STT.
+#
+# The fix is the shape `SnapDetector` always had: the absolute value becomes a
+# FLOOR under a relative threshold, `max(speech_rms, speech_ratio * background)`,
+# fed by the SAME `RmsBackground` the orienting gate reads. Two consumers, two
+# thresholds, ONE estimate of the room.
+
+
+def _hum(level: float, n: int = CHUNK) -> np.ndarray:
+    """A chunk whose rms is exactly *level* — the room, not a voice."""
+    return np.full(n, float(level), dtype=np.float32)
+
+
+def test_without_a_background_seam_the_gate_is_the_shipped_absolute_floor() -> None:
+    """No estimator wired -> byte-identical to what shipped (the donor's VAD)."""
+    driver = _driver(_Media())
+    assert driver._speech_threshold() == pytest.approx(TranscriptTuning().speech_rms)
+
+
+def test_a_quiet_room_keeps_the_shipped_sensitivity_exactly() -> None:
+    """3x the measured DAYTIME background (0.012) is below the 0.02 floor, so
+    the floor still governs — a quiet room's capture behaviour does not move."""
+    driver = _driver(_Media(), background=lambda: 0.004)
+    assert driver._speech_threshold() == pytest.approx(TranscriptTuning().speech_rms)
+
+
+def test_a_night_room_raises_the_gate_above_its_own_hiss() -> None:
+    """The defect, closed: at the measured night background the gate is 0.102,
+    not 0.02, so the room's own hiss can no longer start an utterance."""
+    driver = _driver(_Media(), background=lambda: 0.034)
+    tuning = TranscriptTuning()
+    assert driver._speech_threshold() == pytest.approx(0.034 * tuning.speech_ratio)
+    assert not driver._is_speech(_hum(0.05))  # loud in absolute terms, still the room
+    assert driver._is_speech(_hum(0.2))  # a real voice over it still gets through
+
+
+def test_the_capture_gate_is_looser_than_the_orienting_gate() -> None:
+    """Asymmetric costs, asymmetric thresholds: a missed utterance is gone
+    forever, a wasted capture costs one empty STT POST — so hearing starts on
+    less evidence than turning the head does."""
+    from reachy.behavior.rms_background import DEFAULT_RATIO
+
+    assert TranscriptTuning().speech_ratio < DEFAULT_RATIO
+
+
+def test_the_capture_gate_clears_the_measured_still_room_spread() -> None:
+    """...but not so loose that an empty room starts recording: every measured
+    condition tops out at ~2.5x its own median."""
+    assert TranscriptTuning().speech_ratio > 2.5
+
+
+@pytest.mark.parametrize(
+    "peek",
+    [
+        lambda: None,  # a cold estimator
+        lambda: float("nan"),
+        lambda: -1.0,
+        lambda: "loud",
+        (lambda: (_ for _ in ()).throw(RuntimeError("estimator on fire"))),
+    ],
+)
+def test_a_broken_background_peek_degrades_to_the_floor(peek) -> None:
+    """A sense tap must never crash the 20 ms tick it runs on — it falls back
+    to the pre-#102 absolute floor, which is a working gate, not silence."""
+    driver = _driver(_Media(), background=peek)
+    assert driver._speech_threshold() == pytest.approx(TranscriptTuning().speech_rms)
+
+
+def test_the_onset_scan_uses_the_same_threshold_as_the_vad() -> None:
+    """The pre-roll onset measurement must agree with the gate that admitted the
+    utterance, or the emitted clip's lead-in is cut against a different room."""
+    media = _Media()
+    driver = _driver(media, background=lambda: 0.034)
+    snapshot = np.concatenate([_hum(0.05, 400), _hum(0.4, 400)])
+    driver._rate = RATE
+    driver._onset_window = 100
+    # The 0.05 lead-in is the room at night, not speech: onset lands in the
+    # second half. Under the retired absolute 0.02 it would have landed at 0.
+    assert driver._measure_onset(snapshot) >= 400

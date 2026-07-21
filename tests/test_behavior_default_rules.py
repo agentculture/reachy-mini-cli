@@ -242,10 +242,10 @@ def test_the_orienting_window_covers_a_whole_turn_hold_recenter_cycle() -> None:
 
 
 def test_the_orienting_rule_admits_no_lower_than_the_behaviors_own_gate() -> None:
-    """The rule's floor IS `OrientParams.rms_floor` — one number, not two."""
+    """The rule's ratio IS `OrientParams.rms_ratio` — one number, not two."""
     rule = _by_id(load_shipped_rules(), "look-toward-sound")
-    assert rule.when.field == "rms"
-    assert rule.when.value == pytest.approx(OrientParams().rms_floor)
+    assert rule.when.field == "rms_ratio"
+    assert rule.when.value == pytest.approx(OrientParams().rms_ratio)
 
 
 # --------------------------------------------------------------------------- #
@@ -255,7 +255,7 @@ def test_the_orienting_rule_admits_no_lower_than_the_behaviors_own_gate() -> Non
 
 def test_the_shipped_set_covers_touch_sound_and_words() -> None:
     config = load_shipped_rules()
-    assert {r.when.field for r in config.react} == {"pat", "rms", "transcript"}
+    assert {r.when.field for r in config.react} == {"pat", "rms_ratio", "transcript"}
 
 
 def test_exactly_one_shipped_rule_has_a_voice_and_it_is_short() -> None:
@@ -284,13 +284,18 @@ def test_an_at_rest_snapshot_admits_nothing() -> None:
 
 def test_a_quiet_room_with_the_speech_flag_stuck_true_still_admits_nothing() -> None:
     """The measured 45.8 %-at-rest case, verbatim: flag true, nothing corroborating."""
-    quiet = Sense(doa_angle=1.7, speech_detected=True, rms=0.004)
+    quiet = Sense(doa_angle=1.7, speech_detected=True, rms=0.004, rms_ratio=1.0)
     assert _admitted(_drive(quiet)) == []
 
 
-def test_ambient_hum_below_the_orienting_floor_admits_nothing() -> None:
-    below = OrientParams().rms_floor - 0.001
-    assert _admitted(_drive(Sense(speech_detected=True, rms=below))) == []
+def test_ambient_hum_below_the_orienting_ratio_admits_nothing() -> None:
+    """A hum LOUDER than the retired 0.02 floor, but only 2x its own room.
+
+    The #102 case in one line: absolute loudness says "fire", the room says
+    "that is just the room", and the room wins.
+    """
+    below = OrientParams().rms_ratio - 1.0
+    assert _admitted(_drive(Sense(speech_detected=True, rms=0.09, rms_ratio=below))) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -304,7 +309,7 @@ def test_a_pat_admits_the_pet_reaction() -> None:
 
 
 def test_audible_sound_admits_bounded_orienting() -> None:
-    ctx = _drive(Sense(doa_angle=1.1, rms=0.05))
+    ctx = _drive(Sense(doa_angle=1.1, rms=0.05, rms_ratio=12.0))
     assert _admitted(ctx) == ["orient-to-sound"]
     assert ctx.admits[0].lifetime.duration == pytest.approx(
         _by_id(load_shipped_rules(), "look-toward-sound").duration_s

@@ -272,8 +272,14 @@ LIBRARY: dict[str, LibraryEntry] = {
             "recenter_after": _ORIENT_PARAM(
                 "recenter_after", "s", "silence grace before the heading drifts home"
             ),
-            "rms_floor": _ORIENT_PARAM(
-                "rms_floor", "rms", "loudness floor corroborating that sound is live"
+            "rms_ratio": _ORIENT_PARAM(
+                "rms_ratio", "x", "times the room's rolling background before sound counts as live"
+            ),
+            "rms_ratio_loud": _ORIENT_PARAM(
+                "rms_ratio_loud", "x", "times the background that promotes tier 2 on loudness"
+            ),
+            "sustain_s": _ORIENT_PARAM(
+                "sustain_s", "s", "ongoing sound that promotes tier 2 without being loud"
             ),
             "dwell_s": _ORIENT_PARAM(
                 "dwell_s", "s", "the bearing must hold this long before the head moves"
