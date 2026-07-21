@@ -101,12 +101,27 @@ Covers t7's deferred audible-output criteria.
 
 ### C5 — sound, and orienting (t15 + t8)
 
-- **Pass:** an audible sound produces
+> **Amended 2026-07-21 (deviation `d6`).** The criterion below originally read
+> "an audible sound … and the robot orients toward it". That is no longer the
+> shipped behaviour: sound reaction is now a **graded two-tier ladder**, and a
+> single transient like a clap is *supposed* to stop at the antennas. Testing
+> the old criterion would fail a robot that is behaving as designed.
+
+- **Pass, tier 1 (any sound above the room):**
   `[SENSE stage=rule source=rms event=look-toward-sound] fired ... run=orient-to-sound`
-  and the robot orients toward it; head returns to base presence smoothly at
-  the end of the window, **without a snap**.
-- **Fail:** no admission on clear sound; or a visible snap when the behavior's
-  12 s window ends (would mean `duration_s` is mis-derived).
+  and `[SENSE stage=orient source=doa event=tier] NONE->NOISE` — the near-side
+  antenna leans toward the bearing and **the head does not move**.
+- **Pass, tier 2 (sustained OR loud relative to the room):** a
+  `[SENSE stage=orient source=doa event=tier2] promoted reason=sustained|loud`
+  line, the head/body turning toward the source, and a smooth return to base
+  presence at the end of the 12 s window **without a snap**.
+- **Fail:** a single clap turning the head (tier 2 too cheap); no antenna
+  response at all to clear sound (tier 1 deaf); or a visible snap at the
+  window end (would mean `duration_s` is mis-derived).
+- **Note:** the tier-1 half is verified — 4 admissions / 100 s, all
+  `NONE->NOISE`, zero head turns, in the same room that previously produced
+  203 fires in 8 minutes. Tier 2 still needs a deliberate sustained or loud
+  source.
 - **Watch:** the handover snap t15 flagged — `greet-when-addressed` admitting
   `speak` while the head is held at up to 35°. Record if seen; it is
   pre-existing arbitration behaviour, but these defaults make it reachable.
@@ -164,13 +179,34 @@ reproducible from the repo**. `panel.conf` carries a hardcoded bridge IP
 (`192.168.1.173`) and an `ExecStart=` override that must stay flag-synced with
 the main unit. Losing these means re-deriving them from journal archaeology.
 
+> **Amended 2026-07-21 (deviation `d7`) after executing this runbook
+> end-to-end.** As originally written it failed in four ways — the
+> corrections are inline below and the failures are recorded in §5.2, because
+> a runbook is only worth what its last rehearsal proved.
+
 ### 3.2 Downgrade
 
 ```bash
 systemctl --user stop reachy-runtime.service
-uv tool install --force 'reachy-mini-cli==0.41.0'
-reachy --version   # expect 0.41.0
+uv tool install --force 'reachy-mini-cli[daemon]==0.41.0'   # [daemon] IS REQUIRED
+cd /tmp && ~/.local/share/uv/tools/reachy-mini-cli/bin/python3 \
+  -c "import reachy; print(reachy.__file__)"                # expect site-packages, NOT the checkout
+ls ~/.local/share/uv/tools/reachy-mini-cli/bin/reachy-mini-daemon   # must exist
 ```
+
+**Why `[daemon]`, and why the version check is gone.** Two failures found by
+rehearsal:
+
+- `uv tool install --force 'reachy-mini-cli==0.41.0'` (no extra) removes
+  `reachy_mini`, so the sdk-only `listen run --live` cannot start at all —
+  and it **deletes `reachy-mini-daemon`**, the binary
+  `reachy-daemon.service` execs. The running daemon survives only because
+  its process is already resident: the box looks healthy and is one reboot
+  from having no robot. A rollback that fails invisibly is worse than one
+  that fails loudly.
+- `reachy --version` proves nothing here — the branch build and released
+  0.41.0 carry the **same** version string (deliberately unbumped mid-arc),
+  so only the import path discriminates.
 
 ### 3.3 Restore the old presence
 
@@ -178,8 +214,22 @@ reachy --version   # expect 0.41.0
 cp -a ~/reachy-rollback-2026-07-20/reachy-live.service.d ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user disable --now reachy-runtime.service
+curl -s -X POST http://localhost:8000/api/media/acquire     # REQUIRED — see below
+curl -s http://localhost:8000/api/media/status              # expect available:true
 systemctl --user enable --now reachy-live.service
 ```
+
+**Why the acquire step.** Released 0.41.0 carries #94: it never acquires the
+daemon's media subsystem, and `released: true` is the daemon's ordinary
+resting state once the last consumer disconnects. Without the acquire the
+restored presence crash-loops on `ConnectionRefusedError` — observed at
+**47 restarts** before the step was added. `t30` is what makes the *runtime*
+side self-sufficient; the rolled-back build has no such fix, so the operator
+supplies it by hand.
+
+**Leave no orphaned hold.** A hand-issued acquire outlives the process it was
+for. After §3.5, `POST /api/media/release` if the runtime reports
+`contended: daemon media not released by its current owner` (#98).
 
 ### 3.4 Verify the rollback actually worked
 
@@ -198,9 +248,18 @@ behaviour is a runbook that fails when it is needed.
 
 ```bash
 systemctl --user disable --now reachy-live.service
-uv tool install --force --editable /home/spark/git/reachy-mini-cli
+uv tool install --force --editable '/home/spark/git/reachy-mini-cli[daemon]'
+cd /tmp && ~/.local/share/uv/tools/reachy-mini-cli/bin/python3 \
+  -c "import reachy; print(reachy.__file__)"     # expect the CHECKOUT path
 systemctl --user enable --now reachy-runtime.service
+curl -s http://localhost:8000/api/media/status   # expect available:true within ~30 s
 ```
+
+`[daemon]` is required here for the same reason as §3.2 — without it this
+step silently strips the daemon binary again. Verify from a **neutral cwd**:
+run from inside the checkout, `sys.path[0]` shadows the tool venv and the
+check passes no matter what is installed (the stale-wheel trap of
+2026-07-21).
 
 ## 4. Explicitly out of scope for this gate
 
@@ -221,19 +280,32 @@ Filled in as the gate is executed. A dash means not yet run.
 |---|---|---|
 | C1 media acquired | **PASS** (2026-07-20 + re-verified on every 07-21 restart) | `available: true, released: false` with the runtime active; journal `media acquired from the daemon` → `connected (default media profile, recording)` |
 | C2 quiet room | **PASS** (formal, 2026-07-21 ~02:05, 5 min, empty room) | 0 `->SPEECH`, 0 `->ENGAGED`, 0 latch lines. Residual NOISE-tier antenna blinks traced to the drifting mic background — see `2026-07-21-live-verification-night.md` §3–4 and #102 (t36) |
-| C3 pat | — | |
-| C4 words + audible | — | |
-| C5 sound + orient | — | |
+| C3 pat | **PASS** (2026-07-21, operator present, post-`t36`) | `Pat level1! type=side_pat` → `[SENSE stage=rule source=pat event=pat-acknowledge] fired kind=react run=pet-reaction`, from the SHIPPED rule (overlay moved aside), operator observed the antennas contract. **First touch after `t36`** — the same room recorded **zero** detections in 5 min before it |
+| C4 words + audible | **PARTIAL** — audible half PASS, addressed half BLOCKED | The full chain is proven: `heard "…"` → `greet-when-addressed fired … say="I'm here."` → `spoke voice=harmonic`, and the operator confirmed hearing it. But it fired on **unaddressed** speech (#104/#105), and the operator's actual addressed utterance was never transcribed (`stt-empty`). Blocked by deviation `d9` |
+| C5 sound + orient | **CRITERION AMENDED** by `d6` — see below | Tier 1 verified: 4 × `NONE->NOISE` in 100 s, antenna lean only, **0 head turns**, down from 203 fires / 8 min. Tier 2 (sustained-or-loud) not yet exercised |
 
 ### 5.2 Rollback runbook
 
+Rehearsed end-to-end **2026-07-21**, operator present, while
+`reachy-live.service` still existed — the one window in which this can be
+validated rather than trusted.
+
 | Step | Result | Notes |
 |---|---|---|
-| 3.1 state preserved | — | |
-| 3.2 downgrade | — | |
-| 3.3 restore presence | — | |
-| 3.4 **function verified** | — | |
-| 3.5 return to branch | — | |
+| 3.1 state preserved | **PASS** | Refreshed to `~/reachy-rollback-2026-07-21/` (units, drop-ins, pre-state) |
+| 3.2 downgrade | **FAIL as written → PASS corrected** | Missing `[daemon]` stripped `reachy_mini` **and** `reachy-mini-daemon`; `reachy --version` cannot discriminate. Both fixed above (`d7`) |
+| 3.3 restore presence | **FAIL as written → PASS corrected** | 47 restarts on #94 `ConnectionRefusedError`; passes once `POST /api/media/acquire` precedes the start (`d7`) |
+| 3.4 **function verified** | **PASS** | `active`; all four flags (`--live --transcribe --cognition agent --voice-engine harmonic`); panel pipe present (`--export - --host 192.168.1.173`); **a real pat produced `Pat level2! type=scratch (sustained 11.6 s)` → `pat fire: scratch/level2` → `[SENSE stage=cue source=pat] felt a firm scratch on the head`** |
+| 3.5 return to branch | **PASS** | Editable branch build restored with `[daemon]`; runtime re-acquired media unaided (`media acquired from the daemon (was released)` → `connected` → pump `live after discarding 0 stale chunk(s)`) |
+
+**Verdict: the runbook PASSES only in its amended form.** Executed verbatim
+it would have left the box without a daemon binary and with a crash-looping
+presence — silently, on the first count. That is the single most valuable
+finding of the rehearsal and the reason `t19` required it be done *before*
+the deletions rather than trusted afterwards.
+
+**Incidental:** §3.4 also reproduced #96 in released 0.41.0 (every journal
+line doubled), confirming `t32` fixed something real rather than cosmetic.
 
 ### 5.3 Soak
 
