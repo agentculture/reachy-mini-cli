@@ -170,7 +170,26 @@ def _utterance(hook, holder, *, t_speech=0.0, t_pause=1.0, doa=10.0, audio=None)
 
 
 def _stamp_window(hook: TranscribeHook, last_accepted_t: float) -> None:
+    """Put the hook mid-conversation: BOTH the heuristic window and the gate's.
+
+    Since #105 the classifier path has its own warm window, opened by a name
+    mention, and a nameless utterance arriving while it is closed is dropped
+    without any classifier call. So a test that means "a conversation is already
+    underway" has to warm both; stamping only the heuristic's window would leave
+    the gate cold and the classifier silently unconsulted.
+    """
     hook._engaged_until = last_accepted_t + hook._engage_window_s
+    _warm_gate(hook, last_accepted_t)
+
+
+def _warm_gate(hook: TranscribeHook, last_accepted_t: float) -> None:
+    """Open the GATE's conversation only, leaving the heuristic's window closed.
+
+    Used where a test needs the classifier to be reached but the DEGRADE
+    fallback to then drop.
+    """
+    if hook._gate is not None:
+        hook._gate.note_engaged("reachy hello", last_accepted_t)
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +338,8 @@ def test_misheard_falling_through_engages_via_classifier(line: TranscriptLine) -
     """MISHEARD lines that fall through fuzzy-match engage via a YES classifier verdict."""
     classifier = _CategoryClassifier()  # says YES for misheard fixtures
     hook, _buffer, _tr = _make_hook(classifier=classifier)
-    assert hook._decide(line.text, 0.0) is True
+    _stamp_window(hook, last_accepted_t=0.0)  # a conversation is underway
+    assert hook._decide(line.text, 1.0) is True
     assert (
         len(classifier.calls) == 1
     ), f"a fall-through misheard must consult the classifier: {line.text!r}"
@@ -348,7 +368,8 @@ def test_addressed_followup_engages_via_classifier(line: TranscriptLine) -> None
     """ADDRESSED_FOLLOWUP lines engage via a positive classifier verdict."""
     classifier = _CategoryClassifier()  # says YES for follow-ups
     hook, _buffer, _tr = _make_hook(classifier=classifier)
-    assert hook._decide(line.text, 0.0) is True
+    _stamp_window(hook, last_accepted_t=0.0)  # a follow-up follows something
+    assert hook._decide(line.text, 1.0) is True
     assert len(classifier.calls) == 1, f"a follow-up must consult the classifier: {line.text!r}"
 
 
@@ -356,14 +377,15 @@ def test_addressed_followup_engages_via_classifier(line: TranscriptLine) -> None
 def test_failing_classifier_keeps_hearing_over_fixtures(line: TranscriptLine) -> None:
     """A forced-FAILING classifier degrades to the heuristic for every fixture.
 
-    Out-of-window (no open conversation) the heuristic drops everything, so the
-    loop stays quiet AND never raises — the degrade path is exercised on every
-    ambient line without an exception escaping.
+    The gate's conversation is open (so the classifier IS reached and raises)
+    but the heuristic's own window is closed, so the fallback drops everything:
+    the loop stays quiet AND never raises — the degrade path is exercised on
+    every ambient line without an exception escaping.
     """
     classifier = _RaisingClassifier()
     hook, _buffer, _tr = _make_hook(classifier=classifier)
-    # Out of window → heuristic drops; the point is the call does not raise.
-    assert hook._decide(line.text, 100.0) is False
+    _warm_gate(hook, 0.0)  # gate open; hook._engaged_until deliberately left at 0
+    assert hook._decide(line.text, 5.0) is False
     assert len(classifier.calls) == 1
 
 
@@ -383,17 +405,41 @@ def test_decision_label_name(caplog) -> None:
 def test_decision_label_context(caplog) -> None:
     classifier = _RecordingClassifier(verdict=True)  # YES, no name → "context"
     hook, _buffer, _tr = _make_hook(classifier=classifier)
+    _stamp_window(hook, last_accepted_t=0.0)
     with caplog.at_level(logging.INFO, logger="reachy.motion.listen_transcribe"):
-        assert hook._decide("what do you think about that", 0.0) is True
+        assert hook._decide("what do you think about that", 1.0) is True
     assert any("context" in rec.getMessage() for rec in caplog.records), caplog.text
 
 
 def test_decision_label_dropped(caplog) -> None:
-    classifier = _RecordingClassifier(verdict=False)  # NO → dropped
+    """A classifier NO is labelled ``not-addressed`` — the reason, not just "dropped"."""
+    classifier = _RecordingClassifier(verdict=False)  # NO → not-addressed
+    hook, _buffer, _tr = _make_hook(classifier=classifier)
+    _stamp_window(hook, last_accepted_t=0.0)
+    with caplog.at_level(logging.INFO, logger="reachy.motion.listen_transcribe"):
+        assert hook._decide("the weather looks nice today", 1.0) is False
+    assert any("not-addressed" in rec.getMessage() for rec in caplog.records), caplog.text
+
+
+def test_decision_label_dropped_cold(caplog) -> None:
+    """A drop for want of an open conversation names ITSELF (#105)."""
+    classifier = _RecordingClassifier(verdict=True)
     hook, _buffer, _tr = _make_hook(classifier=classifier)
     with caplog.at_level(logging.INFO, logger="reachy.motion.listen_transcribe"):
         assert hook._decide("the weather looks nice today", 0.0) is False
-    assert any("dropped" in rec.getMessage() for rec in caplog.records), caplog.text
+    assert any("not-addressed-cold" in rec.getMessage() for rec in caplog.records), caplog.text
+    assert classifier.calls == []
+
+
+def test_decision_label_dropped_short(caplog) -> None:
+    """A drop for being too short to carry addressing signal names itself (#105)."""
+    classifier = _RecordingClassifier(verdict=True)
+    hook, _buffer, _tr = _make_hook(classifier=classifier)
+    _stamp_window(hook, last_accepted_t=0.0)
+    with caplog.at_level(logging.INFO, logger="reachy.motion.listen_transcribe"):
+        assert hook._decide("Okay.", 1.0) is False
+    assert any("not-addressed-short" in rec.getMessage() for rec in caplog.records), caplog.text
+    assert classifier.calls == []
 
 
 def test_decision_label_degrade(caplog) -> None:
@@ -415,22 +461,44 @@ def test_history_passed_as_context_and_grows_on_engage() -> None:
     classifier = _RecordingClassifier(verdict=True)  # everything engages
     hook, _buffer, _tr = _make_hook(classifier=classifier)
 
-    # First non-name utterance: empty context, then it is appended to history.
-    assert hook._decide("tell me more about that", 0.0) is True
-    assert classifier.calls[0][1] == (), "first decision sees empty context"
+    # A name opens the conversation (fast path, no classifier call).
+    assert hook._decide("reachy are you there", 0.0) is True
+    assert classifier.calls == []
 
-    # Second: the first accepted utterance is now in the context.
-    assert hook._decide("how does that make you feel", 1.0) is True
-    assert classifier.calls[1][1] == ("tell me more about that",)
+    # First follow-up: sees only the opening turn.
+    assert hook._decide("tell me more about that", 1.0) is True
+    assert classifier.calls[0][1] == ("reachy are you there",)
+
+    # Second: the first accepted follow-up is now in the context too.
+    assert hook._decide("how does that make you feel", 2.0) is True
+    assert classifier.calls[1][1] == ("reachy are you there", "tell me more about that")
 
 
 def test_history_not_grown_on_drop() -> None:
     """A DROP decision must NOT append to the conversation history."""
     classifier = _RecordingClassifier(verdict=False)
     hook, _buffer, _tr = _make_hook(classifier=classifier)
-    assert hook._decide("the weather looks nice today", 0.0) is False
-    assert hook._decide("did you see the game last night", 1.0) is False
-    assert classifier.calls[1][1] == (), "a dropped utterance must not enter history"
+    assert hook._decide("reachy are you there", 0.0) is True  # opens the conversation
+    assert hook._decide("the weather looks nice today", 1.0) is False
+    assert hook._decide("did you see the game last night", 2.0) is False
+    assert classifier.calls[1][1] == (
+        "reachy are you there",
+    ), "a dropped utterance must not enter history"
+
+
+def test_a_false_accept_does_not_hold_the_hook_gate_open() -> None:
+    """THE #105 REGRESSION on the listen --live hook — same shape as the runtime's.
+
+    The gate is shared, so the fix must land on both consumers. One accepted
+    turn, then the short backchannels measured engaging live: none may ride the
+    open conversation, and the credulous classifier is never even asked.
+    """
+    classifier = _RecordingClassifier(verdict=True)
+    hook, _buffer, _tr = _make_hook(classifier=classifier)
+    assert hook._decide("reachy are you there", 0.0) is True
+    for offset, text in enumerate(["No.", "Okay.", "Right.", "Yeah.", "Hold up."], start=1):
+        assert hook._decide(text, float(offset)) is False, f"{text!r} rode the conversation"
+    assert classifier.calls == []
 
 
 # ---------------------------------------------------------------------------

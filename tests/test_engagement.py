@@ -25,6 +25,7 @@ from collections.abc import Sequence
 import pytest
 
 from reachy.speech.engagement import (
+    ConversationGate,
     Decision,
     EngagementClassifier,
     decide_engagement,
@@ -391,3 +392,180 @@ def test_real_classifier_drops_ambient_engages_addressed() -> None:
         decide_engagement("did you see the game last night", ["reachy hi"], classifier=dropping)
         is Decision.DROP
     )
+
+
+# ===========================================================================
+# ConversationGate — the stateful gate (issue #105: the one-way ratchet)
+# ===========================================================================
+#
+# `decide_engagement` above is STATELESS: it judges one utterance against a
+# context somebody else maintains.  Maintaining that context by appending only
+# ACCEPTED utterances made it a ratchet — a single false accept planted a
+# six-turn "we are mid-conversation" context that made the next accept more
+# likely, and each accept re-seeded it.  Measured live over 45 minutes with the
+# robot's name never spoken: 199 correct drops, 39 false accepts (3 name via the
+# #104 collision, 36 context), i.e. every single accept in the session was wrong.
+#
+# `ConversationGate` owns that state and can LOSE confidence.  These tests pin
+# the three rules that make the leak un-amplifiable.
+
+_SHORT_BACKCHANNELS = ["No.", "Okay.", "Right.", "Yeah.", "Hold up."]
+
+
+def _gate(classifier, **kw) -> ConversationGate:
+    """A gate with the shipped defaults unless a test overrides one."""
+    return ConversationGate(classifier=classifier, **kw)
+
+
+def test_a_false_accept_does_not_hold_the_gate_open() -> None:
+    """THE #105 REGRESSION: the exact live trace must not reproduce.
+
+    One accepted utterance opens the conversation, then the five short
+    backchannels observed engaging on the deployed box arrive.  Under the old
+    ratchet every one of them reached a (credulous) classifier and engaged.
+    Here the classifier is maximally credulous — it says YES to everything — so
+    the ONLY thing that can stop them is the gate's own structure.
+    """
+    classifier = _RecordingClassifier(verdict=True)
+    gate = _gate(classifier)
+
+    opened = gate.decide("reachy are you there", now=0.0)
+    assert opened.decision is Decision.ENGAGE
+    assert opened.label == "name"
+    assert classifier.calls == [], "the name fast-path must make zero classifier calls"
+
+    for offset, text in enumerate(_SHORT_BACKCHANNELS, start=1):
+        verdict = gate.decide(text, now=float(offset))
+        assert verdict.decision is Decision.DROP, f"{text!r} engaged on context alone"
+        assert verdict.label == "not-addressed-short"
+
+    assert classifier.calls == [], "a short backchannel must not even reach the classifier"
+
+
+def test_the_gate_closes_once_the_conversation_goes_quiet() -> None:
+    """A conversation that has gone quiet stops admitting context-only turns.
+
+    The warm window is what makes the leak un-amplifiable: past it, a nameless
+    utterance is dropped WITHOUT a classifier call, so no verdict — however
+    credulous — can re-open the conversation.  Only a fresh name can.
+    """
+    classifier = _RecordingClassifier(verdict=True)
+    gate = _gate(classifier, warm_window_s=20.0)
+
+    assert gate.decide("reachy hello there", now=0.0).decision is Decision.ENGAGE
+
+    # Still warm: a coherent follow-up is judged (one call) and engages.
+    warm = gate.decide("what time is it now", now=10.0)
+    assert warm.decision is Decision.ENGAGE
+    assert warm.label == "context"
+    assert len(classifier.calls) == 1
+
+    # Past the window: dropped with no second opinion sought.
+    cold = gate.decide("did you see the game last night", now=10_000.0)
+    assert cold.decision is Decision.DROP
+    assert cold.label == "not-addressed-cold"
+    assert len(classifier.calls) == 1, "a cold conversation must not consult the classifier"
+
+
+def test_a_cold_gate_never_engages_on_context_alone() -> None:
+    """From cold, a nameless utterance can never bootstrap a conversation.
+
+    This is the structural answer to "the leak self-amplifies": context-only
+    engagement requires a conversation that a NAME opened.  With no name ever
+    spoken — the condition of the measured 45-minute session — the gate has
+    nothing to amplify.
+    """
+    classifier = _RecordingClassifier(verdict=True)
+    gate = _gate(classifier)
+    for offset, text in enumerate(
+        [
+            "did you see the game last night",
+            "i think we should order lunch soon",
+            "the weather looks nice today",
+        ]
+    ):
+        verdict = gate.decide(text, now=float(offset))
+        assert verdict.decision is Decision.DROP
+        assert verdict.label == "not-addressed-cold"
+    assert classifier.calls == []
+
+
+def test_a_name_always_engages_however_short_or_cold() -> None:
+    """The name fast-path outranks both new rules, and still costs zero calls."""
+    classifier = _RecordingClassifier(verdict=False)
+    gate = _gate(classifier)
+    verdict = gate.decide("reachy", now=1_000_000.0)
+    assert verdict.decision is Decision.ENGAGE
+    assert verdict.label == "name"
+    assert classifier.calls == []
+
+
+def test_history_decays_so_a_reopened_conversation_starts_clean() -> None:
+    """Turns older than the warm window are not "the recent conversation".
+
+    Without decay, a conversation reopened an hour later would hand the
+    classifier the previous one's turns as context — the same stale-evidence
+    defect at a longer timescale.
+    """
+    classifier = _RecordingClassifier(verdict=True)
+    gate = _gate(classifier, warm_window_s=20.0)
+
+    gate.decide("reachy remember this turn", now=0.0)
+    gate.decide("reachy hello again", now=10_000.0)  # reopens, much later
+    gate.decide("what do you think about that", now=10_001.0)
+
+    _text, context = classifier.calls[-1]
+    assert "reachy remember this turn" not in context, "a stale turn leaked into the context"
+    assert context == ("reachy hello again",)
+
+
+def test_history_is_bounded() -> None:
+    """The context handed to the classifier never grows past ``history_maxlen``."""
+    classifier = _RecordingClassifier(verdict=True)
+    gate = _gate(classifier, history_maxlen=3)
+    gate.decide("reachy start the conversation", now=0.0)
+    for offset in range(1, 8):
+        gate.decide(f"turn number {offset} here", now=float(offset))
+    _text, context = classifier.calls[-1]
+    assert len(context) <= 3
+
+
+def test_degrade_survives_the_new_rules() -> None:
+    """A raising classifier still yields DEGRADE — the hearing loop never stalls."""
+    classifier = _RaisingClassifier(socket.timeout("timed out"))
+    gate = _gate(classifier)
+    gate.decide("reachy are you awake", now=0.0)  # open the conversation
+    verdict = gate.decide("what do you think about that", now=1.0)
+    assert verdict.decision is Decision.DEGRADE
+    assert verdict.label == "degrade"
+    assert len(classifier.calls) == 1
+
+
+def test_note_engaged_lets_the_caller_report_a_heuristic_accept() -> None:
+    """The DEGRADE fallback's own accept must warm the conversation too.
+
+    The caller owns the heuristic (``decide_engagement`` runs none), so the
+    caller reports its outcome back to the gate; otherwise a run of degraded
+    turns would leave the gate permanently cold.
+    """
+    classifier = _RecordingClassifier(verdict=True)
+    gate = _gate(classifier)
+    assert gate.is_warm(0.0) is False
+    gate.note_engaged("a heuristic accept", now=0.0)
+    assert gate.is_warm(1.0) is True
+
+
+def test_short_utterances_are_gated_even_while_warm() -> None:
+    """The short-utterance rule is a NAMED rule, not a threshold side effect.
+
+    Every false context engagement measured live was one or two words.  A
+    backchannel carries almost no addressing signal, so it is never admitted on
+    context alone — only a name can engage in that few words.
+    """
+    classifier = _RecordingClassifier(verdict=True)
+    gate = _gate(classifier)
+    gate.decide("reachy hello there", now=0.0)
+    verdict = gate.decide("Okay.", now=0.5)  # firmly inside the warm window
+    assert verdict.decision is Decision.DROP
+    assert verdict.label == "not-addressed-short"
+    assert classifier.calls == []

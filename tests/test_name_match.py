@@ -155,6 +155,77 @@ def test_initial_guard_rejects_same_score_collisions(text: str) -> None:
     assert is_name_match(text) is False, f"'{text}' should be rejected by the initial guard"
 
 
+# ---------------------------------------------------------------------------
+# Real-world collisions — a GROWING list, one entry per defect actually observed
+# ---------------------------------------------------------------------------
+#
+# This is a RECURRING defect class, not a one-off (issue #104).  Each entry below
+# is a word that reached the name fast-path on a deployed robot, or a word from
+# the same structural family found while fixing one that did.  The name path
+# engages with ZERO classifier calls, so there is no second opinion to catch a
+# false positive here — every one of these is an unprompted chirp in a
+# conversation the robot was never part of.
+#
+# Add to this table whenever a new collision is observed live.  Each entry
+# records the score it achieved against the name it collided with, so the next
+# person can see exactly how close to the line it was.
+_COLLISION_TABLE: list[tuple[str, str, str]] = [
+    # (word, colliding name, why the pre-#104 guards let it through)
+    # --- observed live on the deployed box, 2026-07-21 (issue #104) ---
+    ("really", "reachy", "score 0.667: same length, shared 'rea' prefix, shared initial 'r'"),
+    ("reality", "reachy", "score 0.527: shared 'rea' prefix, shared initial 'r'"),
+    # --- same structural family, found by sweeping common words while fixing ---
+    ("ready", "reachy", "score 0.606"),
+    ("reader", "reachy", "score 0.500"),
+    ("reason", "reachy", "score 0.500"),
+    ("recent", "reachy", "score 0.500"),
+    ("record", "reachy", "score 0.500"),
+    ("rachel", "reachy", "score 0.667 — a human name, not the robot's"),
+    ("room", "robot", "score 0.533"),
+    ("robe", "robot", "score 0.533"),
+    ("route", "robot", "score 0.600"),
+    ("root", "robot", "score 0.711"),
+    ("robust", "robot", "score 0.606"),
+]
+
+
+@pytest.mark.parametrize(
+    "word,name,why", _COLLISION_TABLE, ids=[row[0] for row in _COLLISION_TABLE]
+)
+def test_real_world_collisions_are_rejected(word: str, name: str, why: str) -> None:
+    """Common English words must never take the zero-classifier name fast-path.
+
+    Every word here clears the combined similarity threshold against *name* and
+    survives the prefix / superstring / initial-letter guards — they are all
+    'r'-initial words that share letters with "reachy"/"robot".  What separates
+    them from a genuine STT mishearing is the CONSONANT SKELETON: "richie",
+    "reachie" and "richy" all keep "reachy"'s r-ch, while "really" (r-l),
+    "reason" (r-s-n) and "root" (r-t) do not.  That is what the phonetic guard
+    tests.
+    """
+    assert is_name_match(word) is False, f"{word!r} must not name-match {name!r} ({why})"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "That was really good.",
+        "in reality it never happened",
+        "are you ready to go",
+        "let me give a speech about this",
+        "i will be there in a room upstairs",
+        "we took the scenic route home",
+    ],
+)
+def test_real_world_collisions_in_sentences(text: str) -> None:
+    """The collisions above stay rejected inside natural sentences.
+
+    ``"That was really good."`` is the exact utterance that fired
+    ``greet-when-addressed`` on the deployed robot with nobody addressing it.
+    """
+    assert is_name_match(text) is False, f"{text!r} must not engage the name fast-path"
+
+
 def test_exact_match_always_passes_regardless_of_threshold() -> None:
     """An exact name match always returns True, even at threshold=1.0."""
     assert is_name_match("reachy", threshold=1.0) is True

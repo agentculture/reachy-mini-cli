@@ -493,27 +493,49 @@ The `listen` loop is implemented as a two-tier `ListenProducer`:
     1. **Fuzzy name fast-path** (`is_name_match` in `reachy/speech/name_match.py`) — checks
        every word in the utterance against the canonical names (`reachy`/`robot`) and a set
        of common STT mishearings (`richie`, `reachie`, `richy`). The matcher uses a combined
-       `difflib_ratio × length_ratio` score with three structural guards (prefix guard,
-       superstring guard, initial-letter guard) so the ubiquitous word "speech" never
-       false-triggers. An exact or close-enough match → ENGAGE immediately, **zero classifier
-       calls**.
-    2. **Single-shot LLM classifier** (`EngagementClassifier` in `reachy/speech/engagement.py`,
-       backed by the new non-streaming `reachy/speech/llm.py` `complete()`) — for a coherent
-       utterance with no name hit, judges "is this addressed to the robot, given the recent
-       conversation?" against up to the last 6 accepted turns. Verdict YES → ENGAGE;
-       NO → DROP. At most one `REACHY_OPENAI_*` endpoint call per utterance (same endpoint
-       as cognition, `DEFAULT_CLASSIFIER_TIMEOUT = 5 s`).
-    3. **DEGRADE fallback** — if the classifier raises (network error / timeout / unparseable
-       response), `decide_engagement` returns `Decision.DEGRADE` and `TranscribeHook._decide`
-       falls back to `_should_engage` (the original coherent-sentence-in-window heuristic).
-       The hearing loop never stalls; classifier failures are logged once.
-    4. Anything else is **DROP** — ambient human-to-human chatter never feeds cognition.
+       `difflib_ratio × length_ratio` score with four structural guards (prefix, superstring,
+       initial-letter, and **phonetic**). The phonetic guard (#104) requires the word to share
+       the name's Soundex consonant skeleton, because an STT mishearing is a *phonetic*
+       confusion and preserves it (`richie`/`reachie`/`richy` → R200) while an ordinary word
+       that merely shares letters does not (`really` R400, `reality` R430, `root` R300). The
+       three orthographic guards alone were pairwise-blind to this and let a large family of
+       everyday `r`-words through — `really`, `reality`, `ready`, `reason`, `record`, `room`,
+       `route`, `robust` — engaging the robot with **no classifier call to catch it**. An
+       exact or close-enough match → ENGAGE immediately, **zero classifier calls**, and it
+       OPENS the conversation. `tests/test_name_match.py` keeps a growing `_COLLISION_TABLE`
+       of real-world collisions; this defect class recurs, so add to it rather than re-deriving.
+    2. **Short-utterance rule** (#105) — a context-only engagement needs `min_words` (3) words.
+       A name match is exempt, so a bare "Reachy!" still engages. **Zero classifier calls.**
+    3. **Warm-window rule** (#105) — a nameless utterance is judged only while a conversation
+       is live (within `engage_window_s`, 20 s, of the last accepted turn); only a NAME can
+       open one from cold. **Zero classifier calls** when closed.
+    4. **Single-shot LLM classifier** (`EngagementClassifier` in `reachy/speech/engagement.py`,
+       backed by the non-streaming `reachy/speech/llm.py` `complete()`) — judges "is this
+       addressed to the robot, given the recent conversation?" against up to the last 6
+       accepted turns, each expiring after the warm window. Verdict YES → ENGAGE; NO → DROP.
+       At most one `REACHY_OPENAI_*` endpoint call per utterance (same endpoint as cognition,
+       `DEFAULT_CLASSIFIER_TIMEOUT = 5 s`).
+    5. **DEGRADE fallback** — if the classifier raises (network error / timeout / unparseable
+       response), the gate returns `Decision.DEGRADE` and each driver's `_decide` falls back
+       to `_should_engage` (the original coherent-sentence-in-window heuristic), reporting an
+       accept back via `note_engaged` so degraded turns keep the conversation warm. The
+       hearing loop never stalls; classifier failures are logged once.
+    6. Anything else is **DROP** — ambient human-to-human chatter never feeds cognition.
+    - **The state lives in `ConversationGate`** (`reachy/speech/engagement.py`), shared by BOTH
+      consumers (`behavior/transcript_sense.py` and `listen --live`'s `TranscribeHook`) — never
+      reimplemented per driver. It replaced an accept-only history that was a **one-way ratchet**:
+      only ENGAGEs entered the classifier's "recent conversation", so a single false accept
+      planted a six-turn mid-conversation context and each accept re-seeded it. Measured live
+      over 45 min with the name never spoken: 199 correct drops, 39 accepts, *all wrong*. Rules
+      2/3 are deliberately **structural** (control flow, provable by a test) rather than advisory
+      (feeding DROPs into the prompt), since the model had already said YES 36/36 times.
+    - **Every outcome is NAMED** and the label is used verbatim as the `senselog.drop` reason:
+      `name` / `context` on an engage, `not-addressed` / `not-addressed-short` /
+      `not-addressed-cold` on a drop. The shared `not-addressed` prefix keeps the old grep working.
     - **Escape hatch:** `REACHY_ENGAGE_HEURISTIC=1` (or `true`/`yes`/`on`) forces the pure
-      heuristic gate (`_should_engage`) throughout the process lifetime — no classifier is
-      even built. Useful for debugging or when the LLM endpoint is unavailable at boot.
-    - **History context:** on an ENGAGE decision the utterance is appended to a rolling deque
-      (`_HISTORY_MAXLEN = 6`) handed to subsequent classifier calls, so ongoing conversation
-      context flows forward without accumulating unboundedly.
+      heuristic gate (`_should_engage`) throughout the process lifetime — no gate and no
+      classifier is even built. Useful for debugging or when the LLM endpoint is unavailable at
+      boot. Omitting the `classifier` argument gives the same guarantee.
   - **3-tier motion ladder** (`reachy/motion/listen.py` `ListenProducer`), replacing the
     blanket `turn_enabled=False` suppression that previously muted all head motion under
     `--transcribe`. Reaction is graded by perception level:
