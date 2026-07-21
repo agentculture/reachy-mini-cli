@@ -24,7 +24,7 @@ import pytest
 from reachy.cli import main
 from reachy.cli._commands import service as service_cmd
 from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR
-from reachy.service.units import DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RETIRED_UNITS
+from reachy.service.units import DAEMON_UNIT, DEMO_UNIT, RETIRED_UNITS, RUNTIME_UNIT
 
 # --------------------------------------------------------------------------- #
 # Fake systemctl runner — records arg vectors, serves canned query state.
@@ -131,11 +131,11 @@ def test_enable_demo_dispatches_through_manager(fake, capsys, tmp_path):
     rc = main(["service", "enable", "demo"])
     out, err = capsys.readouterr()
     assert rc == 0
-    # The chosen presence + daemon are enabled; the sibling (live) is disabled.
+    # The chosen presence + daemon are enabled; the sibling (runtime) is disabled.
     enabled = [c for c in fake.verbs_for("enable")]
     assert ["--user", "enable", "--now", DAEMON_UNIT] in enabled
     assert ["--user", "enable", "--now", DEMO_UNIT] in enabled
-    assert ["--user", "disable", "--now", LIVE_UNIT] in fake.calls
+    assert ["--user", "disable", "--now", RUNTIME_UNIT] in fake.calls
     # Result on stdout, nothing on stderr.
     assert "demo" in out
     assert err == ""
@@ -144,13 +144,13 @@ def test_enable_demo_dispatches_through_manager(fake, capsys, tmp_path):
     assert (_unit_dir(tmp_path) / DEMO_UNIT).is_file()
 
 
-def test_enable_live_dispatches_through_manager(fake, capsys):
-    rc = main(["service", "enable", "live"])
+def test_enable_runtime_dispatches_through_manager(fake, capsys):
+    rc = main(["service", "enable", "runtime"])
     out, err = capsys.readouterr()
     assert rc == 0
-    assert ["--user", "enable", "--now", LIVE_UNIT] in fake.calls
+    assert ["--user", "enable", "--now", RUNTIME_UNIT] in fake.calls
     assert ["--user", "disable", "--now", DEMO_UNIT] in fake.calls
-    assert "live" in out
+    assert "runtime" in out
     assert err == ""
 
 
@@ -162,7 +162,7 @@ def test_enable_json(fake, capsys):
     assert payload["status"] == "enabled"
     assert payload["mode"] == "demo"
     assert payload["presence_unit"] == DEMO_UNIT
-    assert payload["disabled_sibling"] == LIVE_UNIT
+    assert payload["disabled_sibling"] == RUNTIME_UNIT
     assert err == ""
 
 
@@ -197,7 +197,7 @@ def test_enable_invalid_mode_json_is_structured(fake, capsys):
 
 def test_disable_dispatches_through_manager(fake, capsys):
     fake.set_enabled(DEMO_UNIT, "enabled")
-    fake.set_enabled(LIVE_UNIT, "disabled")
+    fake.set_enabled(RUNTIME_UNIT, "disabled")
     rc = main(["service", "disable"])
     out, err = capsys.readouterr()
     assert rc == 0
@@ -208,7 +208,7 @@ def test_disable_dispatches_through_manager(fake, capsys):
 
 def test_disable_json(fake, capsys):
     fake.set_enabled(DEMO_UNIT, "disabled")
-    fake.set_enabled(LIVE_UNIT, "disabled")
+    fake.set_enabled(RUNTIME_UNIT, "disabled")
     rc = main(["service", "disable", "--json"])
     out, err = capsys.readouterr()
     assert rc == 0
@@ -228,16 +228,16 @@ def test_disable_json(fake, capsys):
 def test_status_reports_enabled_mode(fake, capsys):
     fake.set_enabled(DAEMON_UNIT, "enabled")
     fake.set_active(DAEMON_UNIT, "active")
-    fake.set_enabled(LIVE_UNIT, "enabled")
-    fake.set_active(LIVE_UNIT, "active")
+    fake.set_enabled(RUNTIME_UNIT, "enabled")
+    fake.set_active(RUNTIME_UNIT, "active")
     fake.set_enabled(DEMO_UNIT, "disabled")
     fake.set_active(DEMO_UNIT, "inactive")
     rc = main(["service", "status", "--json"])
     out, err = capsys.readouterr()
     assert rc == 0
     payload = json.loads(out)
-    assert payload["mode"] == "live"
-    assert payload["presence_unit"] == LIVE_UNIT
+    assert payload["mode"] == "runtime"
+    assert payload["presence_unit"] == RUNTIME_UNIT
     assert payload["daemon_healthy"] is True
     assert payload["units"][DAEMON_UNIT]["enabled"] == "enabled"
     assert err == ""
@@ -245,7 +245,7 @@ def test_status_reports_enabled_mode(fake, capsys):
 
 def test_status_text(fake, capsys):
     fake.set_enabled(DEMO_UNIT, "disabled")
-    fake.set_enabled(LIVE_UNIT, "disabled")
+    fake.set_enabled(RUNTIME_UNIT, "disabled")
     rc = main(["service", "status"])
     out, err = capsys.readouterr()
     assert rc == 0
@@ -263,7 +263,7 @@ def test_install_writes_units_and_reloads_without_enabling(fake, capsys, tmp_pat
     out, err = capsys.readouterr()
     assert rc == 0
     # Both presence units + the daemon unit are written.
-    for unit in (DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT):
+    for unit in (DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT):
         assert (_unit_dir(tmp_path) / unit).is_file()
     # daemon-reload happened, and NOTHING was enabled.
     assert ["--user", "daemon-reload"] in fake.calls
@@ -273,7 +273,7 @@ def test_install_writes_units_and_reloads_without_enabling(fake, capsys, tmp_pat
     # the CURRENT catalog is ever disabled by install.
     disabled = [c[-1] for c in fake.verbs_for("disable")]
     assert set(disabled) <= set(RETIRED_UNITS)
-    assert not {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT} & set(disabled)
+    assert not {DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT} & set(disabled)
     assert err == ""
     assert out != ""
 
@@ -295,7 +295,7 @@ def test_uninstall_removes_units_and_reloads(fake, capsys, tmp_path):
     rc = main(["service", "uninstall"])
     out, err = capsys.readouterr()
     assert rc == 0
-    for unit in (DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT):
+    for unit in (DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT):
         assert not (_unit_dir(tmp_path) / unit).is_file()
     assert ["--user", "daemon-reload"] in fake.calls
     assert err == ""

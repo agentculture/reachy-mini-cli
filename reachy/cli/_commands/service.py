@@ -1,12 +1,11 @@
 """``reachy-mini-cli service`` — boot-persistent presence in exactly one mode.
 
 This is the single CLI surface that makes the robot survive a reboot in *one*
-presence mode — the idle ``demo-mode`` loop, the folded live sense loop
-(``listen run --live``, retiring), or the AI-agnostic symbolic runtime (``behavior engine
-run``, the boot default per decision c19) — never more than one at a time. It is
-the operator-facing front for the already-built
+presence mode — the idle ``demo-mode`` loop or the AI-agnostic symbolic runtime
+(``behavior engine run``, the boot default per decision c19) — never both at
+once. It is the operator-facing front for the already-built
 :class:`reachy.service.manager.ServiceManager`, which enforces the
-single-presence-owner invariant (enable one mode → both siblings are disabled).
+single-presence-owner invariant (enable one mode → every sibling is disabled).
 
 Like ``daemon``, ``service`` does **not** talk to the robot through a transport —
 it talks to **systemd** (``systemctl --user``). So it never calls
@@ -14,20 +13,26 @@ it talks to **systemd** (``systemctl --user``). So it never calls
 
 Verbs:
 
-* ``enable {demo|live|runtime}`` — write the daemon + chosen presence unit,
-  enable them, and disable both siblings (mutual exclusion). Delegates to
+* ``enable {demo|runtime}`` — write the daemon + chosen presence unit,
+  enable them, and disable the sibling (mutual exclusion). Delegates to
   ``ServiceManager``.
 * ``disable`` — disable whichever presence unit is enabled; the daemon is left
   enabled deliberately. Delegates to ``ServiceManager``.
 * ``status`` — which presence mode is enabled (or none) + daemon health.
   Delegates to ``ServiceManager``.
-* ``install`` — write all four unit files + ``daemon-reload`` WITHOUT enabling
+* ``install`` — write all three unit files + ``daemon-reload`` WITHOUT enabling
   anything (so a separate ``enable`` chooses the mode).
 * ``uninstall`` — remove the unit files + ``daemon-reload``.
 
 Every verb supports ``--json`` with the strict results→stdout /
 errors+diagnostics→stderr split. A missing ``systemctl`` on PATH raises a clean
 exit-2 :class:`CliError`; an invalid mode is rejected as an exit-1 user error.
+
+There is no ``live`` mode: ``reachy-live.service`` ran ``listen run --live``, a
+command ``t21``/``t22`` deleted, so the unit it wrote crash-looped every
+``RestartSec=5``. ``t23`` retired the name into
+:data:`reachy.service.units.RETIRED_UNITS`, and every verb below purges it from
+a deployed box on the way past.
 """
 
 from __future__ import annotations
@@ -44,30 +49,25 @@ from reachy.service.manager import ServiceManager, _default_unit_dir
 from reachy.service.units import (
     DAEMON_UNIT,
     DEMO_UNIT,
-    LIVE_UNIT,
     RUNTIME_UNIT,
     daemon_unit_text,
     demo_unit_text,
-    live_unit_text,
     runtime_unit_text,
 )
 
 _JSON_HELP = "Emit structured JSON."
 
-# The four units this noun manages, with their pure text renderers (t1/t10).
+# The three units this noun manages, with their pure text renderers (t1/t10).
 # Used by install/uninstall to write/remove every unit file at once.
 _ALL_UNITS = (
     (DAEMON_UNIT, daemon_unit_text),
     (DEMO_UNIT, demo_unit_text),
-    (LIVE_UNIT, live_unit_text),
     (RUNTIME_UNIT, runtime_unit_text),
 )
 
 _VERBS = [
-    "service enable demo — boot-persist the idle demo-mode presence (disables live/runtime)",
-    "service enable live — boot-persist the folded live sense loop (disables demo/runtime)",
-    "service enable runtime — boot-persist the AI-agnostic symbolic runtime "
-    "(disables demo/live)",
+    "service enable demo — boot-persist the idle demo-mode presence (disables runtime)",
+    "service enable runtime — boot-persist the AI-agnostic symbolic runtime (disables demo)",
     "service disable — disable the enabled presence (daemon left enabled)",
     "service status — which presence mode is enabled (or none) + daemon health",
     "service install — write the unit files + daemon-reload, WITHOUT enabling",
@@ -128,9 +128,8 @@ def cmd_service_overview(args: argparse.Namespace) -> int:
             "title": "What",
             "items": [
                 "Makes the robot boot-persistent in EXACTLY ONE presence mode — the "
-                "idle demo-mode loop, the folded live sense loop, or the AI-agnostic "
-                "symbolic runtime — never more than one.",
-                "Backed by systemd --user units; enable one mode and BOTH siblings are "
+                "idle demo-mode loop or the AI-agnostic symbolic runtime — never both.",
+                "Backed by systemd --user units; enable one mode and EVERY sibling is "
                 "disabled (the single-presence-owner invariant).",
             ],
         },
@@ -140,9 +139,9 @@ def cmd_service_overview(args: argparse.Namespace) -> int:
             "items": [
                 f"daemon: {DAEMON_UNIT}",
                 f"demo presence: {DEMO_UNIT}",
-                f"live presence: {LIVE_UNIT}",
                 f"runtime presence: {RUNTIME_UNIT}",
                 f"unit dir: {_default_unit_dir()}",
+                "retired (purged by every verb): " + ", ".join(units_mod.RETIRED_UNITS),
             ],
         },
         {
@@ -151,8 +150,8 @@ def cmd_service_overview(args: argparse.Namespace) -> int:
                 "every command supports --json",
                 "results to stdout, errors/diagnostics to stderr (never mixed)",
                 "talks to systemd, not the robot — no --transport flag",
-                "install writes units without enabling; "
-                "enable {demo|live|runtime} chooses the mode",
+                "install writes units without enabling; enable {demo|runtime} chooses the mode",
+                "the retired 'live' mode is gone — its unit ran a removed command",
                 "exit codes: 0 ok, 1 user error, 2 environment (systemctl missing)",
             ],
         },
@@ -207,7 +206,7 @@ def _require(args: list[str], action: str) -> None:
 
 
 def cmd_service_install(args: argparse.Namespace) -> int:
-    """Write all four unit files + daemon-reload, WITHOUT enabling anything.
+    """Write all three unit files + daemon-reload, WITHOUT enabling anything.
 
     Also purges any since-retired unit first (see
     :meth:`ServiceManager.cleanup_retired_units`) — an upgrade rewrites nothing
@@ -237,7 +236,7 @@ def cmd_service_install(args: argparse.Namespace) -> int:
 
 
 def cmd_service_uninstall(args: argparse.Namespace) -> int:
-    """Remove all four unit files + daemon-reload (best-effort, idempotent).
+    """Remove all three unit files + daemon-reload (best-effort, idempotent).
 
     Retired unit names are purged too — "remove everything this CLI installed"
     must include what it installed under a name it no longer uses.
@@ -282,8 +281,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     enable = noun_sub.add_parser("enable", help="Boot-persist exactly one presence mode.")
     enable.add_argument(
         "mode",
-        choices=("demo", "live", "runtime"),
-        help="Which presence to boot-persist (both siblings are disabled).",
+        choices=("demo", "runtime"),
+        help="Which presence to boot-persist (every sibling is disabled).",
     )
     enable.add_argument("--json", action="store_true", help=_JSON_HELP)
     enable.set_defaults(func=cmd_service_enable)

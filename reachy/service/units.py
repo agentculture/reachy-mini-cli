@@ -1,13 +1,13 @@
 """Pure systemd ``--user`` unit-file text generation for the presence stack.
 
-This module renders the unit text for the four units that make the robot a
+This module renders the unit text for the three units that make the robot a
 boot-surviving, self-healing presence: the local ``reachy-mini-daemon`` and
-three mutually-exclusive presence loops — idle ``demo-mode``, the folded-live
-``listen run --live``, and the AI-agnostic symbolic runtime
-(``behavior engine run``). It is **pure**: every function returns a ``str`` and
-has no side effects — no ``systemctl``, no file writes, no process launches. The
-installer half (writing + enabling these) lives in sibling modules; this one only
-*describes* the units so the text is trivially testable field-by-field.
+two mutually-exclusive presence loops — idle ``demo-mode`` and the AI-agnostic
+symbolic runtime (``behavior engine run``). It is **pure**: every function
+returns a ``str`` and has no side effects — no ``systemctl``, no file writes, no
+process launches. The installer half (writing + enabling these) lives in sibling
+modules; this one only *describes* the units so the text is trivially testable
+field-by-field.
 
 The shape mirrors the hand-authored units this stack replaces (and the existing
 :mod:`reachy.demo_service` unit grammar): ``Type=simple``, ``Restart=on-failure``,
@@ -16,9 +16,18 @@ and an ``ExecStart`` that re-invokes the running interpreter against the
 ``-m reachy …`` module entry (PATH-independent).
 
 Canonical unit names are exported as module constants
-(:data:`DAEMON_UNIT` / :data:`DEMO_UNIT` / :data:`LIVE_UNIT` / :data:`RUNTIME_UNIT`)
-— a cross-task contract: anything that installs / enables / orders these units
-imports the names from here rather than re-spelling the strings.
+(:data:`DAEMON_UNIT` / :data:`DEMO_UNIT` / :data:`RUNTIME_UNIT`) — a cross-task
+contract: anything that installs / enables / orders these units imports the
+names from here rather than re-spelling the strings.
+
+There is deliberately **no ``LIVE_UNIT``**. ``reachy-live.service`` ran the
+folded ``listen run --live`` loop; task ``t21`` deleted the ``--live`` flag and
+``t22`` deleted the ``listen`` noun, so that ``ExecStart`` no longer parses — a
+unit carrying it is an argparse error every ``RestartSec=5``, not a quiet no-op.
+``t23`` therefore moved the name out of the catalog and into
+:data:`RETIRED_UNITS`, whose migration purges it from a deployed box. It is
+named there as a plain string on purpose: a retired unit must not have a
+constant that some future catalog tuple can import back in.
 
 The runtime unit (:data:`RUNTIME_UNIT`) is the boot default per decision c19
 (issue #70): the deterministic ``behavior engine run`` loop owns presence with
@@ -42,7 +51,6 @@ DAEMON_BINARY = "reachy-mini-daemon"
 # --------------------------------------------------------------------------- #
 DAEMON_UNIT = "reachy-daemon.service"
 DEMO_UNIT = "reachy-demo-mode.service"
-LIVE_UNIT = "reachy-live.service"
 RUNTIME_UNIT = "reachy-runtime.service"
 
 # --------------------------------------------------------------------------- #
@@ -66,10 +74,26 @@ RUNTIME_UNIT = "reachy-runtime.service"
 # operator on the next ``service`` command.
 #
 # ``reachy-listen.service`` is the hand-authored unit the CLI-generated
-# :data:`LIVE_UNIT` superseded; an orphaned copy still sits enabled in
+# ``reachy-live.service`` superseded; an orphaned copy still sits enabled in
 # ``~/.config/systemd/user`` on the deployed box, in no catalog and removed by
 # nothing. It is the reason this list exists.
-RETIRED_UNITS: tuple[str, ...] = ("reachy-listen.service",)
+#
+# ``reachy-live.service`` joined it in ``t23``. It is not merely dead weight:
+# its ``ExecStart`` was ``… -m reachy listen run --live --transcribe --cognition
+# agent --voice-engine harmonic``, and ``t21``/``t22`` removed the ``--live``
+# flag and the ``listen`` noun outright. A box that upgrades with that unit
+# enabled runs an argparse error, exits 1, and — ``Restart=on-failure`` +
+# ``RestartSec=5`` — does it again five seconds later, forever. Retiring the
+# name is what disables it, unlinks it, and drops its ``.d/`` overrides on the
+# next ordinary ``service`` verb.
+#
+# NOTE for the operator: that cleanup is DESTRUCTIVE and irreversible. The
+# deployed box's ``reachy-live.service.d/`` holds six hand-authored drop-ins
+# (a hardcoded-IP ``panel.conf``, a ``tts.conf`` routing around an EXPOSE-only
+# container) that are not reproducible from this repo. Back them up BEFORE
+# running any ``service`` verb — ``docs/verification/2026-07-20-t19-soak-exit-
+# criteria.md`` §3.1 is that backup step, and §3.3 restores from it.
+RETIRED_UNITS: tuple[str, ...] = ("reachy-listen.service", "reachy-live.service")
 
 # --------------------------------------------------------------------------- #
 # Runtime unit's explicit TTS route (task t7 / issue #70 arc, decision c27).  #
@@ -77,7 +101,8 @@ RETIRED_UNITS: tuple[str, ...] = ("reachy-listen.service",)
 #
 # The deployed box's ONLY ``REACHY_TTS_ROUTE`` configuration lives in
 # ``reachy-live.service.d/tts.conf`` -- a hand-authored drop-in belonging to
-# :data:`LIVE_UNIT`, a unit this arc deletes. That drop-in's own comment
+# ``reachy-live.service``, the unit ``t23`` retired (see :data:`RETIRED_UNITS`;
+# the migration removes that drop-in directory). That drop-in's own comment
 # documents WHY it exists: the default route ("chatterbox") POSTs to
 # ``REACHY_TTS_URL`` (default ``http://localhost:9000``), but model-gear's
 # chatterbox container is EXPOSE-only, never published to the host -- so the
@@ -151,31 +176,6 @@ def demo_exec_start(python: str | None = None, config_file: str | None = None) -
     py = python or _default_python()
     cfg = config_file or ""
     return f"{_unit_arg(py)} -m reachy demo-mode run --config {_unit_arg(cfg)}"
-
-
-def live_exec_start(python: str | None = None) -> str:
-    """ExecStart for the live presence unit: the folded live loop, agent-cognition by default.
-
-    ``listen run --live --transcribe --cognition agent --voice-engine harmonic`` runs
-    the folded live loop (hearing + pat + cognition + vision + sleep in one loop) with STT
-    transcription on and cognition driven by the tool-use ``AgentTurnEngine`` (acting
-    through ``speak`` / ``harmonics`` / ``apply_pose`` tool calls rather than the
-    ``*emoji*``/``"speech"`` marker convention). ``--voice-engine harmonic`` is passed
-    too — inert for ``agent`` mode itself (both the ``tts`` and ``harmonic`` voices are
-    always registered as tools there), but it is what the ``marker`` engine would use if
-    the unit's ``ExecStart`` were ever edited back to ``--cognition marker``. All three
-    — ``--transcribe``, ``--cognition agent``, and ``--voice-engine harmonic`` — stay
-    off/at their CLI default (``--cognition`` defaults to ``"marker"``,
-    ``--voice-engine`` to ``"tts"``) unless explicitly passed; the unit opts in to all
-    three so the on-robot presence hears words, reasons through the tool-use agent, and
-    has an offline voice available, out of the box. The flags are implemented
-    elsewhere — this only renders the string.
-    """
-    py = python or _default_python()
-    return (
-        f"{_unit_arg(py)} -m reachy listen run --live --transcribe "
-        "--cognition agent --voice-engine harmonic"
-    )
 
 
 def runtime_exec_start(python: str | None = None) -> str:
@@ -259,16 +259,6 @@ def demo_unit_text(python: str | None = None, config_file: str | None = None) ->
     )
 
 
-def live_unit_text(python: str | None = None) -> str:
-    """Render ``reachy-live.service`` — folded live presence loop (listen --live)."""
-    return _render(
-        description="Reachy Mini live presence (hearing + pat, folded live loop)",
-        exec_start=live_exec_start(python),
-        requires=DAEMON_UNIT,
-        after_daemon=True,
-    )
-
-
 def runtime_unit_text(python: str | None = None, tts_route: str | None = None) -> str:
     """Render ``reachy-runtime.service`` — the AI-agnostic symbolic runtime presence.
 
@@ -279,8 +269,9 @@ def runtime_unit_text(python: str | None = None, tts_route: str | None = None) -
     Sets ``REACHY_TTS_ROUTE`` EXPLICITLY (*tts_route*, defaulting to
     :data:`DEFAULT_RUNTIME_TTS_ROUTE`) as an ``Environment=`` directive baked
     into this unit's own text, rather than depending on
-    ``reachy-live.service.d/tts.conf`` — a drop-in that belongs to
-    :data:`LIVE_UNIT`, a unit this arc retires (task t7, decision c27). See the
+    ``reachy-live.service.d/tts.conf`` — a drop-in that belonged to
+    ``reachy-live.service``, the unit this arc retired (task t7, decision c27;
+    retired in t23, see :data:`RETIRED_UNITS`). See the
     module-level comment above :data:`RUNTIME_TTS_ROUTE_ENV` for why the
     default route would otherwise be silently connection-refused on the
     deployed box. This is a TTS route, not an LLM endpoint — it stays inert

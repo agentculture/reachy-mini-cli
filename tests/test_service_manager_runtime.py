@@ -1,11 +1,16 @@
-"""Tests for the three-way single-presence-owner invariant (t10, decisions c19/c20).
+"""Tests for the single-presence-owner invariant (t10, decisions c19/c20).
 
-Extends the ``ServiceManager`` coverage in ``tests/test_service_manager.py`` (not
-edited — this file mirrors its ``FakeSystemctl`` recorder style) to the new
-``runtime`` mode: after ANY sequence of ``enable(mode)`` calls across
-``{demo, live, runtime}``, exactly the chosen unit is enabled and BOTH siblings
-are disabled --now'd. Every side effect goes through the injected ``run`` /
-``unit_dir`` / ``daemon_health`` seams — no real systemctl, no real unit dir.
+Extends the ``ServiceManager`` coverage in ``tests/test_service_manager.py``
+(this file mirrors its ``FakeSystemctl`` recorder style) to the ``runtime``
+mode: after ANY sequence of ``enable(mode)`` calls across the presence catalog,
+exactly the chosen unit is enabled and EVERY sibling is disabled --now'd. Every
+side effect goes through the injected ``run`` / ``unit_dir`` / ``daemon_health``
+seams — no real systemctl, no real unit dir.
+
+Written against a three-mode catalog (``demo`` / ``live`` / ``runtime``); ``t23``
+retired ``live``, so the exclusion matrix below is now two-way. The ``live``
+retirement itself — refusal, migration, and the invariant re-proven on the new
+catalog — is covered in ``tests/test_service_live_retirement.py``.
 """
 
 from __future__ import annotations
@@ -20,17 +25,15 @@ from reachy.service.manager import ServiceManager
 from reachy.service.units import (
     DAEMON_UNIT,
     DEMO_UNIT,
-    LIVE_UNIT,
     RETIRED_UNITS,
     RUNTIME_UNIT,
     daemon_unit_text,
     demo_unit_text,
-    live_unit_text,
     runtime_unit_text,
 )
 
-PRESENCE_UNITS = (DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT)
-MODE_UNIT = {"demo": DEMO_UNIT, "live": LIVE_UNIT, "runtime": RUNTIME_UNIT}
+PRESENCE_UNITS = (DEMO_UNIT, RUNTIME_UNIT)
+MODE_UNIT = {"demo": DEMO_UNIT, "runtime": RUNTIME_UNIT}
 
 
 # --------------------------------------------------------------------------- #
@@ -101,19 +104,18 @@ def test_enable_runtime_writes_daemon_and_runtime_units(make_manager, unit_dir):
     assert runtime_path.read_text(encoding="utf-8") == runtime_unit_text()
 
 
-def test_enable_runtime_writes_all_four_unit_files(make_manager, unit_dir):
+def test_enable_runtime_writes_every_unit_file(make_manager, unit_dir):
     """A fresh enable("runtime") writes every sibling too (safe disable target)."""
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
     mgr.enable("runtime")
 
-    for unit in (DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT):
+    for unit in (DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT):
         assert (unit_dir / unit).is_file(), f"{unit} not written"
     assert (unit_dir / DEMO_UNIT).read_text(encoding="utf-8") == demo_unit_text()
-    assert (unit_dir / LIVE_UNIT).read_text(encoding="utf-8") == live_unit_text()
 
 
-def test_enable_runtime_enables_daemon_plus_runtime_disables_both_siblings(make_manager):
+def test_enable_runtime_enables_daemon_plus_runtime_disables_every_sibling(make_manager):
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
     mgr.enable("runtime")
@@ -122,30 +124,17 @@ def test_enable_runtime_enables_daemon_plus_runtime_disables_both_siblings(make_
     assert DAEMON_UNIT in fake.enabled_units()
     assert RUNTIME_UNIT in fake.enabled_units()
     assert DEMO_UNIT in fake.disabled_units()
-    assert LIVE_UNIT in fake.disabled_units()
     assert DEMO_UNIT not in fake.enabled_units()
-    assert LIVE_UNIT not in fake.enabled_units()
     assert ["--user", "enable", "--now", RUNTIME_UNIT] in fake.calls
     assert ["--user", "disable", "--now", DEMO_UNIT] in fake.calls
-    assert ["--user", "disable", "--now", LIVE_UNIT] in fake.calls
 
 
-def test_enable_demo_now_disables_both_live_and_runtime(make_manager):
-    """enable("demo") must disable BOTH other presences, not just live."""
+def test_enable_demo_now_disables_runtime(make_manager):
+    """enable("demo") must disable every OTHER presence, not just the first."""
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
     mgr.enable("demo")
 
-    assert ["--user", "disable", "--now", LIVE_UNIT] in fake.calls
-    assert ["--user", "disable", "--now", RUNTIME_UNIT] in fake.calls
-
-
-def test_enable_live_now_disables_both_demo_and_runtime(make_manager):
-    fake = FakeSystemctl()
-    mgr = make_manager(run=fake)
-    mgr.enable("live")
-
-    assert ["--user", "disable", "--now", DEMO_UNIT] in fake.calls
     assert ["--user", "disable", "--now", RUNTIME_UNIT] in fake.calls
 
 
@@ -156,8 +145,8 @@ def test_enable_result_reports_runtime_mode(make_manager):
     assert result["mode"] == "runtime"
     assert result["status"] == "enabled"
     assert result["presence_unit"] == RUNTIME_UNIT
-    # Both siblings are reported, not just one.
-    assert set(result["disabled_siblings"]) == {DEMO_UNIT, LIVE_UNIT}
+    # Every sibling is reported.
+    assert set(result["disabled_siblings"]) == {DEMO_UNIT}
 
 
 # --------------------------------------------------------------------------- #
@@ -166,12 +155,11 @@ def test_enable_result_reports_runtime_mode(make_manager):
 
 
 def test_invariant_holds_for_every_pairwise_transition(make_manager):
-    """For every (X, Y) in {demo, live, runtime}^2, enable(X) then enable(Y)
-    leaves exactly Y's unit enabled and BOTH siblings disable --now'd.
+    """For every ordered pair (X, Y) of presence modes, enable(X) then enable(Y)
+    leaves exactly Y's unit enabled and EVERY sibling disable --now'd.
 
-    This is the exclusion-matrix acceptance criterion: not just adjacent
-    demo<->live switches, but every ordered pair including runtime and the
-    X == Y (re-enable the same mode) case.
+    This is the exclusion-matrix acceptance criterion: every ordered pair,
+    including the X == Y (re-enable the same mode) case.
     """
     for mode_x, mode_y in itertools.product(MODE_UNIT, repeat=2):
         fake = FakeSystemctl()
@@ -197,12 +185,11 @@ def test_invariant_holds_for_every_pairwise_transition(make_manager):
             ), f"enable({mode_x!r}) then enable({mode_y!r}): {sibling} was (re-)enabled"
 
 
-def test_invariant_at_most_one_presence_enabled_after_any_sequence_of_three_modes(make_manager):
-    """After ANY sequence of enables across all three modes, at most one is enabled.
+def test_invariant_at_most_one_presence_enabled_after_any_sequence_of_modes(make_manager):
+    """After ANY sequence of enables across every mode, at most one is enabled.
 
-    Mirrors test_service_manager.py's two-way version, extended with runtime and
-    a tracking wrapper so we can read back the post-sequence enabled/disabled
-    state exactly as status() would.
+    Mirrors test_service_manager.py's version with a tracking wrapper so we can
+    read back the post-sequence enabled/disabled state exactly as status() would.
     """
     fake = FakeSystemctl()
     state: dict[str, bool] = {u: False for u in (DAEMON_UNIT, *PRESENCE_UNITS)}
@@ -218,7 +205,7 @@ def test_invariant_at_most_one_presence_enabled_after_any_sequence_of_three_mode
 
     mgr = make_manager(run=tracking_run)
 
-    sequence = ["demo", "live", "runtime", "runtime", "demo", "runtime", "live", "demo"]
+    sequence = ["demo", "runtime", "runtime", "demo", "runtime", "demo"]
     for mode in sequence:
         mgr.enable(mode)
         enabled_presence = [u for u in PRESENCE_UNITS if state[u]]
@@ -248,7 +235,6 @@ def test_status_reports_enabled_runtime_mode(make_manager):
     fake.query_results[("is-enabled", RUNTIME_UNIT)] = ("enabled", 0)
     fake.query_results[("is-active", RUNTIME_UNIT)] = ("active", 0)
     fake.query_results[("is-enabled", DEMO_UNIT)] = ("disabled", 1)
-    fake.query_results[("is-enabled", LIVE_UNIT)] = ("disabled", 1)
     fake.query_results[("is-enabled", DAEMON_UNIT)] = ("enabled", 0)
     mgr = make_manager(run=fake, daemon_health=lambda: True)
 
@@ -259,21 +245,19 @@ def test_status_reports_enabled_runtime_mode(make_manager):
     assert st["units"][RUNTIME_UNIT]["active"] == "active"
 
 
-def test_status_units_dict_has_all_four_keys(make_manager):
+def test_status_units_dict_has_every_catalogued_key(make_manager):
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
     st = mgr.status()
-    # The four catalogued units are always probed. status() ALSO probes every
+    # Every catalogued unit is always probed. status() ALSO probes every
     # RETIRED_UNITS name — a retired unit still enabled is a crash loop, and a
     # status that only iterated the current catalog would report mode=None for
     # exactly the box that most needs a true answer.
-    assert {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT} <= set(st["units"])
-    assert set(st["units"]) == {DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT} | set(
-        RETIRED_UNITS
-    )
+    assert {DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT} <= set(st["units"])
+    assert set(st["units"]) == {DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT} | set(RETIRED_UNITS)
 
 
-def test_status_reports_none_when_no_presence_enabled_among_three(make_manager):
+def test_status_reports_none_when_no_presence_enabled(make_manager):
     fake = FakeSystemctl()
     for unit in PRESENCE_UNITS:
         fake.query_results[("is-enabled", unit)] = ("disabled", 1)
@@ -292,7 +276,6 @@ def test_disable_stops_enabled_runtime_unit(make_manager):
     fake = FakeSystemctl()
     fake.query_results[("is-enabled", RUNTIME_UNIT)] = ("enabled", 0)
     fake.query_results[("is-enabled", DEMO_UNIT)] = ("disabled", 1)
-    fake.query_results[("is-enabled", LIVE_UNIT)] = ("disabled", 1)
     mgr = make_manager(run=fake)
     result = mgr.disable()
 

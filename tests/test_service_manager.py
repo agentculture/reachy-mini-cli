@@ -18,10 +18,10 @@ from reachy.service.manager import ServiceManager
 from reachy.service.units import (
     DAEMON_UNIT,
     DEMO_UNIT,
-    LIVE_UNIT,
+    RUNTIME_UNIT,
     daemon_unit_text,
     demo_unit_text,
-    live_unit_text,
+    runtime_unit_text,
 )
 
 # --------------------------------------------------------------------------- #
@@ -109,18 +109,18 @@ def make_manager(unit_dir):
 # --------------------------------------------------------------------------- #
 
 
-def test_enable_live_writes_daemon_and_live_units(make_manager, unit_dir):
+def test_enable_runtime_writes_daemon_and_runtime_units(make_manager, unit_dir):
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
-    mgr.enable("live")
+    mgr.enable("runtime")
 
     daemon_path = unit_dir / DAEMON_UNIT
-    live_path = unit_dir / LIVE_UNIT
+    runtime_path = unit_dir / RUNTIME_UNIT
     assert daemon_path.is_file()
-    assert live_path.is_file()
+    assert runtime_path.is_file()
     # Text comes from t1's renderers verbatim — no re-rendering in the manager.
     assert daemon_path.read_text(encoding="utf-8") == daemon_unit_text()
-    assert live_path.read_text(encoding="utf-8") == live_unit_text()
+    assert runtime_path.read_text(encoding="utf-8") == runtime_unit_text()
 
 
 def test_enable_demo_writes_daemon_and_demo_units(make_manager, unit_dir):
@@ -134,39 +134,39 @@ def test_enable_demo_writes_daemon_and_demo_units(make_manager, unit_dir):
     assert demo_path.read_text(encoding="utf-8") == demo_unit_text()
 
 
-def test_enable_live_enables_daemon_plus_live_disables_demo(make_manager):
+def test_enable_runtime_enables_daemon_plus_runtime_disables_demo(make_manager):
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
-    mgr.enable("live")
+    mgr.enable("runtime")
 
     # daemon-reload happens before enabling.
     assert ["--user", "daemon-reload"] in fake.calls
     # daemon AND the chosen presence get enabled --now.
     assert DAEMON_UNIT in fake.enabled_units()
-    assert LIVE_UNIT in fake.enabled_units()
+    assert RUNTIME_UNIT in fake.enabled_units()
     # the sibling presence is disabled --now.
     assert DEMO_UNIT in fake.disabled_units()
     # the sibling is NOT enabled.
     assert DEMO_UNIT not in fake.enabled_units()
 
 
-def test_enable_demo_enables_daemon_plus_demo_disables_live(make_manager):
+def test_enable_demo_enables_daemon_plus_demo_disables_runtime(make_manager):
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
     mgr.enable("demo")
 
     assert DAEMON_UNIT in fake.enabled_units()
     assert DEMO_UNIT in fake.enabled_units()
-    assert LIVE_UNIT in fake.disabled_units()
-    assert LIVE_UNIT not in fake.enabled_units()
+    assert RUNTIME_UNIT in fake.disabled_units()
+    assert RUNTIME_UNIT not in fake.enabled_units()
 
 
 def test_enable_uses_now_flag_for_presence(make_manager):
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
-    mgr.enable("live")
+    mgr.enable("runtime")
     # presence enable is enable --now (start it immediately).
-    assert ["--user", "enable", "--now", LIVE_UNIT] in fake.calls
+    assert ["--user", "enable", "--now", RUNTIME_UNIT] in fake.calls
     # daemon is enabled --now too.
     assert ["--user", "enable", "--now", DAEMON_UNIT] in fake.calls
     # sibling disable is disable --now.
@@ -183,8 +183,8 @@ def test_enable_rejects_unknown_mode(make_manager):
 def test_enable_result_reports_mode(make_manager):
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
-    result = mgr.enable("live")
-    assert result["mode"] == "live"
+    result = mgr.enable("runtime")
+    assert result["mode"] == "runtime"
     assert result["status"] == "enabled"
 
 
@@ -205,7 +205,7 @@ def test_invariant_at_most_one_presence_enabled_after_any_sequence(make_manager)
     # the post-sequence state exactly as ``status()`` would. (We wrap a plain
     # callable rather than reassigning ``__call__`` on the instance, because
     # Python resolves dunders on the type, not the instance.)
-    state: dict[str, bool] = {DEMO_UNIT: False, LIVE_UNIT: False, DAEMON_UNIT: False}
+    state: dict[str, bool] = {DEMO_UNIT: False, RUNTIME_UNIT: False, DAEMON_UNIT: False}
 
     def tracking_run(args):
         result = fake(args)
@@ -218,13 +218,13 @@ def test_invariant_at_most_one_presence_enabled_after_any_sequence(make_manager)
 
     mgr = make_manager(run=tracking_run)
 
-    for mode in ("demo", "live", "live", "demo", "live"):
+    for mode in ("demo", "runtime", "runtime", "demo", "runtime"):
         mgr.enable(mode)
-        enabled_presence = [u for u in (DEMO_UNIT, LIVE_UNIT) if state[u]]
+        enabled_presence = [u for u in (DEMO_UNIT, RUNTIME_UNIT) if state[u]]
         assert len(enabled_presence) <= 1, f"two presence units enabled: {enabled_presence}"
 
-    # End state: only the last mode (live) presence is enabled.
-    assert state[LIVE_UNIT] is True
+    # End state: only the last mode (runtime) presence is enabled.
+    assert state[RUNTIME_UNIT] is True
     assert state[DEMO_UNIT] is False
 
 
@@ -233,10 +233,10 @@ def test_invariant_at_most_one_presence_enabled_after_any_sequence(make_manager)
 # --------------------------------------------------------------------------- #
 
 
-def test_status_reports_enabled_live_mode(make_manager):
+def test_status_reports_enabled_runtime_mode(make_manager):
     fake = FakeSystemctl()
-    fake.set_enabled(LIVE_UNIT, "enabled")
-    fake.set_active(LIVE_UNIT, "active")
+    fake.set_enabled(RUNTIME_UNIT, "enabled")
+    fake.set_active(RUNTIME_UNIT, "active")
     fake.set_enabled(DEMO_UNIT, "disabled")
     fake.set_active(DEMO_UNIT, "inactive")
     fake.set_enabled(DAEMON_UNIT, "enabled")
@@ -244,14 +244,14 @@ def test_status_reports_enabled_live_mode(make_manager):
     mgr = make_manager(run=fake, daemon_health=lambda: True)
 
     st = mgr.status()
-    assert st["mode"] == "live"
+    assert st["mode"] == "runtime"
     assert st["daemon_healthy"] is True
 
 
 def test_status_reports_enabled_demo_mode(make_manager):
     fake = FakeSystemctl()
     fake.set_enabled(DEMO_UNIT, "enabled")
-    fake.set_enabled(LIVE_UNIT, "disabled")
+    fake.set_enabled(RUNTIME_UNIT, "disabled")
     mgr = make_manager(run=fake)
     st = mgr.status()
     assert st["mode"] == "demo"
@@ -260,7 +260,7 @@ def test_status_reports_enabled_demo_mode(make_manager):
 def test_status_reports_none_when_no_presence_enabled(make_manager):
     fake = FakeSystemctl()
     fake.set_enabled(DEMO_UNIT, "disabled")
-    fake.set_enabled(LIVE_UNIT, "disabled")
+    fake.set_enabled(RUNTIME_UNIT, "disabled")
     mgr = make_manager(run=fake)
     st = mgr.status()
     assert st["mode"] is None
@@ -268,7 +268,7 @@ def test_status_reports_none_when_no_presence_enabled(make_manager):
 
 def test_status_folds_daemon_health_false(make_manager):
     fake = FakeSystemctl()
-    fake.set_enabled(LIVE_UNIT, "enabled")
+    fake.set_enabled(RUNTIME_UNIT, "enabled")
     mgr = make_manager(run=fake, daemon_health=lambda: False)
     st = mgr.status()
     assert st["daemon_healthy"] is False
@@ -276,8 +276,8 @@ def test_status_folds_daemon_health_false(make_manager):
 
 def test_status_reports_per_unit_enabled_active(make_manager):
     fake = FakeSystemctl()
-    fake.set_enabled(LIVE_UNIT, "enabled")
-    fake.set_active(LIVE_UNIT, "active")
+    fake.set_enabled(RUNTIME_UNIT, "enabled")
+    fake.set_active(RUNTIME_UNIT, "active")
     fake.set_enabled(DEMO_UNIT, "disabled")
     fake.set_active(DEMO_UNIT, "inactive")
     fake.set_enabled(DAEMON_UNIT, "enabled")
@@ -285,15 +285,15 @@ def test_status_reports_per_unit_enabled_active(make_manager):
     mgr = make_manager(run=fake)
     st = mgr.status()
     units = st["units"]
-    assert units[LIVE_UNIT]["enabled"] == "enabled"
-    assert units[LIVE_UNIT]["active"] == "active"
+    assert units[RUNTIME_UNIT]["enabled"] == "enabled"
+    assert units[RUNTIME_UNIT]["active"] == "active"
     assert units[DEMO_UNIT]["enabled"] == "disabled"
     assert units[DAEMON_UNIT]["enabled"] == "enabled"
 
 
 def test_status_does_no_mutating_calls(make_manager):
     fake = FakeSystemctl()
-    fake.set_enabled(LIVE_UNIT, "enabled")
+    fake.set_enabled(RUNTIME_UNIT, "enabled")
     mgr = make_manager(run=fake)
     mgr.status()
     assert fake.mutating_calls() == []
@@ -306,20 +306,20 @@ def test_status_does_no_mutating_calls(make_manager):
 
 def test_disable_stops_enabled_presence_unit(make_manager):
     fake = FakeSystemctl()
-    fake.set_enabled(LIVE_UNIT, "enabled")
+    fake.set_enabled(RUNTIME_UNIT, "enabled")
     fake.set_enabled(DEMO_UNIT, "disabled")
     mgr = make_manager(run=fake)
     result = mgr.disable()
 
     # the enabled presence is disabled --now (stop + disable).
-    assert ["--user", "disable", "--now", LIVE_UNIT] in fake.calls
-    assert result["disabled"] == LIVE_UNIT
+    assert ["--user", "disable", "--now", RUNTIME_UNIT] in fake.calls
+    assert result["disabled"] == RUNTIME_UNIT
 
 
 def test_disable_leaves_daemon_enabled(make_manager):
     fake = FakeSystemctl()
     fake.set_enabled(DEMO_UNIT, "enabled")
-    fake.set_enabled(LIVE_UNIT, "disabled")
+    fake.set_enabled(RUNTIME_UNIT, "disabled")
     mgr = make_manager(run=fake)
     result = mgr.disable()
 
@@ -331,7 +331,7 @@ def test_disable_leaves_daemon_enabled(make_manager):
 def test_disable_with_no_presence_enabled_is_noop(make_manager):
     fake = FakeSystemctl()
     fake.set_enabled(DEMO_UNIT, "disabled")
-    fake.set_enabled(LIVE_UNIT, "disabled")
+    fake.set_enabled(RUNTIME_UNIT, "disabled")
     mgr = make_manager(run=fake)
     result = mgr.disable()
     assert result["disabled"] is None
@@ -349,7 +349,7 @@ def test_enable_surfaces_systemctl_failure_as_clierror(make_manager):
     fake.fail[("enable", DAEMON_UNIT)] = ("Failed to enable", 1)
     mgr = make_manager(run=fake)
     with pytest.raises(CliError) as ei:
-        mgr.enable("live")
+        mgr.enable("runtime")
     assert ei.value.code != 0
 
 
@@ -381,7 +381,7 @@ def test_systemctl_failure_message_is_single_line(make_manager):
     mgr = make_manager(run=fake)
 
     with pytest.raises(CliError) as ei:
-        mgr.enable("live")
+        mgr.enable("runtime")
 
     assert "\n" not in ei.value.message
     assert "Unit not found" in ei.value.message  # detail preserved, just flattened
@@ -398,7 +398,7 @@ def test_enable_writes_both_presence_units(make_manager, unit_dir):
     fake = FakeSystemctl()
     mgr = make_manager(run=fake)
 
-    mgr.enable("live")  # fresh enable — nothing pre-installed
+    mgr.enable("runtime")  # fresh enable — nothing pre-installed
 
-    assert (unit_dir / LIVE_UNIT).is_file()
+    assert (unit_dir / RUNTIME_UNIT).is_file()
     assert (unit_dir / DEMO_UNIT).is_file()  # sibling written too -> disable is safe

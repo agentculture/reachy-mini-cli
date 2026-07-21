@@ -10,9 +10,9 @@ a simulated reboot) and *active* (running now) state.
 
 The three things this test proves end to end:
 
-1. **Single-owner switching.** Driving ``enable("live") -> enable("demo") ->
-   enable("live")`` leaves exactly ONE presence unit enabled after EVERY enable
-   (``reachy-demo-mode.service`` XOR ``reachy-live.service``) plus the daemon.
+1. **Single-owner switching.** Driving ``enable("runtime") -> enable("demo") ->
+   enable("runtime")`` leaves exactly ONE presence unit enabled after EVERY enable
+   (``reachy-demo-mode.service`` XOR ``reachy-runtime.service``) plus the daemon.
    The single-SDK-owner model in ``CLAUDE.md`` is the *why*: only one presence
    loop may own the head, never both. A test fails if the two presence units are
    ever both enabled at once — the load-bearing invariant.
@@ -43,14 +43,14 @@ from reachy.service.manager import ServiceManager
 from reachy.service.units import (
     DAEMON_UNIT,
     DEMO_UNIT,
-    LIVE_UNIT,
+    RUNTIME_UNIT,
     daemon_unit_text,
     demo_unit_text,
-    live_unit_text,
+    runtime_unit_text,
 )
 
-PRESENCE_UNITS = (DEMO_UNIT, LIVE_UNIT)
-ALL_UNITS = (DAEMON_UNIT, DEMO_UNIT, LIVE_UNIT)
+PRESENCE_UNITS = (DEMO_UNIT, RUNTIME_UNIT)
+ALL_UNITS = (DAEMON_UNIT, DEMO_UNIT, RUNTIME_UNIT)
 
 
 # --------------------------------------------------------------------------- #
@@ -220,15 +220,15 @@ def _make_manager(run, unit_dir):
 # --------------------------------------------------------------------------- #
 
 
-def test_single_owner_switching_live_demo_live(unit_dir):
-    """live -> demo -> live: one presence + daemon enabled after EVERY enable."""
+def test_single_owner_switching_runtime_demo_runtime(unit_dir):
+    """runtime -> demo -> runtime: one presence + daemon enabled after EVERY enable."""
     sysd = StatefulSystemctl()
     mgr = _make_manager(sysd, unit_dir)
 
     for mode, expected_unit in (
-        ("live", LIVE_UNIT),
+        ("runtime", RUNTIME_UNIT),
         ("demo", DEMO_UNIT),
-        ("live", LIVE_UNIT),
+        ("runtime", RUNTIME_UNIT),
     ):
         mgr.enable(mode)
 
@@ -255,7 +255,7 @@ def test_both_presence_units_enabled_is_a_failure(unit_dir):
     """
     sysd = StatefulSystemctl()
     sysd.enabled[DEMO_UNIT] = True
-    sysd.enabled[LIVE_UNIT] = True
+    sysd.enabled[RUNTIME_UNIT] = True
 
     enabled_presence = sysd.enabled_presence_units()
     # The exact predicate the single-owner test relies on — it MUST fail here.
@@ -269,7 +269,7 @@ def test_single_owner_holds_over_a_long_random_looking_sequence(unit_dir):
     sysd = StatefulSystemctl()
     mgr = _make_manager(sysd, unit_dir)
 
-    sequence = ["demo", "live", "live", "demo", "demo", "live", "demo"]
+    sequence = ["demo", "runtime", "runtime", "demo", "demo", "runtime", "demo"]
     for mode in sequence:
         mgr.enable(mode)
         assert len(sysd.enabled_presence_units()) <= 1
@@ -277,7 +277,7 @@ def test_single_owner_holds_over_a_long_random_looking_sequence(unit_dir):
 
     # End state matches the last mode.
     last = sequence[-1]
-    expected = DEMO_UNIT if last == "demo" else LIVE_UNIT
+    expected = DEMO_UNIT if last == "demo" else RUNTIME_UNIT
     assert sysd.enabled_presence_units() == [expected]
 
 
@@ -290,7 +290,7 @@ def _unit_field_lines(text: str, prefix: str) -> list[str]:
     return [ln for ln in text.splitlines() if ln.startswith(prefix)]
 
 
-@pytest.mark.parametrize("render", (demo_unit_text, live_unit_text))
+@pytest.mark.parametrize("render", (demo_unit_text, runtime_unit_text))
 def test_presence_unit_requires_and_orders_after_daemon(render):
     """Both presence units declare Requires= AND After= the daemon unit."""
     text = render()
@@ -311,7 +311,7 @@ def test_daemon_unit_does_not_depend_on_presence():
     """The daemon must NOT require/After a presence unit (no dependency cycle)."""
     text = daemon_unit_text()
     assert DEMO_UNIT not in text
-    assert LIVE_UNIT not in text
+    assert RUNTIME_UNIT not in text
     # Daemon has no Requires= line at all.
     assert _unit_field_lines(text, "Requires=") == []
 
@@ -324,22 +324,22 @@ def test_daemon_unit_does_not_depend_on_presence():
 # --------------------------------------------------------------------------- #
 
 
-def test_reboot_brings_back_last_enabled_mode_only_live(unit_dir):
-    """After enabling live then rebooting, only the live presence runs."""
+def test_reboot_brings_back_last_enabled_mode_only_runtime(unit_dir):
+    """After enabling runtime then rebooting, only the runtime presence runs."""
     sysd = StatefulSystemctl()
     mgr = _make_manager(sysd, unit_dir)
 
     mgr.enable("demo")  # earlier mode
-    mgr.enable("live")  # the last-enabled mode wins
+    mgr.enable("runtime")  # the last-enabled mode wins
 
     order = sysd.simulate_reboot(unit_dir)
 
     # Daemon comes up first, before any presence loop.
     assert order[0] == DAEMON_UNIT
-    assert order.index(DAEMON_UNIT) < order.index(LIVE_UNIT)
+    assert order.index(DAEMON_UNIT) < order.index(RUNTIME_UNIT)
 
     # Exactly one presence loop is running, and it is the last-enabled one.
-    assert sysd.active_presence_units() == [LIVE_UNIT]
+    assert sysd.active_presence_units() == [RUNTIME_UNIT]
     # The other mode is NOT running.
     assert sysd.active[DEMO_UNIT] is False
     # The daemon is up.
@@ -351,7 +351,7 @@ def test_reboot_brings_back_last_enabled_mode_only_demo(unit_dir):
     sysd = StatefulSystemctl()
     mgr = _make_manager(sysd, unit_dir)
 
-    mgr.enable("live")
+    mgr.enable("runtime")
     mgr.enable("demo")  # last-enabled wins
 
     order = sysd.simulate_reboot(unit_dir)
@@ -359,7 +359,7 @@ def test_reboot_brings_back_last_enabled_mode_only_demo(unit_dir):
     assert order[0] == DAEMON_UNIT
     assert order.index(DAEMON_UNIT) < order.index(DEMO_UNIT)
     assert sysd.active_presence_units() == [DEMO_UNIT]
-    assert sysd.active[LIVE_UNIT] is False
+    assert sysd.active[RUNTIME_UNIT] is False
     assert sysd.active[DAEMON_UNIT] is True
 
 
@@ -368,7 +368,7 @@ def test_reboot_after_disable_runs_no_presence_but_keeps_daemon(unit_dir):
     sysd = StatefulSystemctl()
     mgr = _make_manager(sysd, unit_dir)
 
-    mgr.enable("live")
+    mgr.enable("runtime")
     mgr.disable()  # stops/disables the presence; daemon left enabled
 
     # Disable cleared the presence enable but kept the daemon enabled.
@@ -388,31 +388,31 @@ def test_reboot_is_idempotent_repeated_boots_keep_single_owner(unit_dir):
     sysd = StatefulSystemctl()
     mgr = _make_manager(sysd, unit_dir)
 
-    mgr.enable("live")
+    mgr.enable("runtime")
 
     sysd.simulate_reboot(unit_dir)
-    assert sysd.active_presence_units() == [LIVE_UNIT]
+    assert sysd.active_presence_units() == [RUNTIME_UNIT]
 
     # A second boot from the same persisted enable state is identical.
     sysd.simulate_reboot(unit_dir)
-    assert sysd.active_presence_units() == [LIVE_UNIT]
+    assert sysd.active_presence_units() == [RUNTIME_UNIT]
     assert sysd.active[DEMO_UNIT] is False
 
 
 def test_status_after_reboot_reports_the_surviving_mode(unit_dir):
-    """The real manager.status() reads the post-reboot state as the live mode."""
+    """The real manager.status() reads the post-reboot state as the runtime mode."""
     sysd = StatefulSystemctl()
     mgr = _make_manager(sysd, unit_dir)
 
     mgr.enable("demo")
-    mgr.enable("live")
+    mgr.enable("runtime")
     sysd.simulate_reboot(unit_dir)
 
     # status() queries is-enabled/is-active through the same stateful fake.
     st = mgr.status()
-    assert st["mode"] == "live"
-    assert st["presence_unit"] == LIVE_UNIT
-    assert st["units"][LIVE_UNIT]["active"] == "active"
+    assert st["mode"] == "runtime"
+    assert st["presence_unit"] == RUNTIME_UNIT
+    assert st["units"][RUNTIME_UNIT]["active"] == "active"
     assert st["units"][DEMO_UNIT]["enabled"] == "disabled"
     assert st["units"][DAEMON_UNIT]["active"] == "active"
     assert st["daemon_healthy"] is True

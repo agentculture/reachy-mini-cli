@@ -20,10 +20,16 @@ These tests pin the three contract points that close that hole:
 
 The scenario is parameterised on the retired NAME rather than hardcoding the
 catalog, because the whole point of ``RETIRED_UNITS`` is that adding a name to
-it is the only step a later removal needs. ``LIVE_UNIT`` is used as the
-injected retirement candidate here — it is still a live presence mode today, so
-it is not yet in the real constant, but it is exactly the box state the coming
-removal creates.
+it is the only step a later removal needs. :data:`SYNTHETIC_RETIRED` — a name
+in no catalog and on no box — is the injected retirement candidate for the
+generic mechanism, so these tests keep proving the MECHANISM rather than any one
+retirement. (They were originally written against ``LIVE_UNIT`` as a stand-in
+for "a unit about to be retired"; ``t23`` actually retired it, and its specific
+migration is covered in ``tests/test_service_live_retirement.py``.)
+
+Tests that need the retired name to ALSO be a live catalog entry — proving
+``RETIRED_UNITS`` wins over a lingering catalog tuple — inject ``DEMO_UNIT``
+instead, since a synthetic name has no catalog entry to lose to.
 """
 
 from __future__ import annotations
@@ -38,7 +44,11 @@ from reachy.cli._commands import service as service_cmd
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.service import units as units_mod
 from reachy.service.manager import ServiceManager
-from reachy.service.units import DEMO_UNIT, LIVE_UNIT, RETIRED_UNITS, RUNTIME_UNIT
+from reachy.service.units import DEMO_UNIT, RETIRED_UNITS, RUNTIME_UNIT
+
+#: A retirement candidate in NO catalog and on no real box — these tests prove
+#: the migration MECHANISM, not any particular retirement.
+SYNTHETIC_RETIRED = "reachy-legacy-presence.service"
 
 # --------------------------------------------------------------------------- #
 # Fake systemctl runner — records arg vectors, serves canned query state.
@@ -140,8 +150,8 @@ def test_retired_units_carries_the_known_orphan():
 
 
 def test_retired_units_excludes_units_still_in_the_catalog():
-    """A live presence unit must never be listed as retired."""
-    for still_live in (DEMO_UNIT, RUNTIME_UNIT, LIVE_UNIT):
+    """A surviving presence unit must never be listed as retired."""
+    for still_live in (DEMO_UNIT, RUNTIME_UNIT):
         assert still_live not in RETIRED_UNITS
 
 
@@ -151,13 +161,13 @@ def test_retired_units_excludes_units_still_in_the_catalog():
 
 
 def test_cleanup_disables_unlinks_and_removes_the_dropin_dir(manager, fake, unit_dir):
-    path, dropin = _seed_deployed_unit(unit_dir, LIVE_UNIT)
-    fake.set_enabled(LIVE_UNIT, "enabled")
+    path, dropin = _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
+    fake.set_enabled(SYNTHETIC_RETIRED, "enabled")
 
-    removed = manager.cleanup_retired_units(retired=(LIVE_UNIT,))
+    removed = manager.cleanup_retired_units(retired=(SYNTHETIC_RETIRED,))
 
-    assert LIVE_UNIT in removed
-    assert ["--user", "disable", "--now", LIVE_UNIT] in fake.calls
+    assert SYNTHETIC_RETIRED in removed
+    assert ["--user", "disable", "--now", SYNTHETIC_RETIRED] in fake.calls
     assert not path.exists(), "the retired unit file must be unlinked"
     assert not dropin.exists(), "the retired unit's .d/ drop-in dir must be removed"
 
@@ -168,36 +178,36 @@ def test_cleanup_disable_is_unconditional_even_with_no_file_on_disk(manager, fak
     The unit may have been enabled from a package-managed path; the symlink in
     ``…/default.target.wants/`` outlives the file we can see.
     """
-    removed = manager.cleanup_retired_units(retired=(LIVE_UNIT,))
+    removed = manager.cleanup_retired_units(retired=(SYNTHETIC_RETIRED,))
 
-    assert ["--user", "disable", "--now", LIVE_UNIT] in fake.calls
+    assert ["--user", "disable", "--now", SYNTHETIC_RETIRED] in fake.calls
     assert removed == []
 
 
 def test_cleanup_survives_systemctl_failure_on_an_unknown_unit(manager, fake, unit_dir):
     """A real ``disable`` of a nonexistent unit exits non-zero — never fatal here."""
-    path, dropin = _seed_deployed_unit(unit_dir, LIVE_UNIT)
-    fake.fail_verb("disable", LIVE_UNIT, "Failed to disable: Unit file does not exist.")
+    path, dropin = _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
+    fake.fail_verb("disable", SYNTHETIC_RETIRED, "Failed to disable: Unit file does not exist.")
 
-    removed = manager.cleanup_retired_units(retired=(LIVE_UNIT,))
+    removed = manager.cleanup_retired_units(retired=(SYNTHETIC_RETIRED,))
 
-    assert removed == [LIVE_UNIT]
+    assert removed == [SYNTHETIC_RETIRED]
     assert not path.exists()
     assert not dropin.exists()
 
 
 def test_cleanup_is_idempotent(manager, fake, unit_dir):
-    _seed_deployed_unit(unit_dir, LIVE_UNIT)
-    assert manager.cleanup_retired_units(retired=(LIVE_UNIT,)) == [LIVE_UNIT]
-    assert manager.cleanup_retired_units(retired=(LIVE_UNIT,)) == []
+    _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
+    assert manager.cleanup_retired_units(retired=(SYNTHETIC_RETIRED,)) == [SYNTHETIC_RETIRED]
+    assert manager.cleanup_retired_units(retired=(SYNTHETIC_RETIRED,)) == []
 
 
 def test_cleanup_only_touches_retired_names(manager, fake, unit_dir):
     """The negative control: a still-catalogued unit is left completely alone."""
     keep, keep_dropin = _seed_deployed_unit(unit_dir, RUNTIME_UNIT)
-    _seed_deployed_unit(unit_dir, LIVE_UNIT)
+    _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
 
-    manager.cleanup_retired_units(retired=(LIVE_UNIT,))
+    manager.cleanup_retired_units(retired=(SYNTHETIC_RETIRED,))
 
     assert keep.exists()
     assert keep_dropin.exists()
@@ -206,10 +216,10 @@ def test_cleanup_only_touches_retired_names(manager, fake, unit_dir):
 
 def test_cleanup_defaults_to_the_module_constant(manager, fake, unit_dir, monkeypatch):
     """No argument → the real ``RETIRED_UNITS`` drives the migration."""
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
-    path, dropin = _seed_deployed_unit(unit_dir, LIVE_UNIT)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
+    path, dropin = _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
 
-    assert manager.cleanup_retired_units() == [LIVE_UNIT]
+    assert manager.cleanup_retired_units() == [SYNTHETIC_RETIRED]
     assert not path.exists()
     assert not dropin.exists()
 
@@ -220,12 +230,12 @@ def test_cleanup_defaults_to_the_module_constant(manager, fake, unit_dir, monkey
 
 
 def test_enable_runs_the_retired_cleanup(manager, fake, unit_dir, monkeypatch):
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
-    path, dropin = _seed_deployed_unit(unit_dir, LIVE_UNIT)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
+    path, dropin = _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
 
     result = manager.enable("runtime")
 
-    assert result["retired_removed"] == [LIVE_UNIT]
+    assert result["retired_removed"] == [SYNTHETIC_RETIRED]
     assert not path.exists()
     assert not dropin.exists()
     # The chosen presence still comes up.
@@ -235,8 +245,8 @@ def test_enable_runs_the_retired_cleanup(manager, fake, unit_dir, monkeypatch):
 
 def test_enable_cleanup_precedes_the_daemon_reload(manager, fake, unit_dir, monkeypatch):
     """Removal must land BEFORE ``daemon-reload`` so systemd sees the new truth."""
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
-    _seed_deployed_unit(unit_dir, LIVE_UNIT)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
+    _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
 
     manager.enable("runtime")
 
@@ -250,17 +260,17 @@ def test_cli_install_runs_the_retired_cleanup(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(service_cmd, "_systemctl_run", runner, raising=True)
     monkeypatch.setattr(service_cmd, "_daemon_health", lambda: True, raising=True)
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    path, dropin = _seed_deployed_unit(unit_dir, LIVE_UNIT)
+    path, dropin = _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
 
     rc = main(["service", "install", "--json"])
     out, err = capsys.readouterr()
 
     assert rc == 0
     payload = json.loads(out)
-    assert payload["retired_removed"] == [LIVE_UNIT]
+    assert payload["retired_removed"] == [SYNTHETIC_RETIRED]
     assert not path.exists()
     assert not dropin.exists()
     assert err == ""
@@ -271,16 +281,16 @@ def test_cli_enable_runs_the_retired_cleanup(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(service_cmd, "_systemctl_run", runner, raising=True)
     monkeypatch.setattr(service_cmd, "_daemon_health", lambda: True, raising=True)
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    path, dropin = _seed_deployed_unit(unit_dir, LIVE_UNIT)
+    path, dropin = _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
 
     rc = main(["service", "enable", "runtime", "--json"])
     out, _ = capsys.readouterr()
 
     assert rc == 0
-    assert json.loads(out)["retired_removed"] == [LIVE_UNIT]
+    assert json.loads(out)["retired_removed"] == [SYNTHETIC_RETIRED]
     assert not path.exists()
     assert not dropin.exists()
 
@@ -290,16 +300,16 @@ def test_cli_uninstall_runs_the_retired_cleanup(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(service_cmd, "_systemctl_run", runner, raising=True)
     monkeypatch.setattr(service_cmd, "_daemon_health", lambda: True, raising=True)
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    path, dropin = _seed_deployed_unit(unit_dir, LIVE_UNIT)
+    path, dropin = _seed_deployed_unit(unit_dir, SYNTHETIC_RETIRED)
 
     rc = main(["service", "uninstall", "--json"])
     out, _ = capsys.readouterr()
 
     assert rc == 0
-    assert json.loads(out)["retired_removed"] == [LIVE_UNIT]
+    assert json.loads(out)["retired_removed"] == [SYNTHETIC_RETIRED]
     assert not path.exists()
     assert not dropin.exists()
 
@@ -316,21 +326,26 @@ def test_enable_never_rewrites_a_retired_unit(manager, fake, unit_dir, monkeypat
     an installed unit). If a retired name were still in that catalog, the write
     would resurrect the file the migration just deleted — one line out of order
     and the crash loop comes back. ``RETIRED_UNITS`` is the source of truth.
+
+    ``DEMO_UNIT`` is injected as the retirement candidate precisely BECAUSE it
+    is still catalogued: a synthetic name has no catalog entry for retirement to
+    have to beat.
     """
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
-    _seed_deployed_unit(unit_dir, LIVE_UNIT)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (DEMO_UNIT,), raising=True)
+    _seed_deployed_unit(unit_dir, DEMO_UNIT)
 
     manager.enable("runtime")
 
-    assert not (unit_dir / LIVE_UNIT).exists()
-    assert not (unit_dir / f"{LIVE_UNIT}.d").exists()
-    assert LIVE_UNIT not in manager.enable("runtime")["disabled_siblings"]
+    assert not (unit_dir / DEMO_UNIT).exists()
+    assert not (unit_dir / f"{DEMO_UNIT}.d").exists()
+    assert DEMO_UNIT not in manager.enable("runtime")["disabled_siblings"]
 
 
 def test_enabling_a_retired_mode_is_a_user_error(manager, fake, monkeypatch):
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
+    """A mode whose unit is retired is refused, not silently written."""
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (DEMO_UNIT,), raising=True)
     with pytest.raises(CliError) as excinfo:
-        manager.enable("live")
+        manager.enable("demo")
     assert excinfo.value.code == EXIT_USER_ERROR
     assert "retired" in str(excinfo.value.message).lower()
 
@@ -340,19 +355,19 @@ def test_install_never_rewrites_a_retired_unit(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(service_cmd, "_systemctl_run", runner, raising=True)
     monkeypatch.setattr(service_cmd, "_daemon_health", lambda: True, raising=True)
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (DEMO_UNIT,), raising=True)
     unit_dir = tmp_path / "config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    _seed_deployed_unit(unit_dir, LIVE_UNIT)
+    _seed_deployed_unit(unit_dir, DEMO_UNIT)
 
     rc = main(["service", "install", "--json"])
     out, _ = capsys.readouterr()
 
     assert rc == 0
     payload = json.loads(out)
-    assert LIVE_UNIT not in payload["unit_paths"]
-    assert not (unit_dir / LIVE_UNIT).exists()
-    assert not (unit_dir / f"{LIVE_UNIT}.d").exists()
+    assert DEMO_UNIT not in payload["unit_paths"]
+    assert not (unit_dir / DEMO_UNIT).exists()
+    assert not (unit_dir / f"{DEMO_UNIT}.d").exists()
     # The still-catalogued units are installed as usual.
     assert RUNTIME_UNIT in payload["unit_paths"]
 
@@ -364,26 +379,26 @@ def test_install_never_rewrites_a_retired_unit(monkeypatch, tmp_path, capsys):
 
 def test_status_reports_a_retired_unit_that_is_still_enabled(manager, fake, monkeypatch):
     """The crash-loop case: a retired unit is enabled; status must NOT say None."""
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
-    fake.set_enabled(LIVE_UNIT, "enabled")
-    fake.set_active(LIVE_UNIT, "activating")
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
+    fake.set_enabled(SYNTHETIC_RETIRED, "enabled")
+    fake.set_active(SYNTHETIC_RETIRED, "activating")
     for unit in (DEMO_UNIT, RUNTIME_UNIT):
         fake.set_enabled(unit, "disabled")
 
     data = manager.status()
 
     assert data["mode"] is not None, "status must not report mode=None while a unit is enabled"
-    assert data["presence_unit"] == LIVE_UNIT
-    assert data["retired_enabled"] == [LIVE_UNIT]
-    assert LIVE_UNIT in data["units"]
+    assert data["presence_unit"] == SYNTHETIC_RETIRED
+    assert data["retired_enabled"] == [SYNTHETIC_RETIRED]
+    assert SYNTHETIC_RETIRED in data["units"]
     assert data["warning"]
-    assert LIVE_UNIT in str(data["warning"])
+    assert SYNTHETIC_RETIRED in str(data["warning"])
 
 
 def test_status_is_clean_when_nothing_retired_is_enabled(manager, fake, monkeypatch):
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
     fake.set_enabled(RUNTIME_UNIT, "enabled")
-    for unit in (DEMO_UNIT, LIVE_UNIT):
+    for unit in (DEMO_UNIT, SYNTHETIC_RETIRED):
         fake.set_enabled(unit, "disabled")
 
     data = manager.status()
@@ -395,8 +410,8 @@ def test_status_is_clean_when_nothing_retired_is_enabled(manager, fake, monkeypa
 
 
 def test_status_mode_none_only_when_truly_nothing_is_enabled(manager, fake, monkeypatch):
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
-    for unit in (DEMO_UNIT, LIVE_UNIT, RUNTIME_UNIT):
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
+    for unit in (DEMO_UNIT, SYNTHETIC_RETIRED, RUNTIME_UNIT):
         fake.set_enabled(unit, "disabled")
 
     data = manager.status()
@@ -413,8 +428,7 @@ def test_status_honours_enabled_runtime_as_enabled(manager, fake):
     same class of lie the retired-unit hole creates.
     """
     fake.query_results[("is-enabled", RUNTIME_UNIT)] = ("enabled-runtime", 0)
-    for unit in (DEMO_UNIT, LIVE_UNIT):
-        fake.set_enabled(unit, "disabled")
+    fake.set_enabled(DEMO_UNIT, "disabled")
 
     data = manager.status()
 
@@ -424,13 +438,13 @@ def test_status_honours_enabled_runtime_as_enabled(manager, fake):
 
 def test_cli_status_surfaces_the_retired_warning(monkeypatch, tmp_path, capsys):
     runner = FakeSystemctl()
-    runner.set_enabled(LIVE_UNIT, "enabled")
+    runner.set_enabled(SYNTHETIC_RETIRED, "enabled")
     for unit in (DEMO_UNIT, RUNTIME_UNIT):
         runner.set_enabled(unit, "disabled")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(service_cmd, "_systemctl_run", runner, raising=True)
     monkeypatch.setattr(service_cmd, "_daemon_health", lambda: True, raising=True)
-    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (LIVE_UNIT,), raising=True)
+    monkeypatch.setattr(units_mod, "RETIRED_UNITS", (SYNTHETIC_RETIRED,), raising=True)
 
     rc = main(["service", "status", "--json"])
     out, err = capsys.readouterr()
@@ -438,5 +452,5 @@ def test_cli_status_surfaces_the_retired_warning(monkeypatch, tmp_path, capsys):
     assert rc == 0
     payload = json.loads(out)
     assert payload["mode"] is not None
-    assert payload["retired_enabled"] == [LIVE_UNIT]
+    assert payload["retired_enabled"] == [SYNTHETIC_RETIRED]
     assert err == ""

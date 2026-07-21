@@ -133,21 +133,22 @@ def test_runtime_requires_and_after_daemon():
 
 # --------------------------------------------------------------------------- #
 # Task t7 — the runtime unit sets its TTS route EXPLICITLY, inheriting        #
-# nothing from reachy-live.service.d/tts.conf (a drop-in belonging to a unit  #
-# this arc retires).                                                          #
+# nothing from reachy-live.service.d/tts.conf (a drop-in belonging to the     #
+# unit t23 retired).                                                          #
 # --------------------------------------------------------------------------- #
 
 
 def test_runtime_unit_sets_the_tts_route_explicitly():
     """The deployed box's ONLY REACHY_TTS_ROUTE configuration today lives in
-    ``reachy-live.service.d/tts.conf`` — a drop-in that belongs to LIVE_UNIT,
-    which this arc deletes. That drop-in's own comment documents the default
-    route's port (chatterbox, :9000) as connection-refused on this box (the
-    container is EXPOSE-only, never published to the host). Without an
-    explicit route baked into the runtime unit itself, selecting the TTS voice
-    (an operator-selectable alternative to the harmonic default) would silently
-    degrade to silence for exactly the reason that drop-in exists to route
-    around — and it would no longer be there to route around it.
+    ``reachy-live.service.d/tts.conf`` — a drop-in belonging to
+    ``reachy-live.service``, the unit ``t23`` retired (its ``RETIRED_UNITS``
+    migration removes that whole ``.d/`` directory). That drop-in's own comment
+    documents the default route's port (chatterbox, :9000) as connection-refused
+    on this box (the container is EXPOSE-only, never published to the host).
+    Without an explicit route baked into the runtime unit itself, selecting the
+    TTS voice (an operator-selectable alternative to the harmonic default) would
+    silently degrade to silence for exactly the reason that drop-in exists to
+    route around — and it would no longer be there to route around it.
     """
     text = units.runtime_unit_text(python=PY)
     sec = parse_unit(text)

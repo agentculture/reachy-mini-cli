@@ -49,7 +49,22 @@ def parse_unit(text: str) -> dict[str, dict[str, list[str]]]:
 def test_unit_name_constants():
     assert units.DAEMON_UNIT == "reachy-daemon.service"
     assert units.DEMO_UNIT == "reachy-demo-mode.service"
-    assert units.LIVE_UNIT == "reachy-live.service"
+    assert units.RUNTIME_UNIT == "reachy-runtime.service"
+
+
+def test_no_live_unit_constant_or_renderer():
+    """``t23``: the live presence is retired, so its name/renderers are GONE.
+
+    ``reachy-live.service`` rendered ``ExecStart=… listen run --live …`` — a
+    command ``t21``/``t22`` deleted — so keeping the renderer around meant
+    ``service enable live`` could still write a unit that crash-loops every
+    ``RestartSec=5``. The name now exists only in ``RETIRED_UNITS``, which
+    purges it from a deployed box (see ``tests/test_service_live_retirement.py``).
+    """
+    assert not hasattr(units, "LIVE_UNIT")
+    assert not hasattr(units, "live_unit_text")
+    assert not hasattr(units, "live_exec_start")
+    assert "reachy-live.service" in units.RETIRED_UNITS
 
 
 # --------------------------------------------------------------------------- #
@@ -62,7 +77,7 @@ def test_unit_name_constants():
     [
         units.daemon_unit_text(daemon_cmd=DAEMON_BIN),
         units.demo_unit_text(python=PY, config_file=CFG),
-        units.live_unit_text(python=PY),
+        units.runtime_unit_text(python=PY),
     ],
 )
 def test_common_shape(text):
@@ -132,42 +147,13 @@ def test_demo_default_python_is_running_interpreter():
 
 
 # --------------------------------------------------------------------------- #
-# Live presence unit (criterion 2: folded live loop; depends on daemon).
-# --------------------------------------------------------------------------- #
-
-
-def test_live_exec_runs_listen_live():
-    text = units.live_unit_text(python=PY)
-    sec = parse_unit(text)
-    exec_start = sec["Service"]["ExecStart"][0]
-    # The deployed boot presence opts into --transcribe so on-robot it hears words
-    # (the CLI default stays off; the unit opts in), reasons with the tool-use
-    # agent engine (--cognition marker is the CLI default; the unit opts into
-    # "agent"), and defaults to the harmonic voice engine (--voice-engine tts is
-    # the CLI default; the unit opts in).
-    assert exec_start == (
-        f'"{PY}" -m reachy listen run --live --transcribe '
-        "--cognition agent --voice-engine harmonic"
-    )
-
-
-def test_live_requires_and_after_daemon():
-    text = units.live_unit_text(python=PY)
-    sec = parse_unit(text)
-    assert sec["Unit"]["Requires"] == [units.DAEMON_UNIT]
-    after_values = " ".join(sec["Unit"]["After"])
-    assert units.DAEMON_UNIT in after_values
-    assert "network-online.target" in after_values
-
-
-# --------------------------------------------------------------------------- #
 # Quoting / escaping (mirror demo_service grammar): spaces, %, ", backslash.
 # --------------------------------------------------------------------------- #
 
 
 def test_exec_args_are_quoted_and_escaped():
     weird = "/path with space/py%thon"
-    text = units.live_unit_text(python=weird)
+    text = units.runtime_unit_text(python=weird)
     sec = parse_unit(text)
     exec_start = sec["Service"]["ExecStart"][0]
     # space preserved inside quotes, % doubled for systemd specifier grammar.
