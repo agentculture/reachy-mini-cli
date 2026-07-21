@@ -1431,7 +1431,7 @@ class _AudioTap:
     consumers need it — the ``rms`` provider (read at the START of the tick,
     when perception is composed) and the transcript driver (which runs at the
     END of the tick) — so composition, not either module, owns the fan-out.
-    This is the ``SenseSample`` pattern the folded ``listen`` loop already uses,
+    This is the ``SenseSample`` pattern the retired folded ``listen`` loop used,
     restated for the engine's tick seam.
 
     Since #100 the tap performs NO audio I/O of its own: acquisition lives on
@@ -1539,7 +1539,7 @@ class _RuntimeResources:
 def _engagement_classifier():
     """The transcript gate's optional LLM classifier, or ``None``.
 
-    Mirrors ``listen --live --transcribe``'s own builder so the symbolic runtime
+    Mirrors the retired ``listen --live --transcribe`` builder so the symbolic runtime
     applies the SAME layered engagement gate the retiring loop applied: name
     fast-path, then one "is this addressed to me, in context?" call, then a
     heuristic fallback. Imported lazily and built defensively — construction does

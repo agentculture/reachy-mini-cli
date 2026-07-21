@@ -60,7 +60,7 @@ starved. Only the very first tick (no previous commanded pose, an in-flight
 move of unknown start) rides to the horizon unsensed. The ``on_tick`` contract
 ``(transport, queue, t, commanded_head)`` is unchanged — the seam is a
 constructor argument, so the other folded hooks and
-:class:`~reachy.motion.listen_hooks.HookChain` need no change.
+a composing caller need no change.
 
 **Re-baseline on resume.** After a reaction window closes, the first sensing
 pass calls :meth:`PatDetector.reset` before feeding the fresh reading, so the

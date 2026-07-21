@@ -220,7 +220,7 @@ class DoaPoller:
 #: A provider is a zero-arg callable returning its field's latest reading — a
 #: PEEK of a shared per-tick source, never a consuming read. This is the same
 #: "peek, not take" contract as
-#: ``reachy.motion.listen_vision.VisionHook.latest_frame`` (a non-consuming
+#: the retired ``VisionHook.latest_frame`` peek (a non-consuming
 #: peek at the vision grabber's held frame) versus that hook's own consuming
 #: ``take()`` — so two independent consumers of the SAME provider (e.g. a
 #: behavior and a cognition sink) see the SAME tick's value, and a provider

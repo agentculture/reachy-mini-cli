@@ -1,9 +1,17 @@
-"""Characterization tests for today's ``_should_engage`` heuristic.
+"""Characterization tests for the ``_should_engage`` heuristic.
 
-These tests PIN the CURRENT behavior of
-:meth:`~reachy.motion.listen_transcribe.TranscribeHook._should_engage` exactly
-as shipped (PR #54, v0.27.0) and demonstrate the flaw that the upcoming gate
-change (t5/t6) is designed to fix.
+These tests PIN the behavior of
+:meth:`~reachy.behavior.transcript_sense.TranscriptSenseDriver._should_engage`
+exactly as shipped (PR #54, v0.27.0, on the retired
+``listen --live --transcribe`` donor; ported verbatim onto the symbolic
+runtime's transcript sense) and demonstrate the flaw that the gate change
+(t5/t6) is designed to fix.
+
+The heuristic is the DEGRADE / no-classifier fallback path — it runs when
+``REACHY_ENGAGE_HEURISTIC`` is set, when no classifier is injected, or when the
+LLM classifier raises. The stateful :class:`~reachy.speech.engagement.ConversationGate`
+that supersedes it in the normal path has its own suite in
+``tests/test_engagement.py``.
 
 Do NOT modify these to make them pass after the gate change — they are a
 **baseline** that the new gate must beat on the ``ambient`` category.  The
@@ -35,7 +43,7 @@ from dataclasses import fields as _dc_fields
 
 import pytest
 
-from reachy.motion.listen_transcribe import TranscribeHook, TranscribeTuning
+from reachy.behavior.transcript_sense import TranscriptSenseDriver, TranscriptTuning
 from tests.fixtures.engagement_transcripts import (
     ADDRESSED_FOLLOWUP,
     AMBIENT,
@@ -49,39 +57,39 @@ from tests.fixtures.engagement_transcripts import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-#: Module-level word regex — must match the one in listen_transcribe (copied
+#: Module-level word regex — must match the one in transcript_sense (copied
 #  here so the characterization test can verify the word-count independently).
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 
-#: Default constructor values (mirrors TranscribeHook.__init__ defaults).
+#: Default constructor values (mirrors TranscriptSenseDriver.__init__ defaults).
 _DEFAULT_NAMES = ("reachy", "robot")
 _DEFAULT_MIN_WORDS = 3
 _DEFAULT_ENGAGE_WINDOW = 20.0
 
-#: Field names of TranscribeTuning — used to split tuning kwargs from seam kwargs
-#: at the test helper below (S107 split: the constructor now takes one grouped
-#: ``tuning=`` object instead of nine individual numeric parameters).
-_TUNING_FIELDS = {f.name for f in _dc_fields(TranscribeTuning)}
+#: Field names of TranscriptTuning — used to split tuning kwargs from seam kwargs
+#: at the test helper below (S107 split: the constructor takes one grouped
+#: ``tuning=`` object instead of a dozen individual numeric parameters).
+_TUNING_FIELDS = {f.name for f in _dc_fields(TranscriptTuning)}
 
 
-def _pop_tuning(kwargs: dict) -> TranscribeTuning:
-    """Pop any TranscribeTuning-field keys out of *kwargs* and build a TranscribeTuning."""
-    return TranscribeTuning(**{k: kwargs.pop(k) for k in list(kwargs) if k in _TUNING_FIELDS})
+def _pop_tuning(kwargs: dict) -> TranscriptTuning:
+    """Pop any TranscriptTuning-field keys out of *kwargs* and build a TranscriptTuning."""
+    return TranscriptTuning(**{k: kwargs.pop(k) for k in list(kwargs) if k in _TUNING_FIELDS})
 
 
-class _FakeBuffer:
-    """Minimal EventBuffer stand-in (we never call feed_transcript in these tests)."""
+def _make_hook(**kwargs) -> TranscriptSenseDriver:
+    """Build a driver suitable for driving ``_should_engage`` directly.
 
-    def feed_transcript(self, text: str, *, direction: str | None = None) -> None:  # noqa: ARG002
-        pass
-
-
-def _make_hook(**kwargs) -> TranscribeHook:
-    """Build a TranscribeHook suitable for driving ``_should_engage`` directly.
-
-    Injects a trivially-failing transcriber (we never drive a full tick here —
-    we only call ``_should_engage`` directly on the constructed object).
+    Injects a never-reading media client and a trivially-failing transcriber (we
+    never drive a full tick here — we only call ``_should_engage`` directly on
+    the constructed object, and it starts no worker thread).
     """
+
+    class _NullMedia:
+        connected = False
+
+        def audio(self):
+            return None
 
     class _NullTranscriber:
         def transcribe_once(self, audio):  # noqa: ARG002
@@ -89,23 +97,22 @@ def _make_hook(**kwargs) -> TranscribeHook:
 
     kwargs.setdefault("min_utterance_s", 0.0)
     tuning = _pop_tuning(kwargs)
-    return TranscribeHook(
-        lambda: None,
-        buffer=_FakeBuffer(),
+    return TranscriptSenseDriver(
+        media=_NullMedia(),
         transcriber=_NullTranscriber(),
         tuning=tuning,
         **kwargs,
     )
 
 
-def _stamp_window(hook: TranscribeHook, last_accepted_t: float) -> None:
+def _stamp_window(hook: TranscriptSenseDriver, last_accepted_t: float) -> None:
     """Simulate a previous accepted utterance at *last_accepted_t*.
 
-    Directly stamps ``_engaged_until`` the same way ``_flush`` does so that
+    Directly stamps ``_engaged_until`` the same way ``_handle`` does so that
     follow-up / ambient tests can exercise the in-window branch without
     running a full utterance through the loop.
     """
-    hook._engaged_until = last_accepted_t + hook._engage_window_s
+    hook._engaged_until = last_accepted_t + hook._tuning.engage_window_s
 
 
 # ---------------------------------------------------------------------------
@@ -116,12 +123,12 @@ def _stamp_window(hook: TranscribeHook, last_accepted_t: float) -> None:
 def test_heuristic_logic_matches_source() -> None:
     """Pin TODAY's exact ``_should_engage`` rule.
 
-    The rule (from ``reachy/motion/listen_transcribe.py`` ~lines 293-309):
+    The rule (from ``reachy/behavior/transcript_sense.py``'s ``_should_engage``):
 
         words = _WORD_RE.findall(text.lower())
         if any(name in words for name in self._names):
             return True
-        coherent = len(words) >= self._min_words
+        coherent = len(words) >= self._tuning.min_words
         return coherent and t < self._engaged_until
 
     We verify this *exactly* by probing four representative points:

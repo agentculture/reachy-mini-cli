@@ -20,10 +20,11 @@ plan could regress:
 
 Both simply reuse :class:`reachy.motion.pat.PatDetector` as-is; neither one
 has a concept of "commanded pose held still for N seconds" at all.
-``reachy.motion.listen_sleep.SleepHook`` (folded ``sleep`` inside ``listen``)
-shares the same commanded-baseline mechanism as ``PatHook`` and is included in
-the import-boundary check below as a bonus — it was not one of the two
-required targets, but the check costs nothing extra.
+
+(``reachy.motion.listen_sleep.SleepHook`` — the folded ``sleep`` inside
+``listen --live`` — used to ride along in the import-boundary check below as a
+bonus third target. It retired with the ``--live`` composition root, so only the
+two required targets remain.)
 """
 
 from __future__ import annotations
@@ -37,7 +38,6 @@ import sys
 import pytest
 
 import reachy.motion.listen_pat as listen_pat_mod
-import reachy.motion.listen_sleep as listen_sleep_mod
 import reachy.motion.pat_signal as pat_signal
 import reachy.sleep.patwake as patwake_mod
 from reachy.motion.listen_pat import PatHook
@@ -228,10 +228,8 @@ _STILLNESS_NAMES = frozenset(
     }
 )
 
-#: The two required targets (acceptance criterion 2), plus listen_sleep.py as
-#: a bonus — it shares PatHook's commanded-baseline mechanism and was called
-#: out as relevant, though not a required target, in the task brief.
-_TARGET_MODULES = (listen_pat_mod, patwake_mod, listen_sleep_mod)
+#: The two required targets (acceptance criterion 2).
+_TARGET_MODULES = (listen_pat_mod, patwake_mod)
 
 
 def _imported_module_names(module) -> set[str]:
@@ -269,7 +267,7 @@ def test_module_does_not_expose_pat_sense_stillness_names(module) -> None:
 
 @pytest.mark.parametrize(
     "module_name",
-    ["reachy.motion.listen_pat", "reachy.sleep.patwake", "reachy.motion.listen_sleep"],
+    ["reachy.motion.listen_pat", "reachy.sleep.patwake"],
 )
 def test_importing_module_does_not_pull_pat_sense_into_sys_modules(module_name: str) -> None:
     """A fresh interpreter importing the module must not transitively import pat_sense.

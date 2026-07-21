@@ -15,7 +15,7 @@ from nova, and why:
 * **No threading / no background dispatch loop.** Nova's ``FaceRecognition``
   owns a daemon thread, a busy flag, and a fixed 500 ms detect interval
   (``update_frame`` dispatches to ``_run_detection`` on a background thread).
-  That loop-owning responsibility belongs to the live ``listen --live``
+  That loop-owning responsibility belongs to the composing runtime
   ``FaceHook`` — a separate task, out of scope here. :class:`FaceEngine` is a
   synchronous, stateless-per-call ``detect(frame)``; the hook throttles and
   calls it from its own tick, exactly like the vision motion/light detectors.

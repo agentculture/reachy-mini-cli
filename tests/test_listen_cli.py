@@ -441,3 +441,136 @@ def test_snap_ratio_and_floor_flags_parse() -> None:
     args = _parse_tuning(["--snap-ratio", "7.0", "--snap-floor", "0.05"])
     assert args.snap_ratio == 7.0
     assert args.snap_floor == 0.05
+
+
+# ---------------------------------------------------------------------------
+# Issue #51 — the deployed ``listen run`` loop must not open a per-call SDK
+# client per tick. Moved here (unchanged in substance) from the retired
+# ``tests/test_listen_live.py`` when the ``--live`` composition was deleted:
+# the leak-freedom proof it carried for the *plain* loop is about the surviving
+# ``_SessionBoundTransport`` wiring, not about ``--live``.
+# ---------------------------------------------------------------------------
+
+
+class _Session:
+    """The ONE open client for the loop: audio + DoA + pose + move all ride it."""
+
+    def __init__(self):
+        import numpy as np
+
+        self._sample = np.full(512, 0.001, dtype=np.float32)  # below min_rms → no snap
+        self.gotos: list[dict] = []
+
+    def doa(self, *, timeout=None):  # noqa: ARG002
+        import math
+
+        return {"angle": math.pi / 2, "speech_detected": False}  # front, no speech
+
+    def get_audio_sample(self):
+        return self._sample
+
+    def head_pose(self) -> tuple[float, float]:
+        return (0.0, 0.0)  # flat: no pat
+
+    def get_frame(self):
+        return None
+
+    def move_goto(self, *, head=None, antennas=None, body_yaw=None, duration, interpolation):
+        self.gotos.append({"head": head, "duration": duration})
+        return {"uuid": "fake"}
+
+    @property
+    def samplerate(self):
+        return 16000
+
+    @property
+    def channels(self):
+        return 1
+
+
+class _SdkTransport:
+    """A fake sdk transport whose per-call ``head_pose``/``move_goto``/``get_frame``
+    stand in for the LEAKY fresh-``ReachyMini``-per-call path; the loop must route
+    those through the one open session instead, so ``base_calls`` must not grow
+    with the tick count. ``media_opens`` counts sessions opened — exactly one.
+    """
+
+    name = "sdk-fake"
+
+    def __init__(self):
+        self.media_opens = 0
+        self.base_calls = 0
+        self._session = _Session()
+
+    @property
+    def gotos(self):  # moves ride the one open session
+        return self._session.gotos
+
+    def head_pose(self) -> tuple[float, float]:
+        self.base_calls += 1
+        return (0.0, 0.0)
+
+    def get_frame(self):
+        self.base_calls += 1
+        return None
+
+    def move_goto(self, *, head=None, antennas=None, body_yaw=None, duration, interpolation):
+        self.base_calls += 1
+        return {"uuid": "fake"}
+
+    def media_session(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def _open():
+            self.media_opens += 1
+            yield self._session
+
+        return _open()
+
+
+def _run_plain_listen(monkeypatch, transport, *, max_ticks):
+    """Run the DEPLOYED path — plain ``listen run`` — against *transport*."""
+    import io
+    import sys
+
+    monkeypatch.setattr("reachy.cli._commands.listen.get_transport", lambda _: transport)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        return main(
+            [
+                "listen",
+                "run",
+                "--json",
+                "--transport",
+                "sdk",
+                "--deadband",
+                "0",
+                "--max-ticks",
+                str(max_ticks),
+            ]
+        )
+    finally:
+        sys.stdout = old
+
+
+def test_listen_run_does_not_leak_per_tick(monkeypatch) -> None:
+    """The DEPLOYED crash path (plain ``listen run``) is leak-free.
+
+    A tick-invariance proof: the loop's per-tick PatHook ``head_pose`` read and
+    per-move ``move_goto`` route through the one open session, so base per-call
+    SDK opens do not grow with ticks.
+    """
+    short = _SdkTransport()
+    assert _run_plain_listen(monkeypatch, short, max_ticks=5) == 0
+    long = _SdkTransport()
+    assert _run_plain_listen(monkeypatch, long, max_ticks=40) == 0
+
+    assert short.media_opens == 1 and long.media_opens == 1
+    assert long.base_calls == short.base_calls, (
+        "plain listen scaled per-call SDK opens with ticks — issue #51 leak present "
+        f"({short.base_calls} at 5 ticks, {long.base_calls} at 40)"
+    )

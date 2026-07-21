@@ -5,7 +5,7 @@ currently in progress.  The flag lives under the same per-user state directory
 that every other piece of bookkeeping in this project uses (daemon PID file,
 listen/think supervisor PID files, the cognition-active flag, …).
 
-This mirrors :mod:`reachy.speech.cognition_signal` *exactly* in shape — only the
+This mirrors :mod:`reachy.motion.sleep_signal` *exactly* in shape — only the
 flag file name and the symbol names differ.  The :func:`pat_active` context
 manager is the canonical way to set and clear the flag; the lower-level
 :func:`write` / :func:`clear` / :func:`is_active` functions are exposed for

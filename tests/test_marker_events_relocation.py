@@ -3,28 +3,27 @@
 
 Why this exists
 ----------------
-A later PR deletes ``reachy/speech/markers.py`` entirely as part of retiring the
-in-loop LLM cognition path (the streaming ``MarkerParser`` it hosts).  But
+``reachy/speech/markers.py`` hosted the streaming ``MarkerParser`` of the
+in-loop LLM cognition path, and also DEFINED ``Event``/``MarkerEvent``.  But
 :mod:`reachy.motion.expression` — part of the ``apply_pose`` tool path that
-SURVIVES that deletion (used by ``reachy agent attach``) — imports
-``Event``/``MarkerEvent`` from ``reachy.speech.markers``.  If those types stay
-defined only in ``markers.py``, deleting it would break the surviving
-``expression``/``tools`` import chain.
+SURVIVES (used by ``reachy agent attach``) — needs those types.  Task t2
+therefore moved them into :mod:`reachy.speech.marker_events`, so that deleting
+``markers.py`` could not break the surviving ``expression``/``tools`` import
+chain.
 
-Acceptance criteria (from the task)
-------------------------------------
+Task t21 then deleted ``markers.py`` for real, together with the
+``--live`` composition root and the ``CognitionEngine`` it fed.  So the
+criteria below are no longer simulated — they are the live state of the tree:
+
 1. Importing ``reachy.speech.tools`` and ``reachy.motion.expression`` succeeds
-   with ``markers.py`` absent.
-2. ``Event``/``MarkerEvent`` keep their current shape; ``expression.py``
+   with ``markers.py`` genuinely absent (and neither pulls it in).
+2. ``Event``/``MarkerEvent`` keep their shape in their new home; ``expression.py``
    consumers are unchanged.
 
-Criterion 1 is proved with a **subprocess** probe (not an in-process
-``sys.modules`` eviction) — this repo's own lessons (see
+Criterion 1 is proved with a **subprocess** probe rather than an in-process
+``sys.modules`` eviction — this repo's own lessons (see
 ``reachy-sleep-mode-spec`` memory / ``test_speech_tools.py``) note that
-in-process module eviction pollutes sibling tests, so a fresh interpreter with
-a meta-path finder that raises for ``reachy.speech.markers`` specifically is
-used instead, simulating the file's absence without touching disk or
-``sys.modules`` in the test process itself.
+in-process module eviction pollutes sibling tests.
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ import subprocess  # nosec B404 — fixed-arg subprocess for an import-boundary 
 import sys
 
 import reachy.motion.expression as expression_mod
-import reachy.speech.markers as markers_mod
+import reachy.speech.marker_events as marker_events_mod
 import reachy.speech.tools as tools_mod
 
 # ---------------------------------------------------------------------------
@@ -75,28 +74,13 @@ def test_expression_module_does_not_import_markers_statically() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Criterion 1b — dynamic: a fresh interpreter with markers.py "absent"
-# (a meta-path finder raises for that one module name) can still import
-# reachy.speech.tools and reachy.motion.expression.
+# Criterion 1b — dynamic: a fresh interpreter imports reachy.speech.tools and
+# reachy.motion.expression with markers.py genuinely deleted, and neither drags
+# it back in.
 # ---------------------------------------------------------------------------
 
-_BLOCK_MARKERS_PROBE = """
+_IMPORT_PROBE = """
 import sys
-import importlib.abc
-
-
-class _BlockMarkers(importlib.abc.MetaPathFinder):
-    \"\"\"Simulate reachy/speech/markers.py being absent from disk.\"\"\"
-
-    def find_spec(self, name, path, target=None):
-        if name == "reachy.speech.markers":
-            raise ModuleNotFoundError(
-                f"No module named {name!r} (simulated absence for t2 probe)"
-            )
-        return None
-
-
-sys.meta_path.insert(0, _BlockMarkers())
 
 import reachy.motion.expression
 import reachy.speech.tools
@@ -115,42 +99,33 @@ print("ok")
 
 
 def test_expression_and_tools_import_with_markers_absent() -> None:
-    """Dynamic proof of criterion 1: block reachy.speech.markers in a fresh
-    subprocess interpreter and confirm reachy.motion.expression and
-    reachy.speech.tools still import successfully."""
+    """Dynamic proof of criterion 1: a fresh subprocess interpreter imports
+    reachy.motion.expression and reachy.speech.tools successfully with
+    markers.py deleted, and never pulls the deleted module in."""
     proc = subprocess.run(  # nosec B603 — fixed args, sys.executable, no shell
-        [sys.executable, "-c", _BLOCK_MARKERS_PROBE],
+        [sys.executable, "-c", _IMPORT_PROBE],
         capture_output=True,
         text=True,
         check=False,
     )
     assert proc.returncode == 0, (
-        f"import chain broke with markers.py simulated absent:\n"
+        f"import chain broke with markers.py absent:\n"
         f"stdout={proc.stdout!r}\nstderr={proc.stderr}"
     )
     assert proc.stdout.strip() == "ok"
 
 
-def test_expression_and_tools_import_fails_today_baseline_guard() -> None:
-    """Sanity guard on the probe itself: confirm that *without* the fix the
-    probe would indeed fail — i.e. some import in the chain really did
-    depend on reachy.speech.markers before this task, so the green result
-    above is meaningful and not a probe that always passes.
-
-    This test does not re-break the fix; it independently re-verifies (via a
-    second, harmless subprocess) that MarkerEvent as seen through
-    reachy.motion.expression is the SAME object as reachy.speech.markers's
-    export, i.e. the type was moved/re-exported rather than duplicated.
-    """
+def test_markers_module_is_gone() -> None:
+    """Guard on the probe above: markers.py really is deleted, so the green
+    result is meaningful and not a probe that would pass either way."""
     proc = subprocess.run(  # nosec B603 — fixed args, sys.executable, no shell
         [
             sys.executable,
             "-c",
             (
-                "import reachy.motion.expression as expr_mod, "
-                "reachy.speech.markers as markers_mod;"
-                "assert expr_mod.MarkerEvent is markers_mod.MarkerEvent, "
-                "'MarkerEvent must be the SAME class, not a duplicate';"
+                "import importlib.util;"
+                "assert importlib.util.find_spec('reachy.speech.markers') is None, "
+                "'reachy.speech.markers must be gone';"
                 "print('ok')"
             ),
         ],
@@ -163,25 +138,25 @@ def test_expression_and_tools_import_fails_today_baseline_guard() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Criterion 2 — shape/identity preserved: markers.py re-exports the SAME
-# class objects (not redefinitions), so isinstance checks across the two
-# import paths (reachy.speech.markers vs. the new home) keep working.
+# Criterion 2 — shape/identity preserved: marker_events.py holds the SAME
+# class objects the surviving consumers use (not redefinitions), so isinstance
+# checks across import paths keep working.
 # ---------------------------------------------------------------------------
 
 
-def test_marker_event_identity_preserved_across_markers_reexport() -> None:
-    """markers.MarkerEvent/SpeechEvent/Event must be the exact objects
-    expression.py (and any other surviving consumer) uses — a re-export,
+def test_marker_event_identity_preserved_in_new_home() -> None:
+    """marker_events.MarkerEvent/SpeechEvent/Event must be the exact objects
+    expression.py (and any other surviving consumer) uses — one definition,
     not a parallel redefinition."""
-    assert markers_mod.MarkerEvent is expression_mod.MarkerEvent
+    assert marker_events_mod.MarkerEvent is expression_mod.MarkerEvent
     # Event is a typing.Union alias; compare structurally as well as by
     # identity where the module chooses to bind the same alias object.
-    assert markers_mod.Event == expression_mod.Event
+    assert marker_events_mod.Event == expression_mod.Event
 
 
 def test_marker_event_shape_unchanged() -> None:
     """MarkerEvent keeps its current frozen-dataclass shape: emoji + kind."""
-    event = markers_mod.MarkerEvent(emoji="🤔")
+    event = marker_events_mod.MarkerEvent(emoji="🤔")
     assert event.emoji == "🤔"
     assert event.kind == "marker"
     # frozen: mutation raises.
@@ -195,7 +170,7 @@ def test_marker_event_shape_unchanged() -> None:
 
 def test_speech_event_shape_unchanged() -> None:
     """SpeechEvent keeps its current frozen-dataclass shape: text + kind."""
-    event = markers_mod.SpeechEvent(text="hello")
+    event = marker_events_mod.SpeechEvent(text="hello")
     assert event.text == "hello"
     assert event.kind == "speech"
 
@@ -214,8 +189,8 @@ def test_expression_producer_consumes_marker_events_unchanged() -> None:
     queue = _RecordingQueue()
     producer = expression_mod.ExpressionProducer(queue=queue)
     events = [
-        markers_mod.MarkerEvent(emoji="🤔"),
-        markers_mod.SpeechEvent(text="hello"),
+        marker_events_mod.MarkerEvent(emoji="🤔"),
+        marker_events_mod.SpeechEvent(text="hello"),
     ]
     moves = producer.consume(events)
     assert moves == 1

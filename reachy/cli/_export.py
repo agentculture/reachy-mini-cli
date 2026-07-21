@@ -1,6 +1,6 @@
 """Shared CLI helper: build the JSONL export sinks from CLI args.
 
-``listen run --live`` and ``agent attach`` expose the same ``--export`` /
+``agent attach`` and ``behavior engine run`` expose the same ``--export`` /
 ``--export-blocks`` pair and wire the *same* generic sink — a newline-delimited
 JSON event feed on stdout (``thinking`` / ``message`` / ``emotion`` blocks; see
 ``docs/export-schema.md``). The feed is format-agnostic by design: a reTerminal

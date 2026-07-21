@@ -14,7 +14,7 @@ decisions from the ``symbolic-runtime-70`` spec:
   only perception/decision events (``sense``/``rule``/``intent``/``motion`` — see
   :mod:`reachy.export.runtime`); it never carries a cognition block. The agent's
   *thinking/message/emotion* is a wholly separate feed, published here through the
-  **same** exporter ``listen run --live --export -`` uses
+  **same** shared exporter builder
   (:func:`reachy.cli._export.build_export_hook`), so the wire contract matches
   ``docs/export-schema.md``'s cognition feed exactly.
 
@@ -27,8 +27,8 @@ network):
   mapped to zero or more short first-person perception cues
   (:func:`_cues_for_runtime_event`) and accumulated in a
   :class:`_RuntimeCueBuffer` — a minimal ``snapshot()``-only buffer the tool-use
-  engine consumes exactly as it consumes the folded ``listen --live`` sense
-  buffer.
+  engine consumes exactly as it consumed the retired folded ``listen --live``
+  sense buffer.
 * **COGNITION** — an :class:`~reachy.speech.agent_turn.AgentTurnEngine` wired with
   a :class:`~reachy.speech.tools.ToolRegistry` carrying the four **intent tools**
   (:func:`reachy.speech.intent_tools.register_intent_tools`) so its actions are
@@ -58,8 +58,7 @@ Runtime-event → cue mapping (honest + documented)
 -------------------------------------------------
 Every runtime event is edge-triggered (published only when it changes), so the
 feed is naturally sparse — no per-tick flood. Each event maps to a concise
-perception cue reusing the same vocabulary the folded ``listen --live`` cognition
-path uses (:mod:`reachy.speech.events`):
+perception cue reusing the same vocabulary :mod:`reachy.speech.events` defines:
 
 * ``sense``  → ``"speech from the <dir>"`` / ``"loud sound <dir>"`` /
   ``"felt a <intensity> <touch> on the head"`` / ``"saw <name>"``.
@@ -99,7 +98,7 @@ _JSON_HELP = "Emit structured JSON."
 # Sound-direction band + loudness threshold — mirror reachy.speech.events'
 # DoA convention (0 = left, pi/2 = front, pi = right; ~15° "ahead" band) and its
 # loud-sound floor, so the agent's perception vocabulary matches the folded
-# listen --live cognition path exactly.
+# retired listen --live cognition path exactly.
 _AHEAD_BAND_RAD: float = 0.26
 _LOUD_RMS_THRESHOLD: float = 0.02
 
@@ -261,7 +260,7 @@ class _RuntimeCueBuffer:
     Satisfies the ``_BufferLike`` protocol the
     :class:`~reachy.speech.agent_turn.AgentTurnEngine` consumes (a single
     ``snapshot() -> list[SenseCue]``), so the tool-use engine drives it exactly as
-    it drives the folded ``listen --live`` sense buffer. Runtime events are pushed
+    it drove the retired folded ``listen --live`` sense buffer. Runtime events are pushed
     in via :meth:`feed_event`; :meth:`snapshot` atomically drains.
     """
 
@@ -291,7 +290,7 @@ class _RuntimeCueBuffer:
         """Append one forge self-extension lifecycle cue (the ``announce`` seam).
 
         Mirrors :meth:`reachy.speech.events.EventBuffer.feed_forge` — the method the
-        folded ``listen --live`` cognition path wires as
+        retired folded ``listen --live`` cognition path wired as
         :class:`~reachy.forge.activate.ForgeActivator`'s ``announce`` — so a skill the
         agent forged announces itself back as a perception ("learned a new skill:
         <name>") and the agent discovers on its next snapshot that it gained a tool.
@@ -644,7 +643,7 @@ def cmd_agent_attach(
     json_mode = bool(getattr(args, "json", False))
 
     # OUTPUT seam: the agent's OWN cognition feed (thinking/message/emotion), the
-    # SAME exporter ``listen --live`` uses — the wire contract matches the schema doc.
+    # The shared exporter builder — the wire contract matches the schema doc.
     export_hook = build_export_hook(args, stream=stream)
 
     # INPUT seam: runtime-event JSONL lines (a stream/FIFO/file, or '-' for stdin).

@@ -23,62 +23,34 @@ bring one up with ``reachy daemon start``.
 from __future__ import annotations
 
 import argparse
-import logging
-import math
 import os
 from typing import Callable
 
 import numpy as np
 
-from reachy.behavior.sense import DOA_TIMEOUT, DoaPoller, Sense, read_doa
+from reachy.behavior.sense import DOA_TIMEOUT, DoaPoller, read_doa
 from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
-from reachy.cli._errors import EXIT_USER_ERROR, CliError
-from reachy.cli._export import add_export_args, build_export_hook
+from reachy.cli._errors import CliError
 from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.motion import supervisor
-from reachy.motion.listen import ListenParams, ListenProducer, SampleHolder
-from reachy.motion.listen_hooks import HookChain
+from reachy.motion.listen import ListenParams, ListenProducer
 from reachy.motion.listen_pat import (
     LIVE_PRESS_THRESHOLD_DEG,
     LIVE_YAW_PRESS_THRESHOLD_DEG,
     WARMUP_SECONDS,
     PatHook,
 )
-from reachy.motion.listen_sleep import SleepHook
-from reachy.motion.listen_think import ThinkHook
-from reachy.motion.listen_transcribe import TranscribeHook
-from reachy.motion.listen_vision import VisionHook
 from reachy.motion.pat import PatDetector
 from reachy.motion.queue import MotionQueue
-from reachy.motion.sense_sample import SenseSample
 from reachy.motion.server import LoopHooks
 from reachy.motion.server import run as run_loop
 from reachy.motion.snap import SnapDetector
 from reachy.robot import add_robot_args, get_transport
-from reachy.speech.voice import VoiceEngine, resolve_voice_engine
-
-logger = logging.getLogger(__name__)
 
 _JSON_HELP = "Emit structured JSON."
 _CENTER = {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}
-
-# Self-mute window (seconds) after a spoken clip during which the TranscribeHook
-# discards captured audio, so the robot never transcribes its own TTS through the
-# shared USB audio device. Declared locally rather than imported from a speech
-# module, keeping this module free of a cross-command import that would pull the
-# cognition stack at import time; the runtime's speech actuator carries the same
-# documented default and the two are intended to agree.
-_DEFAULT_MUTE_AFTER_SPEAK = 2.5
-
-# --cognition: which folded-live cognition engine drives thinking. ``marker`` is
-# the established ``*emoji*``/``"speech"`` marker path (CognitionEngine); ``agent``
-# swaps in the tool-use AgentTurnEngine (speak/harmonics/apply_pose as LLM tool
-# calls) behind the SAME folded ThinkHook seam. Mirrors REACHY_VOICE_ENGINE.
-COGNITION_ENV = "REACHY_COGNITION"
-DEFAULT_COGNITION = "marker"
-_COGNITION_CHOICES = ("marker", "agent")
 
 _VERBS = [
     "listen run — run the sound-orienting loop in the foreground",
@@ -246,94 +218,6 @@ def _add_pat_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_live_arg(parser: argparse.ArgumentParser) -> None:
-    """The ``--live`` opt-in: fold ALL the senses into the one listen loop.
-
-    Off by default — bare ``listen run`` is exactly as today (sound-orient + the
-    single head-pat hook). With ``--live`` the loop additionally composes the
-    ``think`` cognition trigger, ``vision`` motion/light detection, and the
-    ``sleep`` decay→wake state machine — all four sense hooks ride the ONE SDK
-    media session and the ONE motion queue, arbitrated by the idle-interrupt
-    priority ``sleep > pat > think``. This is the "live mode" the boot service
-    runs. SDK transport only (the http profile has no audio/camera/pose).
-    """
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        dest="live",
-        default=False,
-        help="fold think + vision + sleep into the loop alongside sound-orient + pat "
-        "(sdk only; the mode the boot service runs).",
-    )
-    parser.add_argument(
-        "--transcribe",
-        action="store_true",
-        dest="transcribe",
-        default=False,
-        help="transcribe nearby speech (STT) and feed the WORDS into live cognition "
-        "(requires --live + sdk; off by default; the robot never transcribes its own "
-        "voice — a self-mute window after each spoken clip drops its own audio).",
-    )
-
-
-def _add_voice_engine_arg(parser: argparse.ArgumentParser) -> None:
-    """The ``--voice-engine`` opt-in: pick the folded live cognition's speech backend.
-
-    Selects between ``"tts"`` (default — the external Chatterbox HTTP speech engine,
-    :mod:`reachy.speech.tts`) and ``"harmonic"`` (in-process, fully offline melodic
-    gesture voice, :mod:`reachy.speech.harmonic`). The choice only matters inside the
-    folded live cognition loop, so — mirroring ``--export``/``--transcribe`` — it is
-    honoured ONLY with ``--live``; a bare ``--voice-engine`` is a clean exit-1 error
-    (see :func:`_resolve_voice_engine`). Left unset (``None``), it defers to
-    :func:`reachy.speech.voice.resolve_voice_engine`'s own fallback (the
-    ``REACHY_VOICE_ENGINE`` env var, then ``"tts"``), so a bare ``listen run --live``
-    with no flag stays behaviourally identical to before this feature.
-    """
-    parser.add_argument(
-        "--voice-engine",
-        choices=("tts", "harmonic"),
-        default=None,
-        dest="voice_engine",
-        help="folded live cognition speech backend: 'tts' (default; Chatterbox HTTP) "
-        "or 'harmonic' (in-process melodic gesture, fully offline); overrides "
-        "REACHY_VOICE_ENGINE (requires --live). In --cognition agent mode BOTH voices "
-        "are always available as tools, so this flag only affects --cognition marker.",
-    )
-
-
-def _add_cognition_arg(parser: argparse.ArgumentParser) -> None:
-    """The ``--cognition`` opt-in: pick the folded live cognition engine.
-
-    Selects between ``"marker"`` (default — the established ``*emoji*`` / ``"speech"``
-    marker path, :class:`~reachy.speech.cognition.CognitionEngine`) and ``"agent"``
-    (the tool-use engine, :class:`~reachy.speech.agent_turn.AgentTurnEngine`, which
-    acts through ``speak`` / ``harmonics`` / ``apply_pose`` LLM tool calls). The two
-    engines share the SAME folded :class:`~reachy.motion.listen_think.ThinkHook` seam,
-    the SAME shared :class:`~reachy.speech.events.EventBuffer`, and the SAME export
-    feed — so ``agent`` is a drop-in behind the seam with no new process and no second
-    media session. Mirroring ``--voice-engine`` / ``--transcribe`` / ``--export``, it
-    is honoured ONLY with ``--live``; a bare ``--cognition`` is a clean exit-1 error
-    (see :func:`_resolve_cognition`). Left unset (``None``), it defers to
-    ``REACHY_COGNITION`` then ``"marker"``.
-
-    Interplay with ``--voice-engine``: in ``agent`` mode the tool registry always
-    exposes BOTH the ``tts`` and ``harmonic`` voices as separate tools, so the agent
-    picks per utterance — ``--voice-engine`` there is inert (it keeps controlling only
-    the ``marker`` engine's single speech backend).
-    """
-    parser.add_argument(
-        "--cognition",
-        choices=_COGNITION_CHOICES,
-        default=None,
-        dest="cognition",
-        help="folded live cognition engine: 'marker' (default; the *emoji*/\"speech\" "
-        "marker path) or 'agent' (the tool-use engine — speak/harmonics/apply_pose as "
-        "LLM tool calls); overrides REACHY_COGNITION (requires --live). In 'agent' mode "
-        "BOTH voices are always available as tools, so --voice-engine affects only "
-        "'marker' mode.",
-    )
-
-
 # 1:1 ``(arg attr, ListenParams attr)`` flags: an unset CLI flag (``None``) keeps
 # the param's default. The genuinely special cases (--speed sets two fields,
 # --speech-only is a bool flag, --pat is a default-True toggle) are handled apart.
@@ -446,7 +330,6 @@ def _build_pat_hook(
     queue,
     *,
     busy_horizon: Callable[[], float] | None = None,
-    buffer: object | None = None,
 ) -> PatHook | None:
     """A :class:`PatHook` bound to the loop's queue, or ``None`` when pat is off.
 
@@ -465,15 +348,10 @@ def _build_pat_hook(
     (holds + sub-degree breaths, in flight ~90 % of wall time) is sensed straight
     through — a binary any-move gate starved detection entirely on the live robot.
 
-    ``buffer`` lets the ``--live`` composition pass the SAME shared cognition
-    :class:`~reachy.speech.events.EventBuffer` the folded ThinkHook/agent engine
-    consumes (built up front in :func:`_run_sdk_loop`, before this hook, so the one
-    object exists in time — see the ``--live`` wiring there). A detected pat then
-    feeds cognition directly via :meth:`~reachy.speech.events.EventBuffer.feed_pat`,
-    bypassing the ``--transcribe`` engagement gate entirely (that gate only judges
-    transcribed WORDS, see ``reachy/speech/engagement.py``). ``None`` (the default,
-    always the case outside ``--live``, where no cognition buffer exists) keeps the
-    hook byte-identical to before this feature.
+    The hook's optional cognition ``buffer`` seam (see
+    :class:`~reachy.motion.listen_pat.PatHook`) is deliberately *not* wired here:
+    the in-loop cognition engine it fed retired with the folded ``--live``
+    composition, so the loop's pat reflex is motion-only.
     """
     if not getattr(args, "pat", True):
         return None
@@ -495,271 +373,8 @@ def _build_pat_hook(
         queue,
         detector=PatDetector(**kw),
         busy_horizon=busy_horizon,
-        buffer=buffer,
         warmup=WARMUP_SECONDS,
     )
-
-
-def _build_think_hook(
-    provider: Callable[[], SenseSample | None],
-    *,
-    export: object | None = None,
-    buffer: object | None = None,
-    play_audio: object | None = None,
-    feed_doa_cues: bool = True,
-    voice_engine: VoiceEngine | None = None,
-) -> ThinkHook | None:
-    """A :class:`ThinkHook` driving cognition from the shared sample, or ``None``.
-
-    Builds a real :class:`~reachy.speech.cognition.CognitionEngine` over a shared
-    :class:`~reachy.speech.events.EventBuffer` and wires that *same* buffer into the
-    hook (the engine stores its buffer privately and does not expose it, so the
-    composition layer must pass it explicitly — see ``listen_think.ThinkHook``).
-    Construction is wrapped: if the cognition stack can't be assembled (e.g. the LLM
-    env isn't configured), we log once and return ``None`` so ``--live`` still runs
-    the other three senses — the loop must never die because cognition is absent.
-
-    The folded-live engine is built ``audio_optional=True``: a TTS/playback outage
-    degrades to "no speech" instead of killing the cognition worker (the bug where a
-    wedged TTS endpoint silently took down ``listen --live``'s thinking). When
-    ``export`` is an :class:`~reachy.export.exporter.ExportHook`, the engine also
-    emits the ``thinking`` / ``message`` / ``emotion`` JSONL feed — so the live loop
-    streams what the robot is thinking to any subscriber (a reTerminal panel, a log,
-    an audio renderer) over the one documented wire contract.
-
-    ``buffer`` lets the composition layer pass the *shared* cognition event buffer
-    so the optional :class:`~reachy.motion.listen_transcribe.TranscribeHook` can feed
-    transcribed words into the *same* buffer the engine consumes (``--transcribe``);
-    when ``None`` a fresh buffer is created internally. ``play_audio`` lets the layer
-    inject a self-mute-stamping playback wrapper so the engine and the transcribe
-    hook's mute window agree; when ``None`` the engine's default playback is used.
-
-    ``voice_engine`` is the resolved :class:`~reachy.speech.voice.VoiceEngine`
-    (``--voice-engine`` / ``REACHY_VOICE_ENGINE``, see :func:`_resolve_voice_engine`).
-    When given, its ``synthesize`` callable and an empty ``tts_kwargs`` are passed to
-    the engine explicitly — for the default ``"tts"`` engine this is the exact same
-    function object :class:`~reachy.speech.cognition.CognitionEngine` already defaults
-    to, so passing it is behaviourally byte-identical; for ``"harmonic"`` it swaps in
-    :func:`reachy.speech.harmonic.synthesize` with zero other engine changes. ``None``
-    (the default; only reachable from a direct test call, never from the CLI, which
-    always resolves an engine) skips the override entirely.
-    """
-    try:
-        # Imported lazily so a bare (no-LLM) live run, or a box without the speech
-        # deps configured, doesn't pull the cognition stack at module import time.
-        from reachy.speech.cognition import CognitionEngine
-        from reachy.speech.events import EventBuffer
-
-        buf = buffer if buffer is not None else EventBuffer()
-        engine_kwargs: dict[str, object] = {
-            "buffer": buf,
-            "export": export,
-            "audio_optional": True,
-        }
-        if play_audio is not None:
-            engine_kwargs["play_audio"] = play_audio
-        if voice_engine is not None:
-            engine_kwargs["synthesize"] = voice_engine.synthesize
-            engine_kwargs["tts_kwargs"] = {}
-        engine = CognitionEngine(**engine_kwargs)
-        return ThinkHook(provider, engine=engine, buffer=buf, feed_doa_cues=feed_doa_cues)
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "listen --live: cognition engine unavailable; think fold-in disabled", exc_info=True
-        )
-        return None
-
-
-def _build_agent_think_hook(
-    provider: Callable[[], SenseSample | None],
-    queue: MotionQueue,
-    *,
-    export: object | None = None,
-    buffer: object | None = None,
-    play_audio: object | None = None,
-    feed_doa_cues: bool = True,
-    describe_scene: Callable[[], str] | None = None,
-) -> ThinkHook | None:
-    """A :class:`ThinkHook` driving the tool-use agent engine, or ``None``.
-
-    The ``--cognition agent`` counterpart of :func:`_build_think_hook`: it builds a
-    :class:`~reachy.speech.agent_turn.AgentTurnEngine` (which exposes the *same*
-    ``.buffer`` / ``run(stop=...)`` surface as :class:`CognitionEngine`, so the
-    folded :class:`~reachy.motion.listen_think.ThinkHook` drives it unchanged) over a
-    :class:`~reachy.speech.tools.ToolRegistry` wired with the loop's REAL seams:
-
-    * ``express`` -> an :class:`~reachy.motion.expression.ExpressionProducer` bound to
-      the loop's ONE ``queue`` — so ``apply_pose`` tool calls enqueue on the SAME
-      serial :class:`~reachy.motion.queue.MotionQueue` every other sense hook uses (no
-      new motion channel);
-    * ``speak_engine`` / ``harmonic_engine`` -> ``resolve_voice_engine("tts")`` /
-      ``("harmonic")`` — BOTH voices are always available as tools regardless of
-      ``--voice-engine`` (that flag only affects the marker engine);
-    * ``play`` -> the injected ``play_audio`` seam, which is the SAME self-mute
-      wrapper ``--transcribe`` uses today (stamps the mute window the TranscribeHook
-      reads), so the robot never transcribes its own *tool*-spoken voice.
-
-    Like the marker engine it is built ``audio_optional=True`` (a wedged TTS degrades
-    to "no speech" instead of killing live thinking) and threads the SAME ``export``
-    hook (shared :func:`reachy.cli._export.build_export_hook` builder). ``buffer`` is
-    the shared cognition :class:`~reachy.speech.events.EventBuffer` (so a folded
-    TranscribeHook feeds the SAME buffer the engine consumes); ``feed_doa_cues`` is
-    threaded to the ThinkHook exactly as the marker path does (``False`` under
-    ``--transcribe`` — words-only cognition). ``describe_scene`` is the optional
-    on-demand scene-describe seam (see :func:`_build_describe_scene_seam`): when given
-    it is wired into the :class:`~reachy.speech.tools.ToolRegistry` so the agent gains
-    a ``describe_scene`` tool over the SAME describe path the periodic SceneHook uses;
-    ``None`` (no cv2 / bare install) simply omits the tool. Construction is guarded: if
-    the agent stack can't be assembled (e.g. no LLM env) we log once and return ``None``
-    so ``--live`` still runs the other senses.
-    """
-    try:
-        # Imported lazily (like _build_think_hook) so a bare live run doesn't pull the
-        # agent stack at module import time.
-        from reachy.motion.expression import ExpressionProducer
-        from reachy.speech.agent_turn import AgentTurnEngine
-        from reachy.speech.events import EventBuffer
-        from reachy.speech.playback import play_audio as _default_play_audio
-        from reachy.speech.tools import ToolRegistry
-        from reachy.speech.voice import resolve_voice_engine
-
-        buf = buffer if buffer is not None else EventBuffer()
-        # Build the reaction seams ONCE and share them between the built-in tools and the
-        # forged-skill ctx, so a forged skill's ctx.speak / ctx.express render through the
-        # SAME synth+play / express seams the speak / apply_pose tools use.
-        express_seam = ExpressionProducer(queue=queue).express
-        speak_engine = resolve_voice_engine("tts")
-        harmonic_engine = resolve_voice_engine("harmonic")
-        play_seam = play_audio if play_audio is not None else _default_play_audio
-        registry_kwargs: dict[str, object] = {
-            # apply_pose enqueues on the loop's ONE MotionQueue (same serial queue the
-            # other sense hooks drain), byte-for-byte the *emoji* marker path's action.
-            "express": express_seam,
-            # Both voices are tools side by side — --voice-engine does not gate them.
-            "speak_engine": speak_engine,
-            "harmonic_engine": harmonic_engine,
-        }
-        if play_audio is not None:
-            # The SAME self-mute-stamping wrapper the marker engine + TranscribeHook
-            # share, so a tool-spoken clip mutes the hook exactly like marker speech.
-            registry_kwargs["play"] = play_audio
-        if describe_scene is not None:
-            # The on-demand describe_scene tool — the same describe path the periodic
-            # SceneHook uses, over the shared VisionHook frame source. Omitted (tool
-            # not advertised) when cv2 is absent.
-            registry_kwargs["describe_scene"] = describe_scene
-
-        # The forge self-extension tool: a late-bound dispatch seam so the registry can be
-        # constructed with the `forge` tool listed BEFORE the ForgeClient (which needs the
-        # already-built registry, via the activator's register callback) exists. The seam
-        # dereferences the holder only at call time. Only advertised when the forge stack
-        # imports (like describe_scene, opt-in) — see _activate_forge for the activation
-        # side (auto-activation on stage + boot reload of active/).
-        forge_holder: list = []
-        if _forge_stack_available():
-
-            def _forge_seam(goal: str, improve: str | None = None) -> object:
-                if not forge_holder:
-                    return None
-                return forge_holder[0].dispatch(goal, improve=improve)
-
-            registry_kwargs["forge"] = _forge_seam
-
-        registry = ToolRegistry(**registry_kwargs)
-
-        if "forge" in registry_kwargs:
-            # After the registry exists: wire the activation subsystem + ForgeClient and
-            # arm the seam. Best-effort — a failure leaves cognition running (the forge
-            # tool degrades to an inert no-op, logged).
-            _activate_forge(
-                registry,
-                buf,
-                forge_holder,
-                express=express_seam,
-                speak_engine=speak_engine,
-                harmonic_engine=harmonic_engine,
-                play=play_seam,
-            )
-
-        engine = AgentTurnEngine(
-            buffer=buf,
-            registry=registry,
-            export=export,
-            audio_optional=True,
-        )
-        return ThinkHook(provider, engine=engine, buffer=buf, feed_doa_cues=feed_doa_cues)
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "listen --live --cognition agent: agent engine unavailable; think fold-in disabled",
-            exc_info=True,
-        )
-        return None
-
-
-def _forge_stack_available() -> bool:
-    """Whether the forge self-extension stack is importable (advertise the tool only if so)."""
-    try:
-        import reachy.forge  # noqa: F401
-    except Exception:  # noqa: BLE001
-        return False
-    return True
-
-
-def _activate_forge(
-    registry: object,
-    buffer: object,
-    holder: list,
-    *,
-    express: Callable[[str], object],
-    speak_engine: object,
-    harmonic_engine: object,
-    play: Callable[..., None],
-) -> None:
-    """Wire the forge auto-activation subsystem for the agent registry (best-effort).
-
-    Builds the restricted :class:`~reachy.forge.ForgedSkillContext` over the SAME seams the
-    built-in tools use, a register callback that HOT-registers a forged skill into the LIVE
-    ``registry``, a :class:`~reachy.forge.ForgeActivator` (validator-gated AUTO-activation
-    on ``forge/staged`` + boot reload of ``active/``), and a
-    :class:`~reachy.forge.ForgeClient` whose ``publish`` IS the activator. Finally arms the
-    late-bound dispatch seam by appending the client to ``holder``. The announce seam is the
-    shared cognition buffer's :meth:`~reachy.speech.events.EventBuffer.feed_forge` — kept a
-    plain callable, so the forge modules never import the event bus. A failure disables only
-    the forge tool; cognition keeps running.
-    """
-    try:
-        from reachy.forge import ForgeActivator, ForgeClient, build_ctx_seams
-        from reachy.forge.validator import DEFAULT_ALLOWED_CTX_ATTRS
-        from reachy.speech.tools import function_tool
-
-        def _register(name: str, description: str, parameters: dict, handler: object) -> None:
-            registry.register(
-                function_tool(
-                    name=name, description=description, parameters=parameters, handler=handler
-                )
-            )
-
-        ctx = build_ctx_seams(
-            speak_engine=speak_engine,
-            harmonic_engine=harmonic_engine,
-            play=play,
-            express=express,
-        )
-        announce = getattr(buffer, "feed_forge", None)
-        activator = ForgeActivator(register=_register, ctx=ctx, announce=announce)
-        # Boot reload: any active/<name> forged skill re-registers now (idempotent).
-        activator.reload_active()
-        holder.append(
-            ForgeClient(
-                publish=activator.publish,
-                allowed_ctx_attrs=set(DEFAULT_ALLOWED_CTX_ATTRS),
-            )
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "listen --live --cognition agent: forge subsystem unavailable; self-extension disabled",
-            exc_info=True,
-        )
 
 
 class _SessionBoundTransport:
@@ -802,599 +417,11 @@ class _SessionBoundTransport:
         return getattr(self._base, name)
 
 
-def _build_engagement_classifier() -> object | None:
-    """Build the LLM engagement classifier for the ``--transcribe`` gate, or ``None``.
-
-    The classifier judges *addressed-to-the-robot* vs *ambient* speech (issue #55).
-    It is constructed with the SAME LLM endpoint config the folded
-    :class:`~reachy.speech.cognition.CognitionEngine` uses: both leave
-    ``base_url`` / ``model`` / ``api_key`` unset so the underlying
-    :func:`reachy.speech.llm.complete` resolves the one ``REACHY_OPENAI_*`` endpoint
-    (the cognition engine resolves the *same* env via :func:`reachy.speech.llm`),
-    so the gate and cognition always hit the same backend — no separate config and
-    no new remote API surface. Construction does **no** network I/O.
-
-    Imported lazily (like :func:`_build_think_hook`) so a bare live run without the
-    speech stack configured doesn't pull the cognition modules at import time, and a
-    construction fault degrades to ``None`` (the gate then stays on the pure
-    :meth:`~reachy.motion.listen_transcribe.TranscribeHook._should_engage` heuristic).
-
-    When the ``REACHY_ENGAGE_HEURISTIC`` escape hatch is truthy the hook ignores any
-    injected classifier, so we skip building one entirely — saving the import and
-    keeping the path identical to the un-injected heuristic.
-    """
-    from reachy.motion.listen_transcribe import _env_truthy  # local: stdlib-only helper
-
-    if _env_truthy(os.environ.get("REACHY_ENGAGE_HEURISTIC")):
-        return None
-    try:
-        from reachy.speech.engagement import EngagementClassifier
-
-        # No base_url/model/api_key overrides → llm.complete resolves the same
-        # REACHY_OPENAI_* env the CognitionEngine's LLM client resolves.
-        return EngagementClassifier()
-    except Exception:  # noqa: BLE001 — a build fault must not disable hearing
-        logger.warning(
-            "listen --live --transcribe: engagement classifier unavailable; "
-            "gate stays on the heuristic",
-            exc_info=True,
-        )
-        return None
-
-
-def _build_transcribe_hook(
-    provider: Callable[[], SenseSample | None],
-    *,
-    buffer: object,
-    mute_until: Callable[[], float],
-    sample_rate: int | None = None,
-    classifier: object | None = None,
-    on_engage: Callable[[], None] | None = None,
-) -> TranscribeHook:
-    """A :class:`TranscribeHook` feeding STT words into the shared cognition buffer.
-
-    Wired to the *same* :class:`~reachy.speech.events.EventBuffer` the
-    :class:`~reachy.speech.cognition.CognitionEngine` consumes (so transcribed words
-    become cognition cues) and a real :class:`~reachy.speech.stt.Transcriber` (no
-    network I/O at construction). ``mute_until`` reads the shared self-mute window
-    the playback wrapper stamps, so the robot never transcribes its own TTS.
-    ``sample_rate`` is the REAL mic rate from the SDK session (``session.samplerate``)
-    so the WAV sent to STT is labelled correctly — a wrong rate makes STT return
-    nothing (the gap live-testing exposed); ``None`` falls back to the 16 kHz default.
-
-    ``classifier`` is the optional :class:`~reachy.speech.engagement.EngagementClassifier`
-    that runs the addressed-vs-ambient LLM gate (``None`` keeps the pure heuristic).
-    ``on_engage`` is the motion-ladder signal fired exactly when the gate ENGAGES —
-    the composition layer wires it to ``ListenProducer.set_engaged`` so an addressed
-    utterance latches one deliberate turn toward the speaker.
-    """
-    return TranscribeHook(
-        provider,
-        buffer=buffer,
-        mute_until=mute_until,
-        sample_rate=sample_rate,
-        classifier=classifier,
-        on_engage=on_engage,
-    )
-
-
-def _build_face_hook(
-    vision_hook: object,
-    buffer: object | None,
-    *,
-    clock: Callable[[], float] | None = None,
-) -> object | None:
-    """Build a FaceHook sharing VisionHook's frame source, or ``None`` when unavailable.
-
-    Face recognition needs the ``[vision]`` extra (opencv). When cv2 is not
-    importable — CI's bare install, the HTTP remote profile — the hook is skipped
-    with a single logged warning rather than crashing the loop (the same lazy-extra
-    degrade the other sense engines use). When available it lazily builds the real
-    :class:`~reachy.vision.face.FaceEngine` +
-    :class:`~reachy.vision.face_store.FaceStore` and wires (a) the SHARED cognition
-    ``buffer`` (so a recognised face reaches cognition via the same buffer PatHook /
-    the think engine consume) and (b) the SHARED frame source
-    ``vision_hook.latest_frame`` — the non-consuming peek at VisionHook's ONE
-    grabber, so face detection never opens a second camera grabber.
-    """
-    import importlib.util
-
-    if importlib.util.find_spec("cv2") is None:
-        logger.warning(
-            "listen --live: face recognition needs the [vision] extra (opencv); "
-            "skipping FaceHook (install: pip install 'reachy-mini-cli[vision]')"
-        )
-        return None
-    try:
-        from reachy.motion.listen_face import FaceHook
-        from reachy.vision.face import FaceEngine
-        from reachy.vision.face_store import FaceStore
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "listen --live: face recognition unavailable; skipping FaceHook", exc_info=True
-        )
-        return None
-
-    kwargs: dict[str, object] = {
-        "engine": FaceEngine(),
-        "store": FaceStore(),
-        "frame_provider": vision_hook.latest_frame,  # type: ignore[attr-defined]
-        "buffer": buffer,
-    }
-    if clock is not None:
-        kwargs["clock"] = clock
-    return FaceHook(**kwargs)
-
-
-def _build_scene_hook(
-    vision_hook: object,
-    buffer: object | None,
-    *,
-    clock: Callable[[], float] | None = None,
-) -> object | None:
-    """Build a SceneHook sharing VisionHook's frame source, or ``None`` when unavailable.
-
-    Periodic VLM scene description needs the ``[vision]`` extra (opencv, for the JPEG
-    encode). When cv2 is not importable — CI's bare install, the HTTP remote profile —
-    the hook is skipped with a single logged warning rather than crashing the loop (the
-    same lazy-extra degrade the other sense engines use). When available it builds a
-    :class:`~reachy.motion.listen_scene.SceneHook` (default describe seam:
-    :func:`reachy.vision.scene.describe_frame`) wired to (a) the SHARED cognition
-    ``buffer`` (so a described scene reaches cognition via the same buffer PatHook /
-    the think engine consume) and (b) the SHARED frame source
-    ``vision_hook.latest_frame`` — the non-consuming peek at VisionHook's ONE grabber,
-    so scene description never opens a second camera grabber.
-    """
-    import importlib.util
-
-    if importlib.util.find_spec("cv2") is None:
-        logger.warning(
-            "listen --live: scene description needs the [vision] extra (opencv); "
-            "skipping SceneHook (install: pip install 'reachy-mini-cli[vision]')"
-        )
-        return None
-    try:
-        from reachy.motion.listen_scene import SceneHook
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "listen --live: scene description unavailable; skipping SceneHook", exc_info=True
-        )
-        return None
-
-    kwargs: dict[str, object] = {
-        "frame_provider": vision_hook.latest_frame,  # type: ignore[attr-defined]
-        "buffer": buffer,
-    }
-    if clock is not None:
-        kwargs["clock"] = clock
-    return SceneHook(**kwargs)
-
-
-def _build_describe_scene_seam(vision_hook: object) -> Callable[[], str] | None:
-    """A zero-arg ``describe_scene() -> str`` seam over the shared frame source, or ``None``.
-
-    The on-demand counterpart of :func:`_build_scene_hook`'s periodic path: it captures
-    the SAME :func:`reachy.vision.scene.describe_frame` and the SAME non-consuming
-    VisionHook frame peek, so the ``describe_scene`` agent tool and the periodic
-    SceneHook are two consumers of one describe path (no second grabber, no second
-    implementation). Returns ``None`` when the ``[vision]`` extra is absent (the tool is
-    then simply not advertised — see :func:`_build_agent_think_hook`). The returned
-    callable grabs the latest shared frame each call; with no frame it returns a plain
-    sentinel string (a valid, honest description the agent can read), and a
-    :class:`~reachy.vision.scene.SceneError` from an unreachable VLM propagates to the
-    tool dispatch's error handling.
-    """
-    import importlib.util
-
-    if importlib.util.find_spec("cv2") is None:
-        return None
-    try:
-        from reachy.vision.scene import describe_frame
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "listen --live: describe_scene tool unavailable; not advertising it", exc_info=True
-        )
-        return None
-
-    frame_provider = vision_hook.latest_frame  # type: ignore[attr-defined]
-
-    def _describe() -> str:
-        frame = frame_provider()
-        if frame is None:
-            return "[no camera frame available]"
-        return describe_frame(frame)
-
-    return _describe
-
-
-def _build_live_hooks(
-    transport: object,
-    queue: MotionQueue,
-    provider: Callable[[], SenseSample | None],
-    pat_hook: PatHook | None,
-    *,
-    export: object | None = None,
-    transcribe: bool = False,
-    sample_rate: int | None = None,
-    clock: Callable[[], float] | None = None,
-    producer: object | None = None,
-    voice_engine: VoiceEngine | None = None,
-    cognition: str = DEFAULT_COGNITION,
-    buffer: object | None = None,
-) -> list[object]:
-    """Build the ``--live`` sense hooks in ``sleep > pat > think`` priority order.
-
-    The flag-arbitrated three lead in descending idle-interrupt priority (sleep
-    yields the head entirely, pat pauses the idle wander, think drops to a focused
-    breathe), then vision rides last (it competes for nothing the flags arbitrate).
-    All four share the loop's one ``queue`` and the one shared-sample ``provider``;
-    none opens its own audio/camera/pose — they ride the single SDK client the loop
-    owns. A hook whose optional stack is unavailable is simply omitted. The list is
-    handed to a :class:`~reachy.motion.listen_hooks.HookChain` as the loop's single
-    ``on_tick``. ``export`` (an :class:`~reachy.export.exporter.ExportHook` or
-    ``None``) is threaded into the think hook's engine to stream the cognition feed.
-
-    ``buffer`` is the shared cognition :class:`~reachy.speech.events.EventBuffer`
-    the caller (:func:`_run_sdk_loop`) builds up front, BEFORE constructing
-    ``pat_hook`` — so the SAME object is already threaded into ``pat_hook`` (via
-    :func:`_build_pat_hook`) by the time it reaches here. Passed straight through
-    as ``buffer=`` to :func:`_build_think_hook` / :func:`_build_agent_think_hook`
-    (whose own ``buf = buffer if buffer is not None else EventBuffer()`` fallback
-    means a caller that omits it, e.g. a direct unit-test call, still gets a fresh
-    buffer — just not one shared with ``pat_hook``). The result: a detected pat and
-    a folded cognition turn draw from the one buffer, so pat cues reach cognition
-    directly — no ``--transcribe``, no engagement gate (see ``buffer``'s own note
-    on :func:`_build_pat_hook`).
-
-    ``transcribe`` (the ``--transcribe`` opt-in) additionally composes a
-    :class:`~reachy.motion.listen_transcribe.TranscribeHook` that transcribes the
-    loop's shared per-tick audio and feeds the recognised **words** into the SAME
-    :class:`~reachy.speech.events.EventBuffer` the cognition engine (and, per above,
-    ``pat_hook``) consumes — wired into both the engine (via
-    :func:`_build_think_hook`) and the transcribe hook. It also creates the shared
-    self-mute window: a ``play_audio`` wrapper stamps ``mute["until"]`` after every
-    spoken clip and the transcribe hook's ``mute_until`` reads it, so the robot never
-    transcribes its own voice. If cognition is unavailable (no LLM env →
-    :func:`_build_think_hook` returns ``None``) there is no buffer to feed, so the
-    transcribe hook is skipped (logged once) and the loop still runs the rest.
-
-    Under ``transcribe`` the transcribe hook is also given (a) an
-    :class:`~reachy.speech.engagement.EngagementClassifier` (the LLM addressed-vs-ambient
-    gate, built with the SAME ``REACHY_OPENAI_*`` endpoint config as cognition — see
-    :func:`_build_engagement_classifier`) and (b) ``on_engage=producer.set_engaged``,
-    the motion-ladder signal. The result: an addressed/named utterance latches exactly
-    one deliberate turn toward the speaker's DoA (via the producer's one-shot engaged
-    latch) while ambient/dropped speech latches no turn at all (no barge-in). ``producer``
-    is the loop's :class:`~reachy.motion.listen.ListenProducer`; when it is ``None`` (or
-    has no ``set_engaged``) the engaged signal is simply not wired and the gate still
-    runs (words flow, no engaged turn). WITHOUT ``transcribe`` no classifier is built and
-    no engaged signal is wired — the off path is byte-identical to today.
-
-    ``voice_engine`` is the resolved :class:`~reachy.speech.voice.VoiceEngine`
-    (see :func:`_resolve_voice_engine`) selecting the folded cognition's speech
-    backend. It is threaded to BOTH the ``play_audio`` wrapper (so the self-mute
-    window is stamped from the clip's REAL duration at the engine's sample rate —
-    a fixed TTS-rate assumption would under/over-stamp a harmonic-rate clip) and
-    into :func:`_build_think_hook` (so the engine's ``synthesize`` matches). For
-    the default ``"tts"`` engine the wrapper's ``samplerate`` override is skipped
-    entirely, so playback + mute-stamping stay byte-identical to before this
-    feature; only ``"harmonic"`` threads a real override.
-
-    ``cognition`` (the ``--cognition`` choice — ``"marker"`` default or ``"agent"``)
-    selects which engine is built *behind the ThinkHook seam*: ``"marker"`` builds the
-    established :class:`~reachy.speech.cognition.CognitionEngine` (via
-    :func:`_build_think_hook`, byte-identical to before), ``"agent"`` builds the
-    tool-use :class:`~reachy.speech.agent_turn.AgentTurnEngine` (via
-    :func:`_build_agent_think_hook`) with the loop's ``queue`` wired into its
-    ``apply_pose`` tool. Everything else — the shared buffer, the self-mute play
-    wrapper, the TranscribeHook composition + engagement gate, the ordering — is
-    identical for both; only the engine object behind the seam differs.
-    """
-    if clock is None:
-        import time as _time
-
-        clock = _time.monotonic
-
-    sleep_hook = SleepHook(provider)
-    # ``buffer`` is the SAME shared cognition EventBuffer already threaded into
-    # pat_hook / the think/agent engine / (under --transcribe) the TranscribeHook —
-    # see this function's own docstring. A motion/light decision then feeds
-    # cognition directly too (coalesced; see reachy.motion.listen_vision's module
-    # docstring), the same way a detected pat already does.
-    vision_hook = VisionHook(queue=queue, transport=transport, buffer=buffer)
-    # Face recognition rides the SAME ONE grabber vision owns (frame_provider=
-    # vision_hook.latest_frame — a non-consuming peek, no second grabber) and feeds
-    # the SAME shared cognition buffer. Skipped (logged) when the [vision] extra is
-    # not importable, so a bare install / CI never crashes on a missing cv2.
-    face_hook = _build_face_hook(vision_hook, buffer, clock=clock)
-    # Periodic scene description rides that SAME ONE grabber too (frame_provider=
-    # vision_hook.latest_frame) and feeds the SAME shared cognition buffer. The
-    # on-demand describe_scene agent tool captures the SAME describe path over the SAME
-    # frame source (one shared describe path). Both are skipped when cv2 is absent.
-    scene_hook = _build_scene_hook(vision_hook, buffer, clock=clock)
-    describe_scene_seam = _build_describe_scene_seam(vision_hook)
-
-    # The shared cognition buffer (built by the caller, before pat_hook, and handed
-    # in as ``buffer``) + self-mute window live at composition level, so pat_hook
-    # and the optional TranscribeHook both feed the SAME buffer the engine consumes,
-    # and the transcribe hook reads the SAME mute window the playback wrapper stamps.
-    think_buffer: object | None = buffer
-    mute = {"until": 0.0}
-    # Only the non-default ("harmonic") engine gets an explicit samplerate override —
-    # the default "tts" engine's rate already matches _make_self_mute_play_audio's own
-    # hardcoded TTS-rate fallback, so leaving it unset keeps both the real playback
-    # call and the mute-duration math byte-identical to before this feature.
-    voice_samplerate = (
-        voice_engine.samplerate if voice_engine is not None and voice_engine.name != "tts" else None
-    )
-    # Always route --live cognition playback over HTTP to the daemon: speech plays
-    # through the daemon's mixer (proven to coexist with the loop's one SDK session)
-    # rather than opening a second ReachyMini client (single-SDK-owner). The wrapper
-    # also stamps the self-mute window the TranscribeHook reads after each spoken clip.
-    think_play_audio: object | None = _make_self_mute_play_audio(
-        mute, clock, playback_transport="http", samplerate=voice_samplerate
-    )
-
-    if transcribe and think_buffer is None:
-        # A caller that supplied ``buffer`` (the real --live path) already has one;
-        # this only fires for a direct call (e.g. a unit test) that asked for
-        # ``transcribe`` without pre-building a buffer — matches prior behaviour.
-        think_buffer = _make_shared_cognition_buffer()
-
-    # Under --transcribe, cognition is driven by transcribed WORDS only: the ThinkHook
-    # stops pushing raw DoA/RMS sound cues, so the robot doesn't react to its own TTS
-    # (a feedback loop) and stays quiet until someone actually speaks. Without
-    # --transcribe there are no transcripts, so DoA cues remain the cognition input.
-    # ``cognition`` selects the engine BEHIND the seam; the ``feed_doa_cues`` /
-    # play_audio / buffer / export wiring is identical for both engines.
-    if cognition == "agent":
-        think_hook: object | None = _build_agent_think_hook(
-            provider,
-            queue,
-            export=export,
-            buffer=think_buffer,
-            play_audio=think_play_audio,
-            feed_doa_cues=not transcribe,
-            describe_scene=describe_scene_seam,
-        )
-    else:
-        think_hook = _build_think_hook(
-            provider,
-            export=export,
-            buffer=think_buffer,
-            play_audio=think_play_audio,
-            feed_doa_cues=not transcribe,
-            voice_engine=voice_engine,
-        )
-
-    ordered: list[object] = [sleep_hook]
-    if pat_hook is not None:
-        ordered.append(pat_hook)
-    if think_hook is not None:
-        ordered.append(think_hook)
-
-    if transcribe:
-        transcribe_hook = _compose_transcribe_hook(
-            provider,
-            think_hook=think_hook,
-            mute=mute,
-            sample_rate=sample_rate,
-            producer=producer,
-        )
-        if transcribe_hook is not None:
-            ordered.append(transcribe_hook)
-
-    ordered.append(vision_hook)
-    # Face recognition rides last too — like vision it competes for nothing the
-    # ``*_active`` flags arbitrate. Omitted when the [vision] extra is unavailable.
-    if face_hook is not None:
-        ordered.append(face_hook)
-    # Periodic scene description rides last as well (it competes for nothing the flags
-    # arbitrate; its describe worker is off the tick thread). Omitted when cv2 is absent.
-    if scene_hook is not None:
-        ordered.append(scene_hook)
-    return ordered
-
-
-def _make_shared_cognition_buffer() -> object | None:
-    """The shared ``--live`` cognition :class:`~reachy.speech.events.EventBuffer`.
-
-    ``None`` if the module is unavailable. Built up front, at composition level
-    (:func:`_run_sdk_loop`, and — for a caller that skips that step — as a fallback
-    inside :func:`_build_live_hooks`), so the ONE object can be wired into
-    ``pat_hook`` (:func:`_build_pat_hook`), the think/agent engine
-    (:func:`_build_think_hook` / :func:`_build_agent_think_hook`), and — under
-    ``--transcribe`` — the TranscribeHook.
-    """
-    try:
-        from reachy.speech.events import EventBuffer
-
-        return EventBuffer()
-    except Exception:  # noqa: BLE001
-        logger.warning("listen --live: shared EventBuffer unavailable", exc_info=True)
-        return None
-
-
-def _compose_transcribe_hook(
-    provider: Callable[[], SenseSample | None],
-    *,
-    think_hook: object | None,
-    mute: dict[str, float],
-    sample_rate: int | None,
-    producer: object | None,
-) -> object | None:
-    """Compose the ``--transcribe`` hook against the ThinkHook's REAL buffer.
-
-    The transcribe hook feeds the buffer the ThinkHook's engine consumes — the
-    buffer the hook was actually built with (it may differ if the shared buffer
-    was ``None`` and the hook built its own). If cognition is unavailable
-    entirely (no ThinkHook) there is no buffer to feed, so transcription is
-    skipped gracefully (logged once) and ``None`` is returned.
-
-    The engagement gate (addressed-vs-ambient LLM classifier) + the
-    motion-ladder engaged signal are built ONLY here, under ``--transcribe``.
-    The classifier shares cognition's ``REACHY_OPENAI_*`` endpoint; ``on_engage``
-    is the producer's one-shot turn latch — fired only when the gate ENGAGES,
-    so ambient speech never latches a barge-in turn.
-    """
-    feed_buffer = getattr(think_hook, "_buffer", None) if think_hook is not None else None
-    if feed_buffer is None:
-        logger.warning(
-            "listen --live --transcribe: cognition unavailable; no buffer to feed "
-            "transcribed words into — transcription disabled this run"
-        )
-        return None
-    classifier = _build_engagement_classifier()
-    on_engage = getattr(producer, "set_engaged", None) if producer is not None else None
-    return _build_transcribe_hook(
-        provider,
-        buffer=feed_buffer,
-        mute_until=lambda: mute["until"],
-        sample_rate=sample_rate,
-        classifier=classifier,
-        on_engage=on_engage,
-    )
-
-
-def _make_self_mute_play_audio(
-    mute: dict[str, float],
-    clock: Callable[[], float],
-    *,
-    mute_after: float | None = None,
-    playback_transport: str | None = None,
-    samplerate: int | None = None,
-) -> Callable[..., None]:
-    """Wrap the real playback so each clip stamps the shared self-mute window.
-
-    The returned callable plays the PCM (via :func:`reachy.speech.playback.play_audio`)
-    and then stamps ``mute["until"] = clock() + mute_after`` so the TranscribeHook
-    (reading ``mute_until=lambda: mute["until"]``) drops any audio captured while —
-    and just after — the robot speaks. The
-    default ``mute_after`` is the documented ``_DEFAULT_MUTE_AFTER_SPEAK`` (2.5 s).
-
-    ``playback_transport`` (e.g. ``"http"``) is injected as ``transport=`` into the
-    playback call unless the caller already set one. ``--live`` passes ``"http"`` so
-    cognition speech plays through the daemon's mixer — which coexists with the loop's
-    one open SDK session — instead of opening a *second* ``ReachyMini`` client (the
-    single-SDK-owner model; see ``CLAUDE.md``).
-
-    ``samplerate`` (the active :class:`~reachy.speech.voice.VoiceEngine`'s rate, e.g.
-    16000 for the harmonic voice) is injected as ``samplerate=`` into the playback
-    call the SAME way — unless the caller already set one — and is ALSO the rate the
-    mute-duration math below converts the clip's byte length with, so the mute window
-    reflects the clip's REAL duration regardless of which engine rendered it. ``None``
-    (the default) keeps today's behaviour exactly: no ``samplerate`` kwarg is injected
-    into the playback call, and the duration math falls back to the hardcoded TTS
-    default (:data:`reachy.speech.tts.DEFAULT_SAMPLE_RATE`) — so the default ``"tts"``
-    voice engine's playback + mute stamping stay byte-identical to before this feature.
-    """
-    after = _DEFAULT_MUTE_AFTER_SPEAK if mute_after is None else max(0.0, float(mute_after))
-
-    def _guarded_play(pcm: bytes, **kwargs: object) -> None:
-        from reachy.speech.playback import play_audio as _play
-
-        _default_kwarg(kwargs, "transport", playback_transport)
-        _default_kwarg(kwargs, "samplerate", samplerate)
-        _play(pcm, **kwargs)
-        if after > 0:
-            _stamp_mute_window(mute, clock, pcm, samplerate=samplerate, after=after)
-
-    return _guarded_play
-
-
-def _default_kwarg(kwargs: dict[str, object], key: str, value: object | None) -> None:
-    """Inject ``key=value`` into a playback call's kwargs unless the caller set one."""
-    if value is not None and key not in kwargs:
-        kwargs[key] = value
-
-
-def _stamp_mute_window(
-    mute: dict[str, float],
-    clock: Callable[[], float],
-    pcm: bytes,
-    *,
-    samplerate: int | None,
-    after: float,
-) -> None:
-    """Advance ``mute["until"]`` past this clip's REAL duration plus the margin.
-
-    Playback may be async (HTTP play_sound returns before the audio finishes),
-    so a fixed pad alone would expire mid-utterance and let the robot
-    transcribe its own (long) voice — a slower feedback loop. Base the window
-    on the audio length so the whole utterance is covered; ``samplerate=None``
-    falls back to the hardcoded TTS default rate.
-    """
-    from reachy.speech.tts import DEFAULT_SAMPLE_RATE
-
-    rate = float(samplerate if samplerate is not None else (DEFAULT_SAMPLE_RATE or 24000))
-    clip_seconds = len(pcm) / (2.0 * rate) if rate > 0 else 0.0
-    mute["until"] = clock() + clip_seconds + after
-
-
-def _build_sample_tap(
-    holder: SampleHolder,
-    poller: DoaPoller,
-    audio: Callable[[float], tuple[bool, bool | None]],
-    audio_rms: dict[str, object],
-    *,
-    transcribe: bool = False,
-) -> tuple[Callable[[float], Sense], Callable[[float], tuple[bool, bool | None]]]:
-    """Wrap the loop's sense/audio taps so each tick publishes a shared SenseSample.
-
-    The loop reads ONE mic chunk per tick — inside ``audio(t)`` (the loop's
-    ``_audio``), which computes snap/sound_present AND stashes that chunk's loudness
-    into ``audio_rms`` (and, under ``--transcribe``, the raw float32 chunk itself,
-    next to the rms). We reuse those exact values here rather than re-reading the
-    session (a second ``get_audio_sample()`` would consume a *different* chunk,
-    desyncing the stored RMS from the snap decision and dropping half the audio).
-    ``server.run`` calls ``audio(t)`` then ``sense(t)`` each tick, so the audio
-    wrapper records this tick's snap and the sense wrapper (running second)
-    assembles the full :class:`SenseSample` from the same chunk and publishes it.
-
-    ``transcribe`` gates whether the raw chunk rides on :attr:`SenseSample.audio`:
-    only when ``--transcribe`` is on does the sense tap copy the chunk ``_audio``
-    already pulled (``audio_rms["audio"]``) onto the sample, so the STT hook can
-    transcribe it. When off, :attr:`SenseSample.audio` stays ``None`` — there is no
-    second read and the off path is byte-identical to today.
-    """
-    last: dict[str, bool | None] = {"snap": False, "sound_present": None}
-
-    def _audio_tap(t: float) -> tuple[bool, bool | None]:
-        snap, sound_present = audio(t)  # reads the chunk ONCE; stashes rms in audio_rms
-        last["snap"] = bool(snap)
-        last["sound_present"] = sound_present
-        return snap, sound_present
-
-    def _sense_tap(t: float) -> Sense:
-        sense = poller(t)
-        doa_deg = None if sense.doa_angle is None else math.degrees(sense.doa_angle)
-        # Only ride the raw chunk onto the sample when transcription is on; the
-        # chunk was already read by _audio this tick (no second get_audio_sample()).
-        raw_audio = audio_rms.get("audio") if transcribe else None
-        holder.update(
-            SenseSample(
-                rms=float(audio_rms["rms"]),  # type: ignore[arg-type]
-                doa=doa_deg,
-                speech=bool(sense.speech_detected) or bool(last["snap"]),
-                ts=t,
-                audio=raw_audio,  # type: ignore[arg-type]
-            )
-        )
-        return sense
-
-    return _sense_tap, _audio_tap
-
-
 def _run_sdk_loop(
     transport: object,
     producer: ListenProducer,
     args: argparse.Namespace,
     on_action: Callable[[object], None],
-    *,
-    export: object | None = None,
-    transcribe: bool = False,
-    voice_engine: VoiceEngine | None = None,
-    cognition: str = DEFAULT_COGNITION,
 ) -> int:
     """Drive the loop over an open SDK media session (real DoA + mic-audio loudness).
 
@@ -1403,26 +430,6 @@ def _run_sdk_loop(
     ``on_tick`` seam, reading the head pose back through the *same* SDK client the
     loop owns. On a detected pat it enqueues a lean→nuzzle→settle gesture and raises
     the ``pat_active`` flag (so the idle wander yields).
-
-    Under ``--live`` it composes ALL four sense hooks into ONE
-    :class:`~reachy.motion.listen_hooks.HookChain` (the loop's single ``on_tick``):
-    ``sleep > pat > think`` by idle-interrupt priority, plus vision. The loop opens
-    ONE media session and every hook rides it via the shared-sample provider — no
-    hook opens a second single-consumer session (see the single-SDK-owner model in
-    ``CLAUDE.md``). ``voice_engine`` (see :func:`_resolve_voice_engine`) is threaded
-    into the live composition only — it selects the folded cognition's speech
-    backend and is ignored entirely outside ``--live``. ``cognition`` (see
-    :func:`_resolve_cognition`) selects the folded engine behind the ThinkHook seam
-    (``"marker"`` default, ``"agent"`` for the tool-use engine); it is likewise a
-    live-only choice.
-
-    Under ``--live`` the shared cognition :class:`~reachy.speech.events.EventBuffer`
-    is built here, BEFORE ``pat_hook`` (:func:`_build_pat_hook` needs it at
-    construction time), and handed to both ``pat_hook`` and :func:`_build_live_hooks`
-    (which threads it on into the think/agent engine and, under ``--transcribe``,
-    the TranscribeHook) — so a detected pat lands in the exact buffer cognition
-    consumes, no engagement gate involved. Outside ``--live`` no buffer is built and
-    ``pat_hook`` is constructed exactly as before (``buffer=None``).
     """
     snap_kwargs: dict[str, float] = {}
     if getattr(args, "snap_ratio", None) is not None:
@@ -1434,83 +441,31 @@ def _run_sdk_loop(
     # (only on large commanded jumps) to ride out a look/turn's transit unsensed.
     # Shared object: run_loop writes it, the horizon closure below reads it.
     busy: dict[str, float] = {"until": 0.0}
-    live = getattr(args, "live", False)
-    # Built BEFORE pat_hook (below) so the SAME buffer object can be threaded into
-    # it — see this function's docstring and _build_pat_hook's ``buffer`` note.
-    # Non-live never builds one: pat_hook there stays buffer=None, unchanged.
-    cognition_buffer = _make_shared_cognition_buffer() if live else None
-    pat_hook = _build_pat_hook(
-        args,
-        transport,
-        queue,
-        busy_horizon=lambda: busy["until"],
-        buffer=cognition_buffer,
-    )
-    holder = SampleHolder()
+    pat_hook = _build_pat_hook(args, transport, queue, busy_horizon=lambda: busy["until"])
     with transport.media_session() as session:  # type: ignore[attr-defined]
         # Per-tick pose / move / frame reads ride the ONE open client (issue #51).
         loop_transport = _SessionBoundTransport(transport, session)
         poller = DoaPoller(read=lambda: read_doa(session, timeout=DOA_TIMEOUT))
         detector = SnapDetector(**snap_kwargs)
-        # The ONE mic chunk read per tick; _audio stashes its loudness here so the
-        # --live sample tap reuses it instead of reading a second (different) chunk.
-        # Under --transcribe the SAME read also retains the raw chunk (audio_rms[
-        # "audio"]) so the STT hook transcribes the exact chunk — still ONE read.
-        audio_rms: dict[str, object] = {"rms": 0.0, "audio": None}
 
         def _audio(_t: float) -> tuple[bool, bool | None]:
             sample = session.get_audio_sample()
             if sample is None:
-                audio_rms["rms"] = 0.0
-                audio_rms["audio"] = None
                 return (False, None)
             rms = float(np.sqrt(np.mean(sample**2)))
-            audio_rms["rms"] = rms
-            # Retain the raw chunk for the transcribe hook only when transcribing —
-            # the same single read; when off this stays None (no STT input, byte-
-            # identical off path).
-            audio_rms["audio"] = sample if transcribe else None
             return (detector.feed(sample), rms > detector.min_rms)
-
-        # --live composes all four sense hooks into one HookChain *and* taps the
-        # loop's per-tick reading into the shared-sample holder the audio hooks read.
-        # The default keeps the established single-PatHook on_tick and the bare
-        # sense/audio taps byte-for-byte (no chain, no holder tap, no extra read).
-        if live:
-            sense_tap, audio_tap = _build_sample_tap(
-                holder, poller, _audio, audio_rms, transcribe=transcribe
-            )
-            hooks_list = _build_live_hooks(
-                loop_transport,
-                queue,
-                holder.provider,
-                pat_hook,
-                export=export,
-                transcribe=transcribe,
-                sample_rate=getattr(session, "samplerate", None),
-                producer=producer,
-                voice_engine=voice_engine,
-                cognition=cognition,
-                buffer=cognition_buffer,
-            )
-            on_tick: object = HookChain(hooks_list)
-        else:
-            sense_tap, audio_tap = poller, _audio
-            on_tick = pat_hook
 
         try:
             return run_loop(
                 loop_transport,
                 producer,
-                hooks=LoopHooks(
-                    sense=sense_tap, audio=audio_tap, on_action=on_action, on_tick=on_tick
-                ),
+                hooks=LoopHooks(sense=poller, audio=_audio, on_action=on_action, on_tick=pat_hook),
                 queue=queue,
                 max_ticks=args.max_ticks,
                 busy=busy,
             )
         finally:
-            close = getattr(on_tick, "close", None)
+            close = getattr(pat_hook, "close", None)
             if close is not None:
                 close()
 
@@ -1531,200 +486,31 @@ def _run_http_loop(
     )
 
 
-def _resolve_export_hook(args: argparse.Namespace) -> object | None:
-    """Build the ``--export`` hook (or ``None``), requiring ``--live`` for it.
-
-    A bare ``--export`` (no ``--live``) is a clean exit-1 user error — the feed
-    carries cognition blocks only the folded live loop produces. This runs *before*
-    ``get_transport`` so the combo error fires regardless of whether the sdk extra
-    is installed (the tests rely on this ordering).
-    """
-    export_hook = build_export_hook(args)
-    if export_hook is not None and not getattr(args, "live", False):
-        raise CliError(
-            code=EXIT_USER_ERROR,
-            message="--export needs --live",
-            remediation="the export feed carries cognition blocks, which only the "
-            "folded live loop produces; add --live (it runs on the sdk transport)",
-        )
-    return export_hook
-
-
-def _require_export_transport(export_hook: object | None, transport: object) -> None:
-    """The cognition feed needs the sdk media session; the http profile can't fold it."""
-    if export_hook is not None and not hasattr(transport, "media_session"):
-        raise CliError(
-            code=EXIT_USER_ERROR,
-            message="--export/--live require the sdk transport",
-            remediation="run with --transport sdk (the default); the http profile has "
-            "no media session to fold cognition into",
-        )
-
-
-def _resolve_transcribe(args: argparse.Namespace) -> bool:
-    """Whether to fold STT transcription in, requiring ``--live`` for it.
-
-    A bare ``--transcribe`` (no ``--live``) is a clean exit-1 user error — the
-    transcribed words are only useful when there is a folded cognition buffer to
-    feed, which only the live loop builds. This mirrors ``_resolve_export_hook``
-    and runs *before* ``get_transport`` so the combo error fires regardless of
-    whether the sdk extra is installed (the tests rely on this ordering).
-    """
-    transcribe = bool(getattr(args, "transcribe", False))
-    if transcribe and not getattr(args, "live", False):
-        raise CliError(
-            code=EXIT_USER_ERROR,
-            message="--transcribe needs --live",
-            remediation="transcription feeds words into the folded live cognition "
-            "buffer, which only --live builds; add --live (it runs on the sdk transport)",
-        )
-    return transcribe
-
-
-def _require_transcribe_transport(transcribe: bool, transport: object) -> None:
-    """STT transcription needs the sdk media session; the http profile has no mic."""
-    if transcribe and not hasattr(transport, "media_session"):
-        raise CliError(
-            code=EXIT_USER_ERROR,
-            message="--transcribe requires the sdk transport",
-            remediation="run with --transport sdk (the default); the http profile has "
-            "no mic audio to transcribe",
-        )
-
-
-def _resolve_voice_engine(args: argparse.Namespace) -> VoiceEngine:
-    """Resolve the ``--voice-engine`` choice, requiring ``--live`` for the explicit flag.
-
-    A bare ``--voice-engine`` (no ``--live``) is a clean exit-1 user error — the
-    engine only selects the folded live cognition's speech backend, which only
-    ``--live`` builds. This mirrors ``_resolve_export_hook`` / ``_resolve_transcribe``
-    and runs *before* ``get_transport`` so the combo error fires regardless of
-    whether the sdk extra is installed (the tests rely on this ordering).
-
-    Unlike ``export``/``transcribe`` (which are booleans, off by default), a voice
-    engine is ALWAYS resolved — :func:`reachy.speech.voice.resolve_voice_engine`
-    falls back through the ``REACHY_VOICE_ENGINE`` env var to ``"tts"`` when no
-    explicit choice is given, so the return value is never ``None``. The resolved
-    engine is simply unused downstream when ``--live`` is not set.
-    """
-    explicit = getattr(args, "voice_engine", None)
-    if explicit is not None and not getattr(args, "live", False):
-        raise CliError(
-            code=EXIT_USER_ERROR,
-            message="--voice-engine needs --live",
-            remediation="the voice engine selects the folded live cognition's speech "
-            "backend, which only --live builds; add --live (it runs on the sdk "
-            "transport)",
-        )
-    return resolve_voice_engine(explicit)
-
-
-def _resolve_cognition(args: argparse.Namespace) -> str:
-    """Resolve the ``--cognition`` choice, requiring ``--live`` for the explicit flag.
-
-    A bare ``--cognition`` (no ``--live``) is a clean exit-1 user error — the engine
-    only selects the folded live loop's thinking backend, which only ``--live``
-    builds. This mirrors ``_resolve_voice_engine`` / ``_resolve_transcribe`` and runs
-    *before* ``get_transport`` so the combo error fires regardless of whether the sdk
-    extra is installed (the tests rely on this ordering).
-
-    Resolution order mirrors :func:`reachy.speech.voice.resolve_voice_engine`: the
-    explicit flag > the ``REACHY_COGNITION`` env var > the ``"marker"`` default. An
-    unknown value (only reachable through the env var — argparse's ``choices=`` guards
-    the flag) is a clean exit-1 error, like an unknown voice engine.
-    """
-    explicit = getattr(args, "cognition", None)
-    if explicit is not None and not getattr(args, "live", False):
-        raise CliError(
-            code=EXIT_USER_ERROR,
-            message="--cognition needs --live",
-            remediation="the cognition engine selects the folded live loop's thinking "
-            "backend, which only --live builds; add --live (it runs on the sdk "
-            "transport)",
-        )
-    resolved = explicit or os.environ.get(COGNITION_ENV) or DEFAULT_COGNITION
-    if resolved not in _COGNITION_CHOICES:
-        valid = ", ".join(_COGNITION_CHOICES)
-        raise CliError(
-            code=EXIT_USER_ERROR,
-            message=f"unknown cognition engine: {resolved!r}",
-            remediation=f"choose one of: {valid}",
-        )
-    return resolved
-
-
-def _orienting_banner(
-    transport: object,
-    params: object,
-    *,
-    live: bool,
-    exporting: bool,
-    voice_engine: VoiceEngine | None = None,
-    cognition: str = DEFAULT_COGNITION,
-) -> str:
+def _orienting_banner(transport: object, params: object) -> str:
     """The one-line '[listen] orienting…' preflight banner (stderr)."""
-    voice_note = ""
-    if live and voice_engine is not None:
-        voice_note = f" (voice: {voice_engine.name})"
-    # Only the non-default agent engine gets a banner note, so the marker (default)
-    # live banner is unchanged.
-    cognition_note = " (cognition: agent)" if live and cognition == "agent" else ""
     return (
         f"[listen] orienting to sound via {transport.name}: dwell={params.dwell:g}s "
         f"hold={params.hold:g}s speed={params.alert_speed:g}deg/s"
-        f"{' (speech only)' if params.speech_only else ''}"
-        f"{' (live: think/vision/sleep folded in)' if live else ''}"
-        f"{cognition_note}"
-        f"{voice_note}"
-        f"{' [export: stdout]' if exporting else ''}; Ctrl-C to stop"
+        f"{' (speech only)' if params.speech_only else ''}; Ctrl-C to stop"
     )
 
 
 def cmd_listen_run(args: argparse.Namespace) -> int:
     install_logging(getattr(args, "log_level", None))
     json_mode = bool(getattr(args, "json", False))
-    # Export sink (None unless `--export -`) and the --transcribe opt-in. Both are
-    # validated *before* get_transport so a bad combo (e.g. --transcribe without
-    # --live) is a clean exit-1 error regardless of whether the sdk extra is
-    # installed (the tests rely on this ordering).
-    export_hook = _resolve_export_hook(args)
-    transcribe = _resolve_transcribe(args)
-    voice_engine = _resolve_voice_engine(args)
-    cognition = _resolve_cognition(args)
     transport = get_transport(args)
-    _require_export_transport(export_hook, transport)
-    _require_transcribe_transport(transcribe, transport)
     params = _params_from_args(args)
-    if transcribe:
-        # In the words-only live mode the head must NOT swing toward every sound
-        # (it should turn only on its name) — and suppressing the large Tier-2
-        # escalate-turns also sidesteps the SDK goto fault they can trip. Tier-1
-        # antenna lean still reacts to sound.
-        params.turn_enabled = False
     producer = ListenProducer(params)
-    # When exporting, stdout is reserved for the pure JSONL feed: every banner,
-    # action line, and summary goes to stderr regardless of --json.
-    exporting = export_hook is not None
-    text_diagnostics = (not json_mode) or exporting
 
     # Preflight: ease to center. Validates the transport (a dead daemon raises a
     # clean CliError → tidy exit) and gives the loop a known starting pose.
     transport.move_goto(head=dict(_CENTER), duration=0.8, interpolation="minjerk")
-    if text_diagnostics:
-        emit_diagnostic(
-            _orienting_banner(
-                transport,
-                params,
-                live=getattr(args, "live", False),
-                exporting=exporting,
-                voice_engine=voice_engine,
-                cognition=cognition,
-            )
-        )
+    if not json_mode:
+        emit_diagnostic(_orienting_banner(transport, params))
 
     def _on_action(action) -> None:
         yaw = action.head.get("yaw") if action.head else None
-        if json_mode and not exporting:
+        if json_mode:
             emit_result(
                 {"action": action.label, "yaw": yaw, "duration": round(action.duration, 3)},
                 json_mode=True,
@@ -1735,16 +521,7 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
     # SDK profile streams real DoA + mic loudness through a media session; the HTTP/remote
     # profile polls transport.doa() with no audio source.
     if hasattr(transport, "media_session"):
-        ticks = _run_sdk_loop(
-            transport,
-            producer,
-            args,
-            _on_action,
-            export=export_hook,
-            transcribe=transcribe,
-            voice_engine=voice_engine,
-            cognition=cognition,
-        )
+        ticks = _run_sdk_loop(transport, producer, args, _on_action)
     else:
         ticks = _run_http_loop(transport, producer, args, _on_action)
 
@@ -1753,7 +530,7 @@ def cmd_listen_run(args: argparse.Namespace) -> int:
         transport.move_goto(head=dict(_CENTER), duration=0.8, interpolation="minjerk")
     except CliError:
         pass
-    if text_diagnostics:
+    if not json_mode:
         emit_diagnostic(f"[listen] stopped after {ticks} tick(s)")
     return 0
 
@@ -1805,10 +582,6 @@ def _register_run(noun_sub: argparse._SubParsersAction) -> None:
     run.set_defaults(transport=os.environ.get("REACHY_TRANSPORT", "sdk"))
     _add_tuning_args(run)
     _add_pat_args(run)
-    _add_live_arg(run)
-    _add_voice_engine_arg(run)
-    _add_cognition_arg(run)
-    add_export_args(run)
     add_log_level_arg(run)
     run.add_argument(
         "--max-ticks",
