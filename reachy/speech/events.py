@@ -26,11 +26,11 @@ Four feed methods accept values that callers read from hardware/daemons:
   cues like ``"felt a gentle scratch on the head"``.
 
 * :meth:`EventBuffer.feed_face` — the name of a recognised (known, named) face
-  from :class:`~reachy.motion.listen_face.FaceHook`.  Produces cues like
+  from a face sense.  Produces cues like
   ``"saw Ada"``.  An unknown/empty name yields no cue.
 
 * :meth:`EventBuffer.feed_scene` — a VLM scene description from
-  :class:`~reachy.motion.listen_scene.SceneHook` (or the ``describe_scene`` agent
+  the retired periodic scene hook (or the ``describe_scene`` agent
   tool).  Produces cues like ``"noticed: a person waving at the desk"``.  An
   empty/whitespace description yields no cue.
 
@@ -386,7 +386,7 @@ class EventBuffer:
         ----------
         name:
             The name of the matched permanent-tier face, as reported by
-            :class:`~reachy.motion.listen_face.FaceHook`
+            a face sense
             (:class:`~reachy.vision.face_store.FaceMatch.name`).  Stripped of
             surrounding whitespace.
 
@@ -408,7 +408,7 @@ class EventBuffer:
         ----------
         text:
             The scene description produced by :func:`reachy.vision.scene.describe_frame`
-            (via :class:`~reachy.motion.listen_scene.SceneHook` or the
+            (via the retired periodic scene hook or the
             ``describe_scene`` agent tool).  Stripped of surrounding whitespace.
 
         Cue rules

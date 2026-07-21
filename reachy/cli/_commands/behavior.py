@@ -39,16 +39,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
-import time
+import threading
 from pathlib import Path
 from typing import Callable
 
 from reachy import senselog
-from reachy.behavior import control, library, reload_driver
+from reachy.behavior import control, library, liveness, reload_driver
 from reachy.behavior import rules as rules_mod
 from reachy.behavior import supervisor
+from reachy.behavior.audio_pump import AudioPump
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.excited_motion_probe import CUES as PROBE_CUES
@@ -59,6 +61,7 @@ from reachy.behavior.excited_motion_probe import (
     ProbeNamespaceGuard,
     SharedPoseReader,
 )
+from reachy.behavior.face_sense import FaceSenseDriver, build_face_recognition
 from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
 from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
@@ -73,11 +76,36 @@ from reachy.behavior.pat_sense import (
     PatSenseDriver,
 )
 from reachy.behavior.pose_feed import LastPoseHolder
+from reachy.behavior.rms_background import (
+    DEFAULT_SILENCE_FLOOR,
+    DEFAULT_WINDOW_S,
+    SILENCE_FLOOR_ENV,
+    WINDOW_S_ENV,
+    RmsBackground,
+)
+from reachy.behavior.rms_sense import DEFAULT_MOVING_FLOOR, MOVING_FLOOR_ENV, make_rms_providers
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
-from reachy.behavior.sense import DoaPoller, SenseProviders, read_doa, read_perception
+from reachy.behavior.self_motion import (
+    DEFAULT_EPS_DEG,
+    DEFAULT_EPS_MM,
+    DEFAULT_TAIL_S,
+    EPS_DEG_ENV,
+    EPS_MM_ENV,
+    TAIL_S_ENV,
+    SelfMotionDriver,
+)
+from reachy.behavior.sense import (
+    FED_SENSE_FIELDS,
+    DoaPoller,
+    SenseProviders,
+    read_doa,
+    read_perception,
+)
+from reachy.behavior.speech_act import SpeechActuator
 from reachy.behavior.tick_metrics import TickMetrics, budget_from_hz
+from reachy.behavior.transcript_sense import TranscriptSenseDriver
 from reachy.cli._commands._robot import add_robot_args, emit_payload, get_transport, noun_overview
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
@@ -87,18 +115,20 @@ from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.runtime import SenseSnapshotDriver
 from reachy.motion.pat import PatDetector
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, INTERPOLATIONS
+from reachy.robot.media_client import HeldMediaClient
 from reachy.robot.state_reader import HeldStateReader
+from reachy.speech.distinctness import find_too_similar as _find_too_similar
+from reachy.speech.expressions import NEUTRAL_KEY, Catalog
+
+logger = logging.getLogger(__name__)
 
 _JSON_HELP = "Emit structured JSON."
 _EMPTY_SUBMITTED = "(submitted)"
 _AWAIT_TIMEOUT_HELP = "Seconds to wait for the engine to confirm (default: 1.0)."
 _CLASSES = tuple(c.value for c in StopClass)
-_PROBE_HEARTBEAT_TTL_S = 2.0
-#: How far into the future a heartbeat may sit and still count as live. Engine
-#: writes `round(now, 3)`, so a stamp read back microseconds later can be up to
-#: 0.5ms ahead; this window absorbs that (and any small cross-process jitter)
-#: without letting a monotonic-clock reset masquerade as a live engine.
-_PROBE_HEARTBEAT_SKEW_S = 1.0
+#: The heartbeat freshness/skew windows now live in
+#: :mod:`reachy.behavior.liveness`, shared with the foreground ``pat run`` /
+#: ``sleep run`` refusal, so both surfaces agree on when an engine is live.
 
 #: The six head axes a goto may target, in the order ``goto_intent.HEAD_AXES`` /
 #: ``move goto``'s own ``_HEAD_KEYS`` use — flag names match the GotoSpec payload's
@@ -116,6 +146,7 @@ _VERBS = [
     "spool, the same path a live agent uses",
     "behavior rules — render the loaded rules.toml (react/inhibit rules, modes)",
     "behavior rules check — validate rules.toml (a linter; exit 0 unless unreadable)",
+    "behavior expressions — list the expression pose catalog (and 'expressions check')",
     "behavior engine start — start the 50 Hz engine in the background",
     "behavior engine stop — stop the engine (eases the robot to neutral)",
     "behavior engine status — engine process + daemon reachability",
@@ -448,6 +479,12 @@ def _rule_payload(rule: rules_mod.Rule) -> dict[str, object]:
     if rule.kind == rules_mod.KIND_REACT:
         data["run"] = rule.behavior
         data["params"] = dict(rule.params)
+        # Both react-only fields, reported even when unset (a stable key set
+        # beats a shape that changes per rule). `say` especially: an operator
+        # reading this verb is asking "what will my robot do", and the words it
+        # is about to speak are the loudest part of that answer.
+        data["duration_s"] = rule.duration_s
+        data["say"] = rule.say
     else:
         data["disable"] = sorted(rule.disable)
     return data
@@ -463,7 +500,16 @@ def _rules_config_payload(config: rules_mod.RulesConfig, *, path: Path, exists: 
         "modes": {name: dict(mode.params) for name, mode in config.modes.items()},
     }
     if not exists:
-        payload["note"] = "no rules file yet — nothing configured"
+        # "No overlay" stopped meaning "no rules" when the release began
+        # shipping defaults (t15): the rules listed above are real and running,
+        # they just came from the package rather than from this path. Saying
+        # "nothing configured" next to three listed rules would read as a bug.
+        shipped = len(config.react) + len(config.inhibit)
+        payload["note"] = (
+            f"no box-local rules file yet — showing the {shipped} shipped default rule(s)"
+            if shipped
+            else "no rules file yet — nothing configured"
+        )
     return payload
 
 
@@ -485,10 +531,99 @@ def cmd_rules_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _unfed_field_warnings(config: rules_mod.RulesConfig) -> list[str]:
+    """Warn on every rule predicate keyed to a sense field nothing feeds.
+
+    ``reachy.behavior.rules.SENSE_FIELDS`` accepts more predicate fields than
+    the current engine composition (``_compose_run_seam``, above) actually
+    wires a live provider for — see
+    ``reachy.behavior.sense.FED_SENSE_FIELDS``, the one declared source of
+    truth this function reads. A rule keyed on a field outside that set
+    validates cleanly (the schema only checks the field NAME is a known one)
+    and then silently never fires — exactly the class of silent no-op
+    ``reachy.senselog``'s "a drop always names its reason" discipline exists
+    to prevent. This is a LINT finding, not a validation failure: the rule is
+    well-formed, just currently inert, so it is reported as a warning (see
+    ``cmd_rules_check``) and never a reason to reject the file.
+
+    Checks both react and inhibit rules, in file order, so an operator sees
+    every offending rule at once rather than one-at-a-time across repeated
+    edits.
+    """
+    warnings: list[str] = []
+    sections = ((rules_mod.KIND_REACT, config.react), (rules_mod.KIND_INHIBIT, config.inhibit))
+    for kind, rules in sections:
+        for index, rule in enumerate(rules):
+            field = rule.when.field
+            if field in FED_SENSE_FIELDS:
+                continue
+            warnings.append(
+                f"{kind}[{index}] (id={rule.id!r}) is keyed on sense field {field!r}, but "
+                "nothing in the current composition feeds it — this rule will validate "
+                "cleanly but can never fire (fields currently fed: "
+                f"{', '.join(sorted(FED_SENSE_FIELDS))})"
+            )
+    return warnings
+
+
+def _uncorroborated_field_warnings(config: rules_mod.RulesConfig) -> list[str]:
+    """Warn on every rule keyed on a sense field too noisy to stand alone.
+
+    The sibling of ``_unfed_field_warnings``, and the same class of finding: a
+    rule that is schema-valid and yet empirically wrong. Where that one catches
+    a predicate that can NEVER fire, this catches one that fires far too OFTEN —
+    ``speech_detected`` measured true 45.8 % of the time in a quiet room with
+    nobody speaking, with an uncorrelated bearing
+    (``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 2).
+    ``reachy.behavior.rules.UNCORROBORATED_SENSE_FIELDS`` is the one declared
+    source of truth this reads.
+
+    Why a WARNING and not a fail-closed refusal
+    ===========================================
+    The repo's refusal precedent (``goto_intent``'s out-of-range axis, a react
+    rule's unbounded looping lifetime) covers defects with a RUNAWAY actuator an
+    operator cannot recover from — the incident behind the bounded-lifetime rule
+    was a head that oscillated until stopped by hand. This is not that: a
+    ``speech``-keyed rule is already bounded twice over, by ``cooldown_s`` on
+    firing rate and by the ``duration_s`` the lifetime invariant forces onto any
+    looping behavior. The failure is a nuisance, not a runaway.
+
+    Against that, a load-time refusal would be actively unsafe HERE: rules are
+    loaded by the boot-persistent runtime, so shipping one would turn an
+    upgrade into a robot whose presence refuses to start over a rule that had
+    been working — failing closed on the whole presence to fix a noisy
+    predicate. And because a rule carries exactly one predicate, refusal would
+    be indistinguishable from removing ``speech`` from
+    ``reachy.behavior.rules.SENSE_FIELDS``; that is a product decision to take
+    deliberately, not a side effect of a lint.
+
+    The SHIPPED layer gets the hard treatment instead, where it belongs — it is
+    ours, it reaches every robot on upgrade, and no one runs a linter when it
+    does. ``tests/test_behavior_rules_cli.py`` pins it, so a future task that
+    ships such a rule fails CI rather than a deployment.
+    """
+    warnings: list[str] = []
+    sections = ((rules_mod.KIND_REACT, config.react), (rules_mod.KIND_INHIBIT, config.inhibit))
+    for kind, rules in sections:
+        for index, rule in enumerate(rules):
+            field = rule.when.field
+            if field not in rules_mod.UNCORROBORATED_SENSE_FIELDS:
+                continue
+            warnings.append(
+                f"{kind}[{index}] (id={rule.id!r}) is keyed on bare sense field {field!r}, "
+                f"which measured true {rules_mod.UNCORROBORATED_AT_REST_RATE} at rest — "
+                "this rule will validate cleanly and then fire on roughly a coin flip. "
+                "A rule carries exactly one predicate, so pair it with a corroborating "
+                "signal instead by keying on one of: "
+                f"{', '.join(rules_mod.CORROBORATING_SENSE_FIELDS)}"
+            )
+    return warnings
+
+
 def _rules_check_payload(
     path: Path, *, reader: Callable[[Path], str] | None = None
 ) -> dict[str, object]:
-    """Validate *path*; returns ``{ok, path, exists, reasons, counts}`` — a report.
+    """Validate *path*; returns ``{ok, path, exists, reasons, warnings, counts}``.
 
     Mirrors ``think expressions check``'s exit-0-warnings idiom: a malformed or
     missing rules file is a CONTENT problem, not an I/O failure — missing
@@ -500,6 +635,14 @@ def _rules_check_payload(
     — this is a linter, not a gate, so content issues never abort the command,
     but the file being physically unreadable is an environment fact, not a
     content one.
+
+    ``warnings`` (t16) additively reports every rule keyed to a sense field
+    nothing currently feeds (see ``_unfed_field_warnings``) — a rule can be
+    schema-valid (``reasons`` empty) yet still earn a warning, since "well
+    formed" and "wired to something live" are different questions. ``ok`` folds
+    BOTH signals, mirroring ``think expressions check``'s ``ok = not flagged``:
+    ``True`` only when the file is both valid and every predicate is fed. This
+    never changes the exit code — a warning is a warning, not a gate.
 
     ``reader`` is an injection seam for tests (default: ``Path.read_text``) so
     an I/O failure can be simulated deterministically with no OS-level
@@ -519,12 +662,20 @@ def _rules_check_payload(
     try:
         config = rules_mod.load_rules(path)
     except CliError as err:
-        return {"ok": False, "path": str(path), "exists": exists, "reasons": [err.message]}
+        return {
+            "ok": False,
+            "path": str(path),
+            "exists": exists,
+            "reasons": [err.message],
+            "warnings": [],
+        }
+    warnings = _unfed_field_warnings(config) + _uncorroborated_field_warnings(config)
     return {
-        "ok": True,
+        "ok": not warnings,
         "path": str(path),
         "exists": exists,
         "reasons": [],
+        "warnings": warnings,
         "counts": {
             "react": len(config.react),
             "inhibit": len(config.inhibit),
@@ -534,10 +685,10 @@ def _rules_check_payload(
 
 
 def cmd_rules_check(args: argparse.Namespace) -> int:
-    """Lint ``rules.toml``: a malformed file reports ``ok=False`` but still exits 0
-    (a warning, not a gate — mirrors ``think expressions check``). Only an actual
-    I/O failure on an existing path is a clean exit-2 (via ``CliError``, handled
-    by ``_dispatch``).
+    """Lint ``rules.toml``: a malformed file, or a rule keyed to a sense field
+    nothing feeds, reports ``ok=False`` but still exits 0 (a warning, not a gate
+    — mirrors ``think expressions check``). Only an actual I/O failure on an
+    existing path is a clean exit-2 (via ``CliError``, handled by ``_dispatch``).
     """
     json_mode = bool(getattr(args, "json", False))
     payload = _rules_check_payload(rules_mod.default_rules_path())
@@ -566,6 +717,11 @@ def cmd_rules_overview(args: argparse.Namespace) -> int:
                     "a missing rules file is not an error — 'no rules configured yet'",
                     "'rules check' is a linter: a malformed file reports ok=false but "
                     "still exits 0; only an unreadable path is a clean exit-2",
+                    "'rules check' also warns (ok=false, exit 0) on a rule keyed to a "
+                    "sense field nothing currently feeds — it validates but can never fire",
+                    "'rules check' likewise warns on a rule keyed on bare 'speech', which "
+                    "measured 45.8% true in a quiet room — pair it with a corroborating "
+                    "signal (transcript/rms_ratio/rms/pat/face) instead",
                 ],
             },
         ],
@@ -580,6 +736,134 @@ def _rules_no_verb(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# expressions sub-noun — the pose catalog + distinctness check (t18)          #
+# --------------------------------------------------------------------------- #
+#
+# Ported from the retired `think expressions` sub-noun, which went with the
+# rest of the LLM-cognition `think` noun (t20). The catalog itself
+# (`reachy.speech.expressions`, backed by `expressions.toml`) and the
+# distinctness check (`reachy.speech.distinctness`) are NOT LLM-coupled — a
+# TOML table and a geometric distance function — and stayed needed
+# afterward: `reachy.speech.tools`'s `apply_pose` tool (kept by `agent
+# attach`) imports the catalog directly. So the data survives, and `behavior`
+# is now its ONE CLI inspection surface — the surviving presence noun, which
+# already hosts a sibling sub-noun (`rules`, just above) in exactly this
+# "render + lint a file, no running engine needed" shape.
+
+_EXPRESSIONS_VERBS = [
+    "expressions / expressions list — list the expression catalog (emoji + pose descriptor)",
+    "expressions check — flag catalog poses too similar to be distinct",
+    "expressions overview — this summary",
+]
+
+
+def _expression_emojis(catalog: Catalog | None = None) -> list[str]:
+    """The catalog's expression emojis (every key except the neutral fallback)."""
+    cat = catalog if catalog is not None else Catalog()
+    return [key for key in cat.keys() if key != NEUTRAL_KEY]
+
+
+def _pose_descriptor(catalog: Catalog, emoji: str) -> str:
+    """A short, generated descriptor of an emoji's pose (its non-zero axes).
+
+    The catalog is pose values only (the TOML's prose lives in comments, which
+    ``tomllib`` drops), so we summarise the pose itself — the non-zero axes and
+    their signed magnitudes — giving an agent a machine-stable, catalog-derived
+    descriptor without duplicating the TOML comments in code.
+    """
+    pose = catalog.get(emoji)
+    axes = [
+        ("head_x", pose.head_x),
+        ("head_y", pose.head_y),
+        ("head_z", pose.head_z),
+        ("head_roll", pose.head_roll),
+        ("head_pitch", pose.head_pitch),
+        ("head_yaw", pose.head_yaw),
+        ("antenna_right", pose.antenna_right),
+        ("antenna_left", pose.antenna_left),
+        ("body_yaw", pose.body_yaw),
+    ]
+    moved = [f"{name}{value:+g}" for name, value in axes if value]
+    return ", ".join(moved) if moved else "neutral (no offset)"
+
+
+def cmd_expressions_list(args: argparse.Namespace) -> int:
+    """List the expression catalog: each emoji + a short pose descriptor."""
+    catalog = Catalog()
+    rows = [
+        {"emoji": emoji, "descriptor": _pose_descriptor(catalog, emoji)}
+        for emoji in _expression_emojis(catalog)
+    ]
+    if bool(getattr(args, "json", False)):
+        emit_result({"expressions": rows}, json_mode=True)
+    else:
+        lines = [f"{row['emoji']}  {row['descriptor']}" for row in rows]
+        emit_result("\n".join(lines), json_mode=False)
+    return 0
+
+
+def cmd_expressions_check(args: argparse.Namespace) -> int:
+    """Run the distinctness check; report flagged pairs (clean check exits 0).
+
+    A flagged pair is a *warning*, not an error — the catalog still works — so
+    the exit code stays 0; the ``--json`` ``ok`` field is the machine-readable
+    signal (mirrors ``behavior rules check``'s exit-0-warnings idiom).
+    """
+    catalog = Catalog()
+    flagged = _find_too_similar(catalog)
+    ok = not flagged
+    if bool(getattr(args, "json", False)):
+        emit_result(
+            {"ok": ok, "flagged": [[a, b, score] for a, b, score in flagged]},
+            json_mode=True,
+        )
+    else:
+        if ok:
+            emit_result("clean — all expressions are sufficiently distinct", json_mode=False)
+        else:
+            lines = [f"{a} ~ {b} (distance {score:.3f})" for a, b, score in flagged]
+            emit_result(
+                "too similar (" + str(len(flagged)) + " pair(s)):\n" + "\n".join(lines),
+                json_mode=False,
+            )
+    return 0
+
+
+def cmd_expressions_overview(args: argparse.Namespace) -> int:
+    emit_overview(
+        "reachy-mini-cli behavior expressions",
+        [
+            {
+                "title": "What",
+                "items": [
+                    "The emoji-keyed expression pose catalog (loaded from "
+                    "expressions.toml) that agent tool-use's apply_pose drives.",
+                    "list — every catalog emoji + a generated pose descriptor.",
+                    "check — flags catalog poses too similar to be meaningfully " "distinct.",
+                    "These verbs read the catalog file directly — no running " "engine needed.",
+                ],
+            },
+            {"title": "Verbs", "items": list(_EXPRESSIONS_VERBS)},
+            {
+                "title": "Conventions",
+                "items": [
+                    "every command supports --json",
+                    "results to stdout, diagnostics to stderr (never mixed)",
+                    "a flagged 'check' is a warning, not an error — exit stays 0",
+                ],
+            },
+        ],
+        json_mode=bool(getattr(args, "json", False)),
+    )
+    return 0
+
+
+def _expressions_no_verb(args: argparse.Namespace) -> int:
+    # Bare `behavior expressions` lists the catalog (mirrors `behavior rules`).
+    return cmd_expressions_list(args)
+
+
+# --------------------------------------------------------------------------- #
 # rules tick-seam composition (boot resilience)                               #
 # --------------------------------------------------------------------------- #
 
@@ -587,23 +871,29 @@ def _rules_no_verb(args: argparse.Namespace) -> int:
 def _boot_tick_seam() -> reload_driver.ReloadDriver | None:
     """Build the ``behavior engine run`` tick seam, resiliently.
 
-    Loads the default rules file (``RulesLoader.reload()``, see
-    ``reachy.behavior.rules``) exactly once at boot. ``RulesLoader.reload()``
-    never raises a ``CliError`` itself — a MISSING rules file resolves to an
-    empty, inert config (nothing configured yet, not a rejection) — but on a
-    PRESENT, malformed file it keeps the loader's last-good config (here: the
-    all-empty default, since this is the first load) and records why in
+    Loads the rules (``RulesLoader.reload()``, see ``reachy.behavior.rules``)
+    exactly once at boot — both layers: the SHIPPED package resource and the
+    box-local overlay layered over it. ``RulesLoader.reload()`` never raises a
+    ``CliError`` itself — a MISSING overlay resolves to the shipped layer alone
+    (nothing configured locally yet, not a rejection) — but on a PRESENT,
+    malformed overlay it keeps the loader's last-good config (here: the shipped
+    layer, since this is the first load) and records why in
     ``loader.last_error``.
 
     On a rejection this logs exactly one ``[SENSE stage=rule source=rules
     event=boot]`` drop line naming every reason (the validator's own message,
-    which itself enumerates every offending field/id/value it found) and
-    returns ``None`` — the caller installs NO tick seam at all, so the engine
-    runs bare base presence (``feel-alive`` only, no rule seam): an operator's
-    typo in ``rules.toml`` must degrade gracefully, never crash the process
-    (which would otherwise feed a systemd ``Restart=on-failure`` crash loop).
+    which itself enumerates every offending field/id/value it found), and then
+    degrades as far as it can — never crashing the process (which would
+    otherwise feed a systemd ``Restart=on-failure`` crash loop):
 
-    On success (including "no rules file yet") returns a ready
+    * when the fallback config still holds rules (the shipped layer), the seam
+      IS installed and the robot keeps its shipped reactions — an operator's
+      typo in their own overlay must not cost them the defaults as well;
+    * when there is genuinely nothing left to run, this returns ``None`` and
+      the caller installs NO tick seam at all, so the engine runs bare base
+      presence (``feel-alive`` only, no rule seam).
+
+    On success (including "no overlay yet") returns a ready
     :class:`~reachy.behavior.reload_driver.ReloadDriver`, which serves both rule
     evaluation and any later ``behavior reload`` for the life of this run.
     """
@@ -611,8 +901,9 @@ def _boot_tick_seam() -> reload_driver.ReloadDriver | None:
     loader.reload()
     if loader.last_error is not None:
         senselog.drop(RULE_STAGE, "rules", "boot", loader.last_error)
-        return None
-    return reload_driver.ReloadDriver(loader)
+        if not (loader.current.react or loader.current.inhibit):
+            return None
+    return reload_driver.ReloadDriver(loader, param_overrides=_behavior_param_overrides())
 
 
 # --------------------------------------------------------------------------- #
@@ -853,25 +1144,435 @@ def _pat_detector() -> PatDetector | None:
     )
 
 
+def _make_self_motion() -> SelfMotionDriver:
+    """Build the self-motion latch (#95), honouring its env tuning.
+
+    Reads :data:`~reachy.behavior.self_motion.TAIL_S_ENV` /
+    :data:`~reachy.behavior.self_motion.EPS_DEG_ENV` /
+    :data:`~reachy.behavior.self_motion.EPS_MM_ENV` at composition time — the
+    same read-at-composition pattern as the ``REACHY_PAT_*`` knobs above — so
+    an operator who never sets any of them composes a driver at the shipped
+    defaults, and the driver module itself stays environment-free.
+    """
+    return SelfMotionDriver(
+        eps_deg=_pat_float_env(EPS_DEG_ENV, DEFAULT_EPS_DEG),
+        eps_mm=_pat_float_env(EPS_MM_ENV, DEFAULT_EPS_MM),
+        tail_s=_pat_float_env(TAIL_S_ENV, DEFAULT_TAIL_S),
+    )
+
+
+def _rms_moving_floor() -> float:
+    """Resolve the moving rms floor (#95), or its infinite shipped default.
+
+    Deliberately NOT :func:`_pat_float_env`: that helper refuses ``inf`` (a
+    non-finite tuning value is never valid for the pat filters), while here
+    INFINITY is the shipped default — full suppression while moving — and the
+    string ``"inf"`` must round-trip as an explicit operator choice. Only
+    ``nan`` and negatives are refused (fail-closed as a clean user error,
+    matching the CLI's malformed-env contract).
+    """
+    raw = os.environ.get(MOVING_FLOOR_ENV)
+    if raw is None:
+        return DEFAULT_MOVING_FLOOR
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid {MOVING_FLOOR_ENV}={raw!r} (expected a number or 'inf')",
+            remediation=f"set {MOVING_FLOOR_ENV} to a number or 'inf', or unset it",
+        ) from exc
+    if math.isnan(value) or value < 0.0:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"invalid {MOVING_FLOOR_ENV}={raw!r} (expected a non-negative number)",
+            remediation=f"set {MOVING_FLOOR_ENV} to zero or more (or 'inf'), or unset it",
+        )
+    return value
+
+
+#: ``REACHY_*`` env name -> the ``orient-to-sound`` knob it tunes. The three d6
+#: admission knobs, and only those: the ratio that earns the antenna lean, and
+#: the LOUD/ONGOING pair that promotes to a head turn. Every other orient knob
+#: stays rules-file-only — a box tunes admission, a rules file states behavior.
+_ORIENT_PARAM_ENV: dict[str, str] = {
+    "REACHY_ORIENT_RMS_RATIO": "rms_ratio",
+    "REACHY_ORIENT_RMS_RATIO_LOUD": "rms_ratio_loud",
+    "REACHY_ORIENT_SUSTAIN_S": "sustain_s",
+}
+
+
+def _behavior_param_overrides() -> dict[str, dict[str, float]]:
+    """Resolve the ``REACHY_ORIENT_*`` knobs into a rule-engine param overlay.
+
+    Read at COMPOSITION time (the same pattern as ``REACHY_PAT_*`` /
+    ``REACHY_SELF_MOVING_*`` / :func:`_rms_background`), so
+    :mod:`reachy.behavior.orient` and :mod:`reachy.behavior.rule_engine` stay
+    environment-free and deterministic in tests. A malformed value is a clean
+    exit-1 user error, never a silent fallback — see :func:`_pat_float_env`.
+
+    The overlay loses to the rules file on purpose
+    (:class:`~reachy.behavior.rule_engine.RuleEngine`'s constructor note): this
+    is the surface for a box-local systemd drop-in, the way the deployed robot
+    already tunes the pat sense, not a way to override version-controlled
+    behavior config from a stray exported variable.
+    """
+    values: dict[str, float] = {}
+    for env_name, param in _ORIENT_PARAM_ENV.items():
+        if os.environ.get(env_name) is None:
+            continue
+        values[param] = _pat_float_env(env_name, 0.0)
+    return {"orient-to-sound": values} if values else {}
+
+
+def _rms_background() -> RmsBackground:
+    """Build the rolling background estimator (#102), honouring its env tuning.
+
+    Reads :data:`~reachy.behavior.rms_background.WINDOW_S_ENV` /
+    :data:`~reachy.behavior.rms_background.SILENCE_FLOOR_ENV` at composition
+    time — the same read-at-composition pattern as the ``REACHY_PAT_*`` and
+    ``REACHY_SELF_MOVING_*`` knobs above — so an operator who sets neither
+    composes the shipped defaults and the estimator module itself stays
+    environment-free. The RATIO is deliberately NOT an env knob here: it is the
+    admission point, and it lives where an operator can already see and override
+    it, in the ``look-toward-sound`` rule and ``OrientParams``.
+    """
+    return RmsBackground(
+        window_s=_pat_float_env(WINDOW_S_ENV, DEFAULT_WINDOW_S),
+        silence_floor=_pat_float_env(SILENCE_FLOOR_ENV, DEFAULT_SILENCE_FLOOR),
+    )
+
+
+#: How often the background keeper re-checks each held client's free
+#: :attr:`connected` predicate (seconds). Deliberately faster than the holders'
+#: own 5 s retry backoff: the poll itself costs nothing (a pure attribute read),
+#: and the backoff — not this period — is what throttles actual reconnect
+#: attempts, so a shorter period only shortens the window between a daemon
+#: coming up and the sense noticing.
+HOLDER_KEEPER_PERIOD_S = 2.0
+
+#: Bounded join for the keeper thread at teardown.
+_KEEPER_JOIN_TIMEOUT_S = 2.0
+
+_WARM_STAGE = "warmup"
+
+
 def _make_state_reader() -> HeldStateReader:
     """Build the held, media-free SDK pose reader — a test-injection seam.
 
     Isolated as a module-level factory so a composition test can inject a fake
-    reader (recording ``read``/``close``) via ``monkeypatch.setattr`` without a
-    real SDK. In production it returns a bare
+    reader (recording ``warm_up``/``read``/``close``) via ``monkeypatch.setattr``
+    without a real SDK. In production it returns a
     :class:`~reachy.robot.state_reader.HeldStateReader`, which itself degrades to
     a permanently-``None`` reader (one logged warning, then no reading) when the
     ``[sdk]`` extra is absent — which is why :func:`_compose_run_seam` composes
     the enabled pat stack without gating on an SDK-import probe.
+
+    ``allow_inline_connect=False`` closes the on-tick-thread construction door,
+    and it is HALF of a pair that must never be split: with the door closed a
+    read can never construct, so a holder nobody warms is a silently DEAD sense.
+    :func:`_warm_holder` (at setup) and :class:`_HolderKeeper` (for a mid-run
+    drop) are the other half. Together they are what actually fixes the measured
+    425-1213 ms startup tick overruns — the connect is charged to setup, where
+    there is no 20 ms budget to blow.
     """
-    return HeldStateReader()
+    return HeldStateReader(allow_inline_connect=False)
+
+
+def _make_speech_actuator() -> SpeechActuator:
+    """Build the runtime's ONE voice — a test-injection seam.
+
+    Everything about WHICH voice and WHICH speaker is resolved inside
+    :class:`~reachy.behavior.speech_act.SpeechActuator` from the environment
+    (``REACHY_VOICE_ENGINE``, ``REACHY_SPEECH_TRANSPORT``), so this stays a bare
+    constructor call and a malformed variable fails at SETUP with a clean
+    ``CliError`` rather than mid-utterance on the worker thread.
+
+    Unlike the two held SDK clients, the actuator is composed with no degrade
+    path to worry about: its shipped voice is the in-process harmonic synth, so
+    a box with no ``[sdk]`` extra, no network and no TTS still has one.
+    """
+    return SpeechActuator()
+
+
+def _make_media_client() -> HeldMediaClient:
+    """Build the ONE held media client (mic + camera) — a test-injection seam.
+
+    The media-side sibling of :func:`_make_state_reader`, with the same
+    inline-connect discipline and for a stronger reason: the full media profile
+    warms SLOWER than the ``no_media`` pose handle, so an inline connect on the
+    tick thread would add a second, larger stall on top of the one t27/t28 exist
+    to remove.
+
+    This is the runtime's single media owner (the single-SDK-owner model in
+    ``CLAUDE.md``): the rms, transcript, face and frame-available senses all read
+    through THIS object, never their own client. It degrades to permanently-quiet
+    on a bare box (no ``[sdk]`` extra), so it is composed unconditionally.
+    """
+    return HeldMediaClient(allow_inline_connect=False)
+
+
+def _warm_holder(holder, *, label: str) -> bool:
+    """Construct *holder*'s client NOW, on the caller's (setup) thread.
+
+    Returns whether a live client is held. A ``False`` is a NORMAL outcome, not a
+    fault: the daemon may simply not be up yet (systemd orders the daemon unit
+    before a presence unit but does not wait for its readiness), so it is logged
+    as a named drop and left to :class:`_HolderKeeper` to retry.
+
+    The two failure modes are deliberately NOT treated alike. A holder that
+    *fails* to warm degrades quietly (above); a holder with no ``warm_up`` at all
+    is a WIRING bug — no runtime condition can produce one — so the attribute
+    lookup sits outside the guard and its ``AttributeError`` propagates. A
+    swallowed one would silently skip the warm-up on a holder built with
+    ``allow_inline_connect=False``, which is precisely the dead-sense/stalled-tick
+    pair this function exists to prevent.
+    """
+    warm_up = holder.warm_up
+    try:
+        warmed = bool(warm_up())
+    except Exception as err:  # noqa: BLE001 — a warm-up fault must not block boot
+        logger.warning("behavior: %s holder warm-up raised (%s); sense degraded", label, err)
+        senselog.drop(_WARM_STAGE, label, "setup", f"warm-up raised ({err}); keeper will retry")
+        return False
+    if warmed:
+        senselog.stage(_WARM_STAGE, label, "setup", "warmed before the first tick")
+    else:
+        # Never a fault — see the docstring. Named, so it is never a silent no-op.
+        senselog.drop(
+            _WARM_STAGE, label, "setup", "no client yet (daemon not up?); keeper will retry"
+        )
+    return warmed
+
+
+class _HolderKeeper:
+    """Re-warm a dropped held client OFF the tick thread, for the run's lifetime.
+
+    The explicit answer to "what happens when a warm-up fails, or a live client
+    drops mid-run?". With ``allow_inline_connect=False`` a read can never rebuild
+    the client, so without this the first failure would mean a DEAD sense for the
+    rest of the run — on a boot-persistent presence unit that starts alongside
+    the daemon, that is the common case, not the rare one, and it would leave a
+    rebooted robot deaf and blind until a human restarted it.
+
+    The policy is therefore: poll each holder's free :attr:`connected` predicate
+    on a background daemon thread and call ``warm_up()`` only when it reads
+    ``False``. Two properties make that safe against the holders' documented
+    "not thread-safe" note:
+
+    * a DISCONNECTED holder is inert on the tick thread — with the inline door
+      closed, a read only observes ``_client is None`` and returns "no reading";
+      it mutates nothing — so the only thread mutating the holder is this one;
+    * ``warm_up`` is idempotent, never raises, and its own retry backoff
+      throttles the real reconnect attempts, so a fast poll cannot storm.
+
+    Every probe is guarded: a raising holder is logged and polled again, never
+    fatal to the keeper.
+    """
+
+    def __init__(
+        self,
+        holders,
+        *,
+        period: float = HOLDER_KEEPER_PERIOD_S,
+        join_timeout: float = _KEEPER_JOIN_TIMEOUT_S,
+    ) -> None:
+        self._holders = [(label, holder) for label, holder in holders if holder is not None]
+        self._period = max(0.0, float(period))
+        self._join_timeout = max(0.0, float(join_timeout))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Spawn the keeper thread. A no-op when there is nothing to keep."""
+        if self._thread is not None or not self._holders:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="behavior-holder-keeper", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the keeper with a bounded join. Idempotent."""
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self._join_timeout)
+
+    def poll_once(self) -> None:
+        """One sweep: re-warm every holder that is not currently connected."""
+        for label, holder in self._holders:
+            if self._stop.is_set():
+                return
+            try:
+                if holder.connected:
+                    continue
+            except Exception as err:  # noqa: BLE001 — a raising probe is not a verdict
+                logger.debug("behavior: %s liveness probe raised (%s)", label, err)
+                continue
+            if _warm_holder(holder, label=label):
+                senselog.stage(_WARM_STAGE, label, "keeper", "re-warmed after a drop")
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.poll_once()
+            except Exception:  # noqa: BLE001 — the keeper must outlive any single sweep
+                logger.warning("behavior: holder keeper sweep raised; continuing", exc_info=True)
+            self._stop.wait(self._period)
+
+
+class _AudioTap:
+    """ONE pump take per tick, fanned out to every audio consumer.
+
+    ``AudioPump.take()`` is a CONSUMING swap of the pump's pending buffer:
+    calling it twice in a tick would hand each consumer half the audio. Two
+    consumers need it — the ``rms`` provider (read at the START of the tick,
+    when perception is composed) and the transcript driver (which runs at the
+    END of the tick) — so composition, not either module, owns the fan-out.
+    This is the ``SenseSample`` pattern the retired folded ``listen`` loop used,
+    restated for the engine's tick seam.
+
+    Since #100 the tap performs NO audio I/O of its own: acquisition lives on
+    the background :class:`~reachy.behavior.audio_pump.AudioPump` (the SDK's
+    appsink is a ``drop=True, max-buffers=500`` FIFO whose ``get_sample``
+    blocks up to 20 ms when empty — read at tick rate it serves seconds-stale
+    audio, and the block lands on the 20 ms tick budget). :meth:`pull` is a
+    latch swap of whatever the pump accumulated since last tick, returned as
+    one concatenated chunk.
+
+    :meth:`pull` is called once per tick from the sense reader and is idempotent
+    within a tick (guarded on the tick's clock value), so a second perception
+    read in the same tick cannot steal a chunk. Both consumers then see the
+    identical chunk via :meth:`audio`. Also duck-types ``samplerate`` /
+    ``channels`` (off the held media client) so it can be injected wherever the
+    media client itself would be for an audio-only consumer.
+    """
+
+    def __init__(self, pump, media) -> None:
+        self._pump = pump
+        self._media = media
+        self._chunk = None
+        self._pulled_at: float | None = None
+
+    def pull(self, t: float | None = None) -> None:
+        """Latch this tick's audio once. Never raises — a fault is "no audio"."""
+        if t is not None and t == self._pulled_at:
+            return
+        self._pulled_at = t
+        try:
+            self._chunk = self._pump.take()
+        except Exception as err:  # noqa: BLE001 — a take fault degrades to no audio
+            logger.debug("behavior: audio take raised (%s); no audio this tick", err)
+            self._chunk = None
+
+    def audio(self):
+        """This tick's mic audio (or ``None``) — a non-consuming PEEK."""
+        return self._chunk
+
+    @property
+    def samplerate(self):
+        return getattr(self._media, "samplerate", None)
+
+    @property
+    def channels(self):
+        return getattr(self._media, "channels", None)
+
+
+class _RuntimeResources:
+    """Everything :func:`_compose_run_seam` opened that the caller MUST release.
+
+    ``cmd_engine_run`` used to close a single held pose reader; the runtime now
+    owns two held SDK clients, two driver-owned worker threads and the speech
+    actuator's worker, so the teardown travels as one object rather than a
+    growing tuple. ``close()`` is idempotent, releases in reverse dependency
+    order (keeper, then the voice, then drivers that READ the holders, then the
+    holders themselves), and never raises — a failing teardown step must not
+    stop the remaining ones, because an unclosed client hangs the process at
+    interpreter exit.
+
+    The speech actuator is released BEFORE the sense drivers on purpose: it is
+    the only piece that can still be mid-I/O when the loop ends, and its join is
+    bounded, so draining it first keeps the shutdown ordering honest rather than
+    racing a half-played clip against a closing media client. The audio pump
+    (#100) closes after the drivers and BEFORE the media client it reads, so its
+    final guarded read still lands on a live-ish holder rather than a closed one.
+    """
+
+    def __init__(
+        self, *, pose_reader=None, media=None, drivers=(), keeper=None, speech=None, pump=None
+    ):
+        self.pose_reader = pose_reader
+        self.media = media
+        self.drivers = tuple(driver for driver in drivers if driver is not None)
+        self.keeper = keeper
+        self.speech = speech
+        self.pump = pump
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.keeper is not None:
+            self._release(self.keeper.stop, "holder keeper")
+        if self.speech is not None:
+            self._release(self.speech.close, "speech actuator")
+        for driver in self.drivers:
+            self._release(driver.close, f"{type(driver).__name__}")
+        if self.pump is not None:
+            self._release(self.pump.close, "audio pump")
+        if self.media is not None:
+            self._release(self.media.close, "media client")
+        if self.pose_reader is not None:
+            self._release(self.pose_reader.close, "pose reader")
+
+    @staticmethod
+    def _release(close, what: str) -> None:
+        try:
+            close()
+        except Exception:  # noqa: BLE001 — one failing teardown must not skip the rest
+            logger.warning("behavior: closing the %s raised; continuing", what, exc_info=True)
+
+
+def _engagement_classifier():
+    """The transcript gate's optional LLM classifier, or ``None``.
+
+    Mirrors the retired ``listen --live --transcribe`` builder so the symbolic runtime
+    applies the SAME layered engagement gate the retiring loop applied: name
+    fast-path, then one "is this addressed to me, in context?" call, then a
+    heuristic fallback. Imported lazily and built defensively — construction does
+    no network I/O, and a build fault leaves the gate on the pure heuristic
+    rather than disabling hearing.
+
+    ``REACHY_ENGAGE_HEURISTIC`` short-circuits it entirely: the driver would
+    ignore an injected classifier anyway, so no classifier is built at all.
+    """
+    from reachy.behavior.transcript_sense import _env_truthy  # local: stdlib-only helper
+
+    if _env_truthy(os.environ.get("REACHY_ENGAGE_HEURISTIC")):
+        return None
+    try:
+        from reachy.speech.engagement import EngagementClassifier
+
+        # No base_url/model/api_key overrides — llm.complete resolves the one
+        # REACHY_OPENAI_* endpoint, the same backend any external cognition uses.
+        return EngagementClassifier()
+    except Exception:  # noqa: BLE001 — a build fault must not disable hearing
+        logger.warning(
+            "behavior: engagement classifier unavailable; the transcript gate "
+            "stays on the heuristic",
+            exc_info=True,
+        )
+        return None
 
 
 def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer, probe=None):
-    """Build ``behavior engine run``'s sense reader + tick seam + held pose reader.
+    """Build ``behavior engine run``'s sense reader + tick seam + owned resources.
 
     Composes runtime sense/act pieces onto the engine's ONE per-tick seam and
-    returns ``(sense_reader, tick_seam, reader)``. Everything rides ONE
+    returns ``(sense_reader, tick_seam, resources)``. Everything rides ONE
     :class:`TickBus` wrapped in :class:`TickMetrics`, so a tick-budget breach
     surfaces as a ``[SENSE ... event=overrun]`` line (c22).
 
@@ -884,31 +1585,97 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     Perception (``sense_reader``)
     -----------------------------
     Each tick's :class:`~reachy.behavior.sense.Sense` is
-    ``read_perception(SenseProviders(pat_event=..., pat_state=...),
-    base=doa_poller(t))``: the
+    ``read_perception(providers, base=doa_poller(t))``: the
     :class:`~reachy.behavior.sense.DoaPoller` supplies the throttled DoA/speech
-    leg (its own low-rate polling + failure-swallowing preserved), while the pat
-    legacy cue is a non-consuming PEEK of the pat driver's one-tick latch, while
-    the persistent state is a second PEEK of that same driver — so both views
-    describe one held reader and detector. A mic-less box reads EMPTY_SENSE for
-    the DoA leg exactly as before.
+    leg (its own low-rate polling + failure-swallowing preserved), and every
+    other field is a non-consuming PEEK of a driver's one-tick latch or held
+    condition. A mic-less box reads EMPTY_SENSE for the DoA leg exactly as
+    before. Eight providers are wired, from five producers:
 
-    Degrade contract (no ``[sdk]`` extra)
-    -------------------------------------
-    The SDK sense stack (:class:`HeldStateReader` + :class:`PatDetector` +
-    :class:`PatSenseDriver` + :class:`LastPoseHolder`) is ALWAYS composed: every
-    piece is import-safe without ``reachy_mini``, and :class:`HeldStateReader`
-    degrades internally to permanently-``None`` when the extra is absent (one
-    logged warning, then no reading). So on a bare box the engine behaves exactly
-    as before EXCEPT for a few inert drivers — the pat driver reads ``None`` every
-    tick (no pat events, no errors), the holder harmlessly stashes each pose, and
-    an empty goto lane is a per-tick no-op — i.e. DoA-only sense, no pat, no
-    exceptions. The goto path itself needs no SDK, so it still works.
+    * ``pat_event`` / ``pat_state`` — two PEEKs of the ONE
+      :class:`PatSenseDriver`, so both views describe one held reader and
+      detector;
+    * ``rms`` / ``rms_ratio`` — two PEEKs of the ONE
+      :class:`~reachy.behavior.rms_sense.RmsSense` over this tick's shared mic
+      chunk. ``rms`` is the raw loudness, gated by the self-motion latch below
+      (#95): while the engine commands motion and the measured rms sits under
+      the moving floor (:func:`_rms_moving_floor`), the reading reports quiet
+      (0.0) so the robot's own actuator noise can never re-admit
+      ``look-toward-sound``. ``rms_ratio`` is that same reading over a rolling
+      median of the room's own background (:func:`_rms_background`, #102) — the
+      field sound admission actually keys on, because the measured mic
+      background drifts ~25x within a day and no absolute floor is right in
+      both the daytime and the night room. The self-motion latch does double
+      duty: it also EXCLUDES the sample from the estimate, so self-noise is
+      neither heard nor learned as the room;
+    * ``transcript`` — the :class:`TranscriptSenseDriver`'s one-tick latch of an
+      ADDRESSED utterance (its STT round trip and engagement gate run on the
+      driver's own worker thread, never here);
+    * ``face`` / ``frame_available`` — the :class:`FaceSenseDriver`'s one-tick
+      name latch and TTL-held camera condition (detection likewise runs on that
+      driver's worker);
+    * ``self_moving`` — the :class:`SelfMotionDriver`'s held latch (the same
+      peek the rms gate consults), so a rule can key on "am I commanding
+      motion" directly.
+
+    Wiring these is what makes ``rms``/``rms_ratio``/``face``/``frame_available``/
+    ``transcript``/``self_moving`` FED fields: before this, each was a
+    schema-valid ``rules.toml`` predicate that validated cleanly and then
+    silently never fired. The declared truth ``behavior rules check`` lints
+    against (:data:`reachy.behavior.sense.FED_SENSE_FIELDS`) moves in lockstep
+    with this function — see that module's contract note.
+
+    Audio rides a background pump; the tick side is a latch (#100)
+    --------------------------------------------------------------
+    ALL mic acquisition lives on ONE :class:`~reachy.behavior.audio_pump.
+    AudioPump` — a background thread draining ``media.audio()`` at production
+    pace. The SDK's audio appsink is a ``drop=True, max-buffers=500`` FIFO
+    whose ``get_sample`` blocks up to 20 ms when empty: pulled once per tick
+    (the pre-#100 shape) it serves SECONDS-stale audio (live-verified: rule
+    fires the instant the #95 gate closed, STT transcribing the past) and puts
+    audio I/O on the 20 ms tick budget (#97's residual). The pump discards any
+    standing backlog before going live and is started HERE, after the media
+    warm-up, so its drain measures a real queue rather than a cold holder.
+
+    ``rms`` and the transcript driver are still two consumers of ONE consuming
+    read — now :meth:`AudioPump.take`, an O(1) latch swap — so
+    :class:`_AudioTap` takes it ONCE at the top of the tick (in
+    ``sense_reader``) and both read that concatenated chunk. Neither module
+    opens an audio source of its own; both take an injected one, and this is
+    the only place that decides there is exactly one.
+
+    Held clients: warmed HERE, before the first tick
+    ------------------------------------------------
+    Both holders — the ``no_media`` pose reader and the media client — are
+    constructed with ``allow_inline_connect=False`` and warmed synchronously
+    during composition, which runs before ``engine_run`` ticks anything. That
+    ordering IS the fix for the reproducible 425-1213 ms startup tick overruns
+    (21x-61x over a 20 ms budget, measured on every runtime start —
+    ``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 3): the
+    blocking connect is charged to setup, which has no tick budget. Warming them
+    on a background thread *after* ticking begins would merely relocate the
+    stall, and warming without the flag would leave a mid-run fault free to
+    reconstruct inline and reproduce it later in the run. A failed warm is normal
+    (the daemon may still be starting); :class:`_HolderKeeper` re-warms off-thread
+    for the life of the run.
+
+    Degrade contract (no ``[sdk]``/``[vision]`` extra)
+    --------------------------------------------------
+    The whole sense stack is composed UNCONDITIONALLY: every piece is import-safe
+    without ``reachy_mini`` and ``cv2``, and each holder degrades internally to
+    permanently-quiet when its extra is absent (one logged warning, then no
+    reading). So on a bare box the engine behaves exactly as before EXCEPT for a
+    few inert drivers — the pat driver reads ``None`` every tick, the mic chunk is
+    always ``None`` (no rms, no utterances, no STT request ever made), the camera
+    condition stays ``False`` and :func:`build_face_recognition` returns ``None``
+    so the face driver starts no worker — i.e. DoA-only sense, no exceptions. The
+    goto path needs no SDK, so it still works.
 
     Act-in seams (the ONE TickBus, in driver order)
     -----------------------------------------------
-    ``[rules_driver, intent_driver, pat_driver, holder, goto_lane]`` (with a
-    :class:`SenseSnapshotDriver` appended when exporting):
+    ``[rules_driver, intent_driver, pat_driver, transcript_driver, face_driver,
+    self_motion, holder, goto_lane]`` (with a :class:`SenseSnapshotDriver`
+    appended when exporting):
 
     * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
       decisions (admit/evict, drain the intent + goto command spools). The GOTO
@@ -926,6 +1693,16 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       shared engine state and only latches, so its position among the readers is
       immaterial to correctness; it sits after the symbolic drivers by
       convention.
+    * ``transcript_driver`` / ``face_driver`` / ``self_motion`` — the other
+      latching sense drivers, grouped with the pat driver for the same reason:
+      each clears/updates its latch, does bounded O(1) tick-thread work, and
+      latches for the NEXT tick's sense read (``self_motion`` mirrors the pat
+      driver's end-of-tick cadence exactly: it deltas THIS tick's streamed
+      ``ctx.pose``, so the rms provider's read at the start of the next tick
+      consults a latch that already reflects this tick's command). None mutates
+      engine state, so their order among themselves is immaterial; they are
+      ordered after the pat driver by convention, and before the pose holder so
+      the act-in half of the seam stays contiguous.
     * ``holder`` BEFORE ``goto_lane`` — the holder stashes this tick's streamed
       ``ctx.pose``; the goto lane's ``start_pose_provider`` peeks that stash when
       it admits a goto. Running the holder first means a goto admitted THIS tick
@@ -935,116 +1712,250 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       snapshot on change; it reads the fixed ``ctx.sense`` so its position is
       immaterial, appended last so the sense block trails the decisions.
 
-    The returned ``reader`` is the held SDK client the caller MUST ``close()`` at
-    shutdown (an unclosed ``no_media`` client hangs the process at interpreter
-    exit — see :mod:`reachy.robot.state_reader`).
+    The returned ``resources`` bundles every held client and worker-owning driver
+    the caller MUST ``close()`` at shutdown (an unclosed client hangs the process
+    at interpreter exit, whatever its profile — see
+    :mod:`reachy.robot.state_reader`).
     """
     doa_poller = DoaPoller(lambda: read_doa(transport))
 
     if probe is not None:
+        # Observation-only: no media owner, no sense providers, no acting
+        # drivers. The pose reader is still warmed at setup — the probe ticks at
+        # the same 50 Hz and would take the same startup overrun otherwise.
         reader = _make_state_reader()
-        shared_reader = SharedPoseReader(reader.read)
-        mode, probe_emit = probe
-        providers = SenseProviders()
+        keeper = None
+        try:  # release the held client if composition fails — see the note below
+            _warm_holder(reader, label="state")
+            shared_reader = SharedPoseReader(reader.read)
+            mode, probe_emit = probe
+            providers = SenseProviders()
 
-        def probe_sense_reader(t):
+            def probe_sense_reader(t):
+                return read_perception(providers, base=doa_poller(t))
+
+            drivers = [
+                ProbeNamespaceGuard(control.CommandSpool(namespace=INTENT_NAMESPACE)),
+                ProbeDriver(mode, shared_reader, emit=probe_emit),
+            ]
+            consumers = []
+            if runtime_consumer is not None:
+                drivers.append(SenseSnapshotDriver())
+                consumers.append(runtime_consumer)
+            bus = TickBus(drivers=drivers, consumers=consumers)
+            keeper = _HolderKeeper([("state", reader)])
+            keeper.start()
+        except BaseException:
+            _RuntimeResources(pose_reader=reader, keeper=keeper).close()
+            raise
+        return (
+            probe_sense_reader,
+            TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)),
+            _RuntimeResources(pose_reader=reader, keeper=keeper),
+        )
+
+    # Everything below OPENS resources (two held SDK clients, two worker-owning
+    # drivers, the keeper thread, the audio pump thread). A raise part-way
+    # through would strand them: `cmd_engine_run` only closes what it was
+    # RETURNED, and an unclosed client hangs the process at interpreter exit —
+    # turning a clean structured failure into a wedged unit that
+    # `Restart=on-failure` never restarts. So the whole construction is guarded
+    # and releases what it opened before re-raising.
+    reader = media = transcript_driver = face_driver = keeper = speech = pump = None
+    try:
+        # The voice, first: built and STARTED here on the setup thread so no tick
+        # ever pays for thread creation, and so a malformed REACHY_VOICE_ENGINE /
+        # REACHY_SPEECH_TRANSPORT is a clean startup error. `say()` is O(1) and
+        # non-blocking; every slow leg (synthesis, playback) runs on its worker.
+        speech = _make_speech_actuator()
+        speech.start()
+        # The pat sense stack ships ON after the hands-on #80 gate finding: the
+        # complete command must hold still before sensing, which removes wander
+        # ghosts structurally while allowing a settled reaction owner to keep
+        # sensing. REACHY_PAT_SENSE=0 is the explicit sensing rollback.
+        pat_driver = None
+        if _pat_sense_enabled():
+            reader = _make_state_reader()
+            still_hold_s, still_eps = _pat_still_tuning()
+            pat_kwargs: dict = {
+                "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
+                "still_eps": still_eps,  # REACHY_PAT_STILL_EPS override (t2)
+            }
+            # `detector` and `hp_tau` are passed ONLY when actually overridden.
+            # Occupying a keyword with its own default looks like a no-op but is
+            # not: a caller injecting its own detector or high-pass (every
+            # pet-runtime integration test does) would collide on it. Env overrides
+            # must be additive — absent env leaves the driver's own defaults alone.
+            override = _pat_detector()
+            if override is not None:
+                pat_kwargs["detector"] = override  # REACHY_PAT_*_PRESS_DEG overrides
+            hp_tau = _pat_float_override(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
+            if hp_tau is not None:
+                pat_kwargs["hp_tau"] = hp_tau
+            release_after = _pat_float_override(_RELEASE_AFTER_ENV, RELEASE_AFTER_S)
+            if release_after is not None:
+                pat_kwargs["release_after_s"] = release_after
+            pat_driver = PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
+
+        # The ONE media owner, and the two senses that read through it. Composed
+        # unconditionally: both degrade to permanently-quiet without their extras.
+        # The pump is CONSTRUCTED here but started only after the media warm-up
+        # below, so its backlog drain measures a real appsink queue (#100).
+        media = _make_media_client()
+        pump = AudioPump(media)
+        audio_tap = _AudioTap(pump, media)
+        # ONE background estimator for the whole runtime (#102). Built here, not
+        # inside either consumer, because the orienting gate and the utterance
+        # capture gate must agree about what the room sounds like — two
+        # estimators fed from the same mic would differ only by their own bugs.
+        # They differ in THRESHOLD, not in estimate: capture starts at 3x the
+        # background, orienting's antenna lean at 5x.
+        background = _rms_background()
+        transcript_driver = TranscriptSenseDriver(
+            media=audio_tap,  # the shared per-tick chunk, never a second mic read
+            classifier=_engagement_classifier(),
+            # The room's own floor, so an utterance starts on sound that stands
+            # ABOVE the room rather than above a number measured in 2026-07-20's
+            # quiet office. Live-verified defect: with the night background at
+            # 0.034 the absolute 0.02 gate never closed and the journal filled
+            # with `utterance start` -> `dropped reason=stt-empty`.
+            background=lambda: background.level,
+            # Self-mute: the mic and the speaker share a room, so without this the
+            # runtime transcribes its OWN voice, the transcript fires a rule, the
+            # rule speaks, and the robot talks to itself forever. The actuator
+            # publishes the window its clip occupies; this closes the loop.
+            mute_until=speech.mute_until,
+        )
+        recognition = build_face_recognition()
+        face_driver = FaceSenseDriver(
+            media=media,
+            engine=recognition[0] if recognition is not None else None,
+            store=recognition[1] if recognition is not None else None,
+        )
+
+        # Warm BOTH held clients here, on the setup thread, before anything ticks.
+        # Sequential and in this order on purpose: the ``no_media`` pose handle is
+        # the cheaper of the two to bring up, so the shipped, load-bearing pat sense
+        # is live soonest. They are NOT warmed in parallel — two concurrent SDK
+        # client constructions is an unverified claim about the SDK, and setup has no
+        # tick budget to protect, so there is nothing to buy with the risk.
+        if reader is not None:
+            _warm_holder(reader, label="state")
+        _warm_holder(media, label="media")
+        keeper = _HolderKeeper([("state", reader), ("media", media)])
+        keeper.start()
+        # Start the audio pump strictly AFTER the media warm-up: from here on the
+        # pump thread owns every `media.audio()` call, drains the appsink's
+        # standing backlog, and the tick thread only ever swaps its latch (#100).
+        pump.start()
+
+        holder = LastPoseHolder()
+        # The self-motion latch (#95): composed UNCONDITIONALLY (it reads only
+        # ctx.pose — no SDK, no extra), consulted by the rms provider at read
+        # time so the robot's own actuator noise reads quiet while it moves.
+        self_motion = _make_self_motion()
+        # ONE mic read per tick, two sense fields off it (#102): the raw
+        # loudness (gated by the moving floor above) and its ratio over the
+        # rolling background. The self-motion latch does double duty here — it
+        # gates the raw reading AND excludes the sample from the background, so
+        # the robot's own noise can neither be heard nor learned as the room.
+        rms_sense, rms_provider, rms_ratio_provider = make_rms_providers(
+            audio_tap.audio,
+            moving=self_motion.is_moving,
+            moving_floor=_rms_moving_floor(),
+            background=background,  # the ONE estimator, shared with capture above
+        )
+        providers = SenseProviders(
+            pat_event=pat_driver.as_provider() if pat_driver is not None else None,
+            pat_state=pat_driver.as_state_provider() if pat_driver is not None else None,
+            rms=rms_provider,
+            rms_ratio=rms_ratio_provider,
+            transcript=transcript_driver.as_provider(),
+            face=face_driver.as_face_provider(),
+            frame_available=face_driver.as_frame_available_provider(),
+            self_moving=self_motion.is_moving,
+        )
+
+        def sense_reader(t):
+            # Take the tick's ONE audio latch swap first (no mic I/O — the pump
+            # owns that, #100), so the rms sense below and the transcript
+            # driver later in this same tick share the identical chunk.
+            audio_tap.pull(t)
+            # Then the tick's ONE loudness read, off that chunk. Both rms
+            # providers are latch peeks; pulling here (and only here) is what
+            # keeps `rms` and `rms_ratio` two views of one measurement and the
+            # background estimator fed exactly once per tick.
+            rms_sense.pull(t)
+            # DoA (throttled by the poller) as the base; every other field is a
+            # non-consuming peek of a driver's latch or held condition.
             return read_perception(providers, base=doa_poller(t))
 
+        # Give the rules layer its voice. The driver is built before this function
+        # runs (`_boot_tick_seam`, so a malformed rules file is reported before
+        # anything is opened), and it remembers the seam across a live reload — a
+        # rebuilt engine that silently stopped talking would be a nasty bug.
+        if rules_driver is not None:
+            rules_driver.set_speech(speech.say)
+
+        goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
+        intent_driver = IntentDriver(
+            mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
+            known_modes=rules_driver.known_modes if rules_driver is not None else None,
+        )
+        # Register the GOTO kind into the intent driver's OWN registry (which already
+        # carries the four intent defaults) so all five kinds share one registry.
+        intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
+
         drivers = [
-            ProbeNamespaceGuard(control.CommandSpool(namespace=INTENT_NAMESPACE)),
-            ProbeDriver(mode, shared_reader, emit=probe_emit),
+            d
+            for d in (
+                rules_driver,
+                intent_driver,
+                pat_driver,
+                transcript_driver,
+                face_driver,
+                self_motion,
+                holder,
+                goto_lane,
+            )
+            if d is not None
         ]
         consumers = []
         if runtime_consumer is not None:
             drivers.append(SenseSnapshotDriver())
             consumers.append(runtime_consumer)
         bus = TickBus(drivers=drivers, consumers=consumers)
-        return (
-            probe_sense_reader,
-            TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)),
-            reader,
+        resources = _RuntimeResources(
+            pose_reader=reader,
+            media=media,
+            drivers=(transcript_driver, face_driver),
+            keeper=keeper,
+            speech=speech,
+            pump=pump,
         )
-
-    # The pat sense stack ships ON after the hands-on #80 gate finding: the
-    # complete command must hold still before sensing, which removes wander
-    # ghosts structurally while allowing a settled reaction owner to keep
-    # sensing. REACHY_PAT_SENSE=0 is the explicit sensing rollback.
-    reader = None
-    pat_driver = None
-    if _pat_sense_enabled():
-        reader = _make_state_reader()
-        still_hold_s, still_eps = _pat_still_tuning()
-        pat_kwargs: dict = {
-            "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
-            "still_eps": still_eps,  # REACHY_PAT_STILL_EPS override (t2)
-        }
-        # `detector` and `hp_tau` are passed ONLY when actually overridden.
-        # Occupying a keyword with its own default looks like a no-op but is
-        # not: a caller injecting its own detector or high-pass (every
-        # pet-runtime integration test does) would collide on it. Env overrides
-        # must be additive — absent env leaves the driver's own defaults alone.
-        override = _pat_detector()
-        if override is not None:
-            pat_kwargs["detector"] = override  # REACHY_PAT_*_PRESS_DEG overrides
-        hp_tau = _pat_float_override(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
-        if hp_tau is not None:
-            pat_kwargs["hp_tau"] = hp_tau
-        release_after = _pat_float_override(_RELEASE_AFTER_ENV, RELEASE_AFTER_S)
-        if release_after is not None:
-            pat_kwargs["release_after_s"] = release_after
-        pat_driver = PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
-    holder = LastPoseHolder()
-    providers = SenseProviders(
-        pat_event=pat_driver.as_provider() if pat_driver is not None else None,
-        pat_state=pat_driver.as_state_provider() if pat_driver is not None else None,
-    )
-
-    def sense_reader(t):
-        # DoA (throttled by the poller) as the base; the pat cue (when the
-        # enabled stack is composed) is peeked in legacy-event and persistent-
-        # state forms from the same driver.
-        return read_perception(providers, base=doa_poller(t))
-
-    goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
-    intent_driver = IntentDriver(
-        mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
-        known_modes=rules_driver.known_modes if rules_driver is not None else None,
-    )
-    # Register the GOTO kind into the intent driver's OWN registry (which already
-    # carries the four intent defaults) so all five kinds share one registry.
-    intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
-
-    drivers = [
-        d for d in (rules_driver, intent_driver, pat_driver, holder, goto_lane) if d is not None
-    ]
-    consumers = []
-    if runtime_consumer is not None:
-        drivers.append(SenseSnapshotDriver())
-        consumers.append(runtime_consumer)
-    bus = TickBus(drivers=drivers, consumers=consumers)
-    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), reader
+    except BaseException:
+        _RuntimeResources(
+            pose_reader=reader,
+            media=media,
+            drivers=(transcript_driver, face_driver),
+            keeper=keeper,
+            speech=speech,
+            pump=pump,
+        ).close()
+        raise
+    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), resources
 
 
 def _probe_engine_is_fresh() -> bool:
-    """Whether state.json proves another CLI engine heartbeat is still live."""
-    state = control.read_state()
-    updated = state.get("updated") if isinstance(state, dict) else None
-    if isinstance(updated, bool) or not isinstance(updated, (int, float)):
-        return False
-    updated = float(updated)
-    if not math.isfinite(updated):
-        return False
-    age = time.monotonic() - updated
-    if age < 0.0:
-        # Fail CLOSED on a marginally future heartbeat: Engine.state() rounds
-        # `updated` to milliseconds and can round UP, so a genuinely live engine
-        # can read back a hair ahead of us. Treating that as "not fresh" would
-        # let a probe start beside it — the exact race this refusal exists to
-        # prevent. A stamp far in the future is instead a state.json left over
-        # from before a monotonic-clock reset (a reboot), which is stale, not
-        # live, so it must not lock probes out forever.
-        return age >= -_PROBE_HEARTBEAT_SKEW_S
-    return age <= _PROBE_HEARTBEAT_TTL_S
+    """Whether state.json proves another CLI engine heartbeat is still live.
+
+    Delegates to :func:`reachy.behavior.liveness.engine_is_live` — the ONE
+    definition of "an engine is driving the head", shared with the foreground
+    ``pat run`` / ``sleep run`` refusal. Two independently-drifting answers to
+    that question is precisely the defect the shared module exists to prevent;
+    see its docstring for the freshness/skew rationale that used to live here.
+    """
+    return liveness.engine_is_live()
 
 
 def _open_probe_output(path: Path):  # type: ignore[no-untyped-def]
@@ -1110,9 +2021,20 @@ def _open_probe(probe_mode: str, probe_output: str):  # type: ignore[no-untyped-
 def _engine_live_line(  # type: ignore[no-untyped-def]
     config, transport, rules_driver, probe_mode: str | None
 ) -> str:
-    """Build the one-line 'engine live' banner naming the composed layers."""
+    """Build the one-line 'engine live' banner naming the composed layers.
+
+    The three-way split matters because the shipped layer now carries content
+    (t15): a rejected overlay no longer means "no rules at all", it means the
+    SHIPPED rules survived and only the operator's edits were lost. Saying
+    plain ``+ rules`` there would read as "your file loaded" to the one person
+    who most needs to know it did not — so a rejection is named on the banner,
+    not left to the ``[SENSE ... event=boot]`` drop line alone.
+    """
+    rejected = rules_driver is not None and rules_driver.loader.last_error is not None
     if probe_mode is not None:
         rules_note = " (observation-only probe)"
+    elif rejected:
+        rules_note = " + shipped rules (your overlay was rejected)"
     elif rules_driver is not None:
         rules_note = " + rules"
     else:
@@ -1140,7 +2062,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
     rules_driver = None if probe_mode is not None else _boot_tick_seam()
     engine_control = ProbeCommandGuard(spool) if probe_mode is not None else spool
     probe_stream = None
-    reader = None
+    resources = None
     runtime_consumer = None
     try:
         probe = None
@@ -1156,7 +2078,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         # Runtime-events export sink (None unless --export -); this remains
         # separate from the cognition feed and carries runtime events only.
         runtime_consumer = build_runtime_export_consumer(args)
-        sense_reader, tick_seam, reader = _compose_run_seam(
+        sense_reader, tick_seam, resources = _compose_run_seam(
             transport, config, rules_driver, runtime_consumer, probe=probe
         )
 
@@ -1176,8 +2098,10 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         )
     finally:
         # Covers output-open, export setup, seam composition, and engine_run.
-        if reader is not None:
-            reader.close()
+        # `resources` owns BOTH held SDK clients plus the worker-owning sense
+        # drivers; an unclosed client hangs the process at interpreter exit.
+        if resources is not None:
+            resources.close()
         if probe_stream is not None:
             probe_stream.close()
     if runtime_consumer is not None:
@@ -1385,6 +2309,37 @@ def _register_rules(noun_sub: argparse._SubParsersAction) -> None:
     ck.set_defaults(func=cmd_rules_check)
 
 
+def _register_expressions(noun_sub: argparse._SubParsersAction) -> None:
+    """The ``behavior expressions`` sub-noun: list + check the expression catalog.
+
+    Ported from ``think expressions`` (t18) — see the "expressions sub-noun"
+    section above for why. A noun with action-verbs must also expose
+    ``overview`` (rubric requirement); bare ``expressions`` (no sub-verb) lists
+    the catalog, mirroring ``behavior rules``' bare-defaults-to-list idiom.
+    ``parser_class`` propagates so nested parse errors keep the structured
+    error contract.
+    """
+    ex = noun_sub.add_parser(
+        "expressions",
+        help="List/check the expression pose catalog (see 'behavior expressions overview').",
+    )
+    ex.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ex.set_defaults(func=_expressions_no_verb, json=False)
+    ex_sub = ex.add_subparsers(dest="expressions_command", parser_class=type(ex))
+
+    ov = ex_sub.add_parser("overview", help="Describe the expressions sub-noun.")
+    ov.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ov.set_defaults(func=cmd_expressions_overview)
+
+    ls = ex_sub.add_parser("list", help="List the expression pose catalog.")
+    ls.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ls.set_defaults(func=cmd_expressions_list)
+
+    ck = ex_sub.add_parser("check", help="Flag catalog poses too similar to be distinct.")
+    ck.add_argument("--json", action="store_true", help=_JSON_HELP)
+    ck.set_defaults(func=cmd_expressions_check)
+
+
 def _register_engine(noun_sub: argparse._SubParsersAction) -> None:
     eng = noun_sub.add_parser("engine", help="Manage the 50 Hz engine process.")
     eng.add_argument("--json", action="store_true", help=_JSON_HELP)
@@ -1468,4 +2423,5 @@ def register(sub: argparse._SubParsersAction) -> None:
     _register_reload(noun_sub)
     _register_goto(noun_sub)
     _register_rules(noun_sub)
+    _register_expressions(noun_sub)
     _register_engine(noun_sub)

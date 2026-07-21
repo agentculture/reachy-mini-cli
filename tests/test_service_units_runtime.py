@@ -132,6 +132,49 @@ def test_runtime_requires_and_after_daemon():
 
 
 # --------------------------------------------------------------------------- #
+# Task t7 — the runtime unit sets its TTS route EXPLICITLY, inheriting        #
+# nothing from reachy-live.service.d/tts.conf (a drop-in belonging to the     #
+# unit t23 retired).                                                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_runtime_unit_sets_the_tts_route_explicitly():
+    """The deployed box's ONLY REACHY_TTS_ROUTE configuration today lives in
+    ``reachy-live.service.d/tts.conf`` — a drop-in belonging to
+    ``reachy-live.service``, the unit ``t23`` retired (its ``RETIRED_UNITS``
+    migration removes that whole ``.d/`` directory). That drop-in's own comment
+    documents the default route's port (chatterbox, :9000) as connection-refused
+    on this box (the container is EXPOSE-only, never published to the host).
+    Without an explicit route baked into the runtime unit itself, selecting the
+    TTS voice (an operator-selectable alternative to the harmonic default) would
+    silently degrade to silence for exactly the reason that drop-in exists to
+    route around — and it would no longer be there to route around it.
+    """
+    text = units.runtime_unit_text(python=PY)
+    sec = parse_unit(text)
+    assert sec["Service"]["Environment"] == [f"{units.RUNTIME_TTS_ROUTE_ENV}=openai"]
+
+
+def test_runtime_tts_route_constant_matches_the_retiring_dropin():
+    assert units.RUNTIME_TTS_ROUTE_ENV == "REACHY_TTS_ROUTE"
+    assert units.DEFAULT_RUNTIME_TTS_ROUTE == "openai"
+
+
+def test_runtime_tts_route_is_overridable():
+    text = units.runtime_unit_text(python=PY, tts_route="chatterbox")
+    sec = parse_unit(text)
+    assert sec["Service"]["Environment"] == ["REACHY_TTS_ROUTE=chatterbox"]
+
+
+def test_runtime_default_tts_route_needs_no_explicit_argument():
+    # The installer's actual call sites (service.py, manager.py) pass no
+    # tts_route kwarg at all — the explicit route must still be present.
+    text = units.runtime_unit_text()
+    sec = parse_unit(text)
+    assert sec["Service"]["Environment"] == ["REACHY_TTS_ROUTE=openai"]
+
+
+# --------------------------------------------------------------------------- #
 # Quoting/escaping matches the sibling renderers (shared _unit_arg helper).
 # --------------------------------------------------------------------------- #
 

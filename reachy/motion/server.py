@@ -53,8 +53,8 @@ class LoopHooks:
         once per tick *before* the producer is consulted. ``commanded_head`` is a
         ``{"pitch": float, "yaw": float}`` snapshot of the last head pose the loop
         dispatched (neutral ``{"pitch": 0.0, "yaw": 0.0}`` before the first move) —
-        so a second, queue-driven behaviour folded into the loop (e.g. ``listen``'s
-        head-pat detector) can compare the read-back against what the loop actually
+        so a second, queue-driven behaviour folded into the loop (a head-pat
+        detector, say) can compare the read-back against what the loop actually
         commanded, not a fixed baseline.
     """
 
@@ -169,10 +169,12 @@ def _drive(
 
     When ``busy`` is a dict, the loop publishes ``busy["until"] = st.busy_until``
     before each ``on_tick`` — the wall-clock horizon (dispatch + duration + settle)
-    the current move is in flight until. A folded hook (``listen``'s ``PatHook``)
-    reads it via a ``() -> busy["until"]`` seam when it observes a large commanded
-    jump, riding out that move's transit unsensed so its lag is never mistaken for
-    an external press (small idle moves are sensed straight through).
+    the current move is in flight until. A folded hook reads it via a
+    ``() -> busy["until"]`` seam when it observes a large commanded jump, riding out
+    that move's transit unsensed so its lag is never mistaken for an external press
+    (small idle moves are sensed straight through). The retired ``listen`` loop's
+    ``PatHook`` was this argument's original consumer; the seam stays because it is
+    the only way a folded hook can tell transit from touch.
     """
     st = _DriveState(on_action=hooks.on_action)
     while not stop["flag"]:
@@ -226,10 +228,10 @@ def run(
       transport, the working :class:`~reachy.motion.queue.MotionQueue`, the current
       time, and the ``{"pitch": float, "yaw": float}`` head pose the loop last
       dispatched. It lets a caller fold a second, queue-driven behaviour into the
-      same loop that owns the single SDK client — e.g. ``listen`` reads the head
-      pose back through it and compares it to ``commanded_head`` to detect a head
-      pat (deviation = actual − commanded), so ``listen``'s own commanded turns
-      never read as a press.
+      same loop that owns the single SDK client — the retired ``listen`` loop read
+      the head pose back through it and compared it to ``commanded_head`` to detect a
+      head pat (deviation = actual − commanded), so its own commanded turns never
+      read as a press.
 
     ``busy`` (optional) is a mutable dict the loop publishes its ``busy_until``
     horizon into each tick (``busy["until"]``) — the wall-clock time the current

@@ -1,6 +1,6 @@
 """Shared CLI helper: build the JSONL export sinks from CLI args.
 
-``think run`` and ``listen run --live`` expose the same ``--export`` /
+``agent attach`` and ``behavior engine run`` expose the same ``--export`` /
 ``--export-blocks`` pair and wire the *same* generic sink — a newline-delimited
 JSON event feed on stdout (``thinking`` / ``message`` / ``emotion`` blocks; see
 ``docs/export-schema.md``). The feed is format-agnostic by design: a reTerminal
@@ -84,9 +84,10 @@ def build_export_hook(
 def add_export_args(parser: argparse.ArgumentParser) -> None:
     """Register the shared ``--export`` / ``--export-blocks`` arguments on *parser*.
 
-    Mirrors the pair on ``think run`` so the two command modes present an identical
-    surface. The caller decides any mode constraints (e.g. ``listen`` requires
-    ``--live`` for the feed to carry cognition blocks).
+    One shared registration so every command mode presents an identical
+    surface. The caller decides any mode constraints of its own; today
+    ``agent attach`` is the only registration site (and the cognition feed's
+    only producer).
     """
     parser.add_argument(
         "--export",

@@ -2,7 +2,7 @@
 
 :func:`describe_frame` is the single entry point both the on-demand agent tool
 (``describe_scene`` in :mod:`reachy.speech.tools`) and the periodic
-:class:`~reachy.motion.listen_scene.SceneHook` call. It JPEG-encodes a camera
+``describe_scene`` tool call. It JPEG-encodes a camera
 frame (long edge resized to ``max_edge`` px, default 1280), wraps it into an
 OpenAI-compatible multimodal ``/v1/chat/completions`` request, and returns the
 assistant's plain-text description.
@@ -17,7 +17,7 @@ Design (mirrors the rest of this repo's SDK-first, extra-gated senses):
 
 * **``cv2`` is imported lazily, inside functions only** — never at module import
   time — so this module (and anything that merely imports it, e.g.
-  :class:`~reachy.motion.listen_scene.SceneHook`) is loadable on a bare install
+  the ``describe_scene`` tool) is loadable on a bare install
   with no OpenCV present. Cited from ``reachy_nova.nova_vision`` (the 3-frame
   ring, the 30 s fallback + on-demand trigger, the JPEG <= 1280 px resize) but
   reimplemented against the local OpenAI-compatible gateway instead of Bedrock.

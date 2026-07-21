@@ -34,7 +34,8 @@ from pathlib import Path
 
 import pytest
 
-from reachy.behavior.pat_sense import PatSenseDriver
+from reachy.behavior.pat_sense import ENOUGH_MAX_S, WARNING_AFTER_S, PatSenseDriver
+from reachy.motion.pat import PatDetector
 
 pytestmark = pytest.mark.offline
 
@@ -99,10 +100,39 @@ def test_still_untouched_never_fires() -> None:
     assert _Replay("base_still").run(warmup_s=0.0) == 0
 
 
-def test_still_petting_fires_repeatedly() -> None:
-    """50 s of real petting on a still head must be detected, repeatedly."""
-    events = _Replay("pat_still").run(warmup_s=0.0)
-    assert events >= 5, f"only {events} pats detected in 50 s of continuous petting"
+@pytest.mark.parametrize("level2_threshold", [4.0, 5.0, 6.0, 7.0, 8.0])
+@pytest.mark.parametrize("enough_after", [WARNING_AFTER_S, 10.0, ENOUGH_MAX_S])
+def test_still_petting_fires_repeatedly(level2_threshold: float, enough_after: float) -> None:
+    """50 s of real petting on a still head must be detected, repeatedly.
+
+    BOTH random seams are injected. There are two, not one, and missing either
+    leaves the test flaky:
+
+    * ``PatDetector.level2_threshold_fn`` — default ``random.uniform(4.0, 8.0)``
+    * ``PatSenseDriver.enough_after_fn`` — default
+      ``random.uniform(WARNING_AFTER_S, ENOUGH_MAX_S)``
+
+    With both free this test failed about 4% of runs (12 of 300 seeded). Pinning
+    only the detector's threshold did NOT fix it — the driver's ``enough`` timing
+    alone still tipped it under the bar — which is why the parametrization
+    crosses both axes rather than pinning a midpoint.
+
+    The measured grid over the full draw ranges is 5-8 events, and the minimum
+    of exactly 5 sits at ``level2_threshold`` 7.0-8.0. So the ``>= 5`` bar has
+    ZERO margin at the top of the range: that is deliberate and safe only
+    because every cell here is now deterministic. If a future change drops any
+    cell to 4, this SHOULD go red — that is the regression it exists to catch,
+    not a flake to re-tune.
+    """
+    events = _Replay("pat_still").run(
+        warmup_s=0.0,
+        detector=PatDetector(level2_threshold_fn=lambda: level2_threshold),
+        enough_after_fn=lambda: enough_after,
+    )
+    assert events >= 5, (
+        f"only {events} pats detected in 50 s of continuous petting "
+        f"(level2_threshold={level2_threshold}, enough_after={enough_after})"
+    )
 
 
 @pytest.mark.parametrize("press", [0.3, 0.5, 1.0, 2.0])

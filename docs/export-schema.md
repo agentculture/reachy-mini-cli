@@ -6,8 +6,9 @@ or any downstream tool). You need only this document — no Python import from
 the package is required to implement a compatible reader.
 
 There are **two, separate** feeds. This first half of the document covers the
-**cognition feed** (`thinking` / `message` / `emotion`, produced by `think run
---export -` and `listen run --live --export -`). The **runtime feed**
+**cognition feed** (`thinking` / `message` / `emotion`) — whose one and only
+producer is `agent attach --export -`, the attached tool-use agent publishing
+what it perceived, said, and expressed. The **runtime feed**
 (`sense` / `rule` / `intent` / `motion`, produced by `behavior engine run
 --export -`) has its own section below —
 [Runtime Event Feed (`behavior engine run --export -`)](#runtime-event-feed-behavior-engine-run---export--).
@@ -31,31 +32,42 @@ block type before reading the rest of the object.
 
 ### `"thinking"` — internal reasoning turn
 
-Emitted by the cognition loop when the robot processes sense events and
-produces an LLM response.
+Emitted **exactly once per agent turn**, after the turn's tool loop drains — so
+it is the *last* block of a turn, arriving after every `message` / `emotion`
+block that turn produced.
 
 | Key    | Type            | Description                                            |
 |--------|-----------------|--------------------------------------------------------|
 | `t`    | `"thinking"`    | Block-type discriminator                               |
 | `ts`   | float           | Unix timestamp                                         |
-| `cues` | array of string | Sense cues that triggered this turn (may be empty `[]`) |
-| `text` | string          | Raw LLM output including `*emoji*` / `"speech"` markers |
+| `cues` | array of string | Sense cues that triggered this turn (see the note below) |
+| `text` | string          | The turn's raw text — per LLM round, that round's assistant content plus a `name(arguments_json)` rendering of each tool call it made (space-joined); rounds are joined by newlines |
 
 Example line:
 
 ```json
-{"t":"thinking","ts":1718362800.1,"cues":["sound","motion"],"text":"*🤔* \"I heard something.\""}
+{"t":"thinking","ts":1718362800.1,"cues":["speech from the left"],"text":"apply_pose({\"emoji\": \"🤔\"}) speak({\"text\": \"I heard something.\"})"}
 ```
 
 ### `"message"` — speech segment
 
-Emitted when the robot speaks a sentence aloud (after TTS synthesis).
+Emitted when the agent calls a speech tool (`speak` or `harmonics`), at the
+moment that call is dispatched — **before**, and independently of, any synthesis
+or playback.
+
+**A `message` block is an intent to speak, not proof of sound.** `agent attach`
+composes its built-in speech tools **publish-only**: the attached agent is an
+external client, the running runtime owns the robot, and so the client's
+`synthesize` and `play` seams are inert by design. The block records what the
+agent chose to say; making the robot audible is the runtime's job (a react
+rule's `say` field). A consumer rendering "what the robot said" is rendering the
+agent's utterance, which no speaker in this process reproduces.
 
 | Key    | Type        | Description                       |
 |--------|-------------|-----------------------------------|
 | `t`    | `"message"` | Block-type discriminator          |
 | `ts`   | float       | Unix timestamp                    |
-| `text` | string      | The text spoken by the robot      |
+| `text` | string      | The text the agent chose to say   |
 
 Example line:
 
@@ -65,8 +77,10 @@ Example line:
 
 ### `"emotion"` — body-expression trigger
 
-Emitted when the robot adopts an emotional pose (driven by an emoji marker
-from the cognition loop).
+Emitted when the agent calls the `apply_pose` tool to adopt an emotional pose,
+at the same dispatch-time point and with the same "intent, not proof" semantics
+as a `"message"` block: `agent attach`'s `express` seam is publish-only too, so
+the block names the expression the agent chose, not a head that moved.
 
 | Key    | Type              | Description                                                   |
 |--------|-------------------|---------------------------------------------------------------|
@@ -110,17 +124,23 @@ for raw_line in sys.stdin:
   (not escaped as `\uXXXX`).
 - The `pose` field in an `"emotion"` block is `null` (JSON null) when the
   emoji is not in the expression catalog — not absent.
-- `cues` in a `"thinking"` block may be an empty array `[]` when the
-  cognition turn was timer-driven rather than sense-triggered.
+- The `cues` array is **never empty in practice**: a turn only runs when the
+  agent has at least one sense cue to reason about, so every `"thinking"` block
+  the shipped producer emits carries the cues that triggered it. The field is
+  still declared as a possibly-empty array — a reader should tolerate `[]`
+  rather than assume `cues[0]` exists.
 - Consumers should treat unknown `t` values as forward-compatible extensions
   and skip them gracefully.
+- **Block ordering within a turn is stable.** A turn emits its `"message"` and
+  `"emotion"` blocks in tool-call order as each call is dispatched, then exactly
+  one `"thinking"` block once the turn's tool loop drains. A consumer can use
+  the `"thinking"` block as an end-of-turn marker.
 - **`thinking.text` includes all LLM output** — the `text` field of a `"thinking"`
-  block is the **full raw LLM turn stream**, including prose that appears before the
-  first `*emoji*` or `"speech"` marker. By the engine's existing design, leading
-  prose (text before the first delimiter) is also spoken aloud — so such text can
-  appear **both** inside `thinking.text` and as a separate `"message"` block. Do
-  not assume `thinking.text` and the set of `"message"` blocks for the same turn
-  are disjoint.
+  block is the **full raw turn text**: every round's assistant content plus a
+  rendering of the tool calls that round made. Because a speech tool call renders
+  as `speak({"text": …})`, the text of every `"message"` block in a turn also
+  appears inside that turn's `thinking.text`. Do not assume `thinking.text` and
+  the set of `"message"` blocks for the same turn are disjoint.
 
 ## Runtime Event Feed (`behavior engine run --export -`)
 
@@ -179,12 +199,36 @@ loop does not flood the feed with an identical reading every 20 ms.
 | `pat`              | array or `null` | `[kind, level]` from a head-pat detection, or `null`  |
 | `face`             | string or `null`| A recognised face's name, or `null`                   |
 | `frame_available`  | bool            | Whether a camera frame was available to peek           |
+| `pat_state`        | object          | The event-stable pat-interaction state (see below); additive and **may be absent** |
+
+`pat_state` is an additive parallel object carrying the pat interaction's
+event-stable detail, alongside the legacy one-tick `pat` pair. The live
+`behavior engine run --export -` feed always includes it; it is omitted when
+the underlying reading carries no pat state at all, so a reader must tolerate
+its absence.
+
+| Key                | Type             | Description                                          |
+|--------------------|------------------|------------------------------------------------------|
+| `availability`     | string           | `"available"` / `"blocked"` / `"unavailable"`         |
+| `contact`          | bool             | Whether a hand is currently in contact                |
+| `touch_type`       | string or `null` | `"scratch"` / `"side_pat"`, or `null`                 |
+| `level`            | string or `null` | `"level1"` / `"level2"`, or `null`                    |
+| `yaw_deg`          | float or `null`  | Side-pat yaw deflection in degrees, or `null`         |
+| `phase`            | string           | `"idle"` / `"receptive"` / `"contentment"` / `"warning"` / `"released"` / `"enough"` / `"cooldown"` |
+| `phase_started_at` | float or `null`  | When the current phase began, or `null`               |
+| `last_press_at`    | float or `null`  | When the last press was seen, or `null`               |
 
 Example line:
 
 ```json
-{"t":"sense","ts":1718362800.0,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false}
+{"t":"sense","ts":1718362800.0,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false,"pat_state":{"availability":"unavailable","contact":false,"touch_type":null,"level":null,"yaw_deg":null,"phase":"idle","phase_started_at":null,"last_press_at":null}}
 ```
+
+**Not every engine sense field reaches this block.** The engine's internal
+perception snapshot also carries `transcript` (the words a nearby person said),
+`self_moving`, and `rms_ratio`; none of the three is exported here. A consumer
+that needs to know *what was said* cannot get it from this feed today — that is
+tracked as issue #93 and is unchanged by any recent work.
 
 #### `"rule"` — a rule engine decision
 

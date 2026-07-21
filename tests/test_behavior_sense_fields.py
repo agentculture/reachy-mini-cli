@@ -19,6 +19,7 @@ import pytest
 
 from reachy.behavior.sense import (
     EMPTY_SENSE,
+    FED_SENSE_FIELDS,
     NO_PROVIDERS,
     Sense,
     SenseProviders,
@@ -247,3 +248,54 @@ def test_sense_module_stays_stdlib_only() -> None:
     assert not (
         imported_roots & forbidden
     ), f"sense.py must stay a dependency-free leaf, found: {imported_roots & forbidden}"
+
+
+# --------------------------------------------------------------------------- #
+# 5. FED_SENSE_FIELDS — the single declared "what actually feeds a predicate" #
+#    source of truth ``behavior rules check`` reads (t16)                    #
+# --------------------------------------------------------------------------- #
+
+
+def test_fed_sense_fields_is_a_subset_of_the_rules_predicate_vocabulary() -> None:
+    """Every declared fed field must be a real ``Predicate.field`` name.
+
+    A typo here (a fed field this module names that ``rules.py`` would never
+    accept as a predicate field in the first place) would be worse than no
+    declaration at all, so this is asserted directly against
+    ``reachy.behavior.rules.SENSE_FIELDS`` rather than trusted by inspection.
+    """
+    from reachy.behavior.rules import SENSE_FIELDS
+
+    assert FED_SENSE_FIELDS <= SENSE_FIELDS
+
+
+def test_doa_and_speech_are_always_fed() -> None:
+    """The base DoA/speech leg is unconditional — every composition builds a
+    ``DoaPoller`` regardless of which optional providers it wires (see
+    ``read_perception``'s ``base`` argument), so these two never depend on a
+    ``SenseProviders`` field being wired."""
+    assert {"doa", "speech"} <= FED_SENSE_FIELDS
+
+
+def test_pat_is_fed_by_the_current_composition() -> None:
+    """The folded pat-sense driver is composed unconditionally in
+    ``_compose_run_seam`` (opt-out only via ``REACHY_PAT_SENSE=0``), so ``pat``
+    is a fed field today."""
+    assert "pat" in FED_SENSE_FIELDS
+
+
+def test_every_sense_field_is_fed_by_the_current_composition() -> None:
+    """t28 wired the last unfed providers, and this canary flipped as designed.
+
+    It previously asserted the opposite — that ``rms``/``face`` had no provider
+    and a rule keyed on either validated cleanly and then never fired. t28's
+    composition root now wires ``rms`` (the shared per-tick mic chunk),
+    ``transcript``, ``face`` and ``frame_available``, so every predicate field
+    ``rules.py`` accepts is genuinely fed and ``behavior rules check`` has
+    nothing left to warn about. The assertion stays in place inverted, so the
+    NEXT drift (a new predicate field added to ``SENSE_FIELDS`` with nothing
+    feeding it) is caught here rather than discovered as a silently dead rule.
+    """
+    from reachy.behavior.rules import SENSE_FIELDS
+
+    assert FED_SENSE_FIELDS == SENSE_FIELDS

@@ -94,10 +94,20 @@ def roots(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_ctx_public_surface_is_exactly_the_five_sanctioned_seams():
+def test_ctx_public_surface_is_exactly_the_six_sanctioned_seams():
+    """The reachable surface, spelled out. ``run_behavior`` joined it in t29 (the intent
+    effector — see ``tests/test_forge_intent_effector.py`` for the scope argument); this
+    assertion failing is the intended alarm for any further, undeliberate widening."""
     ctx = act.ForgedSkillContext()
     public = {a for a in dir(ctx) if not a.startswith("_")}
-    assert public == {"speak", "harmonics", "express", "state_get", "state_update"}
+    assert public == {
+        "speak",
+        "harmonics",
+        "express",
+        "state_get",
+        "state_update",
+        "run_behavior",
+    }
     # the validator's default allow-list and the ctx surface must agree
     from reachy.forge.validator import DEFAULT_ALLOWED_CTX_ATTRS
 

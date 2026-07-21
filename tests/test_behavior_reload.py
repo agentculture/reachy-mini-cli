@@ -6,6 +6,11 @@ Two acceptance criteria under test:
    engine run`` composition (``reachy.cli._commands.behavior``) yields running
    base presence (``feel-alive``) plus a ``[SENSE]`` rejection naming every
    reason — the process keeps going (exit-0), no tick_seam is installed at all.
+   Since t15 that "no tick_seam at all" outcome is the floor of LAST resort, not
+   what a real robot does: the release now ships default rules, so a broken
+   overlay degrades to THOSE. This module therefore blanks the shipped layer
+   (see ``_no_shipped_rules``) to keep testing the nothing-left-to-run branch;
+   the production branch lives in ``tests/test_behavior_default_rules.py``.
 2. ``behavior reload`` (``reachy.behavior.reload_driver``) swaps the rules
    config at a deterministic between-ticks point; a rejected reload keeps the
    last-good config and reports the rejection; the CLI verb itself still obeys
@@ -35,6 +40,22 @@ from reachy.behavior.rules import RulesLoader
 from reachy.behavior.sense import EMPTY_SENSE
 from reachy.cli import main
 from reachy.cli._commands import behavior as behavior_cmd
+
+
+@pytest.fixture(autouse=True)
+def _no_shipped_rules(monkeypatch):
+    """Blank the SHIPPED rules layer for this module.
+
+    These tests exercise the box-local OVERLAY and the loader/CLI mechanics
+    around it, not the product decision of what the release ships. Pinning them
+    to whatever ``reachy/behavior/default_rules.toml`` happens to contain would
+    churn them on every change to the shipped defaults while testing nothing
+    about the mechanism. The real shipped content is asserted in
+    ``tests/test_behavior_default_rules.py``; the two-layer merge itself in
+    ``tests/test_behavior_rules_layering.py``.
+    """
+    monkeypatch.setattr(rules_mod, "shipped_rules_text", lambda: None)
+
 
 SENSE_LOGGER = "reachy.sense"
 
@@ -301,11 +322,14 @@ def test_reload_swaps_config_mid_run_via_real_engine_loop() -> None:
             reload_driver.submit_reload()
             state["edited"] = True
 
+    # dt=0.005 keeps each tick's apparent work (one clock step) under the 20 ms
+    # period, so the #97 deadline scheduler still requests an inter-tick sleep
+    # (dt=0.02 would consume the whole budget and skip the sleep seam entirely).
     ticks = engine_run(
         tr,
         EngineConfig(compose_hz=50, base_layer=True, settle=False),
         sleep=_sleep_seam,
-        now=_Clock(),
+        now=_Clock(dt=0.005),
         max_ticks=2,
         engine=eng,
         tick_seam=driver,
@@ -319,6 +343,15 @@ def test_reload_swaps_config_mid_run_via_real_engine_loop() -> None:
 # --------------------------------------------------------------------------- #
 # Boot resilience: reachy.cli._commands.behavior._boot_tick_seam              #
 # --------------------------------------------------------------------------- #
+#
+# NOTE the module-level ``_no_shipped_rules`` fixture: everything below runs
+# with the SHIPPED layer blanked, so these cover the "there is genuinely
+# nothing left to fall back to" branch — bare base presence as the floor of
+# LAST resort. The complementary branch, which since t15 is the one a real
+# robot takes (a malformed overlay degrading to the shipped rules rather than
+# to nothing), is covered against the real package resource in
+# ``tests/test_behavior_default_rules.py`` and with an injected shipped layer
+# in ``tests/test_behavior_rules_layering.py``.
 
 
 def test_boot_tick_seam_missing_rules_file_is_not_a_rejection(caplog) -> None:
@@ -360,8 +393,16 @@ def test_engine_run_survives_a_broken_rules_file(monkeypatch, capsys, caplog) ->
     monkeypatch.setattr("reachy.cli._commands.behavior.get_transport", lambda args: tr)
     monkeypatch.setattr("time.sleep", lambda *_: None)
 
-    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
-        rc = main(["behavior", "engine", "run", "--json", "--max-ticks", "3"])
+    # #96: install_logging (run entry) severs propagation past "reachy", so
+    # caplog's ROOT-logger capture handler no longer sees reachy.sense records
+    # — attach that same handler to the sense logger itself for the call.
+    sense_logger = logging.getLogger(SENSE_LOGGER)
+    sense_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+            rc = main(["behavior", "engine", "run", "--json", "--max-ticks", "3"])
+    finally:
+        sense_logger.removeHandler(caplog.handler)
 
     assert rc == 0  # exit-0: no crash, no exception ever raised out of the loop
     events = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.strip()]

@@ -78,7 +78,14 @@ class _MirroredPatReader:
         self._sink = sink
         self._sign = sign
         self._fail_from_tick = fail_from_tick
+        self.connected = False
         self.closed = False
+
+    def warm_up(self) -> bool:
+        """t28's setup-thread connect. Present because the composition warms its
+        holders unconditionally — a fake without it is not a held reader."""
+        self.connected = True
+        return True
 
     def read(self) -> tuple[float, float] | None:
         pitch, yaw = self._sink.commanded_pitch_yaw
@@ -127,6 +134,9 @@ class _StaticRules:
 
     def set_active_mode(self, name: str | None) -> None:
         self._engine.set_active_mode(name)
+
+    def set_speech(self, speech) -> None:
+        self._engine.set_speech(speech)
 
     @staticmethod
     def known_modes() -> tuple[str, ...]:
@@ -324,9 +334,15 @@ def test_explicit_stop_drops_the_reaction_and_all_channel_owners(monkeypatch) ->
 
 
 def test_composition_source_has_one_pat_driver_and_no_dynamic_rule_parameters() -> None:
-    source = behavior_mod._compose_run_seam.__doc__ or ""
-    assert "pat_event=..., pat_state=..." in source
-    assert "same driver" in source
+    # The invariant this tripwire guards is unchanged by t28's provider wiring:
+    # the two pat views must come from ONE driver (one held reader, one
+    # detector), never a second reader opened per view. Only the wording moved
+    # when the docstring grew to describe all six composed providers, so the
+    # match is on reflowed text rather than one hard-wrapped line.
+    source = " ".join((behavior_mod._compose_run_seam.__doc__ or "").split())
+    assert "``pat_event`` / ``pat_state`` — two PEEKs of the ONE" in source
+    assert ":class:`PatSenseDriver`" in source
+    assert "one held reader and detector" in source
 
     config = RulesConfig.from_dict(
         {

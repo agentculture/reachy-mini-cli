@@ -28,6 +28,22 @@ from reachy.cli._commands import behavior as behavior_cmd
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.explain import known_paths
 
+
+@pytest.fixture(autouse=True)
+def _no_shipped_rules(monkeypatch):
+    """Blank the SHIPPED rules layer for this module.
+
+    These tests exercise the box-local OVERLAY and the loader/CLI mechanics
+    around it, not the product decision of what the release ships. Pinning them
+    to whatever ``reachy/behavior/default_rules.toml`` happens to contain would
+    churn them on every change to the shipped defaults while testing nothing
+    about the mechanism. The real shipped content is asserted in
+    ``tests/test_behavior_default_rules.py``; the two-layer merge itself in
+    ``tests/test_behavior_rules_layering.py``.
+    """
+    monkeypatch.setattr(rules_mod, "shipped_rules_text", lambda: None)
+
+
 GOOD_TOML = """\
 active_mode = "calm"
 
@@ -40,7 +56,7 @@ duration_s = 30.0
 
 [[inhibit]]
 id = "i1"
-when = { field = "rms", op = "gt", value = 0.5 }
+when = { field = "doa", op = "gt", value = 0.5 }
 disable = ["speak"]
 
 [modes.calm]
@@ -169,6 +185,7 @@ def test_rules_check_missing_file_ok_true_json(capsys) -> None:
     assert payload["ok"] is True
     assert payload["exists"] is False
     assert payload["reasons"] == []
+    assert payload["warnings"] == []
     assert payload["counts"] == {"react": 0, "inhibit": 0, "modes": 0}
 
 
@@ -180,6 +197,7 @@ def test_rules_check_valid_file_ok_true_with_counts(capsys) -> None:
     assert payload["ok"] is True
     assert payload["exists"] is True
     assert payload["reasons"] == []
+    assert payload["warnings"] == []
     assert payload["counts"] == {"react": 1, "inhibit": 1, "modes": 1}
 
 
@@ -193,6 +211,7 @@ def test_rules_check_malformed_file_still_exits_zero(capsys) -> None:
     assert len(payload["reasons"]) == 1
     assert "mystery" in payload["reasons"][0]
     assert "another_bad" in payload["reasons"][0]
+    assert payload["warnings"] == []
     assert "counts" not in payload
 
 
@@ -202,6 +221,140 @@ def test_rules_check_malformed_file_text_mode_still_exits_zero(capsys) -> None:
     assert rc == 0
     out = capsys.readouterr().out
     assert "mystery" in out or "false" in out.lower() or "ok" in out.lower()
+
+
+# --------------------------------------------------------------------------- #
+# behavior rules check — unfed sense-field warnings (t16, issue: silent no-op #
+# rules that validate cleanly but can never fire)                            #
+# --------------------------------------------------------------------------- #
+
+# `rms` is a schema-valid predicate field (reachy.behavior.rules.SENSE_FIELDS)
+# that a composition may or may not feed (reachy.behavior.sense.FED_SENSE_FIELDS).
+#
+# Since t28 wired the last providers, EVERY schema-valid field is fed, so no real
+# field reproduces the unfed case any more — the tests below shrink
+# `FED_SENSE_FIELDS` to simulate one. That is precisely the drift the warning now
+# guards against: a field added to `SENSE_FIELDS` with no provider wired for it
+# in the composition root, leaving a rule that validates cleanly and can never
+# fire.
+UNFED_FIELD_TOML = """\
+[[inhibit]]
+id = "i-rms"
+when = { field = "rms", op = "gt", value = 0.5 }
+disable = ["speak"]
+"""
+
+# `doa` IS fed (the base DoA/speech leg is unconditional) — a control fixture
+# proving a rule on a fed field never warns.
+FED_FIELD_TOML = """\
+[[react]]
+id = "r-doa"
+when = { field = "doa", op = "is_true" }
+run = "nod"
+duration_s = 5.0
+"""
+
+# One rule on a fed field ("doa") and one on an unfed field ("face") in the
+# same file — only the unfed one should be reported.
+MIXED_FIELD_TOML = """\
+[[react]]
+id = "r-doa"
+when = { field = "doa", op = "is_true" }
+run = "nod"
+duration_s = 5.0
+
+[[inhibit]]
+id = "i-face"
+when = { field = "face", op = "eq", value = "Ada" }
+disable = ["speak"]
+"""
+
+
+def _simulate_unfed(monkeypatch, *fields: str) -> None:
+    """Pretend the composition feeds everything EXCEPT *fields*.
+
+    ``_unfed_field_warnings`` reads the module-global ``FED_SENSE_FIELDS``, so
+    shrinking it here exercises the real linter against the real rules file.
+    """
+    from reachy.behavior.sense import FED_SENSE_FIELDS
+
+    monkeypatch.setattr(
+        "reachy.cli._commands.behavior.FED_SENSE_FIELDS",
+        FED_SENSE_FIELDS - frozenset(fields),
+    )
+
+
+def test_rules_check_warns_on_a_rule_keyed_to_an_unfed_field_json(capsys, monkeypatch) -> None:
+    _simulate_unfed(monkeypatch, "rms")
+    _write_rules(UNFED_FIELD_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0  # a warning, not a failure
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False  # mirrors 'think expressions check': ok := no warnings
+    assert payload["reasons"] == []  # not a schema/validation error
+    assert len(payload["warnings"]) == 1
+    warning = payload["warnings"][0]
+    # names the field ...
+    assert "rms" in warning
+    # ... and the offending rule ...
+    assert "i-rms" in warning
+    # ... and WHY it cannot fire.
+    assert "never fire" in warning or "cannot fire" in warning
+    # the file itself is still perfectly valid TOML/schema — counts are present.
+    assert payload["counts"] == {"react": 0, "inhibit": 1, "modes": 0}
+
+
+def test_rules_check_warns_on_a_rule_keyed_to_an_unfed_field_text_mode(capsys, monkeypatch) -> None:
+    _simulate_unfed(monkeypatch, "rms")
+    _write_rules(UNFED_FIELD_TOML)
+    rc = main(["behavior", "rules", "check"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "rms" in out
+    assert "i-rms" in out
+
+
+def test_rules_check_a_rule_on_a_fed_field_never_warns(capsys) -> None:
+    _write_rules(FED_FIELD_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["warnings"] == []
+
+
+# `self_moving` (#95): the composition wires the SelfMotionDriver latch as a
+# provider, and `_COMPOSED_PROVIDER_FIELDS` was extended in the SAME change, so
+# a rule keyed on it must be accepted with no dormant-predicate warning.
+SELF_MOVING_FIELD_TOML = """\
+[[inhibit]]
+id = "i-self-moving"
+when = { field = "self_moving", op = "is_true" }
+disable = ["speak"]
+"""
+
+
+def test_rules_check_a_rule_keyed_on_self_moving_never_warns(capsys) -> None:
+    _write_rules(SELF_MOVING_FIELD_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["warnings"] == []
+    assert payload["counts"] == {"react": 0, "inhibit": 1, "modes": 0}
+
+
+def test_rules_check_only_the_unfed_rule_is_flagged_in_a_mixed_file(capsys, monkeypatch) -> None:
+    _simulate_unfed(monkeypatch, "face")
+    _write_rules(MIXED_FIELD_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert len(payload["warnings"]) == 1
+    assert "face" in payload["warnings"][0]
+    assert "i-face" in payload["warnings"][0]
+    assert "r-doa" not in payload["warnings"][0]
 
 
 def test_rules_check_payload_unreadable_path_raises_env_error(tmp_path) -> None:
@@ -274,3 +427,110 @@ def test_explain_resolves_rules_paths(capsys) -> None:
         rc = main(["explain", *path])
         assert rc == 0
         capsys.readouterr()
+
+
+# --------------------------------------------------------------------------- #
+# behavior rules check — uncorroborated `speech` warnings                     #
+# (retire-the-old-ai-first-flow t9, acceptance criterion 2)                   #
+# --------------------------------------------------------------------------- #
+#
+# Measured on the deployed robot in a QUIET room with nobody speaking, 120
+# samples over 60 s (docs/verification/2026-07-20-retire-old-flow-baseline.md
+# section 2): `speech_detected` read True 55/120 = 45.8 % of the time, with the
+# bearing wandering the full 0.000-3.124 rad range. A rule keyed on it fires on
+# roughly a coin flip, pointed at nothing.
+#
+# A `Rule` carries exactly ONE `when` predicate (there is no conjunction in the
+# schema), so ANY rule whose `when.field` is "speech" is by construction keyed
+# on BARE `speech_detected` — the check needs no cross-predicate analysis.
+
+SPEECH_ONLY_TOML = """\
+[[react]]
+id = "r-speech"
+when = { field = "speech", op = "is_true" }
+run = "nod"
+duration_s = 5.0
+"""
+
+CORROBORATED_TOML = """\
+[[react]]
+id = "r-heard"
+when = { field = "transcript", op = "is_true" }
+run = "nod"
+duration_s = 5.0
+"""
+
+
+def test_rules_check_warns_on_a_rule_keyed_on_bare_speech(capsys) -> None:
+    _write_rules(SPEECH_ONLY_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0  # a warning, not a gate
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["reasons"] == []  # schema-valid; this is a LINT finding
+    assert len(payload["warnings"]) == 1
+    warning = payload["warnings"][0]
+    assert "r-speech" in warning
+    assert "speech" in warning
+    assert "45.8" in warning  # cites the measurement, not just an opinion
+    assert "corroborat" in warning  # names the requirement
+
+
+def test_the_uncorroborated_warning_names_a_corroborating_field(capsys) -> None:
+    _write_rules(SPEECH_ONLY_TOML)
+    main(["behavior", "rules", "check", "--json"])
+    warning = json.loads(capsys.readouterr().out)["warnings"][0]
+    assert any(f in warning for f in ("transcript", "rms"))
+
+
+def test_a_rule_keyed_on_a_corroborating_field_earns_no_such_warning(capsys) -> None:
+    _write_rules(CORROBORATED_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["warnings"] == []
+
+
+def test_rules_check_text_mode_surfaces_the_uncorroborated_warning(capsys) -> None:
+    _write_rules(SPEECH_ONLY_TOML)
+    assert main(["behavior", "rules", "check"]) == 0
+    out = capsys.readouterr().out
+    assert "r-speech" in out
+    assert "45.8" in out
+
+
+def test_an_inhibit_rule_keyed_on_bare_speech_is_flagged_too(capsys) -> None:
+    _write_rules("""\
+[[inhibit]]
+id = "i-speech"
+when = { field = "speech", op = "is_false" }
+disable = ["speak"]
+""")
+    main(["behavior", "rules", "check", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["warnings"]) == 1
+    assert "i-speech" in payload["warnings"][0]
+
+
+def test_no_shipped_rule_keys_on_an_uncorroborated_sense_field() -> None:
+    """Acceptance criterion 2, pinned where it is scoped.
+
+    The operator's own overlay only earns a WARNING (see the module note above
+    and ``_uncorroborated_field_warnings``' docstring for why refusal would be
+    the wrong trade on a boot-persistent robot). The SHIPPED layer is different:
+    it is ours, it lands on every robot on upgrade, and nobody is watching a
+    linter when it does — so it is enforced HARD, here, and a future task that
+    ships such a rule fails CI.
+    """
+    shipped = rules_mod.load_shipped_rules()
+    offenders = [
+        rule.id
+        for rule in (*shipped.react, *shipped.inhibit)
+        if rule.when.field in rules_mod.UNCORROBORATED_SENSE_FIELDS
+    ]
+    assert offenders == [], (
+        f"shipped rules {offenders} key on a bare uncorroborated sense field; "
+        "measured at 45.8% true in a quiet room — pair it with a corroborating "
+        "signal (transcript/rms/face/pat) instead"
+    )

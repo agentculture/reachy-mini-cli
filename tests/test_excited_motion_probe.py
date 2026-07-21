@@ -364,7 +364,12 @@ def test_cli_engine_run_wires_passive_probe_without_extra_sends(
     class Held:
         def __init__(self) -> None:
             self.calls = 0
+            self.connected = False
             self.closed = False
+
+        def warm_up(self) -> bool:
+            self.connected = True
+            return True
 
         def read(self):  # type: ignore[no-untyped-def]
             self.calls += 1
@@ -374,11 +379,13 @@ def test_cli_engine_run_wires_passive_probe_without_extra_sends(
             self.closed = True
 
     class Clock:
+        # 0.05 per call: the #97 deadline scheduler reads the clock twice per
+        # tick, so the per-tick ctx.now stride stays 0.1 (the probe's max gap).
         def __init__(self) -> None:
             self.value = 0.0
 
         def __call__(self) -> float:
-            self.value += 0.1
+            self.value += 0.05
             return self.value
 
     transport = Transport()
@@ -466,7 +473,12 @@ cooldown_s = 0.0
             self.samples = iter([(-3.0, 0.0), (0.0, 0.0), (-3.0, 0.0)])
             self.last = (0.0, 0.0)
             self.calls = 0
+            self.connected = False
             self.closed = False
+
+        def warm_up(self) -> bool:
+            self.connected = True
+            return True
 
         def read(self):  # type: ignore[no-untyped-def]
             self.calls += 1
@@ -573,7 +585,11 @@ def test_cli_probe_refuses_fresh_engine_before_output_or_transport(
 
     monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path / "state"))
     control.CommandSpool().write_state({"updated": 100.0})
-    monkeypatch.setattr(behavior_module.time, "monotonic", lambda: 101.0)
+    # The freshness read moved to reachy.behavior.liveness (shared with the
+    # foreground pat/sleep refusal), so the clock seam moved with it.
+    from reachy.behavior import liveness
+
+    monkeypatch.setattr(liveness.time, "monotonic", lambda: 101.0)
     transport_calls: list[object] = []
     engine_calls: list[object] = []
     monkeypatch.setattr(behavior_module, "get_transport", lambda args: transport_calls.append(args))
@@ -622,7 +638,9 @@ def test_cli_probe_refuses_heartbeat_dated_marginally_in_the_future(
 
     monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path / "state"))
     control.CommandSpool().write_state({"updated": 100.0005})
-    monkeypatch.setattr(behavior_module.time, "monotonic", lambda: 100.0)
+    from reachy.behavior import liveness
+
+    monkeypatch.setattr(liveness.time, "monotonic", lambda: 100.0)
     transport_calls: list[object] = []
     monkeypatch.setattr(behavior_module, "get_transport", lambda args: transport_calls.append(args))
     output = tmp_path / "must-not-exist.jsonl"
@@ -647,7 +665,9 @@ def test_cli_probe_allows_heartbeat_from_before_a_monotonic_reset(monkeypatch, t
 
     monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path / "state"))
     control.CommandSpool().write_state({"updated": 90_000.0})
-    monkeypatch.setattr(behavior_module.time, "monotonic", lambda: 12.0)
+    from reachy.behavior import liveness
+
+    monkeypatch.setattr(liveness.time, "monotonic", lambda: 12.0)
     engine_calls: list[object] = []
     monkeypatch.setattr(behavior_module, "get_transport", lambda _args: object())
     monkeypatch.setattr(behavior_module, "_compose_run_seam", lambda *a, **k: (None, None, None))

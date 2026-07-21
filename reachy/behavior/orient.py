@@ -1,0 +1,1054 @@
+"""Orienting toward sound in the symbolic runtime — the ported two-tier ladder.
+
+:func:`reachy.behavior.sense.doa_angle_to_yaw` has always mapped a Direction of
+Arrival angle onto a yaw target, but its only production consumer was
+:class:`reachy.motion.listen.ListenProducer` — the retiring AI-first loop. The
+runtime could *sense* ``doa_angle``/``speech_detected`` and *react* discretely
+through a rule, but nothing turned a live bearing into a SUSTAINED gaze target.
+This module is that missing half, expressed the way every other runtime
+capability is expressed: as a library behavior the engine arbitrates like any
+other channel owner.
+
+Three pieces, separable on purpose
+==================================
+* :class:`OrientParams` — the tunables, defaulted to the DONOR's values
+  (:class:`reachy.motion.listen.ListenParams`) knob for knob. A drift guard in
+  ``tests/test_behavior_orient.py`` pins them together, so "observably
+  equivalent motion" cannot rot silently.
+* :func:`plan_orient` — the PURE geometry: the donor's graduated ladder
+  (:meth:`ListenProducer._react_to_angle`) with the motion-queue plumbing
+  removed. Cited, not imported: this package stays a dependency-free leaf that
+  never reaches into :mod:`reachy.motion`.
+* :class:`OrientToSound` — the stateful contribution function the library entry
+  ``orient-to-sound`` mints. It consults an injected *gate* for admission,
+  plans a target, and eases onto it with the same minimum-jerk profile the
+  donor's ``goto`` planner used, over the donor's own computed duration.
+
+Admission is a SEAM, deliberately
+=================================
+The gate is a plain injectable callable ``gate(sense, now, params) ->
+OrientTier``. It is not folded into :func:`plan_orient` and it is not an
+``if sense.speech_detected`` buried in the middle of the behavior, because the
+admission decision is the part still being hardened. Task **t9** used that seam
+exactly as intended: the shipped gate is now
+``LatchedDoaGuard(CorroboratedGate())`` — a pure NARROWING wrapper, with no
+change to the geometry, the behavior, or the inner gate's own verdicts.
+
+Why the default gate is a CONJUNCTION, not ``speech_detected``
+---------------------------------------------------------------
+Measured on the deployed robot, 120 samples at 0.5 s in a QUIET room with
+nobody speaking (``docs/verification/2026-07-20-retire-old-flow-baseline.md``
+section 2):
+
+.. code-block:: text
+
+    speech_detected True: 55/120  (45.8 %)
+    longest consecutive True run: ~2.5 s
+    distinct angles: 35, spanning 0.000-3.124 rad
+
+So ``speech_detected`` FLICKERS — it is not latched on — while the bearing
+wanders essentially the full acoustic range. A goal keyed on the bare flag
+would swivel the robot at nothing about half the time, pointing somewhere
+uncorrelated with anything real. :class:`CorroboratedGate` therefore requires,
+cheapest first:
+
+1. **Sound energy, RELATIVE to the room** — ``sense.rms_ratio >= rms_ratio``.
+   This started as the donor's own ``sound_present``, which was exactly
+   ``rms > SnapDetector.min_rms`` (0.02) in ``listen``'s audio tap, and shipped
+   here as an absolute ``rms_floor``. Hands-on measurement then killed the
+   absolute form (issue #102,
+   ``docs/verification/2026-07-21-live-verification-night.md`` section 4): the
+   mic background drifts ~25x across conditions one robot lives in within 24 h
+   — daytime p50 0.004, night-with-streaming p50 0.034 — so 0.02 sat UNDER the
+   night background (99.1 % of still-room samples cleared it) while anything
+   above the night state deafens the daytime robot. The conjunct is therefore a
+   RATIO over a rolling background estimate
+   (:class:`reachy.behavior.rms_background.RmsBackground`, computed upstream in
+   the sense layer and delivered as ``Sense.rms_ratio``), which restores the
+   shape ``SnapDetector`` always had: ``rms > ratio * rolling_avg``. A quiet
+   room has no energy ABOVE ITSELF however the daemon's speech flag reads, so
+   this alone converts a coin flip into "only while something is actually
+   audible", in every room rather than only the calibration room.
+2. **A bearing that holds still** — the angle must stay within ``dwell_tol_rad``
+   for ``dwell_s`` before any HEAD-moving tier opens. The measured wander (35
+   distinct angles across the full range in 60 s) cannot clear this; a person
+   speaking from one place can.
+3. **Words, for the deliberate turn** — the ENGAGED tier keys on
+   ``sense.transcript``, which by construction is an utterance that already
+   cleared the layered engagement gate
+   (:mod:`reachy.behavior.transcript_sense`). That is the strongest
+   corroboration available in the runtime, and it needs neither dwell nor
+   loudness.
+
+The honest limits of that rule, stated rather than hidden: it is *energy plus
+steadiness*, so a loud steady non-speech source (a fan, music) can still open
+the SPEECH tier. The other limit it named — a frozen-but-plausible daemon angle
+inside a loud room passing the dwell test — is closed by
+:class:`LatchedDoaGuard`, which asks the different question of whether the angle
+has CHANGED at all. Read that class's docstring for what it does and does not
+defend; notably, on the daemon build actually measured it never fires, and
+``rms_ratio`` remains the conjunct that keeps a quiet room still.
+
+The NOISE tier additionally carries an attack/release envelope
+(:class:`_NoiseEnvelope`): live-verified, a keyboard-click train flapped the
+bare per-tick predicate at tick rate (22 ``NONE->NOISE`` opens in 1.3 s), so
+NOISE now opens only after ``noise_attack_ticks`` consecutive loud reads and
+closes only after ``noise_release_s`` of continuous quiet — see that class's
+docstring for the measured burst and the timing contract.
+
+The two tiers are also graded by COST (d6). Tier 1 is the antenna lean and
+leaves the head alone; tier 2 (the head/body turn) additionally requires a
+PROMOTION — sound that is LOUD relative to the room (``rms_ratio_loud``) or
+ONGOING (``sustain_s``). The measured reason is blunt: with the old absolute
+floor the rule fired 203 times in 8 minutes in an ordinary room, and the pat
+sense — which suspends while another behavior owns the head — recorded zero
+detections in 5 minutes. A head that keeps turning cannot feel a pat, so making
+tier 2 rare is what makes touch work. See :class:`CorroboratedGate`'s "Two
+tiers, and why tier 2 is rare".
+
+Pure standard library plus in-package value types. No transport, no
+``reachy_mini``, no :mod:`reachy.motion` import.
+"""
+
+from __future__ import annotations
+
+import enum
+import math
+from dataclasses import dataclass, fields
+from typing import Callable
+
+from reachy import senselog
+from reachy.behavior.model import Contribution, neutral_head
+from reachy.behavior.rms_background import DEFAULT_LOUD_RATIO, DEFAULT_RATIO, DEFAULT_WINDOW_S
+from reachy.behavior.sense import Sense, doa_angle_to_yaw
+
+#: The ``[SENSE stage=...]`` stage name every line this module logs carries.
+STAGE = "orient"
+
+#: How long the Tier-1 antenna lean takes to reach its deflection, in seconds.
+#: The donor's ``_antenna_lean`` built a 0.3 s minjerk ``MotionAction``.
+ANTENNA_LEAN_S = 0.3
+
+#: Below this absolute offset a channel counts as "home" and the behavior
+#: abstains from it entirely, handing it back to the passive base layer.
+HOME_EPS_DEG = 0.05
+
+
+@dataclass(frozen=True)
+class OrientParams:
+    """Tunables for the orienting ladder (degrees, seconds, deg/s).
+
+    Every field that has a counterpart in
+    :class:`reachy.motion.listen.ListenParams` carries the DONOR's value; the
+    last three are this port's own admission gate. Keep them in step with the
+    donor while both exist — a test asserts it.
+    """
+
+    # -- geometry (donor: ListenParams) ------------------------------------ #
+    gain: float = 0.6  # scales the ~+-90 deg acoustic span onto yaw
+    max_yaw: float = 35.0  # head yaw clamp
+    deadband: float = 16.0  # ignore sound within this of the current heading
+    hold: float = 3.0  # after committing, hold this long before reconsidering
+    alert_speed: float = 18.0  # deg/s turning toward a new (more off-axis) sound
+    relax_speed: float = 18.0  # deg/s easing back toward centre
+    min_dur: float = 1.5  # duration floor, so even small turns stay deliberate
+    max_dur: float = 4.0
+    antenna_gain: float = 1.0
+    antenna_max: float = 18.0
+    body_yaw_max: float = 45.0
+    body_speed: float = 12.0  # deg/s (slow — a body turn is deliberate)
+    head_only_band: float = 30.0  # beyond this the body escalates
+    speech_orient_gain: float = 0.6  # fraction of the clamped target the speech tier uses
+    speech_orient_max: float = 20.0  # hard cap on the speech-tier head-only nudge
+    engaged_min_dur: float = 1.5  # duration floor for the deliberate engaged turn
+    recenter_after: float = 4.0  # silence grace before the heading drifts home
+    # -- admission gate (this port's own; see the module docstring) --------- #
+    # The two knobs that ARE the sound-admission contract (#102): how many times
+    # the room's own background a reading must stand, and how long a window that
+    # background is estimated over. They replace the retired absolute
+    # ``rms_floor = 0.02``, which no single value could make right in both the
+    # measured daytime and night rooms. Both read their defaults from
+    # :mod:`reachy.behavior.rms_background` rather than restating a number, so
+    # the gate, the estimator and the shipped rule cannot drift apart.
+    #
+    # ``rms_background_s`` is DECLARED here — it is half of "how many times over
+    # how long", and the admission contract should read in one place — but it is
+    # consumed by the sense-layer estimator, which is composed once per process
+    # (env ``REACHY_RMS_BACKGROUND_S``). Retuning it per behavior instance
+    # therefore does not move the estimator; retuning ``rms_ratio`` does move
+    # this gate. Stated plainly rather than left to be discovered.
+    #
+    # ``rms_ratio_loud`` / ``sustain_s`` are the TIER-2 promotion pair (d6): a
+    # head/body turn needs sound that is LOUD relative to the room, or ONGOING.
+    # See :class:`CorroboratedGate`'s "Two tiers, and why tier 2 is rare".
+    rms_ratio: float = DEFAULT_RATIO  # reading / rolling background, the admission point
+    rms_background_s: float = DEFAULT_WINDOW_S  # window the background is estimated over
+    rms_ratio_loud: float = DEFAULT_LOUD_RATIO  # reading / background that promotes on loudness
+    sustain_s: float = 1.5  # continuous sound above rms_ratio that promotes on persistence
+    dwell_s: float = 0.6  # the bearing must hold this long before the head moves
+    dwell_tol_rad: float = 0.12  # how far the bearing may move and still count as held
+    latch_after_s: float = 8.0  # a BIT-IDENTICAL bearing this long is a wedged feed
+    noise_attack_ticks: int = 2  # consecutive loud reads before the NOISE tier opens
+    noise_release_s: float = 0.7  # continuous quiet before an open NOISE tier closes
+
+
+#: The library entry's parameter names, in declaration order — every
+#: :class:`OrientParams` field is exposed, so a rule or a standing goal retunes
+#: the whole ladder with no code change.
+PARAM_NAMES = tuple(f.name for f in fields(OrientParams))
+
+
+class OrientTier(enum.Enum):
+    """How strongly the runtime should react to what it currently hears.
+
+    The gate's whole vocabulary, ordered by :attr:`rank` — a graduated ladder,
+    not a boolean, because the donor's reaction was graded by perception level
+    and flattening it would either freeze the head or swing it at noise:
+
+    * ``NONE`` — no credible sound; the behavior abstains and the base layer keeps
+      the channels.
+    * ``NOISE`` — live sound, no bearing worth turning to: the donor's Tier-1
+      near-side antenna lean, head untouched.
+    * ``SPEECH`` — speech from a bearing that holds still: a bounded HEAD-ONLY
+      orienting nudge, never a body rotation.
+    * ``ENGAGED`` — an utterance addressed to the robot: the deliberate head
+      turn, escalating to the body beyond ``head_only_band``.
+    """
+
+    NONE = 0
+    NOISE = 1
+    SPEECH = 2
+    ENGAGED = 3
+
+    @property
+    def rank(self) -> int:
+        """How strong this tier is; higher reacts more (``NONE`` is 0)."""
+        return int(self.value)
+
+
+@dataclass(frozen=True)
+class OrientTarget:
+    """One planned commitment: where to point, and how long the move takes.
+
+    A channel left ``None`` is one this commitment does not drive (the NOISE
+    tier drives only ``antennas``, the SPEECH tier never drives ``body_yaw``).
+    ``duration`` is the donor's own computed move time, so the ease onto the
+    target takes exactly as long as the retiring loop's ``goto`` did.
+    """
+
+    head_yaw: float | None
+    body_yaw: float | None
+    antennas: tuple[float, float] | None
+    duration: float
+
+
+#: The admission seam. ``gate(sense, now, params) -> OrientTier``: given this
+#: tick's perception snapshot, the behavior-local clock and the effective
+#: tuning, decide how strongly to react. Duck-typed exactly like
+#: :class:`reachy.behavior.sense.DoaPoller`'s ``read`` callable, so t9's
+#: latched-DoA guard is wired in as a plain callable with no import cycle.
+OrientGate = Callable[[Sense, float, OrientParams], OrientTier]
+
+
+# --------------------------------------------------------------------------- #
+# Pure geometry — the donor's ladder, cited                                    #
+# --------------------------------------------------------------------------- #
+
+
+def minjerk_progress(tau: float) -> float:
+    """The minimum-jerk position profile ``s(t) = 10t^3 - 15t^4 + 6t^5`` on ``[0, 1]``.
+
+    The SAME profile the SDK's ``goto`` planner interpolated the donor's turns
+    with, and the same one :func:`reachy.behavior.goto_lane.minjerk_progress`
+    documents. Re-stated here (not imported) so this module stays a leaf with
+    no dependency on the goto lane; clamped and monotonic, so an approach never
+    overshoots or reverses.
+    """
+    if tau <= 0.0:
+        return 0.0
+    if tau >= 1.0:
+        return 1.0
+    return tau * tau * tau * (10.0 + tau * (-15.0 + 6.0 * tau))
+
+
+def _clamp(value: float, limit: float) -> float:
+    return max(-limit, min(limit, value))
+
+
+def antenna_pair(desired: float, params: OrientParams) -> tuple[float, float]:
+    """The ``(right, left)`` antenna pair leaning toward a head *desired* yaw.
+
+    Cited from the donor's ``_antenna_tuple``: only the NEAR-side antenna
+    deflects, and the right joint's sign is MIRRORED from the left, so a
+    positive value on the right would tilt it toward the centre instead of
+    toward the sound. A desired of zero returns both to neutral.
+    """
+    if abs(desired) < 1e-9:
+        return (0.0, 0.0)
+    lean = min(1.0, abs(desired) / params.max_yaw) * params.antenna_max * params.antenna_gain
+    if desired > 0:  # sound on the left
+        return (0.0, lean)
+    return (-lean, 0.0)
+
+
+def _duration(raw: float, params: OrientParams, floor: float | None = None) -> float:
+    """Clamp a computed move duration to the donor's never-degenerate range."""
+    lo = params.min_dur if floor is None else max(params.min_dur, floor)
+    if not math.isfinite(raw) or raw <= 0.0:
+        return lo
+    return max(lo, min(params.max_dur, raw))
+
+
+def plan_orient(
+    tier: OrientTier,
+    angle: float,
+    params: OrientParams,
+    *,
+    head_yaw: float,
+    body_yaw: float,
+) -> OrientTarget | None:
+    """Plan this tier's commitment toward *angle*, or ``None`` for "stay put".
+
+    A direct port of :meth:`reachy.motion.listen.ListenProducer._react_to_angle`
+    with the ``MotionAction`` plumbing dropped. *head_yaw* / *body_yaw* are the
+    behavior's CURRENT committed targets, which the deadband and the duration
+    arithmetic are measured against — the same role ``ListenProducer.committed``
+    and ``.body`` played.
+
+    * ``ENGAGED`` — the deliberate turn. Beyond ``head_only_band`` the body
+      rotates toward the source (clamped to ``body_yaw_max``) and the head takes
+      the RESIDUAL, so head and body together face the sound with the head near
+      centre. Its duration floor is raised to ``engaged_min_dur``.
+    * ``SPEECH`` — a bounded head-only nudge: a fraction of the clamped target,
+      hard-capped at ``speech_orient_max``, never escalating to the body.
+    * ``NOISE`` — the Tier-1 antenna lean alone.
+    * ``NONE`` — nothing.
+    """
+    raw_desired = doa_angle_to_yaw(angle, params.gain)  # unclamped: drives escalation
+    desired = _clamp(raw_desired, params.max_yaw)
+    off_heading = abs(desired - head_yaw) > params.deadband
+
+    if tier is OrientTier.ENGAGED and off_heading:
+        floor = params.engaged_min_dur
+        if abs(raw_desired) > params.head_only_band:
+            return _escalate(raw_desired, params, body_yaw=body_yaw, floor=floor)
+        return _head_only(desired, params, head_yaw=head_yaw, floor=floor)
+
+    if tier is OrientTier.SPEECH and off_heading:
+        mag = min(abs(desired) * params.speech_orient_gain, params.speech_orient_max)
+        target = math.copysign(mag, desired) if desired else 0.0
+        return _head_only(target, params, head_yaw=head_yaw)
+
+    if tier in (OrientTier.NOISE, OrientTier.SPEECH, OrientTier.ENGAGED):
+        antennas = antenna_pair(desired, params)
+        if antennas == (0.0, 0.0):
+            return None  # a front-facing sound needs no lean (the donor's guard)
+        return OrientTarget(None, None, antennas, ANTENNA_LEAN_S)
+    return None
+
+
+def _head_only(
+    target: float, params: OrientParams, *, head_yaw: float, floor: float | None = None
+) -> OrientTarget:
+    """A head turn to *target*, with the near-side antenna folded in."""
+    toward_centre = abs(target) < abs(head_yaw)
+    speed = params.relax_speed if toward_centre else params.alert_speed
+    raw = abs(target - head_yaw) / speed if speed else params.max_dur
+    return OrientTarget(
+        head_yaw=target,
+        body_yaw=None,
+        antennas=antenna_pair(target, params),
+        duration=_duration(raw, params, floor),
+    )
+
+
+def _escalate(
+    raw_desired: float, params: OrientParams, *, body_yaw: float, floor: float | None
+) -> OrientTarget:
+    """A combined head+body commitment bringing the robot to face the source."""
+    sign = 1.0 if raw_desired >= 0 else -1.0
+    new_body = sign * min(abs(raw_desired), params.body_yaw_max)
+    new_head = _clamp(raw_desired - new_body, params.max_yaw)
+    raw = abs(new_body - body_yaw) / params.body_speed if params.body_speed else params.max_dur
+    return OrientTarget(
+        head_yaw=new_head,
+        body_yaw=new_body,
+        antennas=antenna_pair(new_head, params),
+        duration=_duration(raw, params, floor),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The default admission gate                                                  #
+# --------------------------------------------------------------------------- #
+
+
+class _NoiseEnvelope:
+    """Attack/release timing for the NOISE tier — the anti-flap envelope.
+
+    Measured on the deployed robot (journal, 2026-07-21 01:25): a transient
+    train (keyboard clicks) drove **22 ``NONE->NOISE`` opens in 1.3 s** — one
+    open/close per ~22 ms tick — with the #95 moving-floor gate CLOSED
+    throughout, because the rms reading genuinely alternates loud/quiet per
+    tick on clicky sound. Every open commanded an antenna lean and every close
+    removed it, so the operator saw sharp per-tick antenna twitching. The NOISE
+    tier was a bare per-tick predicate (doa finite AND the loudness conjunct)
+    with zero temporal smoothing — SPEECH has an angular dwell, NOISE had
+    nothing. This envelope is that missing smoothing:
+
+    * **Attack** — the loud condition must hold on ``noise_attack_ticks``
+      CONSECUTIVE decision calls before NOISE opens, so a single one-tick
+      click never opens the tier at all.
+    * **Release** — once NOISE (or a higher tier) is open, a quiet reading
+      does not close it: the tier holds through gaps and closes only after
+      ``noise_release_s`` of CONTINUOUS quiet. A fresh loud reading during
+      the hold resets the quiet timer.
+
+    A worthwhile side effect, intended: while the robot's own lean runs, the
+    #95 moving-floor gate reports rms 0.0 — simply "quiet" riding the release
+    hold — so the tier no longer collapses ~20 ms after its own lean starts.
+    One lean per sound episode, held up to the release window.
+
+    Stateful in a handful of scalars, O(1) per call; the clock is the ``now``
+    already flowing through :meth:`CorroboratedGate._decide`, so it is
+    deterministic under an injected clock. It emits no log lines of its own —
+    the tier transitions :class:`OrientToSound` already logs are the observable
+    trace, and this envelope is exactly what bounds them to ~2 per episode.
+
+    Since d6 it also answers the ONGOING question. An episode's open window IS
+    "the sound is still going" — attack-debounced at the start, gap-tolerant in
+    the middle — so :meth:`sustained_for` is that duration, and the tier-2
+    promotion reads it rather than growing a third smoothing mechanism beside
+    this one and the angular dwell. :attr:`episodes` counts opens, which is what
+    lets a caller log once per episode instead of once per tick.
+    """
+
+    def __init__(self) -> None:
+        self._streak = 0
+        self._open = False
+        self._quiet_since: float | None = None
+        self._open_since: float | None = None
+        self._episodes = 0
+
+    @property
+    def episodes(self) -> int:
+        """How many times this envelope has opened — a per-episode logging key."""
+        return self._episodes
+
+    @property
+    def open_since(self) -> float | None:
+        """When the current episode opened, or ``None`` while closed."""
+        return self._open_since
+
+    def sustained_for(self, now: float) -> float:
+        """How long the current sound episode has been running, in seconds.
+
+        ``0.0`` while closed. Because the release hold rides gaps shorter than
+        ``noise_release_s``, this measures the EPISODE, not an unbroken run of
+        loud ticks — which is what "ongoing sound" means to a listener and what
+        the tier-2 promotion needs. A per-tick-loud requirement would be
+        unsatisfiable on real speech, whose rms alternates loud/quiet at tick
+        rate (the measured click-train finding this envelope was built for).
+        """
+        if not self._open or self._open_since is None:
+            return 0.0
+        return max(0.0, now - self._open_since)
+
+    def loud(self, now: float, params: OrientParams) -> bool:
+        """Record a loud read; return whether NOISE is open after it."""
+        self._quiet_since = None
+        if not self._open:
+            self._streak += 1
+            if self._streak >= max(1, int(params.noise_attack_ticks)):
+                self._begin(now)
+        return self._open
+
+    def force_open(self, now: float) -> None:
+        """A higher tier (SPEECH/ENGAGED) is live: the envelope opens by fiat."""
+        self._streak = 0
+        self._quiet_since = None
+        if not self._open:
+            self._begin(now)
+
+    def quiet(self, now: float, params: OrientParams) -> bool:
+        """Record a quiet read; return whether the release hold keeps NOISE open."""
+        self._streak = 0
+        if not self._open:
+            return False
+        if self._quiet_since is None:
+            self._quiet_since = now
+        if (now - self._quiet_since) >= float(params.noise_release_s):
+            self.reset()
+        return self._open
+
+    def reset(self) -> None:
+        self._streak = 0
+        self._open = False
+        self._quiet_since = None
+        self._open_since = None
+
+    def _begin(self, now: float) -> None:
+        self._open = True
+        self._open_since = now
+        self._episodes += 1
+
+
+class CorroboratedGate:
+    """The interim admission rule: energy, then a steady bearing, then words.
+
+    See the module docstring for the measured evidence behind each conjunct and
+    for what this deliberately does NOT close (which is t9's job). Stateful in
+    the dwell tracker — a running reference bearing plus the time it was
+    adopted — and in the owned :class:`_NoiseEnvelope`'s three scalars, so it
+    is O(1) per tick and deterministic under an injected clock.
+
+    The envelope governs only the NOISE tier's open/close TIMING. The
+    transcript ENGAGED fast-path stays immediate, and during the release
+    hold the gate reports NOISE — a quiet gap has no meaningful bearing, so
+    the lean relaxes when the tier actually closes, exactly once.
+
+    Two tiers, and why tier 2 is rare (d6)
+    ======================================
+    Live-verified on the deployed robot: with the absolute floor,
+    ``look-toward-sound`` fired **203 times in 8 minutes** in an ordinary room,
+    and in the same session the pat sense recorded **zero detections in 5
+    minutes**. Those two numbers are one finding. The pat sense is
+    ownership-gated AND stillness-gated (``CLAUDE.md``, "Pat sense"), so while
+    ``orient-to-sound`` owns the head it suspends and never re-baselines: **a
+    head that keeps turning is a head that can never feel a pat.** Making the
+    head move less is therefore not a cosmetic preference, it is what makes
+    touch work at all.
+
+    So the ladder is graded by COST, not just by evidence:
+
+    * **Tier 1 — the antenna lean** (``NOISE``). Sound standing at
+      ``rms_ratio`` above the room's rolling background, attack/release
+      smoothed by :class:`_NoiseEnvelope`. Cheap, subtle, and it leaves the
+      head alone, so it can afford to be common.
+    * **Tier 2 — the head/body turn** (``SPEECH``). Everything tier 1 needs,
+      plus ``speech_detected``, plus the angular dwell — and now, additionally,
+      a PROMOTION: the sound must be either **LOUD** (``rms_ratio_loud``, three
+      times the tier-1 ratio) or **ONGOING**
+      (:meth:`_NoiseEnvelope.sustained_for` at least ``sustain_s``). A
+      reflexive turn toward an unintelligible one-off is noise-chasing; the
+      promotion is what makes the head rare.
+
+    ``sustain_s`` defaults to 1.5 s against measurement, not feel: the
+    transient train that motivated :class:`_NoiseEnvelope` lasted **1.3 s**, so
+    the worst measured episode of pure clatter still cannot promote on the
+    ongoing branch, while a spoken sentence comfortably does. And a single
+    transient — a clap, a door — cannot reach tier 2 by ANY branch, loud
+    included, because the pre-existing 0.6 s angular dwell already refuses it.
+
+    ``ENGAGED`` keeps its immediate fast-path deliberately. An addressed
+    utterance is not "an unintelligible sound": it has already cleared the
+    layered engagement gate, which is the strongest corroboration the runtime
+    has, and it is by construction sustained speech aimed at the robot. The d6
+    argument — do not turn the head at noise — simply does not apply to it.
+
+    A promotion is logged ONCE PER EPISODE (keyed on
+    :attr:`_NoiseEnvelope.episodes`) and names which branch fired, so a journal
+    read after the fact can tell a turn earned by loudness from one earned by
+    persistence.
+
+    Never raises: a hostile or partially-shaped snapshot resolves to
+    :data:`OrientTier.NONE` (dropping any release hold — fail closed),
+    mirroring :class:`reachy.behavior.sense.DoaPoller`'s "any failure means no
+    reading" contract. A sense that cannot be read must leave the robot still.
+    """
+
+    def __init__(self) -> None:
+        self._ref_angle: float | None = None
+        self._ref_since: float = 0.0
+        self._envelope = _NoiseEnvelope()
+        self._promoted_episode = -1
+
+    def __call__(self, sense: Sense, now: float, params: OrientParams) -> OrientTier:
+        try:
+            return self._decide(sense, now, params)
+        except Exception:  # noqa: BLE001 - an unreadable sense must never steer or raise
+            self._ref_angle = None
+            self._envelope.reset()
+            return OrientTier.NONE
+
+    def _decide(self, sense: Sense, now: float, params: OrientParams) -> OrientTier:
+        angle = sense.doa_angle
+        if angle is None or not math.isfinite(float(angle)):
+            self._ref_angle = None  # no bearing: the dwell clock restarts from scratch
+            return self._quiet(now, params)
+
+        # An ADDRESSED utterance already cleared the layered engagement gate, so it
+        # is corroboration in its own right — no dwell, no loudness threshold, no
+        # attack debounce and no tier-2 promotion (the fast-path stays immediate).
+        if sense.transcript is not None:
+            self._adopt(float(angle), now)
+            self._envelope.force_open(now)
+            return OrientTier.ENGAGED
+
+        # RELATIVE, not absolute (#102): a cold estimator reports ``None`` and
+        # is treated exactly like silence — fail-closed, since with no
+        # background there is nothing for a reading to be loud against.
+        ratio = sense.rms_ratio
+        if ratio is None or not (float(ratio) >= params.rms_ratio):
+            self._ref_angle = None
+            return self._quiet(now, params)
+
+        held_for = self._adopt(float(angle), now, tol=params.dwell_tol_rad)
+        noise_open = self._envelope.loud(now, params)
+        if sense.speech_detected and held_for >= params.dwell_s:
+            # Tier 2 costs the head, so it needs one more thing than tier 1 (d6).
+            if self._promotion(float(ratio), now, params) is not None:
+                self._envelope.force_open(now)
+                return OrientTier.SPEECH
+        return OrientTier.NOISE if noise_open else OrientTier.NONE
+
+    def _promotion(self, ratio: float, now: float, params: OrientParams) -> str | None:
+        """Which tier-2 branch this reading earns, or ``None`` for "stay at tier 1"."""
+        sustained = self._envelope.sustained_for(now)
+        if ratio >= params.rms_ratio_loud:
+            reason = "loud"
+        elif sustained >= params.sustain_s:
+            reason = "sustained"
+        else:
+            return None
+        episode = self._envelope.episodes
+        if episode != self._promoted_episode:
+            self._promoted_episode = episode
+            senselog.stage(
+                STAGE,
+                "doa",
+                "tier2",
+                f"promoted reason={reason} ratio={ratio:.1f}x "
+                f"sustained={sustained:.2f}s loud_at={params.rms_ratio_loud:.1f}x",
+            )
+        return reason
+
+    def _quiet(self, now: float, params: OrientParams) -> OrientTier:
+        """A quiet or bearing-less read: NONE, unless the release hold rides it out."""
+        if self._envelope.quiet(now, params):
+            return OrientTier.NOISE
+        return OrientTier.NONE
+
+    def _adopt(self, angle: float, now: float, *, tol: float = 0.0) -> float:
+        """Track the dwell reference; return how long the bearing has held."""
+        if self._ref_angle is None or abs(angle - self._ref_angle) > tol:
+            self._ref_angle = angle
+            self._ref_since = now
+            return 0.0
+        return max(0.0, now - self._ref_since)
+
+
+class LatchedDoaGuard:
+    """Veto every tier while the bearing feed is FROZEN — the donor's guard, finished.
+
+    What the donor actually guarded
+    ===============================
+    :class:`reachy.motion.listen.ListenProducer` computed its liveness as::
+
+        live = sound_present if sound_present is not None else (angle is not None)
+
+    — "prefer the live mic floor; fall back to the (latched) angle only when
+    there is no audio path at all" — with ``sound_present`` being literally
+    ``rms > SnapDetector.min_rms`` (``_audio`` in
+    ``reachy.cli._commands.listen``). :class:`CorroboratedGate`'s first conjunct
+    IS that check — now in the RELATIVE form ``SnapDetector`` itself always used
+    (#102, see the module docstring) — so the substance of the donor's
+    latched-DoA guard is already ported and this class does NOT re-implement it.
+    (This port is also the stricter of the two: the donor DEGRADED to the
+    latched angle on an audio-less profile, while the runtime refuses — there is
+    always a mic here.)
+
+    The half a floor+dwell gate cannot reach
+    ========================================
+    Dwell asks "is the bearing STEADY"; a wedged feed is *maximally* steady, so
+    the dwell conjunct votes YES **because of** the fault. ``rms_ratio`` (the held
+    media client's mic) and ``doa_angle`` (the daemon's ``/api/state/doa`` route)
+    are independent sources, so a wedged DoA route inside a room with real sound
+    passes both of t8's conjuncts and parks the robot in a stuck stare — pointed
+    at a bearing that stopped meaning anything. This guard asks the different
+    question t8's docstring named: has the angle CHANGED at all?
+
+    Honest scope — a fault this daemon build does not produce
+    ---------------------------------------------------------
+    The measured at-rest feed
+    (``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 2) had
+    **35 distinct angles in 60 s**: the exact value changes constantly, so on the
+    build we can observe, this guard never fires and a test pins that. It is a
+    defence against a *different* state — a wedged pipeline, or another daemon
+    build that latches at rest the way the donor's docstring said the daemon
+    did. It is emphatically NOT what keeps a quiet room still; ``rms_ratio`` is. Stated
+    plainly because a guard nobody can trigger is easy to mistake for a guard
+    that is doing the work.
+
+    Mechanics: exact-value repetition, not tolerance. A bearing must be
+    BIT-IDENTICAL for ``latch_after_s`` before the veto engages, which is what
+    keeps "steady" (a talker holding still, jittering within the mic array's own
+    noise) distinct from "frozen". ``latch_after_s`` defaults well above
+    ``dwell_s`` deliberately: a false latch silences a working sense, so the
+    trade is biased toward a bounded stare over a bounded deafness.
+
+    O(1) per tick, deterministic under the injected ``now``, and never raises —
+    a raising or non-``OrientTier`` inner verdict resolves to
+    :data:`OrientTier.NONE`, matching :class:`CorroboratedGate`'s contract.
+    """
+
+    def __init__(
+        self,
+        inner: OrientGate | None = None,
+        *,
+        latch_after_s: float | None = None,
+    ) -> None:
+        self.inner: OrientGate = inner if inner is not None else CorroboratedGate()
+        self._latch_after_s = latch_after_s
+        self._angle: float | None = None
+        self._since = 0.0
+        self._latched = False
+
+    @property
+    def latched(self) -> bool:
+        """Whether the bearing feed is currently declared frozen."""
+        return self._latched
+
+    def __call__(self, sense: Sense, now: float, params: OrientParams) -> OrientTier:
+        try:
+            frozen = self._track(sense, now, params)
+        except Exception:  # noqa: BLE001 - an unreadable bearing must never steer or raise
+            self._reset()
+            return OrientTier.NONE
+        try:
+            tier = self.inner(sense, now, params)
+        except Exception:  # noqa: BLE001 - a raising inner gate means "no reading"
+            return OrientTier.NONE
+        if not isinstance(tier, OrientTier):
+            return OrientTier.NONE
+        return OrientTier.NONE if frozen else tier
+
+    def _track(self, sense: Sense, now: float, params: OrientParams) -> bool:
+        """Update the repetition tracker; return whether the feed reads as frozen."""
+        raw = getattr(sense, "doa_angle", None)
+        if raw is None:
+            self._reset(now)  # no bearing at all is not a frozen one
+            return False
+        angle = float(raw)
+        if not math.isfinite(angle):
+            self._reset(now)
+            return False
+        if self._angle is None or angle != self._angle:
+            self._release(angle, now)
+            return False
+        after = self._latch_after_s if self._latch_after_s is not None else params.latch_after_s
+        held = now - self._since
+        if held < after:
+            return False
+        if not self._latched:
+            self._latched = True
+            senselog.drop(
+                STAGE,
+                "doa",
+                "latch",
+                f"latched-doa bearing={angle:.3f}rad frozen_for={held:.1f}s",
+            )
+        return True
+
+    def _release(self, angle: float, now: float) -> None:
+        if self._latched:
+            senselog.stage(
+                STAGE,
+                "doa",
+                "latch",
+                f"released reason=latched-doa bearing={angle:.3f}rad",
+            )
+        self._angle = angle
+        self._since = now
+        self._latched = False
+
+    def _reset(self, now: float = 0.0) -> None:
+        if self._latched:
+            senselog.stage(STAGE, "doa", "latch", "released reason=latched-doa bearing=none")
+        self._angle = None
+        self._since = now
+        self._latched = False
+
+
+# --------------------------------------------------------------------------- #
+# The behavior — a sustained gaze goal                                        #
+# --------------------------------------------------------------------------- #
+
+
+class _Axis:
+    """One eased scalar channel: hold a value, ease toward a new target.
+
+    Each re-target restarts a minimum-jerk interpolation FROM the current value
+    (not from neutral), so a bearing that moves mid-turn never snaps — the
+    continuity the goto lane gets from an injected start-pose provider, held
+    internally here because a library behavior has no seam to read the live pose
+    from.
+    """
+
+    __slots__ = ("value", "target", "_from", "_t0", "_dur")
+
+    def __init__(self) -> None:
+        self.value = 0.0
+        self.target = 0.0
+        self._from = 0.0
+        self._t0 = 0.0
+        self._dur = 0.0
+
+    def retarget(self, target: float, duration: float, now: float) -> None:
+        if target == self.target and self._dur > 0.0:
+            return
+        self._from = self.value
+        self.target = target
+        self._t0 = now
+        self._dur = max(1e-6, duration)
+
+    def advance(self, now: float) -> float:
+        if self._dur <= 0.0:
+            self.value = self.target
+            return self.value
+        s = minjerk_progress((now - self._t0) / self._dur)
+        self.value = self._from + (self.target - self._from) * s
+        return self.value
+
+    @property
+    def home(self) -> bool:
+        return abs(self.value) < HOME_EPS_DEG and abs(self.target) < HOME_EPS_DEG
+
+
+class OrientToSound:
+    """The ``orient-to-sound`` contribution function: a sustained gaze goal.
+
+    Callable as ``fn(t_local, params, sense) -> Contribution``, so it plugs
+    straight into :class:`reachy.behavior.model.Behavior` like any other
+    sensor-driven library entry (``pet-reaction`` is the sibling). Every tick it
+
+    1. resolves the effective :class:`OrientParams` from the behavior's own
+       ``params`` dict (so a rule or standing goal retunes it live),
+    2. asks the injected :data:`OrientGate` which tier this perception earns,
+    3. plans a target with :func:`plan_orient` when the ``hold`` window is open,
+    4. advances each channel's minjerk ease and returns the composed offsets.
+
+    Channel discipline — why this ABSTAINS rather than freezing
+    -----------------------------------------------------------
+    The behavior claims all three channels, but a channel it is not currently
+    driving is returned as ``None``. :func:`reachy.behavior.arbitration.arbitrate`
+    is abstention-aware, so an unused channel falls straight through to the next
+    claimant — in practice the passive ``feel-alive`` base layer keeps breathing
+    with it. That is why a quiet room leaves the robot alive rather than locked
+    at neutral, and why the antenna-only NOISE tier does not freeze the head.
+
+    Preemption is therefore the ordinary contention story: this is a
+    ``stoppable`` behavior, so a pat reaction admitted after it (same class,
+    later) takes every shared channel, and a ``stopping``/``unstoppable``
+    behavior — how a sleep presence would be admitted — takes them by priority
+    or evicts outright at admit time. Nothing here needs to know about either.
+
+    Never raises. A hostile snapshot, a non-finite or rewinding clock, or a
+    malformed params dict degrades to "no reading" for the tick, exactly like
+    :class:`reachy.behavior.sense.DoaPoller`.
+    """
+
+    def __init__(self, params: OrientParams | None = None, *, gate: OrientGate | None = None):
+        self._params = params if params is not None else OrientParams()
+        self._explicit_params = params is not None
+        self._gate: OrientGate = gate if gate is not None else LatchedDoaGuard(CorroboratedGate())
+        self._head = _Axis()
+        self._body = _Axis()
+        self._ant_r = _Axis()
+        self._ant_l = _Axis()
+        self._src: dict | None = None
+        self._hold_until = 0.0
+        self._last_live_t: float | None = None
+        self._last_t = 0.0
+        self._last_tier = OrientTier.NONE
+
+    # -- introspection (tests, and any future status view) ------------------ #
+
+    @property
+    def head_yaw(self) -> float:
+        """The head yaw offset currently being commanded, in degrees."""
+        return self._head.value
+
+    @property
+    def target_head_yaw(self) -> float:
+        """The head yaw offset currently being eased toward, in degrees."""
+        return self._head.target
+
+    @property
+    def body_yaw(self) -> float:
+        """The body yaw offset currently being commanded, in degrees."""
+        return self._body.value
+
+    # -- the contribution function ------------------------------------------ #
+
+    def __call__(self, t_local: float, params: dict, sense) -> Contribution:
+        now = self._clock(t_local)
+        effective = self._resolve(params)
+        tier = self._tier(sense, now, effective)
+        self._observe(tier, sense)
+        if tier is not OrientTier.NONE:
+            self._last_live_t = now
+        self._commit(tier, sense, now, effective)
+        self._release(tier, now, effective)
+        return self._compose()
+
+    def _observe(self, tier: OrientTier, sense) -> None:
+        """Log every tier TRANSITION — and only transitions.
+
+        Bounded by construction: a 50 Hz behavior that logged per tick would
+        bury the journal, but the tier changes only when perception genuinely
+        does, so this is the trace an operator greps to answer "did the gate
+        open, and on what?" — the question the live check for this port, and
+        task t9's latched-DoA guard, both turn on. A fall back to ``NONE`` is a
+        DROP naming the tier that ended, so a gate closing is never a silent
+        no-op (:mod:`reachy.senselog`'s discipline).
+        """
+        if tier is self._last_tier:
+            return
+        previous, self._last_tier = self._last_tier, tier
+        angle = getattr(sense, "doa_angle", None)
+        bearing = "none" if angle is None else f"{float(angle):.3f}rad"
+        if tier is OrientTier.NONE:
+            senselog.drop(STAGE, "doa", "tier", f"closed from={previous.name} bearing={bearing}")
+        else:
+            senselog.stage(STAGE, "doa", "tier", f"{previous.name}->{tier.name} bearing={bearing}")
+
+    def _clock(self, t_local: float) -> float:
+        """A monotonic, finite behavior-local clock (a bad one simply does not advance)."""
+        try:
+            t = float(t_local)
+            if not math.isfinite(t):
+                return self._last_t
+            t = max(self._last_t, max(0.0, t))
+        except (TypeError, ValueError):
+            return self._last_t
+        self._last_t = t
+        return t
+
+    def _resolve(self, params: dict) -> OrientParams:
+        """The effective tuning: the behavior's params dict over the defaults.
+
+        Rebuilt only when the dict's contents actually change, so the steady
+        state costs one dict comparison per tick. An explicitly-constructed
+        ``OrientParams`` (the injection path) wins outright — a caller that
+        passed tuning in did not ask for a params dict to override it.
+        """
+        if self._explicit_params or not params:
+            return self._params
+        if params == self._src:
+            return self._params
+        values = {}
+        for name in PARAM_NAMES:
+            raw = params.get(name)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values[name] = value
+        self._src = dict(params)
+        self._params = OrientParams(**values)
+        return self._params
+
+    def _tier(self, sense, now: float, params: OrientParams) -> OrientTier:
+        try:
+            tier = self._gate(sense, now, params)
+        except Exception:  # noqa: BLE001 - a raising gate means "no reading", never a crash
+            return OrientTier.NONE
+        return tier if isinstance(tier, OrientTier) else OrientTier.NONE
+
+    def _commit(self, tier: OrientTier, sense, now: float, params: OrientParams) -> None:
+        """Plan and adopt a new target, unless the hold window is still closed."""
+        if tier is OrientTier.NONE or now < self._hold_until:
+            return
+        angle = getattr(sense, "doa_angle", None)
+        if angle is None:
+            return
+        target = plan_orient(
+            tier, float(angle), params, head_yaw=self._head.target, body_yaw=self._body.target
+        )
+        if target is None:
+            return
+        if target.head_yaw is not None:
+            self._head.retarget(target.head_yaw, target.duration, now)
+        if target.body_yaw is not None:
+            self._body.retarget(target.body_yaw, target.duration, now)
+        if target.antennas is not None:
+            self._ant_r.retarget(target.antennas[0], target.duration, now)
+            self._ant_l.retarget(target.antennas[1], target.duration, now)
+        # Only a committing HEAD move opens a hold window — an antenna-only lean is
+        # cheap and leaves the ladder free to react again on the next tick. That is
+        # the donor's rule exactly: its ``_hold_until`` was set by ``_move_to`` /
+        # ``_escalate_to_body`` alone, while an OPEN hold suppressed re-commits and
+        # leans alike (the early return above).
+        if target.head_yaw is not None:
+            self._hold_until = now + target.duration + params.hold
+
+    def _release(self, tier: OrientTier, now: float, params: OrientParams) -> None:
+        """Ease the committed heading home after the donor's silence grace."""
+        if tier is not OrientTier.NONE:
+            return
+        if self._last_live_t is None or (now - self._last_live_t) < params.recenter_after:
+            return
+        for axis, speed in (
+            (self._head, params.relax_speed),
+            (self._body, params.body_speed),
+            (self._ant_r, params.relax_speed),
+            (self._ant_l, params.relax_speed),
+        ):
+            if axis.target != 0.0:
+                axis.retarget(
+                    0.0, _duration(abs(axis.value) / speed if speed else 0.0, params), now
+                )
+        self._hold_until = 0.0
+
+    def _compose(self) -> Contribution:
+        now = self._last_t
+        head_yaw = self._head.advance(now)
+        body_yaw = self._body.advance(now)
+        right = self._ant_r.advance(now)
+        left = self._ant_l.advance(now)
+        head = None
+        if not self._head.home:
+            head = neutral_head()
+            head["yaw"] = head_yaw
+        antennas = None
+        if not (self._ant_r.home and self._ant_l.home):
+            antennas = (right, left)
+        return Contribution(
+            head=head,
+            antennas=antennas,
+            body_yaw=None if self._body.home else body_yaw,
+        )
+
+
+def make_orient_to_sound() -> Callable[[float, dict, Sense], Contribution]:
+    """Return one fresh, stateful ``orient-to-sound`` contribution function.
+
+    The zero-argument factory shape :class:`reachy.behavior.library.LibraryEntry`
+    calls per behavior instance (``make_fn``), so every admission gets its own
+    dwell tracker and ease state. Construct :class:`OrientToSound` directly to
+    inject tuning or a different gate.
+    """
+    return OrientToSound()
+
+
+__all__ = [
+    "ANTENNA_LEAN_S",
+    "CorroboratedGate",
+    "HOME_EPS_DEG",
+    "LatchedDoaGuard",
+    "OrientGate",
+    "OrientParams",
+    "OrientTarget",
+    "OrientTier",
+    "OrientToSound",
+    "PARAM_NAMES",
+    "STAGE",
+    "antenna_pair",
+    "make_orient_to_sound",
+    "minjerk_progress",
+    "plan_orient",
+]

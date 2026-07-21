@@ -26,6 +26,7 @@ from typing import Callable
 
 from reachy.behavior.feel_alive import make_feel_alive
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass, neutral_head
+from reachy.behavior.orient import OrientParams, make_orient_to_sound
 from reachy.behavior.pet_reaction import (
     DONE_GESTURE_S,
     MAX_CONTACT_S,
@@ -125,7 +126,18 @@ def _shake(t: float, p: dict, _sense: Sense) -> Contribution:
 
 
 def _speak(t: float, p: dict, _sense: Sense) -> Contribution:
-    """Speech-like head bob: a quick pitch oscillation with a smaller offset yaw."""
+    """Speech-like head bob: a quick pitch oscillation with a smaller offset yaw.
+
+    MOTION ONLY, and deliberately still so — the mouth-movement analogue, not a
+    voice. The audible half of speech is a react rule's ``say`` text (see
+    :mod:`reachy.behavior.rules`), rendered off the tick thread by
+    :class:`reachy.behavior.speech_act.SpeechActuator`. The two were reconciled
+    rather than merged: a library entry is a PURE, stateless function of
+    behavior-local time evaluated at 50 Hz, so giving this one a side effect
+    would put synthesis on the tick thread — exactly the defect the actuator
+    exists to avoid. Pair them in ONE rule (``run = "speak"`` + ``say = "..."``)
+    to get a robot that both looks and sounds like it is talking.
+    """
     ph = 2.0 * math.pi * t / p["period"] if p["period"] else 0.0
     return Contribution(
         head=_head(pitch=p["pitch"] * math.sin(ph), yaw=p["yaw"] * math.sin(ph * 1.7 + 0.5))
@@ -160,6 +172,18 @@ def _clamp(value: float, limit: float) -> float:
 _HEAD = frozenset({"head"})
 _ANTENNAS = frozenset({"antennas"})
 _BODY = frozenset({"body_yaw"})
+
+#: Defaults for the ``orient-to-sound`` knobs come from ONE place —
+#: :class:`reachy.behavior.orient.OrientParams`, which itself tracks the donor
+#: ``ListenParams``. Restating a number here would let the catalog and the
+#: ladder drift apart silently, so every entry below reads it instead.
+_ORIENT_DEFAULTS = OrientParams()
+
+
+def _ORIENT_PARAM(name: str, unit: str, help: str) -> Param:  # noqa: N802 - table-local helper
+    """A ``Param`` whose default is read off :class:`OrientParams`, never retyped."""
+    return Param(getattr(_ORIENT_DEFAULTS, name), unit, help)
+
 
 # The reaction normally self-completes no later than its internal contact limit
 # plus one done gesture. Keep a two-tick margin so the engine can observe
@@ -196,6 +220,75 @@ LIBRARY: dict[str, LibraryEntry] = {
         default_duration=_PET_REACTION_BACKSTOP_S,
         params={},
         make_fn=make_pet_reaction,
+        wants_sense=True,
+    ),
+    "orient-to-sound": LibraryEntry(
+        name="orient-to-sound",
+        summary=(
+            "turn toward live sound — antennas lean, then a bounded head nudge, then a "
+            "deliberate head+body turn on an addressed utterance"
+        ),
+        channels=frozenset({"head", "antennas", "body_yaw"}),
+        default_class=StopClass.STOPPABLE,
+        # Looping with NO default duration: orienting is a STANDING goal (the
+        # `declare_goal` surface, which is exempt from the bounded-lifetime
+        # invariant on purpose). A react rule or a `run_behavior` intent must
+        # therefore bound it explicitly, exactly like `nod` / `feel-alive`.
+        looping=True,
+        default_duration=None,
+        params={
+            "gain": _ORIENT_PARAM(
+                "gain", "x", "scales the ~+-90 deg acoustic span onto a yaw target"
+            ),
+            "max_yaw": _ORIENT_PARAM("max_yaw", "deg", "head yaw clamp"),
+            "deadband": _ORIENT_PARAM(
+                "deadband", "deg", "ignore sound within this of the current heading"
+            ),
+            "hold": _ORIENT_PARAM(
+                "hold", "s", "after committing a turn, hold before reconsidering"
+            ),
+            "alert_speed": _ORIENT_PARAM("alert_speed", "deg/s", "turning toward a new sound"),
+            "relax_speed": _ORIENT_PARAM("relax_speed", "deg/s", "easing back toward centre"),
+            "min_dur": _ORIENT_PARAM("min_dur", "s", "duration floor, so turns stay deliberate"),
+            "max_dur": _ORIENT_PARAM("max_dur", "s", "duration ceiling for one turn"),
+            "antenna_gain": _ORIENT_PARAM("antenna_gain", "x", "scales the antenna lean"),
+            "antenna_max": _ORIENT_PARAM(
+                "antenna_max", "deg", "maximum near-side antenna deflection"
+            ),
+            "body_yaw_max": _ORIENT_PARAM("body_yaw_max", "deg", "body yaw clamp"),
+            "body_speed": _ORIENT_PARAM("body_speed", "deg/s", "body rotation speed"),
+            "head_only_band": _ORIENT_PARAM(
+                "head_only_band", "deg", "beyond this the body turn escalates"
+            ),
+            "speech_orient_gain": _ORIENT_PARAM(
+                "speech_orient_gain", "x", "fraction of the target the speech tier uses"
+            ),
+            "speech_orient_max": _ORIENT_PARAM(
+                "speech_orient_max", "deg", "cap on the speech-tier head-only nudge"
+            ),
+            "engaged_min_dur": _ORIENT_PARAM(
+                "engaged_min_dur", "s", "duration floor for the deliberate engaged turn"
+            ),
+            "recenter_after": _ORIENT_PARAM(
+                "recenter_after", "s", "silence grace before the heading drifts home"
+            ),
+            "rms_ratio": _ORIENT_PARAM(
+                "rms_ratio", "x", "times the room's rolling background before sound counts as live"
+            ),
+            "rms_ratio_loud": _ORIENT_PARAM(
+                "rms_ratio_loud", "x", "times the background that promotes tier 2 on loudness"
+            ),
+            "sustain_s": _ORIENT_PARAM(
+                "sustain_s", "s", "ongoing sound that promotes tier 2 without being loud"
+            ),
+            "dwell_s": _ORIENT_PARAM(
+                "dwell_s", "s", "the bearing must hold this long before the head moves"
+            ),
+            "dwell_tol_rad": _ORIENT_PARAM(
+                "dwell_tol_rad", "rad", "how far the bearing may move and still count as held"
+            ),
+        },
+        make_fn=make_orient_to_sound,
         wants_sense=True,
     ),
     "gaze-hold": LibraryEntry(
@@ -241,7 +334,10 @@ LIBRARY: dict[str, LibraryEntry] = {
     ),
     "speak": LibraryEntry(
         name="speak",
-        summary="bob the head like speech (for N seconds or until stopped)",
+        summary=(
+            "bob the head like speech — motion only, no sound; pair with a rule's "
+            'say = "..." for the voice (for N seconds or until stopped)'
+        ),
         channels=_HEAD,
         default_class=StopClass.STOPPABLE,
         looping=True,

@@ -1,25 +1,25 @@
 """Tests for the ``listen`` idle layer yielding to the sleep signal.
 
-The idle producer already layers two file-flag interrupts:
+The idle producer layers two file-flag interrupts:
 
 * :mod:`reachy.motion.pat_signal` — full suppression (return ``None``)
-* :mod:`reachy.speech.cognition_signal` — low-energy "focused breathe"
+* :mod:`reachy.motion.sleep_signal` — full suppression that OUTRANKS pat.
+  When ``sleep_active.flag`` is present the idle producer goes still (returns
+  ``None``) and that decision is taken *before* the pat check, so sleep wins
+  even if the pat flag is also set.
 
-This module pins the *new, top-priority* interrupt added by task t7:
+Regression note: before task t7 the idle path had no rest/decay state above pat
+— the strongest interrupt was pat (full suppression). These tests assert the
+branch ordering (sleep > pat > alive) so both demo and real listen sessions go
+still while the sleep flag is present.
 
-* :mod:`reachy.motion.sleep_signal` — full suppression that outranks **both**
-  pat and cognition. When ``sleep_active.flag`` is present the idle producer
-  goes still (returns ``None``) and that decision is taken *before* the pat and
-  cognition checks, so sleep wins even if those flags are also set.
+A third flag, ``think_active.flag``, used to sit between the two (low-energy
+"focused breathe" rather than suppression). It retired with the folded
+``listen --live`` cognition loop that wrote it — the two precedence tests that
+paired it with sleep went with it; the pat pairing below covers the ordering
+that survives.
 
-Regression note: before t7 the idle path had no rest/decay state above pat —
-the strongest interrupt was pat (full suppression) and cognition only dropped
-energy. There was no way to make the robot defer to a sleep/rest state. These
-tests assert the new branch ordering (sleep > pat > cognition > alive) so both
-demo and real listen sessions now go still while the sleep flag is present.
-
-Mirrors ``tests/test_pat_signal.py``'s idle-suppression section and
-``tests/test_idle_focused.py``'s fixtures.
+Mirrors ``tests/test_pat_signal.py``'s idle-suppression section.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ import pytest
 import reachy.motion.pat_signal as ps
 from reachy.motion import sleep_signal as ss
 from reachy.motion.listen import ListenParams, ListenProducer
-from reachy.speech import cognition_signal
 
 
 @pytest.fixture(autouse=True)
@@ -41,11 +40,9 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     ss.clear()
     ps.clear()
-    cognition_signal.clear()
     yield
     ss.clear()
     ps.clear()
-    cognition_signal.clear()
 
 
 def _fresh_producer(seed: int) -> ListenProducer:
@@ -86,7 +83,7 @@ def test_sleep_signal_read_via_monkeypatch(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 2. Precedence — sleep outranks pat and cognition-focused
+# 2. Precedence — sleep outranks pat
 # ---------------------------------------------------------------------------
 
 
@@ -94,25 +91,6 @@ def test_sleep_beats_pat():
     """Both sleep + pat active: sleep wins, idle returns None."""
     prod = _fresh_producer(99)
     ps.write()
-    ss.write()
-    for i in range(10):
-        assert prod._idle(i * 2.5, live=False) is None
-
-
-def test_sleep_beats_cognition_focused():
-    """Both sleep + cognition active: sleep wins, idle returns None."""
-    prod = _fresh_producer(99)
-    cognition_signal.write()
-    ss.write()
-    for i in range(10):
-        assert prod._idle(i * 2.5, live=False) is None
-
-
-def test_sleep_beats_pat_and_cognition_together():
-    """All three flags active: sleep is strongest, idle returns None."""
-    prod = _fresh_producer(99)
-    ps.write()
-    cognition_signal.write()
     ss.write()
     for i in range(10):
         assert prod._idle(i * 2.5, live=False) is None

@@ -1,21 +1,22 @@
 """Run the ``sleep`` loop as a tracked background process.
 
 The supervisor half of the ``sleep`` noun — a sibling of
-:mod:`reachy.motion.supervisor` (the ``listen`` loop's supervisor) and
-:mod:`reachy.speech.supervisor` (the ``think`` loop's supervisor), but for the
-sleep loop (``reachy sleep run``) instead. ``start`` / ``stop`` / ``restart`` /
-``status`` manage a detached background process tracked with a PID + log file
-under the same per-user state dir the daemon, demo-mode, listen, and think all
-use. ``start`` re-invokes this very CLI (``python -m reachy sleep run``) so the
-loop keeps running after the launching command returns.
+:mod:`reachy.vision.supervisor`, but for the sleep loop (``reachy sleep run``)
+instead. ``start`` / ``stop`` / ``restart`` / ``status`` manage a detached
+background process tracked with a PID + log file under the same per-user state
+dir the daemon, demo-mode and vision all use. ``start`` re-invokes this very CLI
+(``python -m reachy sleep run``) so the loop keeps running after the launching
+command returns.
 
-This module deliberately does **not** import or reuse the listen or think
-supervisors: it owns its own ``sleep.pid`` / ``sleep.log`` filenames so the
-loops can run side-by-side, and it reuses only the *generic* process primitives
-from :mod:`reachy.daemon` (``state_dir`` / ``is_alive`` — PID-file location
-and liveness). The process-management mechanics (PID-file write/read, detached
-spawn, signal-based stop, PID-reuse guard) are kept self-contained here so
-editing the listen-owned or think-owned supervisors is never required.
+This module deliberately owns its whole process layer rather than sharing a
+supervisor with a sibling noun: it owns its own ``sleep.pid`` / ``sleep.log``
+filenames so the loops can run side-by-side, and it reuses only the *generic*
+process primitives from :mod:`reachy.daemon` (``state_dir`` / ``is_alive`` —
+PID-file location and liveness). The process-management mechanics (PID-file
+write/read, detached spawn, signal-based stop, PID-reuse guard) are kept
+self-contained here, so a change in another noun's supervisor can never reach
+this one. (The ``listen`` supervisor this module was originally a sibling of
+retired with its noun; nothing here had to change, which is the point.)
 
 Pure standard library (``subprocess`` / ``signal`` / ``os``): the loop talks to
 the robot over the existing transport, so this adds **no** third-party runtime
@@ -34,7 +35,7 @@ from pathlib import Path
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 
 # Reuse the daemon's generic process primitives + state dir so the sleep loop,
-# the listen loop, think loop, demo-mode, and the daemon share one bookkeeping
+# the vision loop, demo-mode, and the daemon share one bookkeeping
 # location.
 from reachy.daemon import is_alive, state_dir
 from reachy.robot.transport import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
@@ -118,7 +119,7 @@ def build_run_command(
     through to the engine's own env/default resolution in the child. The noun
     task (t8) will finalize which additional flags are accepted; placeholders for
     ``--ticks`` and ``--idle-timeout`` are included here for passthrough
-    consistency with the motion supervisor's approach.
+    consistency with the sibling supervisors' approach.
 
     ``no_audio_wake`` forwards ``--no-audio-wake`` when ``True`` — pat-only /
     quiet-room mode where speech/snap/DoA stimuli are ignored.
@@ -160,7 +161,7 @@ def start(
     spawn the loop detached, record its PID + log path, and give it a short grace
     window to confirm it didn't crash on startup.
 
-    Unlike the daemon/listen ``start``, there is no HTTP health preflight here:
+    Unlike the daemon/vision ``start``, there is no HTTP health preflight here:
     the sleep loop surfaces its own clean exit-2 ``CliError`` if unreachable —
     so a spawned loop that can't reach the robot exits during the grace window and
     is reported as ``exited``.

@@ -1,5 +1,5 @@
-"""Shared logging setup for the long-running sense loops (``listen``/``think``/
-``sleep`` ``run``).
+"""Shared logging setup for the long-running loops (``behavior engine run`` /
+``sleep run``).
 
 Every module in this codebase logs via ``logging.getLogger(__name__)``, but
 nothing ever attached a handler or called ``logging.basicConfig`` — so
@@ -11,12 +11,22 @@ by default — so a single call at run entry makes every module's traces
 visible, with no per-module instrumentation required.
 
 Export purity: the handler always targets ``sys.stderr`` (never ``stdout``),
-so under ``listen run --live --export -`` stdout stays a pure JSONL feed (see
+so under ``behavior engine run --export -`` stdout stays a pure JSONL feed (see
 ``reachy.cli._export``).
+
+Single-copy guarantee (#96): :func:`install_logging` also sets
+``propagate = False`` on the ``"reachy"`` logger, on the fresh AND the reuse
+path. On the live robot every ``reachy.*`` line appeared TWICE in the journal
+(~83 lines/s doubled): once plain via our handler, once
+``INFO:reachy.sense:``-prefixed via a foreign basicConfig-style handler some
+transitive library attaches to the ROOT logger during SDK media construction.
+The culprit is unlocated, and this fix deliberately does not depend on
+locating it — once our handler owns the records, they simply stop propagating
+past ``"reachy"``, so NO root handler (present or future) can double them.
 
 Level precedence: an explicit ``--log-level`` flag value beats the
 ``REACHY_LOG_LEVEL`` environment variable, which beats the caller-supplied
-default (``"INFO"`` for the three long-running loops).
+default (``"INFO"`` for the long-running loops).
 """
 
 from __future__ import annotations
@@ -47,8 +57,8 @@ def add_log_level_arg(parser: argparse.ArgumentParser, *, default: str = DEFAULT
     """Register the shared ``--log-level`` flag on *parser*.
 
     Mirrors the ``add_export_args`` / ``add_robot_args`` pattern (one shared
-    helper) so ``listen run`` / ``think run`` / ``sleep run`` present an
-    identical flag instead of drifting three ways.
+    helper) so ``behavior engine run`` / ``sleep run`` present an identical
+    flag instead of drifting.
     """
     parser.add_argument(
         "--log-level",
@@ -98,6 +108,11 @@ def install_logging(
     calls — e.g. ``restart`` re-reading tuning, or a defensive call at more
     than one entry point — never duplicate the handler or log lines.
 
+    Propagation past ``"reachy"`` is severed (``propagate = False``) on BOTH
+    paths — a repeated call must never re-enable it — so a foreign root
+    handler can never re-emit our records as duplicate lines (#96, see the
+    module docstring for the measured live-journal defect).
+
     ``stream`` is an injection seam for tests; production callers never pass
     it — the handler always targets ``sys.stderr``, so stdout stays available
     for ``--export -``'s pure JSONL feed.
@@ -114,4 +129,8 @@ def install_logging(
 
     handler.setLevel(numeric_level)
     root.setLevel(numeric_level)
+    # #96: with our handler attached, records must not ALSO reach root handlers
+    # (a foreign basicConfig-style one doubled every line in the live journal).
+    # Unconditional, so the reuse path can never re-enable propagation either.
+    root.propagate = False
     return handler

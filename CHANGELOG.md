@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.0] - 2026-07-21
+
+### Added
+
+- The AI-first flow is retired: the robot's presence is now the symbolic `behavior` runtime — rules and configuration, not a model in the loop. Five capabilities were PORTED into it and live-verified on hardware before anything was deleted: voice (a background-worker speech actuator), sound-orienting, hearing words, mic loudness, and face/frame availability.
+- A machine-checked zero-LLM boundary (`tests/test_zero_llm_boundary.py`): an AST import-boundary suite proves the engine, rule engine, rules, intents, arbitration, goto lane and pat sense reach nothing in the speech, vision or forge stacks. The runtime owns a voice and ears, so speech synthesis/playback/transcription are permitted by an explicit allow-list where each entry states why it is not a language model.
+- `reachy/behavior/rms_background.py` — a rolling-median estimate of the room's own mic floor, so 'loud' is a comparison against the current room rather than a fixed number.
+- `reachy/behavior/audio_pump.py` — a background worker owning all mic acquisition, draining the SDK appsink at production pace so the tick thread does zero audio I/O.
+- `reachy/robot/audio_shape.py` — explicit mic-array channel selection, shape-agnostic over (N,), (N,1) and (N,C), replacing a blind reshape.
+- `tests/test_export_schema_doc.py` — the export wire contract is now pinned against the live parser: a retired noun left in the schema doc fails CI instead of quietly becoming a lie.
+
+### Changed
+
+- REMOVED the `think` noun, the `listen --live` composition root with its folded hooks, the `listen` noun, and the cognition/marker engines. `reachy/motion/listen.py`'s `ListenProducer` is KEPT — the offline lane and the runtime's orient donor path both use it.
+- REMOVED the `live` presence mode. `service` now offers exactly `demo` and `runtime`; a box still carrying `reachy-live.service` is purged by the next `service enable`/`install`/`uninstall` (reported as `retired_removed`). The purge is destructive — back up `~/.config/systemd/user/reachy-*.service*` first.
+- Sound reaction is a graded two-tier ladder and is ANTENNA-ONLY by default: tier 1 leans the antennas toward a sound standing above the room; tier 2 (head/body turn) requires sustained or loud-relative-to-background sound. The turn path remains implemented and reachable via an operator overlay or `REACHY_ORIENT_*`. A head that keeps turning is a head that can never feel a pat.
+- rms admission is now RELATIVE (ratio over a rolling background) rather than an absolute 0.02 floor. Measured on the deployed robot, the mic background drifts ~25x across conditions the same robot lives in within 24 h, so no absolute value is correct in both a daytime and a night room.
+- Cognition is demoted, not deleted (issue #70): `agent attach` remains the external, optional AI surface and keeps its own cognition export feed.
+- The export feed's `message` block means what the agent PROPOSED saying — `agent attach` composes its speech tools publish-only. Audible speech comes from a rule's `say` and carries no block of its own.
+
+### Fixed
+
+- The robot could not hear a spoken sentence (#108). The capture path appended only chunks that individually cleared the rms threshold and discarded the rest, so STT received the loud frames butt-spliced together with every unvoiced consonant and inter-word gap excised. Capture now submits one contiguous clip per utterance. Verified live: the same phrase transcribed correctly where the spliced path returned 'Return.'
+- The robot answered conversation it was never part of (#104, #105). `is_name_match` false-triggered on common words (`really`, `reality`, `ready`, `reason`, `record`, `room`, `root`, `rachel`) — an STT mishearing preserves the consonant skeleton, a look-alike word does not, so a phonetic guard now filters the fuzzy match. And the engagement history was a one-way ratchet: only accepted utterances fed the classifier's context, so one false accept made the next more likely, with no decay. A warm window only a name can open replaces it.
+- The runtime heard its own actuators and sustained an orient loop (#95), and read seconds-stale audio from a standing appsink backlog (#100).
+- The behavior engine achieved 23 Hz rather than 50 (#97, partial): a fixed-period sleep ignored work time. Now absolute-deadline scheduled. The remaining tick-work overrun is still open.
+- Every runtime journal line was doubled (#96), and rule drops logged per tick rather than per episode (#99).
+- Building the CLI parser loaded cognition modules, so `say run`, `daemon status` and even `--help` imported an LLM client — and `say`'s dumb-pipe boundary test failed in a fresh pytest worker, surviving `-n auto` only by import order. Both module-scope imports are now lazy.
+- The daemon media subsystem is acquired before the media client is constructed and released on close (#94), so the ported senses are no longer permanently dormant.
+
 ## [0.41.0] - 2026-07-20
 
 ### Changed

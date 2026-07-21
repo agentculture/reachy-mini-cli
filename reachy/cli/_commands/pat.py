@@ -36,6 +36,7 @@ import threading
 import time
 from typing import Callable
 
+from reachy.behavior.liveness import refuse_if_engine_live
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import CliError
 from reachy.cli._output import emit_diagnostic, emit_result
@@ -204,6 +205,14 @@ def _detector_from_args(args: argparse.Namespace) -> PatDetector:
 
 
 def cmd_pat_run(args: argparse.Namespace) -> int:
+    # Head arbitration, FIRST — before the transport is built. The behavior engine
+    # owns motion exclusively at 50 Hz, so a foreground pat loop beside it would
+    # sense pats it can never act on while both fight for the head. Refusing ahead
+    # of transport construction also means we never open the single-consumer SDK
+    # media session we would have contended for. See reachy.behavior.liveness for
+    # why this refuses rather than yielding on the retiring *_active.flag files.
+    refuse_if_engine_live("pat run")
+
     json_mode = bool(getattr(args, "json", False))
     transport = get_transport(args)
     detector = _detector_from_args(args)

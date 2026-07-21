@@ -4,8 +4,12 @@ All tests use a *stubbed* ``reachy_mini`` — ``HeldStateReader._import`` is
 monkeypatched to return a fake ``ReachyMini`` class (mirroring
 ``tests/test_sdk_transport.py``'s ``_patch_import`` seam), so no real hardware or
 installed SDK is needed. A manually-advanced fake clock (mirroring
-``tests/test_listen_direction_invariants.py``'s ``_FakeClock``) makes the
+``tests/test_direction_invariants.py``'s ``_FakeClock``) makes the
 lazy-construction / retry-backoff behavior fully deterministic.
+
+This module also carries the issue-#51 leak-freedom proof (a tick-invariance
+assertion on client opens), which moved here from the ``listen`` loop when that
+noun retired — see ``test_pose_read_back_does_not_leak_per_tick``.
 """
 
 from __future__ import annotations
@@ -115,6 +119,282 @@ def _patch_import_absent(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Off-thread warm-up — the tick-budget affordance (live evidence, t1 section 3)
+# ---------------------------------------------------------------------------
+#
+# This class is the MEASURED cause of a reproducible tick-budget violation on
+# the deployed box. Every start of ``reachy-runtime.service`` logs this pair,
+# in this order, at tick ~447-453:
+#
+#     [SENSE stage=state source=head_pose event=…] connected (media_backend=no_media)
+#     [SENSE stage=rule source=tick event=overrun] overrun tick=449
+#         duration_ms=424.93 budget_ms=20.00
+#
+# Durations across restarts: 424.93 / 974.39 / 990.61 / 1102.92 / 1212.66 ms
+# against a 20 ms budget — 21x to 61x over
+# (``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 3).
+# The cause is construct-on-first-read building the ``no_media`` client ON THE
+# TICK THREAD, so the 50 Hz loop stalls for up to ~1.2 s.
+#
+# The fix mirrors :class:`reachy.robot.media_client.HeldMediaClient` exactly,
+# giving a tick-thread caller two doors:
+#   * :meth:`warm_up` — the owner constructs off-thread, before the loop starts.
+#   * ``allow_inline_connect=False`` — closes the on-thread door entirely, which
+#     ``warm_up()`` alone cannot do (a mid-run reconnect after a read fault
+#     would otherwise construct inline, reproducing the stall mid-run).
+#
+# Both are ADDITIVE: the lazy default is unchanged, so every existing caller
+# (notably ``_commands/behavior.py::_make_state_reader``) keeps working.
+
+
+def test_warm_up_constructs_and_reports_success(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    assert reader.warm_up() is True
+    assert len(fake_cls.calls) == 1
+    assert reader.connected is True
+
+
+def test_reads_after_warm_up_never_construct(monkeypatch) -> None:
+    """THE contract: a warmed reader does zero construction on the tick thread."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    assert reader.warm_up() is True
+    calls_after_warm_up = len(fake_cls.calls)
+
+    for _ in range(50):
+        assert reader.read() == (0.0, 0.0)
+
+    assert len(fake_cls.calls) == calls_after_warm_up == 1
+
+
+def test_warm_up_off_thread_means_the_tick_thread_never_constructs(monkeypatch) -> None:
+    """Criterion 1, stated as the deployment actually runs it.
+
+    The composition root warms the reader on a setup/background thread; the
+    engine then reads on its one tick thread. This asserts the construction
+    happened on the OTHER thread — i.e. the ~1.2 s ``no_media`` bring-up is
+    charged to setup, never to a tick.
+    """
+    import threading
+
+    construct_threads: list[int] = []
+
+    class _ThreadRecordingCls(_FakeMiniCls):
+        def __call__(self, **kwargs):  # type: ignore[no-untyped-def]
+            construct_threads.append(threading.get_ident())
+            return super().__call__(**kwargs)
+
+    fake_cls = _ThreadRecordingCls()
+    _patch_import(monkeypatch, fake_cls)
+    # The door is closed too, so a mid-run drop can never reopen it inline.
+    reader = HeldStateReader(now=_FakeClock(0.0), allow_inline_connect=False)
+
+    warmer = threading.Thread(target=reader.warm_up)
+    warmer.start()
+    warmer.join()
+
+    assert reader.connected is True
+    assert construct_threads == [warmer.ident]
+
+    tick_thread_ident = threading.get_ident()
+    assert tick_thread_ident != warmer.ident
+    for _ in range(100):
+        assert reader.read() == (0.0, 0.0)
+
+    # Exactly one construction, and it did not happen on this (tick) thread.
+    assert len(construct_threads) == 1
+    assert tick_thread_ident not in construct_threads
+
+
+def test_warm_up_is_idempotent(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    for _ in range(5):
+        assert reader.warm_up() is True
+
+    assert len(fake_cls.calls) == 1
+
+
+def test_warm_up_is_safe_and_false_when_sdk_absent(monkeypatch, caplog) -> None:
+    """A bare box (no ``[sdk]`` extra) degrades: False, one warning, no storm."""
+    _patch_import_absent(monkeypatch)
+    clock = _FakeClock(0.0)
+    reader = HeldStateReader(now=clock, retry_backoff=0.001)
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        for _ in range(10):
+            assert reader.warm_up() is False  # must not raise
+            clock.advance(1.0)
+
+    assert reader.connected is False
+    sense_records = [r for r in caplog.records if r.name == _SENSE_LOGGER_NAME]
+    assert len(sense_records) == 1
+
+
+def test_warm_up_reports_failure_and_can_be_retried_after_backoff(monkeypatch) -> None:
+    """An owner polling warm_up() off-thread recovers when the daemon comes up."""
+    fake_cls = _FakeMiniCls(should_fail=True)
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    reader = HeldStateReader(now=clock, retry_backoff=5.0)
+
+    assert reader.warm_up() is False
+    assert reader.connected is False
+
+    clock.advance(1.0)
+    assert reader.warm_up() is False
+    assert len(fake_cls.calls) == 1  # backoff still throttles the off-thread caller
+
+    clock.advance(5.0)
+    fake_cls.should_fail = False
+    assert reader.warm_up() is True
+    assert len(fake_cls.calls) == 2
+
+
+def test_warm_up_after_close_returns_false_and_never_constructs(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    reader.close()
+
+    assert reader.warm_up() is False
+    assert len(fake_cls.calls) == 0
+
+
+def test_connected_never_constructs(monkeypatch) -> None:
+    """``connected`` is a pure predicate — a supervisor can poll it freely."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    for _ in range(10):
+        assert reader.connected is False
+    assert len(fake_cls.calls) == 0
+
+    reader.warm_up()
+    assert reader.connected is True
+
+    reader.close()
+    assert reader.connected is False
+
+
+# --- allow_inline_connect=False: the on-thread door, closed -----------------
+
+
+def test_inline_connect_disabled_reads_never_construct(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    reader = HeldStateReader(now=clock, allow_inline_connect=False)
+
+    for _ in range(20):
+        assert reader.read() is None
+        clock.advance(10.0)
+
+    assert len(fake_cls.calls) == 0
+
+
+def test_inline_connect_disabled_works_normally_after_warm_up(monkeypatch) -> None:
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0), allow_inline_connect=False)
+
+    assert reader.warm_up() is True
+
+    for _ in range(10):
+        assert reader.read() == (0.0, 0.0)
+
+    assert len(fake_cls.calls) == 1
+
+
+def test_inline_connect_disabled_does_not_reconnect_on_the_tick_thread(monkeypatch) -> None:
+    """A mid-run fault must not turn into an inline reconnect stall.
+
+    This is the case ``warm_up()`` alone cannot cover: the first construction is
+    off-thread, but a dropped client would otherwise be rebuilt by whichever
+    read noticed — i.e. on the tick thread, reproducing the measured overrun
+    mid-run instead of at start.
+    """
+    fake_cls = _FakeMiniCls(mini_factory=lambda: _FakeMini(fail_reads=True))
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    reader = HeldStateReader(now=clock, retry_backoff=2.0, allow_inline_connect=False)
+
+    assert reader.warm_up() is True
+    assert reader.read() is None  # the read faults and drops the client
+    assert reader.connected is False
+
+    clock.advance(100.0)  # well past the backoff window
+    for _ in range(10):
+        assert reader.read() is None
+    assert len(fake_cls.calls) == 1  # NO inline reconnect
+
+    # The owner re-warms off-thread, having noticed via ``connected``.
+    fake_cls._mini_factory = _FakeMini
+    assert reader.warm_up() is True
+    assert len(fake_cls.calls) == 2
+    assert reader.read() == (0.0, 0.0)
+
+
+def test_inline_connect_enabled_is_the_default(monkeypatch) -> None:
+    """The lazy default is unchanged — every existing caller keeps working."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    assert reader.read() == (0.0, 0.0)
+    assert len(fake_cls.calls) == 1
+
+
+def test_warm_up_starts_no_threads(monkeypatch) -> None:
+    """The reader stays PASSIVE: warm-up runs on the caller's thread, by design.
+
+    Spawning a thread inside the class would re-introduce exactly the
+    interpreter-exit hazard ``close()`` exists to avoid. The owner decides which
+    thread warms it.
+    """
+    import threading
+
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0))
+
+    before = threading.active_count()
+    reader.warm_up()
+
+    assert threading.active_count() == before
+
+
+def test_warm_up_holds_exactly_one_client_for_the_process_lifetime(monkeypatch) -> None:
+    """The load-bearing contract survives the new API: ONE ``no_media`` client."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    reader = HeldStateReader(now=_FakeClock(0.0), allow_inline_connect=False)
+
+    reader.warm_up()
+    for _ in range(200):
+        reader.read()
+    reader.warm_up()
+
+    assert len(fake_cls.instances) == 1
+    assert fake_cls.calls == [{"media_backend": "no_media"}]
+
+    # ...and close() still explicitly releases it (the interpreter-exit hazard).
+    reader.close()
+    assert fake_cls.instances[0].closed is True
+
+
+# ---------------------------------------------------------------------------
 # Lazy construction — at most one construction across many reads
 # ---------------------------------------------------------------------------
 
@@ -139,6 +419,42 @@ def test_read_constructs_client_at_most_once_across_n_reads(monkeypatch) -> None
         assert reader.read() == (0.0, 0.0)
 
     assert len(fake_cls.calls) == 1
+
+
+def test_pose_read_back_does_not_leak_per_tick(monkeypatch) -> None:
+    """The issue-#51 leak-freedom proof, on the reader that carries it today.
+
+    A **tick-invariance** proof, not just an at-most-once one: a short run and a
+    long run of the SAME reader shape must build the same number of SDK clients.
+    That is the exact shape of issue #51 — ``SdkTransport.head_pose`` opens a
+    fresh ``ReachyMini`` per call and the SDK's ``GStreamerAudio`` teardown leaks
+    file descriptors, so a per-tick read exhausts the process fd limit in minutes
+    and crash-loops the service. Client opens must be flat in tick count, or the
+    leak is back.
+
+    This assertion used to live on the ``listen`` loop's ``_SessionBoundTransport``
+    (``tests/test_listen_cli.py::test_listen_run_does_not_leak_per_tick``), which
+    routed the loop's per-tick ``head_pose`` through its ONE open media session.
+    That loop retired with the ``listen`` noun (task t22); :class:`HeldStateReader`
+    is the runtime's equivalent — one held client for the process lifetime, read at
+    50 Hz — so the property moves here rather than being dropped.
+    """
+    short_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, short_cls)
+    short = HeldStateReader(now=_FakeClock(0.0))
+    for _ in range(5):
+        assert short.read() == (0.0, 0.0)
+
+    long_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, long_cls)
+    long = HeldStateReader(now=_FakeClock(0.0))
+    for _ in range(200):
+        assert long.read() == (0.0, 0.0)
+
+    assert len(long_cls.calls) == len(short_cls.calls), (
+        "pose read-back scaled SDK client opens with ticks — issue #51 leak present "
+        f"({len(short_cls.calls)} at 5 reads, {len(long_cls.calls)} at 200)"
+    )
 
 
 def test_construction_passes_no_media_backend(monkeypatch) -> None:

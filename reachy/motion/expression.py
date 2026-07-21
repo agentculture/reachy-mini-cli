@@ -47,7 +47,7 @@ from typing import Iterable, Optional
 
 from reachy.motion.queue import EXPRESSION_KEY, MotionAction, MotionQueue
 from reachy.speech.expressions import Catalog, ExpressionPose
-from reachy.speech.markers import Event, MarkerEvent
+from reachy.speech.marker_events import Event, MarkerEvent
 
 #: Calm default duration (seconds) for an expression gesture — deliberate, not
 #: snappy, on the same gentle scale as ``listen``'s ``min_dur`` (1.5 s).
@@ -112,7 +112,10 @@ class ExpressionProducer:
         return action
 
     def on_marker(self, event: MarkerEvent) -> MotionAction:
-        """Gesture for a :class:`~reachy.speech.markers.MarkerEvent` (alias of :meth:`express`)."""
+        """Gesture for a :class:`~reachy.speech.marker_events.MarkerEvent`
+
+        Alias of :meth:`express`.
+        """
         return self.express(event.emoji)
 
     def consume(self, events: Iterable[Event]) -> int:

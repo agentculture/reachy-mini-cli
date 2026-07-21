@@ -11,12 +11,12 @@ behavior reads "no reading" and yields rather than crashing.
 
 :class:`SenseProviders` + :func:`read_perception` are the seam for the other
 cues: a small, duck-typed bundle of injected zero-arg PEEK callables (never
-consuming reads) that a future engine composition can wire to the same shared
-per-tick sources the folded ``listen`` hooks already use (``PatHook``,
-``VisionHook``, ``FaceHook`` — see ``reachy/motion/listen_*.py``), so multiple
-consumers reading the same tick's sample never race or steal from one another.
-Not wired into :mod:`reachy.behavior.engine` yet — this module only defines the
-snapshot shape and the provider contract.
+consuming reads) wired to shared per-tick sources, so multiple consumers reading
+the same tick's sample never race or steal from one another. This module only
+defines the snapshot shape and the provider contract; the composition root
+(``_compose_run_seam`` in ``reachy.cli._commands.behavior``) is what supplies
+the concrete callables — today for every optional field (see
+:data:`_COMPOSED_PROVIDER_FIELDS`).
 
 Stdlib only, and it imports neither the transport nor the model package (it
 duck-types the transport's ``doa`` method, and every provider callable) so it
@@ -96,18 +96,27 @@ class Sense:
     (no mic, daemon error, or no sound). ``speech_detected`` is the daemon's
     speech-vs-any-sound flag for the same reading.
 
-    ``rms``, ``pat_event``, ``pat_state``, ``face``, and ``frame_available`` extend the
-    snapshot with the folded-hook cues (mirroring ``listen``'s ``PatHook`` /
-    ``VisionHook`` / ``FaceHook``) so a future sensor-driven behavior can read
-    them the same way it reads ``doa_angle`` today. Each has a "no reading"
+    ``rms``, ``pat_event``, ``pat_state``, ``face``, ``frame_available``,
+    ``transcript``, and ``self_moving`` extend the snapshot with the cues the
+    retired ``listen`` loop carried on its folded hooks (``PatHook`` /
+    ``VisionHook`` / ``FaceHook`` / ``TranscribeHook``), so a sensor-driven
+    behavior reads them the same way it reads ``doa_angle``. Each has a "no reading"
     default so every existing bare or doa-only ``Sense(...)`` call site keeps
     constructing a valid, fully-populated snapshot with no code change:
 
     - ``rms`` — mic loudness for the tick (the same loudness cue
       ``reachy.motion.listen.ListenProducer``'s ``SnapDetector`` reads), or
-      ``None`` when not sampled.
-    - ``pat_event`` — ``(touch_type, level)`` from a folded ``PatHook``
-      detection this tick (mirrors
+      ``None`` when not sampled. Deliberately RAW: an honest measurement other
+      consumers read, never the admission predicate (see ``rms_ratio``).
+    - ``rms_ratio`` — the same tick's loudness over a rolling estimate of the
+      room's own background (:class:`reachy.behavior.rms_background.RmsBackground`),
+      or ``None`` when not sampled or the estimate is still cold. This is what
+      sound ADMISSION keys on, because the measured mic background drifts ~25x
+      across conditions one robot lives in within 24 h (issue #102) — so "loud"
+      has to be a comparison, and a one-predicate rule cannot express a
+      comparison, so it arrives already made.
+    - ``pat_event`` — ``(touch_type, level)`` from a pat detection this tick
+      (mirrors
       ``EventBuffer.feed_pat(kind, level)``'s argument shape), or ``None``
       when there was no pat this tick.
     - ``pat_state`` — the persistent, event-stable interaction snapshot. Its
@@ -119,6 +128,19 @@ class Sense:
       tick. A signal only — never the frame itself, so this module never
       needs to name a frame's concrete type (numpy/cv2) and stays a
       dependency-free leaf. Defaults ``False``.
+    - ``transcript`` — the WORDS of an addressed utterance heard this tick
+      (mirroring the retiring loop's ``feed_transcript(text)``), or ``None``
+      when nothing was heard or the utterance did not clear the engagement
+      gate. Delivered to exactly ONE snapshot by
+      :class:`reachy.behavior.transcript_sense.TranscriptSenseDriver`'s
+      one-tick latch, the same cadence ``pat_event`` uses — so it is a cue
+      ("this was just said"), never a standing value to poll.
+    - ``self_moving`` — whether the engine is currently COMMANDING motion (any
+      watched pose axis — head, ANTENNAS, body yaw — changed above eps within
+      the release tail; see :class:`reachy.behavior.self_motion.SelfMotionDriver`).
+      A CONDITION like ``frame_available`` (an always-populated boolean, never
+      ``None``), defaulting ``False``. It is both a rule predicate in its own
+      right and the latch behind the moving rms floor (#95).
     """
 
     doa_angle: float | None = None
@@ -128,6 +150,9 @@ class Sense:
     face: str | None = None
     frame_available: bool = False
     pat_state: PatState = UNAVAILABLE_PAT_STATE
+    transcript: str | None = None
+    self_moving: bool = False
+    rms_ratio: float | None = None
 
 
 # The "no reading" snapshot — what behaviors get when nothing senses, the poll
@@ -195,7 +220,7 @@ class DoaPoller:
 #: A provider is a zero-arg callable returning its field's latest reading — a
 #: PEEK of a shared per-tick source, never a consuming read. This is the same
 #: "peek, not take" contract as
-#: ``reachy.motion.listen_vision.VisionHook.latest_frame`` (a non-consuming
+#: the retired ``VisionHook.latest_frame`` peek (a non-consuming
 #: peek at the vision grabber's held frame) versus that hook's own consuming
 #: ``take()`` — so two independent consumers of the SAME provider (e.g. a
 #: behavior and a cognition sink) see the SAME tick's value, and a provider
@@ -205,10 +230,13 @@ class DoaPoller:
 #: callable: this module only names the shape and never imports a concrete
 #: source (no ``reachy_mini``, no ``cv2``) — it stays a dependency-free leaf.
 RmsProvider = Callable[[], float | None]
+RmsRatioProvider = Callable[[], float | None]
 PatEventProvider = Callable[[], tuple[str, str] | None]
 PatStateProvider = Callable[[], PatState | None]
 FaceProvider = Callable[[], str | None]
 FrameAvailableProvider = Callable[[], bool]
+TranscriptProvider = Callable[[], str | None]
+SelfMovingProvider = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -232,6 +260,73 @@ class SenseProviders:
     face: FaceProvider | None = None
     frame_available: FrameAvailableProvider | None = None
     pat_state: PatStateProvider | None = None
+    transcript: TranscriptProvider | None = None
+    self_moving: SelfMovingProvider | None = None
+    rms_ratio: RmsRatioProvider | None = None
+
+
+#: Predicate-field names (the ``Predicate.field`` vocabulary validated against
+#: ``reachy.behavior.rules.SENSE_FIELDS``) that the base DoA/speech leg feeds
+#: UNCONDITIONALLY. Every composition builds a :class:`DoaPoller` regardless of
+#: which optional :class:`SenseProviders` fields it wires (see
+#: :func:`read_perception`'s ``base`` argument) — a mic-less box degrades the
+#: *reading* to "no reading", never the *wiring* to "no provider" — so these
+#: two never depend on any ``SenseProviders`` field being set.
+_ALWAYS_FED_FIELDS: frozenset[str] = frozenset({"doa", "speech"})
+
+#: Maps each optional :class:`SenseProviders` attribute to the predicate-field
+#: name it feeds once a real callable is wired into it.
+_PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
+    "rms": "rms",
+    "rms_ratio": "rms_ratio",
+    "pat_event": "pat",
+    "face": "face",
+    "frame_available": "frame_available",
+    "transcript": "transcript",
+    "self_moving": "self_moving",
+}
+
+#: Which of the optional :class:`SenseProviders` attributes the CURRENT engine
+#: composition (``_compose_run_seam`` in ``reachy.cli._commands.behavior``)
+#: actually wires a live provider for. Since t28 that is EVERY optional field:
+#: ``pat_event``/``pat_state`` (the folded pat-sense driver), ``rms`` and
+#: ``rms_ratio`` (two peeks of the ONE ``RmsSense`` over the shared per-tick mic
+#: chunk — the raw loudness gated by the #95 moving floor, and its ratio over
+#: the rolling background of #102), ``transcript`` (the
+#: transcript driver's one-tick latch of an addressed utterance),
+#: ``face``/``frame_available`` (the face driver's name latch and TTL-held
+#: camera condition) and ``self_moving`` (the self-motion driver's held latch
+#: over the commanded pose, #95).
+#:
+#: "Wired" is about the COMPOSITION, not the hardware: a box with no ``[sdk]``
+#: extra, no camera or no reachable STT still has these providers wired and
+#: simply reads "no reading" through them — the same distinction
+#: :data:`_ALWAYS_FED_FIELDS` draws for a mic-less box's DoA leg. A rule keyed
+#: on one of these is therefore live code, not a silent no-op, which is exactly
+#: what this set is asked to declare.
+#:
+#: THIS SET IS THE ONE DECLARED SOURCE OF TRUTH ``behavior rules check``
+#: (``reachy.cli._commands.behavior._unfed_field_warnings``) reads to warn on a
+#: rule predicate keyed to a sense field nothing feeds. A predicate field can
+#: be a valid, schema-accepted ``rules.toml`` value (see
+#: ``reachy.behavior.rules.SENSE_FIELDS``) while still being unfed here — that
+#: gap is exactly what the check surfaces. When a future composition wires a
+#: new provider (e.g. rms/face/frame_available/transcript), add its predicate
+#: field to :data:`FED_SENSE_FIELDS` (via this set, or directly) in the SAME
+#: change that wires the provider — this is the only place that needs
+#: updating; nothing else duplicates this list, so the check can never drift
+#: from reality by forgetting a second copy.
+_COMPOSED_PROVIDER_FIELDS: frozenset[str] = frozenset(
+    {"pat_event", "rms", "rms_ratio", "face", "frame_available", "transcript", "self_moving"}
+)
+
+#: The full set of predicate fields (``Predicate.field`` values) the current
+#: composition feeds a live reading for. A predicate keyed on any field
+#: outside this set will validate cleanly (it is schema-valid) and then
+#: silently never fire — see ``behavior rules check``'s unfed-field warning.
+FED_SENSE_FIELDS: frozenset[str] = _ALWAYS_FED_FIELDS | frozenset(
+    _PROVIDER_PREDICATE_FIELDS[name] for name in _COMPOSED_PROVIDER_FIELDS
+)
 
 
 #: A :class:`SenseProviders` with every field unset — "no providers wired".
@@ -278,10 +373,13 @@ def read_perception(
         doa_angle=base.doa_angle,
         speech_detected=base.speech_detected,
         rms=_peek(providers.rms, None),
+        rms_ratio=_peek(providers.rms_ratio, None),
         pat_event=_peek(providers.pat_event, None),
         face=_peek(providers.face, None),
         frame_available=bool(_peek(providers.frame_available, False)),
         pat_state=pat_state if isinstance(pat_state, PatState) else UNAVAILABLE_PAT_STATE,
+        transcript=_peek(providers.transcript, None),
+        self_moving=bool(_peek(providers.self_moving, False)),
     )
 
 

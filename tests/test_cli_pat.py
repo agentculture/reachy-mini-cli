@@ -23,6 +23,20 @@ import pytest
 from reachy.cli import main
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 
+
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path, monkeypatch):
+    """Never read the REAL state dir — ``pat run`` now arbitrates against it.
+
+    ``pat run`` refuses to start beside a live behavior engine heartbeat
+    (``reachy.behavior.liveness``), which it reads from ``state_dir()``. On a
+    robot box with the runtime service up, an unisolated test would read that
+    live heartbeat and be refused. Same reasoning that made ``test_motion.py``
+    isolate this variable for the ``*_active`` flags.
+    """
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+
+
 # --- overview -------------------------------------------------------------
 
 

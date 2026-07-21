@@ -43,6 +43,7 @@ from typing import Callable
 
 import numpy as np
 
+from reachy.behavior.liveness import refuse_if_engine_live
 from reachy.behavior.sense import DOA_TIMEOUT, EMPTY_SENSE, DoaPoller, Sense, read_doa
 from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
@@ -634,6 +635,15 @@ def _build_pat_wake(
 
 
 def cmd_sleep_run(args: argparse.Namespace) -> int:
+    # Head arbitration, FIRST — before the transport is built. The behavior engine
+    # owns motion exclusively at 50 Hz; a foreground sleep loop beside it would
+    # drive the drowsy fade / sleep-breathe into a head the engine is already
+    # streaming. Refusing ahead of transport construction also means we never open
+    # the single-consumer SDK media session we would have contended for. See
+    # reachy.behavior.liveness for why this refuses rather than yielding on the
+    # retiring *_active.flag files.
+    refuse_if_engine_live("sleep run")
+
     install_logging(getattr(args, "log_level", None))
     json_mode = bool(getattr(args, "json", False))
     transport = get_transport(args)

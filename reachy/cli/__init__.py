@@ -72,7 +72,6 @@ def _build_parser() -> argparse.ArgumentParser:
     from reachy.cli._commands import doctor as _doctor_cmd
     from reachy.cli._commands import explain as _explain_cmd
     from reachy.cli._commands import learn as _learn_cmd
-    from reachy.cli._commands import listen as _listen_group
     from reachy.cli._commands import move as _move_group
     from reachy.cli._commands import overview as _overview_cmd
     from reachy.cli._commands import pat as _pat_group
@@ -80,7 +79,6 @@ def _build_parser() -> argparse.ArgumentParser:
     from reachy.cli._commands import say as _say_group
     from reachy.cli._commands import service as _service_group
     from reachy.cli._commands import sleep as _sleep_group
-    from reachy.cli._commands import think as _think_group
     from reachy.cli._commands import vision as _vision_group
     from reachy.cli._commands import whoami as _whoami_cmd
 
@@ -120,10 +118,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # Higher-level behaviour built on the motion verbs.
     _demo_group.register(sub)
     _behavior_group.register(sub)
-    _listen_group.register(sub)
     _vision_group.register(sub)
     _say_group.register(sub)
-    _think_group.register(sub)
     _pat_group.register(sub)
     _sleep_group.register(sub)
     # Boot persistence: one CLI surface over the presence-service manager.

@@ -51,12 +51,29 @@ Timing semantics (asserted exactly by the tests)
 
 Observability
 -------------
-Every decision that fires, inhibits, or suppresses a rule emits one
-``[SENSE stage=rule source=<field> event=<rule id>] ...`` line via
-:mod:`reachy.senselog` (``stage`` for a fire naming the reason, ``drop`` for a
-suppression naming the reason). A tick where nothing matches logs nothing — no
-per-tick no-match noise — so a log capture reconstructs every non-trivial
-decision and a silent side effect is impossible.
+Every decision that fires or inhibits emits one ``[SENSE stage=rule
+source=<field> event=<rule id>] ...`` line via :mod:`reachy.senselog`
+(``stage`` for a fire naming the reason, ``drop`` for a suppression naming the
+reason). A tick where nothing matches logs nothing — no per-tick no-match
+noise — so a log capture reconstructs every non-trivial decision and a silent
+side effect is impossible.
+
+Suppressions are logged per EPISODE, not per tick (#99). The gating itself is
+measured correct on the live robot and unchanged (spec decision c46) — but
+emitting a ``dropped reason=...`` line on every tick a predicate held while
+gated meant one deployed rule wrote 6722 drop lines into a 3 h journal window
+(5414 ``already-active`` + 1308 ``cooldown``) against 42 genuine fires, at the
+engine's ~23 Hz tick rate. A gated streak now emits ONE line at entry naming
+the reason, one more line only when the reason CHANGES mid-streak (e.g.
+``cooldown`` giving way to ``already-active`` once the timer lapses while the
+behavior is still active), and ONE summary when the streak ends — before the
+fire line when a fire ends it — naming every reason seen and the streak length
+(``dropped reason=cooldown suppressed 214 ticks``). The ``ctx.emit`` event
+stream follows the same transition cadence (the summary event carries a
+structured ``ticks`` count), so the export feed is spared the same flood. A
+streak still open when the loop stops (or when ``reload`` rebuilds the engine)
+emits no summary — its entry line is the record of it. The drop grammar is
+preserved throughout: a drop always names its reason.
 
 Pure standard library (``logging`` only) plus in-package imports; nothing here
 touches a network, an LLM, or ``reachy_mini``.
@@ -65,7 +82,12 @@ touches a network, an LLM, or ``reachy_mini``.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+
+# ``field`` is aliased: this module uses ``field`` as a local for sense-field
+# names throughout (``pred.field``), which would shadow the dataclasses helper.
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from dataclasses import replace
 
 from reachy import senselog
 from reachy.behavior import library as behavior_library
@@ -90,6 +112,13 @@ REASON_COOLDOWN = "cooldown"
 REASON_REARMING = "rearming"
 REASON_INHIBITED = "inhibited"
 REASON_ALREADY_ACTIVE = "already-active"
+#: A rule carried ``say`` but no speech seam was wired into this engine — the
+#: words would go nowhere. Never a silent no-op (see the module docstring's
+#: observability contract).
+REASON_NO_SPEECH = "no-speech-actuator"
+#: The wired speech seam raised. The rule's MOTION half is already admitted by
+#: then and stays admitted; only the voice is lost for that firing.
+REASON_SPEECH_FAILED = "speech-dispatch-failed"
 
 
 # --------------------------------------------------------------------------- #
@@ -100,19 +129,29 @@ REASON_ALREADY_ACTIVE = "already-active"
 def _field_present(sense: Sense, field: str) -> bool:
     """Whether the cue *field* has a reading this tick (the ``is_true`` sense).
 
-    Presence is "the cue fired": ``speech`` uses its boolean flag directly; every
-    other field is present when its snapshot attribute is not ``None``.
+    Presence is "the cue fired": ``speech`` and ``frame_available`` use their
+    boolean flags directly (they are CONDITIONS — always-populated booleans, never
+    ``None``); every other field is present when its snapshot attribute is not
+    ``None``.
     """
     if field == "speech":
         return bool(sense.speech_detected)
+    if field == "frame_available":
+        return bool(sense.frame_available)
+    if field == "self_moving":
+        return bool(sense.self_moving)
     if field == "doa":
         return sense.doa_angle is not None
     if field == "rms":
         return sense.rms is not None
+    if field == "rms_ratio":
+        return sense.rms_ratio is not None
     if field == "pat":
         return sense.pat_event is not None
     if field == "face":
         return sense.face is not None
+    if field == "transcript":
+        return sense.transcript is not None
     return False
 
 
@@ -122,8 +161,12 @@ def _field_value(sense: Sense, field: str):
         "doa": sense.doa_angle,
         "speech": sense.speech_detected,
         "rms": sense.rms,
+        "rms_ratio": sense.rms_ratio,
         "pat": sense.pat_event,
         "face": sense.face,
+        "frame_available": sense.frame_available,
+        "transcript": sense.transcript,
+        "self_moving": sense.self_moving,
     }.get(field)
 
 
@@ -154,11 +197,23 @@ def _compare(op: str, left, right) -> bool:
 
 @dataclass
 class _RuleState:
-    """The cooldown + hysteresis bookkeeping for one rule."""
+    """The cooldown + hysteresis bookkeeping for one rule, plus its
+    suppression-episode ledger (#99).
+
+    ``suppress_reason`` is the CURRENT episode's latest reason (``None`` means
+    no episode is open); ``suppress_ticks`` counts every suppressed tick of the
+    open episode; ``suppress_reasons`` is the ordered, deduplicated list of
+    every reason the episode has passed through, so the release summary can
+    name them all. The trio only shapes what gets LOGGED/EMITTED — the
+    fire/suppress decisions themselves never read it (spec decision c46).
+    """
 
     last_fire_t: float | None = None
     false_since: float | None = None
     armed: bool = True
+    suppress_reason: str | None = None
+    suppress_ticks: int = 0
+    suppress_reasons: list[str] = dataclass_field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -175,19 +230,55 @@ class RuleEngine:
     1. updates per-field last-seen clocks (for ``absent_for``);
     2. fires the inhibit rules that match (evicting their named behaviors),
        cooldown / hysteresis gated;
-    3. fires the react rules that match (admitting their library behavior),
-       suppressing any whose behavior a currently-matching inhibit rule blocks,
-       or that is cooling down, re-arming, or already active.
+    3. fires the react rules that match (admitting their library behavior, and
+       handing any ``say`` text to the injected ``speech`` seam), suppressing
+       any whose behavior a currently-matching inhibit rule blocks, or that is
+       cooling down, re-arming, or already active.
 
     Every fire and every suppression is logged and emitted; a no-match tick is
     silent. It is defensive: a per-rule failure is isolated and logged, never
     propagated into the engine loop.
     """
 
-    def __init__(self, config: RulesConfig, *, id_prefix: str = "rule", lib=None) -> None:
+    def __init__(
+        self,
+        config: RulesConfig,
+        *,
+        id_prefix: str = "rule",
+        lib=None,
+        speech=None,
+        param_overrides: dict[str, dict[str, float]] | None = None,
+    ) -> None:
         self._config = config
         self._prefix = id_prefix
         self._lib = lib if lib is not None else behavior_library
+        #: ``{behavior_name: {param: value}}`` — a COMPOSITION-time overlay on
+        #: the library catalog's own defaults, resolved from the environment by
+        #: ``reachy.cli._commands.behavior`` (the ``REACHY_ORIENT_*`` knobs) and
+        #: injected here, so this module never reads the environment itself.
+        #:
+        #: Precedence, weakest first: library catalog default < THIS overlay <
+        #: active mode params < the rule's own ``params``. That ordering is the
+        #: point — an env override is a BOX-level tuning knob (the deployed
+        #: robot already tunes ``REACHY_PAT_*`` / ``REACHY_SELF_MOVING_*`` this
+        #: way through a systemd drop-in), while a rules file is an explicit,
+        #: version-controlled statement about this robot's behavior and must
+        #: win over an environment variable somebody exported once.
+        #:
+        #: An unknown behavior or an unknown param is IGNORED rather than
+        #: refused: the environment is not validated config, and a stale
+        #: exported variable must not stop a robot from booting.
+        self._param_overrides = dict(param_overrides or {})
+        #: ``speech(text) -> None`` — the ACT-OUT seam a firing rule's ``say``
+        #: is handed to, typically
+        #: :meth:`reachy.behavior.speech_act.SpeechActuator.say`. Injected, and
+        #: duck-typed, so this module never imports the audio stack: everything
+        #: here stays pure stdlib + in-package, and a rules engine in a test (or
+        #: on a mute box) simply has none. The seam is contracted to be O(1) and
+        #: non-blocking — it is called ON THE TICK THREAD, inside the 20 ms
+        #: budget, so anything slow behind it MUST be its own problem to
+        #: dispatch off-thread.
+        self._speech = speech
         self._state: dict[str, _RuleState] = {
             rule.id: _RuleState() for rule in (*config.react, *config.inhibit)
         }
@@ -236,6 +327,16 @@ class RuleEngine:
                 remediation=f"use one of: {valid}",
             )
         self._config = replace(self._config, active_mode=name)
+
+    def set_speech(self, speech) -> None:
+        """Wire (or replace) the act-out speech seam at runtime.
+
+        Purely additive, mirroring :meth:`set_active_mode`: the composition root
+        builds the rules driver before it opens the runtime's resources (so a
+        malformed rules file is reported before anything is constructed), which
+        means the voice necessarily arrives after this engine does.
+        """
+        self._speech = speech
 
     # -- presence tracking (absent_for) ------------------------------------ #
 
@@ -328,11 +429,13 @@ class RuleEngine:
         matched = self._eval(rule.when, sense, now)
         self._step_arming(rule, matched, now)
         if not matched:
+            self._release_suppression(ctx, rule)
             return
         reason = self._fire_reason(rule, now)
         if reason != REASON_FIRED:
-            self._emit_suppress(ctx, rule, reason)
+            self._suppress(ctx, rule, reason)
             return
+        self._release_suppression(ctx, rule)
         for name in sorted(rule.disable):
             ctx.evict(name)
         self._mark_fired(rule, now)
@@ -354,24 +457,56 @@ class RuleEngine:
         matched = self._eval(rule.when, sense, now)
         self._step_arming(rule, matched, now)
         if not matched:
+            self._release_suppression(ctx, rule)
             return False
         if rule.behavior in inhibited:
-            self._emit_suppress(ctx, rule, REASON_INHIBITED)
+            self._suppress(ctx, rule, REASON_INHIBITED)
             return False
         reason = self._fire_reason(rule, now)
         if reason != REASON_FIRED:
-            self._emit_suppress(ctx, rule, reason)
+            self._suppress(ctx, rule, reason)
             return False
         if rule.behavior in active:
-            self._emit_suppress(ctx, rule, REASON_ALREADY_ACTIVE)
+            self._suppress(ctx, rule, REASON_ALREADY_ACTIVE)
             return False
+        self._release_suppression(ctx, rule)
         ctx.admit(self._build(rule))
+        self._speak(rule)
         self._mark_fired(rule, now)
         self._emit_fire(ctx, rule, run=rule.behavior)
         return True
 
+    def _speak(self, rule) -> None:
+        """Hand a firing rule's ``say`` text to the injected speech seam.
+
+        Runs AFTER admission on purpose: the motion half is the reaction's
+        reliable part, so a missing or broken voice never costs the robot its
+        visible response. Both failure modes are named drops, never silence
+        without a reason.
+        """
+        if not rule.say:
+            return
+        if self._speech is None:
+            senselog.drop(STAGE, rule.when.field, rule.id, REASON_NO_SPEECH)
+            return
+        try:
+            self._speech(rule.say)
+        except Exception as err:  # noqa: BLE001 - a voice fault never breaks the tick
+            logger.warning("react rule %r: speech dispatch raised", rule.id, exc_info=True)
+            senselog.drop(
+                STAGE,
+                rule.when.field,
+                rule.id,
+                f"{REASON_SPEECH_FAILED} ({type(err).__name__}: {err})",
+            )
+
     def _build(self, rule: Rule):
         """Realise a react rule via the vetted library.build path (mode-swapped).
+
+        Params are layered weakest-first: the library catalog's defaults, then
+        the composition-time :attr:`_param_overrides` overlay, then the active
+        mode's params, then the rule's own — see the constructor's note on why
+        an environment overlay must lose to a rules file.
 
         The admitted :class:`~reachy.behavior.model.Lifetime` uses
         ``rule.duration_s`` as its ``duration`` when the rule carries one,
@@ -383,6 +518,9 @@ class RuleEngine:
         """
         entry = self._lib.LIBRARY[rule.behavior]
         params = entry.default_params()
+        for key, value in self._param_overrides.get(rule.behavior, {}).items():
+            if key in entry.params:  # an env overlay only moves a real behavior knob
+                params[key] = value
         for key, value in self._active_mode_params().items():
             if key in entry.params:  # a mode param only swaps a real behavior knob
                 params[key] = value
@@ -404,12 +542,52 @@ class RuleEngine:
 
     # -- observability ----------------------------------------------------- #
 
+    def _suppress(self, ctx, rule: Rule, reason: str) -> None:
+        """Record one suppressed tick, emitting only on an episode TRANSITION.
+
+        The #99 fix: the first suppressed tick of a streak emits the usual
+        ``dropped reason=<reason>`` line/event; a tick continuing the streak
+        under the SAME reason is counted silently; a mid-streak reason change
+        emits one new line naming the new reason. The eventual summary is
+        :meth:`_release_suppression`'s job.
+        """
+        state = self._state[rule.id]
+        state.suppress_ticks += 1
+        if reason == state.suppress_reason:
+            return  # continuation — counted, not logged (the 23 Hz flood class)
+        if reason not in state.suppress_reasons:
+            state.suppress_reasons.append(reason)
+        state.suppress_reason = reason
+        self._emit_suppress(ctx, rule, reason)
+
+    def _release_suppression(self, ctx, rule: Rule) -> None:
+        """Close an open suppression episode with ONE summary line/event.
+
+        Called on the first tick the rule is no longer suppressed — either its
+        predicate stopped matching or it is about to FIRE (in which case the
+        summary is emitted before the fire line, keeping the log
+        chronological). The summary names every reason the episode passed
+        through, in order, plus its length in ticks — the drop grammar still
+        names its reason(s). A no-op when no episode is open, so non-suppressed
+        ticks stay exactly as silent as before.
+        """
+        state = self._state[rule.id]
+        if state.suppress_reason is None:
+            return
+        summary = f"{','.join(state.suppress_reasons)} suppressed {state.suppress_ticks} ticks"
+        self._emit_suppress(ctx, rule, summary, ticks=state.suppress_ticks)
+        state.suppress_reason = None
+        state.suppress_ticks = 0
+        state.suppress_reasons = []
+
     def _emit_fire(self, ctx, rule: Rule, *, run: str | None = None, disabled=None) -> None:
         detail = f"fired kind={rule.kind}"
         if run is not None:
             detail += f" run={run}"
         if disabled is not None:
             detail += f" disable={disabled}"
+        if rule.say:
+            detail += f" say={rule.say!r}"
         senselog.stage(STAGE, rule.when.field, rule.id, detail)
         ctx.emit(
             {
@@ -419,6 +597,7 @@ class RuleEngine:
                 "field": rule.when.field,
                 "op": rule.when.op,
                 "behavior": run,
+                "say": rule.say,
                 "disable": disabled or [],
                 "reason": REASON_FIRED,
                 "ts": ctx.now,
@@ -426,20 +605,21 @@ class RuleEngine:
             }
         )
 
-    def _emit_suppress(self, ctx, rule: Rule, reason: str) -> None:
+    def _emit_suppress(self, ctx, rule: Rule, reason: str, *, ticks: int | None = None) -> None:
         senselog.drop(STAGE, rule.when.field, rule.id, reason)
-        ctx.emit(
-            {
-                "type": EVENT_SUPPRESS,
-                "rule": rule.id,
-                "kind": rule.kind,
-                "field": rule.when.field,
-                "op": rule.when.op,
-                "reason": reason,
-                "ts": ctx.now,
-                "tick": ctx.tick,
-            }
-        )
+        event = {
+            "type": EVENT_SUPPRESS,
+            "rule": rule.id,
+            "kind": rule.kind,
+            "field": rule.when.field,
+            "op": rule.when.op,
+            "reason": reason,
+            "ts": ctx.now,
+            "tick": ctx.tick,
+        }
+        if ticks is not None:
+            event["ticks"] = ticks  # the episode-summary event's structured length
+        ctx.emit(event)
 
 
 # --------------------------------------------------------------------------- #
@@ -492,15 +672,19 @@ class TickBus:
                 logger.exception("event consumer %r raised", consumer)
 
 
-def compose_rule_seam(config: RulesConfig, *, drivers=(), consumers=(), id_prefix="rule", lib=None):
+def compose_rule_seam(
+    config: RulesConfig, *, drivers=(), consumers=(), id_prefix="rule", lib=None, speech=None
+):
     """Build a :class:`TickBus` seam that drives *config*'s rules plus any riders.
 
     The returned bus has a :class:`RuleEngine` driver first, then any extra
     *drivers* (e.g. a goto lane), and fans emitted events out to *consumers*
-    (e.g. an export sink). Pass it as ``engine.run(tick_seam=...)``.
+    (e.g. an export sink). Pass it as ``engine.run(tick_seam=...)``. ``speech``
+    is the optional act-out seam a firing rule's ``say`` is handed to (see
+    :class:`RuleEngine`).
     """
     bus = TickBus(consumers=consumers)
-    bus.add_driver(RuleEngine(config, id_prefix=id_prefix, lib=lib))
+    bus.add_driver(RuleEngine(config, id_prefix=id_prefix, lib=lib, speech=speech))
     for driver in drivers:
         bus.add_driver(driver)
     return bus

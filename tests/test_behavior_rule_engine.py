@@ -219,9 +219,12 @@ def test_cooldown_skip_is_logged_with_reason(caplog) -> None:
         # true every tick, dt=0.25 -> fires t=0.25, then cooldown until t>=1.25
         _drive_ticks(re, [Sense(speech_detected=True)] * 3)
     lines = _sense_lines(caplog)
+    # #99 cadence: the gated streak logs ONE entry line, not one per tick (the
+    # second gated tick continues the streak silently; the streak is still open
+    # at run end, so no summary either). The decisions are unchanged.
+    assert len(lines) == 2
     assert lines[0].endswith("] fired kind=react run=nod")
     assert lines[1].endswith("] dropped reason=cooldown")
-    assert lines[2].endswith("] dropped reason=cooldown")
     for ln in lines:
         assert "event=hear" in ln  # rule id present on every decision
 
@@ -256,8 +259,12 @@ def test_every_tick_refire_settles_under_cooldown(caplog) -> None:
     cooldowns = [ln for ln in lines if "reason=cooldown" in ln]
     # dt=0.25, cd=1.0 over t=0.25..5.0 -> fires at 0.25,1.25,2.25,3.25,4.25
     assert len(fires) == 5
-    assert len(cooldowns) == 15
-    assert len(lines) == 20  # every matching tick emits exactly one decision
+    # #99 cadence: each 3-tick gated streak logs one entry + one summary when
+    # the refire closes it (5 entries + 4 summaries; the last streak is still
+    # open at run end), instead of 15 per-tick drop lines. Decisions unchanged.
+    assert len(cooldowns) == 9
+    assert sum("suppressed 3 ticks" in ln for ln in lines) == 4
+    assert len(lines) == 14
     assert len(ctx.admits) == 5
 
 
@@ -297,8 +304,12 @@ def test_two_rule_ping_pong_settles_under_cooldown(caplog) -> None:
     a_cool = [ln for ln in lines if "event=A]" in ln and "reason=cooldown" in ln]
     b_cool = [ln for ln in lines if "event=B]" in ln and "reason=cooldown" in ln]
     assert len(a_fires) == 5 and len(b_fires) == 5  # settled, not 10 each
-    assert len(a_cool) == 5 and len(b_cool) == 5
-    assert len(lines) == 20  # exactly one decision per tick (the non-matching rule is silent)
+    # #99 cadence: the alternating predicate makes every gated streak exactly
+    # one tick long, so each closes with a summary on the next (non-matching)
+    # tick — entry + summary per streak. A's 5 streaks all close inside the
+    # run (10 lines); B's last streak is still open at tick 20 (9 lines).
+    assert len(a_cool) == 10 and len(b_cool) == 9
+    assert len(lines) == 29
     names = [b.name for b in ctx.admits]
     assert names.count("nod") == 5 and names.count("shake") == 5
 
@@ -472,7 +483,9 @@ def test_already_active_behavior_is_not_readmitted(caplog) -> None:
     with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
         ctx = _drive_ticks(re, [Sense(speech_detected=True)] * 4, keep_active=True)
     assert len(ctx.admits) == 1  # admitted once; then already active
-    assert sum("reason=already-active" in ln for ln in _sense_lines(caplog)) == 3
+    # #99 cadence: the 3-tick already-active streak logs ONE entry line (it is
+    # still open at run end, so no summary). The dedup decision is unchanged.
+    assert sum("reason=already-active" in ln for ln in _sense_lines(caplog)) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -719,3 +732,80 @@ def test_a_raising_rule_build_never_escapes_on_tick(monkeypatch) -> None:
     ctx = _RecordingCtx(now=0.25, tick=1, sense=Sense(speech_detected=True))
     re.on_tick(ctx)  # must not raise
     assert ctx.admits == []
+
+
+# --------------------------------------------------------------------------- #
+# Composition-time param overrides (the REACHY_ORIENT_* seam, d6)             #
+# --------------------------------------------------------------------------- #
+#
+# The d6 admission knobs (`rms_ratio`, `rms_ratio_loud`, `sustain_s`) have to be
+# tunable on a deployed box the way `REACHY_PAT_*` and `REACHY_SELF_MOVING_*`
+# already are — a systemd drop-in, no file edit, no rebuild. A behavior is minted
+# from the library catalog on ADMISSION, so `_build` is the only place an
+# environment value can reach one; this overlay is that seam, injected by the CLI
+# (which does the env reading) so this module stays environment-free.
+
+
+def _orient_rule() -> RulesConfig:
+    return RulesConfig.from_dict(
+        {
+            "react": [
+                {
+                    "id": "sound",
+                    "when": {"field": "rms_ratio", "op": "ge", "value": 5.0},
+                    "run": "orient-to-sound",
+                    "duration_s": 12.0,
+                }
+            ]
+        }
+    )
+
+
+def _admit_once(engine: RuleEngine):
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=Sense(doa_angle=1.0, rms_ratio=9.0))
+    engine.on_tick(ctx)
+    assert ctx.admits, "the rule should have fired"
+    return ctx.admits[0]
+
+
+def test_a_param_overlay_moves_a_catalog_default() -> None:
+    engine = RuleEngine(_orient_rule(), param_overrides={"orient-to-sound": {"sustain_s": 4.0}})
+    assert _admit_once(engine).params["sustain_s"] == pytest.approx(4.0)
+
+
+def test_with_no_overlay_the_catalog_default_is_untouched() -> None:
+    from reachy.behavior.orient import OrientParams
+
+    assert _admit_once(RuleEngine(_orient_rule())).params["sustain_s"] == pytest.approx(
+        OrientParams().sustain_s
+    )
+
+
+def test_a_rules_file_param_beats_the_overlay() -> None:
+    """Precedence, and it is a product decision: a rules file is a
+    version-controlled statement about this robot, an env var is something
+    somebody exported once. The file wins."""
+    config = RulesConfig.from_dict(
+        {
+            "react": [
+                {
+                    "id": "sound",
+                    "when": {"field": "rms_ratio", "op": "ge", "value": 5.0},
+                    "run": "orient-to-sound",
+                    "duration_s": 12.0,
+                    "params": {"sustain_s": 0.5},
+                }
+            ]
+        }
+    )
+    engine = RuleEngine(config, param_overrides={"orient-to-sound": {"sustain_s": 4.0}})
+    assert _admit_once(engine).params["sustain_s"] == pytest.approx(0.5)
+
+
+def test_an_unknown_overlay_key_is_ignored_rather_than_refused() -> None:
+    """A stale exported variable must not stop a robot from booting."""
+    engine = RuleEngine(
+        _orient_rule(),
+        param_overrides={"orient-to-sound": {"not_a_knob": 1.0}, "no-such-behavior": {"x": 1.0}},
+    )
+    assert "not_a_knob" not in _admit_once(engine).params

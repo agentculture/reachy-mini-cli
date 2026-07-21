@@ -431,15 +431,17 @@ class TestFeedTranscript:
         cues = buf.snapshot()
         assert len(cues) == 0
 
-    def test_transcript_cue_survives_snapshot_and_build_messages(self):
-        from reachy.speech.cognition import build_messages
+    def test_transcript_cue_survives_snapshot_and_user_message(self):
+        # The surviving renderer is the agent engine's ``build_user_message``
+        # (the marker engine's ``cognition.build_messages`` retired with the
+        # in-loop cognition path); it renders the SAME cue bullets.
+        from reachy.speech.agent_turn import build_user_message
 
         buf = _make_buffer()
         buf.feed_transcript("the robot is alive")
         cues = buf.snapshot()
         assert len(cues) == 1
-        messages = build_messages("system prompt", cues)
-        user_msg = messages[1]["content"]
+        user_msg = build_user_message(cues)
         assert "the robot is alive" in user_msg
 
 

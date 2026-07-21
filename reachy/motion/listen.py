@@ -52,40 +52,6 @@ from reachy.behavior.sense import Sense, doa_angle_to_yaw
 from reachy.motion import pat_signal, sleep_signal
 from reachy.motion.idle import AliveConfig, next_pose
 from reachy.motion.queue import ANTENNA_KEY, IDLE_KEY, LOOK_KEY, MotionAction
-from reachy.motion.sense_sample import SenseSample
-from reachy.speech import cognition_signal
-
-
-class SampleHolder:
-    """The single-writer holder for the loop's per-tick shared :class:`SenseSample`.
-
-    The ``listen`` loop already derives one DoA + RMS + speech reading per tick (to
-    drive the Tier-1 antenna lean and Tier-2 turn). Under ``listen run --live`` the
-    folded audio-sense hooks (``think`` / ``sleep``) must consume *that* reading
-    rather than open a second, single-consumer media session — see the
-    single-SDK-owner model in ``CLAUDE.md`` and :mod:`reachy.motion.sense_sample`.
-
-    The composition layer (``listen run --live``) constructs one holder, wires the
-    loop's sense/audio taps to call :meth:`update` once per tick, and hands the
-    hooks a provider (``holder.provider`` / ``lambda: holder.latest``). It is a
-    plain attribute swap — a single writer (the loop tick) and one or more readers
-    (the hooks, all on the same loop thread), so no lock is needed; a hook simply
-    sees the most recent sample, or ``None`` before the first tick.
-    """
-
-    __slots__ = ("latest",)
-
-    def __init__(self) -> None:
-        #: The most recent per-tick sample, or ``None`` before the first update.
-        self.latest: SenseSample | None = None
-
-    def update(self, sample: SenseSample) -> None:
-        """Publish this tick's shared sample (called once per loop tick)."""
-        self.latest = sample
-
-    def provider(self) -> SenseSample | None:
-        """A :data:`~reachy.motion.sense_sample.SampleProvider` reading the latest sample."""
-        return self.latest
 
 
 @dataclass
@@ -114,9 +80,9 @@ class ListenParams:
     body_speed: float = 12.0  # deg/s (slow — body turn is deliberate, not snappy)
     head_only_band: float = 30.0  # |desired| <= this → head-only; beyond → body escalation
     # When False, the Tier-2 head/body turn is suppressed entirely — only the Tier-1
-    # antenna lean (and idle) react to sound. ``listen --live --transcribe`` sets this
-    # so the head does NOT swing toward every sound (it should turn only on its name),
-    # which also avoids the large escalate-turns that trip the SDK goto planner.
+    # antenna lean (and idle) react to sound. A words-driven caller sets this so the
+    # head does NOT swing toward every sound (it should turn only on its name), which
+    # also avoids the large escalate-turns that trip the SDK goto planner.
     turn_enabled: bool = True
     # --- 3-tier motion ladder (graduated by perception level) -----------------
     # Under transcribe-style operation (``turn_enabled=False``) the reaction is graded by
@@ -222,16 +188,11 @@ class ListenProducer:
     _last_idle_t: float | None = field(default=None, init=False)
     _rng: random.Random = field(init=False, repr=False)
     _alive: AliveConfig = field(init=False, repr=False)
-    _focused: AliveConfig = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Cosmetic idle wander only — not security-sensitive.
         self._rng = random.Random()  # nosec B311
         self._alive = AliveConfig(energy=self.params.idle_energy)
-        # Low-energy "focused" idle used while the think cognition loop is active:
-        # stillness is the thinking posture, so the wander quiets down (it still
-        # breathes — see AliveConfig.focused).
-        self._focused = self._alive.focused()
 
     def set_engaged(self) -> None:
         """Arm the one-shot engaged latch (consumed on the next :meth:`update`).
@@ -477,13 +438,7 @@ class ListenProducer:
             self.committed = _toward_zero(self.committed, step)
             self.body = _toward_zero(self.body, step)
 
-        # Stillness is the thinking posture: while the ``think`` cognition loop is
-        # active (a cheap file-exists check via the cognition signal), drop to the
-        # low-energy focused idle so the wander quiets down while the robot thinks.
-        # ``interval`` / ``breathe_period`` are preserved across the swap so pacing
-        # is unchanged — only the motion amplitude drops.
-        config = self._focused if cognition_signal.is_active() else self._alive
-        pose = next_pose(t - self._t0, self._rng, config)
+        pose = next_pose(t - self._t0, self._rng, self._alive)
         head = dict(pose["head"])  # type: ignore[arg-type]
         head["yaw"] = max(-p.max_yaw, min(p.max_yaw, head["yaw"] + self.committed))
         raw_body = float(pose["body_yaw"]) + self.body  # type: ignore[arg-type]

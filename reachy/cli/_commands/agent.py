@@ -14,8 +14,8 @@ decisions from the ``symbolic-runtime-70`` spec:
   only perception/decision events (``sense``/``rule``/``intent``/``motion`` — see
   :mod:`reachy.export.runtime`); it never carries a cognition block. The agent's
   *thinking/message/emotion* is a wholly separate feed, published here through the
-  **same** exporter ``think run --export -`` / ``listen run --live --export -``
-  use (:func:`reachy.cli._export.build_export_hook`), so the wire contract matches
+  **same** shared exporter builder
+  (:func:`reachy.cli._export.build_export_hook`), so the wire contract matches
   ``docs/export-schema.md``'s cognition feed exactly.
 
 Three composition seams (all injectable so tests need no live LLM, robot, or
@@ -27,8 +27,8 @@ network):
   mapped to zero or more short first-person perception cues
   (:func:`_cues_for_runtime_event`) and accumulated in a
   :class:`_RuntimeCueBuffer` — a minimal ``snapshot()``-only buffer the tool-use
-  engine consumes exactly as it consumes the folded ``listen --live`` sense
-  buffer.
+  engine consumes exactly as it consumed the retired folded ``listen --live``
+  sense buffer.
 * **COGNITION** — an :class:`~reachy.speech.agent_turn.AgentTurnEngine` wired with
   a :class:`~reachy.speech.tools.ToolRegistry` carrying the four **intent tools**
   (:func:`reachy.speech.intent_tools.register_intent_tools`) so its actions are
@@ -37,6 +37,14 @@ network):
   the agent can emit ``message`` / ``emotion`` blocks to its cognition feed
   *without* the external client ever touching the robot (the single-SDK-owner
   model: the runtime loop owns the robot; this client owns cognition + intents).
+  The registry also carries the ``forge`` **self-extension** tool
+  (:mod:`reachy.forge`, composed by :func:`_activate_forge`): a turn can hand a
+  natural-language goal to a coder model and, once the generated code clears the
+  fail-closed AST validator, gain a new callable tool on the *next* turn with no
+  restart. Its dispatch seam and register/announce callbacks are plain **injected**
+  callables — :mod:`reachy.speech.tools` and :mod:`reachy.speech.agent_turn` never
+  import :mod:`reachy.forge` — and a missing/broken forge stack disables only that
+  one tool.
 * **OUTPUT** — ``--export -`` / ``--export-blocks``: the agent's own
   ``thinking`` / ``message`` / ``emotion`` JSONL feed, built by the shared
   :func:`reachy.cli._export.build_export_hook` so it cannot drift from the other
@@ -50,8 +58,7 @@ Runtime-event → cue mapping (honest + documented)
 -------------------------------------------------
 Every runtime event is edge-triggered (published only when it changes), so the
 feed is naturally sparse — no per-tick flood. Each event maps to a concise
-perception cue reusing the same vocabulary the folded ``listen --live`` cognition
-path uses (:mod:`reachy.speech.events`):
+perception cue reusing the same vocabulary :mod:`reachy.speech.events` defines:
 
 * ``sense``  → ``"speech from the <dir>"`` / ``"loud sound <dir>"`` /
   ``"felt a <intensity> <touch> on the head"`` / ``"saw <name>"``.
@@ -67,6 +74,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import logging
 import math
 import sys
 import threading
@@ -74,21 +82,41 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from reachy import senselog
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.cli._export import add_export_args, build_export_hook
 from reachy.cli._output import emit_diagnostic, emit_result
-from reachy.speech.events import SenseCue
+
+if TYPE_CHECKING:  # annotations only — never imported at runtime
+    from reachy.speech.events import SenseCue
+
+
+def _sense_cue():
+    """The :class:`~reachy.speech.events.SenseCue` type, imported on first use.
+
+    Deliberately NOT a module-scope import. ``_build_parser()`` registers this
+    noun, so a top-level ``from reachy.speech.events import SenseCue`` put the
+    cognition event bus in the import path of EVERY ``reachy`` invocation --
+    ``say run``, ``daemon status``, even ``--help``. ``say`` is specified as a
+    dumb TTS pipe and its boundary test forbids exactly that. Found by t24's
+    import-boundary suite.
+    """
+    from reachy.speech.events import SenseCue
+
+    return SenseCue
+
+
+logger = logging.getLogger(__name__)
 
 _JSON_HELP = "Emit structured JSON."
 
 # Sound-direction band + loudness threshold — mirror reachy.speech.events'
 # DoA convention (0 = left, pi/2 = front, pi = right; ~15° "ahead" band) and its
 # loud-sound floor, so the agent's perception vocabulary matches the folded
-# listen --live cognition path exactly.
+# retired listen --live cognition path exactly.
 _AHEAD_BAND_RAD: float = 0.26
 _LOUD_RMS_THRESHOLD: float = 0.02
 
@@ -250,7 +278,7 @@ class _RuntimeCueBuffer:
     Satisfies the ``_BufferLike`` protocol the
     :class:`~reachy.speech.agent_turn.AgentTurnEngine` consumes (a single
     ``snapshot() -> list[SenseCue]``), so the tool-use engine drives it exactly as
-    it drives the folded ``listen --live`` sense buffer. Runtime events are pushed
+    it drove the retired folded ``listen --live`` sense buffer. Runtime events are pushed
     in via :meth:`feed_event`; :meth:`snapshot` atomically drains.
     """
 
@@ -271,10 +299,29 @@ class _RuntimeCueBuffer:
         ts = _event_ts(event)
         with self._lock:
             for text in cues:
-                self._buf.append(SenseCue(text=text, timestamp=ts))
+                self._buf.append(_sense_cue()(text=text, timestamp=ts))
         for text in cues:
             senselog.stage("cue", "runtime", uuid.uuid4().hex[:8], text)
         return len(cues)
+
+    def feed_forge(self, text: str) -> None:
+        """Append one forge self-extension lifecycle cue (the ``announce`` seam).
+
+        Mirrors :meth:`reachy.speech.events.EventBuffer.feed_forge` — the method the
+        retired folded ``listen --live`` cognition path wired as
+        :class:`~reachy.forge.activate.ForgeActivator`'s ``announce`` — so a skill the
+        agent forged announces itself back as a perception ("learned a new skill:
+        <name>") and the agent discovers on its next snapshot that it gained a tool.
+        The text is already a complete human-readable sentence, so (unlike a runtime
+        event) it is passed through verbatim. Empty/whitespace/``None`` yields no cue;
+        never raises, so a fault here can never break activation.
+        """
+        if not text or not str(text).strip():
+            return
+        cue = str(text).strip()
+        with self._lock:
+            self._buf.append(_sense_cue()(text=cue, timestamp=0.0))
+        senselog.stage("cue", "forge", uuid.uuid4().hex[:8], cue)
 
     def snapshot(self) -> list[SenseCue]:
         """Return all buffered cues (oldest first) and atomically clear the buffer."""
@@ -282,6 +329,113 @@ class _RuntimeCueBuffer:
             old = self._buf
             self._buf = deque(maxlen=self._maxlen)
         return list(old)
+
+
+# ---------------------------------------------------------------------------
+# Forge composition — runtime self-extension, wired as INJECTED callables
+# ---------------------------------------------------------------------------
+#
+# ``reachy.forge`` lets an agent turn hand a natural-language goal to a coder model and,
+# if the generated code passes the fail-closed AST validator, gain a new callable tool
+# with no restart. ``agent attach`` is its composition site: the sanctioned external
+# cognition surface.
+#
+# IMPORT BOUNDARY (asserted by tests/test_speech_tools.py, tests/test_agent_turn.py and
+# tests/test_agent_forge.py): :mod:`reachy.speech.tools` and
+# :mod:`reachy.speech.agent_turn` must NEVER import :mod:`reachy.forge`. The dispatch
+# seam and the register/announce callbacks are plain callables INJECTED here, and even
+# here every ``reachy.forge`` import is function-local — so a missing or broken forge
+# stack disables only the forge tool and can never break importing this noun.
+
+
+def _forge_stack_available() -> bool:
+    """Whether the forge self-extension stack imports (advertise the tool only if so)."""
+    try:
+        import reachy.forge  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _default_forge_client_factory(publish: Callable[[str, dict], None]) -> object:
+    """Build the production :class:`~reachy.forge.client.ForgeClient` over *publish*.
+
+    Threaded the DEFAULT sanctioned ``ctx`` surface so the client's validator gates
+    generated code against exactly the attributes :class:`ForgedSkillContext` exposes.
+    Tests inject a substitute factory (see ``forge_client_factory``) so no coder-model
+    endpoint is ever contacted.
+    """
+    from reachy.forge import ForgeClient
+    from reachy.forge.validator import DEFAULT_ALLOWED_CTX_ATTRS
+
+    return ForgeClient(publish=publish, allowed_ctx_attrs=set(DEFAULT_ALLOWED_CTX_ATTRS))
+
+
+def _activate_forge(
+    registry: object,
+    buffer: object,
+    holder: list,
+    *,
+    express: Callable[[str], object],
+    speak_engine: object,
+    harmonic_engine: object,
+    play: Callable[..., None],
+    run_behavior: Callable[..., str],
+    client_factory: Callable[[Callable[[str, dict], None]], object] | None = None,
+) -> None:
+    """Wire the forge auto-activation subsystem for the agent registry (best-effort).
+
+    Builds the restricted :class:`~reachy.forge.ForgedSkillContext` over the SAME
+    publish-only seams this noun's built-in ``speak`` / ``harmonics`` / ``apply_pose``
+    tools use (the external client never opens the robot's SDK — the runtime loop owns
+    the robot), a register callback that HOT-registers a forged skill into the LIVE
+    ``registry``, a :class:`~reachy.forge.ForgeActivator` (validator-gated AUTO-activation
+    on ``forge/staged`` + boot reload of ``active/``), and a
+    :class:`~reachy.forge.ForgeClient` whose ``publish`` IS the activator. Finally arms
+    the late-bound dispatch seam by appending the client to ``holder``.
+
+    ``run_behavior`` is the ctx's one non-inert seam. Because this client is
+    publish-only by design, a forged skill's ``ctx.speak`` / ``ctx.harmonics`` /
+    ``ctx.express`` render nothing — so without an actuator the forge's own premise
+    ("the robot gains a new callable tool") would be only half true here. The seam is
+    :func:`reachy.speech.intent_tools.make_run_behavior_effector`'s callable: the forged
+    skill reaches the robot exactly as this noun's own tools do, by submitting a bounded
+    intent to the spool the running engine drains — never by touching the SDK.
+
+    The ``announce`` seam is the cue buffer's :meth:`_RuntimeCueBuffer.feed_forge` — kept
+    a plain callable, so the forge modules never import the event bus. A failure disables
+    only the forge tool; cognition keeps running.
+    """
+    try:
+        from reachy.forge import ForgeActivator, build_ctx_seams
+        from reachy.speech.tools import function_tool
+
+        def _register(name: str, description: str, parameters: dict, handler: object) -> None:
+            registry.register(
+                function_tool(
+                    name=name, description=description, parameters=parameters, handler=handler
+                )
+            )
+
+        ctx = build_ctx_seams(
+            speak_engine=speak_engine,
+            harmonic_engine=harmonic_engine,
+            play=play,
+            express=express,
+            run_behavior=run_behavior,
+        )
+        announce = getattr(buffer, "feed_forge", None)
+        activator = ForgeActivator(register=_register, ctx=ctx, announce=announce)
+        # Boot reload: any active/<name> forged skill re-registers now (idempotent), so a
+        # skill forged before a restart is callable again on the very first turn.
+        activator.reload_active()
+        factory = client_factory if client_factory is not None else _default_forge_client_factory
+        holder.append(factory(activator.publish))
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "agent attach: forge subsystem unavailable; self-extension disabled",
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +451,7 @@ def _build_default_engine(
     await_timeout: float,
     modes: Iterable[str] = (),
     turn_fn: object | None = None,
+    forge_client_factory: Callable[[Callable[[str, dict], None]], object] | None = None,
 ) -> object:
     """Build the real :class:`AgentTurnEngine` whose actions are intent-spool writes.
 
@@ -312,14 +467,21 @@ def _build_default_engine(
       block is emitted ahead of dispatch by the engine) but the *external* client
       never opens the robot's SDK. The runtime loop owns the robot; this client
       owns cognition + intents.
+    * the ``forge`` **self-extension** tool — advertised only when
+      :func:`_forge_stack_available`, wired as a late-bound dispatch seam (see
+      :func:`_activate_forge`) so the registry can list ``forge`` *before* the
+      :class:`~reachy.forge.client.ForgeClient` (which needs the already-built registry,
+      via the activator's register callback) exists.
 
     ``turn_fn`` is the LLM turn function; ``None`` (the default) lets
     :class:`AgentTurnEngine` use :func:`reachy.speech.llm.stream_turn` over the
-    ``REACHY_OPENAI_*`` config. Tests build this same engine with a fake ``turn_fn``
-    so no network is ever hit. Lazy-imported so registering the noun stays cheap.
+    ``REACHY_OPENAI_*`` config. ``forge_client_factory`` is the matching seam for the
+    coder-model client (``None`` → :func:`_default_forge_client_factory`). Tests build
+    this same engine with a fake ``turn_fn`` and a fake forge client so no network is
+    ever hit. Lazy-imported so registering the noun stays cheap.
     """
     from reachy.speech.agent_turn import AgentTurnEngine
-    from reachy.speech.intent_tools import register_intent_tools
+    from reachy.speech.intent_tools import make_run_behavior_effector, register_intent_tools
     from reachy.speech.tools import ToolRegistry
     from reachy.speech.voice import VoiceEngine
 
@@ -332,17 +494,68 @@ def _build_default_engine(
     def _no_express(_emoji: str) -> None:
         return None
 
-    registry = ToolRegistry(
-        express=_no_express,
-        speak_engine=VoiceEngine(name="tts", synthesize=_silent_synth, samplerate=_TTS_RATE),
-        harmonic_engine=VoiceEngine(
-            name="harmonic", synthesize=_silent_synth, samplerate=_HARMONIC_RATE
-        ),
-        play=_no_play,
+    # Build the publish-only seams ONCE and share them between the built-in tools and
+    # the forged-skill ctx, so a forged skill's ctx.speak / ctx.express render through
+    # exactly the same (inert, no-SDK) seams the speak / apply_pose tools use.
+    speak_engine = VoiceEngine(name="tts", synthesize=_silent_synth, samplerate=_TTS_RATE)
+    harmonic_engine = VoiceEngine(
+        name="harmonic", synthesize=_silent_synth, samplerate=_HARMONIC_RATE
     )
+
+    registry_kwargs: dict[str, object] = {
+        "express": _no_express,
+        "speak_engine": speak_engine,
+        "harmonic_engine": harmonic_engine,
+        "play": _no_play,
+    }
+
+    # The forge self-extension tool: a late-bound dispatch seam that dereferences the
+    # holder only at CALL time, so the registry can be constructed with `forge` listed
+    # before the ForgeClient (which needs this very registry) exists. Only advertised
+    # when the forge stack imports; an unarmed holder degrades the tool to an inert
+    # no-op rather than raising into a turn.
+    forge_holder: list = []
+    if _forge_stack_available():
+
+        def _forge_seam(goal: str, improve: str | None = None) -> object:
+            if not forge_holder:
+                return None
+            return forge_holder[0].dispatch(goal, improve=improve)
+
+        registry_kwargs["forge"] = _forge_seam
+
+    registry = ToolRegistry(**registry_kwargs)
     register_intent_tools(
         registry, spool_dir=spool_dir, await_timeout=await_timeout, modes=tuple(modes)
     )
+
+    if "forge" in registry_kwargs:
+        # After the registry exists: wire the activation subsystem + ForgeClient and arm
+        # the seam. Best-effort by construction — and belt-and-braces here too, so even a
+        # hard failure in composition leaves cognition (intents + publish-only tools)
+        # fully running with the forge tool merely inert.
+        try:
+            _activate_forge(
+                registry,
+                buffer,
+                forge_holder,
+                express=_no_express,
+                speak_engine=speak_engine,
+                harmonic_engine=harmonic_engine,
+                play=_no_play,
+                # The forged skill's ONE actuator: the same bounded, validated
+                # run_behavior admission the registry's own intent tool submits, over
+                # the same spool — never a second path to the robot.
+                run_behavior=make_run_behavior_effector(
+                    spool_dir=spool_dir, await_timeout=await_timeout
+                ),
+                client_factory=forge_client_factory,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "agent attach: forge composition failed; self-extension disabled",
+                exc_info=True,
+            )
 
     kwargs: dict[str, object] = {}
     if turn_fn is not None:
@@ -448,7 +661,7 @@ def cmd_agent_attach(
     json_mode = bool(getattr(args, "json", False))
 
     # OUTPUT seam: the agent's OWN cognition feed (thinking/message/emotion), the
-    # SAME exporter think/listen use — the wire contract matches the schema doc.
+    # The shared exporter builder — the wire contract matches the schema doc.
     export_hook = build_export_hook(args, stream=stream)
 
     # INPUT seam: runtime-event JSONL lines (a stream/FIFO/file, or '-' for stdin).
@@ -510,6 +723,10 @@ def cmd_agent_overview(args: argparse.Namespace) -> int:
                 "COGNITION: a tool-use engine whose actions are ATOMIC INTENT-SPOOL "
                 "writes (run_behavior / declare_goal / set_mode / set_inhibition) the "
                 "running engine drains each tick.",
+                "SELF-EXTENSION: the `forge` tool hands a natural-language goal to a "
+                "coder model; generated code must pass a fail-closed AST validator "
+                "before it is auto-activated and becomes callable on the NEXT turn "
+                "(and again after a restart, reloaded from the active/ store).",
                 "OUTPUT: the agent publishes its OWN thinking/message/emotion feed via "
                 "--export - (decision c27: the runtime feed carries no cognition block).",
                 "Detaching changes nothing about the loop — it keeps ticking and its "
