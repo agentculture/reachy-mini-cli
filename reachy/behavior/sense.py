@@ -97,10 +97,10 @@ class Sense:
     speech-vs-any-sound flag for the same reading.
 
     ``rms``, ``pat_event``, ``pat_state``, ``face``, ``frame_available``,
-    ``transcript``, and ``self_moving`` extend the
-    snapshot with the folded-hook cues (mirroring ``listen``'s ``PatHook`` /
-    ``VisionHook`` / ``FaceHook`` / ``TranscribeHook``) so a future sensor-driven behavior can read
-    them the same way it reads ``doa_angle`` today. Each has a "no reading"
+    ``transcript``, and ``self_moving`` extend the snapshot with the cues the
+    retired ``listen`` loop carried on its folded hooks (``PatHook`` /
+    ``VisionHook`` / ``FaceHook`` / ``TranscribeHook``), so a sensor-driven
+    behavior reads them the same way it reads ``doa_angle``. Each has a "no reading"
     default so every existing bare or doa-only ``Sense(...)`` call site keeps
     constructing a valid, fully-populated snapshot with no code change:
 
@@ -115,8 +115,8 @@ class Sense:
       across conditions one robot lives in within 24 h (issue #102) — so "loud"
       has to be a comparison, and a one-predicate rule cannot express a
       comparison, so it arrives already made.
-    - ``pat_event`` — ``(touch_type, level)`` from a folded ``PatHook``
-      detection this tick (mirrors
+    - ``pat_event`` — ``(touch_type, level)`` from a pat detection this tick
+      (mirrors
       ``EventBuffer.feed_pat(kind, level)``'s argument shape), or ``None``
       when there was no pat this tick.
     - ``pat_state`` — the persistent, event-stable interaction snapshot. Its

@@ -1,5 +1,5 @@
-"""Shared logging setup for the long-running sense loops (``listen``/``sleep``
-``run``).
+"""Shared logging setup for the long-running loops (``behavior engine run`` /
+``sleep run``).
 
 Every module in this codebase logs via ``logging.getLogger(__name__)``, but
 nothing ever attached a handler or called ``logging.basicConfig`` — so
@@ -26,7 +26,7 @@ past ``"reachy"``, so NO root handler (present or future) can double them.
 
 Level precedence: an explicit ``--log-level`` flag value beats the
 ``REACHY_LOG_LEVEL`` environment variable, which beats the caller-supplied
-default (``"INFO"`` for the three long-running loops).
+default (``"INFO"`` for the long-running loops).
 """
 
 from __future__ import annotations
@@ -57,8 +57,8 @@ def add_log_level_arg(parser: argparse.ArgumentParser, *, default: str = DEFAULT
     """Register the shared ``--log-level`` flag on *parser*.
 
     Mirrors the ``add_export_args`` / ``add_robot_args`` pattern (one shared
-    helper) so ``listen run`` / ``sleep run`` present an identical flag
-    instead of drifting.
+    helper) so ``behavior engine run`` / ``sleep run`` present an identical
+    flag instead of drifting.
     """
     parser.add_argument(
         "--log-level",

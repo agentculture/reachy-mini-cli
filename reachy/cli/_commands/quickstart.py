@@ -29,7 +29,7 @@ Real mode — local robot (recommended)
      reachy-mini-cli device status
 
 4. Make it do something:
-     reachy-mini-cli listen run                  # orient to sound (Ctrl-C to stop)
+     reachy-mini-cli behavior engine run         # the presence loop (Ctrl-C to stop)
      reachy-mini-cli demo-mode start             # feel-alive idle loop (background)
      reachy-mini-cli move goto --z 10 --pitch -5 # one motion command
 
@@ -42,13 +42,13 @@ Install numpy-only (no daemon binary), talk to a daemon running elsewhere:
      uv tool install reachy-mini-cli
      export REACHY_BASE_URL=http://reachy.local:8000
      reachy-mini-cli device status
-     reachy-mini-cli listen run --transport http
+     reachy-mini-cli behavior engine run --transport http
 
 Always available (no daemon needed)
 -----------------------------------
      reachy-mini-cli learn               # the full command map
      reachy-mini-cli explain daemon      # full docs for the daemon noun
-     reachy-mini-cli explain listen      # full docs for listen
+     reachy-mini-cli explain behavior    # full docs for the behavior noun
      reachy-mini-cli quickstart --json   # this guide as JSON
 
 Exit codes: 0 success, 1 user error, 2 environment/setup error.
@@ -66,7 +66,7 @@ def _as_json_payload() -> dict[str, object]:
                 "steps": [
                     "reachy-mini-cli daemon start",
                     "reachy-mini-cli device status",
-                    "reachy-mini-cli listen run",
+                    "reachy-mini-cli behavior engine run",
                     "reachy-mini-cli daemon stop",
                 ],
             },
@@ -77,7 +77,7 @@ def _as_json_payload() -> dict[str, object]:
                 "steps": [
                     "export REACHY_BASE_URL=http://reachy.local:8000",
                     "reachy-mini-cli device status",
-                    "reachy-mini-cli listen run --transport http",
+                    "reachy-mini-cli behavior engine run --transport http",
                 ],
             },
         ],
@@ -89,7 +89,7 @@ def _as_json_payload() -> dict[str, object]:
         "agent_first": [
             "reachy-mini-cli learn",
             "reachy-mini-cli explain daemon",
-            "reachy-mini-cli explain listen",
+            "reachy-mini-cli explain behavior",
             "reachy-mini-cli quickstart --json",
         ],
     }

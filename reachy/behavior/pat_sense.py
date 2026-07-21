@@ -160,8 +160,8 @@ never-raise contract of :class:`reachy.robot.state_reader.HeldStateReader`:
 
 Determinism: the detector, reader, and clock are all injected seams. Time comes
 from ``ctx.now`` (the engine's injected monotonic clock), so the driver inherits
-the loop's determinism with no extra clock of its own — the same choice
-:class:`reachy.motion.listen_pat.PatHook` makes.
+the loop's determinism with no extra clock of its own — the same choice the
+retired ``listen`` loop's ``PatHook`` made.
 
 Stdlib plus :mod:`reachy.motion.pat` (numpy) and the base-layer name constant
 from :mod:`reachy.behavior.engine`; the reader is duck-typed (a zero-arg

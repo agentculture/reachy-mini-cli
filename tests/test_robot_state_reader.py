@@ -4,8 +4,12 @@ All tests use a *stubbed* ``reachy_mini`` — ``HeldStateReader._import`` is
 monkeypatched to return a fake ``ReachyMini`` class (mirroring
 ``tests/test_sdk_transport.py``'s ``_patch_import`` seam), so no real hardware or
 installed SDK is needed. A manually-advanced fake clock (mirroring
-``tests/test_listen_direction_invariants.py``'s ``_FakeClock``) makes the
+``tests/test_direction_invariants.py``'s ``_FakeClock``) makes the
 lazy-construction / retry-backoff behavior fully deterministic.
+
+This module also carries the issue-#51 leak-freedom proof (a tick-invariance
+assertion on client opens), which moved here from the ``listen`` loop when that
+noun retired — see ``test_pose_read_back_does_not_leak_per_tick``.
 """
 
 from __future__ import annotations
@@ -415,6 +419,42 @@ def test_read_constructs_client_at_most_once_across_n_reads(monkeypatch) -> None
         assert reader.read() == (0.0, 0.0)
 
     assert len(fake_cls.calls) == 1
+
+
+def test_pose_read_back_does_not_leak_per_tick(monkeypatch) -> None:
+    """The issue-#51 leak-freedom proof, on the reader that carries it today.
+
+    A **tick-invariance** proof, not just an at-most-once one: a short run and a
+    long run of the SAME reader shape must build the same number of SDK clients.
+    That is the exact shape of issue #51 — ``SdkTransport.head_pose`` opens a
+    fresh ``ReachyMini`` per call and the SDK's ``GStreamerAudio`` teardown leaks
+    file descriptors, so a per-tick read exhausts the process fd limit in minutes
+    and crash-loops the service. Client opens must be flat in tick count, or the
+    leak is back.
+
+    This assertion used to live on the ``listen`` loop's ``_SessionBoundTransport``
+    (``tests/test_listen_cli.py::test_listen_run_does_not_leak_per_tick``), which
+    routed the loop's per-tick ``head_pose`` through its ONE open media session.
+    That loop retired with the ``listen`` noun (task t22); :class:`HeldStateReader`
+    is the runtime's equivalent — one held client for the process lifetime, read at
+    50 Hz — so the property moves here rather than being dropped.
+    """
+    short_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, short_cls)
+    short = HeldStateReader(now=_FakeClock(0.0))
+    for _ in range(5):
+        assert short.read() == (0.0, 0.0)
+
+    long_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, long_cls)
+    long = HeldStateReader(now=_FakeClock(0.0))
+    for _ in range(200):
+        assert long.read() == (0.0, 0.0)
+
+    assert len(long_cls.calls) == len(short_cls.calls), (
+        "pose read-back scaled SDK client opens with ticks — issue #51 leak present "
+        f"({len(short_cls.calls)} at 5 reads, {len(long_cls.calls)} at 200)"
+    )
 
 
 def test_construction_passes_no_media_backend(monkeypatch) -> None:

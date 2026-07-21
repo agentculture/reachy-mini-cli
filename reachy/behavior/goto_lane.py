@@ -24,10 +24,11 @@ its curve to ``move_goto``; it must produce the interpolated pose itself, per ti
 * its contribution at behavior-local time ``t`` is the minimum-jerk interpolation
   from a *start* pose to the *target* pose, ``s(τ) = 10τ³ − 15τ⁴ + 6τ⁵`` with
   ``τ = t / duration`` — the **same smooth profile the SDK's ``goto`` planner
-  uses**. The math is *cited*, not imported: :func:`minjerk_progress` mirrors
-  :func:`reachy.motion.listen_pat.minjerk_progress` (which in turn documents it as
-  the SDK planner's profile) so this leaf stays a pure, numpy-free, stdlib-only
-  module that imports no ``reachy_mini`` and no motion machinery.
+  uses**. The math is *cited*, not imported: :func:`minjerk_progress` reproduces
+  the SDK planner's own profile (it was originally cited here from the retired
+  ``reachy.motion.listen_pat.minjerk_progress``) so this leaf stays a pure,
+  numpy-free, stdlib-only module that imports no ``reachy_mini`` and no motion
+  machinery.
 
 Start pose — the choice, and its limitation
 --------------------------------------------
@@ -130,10 +131,11 @@ _HEAD_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
 def minjerk_progress(tau: float) -> float:
     """The minimum-jerk position profile ``s(τ) = 10τ³ − 15τ⁴ + 6τ⁵`` on ``[0, 1]``.
 
-    Cited from :func:`reachy.motion.listen_pat.minjerk_progress` — the same smooth
-    profile the SDK's ``goto`` planner interpolates with — reimplemented here (not
-    imported) so this module stays a stdlib-only leaf with no motion/numpy/SDK
-    dependency. Clamped: ``τ ≤ 0 → 0``, ``τ ≥ 1 → 1``. Monotonic non-decreasing on
+    The same smooth profile the SDK's ``goto`` planner interpolates with, written
+    out here (not imported) so this module stays a stdlib-only leaf with no
+    motion/numpy/SDK dependency. Originally cited from the retired
+    ``reachy.motion.listen_pat.minjerk_progress``, which carried the identical
+    polynomial. Clamped: ``τ ≤ 0 → 0``, ``τ ≥ 1 → 1``. Monotonic non-decreasing on
     ``[0, 1]``, so a goto's approach to its target never overshoots or reverses.
     """
     if tau <= 0.0:
