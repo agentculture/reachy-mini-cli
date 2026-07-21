@@ -335,8 +335,18 @@ class SpeechActuator:
         if worker is not None:
             try:
                 self._pending.put_nowait(None)
-            except queue.Full:  # pragma: no cover - a full queue still drains
-                pass
+            except queue.Full:
+                # Make room: a wedged queue must not stop us signalling the
+                # worker. Dropping one queued utterance at shutdown is strictly
+                # better than a worker that never learns to stop — the bounded
+                # join() below would merely stop WAITING for it, leaving
+                # synthesis and playback running through teardown.
+                # Same pattern as TranscriptSenseDriver.close().
+                try:
+                    self._pending.get_nowait()
+                    self._pending.put_nowait(None)
+                except (queue.Empty, queue.Full):  # pragma: no cover - defensive
+                    logger.debug("speech: could not enqueue worker stop")
             worker.join(timeout=self._join_timeout_s)
 
     def __enter__(self) -> "SpeechActuator":
@@ -371,7 +381,11 @@ class SpeechActuator:
         with self._idle:
             self._inflight += 1
         try:
-            self._pending.put_nowait(text)
+            # (event, text), not bare text: the worker logs this utterance's
+            # outcome under the SAME id say() already used for its drops, so
+            # an accept and its spoke/failure line can be correlated. It also
+            # makes _next_event() single-threaded (tick thread only).
+            self._pending.put_nowait((event, text))
         except queue.Full:
             with self._idle:
                 self._inflight -= 1
@@ -423,7 +437,7 @@ class SpeechActuator:
             if item is None:
                 return
             try:
-                self._render(item)
+                self._render(*item)
             except Exception:  # noqa: BLE001 — the worker must outlive any utterance
                 logger.warning("speech: rendering an utterance raised", exc_info=True)
             finally:
@@ -431,9 +445,13 @@ class SpeechActuator:
                     self._inflight -= 1
                     self._idle.notify_all()
 
-    def _render(self, text: str) -> None:
-        """Synthesize then play ONE utterance. Every failure degrades to silence."""
-        event = self._next_event()
+    def _render(self, event: str, text: str) -> None:
+        """Synthesize then play ONE utterance. Every failure degrades to silence.
+
+        *event* is allocated by :meth:`say` on the tick thread and carried
+        through the queue, so every line this utterance produces — accept,
+        drop, failure, ``spoke`` — shares one id.
+        """
         if self.muted:
             self._drop(event, REASON_LATCHED)
             return
@@ -496,6 +514,14 @@ class SpeechActuator:
     # ------------------------------------------------------------------ #
 
     def _next_event(self) -> str:
+        """Allocate an utterance id. **Tick thread only** — see :meth:`say`.
+
+        Single-threaded by contract rather than by lock: ``say()`` is the only
+        caller, and it hands the id to the worker through the queue. When the
+        worker minted its own, an utterance's accept and its outcome carried
+        DIFFERENT ids (the live journal showed ``spoke`` on even ids only,
+        drops on odd), so the two could never be correlated.
+        """
         self._seq += 1
         return f"utt{self._seq}"
 

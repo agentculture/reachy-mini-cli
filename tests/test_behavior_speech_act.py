@@ -19,11 +19,14 @@ Task t6. These tests are the acceptance contract for
 from __future__ import annotations
 
 import contextlib
+import queue
 import threading
 import time
+from unittest import mock
 
 import pytest
 
+from reachy import senselog
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.rule_engine import TickBus
@@ -581,3 +584,83 @@ def test_the_whole_default_path_degrades_to_silence_when_playback_is_also_down()
         assert actuator.worker is not None and actuator.worker.is_alive()
     finally:
         actuator.close()
+
+
+# --------------------------------------------------------------------------- #
+# Qodo review findings on PR #114 — both were REAL, both pinned here.          #
+# --------------------------------------------------------------------------- #
+
+
+def test_close_signals_the_worker_even_when_the_queue_is_full() -> None:
+    """A full queue must not swallow the stop sentinel.
+
+    ``close()`` used to ``put_nowait(None)`` and pass on ``queue.Full``. The
+    bounded ``join()`` that follows merely stops WAITING for the worker — it
+    does not stop it — so a wedged queue left synthesis and playback running
+    through teardown, nondeterministically. Same defect class the
+    ``TranscriptSenseDriver.close()`` make-room pattern already solved.
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_synth(text: str) -> bytes:
+        started.set()
+        release.wait(timeout=5.0)
+        return b""
+
+    actuator = SpeechActuator(
+        synthesize=blocking_synth,
+        samplerate=16000,
+        play=lambda pcm, *, samplerate: None,
+        join_timeout_s=5.0,
+    )
+    # Wedge the worker mid-utterance, then fill the bounded queue behind it.
+    assert actuator.say("first")
+    assert started.wait(timeout=5.0)
+    while True:
+        try:
+            actuator._pending.put_nowait(("filler", "x"))
+        except queue.Full:
+            break
+    assert actuator._pending.full()
+
+    worker = actuator.worker
+    assert worker is not None
+    release.set()
+    actuator.close()
+
+    assert not worker.is_alive(), "the worker outlived close() — stop sentinel lost"
+
+
+def test_one_utterance_carries_one_event_id_end_to_end() -> None:
+    """An utterance's accept and its outcome must share an id.
+
+    The queue used to carry bare text, so the worker minted a SECOND id for the
+    same utterance via ``_next_event()``. On the deployed robot that showed up
+    as ``spoke`` lines on even ids only, with drops on odd ones — an utterance
+    could never be correlated with its own outcome in the journal. Allocating in
+    ``say()`` and carrying ``(event, text)`` also makes ``_next_event()``
+    single-threaded, which is the race Qodo flagged.
+    """
+    seen: list[tuple[str, str]] = []
+
+    def record(stage: str, source: str, event: str, detail: str) -> None:
+        seen.append((event, detail))
+
+    actuator = SpeechActuator(
+        synthesize=lambda text: b"\x00\x00" * 400,
+        samplerate=16000,
+        play=lambda pcm, *, samplerate: None,
+    )
+    with mock.patch.object(senselog, "stage", record):
+        assert actuator.say("hello")
+        assert actuator.join_idle(timeout=5.0)
+    actuator.close()
+
+    spoke = [(event, detail) for event, detail in seen if detail.startswith("spoke")]
+    assert len(spoke) == 1, f"expected exactly one spoke line, got {seen}"
+    # say() allocated utt1 — the worker must reuse it, not mint utt2.
+    assert spoke[0][0] == "utt1", (
+        f"the worker logged {spoke[0][0]!r} for the utterance say() called 'utt1' — "
+        "the id is being minted twice, so accept and outcome cannot be correlated"
+    )
