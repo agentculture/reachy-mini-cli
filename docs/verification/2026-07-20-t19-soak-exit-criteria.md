@@ -111,17 +111,23 @@ Covers t7's deferred audible-output criteria.
   `[SENSE stage=rule source=rms event=look-toward-sound] fired ... run=orient-to-sound`
   and `[SENSE stage=orient source=doa event=tier] NONE->NOISE` — the near-side
   antenna leans toward the bearing and **the head does not move**.
-- **Pass, tier 2 (sustained OR loud relative to the room):** a
-  `[SENSE stage=orient source=doa event=tier2] promoted reason=sustained|loud`
-  line, the head/body turning toward the source, and a smooth return to base
-  presence at the end of the 12 s window **without a snap**.
-- **Fail:** a single clap turning the head (tier 2 too cheap); no antenna
-  response at all to clear sound (tier 1 deaf); or a visible snap at the
-  window end (would mean `duration_s` is mis-derived).
-- **Note:** the tier-1 half is verified — 4 admissions / 100 s, all
-  `NONE->NOISE`, zero head turns, in the same room that previously produced
-  203 fires in 8 minutes. Tier 2 still needs a deliberate sustained or loud
-  source.
+- **Tier 2 (head/body turn) is NOT part of this gate** — deviation `d11`,
+  2026-07-21. The shipped sound reaction is antenna-only. Live, 8 admissions
+  including 3 s of deliberate continuous speech produced **zero** tier-2
+  promotions: the NOISE envelope reopens and closes rather than holding, so
+  `sustain_s` never accumulates, and ordinary speech does not reach 15× the
+  room. Rather than ship a promotion path that exists on paper and never
+  fires, the boundary is stated.
+- **This does not weaken the port-before-delete argument.** The orienting
+  capability is fully ported by `t8`/`t9` — `doa_angle_to_yaw`,
+  `CorroboratedGate`, `LatchedDoaGuard` and the whole turn path exist, are
+  tested, and are reachable via an operator overlay or `REACHY_ORIENT_*`.
+  Only the shipped *default* is antenna-only. Nothing is deleted that has no
+  home in the runtime.
+- **Successor work:** #107 — spend a head turn only when vision and the mic
+  agree on a bearing, which is corroboration loudness alone never provided.
+- **Fail:** no antenna response at all to clear sound (tier 1 deaf), or a
+  visible snap at the window end (would mean `duration_s` is mis-derived).
 - **Watch:** the handover snap t15 flagged — `greet-when-addressed` admitting
   `speak` while the head is held at up to 35°. Record if seen; it is
   pre-existing arbitration behaviour, but these defaults make it reachable.
@@ -282,7 +288,7 @@ Filled in as the gate is executed. A dash means not yet run.
 | C2 quiet room | **PASS** (formal, 2026-07-21 ~02:05, 5 min, empty room) | 0 `->SPEECH`, 0 `->ENGAGED`, 0 latch lines. Residual NOISE-tier antenna blinks traced to the drifting mic background — see `2026-07-21-live-verification-night.md` §3–4 and #102 (t36) |
 | C3 pat | **PASS** (2026-07-21, operator present, post-`t36`) | `Pat level1! type=side_pat` → `[SENSE stage=rule source=pat event=pat-acknowledge] fired kind=react run=pet-reaction`, from the SHIPPED rule (overlay moved aside), operator observed the antennas contract. **First touch after `t36`** — the same room recorded **zero** detections in 5 min before it |
 | C4 words + audible | **PARTIAL** — audible half PASS, addressed half BLOCKED | The full chain is proven: `heard "…"` → `greet-when-addressed fired … say="I'm here."` → `spoke voice=harmonic`, and the operator confirmed hearing it. But it fired on **unaddressed** speech (#104/#105), and the operator's actual addressed utterance was never transcribed (`stt-empty`). Blocked by deviation `d9` |
-| C5 sound + orient | **CRITERION AMENDED** by `d6` — see below | Tier 1 verified: 4 × `NONE->NOISE` in 100 s, antenna lean only, **0 head turns**, down from 203 fires / 8 min. Tier 2 (sustained-or-loud) not yet exercised |
+| C5 sound + orient | **PASS** — scope narrowed to tier 1 by `d6` + `d11` | Antenna lean only, by decision: 4 admissions / 100 s, all `NONE->NOISE`, **0 head turns**, down from 203 fires / 8 min; operator verdict *"antennas moved, i liked it"*. The head-turn half is explicitly **out of scope for this arc** (`d11`) — the capability is ported and reachable by configuration, just not defaulted on. Vision-corroborated head turning is the successor: #107 |
 
 ### 5.2 Rollback runbook
 
