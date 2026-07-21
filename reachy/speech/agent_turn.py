@@ -1,14 +1,14 @@
 """The agent turn engine: sense events → a tool-use turn → structured actions.
 
 :class:`AgentTurnEngine` is the tool-use counterpart of
-:class:`~reachy.speech.cognition.CognitionEngine`. Where the marker engine parses
+the retired marker ``CognitionEngine``. Where that engine parsed
 expression + speech out of the ``*emoji*`` / ``"speech"`` convention, the agent
 engine *acts through tools*: an LLM turn emits structured ``tool_calls`` that this
 engine executes through an injected :class:`~reachy.speech.tools.ToolRegistry`
 (``speak`` / ``harmonics`` / ``apply_pose`` in v1). It consumes the *same*
 :class:`~reachy.speech.events.EventBuffer` and feeds the *same*
 ``thinking`` / ``message`` / ``emotion`` export sinks, so a later wiring task can
-swap it in behind ``listen``'s folded :class:`~reachy.motion.listen_think.ThinkHook`
+compose it behind ``agent attach``'s runtime-feed cue buffer
 seam without touching the loop.
 
 Serialized agent turns
@@ -17,7 +17,7 @@ Exactly **one** turn runs at a time: :meth:`run_turn` holds a
 :class:`threading.Lock` for the whole turn, so a second concurrent call blocks until
 the first completes. A turn *snapshots* the event buffer at its very start — before
 any LLM work — so cues that arrive *during* a turn accumulate for the **next** turn.
-This mirrors :class:`CognitionEngine`'s serialized-cognition guarantee.
+This mirrors the retired marker engine's serialized-cognition guarantee.
 
 The tool loop
 -------------
@@ -39,7 +39,7 @@ One :meth:`run_turn` runs the full OpenAI tool loop:
    made).
 
 Export blocks match ``docs/export-schema.md`` exactly and reuse the export
-:class:`~reachy.export.exporter.ExportHook` contract from :mod:`reachy.speech.cognition`
+:class:`~reachy.export.exporter.ExportHook` contract the marker engine defined
 (``emit`` sink + ``pose_resolver`` + ``time_fn``), so the two feeds cannot drift.
 
 Audio is an optional sink (the registry-dispatch seam)
@@ -48,13 +48,13 @@ The registry *executes speech itself* — its ``speak`` / ``harmonics`` handlers
 synthesize and play — and :meth:`ToolRegistry.dispatch` never raises: a synth /
 playback failure comes back as an **error tool-result** (``content`` is
 ``{"error": …}``). The engine observes that result to carry over
-:class:`CognitionEngine`'s ``audio_optional`` degradation without touching the
+the marker engine's ``audio_optional`` degradation without touching the
 registry:
 
 * ``audio_optional=False`` (default): an error result from an audio tool aborts the
   turn with a :class:`~reachy.cli._errors.CliError` (exit-2) — the strict fail-fast
   contract of standalone ``think`` / ``say``.
-* ``audio_optional=True`` (the folded ``listen --live`` path): the failure is
+* ``audio_optional=True`` (the ``agent attach`` path): the failure is
   absorbed — logged once, the utterance still exported as a ``MessageEvent`` — and
   after ``audio_mute_threshold`` consecutive failures the audio sink **latches
   off**: subsequent speak/harmonics calls skip dispatch entirely (a synthetic
@@ -62,7 +62,7 @@ registry:
   agent. Non-audio tools (apply_pose) and every export block keep flowing.
 
 This is the same ``_note_audio_failure`` streak/latch pattern as
-:class:`CognitionEngine`; the only difference is *where* the failure surfaces (a
+the retired marker engine; the only difference is *where* the failure surfaces (a
 dispatch result here vs. a re-raised worker exception there).
 
 Determinism
@@ -154,7 +154,7 @@ def build_user_message(cues: list[SenseCue]) -> str:
     """Render a turn's sense cues into the user-message content string.
 
     Oldest first, one bullet per cue — identical in shape to
-    :func:`reachy.speech.cognition.build_messages`'s user content, so the two
+    the retired marker engine's ``build_messages`` user content, so the two
     engines present perceptions to the model the same way.
     """
     lines = [f"- {cue.text}" for cue in cues]
@@ -174,7 +174,7 @@ class AgentTurnEngine:
     buffer:
         The sense-event source. Its :meth:`~EventBuffer.snapshot` is the engine's
         only input. Exposed as the public :attr:`buffer` attribute so
-        :class:`~reachy.motion.listen_think.ThinkHook` (which reads ``.buffer`` via
+        any driver (which reads ``.buffer`` via
         ``getattr``) can drive this engine unchanged.
     registry:
         The :class:`~reachy.speech.tools.ToolRegistry` whose :meth:`tools` is
@@ -243,7 +243,7 @@ class AgentTurnEngine:
         self._turn_interval = turn_interval
         self._max_tool_rounds = max(1, int(max_tool_rounds))
 
-        # Audio-optional latch state (mirrors CognitionEngine).
+        # Audio-optional latch state (mirrors the retired marker engine).
         self._audio_optional = audio_optional
         self._audio_mute_threshold = DEFAULT_AUDIO_MUTE_THRESHOLD
         self._audio_muted = False
@@ -338,7 +338,7 @@ class AgentTurnEngine:
 
         The export block is emitted first and independently of dispatch success, so
         a spoken utterance still reaches the export feed even when its audio sink is
-        dead or muted — matching :class:`CognitionEngine`, where export runs on the
+        dead or muted — matching the retired marker engine, where export ran on the
         producer thread ahead of the speak worker.
         """
         if self._export is not None:
@@ -392,7 +392,7 @@ class AgentTurnEngine:
     def _note_audio_failure(self, *, error_text: str = "") -> None:
         """Record one audio-dispatch failure (log once, latch off after the streak).
 
-        Mirrors :meth:`CognitionEngine._note_audio_failure`: logs on the first
+        Mirrors the retired marker engine's ``_note_audio_failure``: logs on the first
         failure of a streak, and once :attr:`_audio_mute_threshold` consecutive
         failures accumulate, latches the audio sink off so no further synth is
         attempted — the agent keeps thinking + acting on non-audio tools at full
@@ -432,8 +432,8 @@ class AgentTurnEngine:
     ) -> int:
         """Repeatedly run turns while cues exist, until stopped. Returns turns run.
 
-        Signature and semantics mirror :meth:`CognitionEngine.run` so the folded
-        :class:`~reachy.motion.listen_think.ThinkHook` — which calls
+        Signature and semantics mirror the retired marker engine's ``run`` so any
+        driver — which calls
         ``engine.run(stop=…)`` on a worker thread — drives this engine unchanged.
 
         Parameters

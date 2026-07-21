@@ -109,7 +109,7 @@ import difflib
 import re
 from collections.abc import Iterable
 
-# Same word-tokenisation pattern used by listen_transcribe.py
+# Same word-tokenisation pattern used by behavior/transcript_sense.py
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 
 #: Default similarity threshold for :func:`is_name_match`.

@@ -1,7 +1,7 @@
 """Single-presence-owner service manager for the boot-survival presence stack.
 
 The robot has exactly **one** presence at a time (the single-SDK-owner model in
-``CLAUDE.md``): the idle ``demo-mode`` loop, the folded ``listen --live`` loop,
+``CLAUDE.md``): the idle ``demo-mode`` loop, the retiring ``listen --live`` loop,
 or the AI-agnostic symbolic runtime (``behavior engine run``, decision c19) may
 own the head, never more than one. This manager makes that invariant true across
 reboots via systemd ``--user`` units: ``enable(mode)`` installs + enables the

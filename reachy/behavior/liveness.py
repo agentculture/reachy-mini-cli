@@ -3,16 +3,17 @@
 Why this module exists (the decision)
 =====================================
 The head is a single resource. Three ``*_active.flag`` files
-(:mod:`reachy.speech.cognition_signal`, :mod:`reachy.motion.pat_signal`,
+(``reachy.speech.cognition_signal``, :mod:`reachy.motion.pat_signal`,
 :mod:`reachy.motion.sleep_signal`) used to coordinate it across processes, but
 they were only ever *read* by the ``listen`` idle layer, which yielded the motion
-channel by priority ``sleep > pat > think``. When the ``listen`` noun retires,
-every reader goes with it: ``think_active.flag`` is cleanly orphaned, while
-``pat_active.flag`` / ``sleep_active.flag`` keep their writers in ``pat run`` /
-``sleep run`` and signal into the void. Nothing in :mod:`reachy.behavior` ever
-read any of the three. So a foreground ``reachy pat run`` and the
-``reachy-runtime.service`` behavior engine would drive the head with **no mutual
-awareness at all**.
+channel by priority ``sleep > pat > think``. ``think_active.flag`` is already
+gone — task t21 deleted its writer (the folded ``listen --live`` cognition
+hook), its reader and its module in one pass. ``pat_active.flag`` /
+``sleep_active.flag`` keep their writers in ``pat run`` / ``sleep run`` and
+their one reader in the ``listen`` idle layer, which the noun's own retirement
+will take with it. Nothing in :mod:`reachy.behavior` ever read any of the
+three. So a foreground ``reachy pat run`` and the ``reachy-runtime.service``
+behavior engine would drive the head with **no mutual awareness at all**.
 
 Two options were defensible: the runtime could read the flags and yield the head
 (preserving today's soft-guard semantics), or the foreground verbs could refuse

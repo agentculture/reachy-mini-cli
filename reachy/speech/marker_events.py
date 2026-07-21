@@ -1,14 +1,14 @@
 """Event types for the ``*marker* / "speech"`` LLM output convention.
 
 These are the two pure, frozen dataclasses (plus their union alias) that
-:mod:`reachy.speech.markers`'s streaming :class:`~reachy.speech.markers.MarkerParser`
-produces. They live in their own module — separate from the parser — so that
+the (now deleted) ``reachy.speech.markers`` streaming ``MarkerParser``
+produced. They live in their own module — separate from the parser — so that
 :mod:`reachy.motion.expression` (part of the ``apply_pose`` tool path that
 survives the in-loop cognition engine's eventual removal) can depend on the
 *shape* of a marker event without depending on the parser that produces it.
-:mod:`reachy.speech.markers` imports these names back (a re-export, not a
-redefinition — the class objects are identical) so every existing importer of
-``reachy.speech.markers.MarkerEvent`` / ``Event`` keeps working unchanged.
+``markers.py`` re-exported these names while it lived, so its importers never
+noticed the move; t21 then deleted it, and this module is the ONE home. A
+caller now builds the events directly — there is no parser left.
 
 Public API
 ----------

@@ -6,8 +6,7 @@ pat lean/snuggle reaction is not fought by idle motion.
 
 Two layers are exercised:
 
-* :mod:`reachy.motion.pat_signal` — a stdlib file flag mirroring
-  :mod:`reachy.speech.cognition_signal` exactly in shape (write / clear /
+* :mod:`reachy.motion.pat_signal` — a stdlib file flag (write / clear /
   is_active / context manager / flag-path helper), resolved under
   ``$REACHY_STATE_DIR``.
 * :meth:`ListenProducer._idle` — reads ``pat_signal.is_active()`` per tick and
@@ -23,7 +22,6 @@ import pytest
 
 import reachy.motion.pat_signal as ps
 from reachy.motion.listen import ListenParams, ListenProducer
-from reachy.speech import cognition_signal
 
 
 @pytest.fixture(autouse=True)
@@ -32,10 +30,8 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     ps.clear()
-    cognition_signal.clear()
     yield
     ps.clear()
-    cognition_signal.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -134,22 +130,7 @@ def test_context_manager_tolerates_stale_flag():
 
 
 # ---------------------------------------------------------------------------
-# 3. Pat flag is independent of the cognition (think) flag
-# ---------------------------------------------------------------------------
-
-
-def test_pat_and_cognition_flags_are_distinct():
-    ps.write()
-    assert ps.is_active() is True
-    assert cognition_signal.is_active() is False
-    cognition_signal.write()
-    ps.clear()
-    assert ps.is_active() is False
-    assert cognition_signal.is_active() is True
-
-
-# ---------------------------------------------------------------------------
-# 4. ListenProducer._idle — pat suppression
+# 3. ListenProducer._idle — pat suppression
 # ---------------------------------------------------------------------------
 
 
@@ -179,17 +160,8 @@ def test_idle_resumes_when_pat_cleared():
     assert any(a is not None for a in emitted), "idle must resume once pat clears"
 
 
-def test_pat_suppression_beats_cognition_focused():
-    """If BOTH flags are active, pat wins: the idle producer returns None."""
-    prod = _fresh_producer(99)
-    cognition_signal.write()
-    ps.write()
-    for i in range(10):
-        assert prod._idle(i * 2.5, live=False) is None
-
-
 def test_idle_emits_normally_with_no_flags():
-    """Sanity: with neither flag set the idle layer emits poses (not all None)."""
+    """Sanity: with the flag unset the idle layer emits poses (not all None)."""
     prod = _fresh_producer(99)
     emitted = [prod._idle(i * 2.5, live=False) for i in range(10)]
     assert any(a is not None for a in emitted)

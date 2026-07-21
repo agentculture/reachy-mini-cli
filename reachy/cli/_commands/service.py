@@ -2,7 +2,7 @@
 
 This is the single CLI surface that makes the robot survive a reboot in *one*
 presence mode — the idle ``demo-mode`` loop, the folded live sense loop
-(``listen run --live``), or the AI-agnostic symbolic runtime (``behavior engine
+(``listen run --live``, retiring), or the AI-agnostic symbolic runtime (``behavior engine
 run``, the boot default per decision c19) — never more than one at a time. It is
 the operator-facing front for the already-built
 :class:`reachy.service.manager.ServiceManager`, which enforces the

@@ -10,9 +10,8 @@ Two acceptance criteria are exercised:
   including on exception.
 * :func:`is_active` is a pure :meth:`Path.exists` check.
 
-The flag is structurally identical to :mod:`reachy.motion.pat_signal` and
-:mod:`reachy.speech.cognition_signal` — only the flag file name and symbol names
-differ.
+The flag is structurally identical to :mod:`reachy.motion.pat_signal` — only
+the flag file name and symbol names differ.
 """
 
 from __future__ import annotations
@@ -23,7 +22,6 @@ import pytest
 
 import reachy.motion.sleep_signal as ss
 from reachy.motion import pat_signal as ps
-from reachy.speech import cognition_signal
 
 
 @pytest.fixture(autouse=True)
@@ -132,20 +130,8 @@ def test_context_manager_tolerates_stale_flag():
 
 
 # ---------------------------------------------------------------------------
-# 3. Sleep flag is independent of the cognition (think) and pat flags
+# 3. Sleep flag is independent of the pat flag
 # ---------------------------------------------------------------------------
-
-
-def test_sleep_and_cognition_flags_are_distinct(monkeypatch, tmp_path):
-    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
-    ss.write()
-    assert ss.is_active() is True
-    assert cognition_signal.is_active() is False
-    cognition_signal.write()
-    ss.clear()
-    assert ss.is_active() is False
-    assert cognition_signal.is_active() is True
-    cognition_signal.clear()
 
 
 def test_sleep_and_pat_flags_are_distinct(monkeypatch, tmp_path):

@@ -6,11 +6,11 @@ client — the same canonical path the live ``listen`` loop uses), detects the
 largest face with the YuNet+SFace :class:`~reachy.vision.face.FaceEngine`, embeds
 it, and enrolls the 128-dim embedding into the
 :class:`~reachy.vision.face_store.FaceStore` permanent tier under a name. After
-this, the folded :class:`~reachy.motion.listen_face.FaceHook` will recognise that
+this, the runtime's face sense (:mod:`reachy.behavior.face_sense`) will recognise that
 person live and feed ``saw <name>`` cues to cognition.
 
 This is the operator-facing counterpart to
-:meth:`~reachy.motion.listen_face.FaceHook.enroll_from_frame` (the in-process
+the retired ``FaceHook.enroll_from_frame`` (the in-process
 seam a future agent tool would call). There is deliberately no ``reachy face`` CLI
 noun in this task.
 

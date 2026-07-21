@@ -16,7 +16,7 @@ from __future__ import annotations
 from reachy.motion.expression import EXPRESSION_DURATION, ExpressionProducer
 from reachy.motion.queue import EXPRESSION_KEY, IDLE_KEY, MotionAction, MotionQueue
 from reachy.speech.expressions import Catalog, get_pose
-from reachy.speech.markers import MarkerEvent, SpeechEvent, parse
+from reachy.speech.marker_events import MarkerEvent, SpeechEvent
 
 # --------------------------------------------------------------------------- #
 # AC1 — a marker maps to EXACTLY ONE MotionAction on the existing queue        #
@@ -85,9 +85,18 @@ def test_speech_events_produce_no_motion() -> None:
 
 def test_consume_emits_one_move_per_marker_not_per_sentence() -> None:
     # A realistic marked stream: two markers, several sentences. The robot moves on the
-    # markers ONLY — sentences are silent (stillness is the thinking posture).
-    stream = '*🤔* "I wonder what that sound was." "It came from the left." *👂* "There it is."'
-    events = parse(stream)
+    # markers ONLY — sentences are silent (stillness is the thinking posture). The
+    # events are built literally: the streaming parser that used to produce them
+    # (``reachy.speech.markers.parse``) retired with the in-loop cognition engine;
+    # only the event *shape* (:mod:`reachy.speech.marker_events`) survives, and it
+    # is the shape this producer consumes.
+    events = [
+        MarkerEvent(emoji="🤔"),
+        SpeechEvent(text="I wonder what that sound was."),
+        SpeechEvent(text="It came from the left."),
+        MarkerEvent(emoji="👂"),
+        SpeechEvent(text="There it is."),
+    ]
     markers = [e for e in events if isinstance(e, MarkerEvent)]
     speeches = [e for e in events if isinstance(e, SpeechEvent)]
     assert len(markers) == 2 and len(speeches) == 3  # guard the fixture

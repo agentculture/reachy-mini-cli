@@ -134,7 +134,7 @@ DEFAULT_QUEUE_MAXSIZE = 2
 #: Consecutive render failures before the audio sink latches off.
 DEFAULT_FAILURE_LATCH = 3
 #: How long a latched-off sink stays off before trying again. Time-bounded (not
-#: permanent, unlike ``CognitionEngine``'s latch) because a boot-persistent
+#: permanent, unlike the cognition engine's latch) because a boot-persistent
 #: robot must recover from a daemon restart without a human restarting it.
 DEFAULT_RETRY_AFTER_S = 30.0
 #: Padding added to a clip's own duration when stamping the self-mute window.

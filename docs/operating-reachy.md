@@ -32,10 +32,10 @@ a **noun** you run from the shell or an agent loop:
 - **Orient to sight** — turn toward motion or light in the camera, no ML
   (`vision`).
 - **Speak** — text-to-speech straight to the speaker (`say`).
-- **Think out loud** — an LLM cognition loop that talks and moves its body in
-  step with its thoughts, and can **export** a live feed of what it is
-  thinking / saying / feeling (`listen run --live --export -`, and — for an
-  external agent — `agent attach --export -`).
+- **Compose every sense into one deterministic presence** — the symbolic
+  runtime (`behavior engine run`), which an external AI agent attaches to and
+  can **export** a live feed of what it is thinking / saying / feeling
+  (`agent attach --export -`).
 - **Feel a head pat and lean into it** — proprioceptive touch, no touch sensor
   (`pat`).
 - **Fall asleep when left alone and wake when addressed** (`sleep`).
@@ -138,20 +138,23 @@ You have two correct patterns, and one coordination mechanism:
 
 - **Fold senses into one loop (the #43 pattern).** Rather than run `pat`
   alongside `listen`, head-pat detection runs **inside** the `listen` loop via a
-  per-tick `PatHook` — one process, one media session, both behaviors. This is
-  the model for combining live senses on `sdk`.
+  per-tick `PatHook` — one process, one media session, both behaviors. The
+  symbolic runtime (`behavior engine run`) is the same idea taken all the way:
+  every sense composed onto one 50 Hz tick, holding one media client and one
+  pose reader. This is the model for combining live senses on `sdk`.
 - **Put the secondary noun on `--transport http`.** An `http`-transport noun
   polls the daemon's DoA route instead of opening a media session, so it never
   competes for the SDK client. Use this for a remote control box, or to layer a
   second behavior onto the one local `sdk` owner.
 - **The `*_active.flag` files coordinate the shared *head*, not the media
-  session.** When behaviors are composed, the folded cognition hook, `pat`, and
-  `sleep` each drop a flag file under the state dir (`think_active.flag`,
-  `pat_active.flag`, `sleep_active.flag`). The always-alive `listen` idle layer
+  session.** `pat` and `sleep` each drop a flag file under the state dir
+  (`pat_active.flag`, `sleep_active.flag`). The always-alive `listen` idle layer
   reads them and *yields the motion channel* by priority: `sleep` (strongest —
-  yields entirely) > `pat` (pauses the idle wander) > cognition (drops to a
-  quiet "focused breathe"). These flags solve head contention; they do **not**
-  lift the single-media-session limit.
+  yields entirely) > `pat` (pauses the idle wander). These flags solve head
+  contention between the foreground sense verbs; they do **not** lift the
+  single-media-session limit, and the symbolic runtime does not use them at all
+  (a foreground verb beside a live engine is refused outright — see
+  `reachy/behavior/liveness.py`).
 
 > **Rule of thumb:** one `sdk` media owner per robot. Everything else either
 > folds into that loop or runs on `http`.
@@ -237,23 +240,29 @@ robot boots into **exactly one** presence mode and auto-restarts on crash. This
 is the single-SDK-owner model expressed across reboots: only one presence owns
 the robot, so `service` lets you persist only one mode at a time.
 
-### The two presence modes
+### The presence modes
 
 | Mode | What boots | Best for |
 |---|---|---|
 | `demo` | `reachy-mini-cli demo-mode run` — the idle feel-alive loop | A robot that just looks present (breathing, glances, sway) |
-| `live` | `reachy-mini-cli listen run --live --transcribe --cognition agent --voice-engine harmonic` — the folded live sense loop | A robot that hears, sees, thinks (via tool-use agent cognition), sleeps, feels pats, and speaks with its own offline voice |
+| `runtime` | `reachy-mini-cli behavior engine run` — the symbolic runtime | A robot that hears, sees, feels pats and speaks, deterministically and with zero LLM tokens; an AI agent attaches to it afterwards |
+| `live` | *retiring* — its `ExecStart` names `listen run --live`, a command this release removed | Nothing; use `runtime` |
 
-The `live` mode is the [folded live loop](#senses-one-sdk-media-owner-at-a-time):
-**one** process running every live sense (hearing + pat + cognition + vision +
-sleep) over the **one** SDK media session — the supported way to run all the
-senses at once.
+The `runtime` mode is the [symbolic runtime](#the-symbolic-runtime): **one**
+process composing every sense onto one 50 Hz tick over the **one** SDK media
+session — the supported way to run all the senses at once.
+
+> **The `live` mode is on its way out.** `service enable live` still writes and
+> enables `reachy-live.service`, but the folded `listen run --live` loop its
+> `ExecStart` names no longer exists, so the unit would exit immediately. The
+> unit and the mode are removed in a follow-up change; until then, enable
+> `runtime` (or `demo`).
 
 ### The workflow
 
 ```bash
-reachy-mini-cli service install          # write the three systemd --user units (enable nothing)
-reachy-mini-cli service enable live      # boot-persist listen run --live
+reachy-mini-cli service install          # write the systemd --user units (enable nothing)
+reachy-mini-cli service enable runtime   # boot-persist the symbolic runtime
 #   or: reachy-mini-cli service enable demo   # boot-persist the idle demo loop instead
 
 reachy-mini-cli service status           # which mode is enabled (or none) + daemon health
@@ -261,10 +270,10 @@ reachy-mini-cli service disable          # stop the enabled presence (the daemon
 reachy-mini-cli service uninstall        # remove the unit files
 ```
 
-- **Exactly one presence is boot-persistent.** Enabling one mode **disables the
-  sibling** — `service enable demo` after `service enable live` flips the robot
-  to the idle loop and turns the live loop off. You never end up with two
-  presences fighting for the robot.
+- **Exactly one presence is boot-persistent.** Enabling one mode **disables
+  every sibling** — `service enable demo` after `service enable runtime` flips
+  the robot to the idle loop and turns the runtime off. You never end up with
+  two presences fighting for the robot.
 - **It auto-restarts.** Each unit is `Restart=on-failure` with a 5 s back-off, so
   a presence that crashes comes straight back.
 - **The daemon is a boot dependency.** `service` writes a `reachy-daemon.service`
@@ -272,26 +281,17 @@ reachy-mini-cli service uninstall        # remove the unit files
   up first. `service disable` stops only the presence and **leaves the daemon
   enabled** (other clients of the robot depend on it) — reported as
   `daemon=left-enabled`.
-- **`install` vs `enable`.** `install` writes all three unit files and reloads
+- **`install` vs `enable`.** `install` writes every unit file and reloads
   systemd **without enabling anything**, so you can stage the units and choose the
-  mode separately; `enable {demo|live}` is the all-in-one (write + enable + disable
-  the sibling). Every verb supports `--json`.
-- **`live` boots into the tool-use agent, voiced harmonically.** The rendered
-  `live` unit's `ExecStart` is `listen run --live --transcribe --cognition agent
-  --voice-engine harmonic` (see [Agent cognition](#agent-cognition--tool-use-live-mode)
-  and [The harmonic voice](#the-harmonic-voice)) — a deliberate choice so the
-  robot reasons through tool calls and has its own voice at boot, independent of
-  whether the TTS service is reachable. Because `--cognition agent` and
-  `--voice-engine harmonic` are explicit flags baked into the unit, setting
-  `REACHY_COGNITION=marker` / `REACHY_VOICE_ENGINE=tts` as a unit environment
-  override does **not** revert them — an explicit flag always beats the env var.
-  To run the boot presence on the marker engine and/or TTS instead, override the
-  unit's `ExecStart` with `systemctl --user edit reachy-live.service` (clear it
-  with a bare `ExecStart=` line, then set a new one ending `--cognition marker
-  --voice-engine tts`, or whichever combination you want) and `systemctl --user
-  restart reachy-live.service`; or skip the boot service and run
-  `reachy-mini-cli listen run --live --transcribe --cognition marker
-  --voice-engine tts` in the foreground instead.
+  mode separately; `enable {demo|runtime|live}` is the all-in-one: write, enable,
+  and disable the siblings. Every verb supports `--json`.
+- **`runtime` boots the deterministic presence, voiced harmonically.** The
+  rendered `runtime` unit's `ExecStart` is `behavior engine run`, with
+  `REACHY_TTS_ROUTE` baked in as an `Environment=` directive (see
+  [The harmonic voice](#the-harmonic-voice)) — a deliberate choice so the robot
+  has its own voice at boot, independent of whether the TTS service is
+  reachable. An AI agent attaches to the running unit afterwards with
+  `reachy-mini-cli agent attach`; it is never wired into the unit.
 
 > **Reboot at machine power-on needs linger.** A `systemctl --user` service
 > normally starts at **first login**, not at machine boot. For a headless robot
@@ -386,14 +386,13 @@ vars override the built-in default.
 | `REACHY_STATE_DIR` | `$XDG_STATE_HOME/reachy` → `~/.local/state/reachy` | Where PID + log files for daemon/`demo-mode`/`listen`/`sleep`/`behavior` live | `daemon.py` |
 | `XDG_STATE_HOME` | `~/.local/state` | Base for the state dir when `REACHY_STATE_DIR` is unset | `daemon.py` |
 | `XDG_CONFIG_HOME` | `~/.config` | Base for config (`<…>/reachy/demo-mode.json`) | `demo_config.py` |
-| `REACHY_TTS_URL` | `http://localhost:9000` | Magpie-style TTS HTTP endpoint | `speech/tts.py` (`say`, `listen --live`) |
+| `REACHY_TTS_URL` | `http://localhost:9000` | Magpie-style TTS HTTP endpoint | `speech/tts.py` (`say`, the runtime's voice) |
 | `REACHY_TTS_VOICE` | `Magpie-Multilingual.EN-US.Mia.Calm` | TTS voice identifier | `speech/tts.py` |
-| `REACHY_VOICE_ENGINE` | `tts` for `say`/`listen --live`; **`harmonic`** for the behavior runtime | Speech backend: `tts` or `harmonic`. The symbolic runtime defaults the other way on purpose — its voice must work with nothing reachable | `speech/voice.py`, `behavior/speech_act.py` |
+| `REACHY_VOICE_ENGINE` | `tts` for `say`; **`harmonic`** for the behavior runtime | Speech backend: `tts` or `harmonic`. The symbolic runtime defaults the other way on purpose — its voice must work with nothing reachable | `speech/voice.py`, `behavior/speech_act.py` |
 | `REACHY_SPEECH_TRANSPORT` | `http` | How the behavior runtime's voice reaches the speaker: `http` (upload + play via the daemon) or `sdk` (push PCM in-process). Falls back to `REACHY_TRANSPORT`; `http` is the default because the media-profile SDK client is currently unconstructable on the robot (issue #94) | `behavior/speech_act.py` |
-| `REACHY_COGNITION` | `marker` | Folded live cognition engine for `listen --live`: `marker` or `agent` | `cli/_commands/listen.py` |
 | `REACHY_HARMONIC_IDENTITY` | `reachy` | Harmonic voice identity signature (root pitch + instrument) | `speech/harmonic.py` |
 | `REACHY_HARMONIC_ARTICULATION` | `smooth` | Harmonic rendering style: `discrete` / `speechy` / `smooth` / `alien` | `speech/harmonic.py` |
-| `REACHY_OPENAI_URL_BASE` | `http://localhost:8000` | OpenAI-compatible LLM base URL for the folded `listen --live` cognition (legacy: `REACHY_LLM_BASE_URL`) | `speech/llm.py` |
+| `REACHY_OPENAI_URL_BASE` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `agent attach`'s cognition and the engagement classifier (legacy: `REACHY_LLM_BASE_URL`) | `speech/llm.py` |
 | `REACHY_OPENAI_MODEL_ID` | `default` | LLM model id for that cognition — must be a model the endpoint serves (legacy: `REACHY_LLM_MODEL`) | `speech/llm.py` |
 | `REACHY_OPENAI_API_KEY` | (unset) | Bearer key for the LLM endpoint, only sent when present (legacy: `REACHY_LLM_API_KEY`) | `speech/llm.py` |
 | `REACHY_STT_URL` | `http://localhost:9002` | OpenAI-compatible STT (Parakeet) for `sleep` wake-word | `sleep/wakeword.py` |
@@ -401,7 +400,7 @@ vars override the built-in default.
 | `REACHY_STT_LANGUAGE` | `en` | STT language hint | `sleep/wakeword.py` |
 | `REACHY_STT_TIMEOUT` | `2.0` (seconds) | Per-request STT socket timeout (kept short so a wake check never stalls the loop) | `sleep/wakeword.py` |
 | `REACHY_LOG_LEVEL` | `INFO` | Verbosity for every `reachy.*` module logger on `listen`/`sleep run` (a `--log-level` flag wins over this) | `cli/_logging.py` |
-| `REACHY_VISION_MODEL_ID` | `coolthor/gemma-4-12B-it-NVFP4A16` | VLM model id for scene description (`describe_scene` tool + the periodic `SceneHook`); same base URL family as `REACHY_OPENAI_URL_BASE`/`REACHY_OPENAI_API_KEY` | `vision/scene.py` |
+| `REACHY_VISION_MODEL_ID` | `coolthor/gemma-4-12B-it-NVFP4A16` | VLM model id for scene description (the `describe_scene` tool seam; no composition wires it today); same base URL family as `REACHY_OPENAI_URL_BASE`/`REACHY_OPENAI_API_KEY` | `vision/scene.py` |
 | `FORGE_BASE_URL` | `http://localhost:8001/v1` | Coder-model endpoint the `forge` tool dispatches to (the lobes gateway's cortex route) | `forge/client.py` |
 | `FORGE_MODEL` | `qwen3` | Coder-model id sent in the forge dispatch request | `forge/client.py` |
 | `FORGE_API_KEY` | (unset) | Bearer key for the forge endpoint, sent only when present | `forge/client.py` |
@@ -409,11 +408,14 @@ vars override the built-in default.
 ### Inert leftovers in the state dir
 
 The `think` noun (the standalone LLM cognition loop, `think run` /
-`think start` / `think expressions` / `think demo`) has been **removed**. Its
-capabilities did not disappear — they live on in `listen run --live`'s folded
-cognition, in `agent attach`, and in the symbolic runtime's own voice — but
-the verb is gone, and so is its supervisor (`reachy/speech/supervisor.py`) and
-its expression-catalog sub-noun (now `behavior expressions`).
+`think start` / `think expressions` / `think demo`) and the folded
+`listen run --live` cognition loop that briefly inherited it have both been
+**removed**. Their capabilities did not disappear — they live on in
+`agent attach` and in the symbolic runtime's own senses and voice — but the
+verbs and flags are gone, and so is `think`'s supervisor
+(`reachy/speech/supervisor.py`), its expression-catalog sub-noun (now
+`behavior expressions`), and the whole `--live` / `--transcribe` /
+`--cognition` / `--voice-engine` flag family on `listen run`.
 
 A box that ran the old flow will still have these files under the state dir
 (`$REACHY_STATE_DIR`, or `$XDG_STATE_HOME/reachy` → `~/.local/state/reachy`).
@@ -425,7 +427,7 @@ delete and safe to leave:
 | `think.pid` | PID of the background `think start` loop | orphaned — no writer, no reader |
 | `think.log` | that loop's captured stdout/stderr | orphaned — no writer, no reader |
 | `think.voice` | sidecar naming the running loop's `--voice-engine`, read by `think status --json` | orphaned — no writer, no reader |
-| `think_active.flag` | "cognition is thinking" signal the `listen` idle layer reads to drop to a focused breathe | **still live** — written by `listen run --live`'s folded cognition hook, not by any `think` verb |
+| `think_active.flag` | "cognition is thinking" signal the `listen` idle layer read to drop to a focused breathe | orphaned — writer and reader both retired with the folded `--live` loop |
 
 A stale `think.pid` cannot resurrect anything: no code path consults it, and
 no `reachy-mini-cli` verb spawns a `think` process. Clean them up whenever you
@@ -434,81 +436,84 @@ like:
 ```bash
 rm -f "${REACHY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/reachy}"/think.pid \
       "${REACHY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/reachy}"/think.log \
-      "${REACHY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/reachy}"/think.voice
+      "${REACHY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/reachy}"/think.voice \
+      "${REACHY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/reachy}"/think_active.flag
 ```
 
-Leave `think_active.flag` alone — it is a live coordination flag with a
-misleading name, and the `listen` idle layer still reads it.
+`pat_active.flag` / `sleep_active.flag` are **not** leftovers: `pat run` and
+`sleep run` still write them and the `listen` idle layer still reads them.
 
-### Agent cognition — tool-use live mode
+### Agent cognition — tool use over the runtime feed
 
-`listen run --live`'s folded cognition can run one of two engines, picked by
-`--cognition {marker,agent}` (env `REACHY_COGNITION`, default `marker`;
-`--live`-only — a bare `--cognition` is a clean exit-1 error):
+Cognition is **not** part of the presence loop any more. The deterministic
+runtime (`behavior engine run`) senses, decides and moves on its own; an LLM
+attaches to it from a *separate process* with `reachy-mini-cli agent attach`,
+reads its published event feed, and acts by writing into the intents spool.
+That client's engine is a **tool-use** engine
+(`reachy.speech.agent_turn.AgentTurnEngine`): the LLM acts through explicit
+tool calls instead of free-text parsing. Each `tool_calls` response is executed
+and fed back as a tool result until the model returns plain text with no
+further calls.
 
-- **`marker`** (default, unchanged) — the established `*emoji*`/`"speech"`
-  convention: the LLM's free-text reply is parsed for markers and spoken /
-  expressed accordingly.
-- **`agent`** — the LLM acts through explicit tool calls instead of text
-  parsing. Three tools are published to the model as an OpenAI `tools=` array:
-  `speak` (the TTS voice), `harmonics` (the offline melodic voice), and
-  `apply_pose` (a catalog-emoji body expression — the full catalog is advertised
-  to the model as an enum, and an unknown emoji comes back as an error naming the
-  valid keys instead of silently doing nothing). Each `tool_calls` response is
-  executed and fed back as a tool result until the model returns plain text with
-  no more calls. Both engines ride the exact same folded `ThinkHook` seam,
-  `EventBuffer`, and export sinks as `marker` — swapping the flag adds no new
-  process and no second media session. `--voice-engine` is inert under `agent`:
-  both the TTS and harmonic voices are always registered as separate tools, so
-  the model picks per utterance rather than the process picking one engine for
-  the whole run.
+Two families of tool are published to the model as an OpenAI `tools=` array:
 
-**The deployed `live` boot unit defaults to `agent`.** `reachy-mini-cli service
-enable live` boots `listen run --live --transcribe --cognition agent
---voice-engine harmonic` — hearing words, reasoning via tool calls, and having a
-voice are all on out of the box (see
-[Boot persistence](#boot-persistence--one-presence-per-reboot)).
+- **The four intent tools** — `run_behavior`, `declare_goal`, `set_mode`,
+  `set_inhibition`. These are the ones that actually change the robot: each is
+  validated against the live behavior/mode catalog and then written as an
+  atomic command into the intents spool the running engine drains.
+- **`speak` / `harmonics` / `apply_pose`, wired publish-only.** They emit
+  `message` / `emotion` blocks onto the agent's own cognition feed but never
+  touch the robot — the single-SDK-owner model, expressed across processes: the
+  runtime loop owns the robot, the attached client owns cognition and intents.
+  The `apply_pose` catalog is advertised to the model as an enum, and an unknown
+  emoji comes back as an error naming the valid keys instead of silently doing
+  nothing.
+
+**The deployed boot unit runs the runtime, not an agent.** `reachy-mini-cli
+service enable runtime` boots `behavior engine run` — deterministic, zero
+tokens, no LLM endpoint required (see
+[Boot persistence](#boot-persistence--one-presence-per-reboot)). Attaching an
+agent is a separate, optional step.
 
 **Voice-only usage story** — how an address near the robot becomes a reply,
 end to end:
 
-1. You say *"Reachy, …"* near the robot. The mic array's per-tick audio is
-   transcribed once the utterance pauses (`--transcribe`'s `TranscribeHook`).
+1. You say *"Reachy, …"* near the robot. The runtime's transcript sense
+   (`reachy/behavior/transcript_sense.py`) accumulates the utterance off a
+   background worker and transcribes it once it pauses.
 2. The transcript passes the [layered engagement
    gate](#senses-one-sdk-media-owner-at-a-time): a fuzzy name match on
    "reachy"/"robot" (and common mishearings) engages immediately and opens the
    conversation; a nameless utterance is judged by a single LLM classifier
    ("is this addressed to me?") only while that conversation is still live, and
    only if it is more than a couple of words. Ambient chatter is dropped before
-   it ever reaches cognition — saying the robot's name is what invites it in.
-3. An ENGAGE verdict does two things at once: the [3-tier motion
-   ladder](#senses-one-sdk-media-owner-at-a-time) fires a deliberate head/body
-   turn toward the speaker, and the transcript is appended to the shared
-   `EventBuffer` both cognition engines read from.
-4. The next agent turn (running on its own background worker, so it never
-   blocks the motion loop) snapshots the buffer, calls the LLM with the
-   `speak`/`harmonics`/`apply_pose` tools, and executes whatever the model
-   calls — a spoken reply, a melodic harmonic phrase, a body pose, or several
-   of these in one turn (see [Agent model
-   choice](#agent-model-choice--cortex-or-muse) below for which model role this
-   targets).
-5. Idle presence never stops: the motion loop keeps breathing/glancing
-   throughout, and the antenna-lean/turn/pat reactions from the other folded
-   senses keep running alongside the agent's replies.
+   it ever reaches a rule — saying the robot's name is what invites it in.
+3. An ENGAGE verdict latches the words onto the tick's `transcript` sense
+   field, where the rules see them: a `say:` rule answers **immediately, with
+   no LLM in the path at all** (the runtime's own voice), and the same event is
+   published on the runtime feed.
+4. An attached `agent attach` client reads that feed line, maps it to a
+   first-person cue (`heard someone say …`), and its next turn (on its own
+   background worker) calls the LLM with the intent + publish-only tools. What
+   the model decides becomes a spool command the engine admits on a later tick
+   (see [Agent model choice](#agent-model-choice--cortex-or-muse) below for
+   which model role this targets).
+5. Idle presence never stops: the 50 Hz loop keeps breathing/glancing
+   throughout, and the antenna-lean/turn/pat reactions keep running alongside.
 
 Touch takes the same road, minus the gate: a head pat fires the reflex
-lean/nuzzle instantly (no LLM in that path), and the detection *also* lands in
-the shared buffer as a `felt a gentle scratch on the head` cue — one cue per
-reaction cycle — so the next agent turn can answer being petted (a word of
-thanks, the 😊 contentment pose). Pats skip the engagement gate entirely:
-touching the robot is inherently addressed to it.
+lean/nuzzle instantly (no LLM in that path), and the detection *also* rides the
+runtime feed, so an attached agent can answer being petted (a word of thanks,
+the 😊 contentment pose). Pats skip the engagement gate entirely: touching the
+robot is inherently addressed to it.
 
-Try it: `reachy-mini-cli service enable live` (boots the agent-mode unit), then
-say *"Reachy, hello!"* near the robot and listen for a reply — or iterate faster
-in the foreground first:
+Try it: `reachy-mini-cli service enable runtime` (boots the deterministic
+presence), then say *"Reachy, hello!"* near the robot and listen for a reply —
+or iterate faster in the foreground, with an agent attached:
 
 ```bash
-reachy-mini-cli listen run --live --transcribe --cognition agent --voice-engine harmonic
+reachy-mini-cli behavior engine run --export - > runtime.jsonl &
+reachy-mini-cli agent attach --feed runtime.jsonl --export -
 # say "Reachy, ..." near the robot — expect a spoken/harmonic reply and/or a
 # pose, while idle presence (breathing, glances) continues underneath
 ```
@@ -523,7 +528,7 @@ natural-language `explanation` — the text embedded (via the lobes gateway
 field, a non-JSON value, an unknown generator) is refused with a clean error. The
 index (records + embedding vectors) persists as one JSON file under
 `<state_dir>/stash/index.json` (the same state-dir family as the daemon PID file
-and the `think_active`/`sleep_active` flags).
+and the `sleep_active`/`pat_active` flags).
 
 Stash round-trip demo — add a record in one session, semantically fetch and apply
 it in a later one, using the package's Python API directly (no stash CLI verb
@@ -589,14 +594,14 @@ lives in one file:
 ~/.config/environment.d/10-reachy-llm.conf
 ```
 
-Day-to-day live cognition (the `*emoji*`/`"speech"` marker convention
-marker-mode `listen --live` uses) is currently pinned to the **`senses`**
-role — a Gemma model (`coolthor/gemma-4-12B-it-NVFP4A16`, proxied to a peer box)
-tuned for reacting to raw perception; that pin is unaffected by anything below.
+The box is currently pinned to the **`senses`** role — a Gemma model
+(`coolthor/gemma-4-12B-it-NVFP4A16`, proxied to a peer box) tuned for reacting
+to raw perception. That is what the runtime's engagement classifier (a single
+"is this addressed to me?" call per utterance) hits, and it is unaffected by
+anything below.
 
-**Agent tool-use** (an LLM turn that calls `speak` / `harmonics` / `apply_pose`
-as tools instead of the marker convention — `--cognition agent`) has two
-verified model choices instead:
+**Agent tool-use** (an `agent attach` turn that calls the intent tools plus
+`speak` / `harmonics` / `apply_pose`) has two verified model choices instead:
 
 - **`cortex`** (`sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`) — served locally by
   the gateway, no proxy hop. The **default / verified fallback**: reliably
@@ -626,12 +631,12 @@ always sends `chat_template_kwargs: {"enable_thinking": false}` on every
 request (`speech/llm.py`'s `_build_request`) — thinking-mode output is never
 requested from any role.
 
-**This choice only matters for agent tool-use.** Marker-mode `listen --live`
-keeps using whatever role `REACHY_OPENAI_MODEL_ID` currently names (`senses`
-today) — its marker-based cognition works against any role and has no opinion
-on which one is configured. Nothing about marker mode's or `say`'s defaults
-changes when you switch; only the agent tool-use path cares
-which role is verified for `tool_calls`.
+**This choice only matters for agent tool-use.** The runtime's engagement
+classifier keeps using whatever role `REACHY_OPENAI_MODEL_ID` currently names
+(`senses` today) — it is a single yes/no completion and has no opinion on which
+role is configured, and the runtime itself needs no LLM at all. Nothing about
+the runtime's or `say`'s defaults changes when you switch; only the agent
+tool-use path cares which role is verified for `tool_calls`.
 
 `tests/test_agent_turn_cortex_integration.py`'s gateway-gated integration test
 runs the identical tool round trip against both `cortex` and `muse` live
@@ -643,25 +648,33 @@ the two at `temperature=0.0`.
 
 ## Event-based senses pipeline
 
-`listen run --live` doesn't just fold cognition/`vision`/`sleep` into one loop
-([the single-SDK-owner model](#the-single-sdk-owner-model)) — every perception
-that loop makes now lands as a structured **event**: touch already did
-(issues #66/67/68), and this pass adds whole-sentence hearing, sight, faces,
-and a scene description, all landing in the same shared `EventBuffer` the
-folded cognition engine reads, with every pipeline stage logged in one
-grep-able grammar. It also gives the agent a way to grow its own reactions at
-runtime (the **forge** loop, below). None of this is a new noun — it all lives
-inside `listen run --live`.
+Every perception the presence loop makes lands as a structured **event**:
+touch already did (issues #66/67/68), and this pass added whole-sentence
+hearing, sight, faces, and a scene description, with every pipeline stage
+logged in one grep-able grammar. It also gives an attached agent a way to grow
+its own reactions at runtime (the **forge** loop, below). None of this is a new
+noun.
+
+> **Where this lives now.** This pipeline was originally built inside the
+> folded `listen run --live` loop. That composition root is gone; its sense
+> engines were ported onto the symbolic runtime's 50 Hz tick — the pre-roll
+> hearing into `reachy/behavior/transcript_sense.py`, faces into
+> `reachy/behavior/face_sense.py` — and the `[SENSE]` log grammar is unchanged.
+> Two donors did **not** survive the move: the periodic VLM scene description
+> (`SceneHook`) and the motion/light → cognition cue feed (`VisionHook`'s
+> `feed_vision` call). The pixel `vision` noun itself is untouched, and
+> `reachy.vision.scene.describe_frame` still backs the optional
+> `describe_scene` agent tool seam — but nothing composes it today.
 
 ### What changed and why
 
 | Sense / concern | Before | After |
 |---|---|---|
-| Speech capture | Accumulation began only on the tick the SDK's ~5 Hz DoA speech flag first read `True` (`listen_transcribe.py`, pre-fix: `if sample.speech and sample.audio is not None:`) — every word spoken before that tick was gone for good | A rolling ~10 s ring buffer is fed every non-muted tick, *before* the speech-flag gate; on the flag's rising edge the onset is *measured* (an RMS scan) and the emitted clip starts `pre_roll` (2.0 s default) before it |
-| Vision → cognition | `EventBuffer.feed_vision` existed (since the body-expression work) but had **zero production callers** — cognition never heard what the robot saw ([issue #32](https://github.com/agentculture/reachy-mini-cli/issues/32)) | `VisionHook` calls it on every motion/light decision, coalesced to one cue per episode |
-| Faces | No face detection/recognition code existed anywhere in the repo (a genuine port, not a wiring job) | `reachy/vision/face.py` (OpenCV YuNet + SFace) + a folded `FaceHook` feed named-face cues, cooldown-gated |
-| Pipeline observability | No `logging.basicConfig`/handler existed anywhere in the codebase — every `logger.info` trace (engagement decisions, pat autopsy, dispatch traces) was silently dropped by Python's WARNING-only "last resort" handler, so a live session was undebuggable from the journal | `reachy/cli/_logging.py` attaches one stderr handler at `listen`/`sleep run` entry; the `[SENSE …]` grammar below makes every stage — and every drop — checkable in the journal |
-| Behavior stash | Built (`reachy/stash/`) but wired to nothing — no CLI verb, no agent tool | **Unchanged by this pipeline.** It stays a separate, declarative-only self-extension path (see [the behavior stash](#agent-cognition--tool-use-live-mode) above); the `forge` tool below is a deliberately different, generated-code path — the two philosophies are not merged |
+| Speech capture | Accumulation began only on the tick the SDK's ~5 Hz DoA speech flag first read `True` — every word spoken before that tick was gone for good | A rolling ~10 s ring buffer is fed every non-muted tick, *before* the speech gate; on its rising edge the onset is *measured* (an RMS scan) and the emitted clip starts `pre_roll` (2.0 s default) before it |
+| Vision → cognition | `EventBuffer.feed_vision` existed (since the body-expression work) but had **zero production callers** — cognition never heard what the robot saw ([issue #32](https://github.com/agentculture/reachy-mini-cli/issues/32)) | The folded `VisionHook` called it on every motion/light decision, coalesced to one cue per episode. That hook retired with the `--live` root; the runtime does not feed vision cues today |
+| Faces | No face detection/recognition code existed anywhere in the repo (a genuine port, not a wiring job) | `reachy/vision/face.py` (OpenCV YuNet + SFace) behind `reachy/behavior/face_sense.py`'s background worker, feeding the tick's `face` sense field |
+| Pipeline observability | No `logging.basicConfig`/handler existed anywhere in the codebase — every `logger.info` trace (engagement decisions, pat autopsy, dispatch traces) was silently dropped by Python's WARNING-only "last resort" handler, so a live session was undebuggable from the journal | `reachy/cli/_logging.py` attaches one stderr handler at `behavior engine run` / `listen run` / `sleep run` entry; the `[SENSE …]` grammar below makes every stage — and every drop — checkable in the journal |
+| Behavior stash | Built (`reachy/stash/`) but wired to nothing — no CLI verb, no agent tool | **Unchanged by this pipeline.** It stays a separate, declarative-only self-extension path (see [the behavior stash](#agent-cognition--tool-use-over-the-runtime-feed) above); the `forge` tool below is a deliberately different, generated-code path — the two philosophies are not merged |
 
 The camera path itself needed a separate repair before any of the vision/face/
 scene work could ship — see [the camera-path repair](#the-camera-path-repair-sdk--19)
@@ -669,10 +682,10 @@ below.
 
 ### Hearing the whole sentence: pre-roll capture
 
-Under `--transcribe`, `TranscribeHook` (`reachy/motion/listen_transcribe.py`)
-now keeps a rolling ring buffer of the raw mic chunks — fed on **every**
-non-self-muted tick, *before* the speech-flag gate — so the words spoken while
-the SDK's ~5 Hz DoA speech flag is still catching up are not lost:
+`TranscriptSenseDriver` (`reachy/behavior/transcript_sense.py`) keeps a rolling
+ring buffer of the raw mic chunks — fed on **every** non-self-muted tick,
+*before* the speech gate — so the words spoken while the speech detector is
+still catching up are not lost:
 
 1. Every tick's chunk is pushed onto a ~10 s ring (trimmed by total samples,
    one cheap append per tick — no per-tick concatenation).
@@ -688,10 +701,10 @@ the SDK's ~5 Hz DoA speech flag is still catching up are not lost:
    own voice) never bleeds into the next one's lead-in.
 
 This is a direct port of `reachy_nova`'s `SpeechEventDetector` design. The ring
-horizon, pre-roll, onset window, and threshold are constructor defaults on
-`TranscribeHook` (`ring_seconds=10.0`, `pre_roll_s=2.0`, `onset_window_s=0.01`,
-`onset_threshold=0.02`) — there is currently no `--pre-roll` CLI flag; tune
-them in code if a deployment needs different values. The self-mute window is
+horizon, pre-roll and onset window are fields of `TranscriptTuning`
+(`ring_seconds=10.0`, `pre_roll_s=2.0`, `onset_window_s=0.01`) — there is
+currently no `--pre-roll` CLI flag; tune them in code if a deployment needs
+different values. The self-mute window is
 still checked first, so the robot never pre-rolls or transcribes its own
 voice.
 
@@ -729,83 +742,71 @@ handler, so every `logger.info` trace — including the `[SENSE]` lines above �
 was silently swallowed by Python's WARNING-only default. `reachy/cli/_logging.py`'s
 `install_logging` now attaches exactly **one** `stderr` `StreamHandler` to the
 `"reachy"` logger (the common ancestor every `reachy.*` module logger
-propagates to) at `listen run` / `sleep run` entry:
+propagates to) at `behavior engine run` / `listen run` / `sleep run` entry:
 
-- **`--log-level LEVEL`** (either of `listen run` / `sleep run`) or
-  the **`REACHY_LOG_LEVEL`** env var selects the verbosity; the flag wins over
-  the env var, which wins over the built-in default (`INFO`).
-- The handler always targets **stderr**, never stdout, so `listen run --live
+- **`--log-level LEVEL`** (on any of those verbs) or the **`REACHY_LOG_LEVEL`**
+  env var selects the verbosity; the flag wins over the env var, which wins
+  over the built-in default (`INFO`).
+- The handler always targets **stderr**, never stdout, so `behavior engine run
   --export -`'s stdout stays a pure JSONL feed — logs and the export feed can
   never mix, in either direction.
 - Calling `install_logging` more than once (e.g. a defensive call at more than
   one entry point) reuses the same handler — never a duplicate line.
 
-Grep the pipeline live, on the deployed `reachy-live.service`:
+Grep the pipeline live, on the deployed `reachy-runtime.service`:
 
 ```bash
 # tail every sense-pipeline line as it happens
-journalctl --user -u reachy-live.service -f | grep -F '[SENSE'
+journalctl --user -u reachy-runtime.service -f | grep -F '[SENSE'
 
-# just the last 10 minutes' worth of cues reaching cognition
-journalctl --user -u reachy-live.service --since "10 min ago" | grep 'stage=cue'
+# just the last 10 minutes' worth of cues reaching the rules
+journalctl --user -u reachy-runtime.service --since "10 min ago" | grep 'stage=cue'
 
 # every drop, with its reason, since boot
-journalctl --user -u reachy-live.service -b | grep -F '[SENSE' | grep 'dropped reason='
+journalctl --user -u reachy-runtime.service -b | grep -F '[SENSE' | grep 'dropped reason='
 
 # run it in the foreground with more (DEBUG) verbosity instead of the journal
-reachy-mini-cli listen run --live --log-level DEBUG
+reachy-mini-cli behavior engine run --log-level DEBUG
 ```
 
 ### Vision, faces, and scene become events
 
-Three folded hooks turn what the camera sees into cues in the same shared
-`EventBuffer` the transcript, DoA, and touch cues already land in — the agent
-reads all of them from one buffer at the start of its next turn:
+Three folded hooks originally turned what the camera sees into cues. **One
+survived the `--live` retirement**; the other two are recorded here for the
+history, and because their engines are still in the tree:
 
-- **`VisionHook` (motion + light → `feed_vision`).** The existing motion/light
-  orienting hook now *also* calls `EventBuffer.feed_vision(direction,
-  brightness_delta)` on every decision. Because the pixel detectors can decide
-  on *every* tick while a subject keeps moving, a naive feed would flood
-  cognition with one cue per tick for a single continuous event — so it
-  **coalesces**: at most one cue per episode, where a new episode starts only
-  after a quiet gap (`DEFAULT_COALESCE_GAP = 2.0 s`) since the last cue, or
-  when the reported direction/brightness shifts by more than a `0.4`
-  band (a genuine swing is reported immediately, even inside the gap).
-- **`FaceHook` (YuNet + SFace → `feed_face`).** Face recognition needs the
-  `[vision]` extra (below). It runs its own detection on a background
-  worker (bounded to `detect_interval`, default 0.5 s) and shares
-  `VisionHook`'s **one** frame grabber via a *non-consuming peek*
-  (`VisionHook.latest_frame`) — it never opens a second camera grabber
-  thread. A permanent-tier match to a *named* face feeds `EventBuffer.feed_face(name)`
-  at most once per **30 s** per name (`DEFAULT_REANNOUNCE_COOLDOWN`), so a
-  face that lingers in frame doesn't spam "saw Ada" every detection cycle.
+- **Faces — now `reachy/behavior/face_sense.py` (YuNet + SFace).** Face
+  recognition needs the `[vision]` extra (below). It runs detection on a
+  background worker (bounded to `detect_interval`, default 0.5 s) off the
+  runtime's ONE held media client — it never opens a second camera grabber
+  thread — and publishes the recognised name onto the tick's `face` sense
+  field (plus `frame_available`, so a rule can tell "no camera" from "nobody
+  there"). A permanent-tier match to a *named* face is re-announced at most
+  once per **30 s** per name (`DEFAULT_REANNOUNCE_COOLDOWN`), so a face that
+  lingers in frame doesn't spam "saw Ada" every detection cycle.
   Unknown/unnamed faces never produce a name cue.
   - **Enrolling a face:** there is deliberately no `reachy face` CLI noun.
     `uv run python scripts/face_enroll.py --name Ada` opens the one live media
     session, watches for up to `--duration` seconds (default 15) for a face,
     embeds it, and enrolls it into the `FaceStore`'s permanent tier — after
-    which the folded `FaceHook` recognizes that person live and feeds `saw
-    Ada` cues. On first run the ~37 MB YuNet+SFace model pair auto-downloads
-    under `state_dir()/models/` (a one-time, network-needing cost).
-- **`SceneHook` (periodic VLM describe → `feed_scene`).** A background worker
-  captures the shared frame and asks a vision-language model to describe it,
-  on a default 30 s cadence (matching `reachy_nova`'s fallback), feeding
-  `EventBuffer.feed_scene(text)`. The **same** describe path
-  (`reachy.vision.scene.describe_frame`) also backs an on-demand
-  `describe_scene` agent tool — advertised only under `--cognition agent` —
-  so the periodic hook and the on-demand tool are two consumers of one
-  implementation, not two. The model id is `REACHY_VISION_MODEL_ID`
-  (default: the lobes gateway's `senses` role model,
-  `coolthor/gemma-4-12B-it-NVFP4A16` — see [Agent model
-  choice](#agent-model-choice--cortex-or-muse) above for the same gateway
-  family). A scene-describe failure (unreachable/slow/malformed VLM) logs
-  exactly **one** loud drop per failure *episode* — not one every 30 s — and
-  never stalls the tick loop; the latch clears on the next success.
-
-All three ride **last** in the live hook chain (after `sleep`/`pat`/cognition,
-and — under `--transcribe` — the transcribe hook): they compete for nothing
-the idle-priority flags arbitrate, so their ordering is purely "whatever is
-left after the higher-priority senses have run this tick."
+    which the runtime recognizes that person live. On first run the ~37 MB
+    YuNet+SFace model pair auto-downloads under `state_dir()/models/` (a
+    one-time, network-needing cost).
+- **`VisionHook` (motion + light → `feed_vision`) — retired.** The folded
+  motion/light orienting hook also called `EventBuffer.feed_vision(direction,
+  brightness_delta)` on every decision, coalesced to at most one cue per
+  episode. The standalone [`vision` noun](#senses-one-sdk-media-owner-at-a-time)
+  still does the pixel orienting; the cue feed into cognition went with the
+  `--live` root and has no runtime equivalent today.
+- **`SceneHook` (periodic VLM describe → `feed_scene`) — retired.** A
+  background worker captured the shared frame on a 30 s cadence and asked a
+  vision-language model to describe it. The describe path itself
+  (`reachy.vision.scene.describe_frame`, model id `REACHY_VISION_MODEL_ID`,
+  default the lobes gateway's `senses` role model
+  `coolthor/gemma-4-12B-it-NVFP4A16`) is untouched and still backs the optional
+  `describe_scene` agent-tool seam in `reachy/speech/tools.py` — but no
+  composition wires that seam today, so scene description is currently
+  unreachable from the CLI.
 
 ### Installing the `[vision]` extra
 
@@ -818,14 +819,9 @@ pip install 'reachy-mini-cli[vision]'      # pulls opencv-python-headless
 uv sync --extra vision
 ```
 
-Without it, `listen run --live` still comes up and runs everything else —
-`FaceHook` and `SceneHook` are each simply **skipped**, with one logged
-warning naming the fix:
-
-```text
-listen --live: face recognition needs the [vision] extra (opencv); skipping FaceHook (install: pip install 'reachy-mini-cli[vision]')
-listen --live: scene description needs the [vision] extra (opencv); skipping SceneHook (install: pip install 'reachy-mini-cli[vision]')
-```
+Without it, `behavior engine run` still comes up and runs everything else —
+the face sense is simply **skipped**, with one logged warning naming the fix,
+and its `face` / `frame_available` sense fields stay permanently quiet.
 
 `[vision]` is not a base dependency — the same lazy-extra pattern as
 `[sdk]`/`[daemon]`/`[cpu]`/`[gpu]` (see [Install profiles](#install-profiles)):
@@ -867,15 +863,14 @@ uv run python scripts/camera_soak.py --duration 10 --json
 ```
 
 It reports frames-total / frames-`None` / frame shapes+dtypes / effective FPS
-through the **same** one held `MediaSession` the live `listen` loop uses (not
-the throwaway per-frame path); a `frames_ok == 0` result prints a targeted
+through the **same** one held `MediaSession` the runtime uses (not the
+throwaway per-frame path); a `frames_ok == 0` result prints a targeted
 hint (daemon running? SDK/daemon versions aligned? `connection_mode
 localhost_only`?).
 
 ### The forge loop — the robot writes its own reaction seams
 
-Under `--cognition agent` only (the marker engine has no tool registry, so it
-has no `forge` tool), the agent can hand a natural-language goal to a coder
+An attached `agent attach` client can hand a natural-language goal to a coder
 model and — if what comes back is safe — gain a new callable tool with **no
 restart**:
 
@@ -920,16 +915,17 @@ restart**:
    `<state_dir>/forge/staged/.rejected/<name>/`. It never raises out to the
    caller and never silently drops.
 7. At process start, `reload_active()` re-registers everything already under
-   `<state_dir>/forge/active/`, so a forged skill survives a `listen --live`
+   `<state_dir>/forge/active/`, so a forged skill survives an `agent attach`
    restart.
 
 ```bash
 FORGE_BASE_URL=http://localhost:8001/v1 FORGE_MODEL=qwen3 \
-  reachy-mini-cli listen run --live --cognition agent --voice-engine harmonic
-# ask the robot (through --transcribe, or an agent script driving cognition)
-# to forge a new skill; a validated skill is usable on the agent's very next
-# turn — watch `journalctl --user -u reachy-live.service | grep stage=forge`
-# for the staged -> activated lifecycle, or `dropped reason=` for a rejection
+  reachy-mini-cli agent attach --feed runtime.jsonl --export -
+# ask the robot (through the runtime's transcript sense, or an agent script
+# driving cognition) to forge a new skill; a validated skill is usable on the
+# agent's very next turn — grep the attach process's stderr for stage=forge
+# to watch the staged -> activated lifecycle, or `dropped reason=` for a
+# rejection
 ```
 
 ---
@@ -1228,14 +1224,14 @@ fire/suppress line — is visible on stderr by default.
 > `tests/test_behavior_engine_composition.py`), and `absent_for` works from
 > tick one. `pat` is live too now (see [the pat sense](#the-pat-sense)
 > below): a held, media-free SDK client reads the actual head pose back every
-> tick and feeds `Sense.pat_event` directly in this standalone process — no
-> `listen --live` needed. The `rms`/`face` fields still have **no live
-> provider in this standalone process** — those readings come from the SDK
-> media session the `listen --live` loop owns, and the single-SDK-owner model
-> keeps them there for now. Rules naming them validate, render, and reload
-> cleanly, but only fire where a provider feeds the field; the provider seams
-> (`reachy.behavior.sense.SenseProviders`) are the designed attach point when
-> that composition lands.
+> tick and feeds `Sense.pat_event` directly in this standalone process. The
+> `rms`, `rms_ratio`, `transcript`, `face`, `frame_available` and `self_moving`
+> fields are live too — all fed by
+> `reachy.behavior.sense.SenseProviders` from the runtime's own held media
+> client (`reachy/behavior/{rms_sense,transcript_sense,face_sense}.py`), so
+> this one process is the single SDK owner rather than deferring to another.
+> `face` needs the `[vision]` extra; without it the field stays permanently
+> quiet rather than crashing the loop.
 
 ### The pat sense
 
@@ -1730,8 +1726,7 @@ Three seams, all real and independently useful:
   first-person perception cue (`"speech from the left"`,
   `"a behavior rule fired (wake-sway): now doing antenna-sway"`,
   `"felt a gentle scratch on the head"`, ...) and buffered for the agent's
-  next turn — the same cue vocabulary the folded `listen --live` cognition
-  path already uses.
+  next turn — the same cue vocabulary `reachy.speech.events` has always used.
 - **COGNITION** — a tool-use engine (`AgentTurnEngine`) wired with the **four
   intent tools** (`reachy.speech.intent_tools.register_intent_tools`):
   `run_behavior` (one-time admission), `declare_goal` (a STANDING goal the
@@ -1748,8 +1743,8 @@ Three seams, all real and independently useful:
   agent's own feed, but never touch the robot, matching the single-SDK-owner
   rule that the *runtime* loop is the only thing that owns the robot.
 - **OUTPUT** — `--export -` / `--export-blocks` publish the agent's **own**
-  `thinking`/`message`/`emotion` feed, through the exact same exporter
-  `listen run --live --export -` uses (see [the two-feed
+  `thinking`/`message`/`emotion` feed, through the shared
+  `reachy.cli._export.build_export_hook` builder (see [the two-feed
   contract](#the-two-feed-contract) below).
 
 ```bash
@@ -1806,8 +1801,7 @@ graph LR
   (`motion`)](export-schema.md#motion--a-behavior-admissioneviction-or-goto).
   **No block type in this schema can represent an LLM call** — there is no
   `thinking`/`message`/`emotion` type here at all.
-- **The cognition feed** (`listen run --live --export -` and — new here —
-  `agent attach --export -`) is an LLM turn's
+- **The cognition feed** (`agent attach --export -`) is an LLM turn's
   own `thinking`/`message`/`emotion` stream (full contract:
   [Block Types](export-schema.md#block-types)). An attached agent publishes
   its cognition through **this** family, never the runtime one — it does not
@@ -1976,32 +1970,26 @@ implementation map.
 ### Senses (one `sdk` media owner at a time)
 
 Because only one `sdk` media owner can run at a time, the supported way to run
-**all** the senses at once is `reachy-mini-cli listen run --live`: it folds
-cognition + `vision` + `sleep` + face recognition + periodic scene description
-into `listen`'s single loop (alongside the head-pat hook), so every live sense
-rides the **one** SDK media session and the **one** motion queue in **one**
-process — arbitrated by the `sleep > pat > cognition` priority flags (vision,
-face, and scene ride last, sharing vision's one frame grabber). This is the
-loop the [`live` boot presence](#boot-persistence--one-presence-per-reboot)
-runs (`service enable live`). Bare `listen run` (no `--live`) is the
-sound-orient + pat loop only; `--live` is `sdk`-only. See
+**all** the senses at once is `reachy-mini-cli behavior engine run` — the
+[symbolic runtime](#the-symbolic-runtime). One process holds one media client
+and one pose reader, composes proprioceptive pat, loudness, transcribed words,
+faces and frame availability onto one 50 Hz tick, and drives the head through
+one arbitrated motion channel. This is the loop the
+[`runtime` boot presence](#boot-persistence--one-presence-per-reboot) runs
+(`service enable runtime`). `listen run` is the sound-orient + pat loop only —
+a focused foreground verb, not a way to run everything at once. See
 [Event-based senses pipeline](#event-based-senses-pipeline) below for the
-pre-roll hearing fix, the `[SENSE]` log grammar, how vision/face/scene reach
-cognition, and the `forge` self-extension loop.
+pre-roll hearing fix, the `[SENSE]` log grammar, and the `forge`
+self-extension loop.
 
-Add **`--transcribe`** (`listen run --live --transcribe`, `sdk`-only) and live
-cognition *hears the words*: nearby speech is transcribed via the external STT
+The runtime *hears the words*: nearby speech is transcribed via the external STT
 service (model-gear / Parakeet at `REACHY_STT_URL`, default `localhost:9002`) and
-fed into the folded cognition loop, so the robot reacts to *what* was said rather than only
-that a sound arrived from a direction. Off by default (when off, behavior and the
-mic read are unchanged); a self-mute window after each spoken clip stops the robot
-transcribing its own voice, and an unreachable STT degrades to "no words" without
-stalling the loop. It is *not* a dialogue/turn-taking assistant and *not* the
-wake-word path — words are one more perception. The deployed `live` boot unit runs
-with `--transcribe` on, so the on-robot presence hears words by default; STT stays
-external (no on-box model bundled). It also defaults to the tool-use
-`--cognition agent` engine over the fetched words — see
-[Agent cognition](#agent-cognition--tool-use-live-mode) above.
+latched onto the tick's `transcript` sense field, so a rule reacts to *what* was
+said rather than only that a sound arrived from a direction. A self-mute window
+after each spoken clip stops the robot transcribing its own voice, and an
+unreachable STT degrades to "no words" without stalling the loop. It is *not* a
+dialogue/turn-taking assistant and *not* the wake-word path — words are one more
+perception, and STT stays external (no on-box model bundled).
 
 The engagement gate that decides which utterances reach cognition is **layered,
 cheapest-first**:
@@ -2054,17 +2042,18 @@ journal, so which rule dropped an utterance is always visible:
 [SENSE stage=transcript source=speech event=91ac33b0] dropped reason=not-addressed
 ```
 
-Motion reaction under `--transcribe` follows a **3-tier ladder** keyed by what was
+`ListenProducer`'s motion reaction follows a **3-tier ladder** keyed by what was
 perceived: ambient **noise** → Tier-1 antenna lean only; detected **speech** → a
 bounded head-only orienting nudge toward the source; an **engaged** utterance (gate
 decided it is addressed to the robot) → a deliberate head/body turn toward the
 speaker's DoA, clamped to a minimum duration so it never trips the SDK `goto`
 planner. The robot thus faces the person who spoke to it while staying still for
-ambient conversation.
+ambient conversation. The runtime reaches the same ladder through its
+`orient-to-sound` rule (see [Orienting](#orienting--orient-to-sound-turns-toward-what-it-hears)).
 
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
-| `listen` | two-tier sound orienting: antenna lean (Tier 1) + head→body turn on speech/snap (Tier 2); hosts the always-alive idle layer + the #43 `PatHook`; `--live` folds in cognition + vision + sleep + face + scene | mic DoA + RMS (`media_session`) | serial MotionQueue (minjerk `goto`) | `sdk` default; `http` polls daemon DoA |
+| `listen` | two-tier sound orienting: antenna lean (Tier 1) + head→body turn on speech/snap (Tier 2); hosts the always-alive idle layer + the #43 `PatHook` | mic DoA + RMS (`media_session`) | serial MotionQueue (minjerk `goto`) | `sdk` default; `http` polls daemon DoA |
 | `vision` | turn toward motion (frame-diff) or light (brightness centroid); pure pixel math, no ML/GPU | camera frames (`get_frame()`) | serial MotionQueue | `sdk` default; `http` = metadata only (`vision specs`) |
 | `pat` | feel a head pat (commanded-vs-actual pose deviation) and lean into it (lean→nuzzle→settle) | head-pose read-back (SDK client) | snuggle gesture on the MotionQueue | `sdk` only (pose read-back); `demo` needs no robot |
 | `sleep` | decay ALERT→DROWSY→ASLEEP when idle, wake on speech/snap/wake-word/pat | mic DoA + RMS (`media_session`); head pose for pat-wake | drowsy fade / sleep-breathe / wake gesture | `sdk` default; `http` for non-pose ops |
@@ -2092,35 +2081,35 @@ is fully offline and deterministic (the same text always renders the same
 PCM), so it never depends on a reachable TTS endpoint, and it gives the robot
 a recognizable non-speech identity distinct from any TTS voice.
 
-Select it with `--voice-engine {tts,harmonic}` on `say run` and
-`listen run --live` (the flag is a clean exit-1 error on a bare `listen run`
-without `--live`), or set it process-wide with
-`REACHY_VOICE_ENGINE=harmonic`. Tune the voice with
+Select it with `--voice-engine {tts,harmonic}` on `say run`, or set it
+process-wide with `REACHY_VOICE_ENGINE=harmonic`. The symbolic runtime's own
+voice (a rule's `say:` field) defaults to `harmonic` regardless, so a box with
+nothing reachable still speaks. Tune the voice with
 `REACHY_HARMONIC_IDENTITY` (default `reachy`) and
 `REACHY_HARMONIC_ARTICULATION` (`discrete` / `speechy` / `smooth` — default —
 / `alien`).
 
 ```bash
 reachy-mini-cli say run "hello" --voice-engine harmonic       # one audible motif, offline
-REACHY_VOICE_ENGINE=harmonic reachy-mini-cli listen run --live --transcribe
+REACHY_VOICE_ENGINE=harmonic reachy-mini-cli behavior engine run
 ```
 
-A nicety: the LLM's `*emphasis*` markers (which TTS speech simply drops)
-become musical stress under the harmonic voice — an emphasized word gets a
-distinct melodic accent, so the emphasis you write still comes through, just
-as sound instead of vocal stress.
+A nicety: `*emphasis*` markers (which TTS speech simply drops) become musical
+stress under the harmonic voice — an emphasized word gets a distinct melodic
+accent, so the emphasis you write still comes through, just as sound instead
+of vocal stress.
 
 `say run`'s TTS-only flags (`--voice`, `--speed`, `--tts-url`) are accepted
 but ignored under `--voice-engine harmonic` — the help text says so; there is
-no hard error. The `listen --live` startup banner names the active
-`voice_engine`, so you can tell which voice a running loop uses without
-reading unit files.
+no hard error. The runtime names the voice it used on every spoken line
+(`[SENSE stage=speech … voice=harmonic …]`), so you can tell which voice a
+running loop uses without reading unit files.
 
 ### Boot persistence
 
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
-| `service` | boot-persist exactly one presence (`demo` or `live`) via systemd `--user`; enabling one disables the sibling; daemon is a boot dependency | — | — | none (talks to `systemctl --user`, not the robot) |
+| `service` | boot-persist exactly one presence (`demo` / `runtime`, plus the retiring `live`) via systemd `--user`; enabling one disables the siblings; daemon is a boot dependency | — | — | none (talks to `systemctl --user`, not the robot) |
 
 See [Boot persistence — one presence per reboot](#boot-persistence--one-presence-per-reboot)
 for the operator workflow.
@@ -2153,20 +2142,20 @@ deterministic **runtime feed** (`sense`/`rule`/`intent`/`motion`, produced by
 symbolic runtime](#the-symbolic-runtime)'s [two-feed
 contract](#the-two-feed-contract) for how the two relate and never mix.
 
-`listen run --live --export -` streams a live **newline-delimited JSON**
-(NDJSON) feed to stdout — one object per line, each with a block-type
-discriminator `t` (`thinking` / `message` / `emotion`) and a unix timestamp
-`ts`. Select a subset with `--export-blocks` (e.g. `--export-blocks
-message,emotion`). The exporter is a passive, broken-pipe-safe tap on the
-cognition loop: a disconnecting consumer never blocks or kills the loop.
-`agent attach --export -` publishes the same three block types.
+`agent attach --export -` streams a live **newline-delimited JSON** (NDJSON)
+feed to stdout — one object per line, each with a block-type discriminator `t`
+(`thinking` / `message` / `emotion`) and a unix timestamp `ts`. Select a subset
+with `--export-blocks` (e.g. `--export-blocks message,emotion`). The exporter
+is a passive, broken-pipe-safe tap on the cognition loop: a disconnecting
+consumer never blocks or kills the loop.
 
 The full wire-format contract is in [`docs/export-schema.md`](export-schema.md).
 
 ```bash
-reachy-mini-cli listen run --live --export -                      # all three block types
-reachy-mini-cli listen run --live --export - --export-blocks message,emotion
-reachy-mini-cli listen run --live --export - | <your renderer>    # the renderer stays out of this repo
+reachy-mini-cli behavior engine run --export - > runtime.jsonl &   # the runtime feed
+reachy-mini-cli agent attach --feed runtime.jsonl --export -       # all three block types
+reachy-mini-cli agent attach --feed runtime.jsonl --export - --export-blocks message,emotion
+reachy-mini-cli agent attach --feed runtime.jsonl --export - | <your renderer>
 ```
 
 **The renderer lives out of repo by design.** This is the export decoupling

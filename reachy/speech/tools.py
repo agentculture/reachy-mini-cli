@@ -2,7 +2,7 @@
 
 This is the tool layer a future *agent-cognition* engine consumes.  Where the
 ``think`` engine today parses expression + speech out of the ``*emoji*`` /
-``"speech"`` marker convention (:mod:`reachy.speech.markers`), an agent instead
+``"speech"`` marker convention of the retired ``markers`` parser, an agent instead
 *calls tools*: the LLM emits structured ``tool_calls`` and this registry both
 **publishes** their JSON-schema definitions (the OpenAI ``tools=`` array shape)
 and **executes** them, returning an OpenAI tool-result message the engine can
@@ -18,7 +18,7 @@ Three tools ship in v1, plus an optional fourth:
 * ``describe_scene`` — look through the camera and describe what is visible. Only
   advertised when composition injects a ``describe_scene`` seam (a zero-arg
   callable, the SAME :func:`reachy.vision.scene.describe_frame` path the periodic
-  :class:`~reachy.motion.listen_scene.SceneHook` uses); absent otherwise. The seam
+  periodic scene hook used); absent otherwise. The seam
   is injected so this module never imports :mod:`reachy.vision` (see the boundary
   note below).
 
@@ -50,7 +50,7 @@ Import boundary
 ---------------
 This module intentionally imports neither :mod:`reachy.speech.llm` nor
 :mod:`reachy.speech.events` — it is a peer of :mod:`reachy.speech.voice`, not of
-:mod:`reachy.speech.cognition`.  The tool *definitions* are produced here; the
+the retired ``reachy.speech.cognition``.  The tool *definitions* are produced here; the
 *decision* to call them (the LLM tool loop) lives in the cognition/agent engine.
 The pose seam is injected as a plain callable, so this module does not even
 import :mod:`reachy.motion`.  :mod:`reachy.speech.expressions` (the catalog
@@ -241,7 +241,7 @@ def _make_describe_scene_handler(describe: DescribeSceneSeam) -> Handler:
     ``describe`` is the composition-injected callable that captures the shared
     frame source (:meth:`VisionHook.latest_frame`) + :func:`reachy.vision.scene.describe_frame`
     — the SAME describe path the periodic
-    :class:`~reachy.motion.listen_scene.SceneHook` uses. The description is returned
+    the retired periodic scene hook used. The description is returned
     verbatim in the tool-result so the agent can react to it; an empty result or a
     raising seam (a :class:`~reachy.vision.scene.SceneError` from an unreachable VLM)
     surfaces as an error tool-result via :meth:`ToolRegistry.dispatch`."""
@@ -399,7 +399,7 @@ class ToolRegistry:
     describe_scene:
         The scene-describe seam — a zero-arg callable ``() -> str`` that captures
         the shared camera frame source + :func:`reachy.vision.scene.describe_frame`
-        (the SAME describe path :class:`~reachy.motion.listen_scene.SceneHook` uses).
+        (the SAME describe path the retired periodic scene hook used).
         When given, the ``describe_scene`` tool is registered and advertised; when
         ``None`` (the default) the tool is **not** advertised at all (unlike
         ``apply_pose``, which is always listed but degrades). Injected — never

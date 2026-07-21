@@ -32,7 +32,7 @@ tick overruns of **425, 974, 991, 1103 and 1213 ms** against that 20 ms budget,
 reproducibly, from a single blocking construction on the tick thread
 (``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 3).
 
-So the split mirrors :class:`reachy.motion.listen_face.FaceHook`'s, restated for
+So the split mirrors the retired ``listen_face.FaceHook``'s, restated for
 a ``TickBus`` driver:
 
 * the TICK THREAD only peeks one frame off the injected media client, validates
@@ -107,7 +107,7 @@ logger = logging.getLogger(__name__)
 
 #: Minimum wall-clock gap (seconds) between two detections on the worker thread.
 #: YuNet+SFace is heavy; ~2 Hz is ample for catching a face entering the frame,
-#: and matches :data:`reachy.motion.listen_face.DEFAULT_DETECT_INTERVAL`.
+#: and matches the retired ``listen_face.DEFAULT_DETECT_INTERVAL``.
 DEFAULT_DETECT_INTERVAL: float = 0.5
 
 #: Per-name re-announce cooldown (seconds): the same name latches into ``face``

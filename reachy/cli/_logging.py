@@ -11,7 +11,7 @@ by default — so a single call at run entry makes every module's traces
 visible, with no per-module instrumentation required.
 
 Export purity: the handler always targets ``sys.stderr`` (never ``stdout``),
-so under ``listen run --live --export -`` stdout stays a pure JSONL feed (see
+so under ``behavior engine run --export -`` stdout stays a pure JSONL feed (see
 ``reachy.cli._export``).
 
 Single-copy guarantee (#96): :func:`install_logging` also sets

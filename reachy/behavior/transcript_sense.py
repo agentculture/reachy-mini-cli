@@ -2,8 +2,8 @@
 
 The symbolic runtime senses direction, loudness and touch, but until now it had
 no path from the microphone to *what was actually said*: that capability lived
-only in the retiring ``listen --live`` loop
-(:mod:`reachy.motion.listen_transcribe`, the donor for this module). This driver
+only in the retired ``listen --live`` loop
+(``reachy.motion.listen_transcribe``, the donor for this module). This driver
 ports it onto the runtime's one tick seam, so a data-only rule (``when
 {field=transcript, op=is_true}``) and an externally attached agent can both
 reason about speech.

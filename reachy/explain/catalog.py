@@ -821,41 +821,25 @@ Feel knobs (each defaults to a tuned value; unset keeps it):
 - `--snap-ratio X` — RMS spike must be this many times the floor to count as a snap.
 - `--snap-floor RMS` — minimum floor RMS below which snap detection is suppressed.
 
-## Live mode
+## Pat
 
-- `--live` — fold cognition + `vision` + `sleep` into this one loop (alongside the
-  head-pat hook), so every sense rides the one SDK media session and the one motion
-  queue in one process. `sdk`-only. This is the loop the `live` boot presence runs.
-- `--transcribe` — (requires `--live`, `sdk`-only) transcribe nearby speech via the
-  external STT service (model-gear / Parakeet at `REACHY_STT_URL`, default
-  `localhost:9002`) and feed the recognised **words** into live cognition, so the
-  robot reasons about *what* was said, not just that a sound came from a direction.
-  Off by default; when off the live loop is unchanged and no STT request is made. A
-  self-mute window after each spoken clip drops the robot's own voice (it never
-  transcribes itself); an unreachable STT degrades to "no words" and never stalls
-  the loop. Not a dialogue/turn-taking assistant — words are one more perception.
-- `--voice-engine {tts,harmonic}` — (requires `--live`; a bare `--voice-engine`
-  without `--live` is a clean exit-1 error) which speech backend voices the
-  folded cognition's spoken sentences (default `tts`; override with
-  `REACHY_VOICE_ENGINE`). `harmonic` is an in-process, offline, non-speech
-  voice — sentences render to a note melody in Reachy's own identity signature,
-  no TTS service needed (tune with `REACHY_HARMONIC_IDENTITY` /
-  `REACHY_HARMONIC_ARTICULATION`). The startup banner names the active engine.
-- `--cognition {marker,agent}` — (requires `--live`; a bare `--cognition` without
-  `--live` is a clean exit-1 error) which cognition engine drives the folded
-  thinking (default `marker`; override with `REACHY_COGNITION`). `marker` is the
-  established `*emoji*`/`"speech"` marker path; `agent` swaps in the tool-use engine
-  that acts through `speak` / `harmonics` / `apply_pose` LLM tool calls behind the
-  same folded seam — no new process, no second media session. In `agent` mode BOTH
-  the `tts` and `harmonic` voices are always available as tools (the agent picks per
-  utterance), so `--voice-engine` there is inert — it keeps controlling only the
-  `marker` engine. The engagement gate (turn/answer only on addressed speech) is
-  identical for both engines. The startup banner names the active mode.
+- `--pat` / `--no-pat` — fold proprioceptive head-pat detection into the loop
+  (on by default, `sdk`-only). The loop owns the single SDK client, so its
+  head-pose read-backs are fast enough to detect a pat; a separate `pat`
+  process would contend and be throttled.
+- `--press-threshold DEG` / `--min-presses N` — pat detector tuning.
+
+> `listen run` used to accept a `--live` flag that folded cognition, `vision`,
+> `sleep`, faces and scene description into this loop. That composition retired
+> — running every sense in one process is now the symbolic runtime's job
+> (`reachy-mini-cli behavior engine run`), and an AI agent attaches to it with
+> `reachy-mini-cli agent attach`.
 
 ## Transport
 
 The `sdk` transport (default) streams mic audio via `reachy_mini` in-process —
-`reachy-mini` and `numpy` are base runtime dependencies. The `http` transport polls
+`numpy` is a base runtime dependency; `reachy-mini` comes from the `[sdk]` /
+`[daemon]` extra. The `http` transport polls
 the daemon's DoA endpoint instead; use it with `--transport http` or
 `REACHY_TRANSPORT=http` on a control box that talks to a remote daemon.
 
@@ -873,7 +857,7 @@ the daemon's DoA endpoint instead; use it with `--transport http` or
     reachy-mini-cli listen run --transport http               # foreground, HTTP transport
     reachy-mini-cli listen start --hold 3 --speech-only       # background, speech only
     reachy-mini-cli listen start --antenna-max 25 --snap-ratio 4
-    reachy-mini-cli listen run --live --transcribe --voice-engine harmonic  # offline voice
+    reachy-mini-cli listen run --no-pat                       # sound-orienting only
     reachy-mini-cli listen status --json
     reachy-mini-cli listen stop                               # eases back to center
 """
@@ -1025,7 +1009,7 @@ _SERVICE = """\
 
 Make the robot boot-persistent in **exactly one** presence mode. The robot has a
 single presence at a time (the single-SDK-owner model): the idle `demo-mode`
-loop, the folded live sense loop (`listen run --live`), or the AI-agnostic
+loop, the retiring folded live loop, or the AI-agnostic
 symbolic runtime (`behavior engine run`) — never more than one. This noun
 installs systemd `--user` units so that one chosen presence survives a reboot
 and auto-restarts on crash, and enabling one mode always disables BOTH siblings
@@ -1041,9 +1025,10 @@ talks to **systemd** (`systemctl --user`), so there is no `--transport` flag.
   up first. `disable` leaves the daemon enabled deliberately (other clients of
   the robot depend on it).
 - `reachy-demo-mode.service` — the idle `demo-mode run` presence loop.
-- `reachy-live.service` — the folded live loop (`listen run --live --transcribe
-  --voice-engine harmonic`): hearing + pat + cognition + vision + sleep in one
-  process, speaking with the offline harmonic voice by default.
+- `reachy-live.service` — **retiring.** Its `ExecStart` names `listen run
+  --live`, a command that no longer exists, so enabling this mode would boot a
+  unit that exits immediately. Use `runtime` instead; the unit is removed in a
+  follow-up release.
 - `reachy-runtime.service` — the AI-agnostic symbolic runtime (`behavior engine
   run`, the boot default per decision c19): the deterministic 50 Hz engine loads
   `rules.toml`, ticks, and sustains declared intents with zero external AI
@@ -1055,8 +1040,8 @@ talks to **systemd** (`systemctl --user`), so there is no `--transport` flag.
 
 - `reachy-mini-cli service enable demo` — boot-persist the idle demo-mode
   presence; disables the live and runtime siblings.
-- `reachy-mini-cli service enable live` — boot-persist the folded live sense
-  loop; disables the demo and runtime siblings.
+- `reachy-mini-cli service enable live` — **retiring**; its unit's `ExecStart`
+  names a removed command. Use `enable runtime`.
 - `reachy-mini-cli service enable runtime` — boot-persist the AI-agnostic
   symbolic runtime; disables the demo and live siblings.
 - `reachy-mini-cli service disable` — disable whichever presence unit is enabled
@@ -1131,8 +1116,8 @@ Three composition seams:
   A missing or broken forge stack disables only this tool — cognition keeps
   running.
 - **OUTPUT** — `--export -` / `--export-blocks`: the agent publishes its OWN
-  `thinking`/`message`/`emotion` feed through the SAME exporter `listen
-  run --live --export -` uses (decision c27: the runtime feed carries no
+  `thinking`/`message`/`emotion` feed through the shared exporter builder
+  (decision c27: the runtime feed carries no
   cognition block). See
   `docs/export-schema.md`.
 
