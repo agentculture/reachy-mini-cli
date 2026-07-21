@@ -444,9 +444,11 @@ end to end:
    transcribed once the utterance pauses (`--transcribe`'s `TranscribeHook`).
 2. The transcript passes the [layered engagement
    gate](#senses-one-sdk-media-owner-at-a-time): a fuzzy name match on
-   "reachy"/"robot" (and common mishearings) engages immediately; anything else
-   goes through a single LLM classifier judging "is this addressed to me?" —
-   ambient chatter is dropped before it ever reaches cognition.
+   "reachy"/"robot" (and common mishearings) engages immediately and opens the
+   conversation; a nameless utterance is judged by a single LLM classifier
+   ("is this addressed to me?") only while that conversation is still live, and
+   only if it is more than a couple of words. Ambient chatter is dropped before
+   it ever reaches cognition — saying the robot's name is what invites it in.
 3. An ENGAGE verdict does two things at once: the [3-tier motion
    ladder](#senses-one-sdk-media-owner-at-a-time) fires a deliberate head/body
    turn toward the speaker, and the transcript is appended to the shared
@@ -1970,16 +1972,55 @@ external (no on-box model bundled). It also defaults to the tool-use
 [Agent cognition](#agent-cognition--tool-use-live-mode) above.
 
 The engagement gate that decides which utterances reach cognition is **layered,
-cheapest-first**: (1) a **fuzzy name fast-path** recognises "reachy"/"robot" and
-common STT mishearings ("richie", "reachie") with an initial-letter guard that
-prevents false triggers from unrelated words like "speech" — matched utterances
-engage immediately with no LLM call; (2) for everything else, a **single-shot LLM
-classifier** (`reachy/speech/engagement.py`) judges "is this addressed to me, given
-recent conversation?" — the key question is *addressed-to-the-robot*, not *could I
-help*; (3) if the classifier times out or errors, a **DEGRADE fallback** silently
-reverts to the original coherent-sentence-in-window heuristic so the hearing loop
-never stalls. Set `REACHY_ENGAGE_HEURISTIC=1` to bypass the LLM gate entirely and
-run the pure heuristic (useful when the LLM endpoint is unavailable).
+cheapest-first**:
+
+1. A **fuzzy name fast-path** recognises "reachy"/"robot" and common STT
+   mishearings ("richie", "reachie"). Matched utterances engage immediately with
+   no LLM call, and **open the conversation**. Beyond the initial-letter guard
+   that keeps "speech" out, the matcher requires a word to share the name's
+   **consonant skeleton** — "richie" sounds like "reachy"; "really", "reality",
+   "ready", "reason", "root" and "route" only *look* like it, and are rejected.
+2. **A short utterance is never admitted on context alone.** An utterance with
+   fewer than three words is dropped unless it names the robot, so "No.",
+   "Okay." and "Yeah." from the room next door stay out. A bare "Reachy!" still
+   engages — the name is exempt.
+3. **A nameless utterance is only judged while a conversation is live** — within
+   20 s of the last accepted turn. Past that, the robot has to be re-addressed
+   by name; it will not join a conversation it was never invited into.
+4. For everything that reaches it, a **single-shot LLM classifier**
+   (`reachy/speech/engagement.py`) judges "is this addressed to me, given recent
+   conversation?" — the key question is *addressed-to-the-robot*, not *could I
+   help*.
+5. If the classifier times out or errors, a **DEGRADE fallback** reverts to the
+   coherent-sentence-in-window heuristic so the hearing loop never stalls.
+
+Set `REACHY_ENGAGE_HEURISTIC=1` to bypass the LLM gate entirely and run the pure
+heuristic (useful when the LLM endpoint is unavailable) — with it set, no
+classifier is built at all.
+
+**Why rules 2 and 3 exist.** They were added after a measured 45-minute session
+on the deployed robot in which its name was never spoken: the gate dropped 199
+utterances correctly but accepted 39, *every one of them wrong*, each firing an
+audible `greet-when-addressed` chirp into a human-to-human conversation. The
+cause was a one-way ratchet — only accepted utterances entered the "recent
+conversation" the classifier was shown, so a single false accept (a "really"
+misread as the robot's name, rule 1) planted a mid-conversation context that made
+the next accept likelier, and every accept re-seeded it. Rules 2 and 3 remove the
+bootstrap: the conversation can only be opened by name, it closes on its own
+after 20 s of quiet, and short backchannels never ride it.
+
+**The cost, stated plainly:** a genuine two-word reply mid-conversation ("yes
+please") is now missed, and a person who starts talking to the robot without
+saying its name is not heard until they do. Nothing here is waiting on a reply —
+there is no dialogue state machine — so a missed short reply costs one turn,
+while an admitted one costs an unprompted chirp. Every drop is named in the
+journal, so which rule dropped an utterance is always visible:
+
+```text
+[SENSE stage=transcript source=speech event=3f2a9c1e] dropped reason=not-addressed-cold
+[SENSE stage=transcript source=speech event=7b1d0e42] dropped reason=not-addressed-short
+[SENSE stage=transcript source=speech event=91ac33b0] dropped reason=not-addressed
+```
 
 Motion reaction under `--transcribe` follows a **3-tier ladder** keyed by what was
 perceived: ambient **noise** → Tier-1 antenna lean only; detected **speech** → a

@@ -49,21 +49,37 @@ therefore leaves the field ``None`` and drops **no ticks**.
 --------------------------------------------------------------------------
 The engagement gate is reused, never reimplemented
 --------------------------------------------------------------------------
-Admission is :func:`reachy.speech.engagement.decide_engagement` plus
-:func:`reachy.speech.name_match.is_name_match` — the #54/#56 layered gate,
-unchanged:
+Admission is :class:`reachy.speech.engagement.ConversationGate` — the #54/#56
+layered gate plus the #105 conversation state, shared with (not duplicated from)
+the donor:
 
 1. **Name fast-path** — an utterance naming the robot (or a common STT
-   mishearing of it) engages immediately, with ZERO classifier calls.
-2. **Single-shot LLM classifier** — otherwise one "is this addressed to me,
+   mishearing of it) engages immediately, with ZERO classifier calls, and opens
+   the conversation.
+2. **Short-utterance rule** — a context-only engagement needs at least
+   ``min_words`` words. A backchannel ("No.", "Okay.") carries no addressing
+   signal; only a name can engage in that few words. Zero classifier calls.
+3. **Warm-window rule** — a nameless utterance is only judged while a
+   conversation is live (within ``engage_window_s`` of the last accepted turn).
+   Past that, it is dropped with zero classifier calls and only a fresh name can
+   reopen the conversation.
+4. **Single-shot LLM classifier** — otherwise one "is this addressed to me,
    given the recent conversation?" call decides ENGAGE or DROP.
-3. **DEGRADE** — a classifier that raises falls back to this module's own cheap
+5. **DEGRADE** — a classifier that raises falls back to this module's own cheap
    heuristic (:meth:`_should_engage`: a clear sentence inside an open
-   conversation window), so hearing never stalls on a dead endpoint.
+   conversation window), so hearing never stalls on a dead endpoint; a heuristic
+   accept is reported back to the gate so degraded turns keep it warm.
+
+Rules 2 and 3 exist because the history this module used to keep by hand was a
+one-way ratchet — only accepts entered it, so a single false accept made the
+next accept likelier (issue #105; the measured trace is in the gate's own
+docstring). Every outcome is NAMED, and the name is used verbatim as the
+:func:`reachy.senselog.drop` reason, so the journal distinguishes
+``not-addressed`` from ``not-addressed-short`` and ``not-addressed-cold``.
 
 ``REACHY_ENGAGE_HEURISTIC`` (read once at construction) forces the heuristic
-throughout, and omitting the ``classifier`` argument does the same with no
-classifier ever built.
+throughout, and omitting the ``classifier`` argument does the same: in both
+cases no gate is built at all, so no classifier call is reachable.
 
 --------------------------------------------------------------------------
 Deviations from the donor, and why
@@ -115,9 +131,8 @@ from typing import Any, Callable
 import numpy as np
 
 from reachy import senselog
-from reachy.speech.engagement import Decision, decide_engagement
+from reachy.speech.engagement import ConversationGate, Decision
 from reachy.speech.events import _doa_direction
-from reachy.speech.name_match import is_name_match
 from reachy.speech.stt import Transcriber
 
 logger = logging.getLogger(__name__)
@@ -128,10 +143,6 @@ _SOURCE = "speech"
 
 #: Truthy strings recognised by the ``REACHY_ENGAGE_HEURISTIC`` escape hatch.
 _TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
-
-#: How many recent accepted utterances are handed to the classifier as context.
-#: Mirrors the donor's ``_HISTORY_MAXLEN``.
-_HISTORY_MAXLEN = 6
 
 #: Words counted by the coherence heuristic (letters + intra-word apostrophes).
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
@@ -323,7 +334,6 @@ class TranscriptSenseDriver:
     ) -> None:
         self._media = media
         self._transcriber = transcriber
-        self._classifier = classifier
         self._on_engage = on_engage
         self._mute_until = mute_until if mute_until is not None else (lambda: 0.0)
         #: Non-consuming peek at the room's rolling background level (#102),
@@ -372,7 +382,25 @@ class TranscriptSenseDriver:
 
         # --- worker-thread gate state (touched by NO other thread) ------------
         self._force_heuristic = _env_truthy(os.environ.get("REACHY_ENGAGE_HEURISTIC"))
-        self._history: list[str] = []
+        #: The stateful engagement gate (#105), or ``None`` when the pure
+        #: heuristic is in force — the escape hatch, or no classifier injected.
+        #: ``None`` means no classifier is ever built OR called, which is exactly
+        #: what ``REACHY_ENGAGE_HEURISTIC=1`` promises.
+        #:
+        #: Its two thresholds are the tuning's own ``engage_window_s`` /
+        #: ``min_words``, so the classifier path and the DEGRADE heuristic path
+        #: share ONE definition of "the conversation is still going" and ONE
+        #: word floor, rather than disagreeing about the same room.
+        self._gate: ConversationGate | None = (
+            None
+            if (self._force_heuristic or classifier is None)
+            else ConversationGate(
+                classifier=classifier,
+                names=self._names,
+                warm_window_s=tuning.engage_window_s,
+                min_context_words=tuning.min_words,
+            )
+        )
         self._engaged_until = 0.0
 
         #: Diagnostics / tests: ticks processed, utterances submitted to the
@@ -539,10 +567,13 @@ class TranscriptSenseDriver:
         if not text:
             senselog.drop(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, "stt-empty")
             return
-        if not self._decide(text, job.t):
-            # Coherent, but not addressed to the robot and not part of an
-            # ongoing conversation — ambient speech. No turn signal fires.
-            senselog.drop(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, "not-addressed")
+        engaged, label = self._decide(text, job.t)
+        if not engaged:
+            # Not addressed to the robot: ambient speech, a backchannel too short
+            # to carry addressing signal, or no conversation open to continue.
+            # The gate's own label is the reason, so the journal distinguishes
+            # the three rather than collapsing them into one word.
+            senselog.drop(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, label)
             return
         self._notify_engaged()
         try:
@@ -579,38 +610,43 @@ class TranscriptSenseDriver:
     # The engagement gate (WORKER THREAD) — reused, not reimplemented
     # ------------------------------------------------------------------
 
-    def _decide(self, text: str, t: float) -> bool:
-        """Layered engagement decision — the #54/#56 gate, unchanged.
+    def _decide(self, text: str, t: float) -> tuple[bool, str]:
+        """Layered engagement decision — the #54/#56 gate, now conversation-aware.
 
-        Heuristic path when the ``REACHY_ENGAGE_HEURISTIC`` escape hatch is set
-        (read once at construction) or no classifier was injected; otherwise
-        :func:`~reachy.speech.engagement.decide_engagement`, whose ENGAGE / DROP
-        / DEGRADE verdicts map to engage / drop / fall back to
-        :meth:`_should_engage`. On an ENGAGE the utterance joins the bounded
-        conversation history handed to the next classifier call.
+        Two paths, chosen once at construction:
+
+        * **Pure heuristic** — the ``REACHY_ENGAGE_HEURISTIC`` escape hatch, or
+          no classifier injected. Byte-identical to what shipped, and no
+          classifier is ever built or called.
+        * **The gate** — :class:`~reachy.speech.engagement.ConversationGate`,
+          which runs the name fast-path, the short-utterance rule and the
+          warm-window rule before spending at most one classifier call, and owns
+          the conversation history that used to be a one-way ratchet here
+          (issue #105; the argument is in that module's docstring). A DEGRADE
+          still falls back to :meth:`_should_engage` so the hearing loop never
+          stalls on a dead endpoint — and a heuristic accept is reported back to
+          the gate, so a run of degraded turns cannot strand it cold.
+
+        Returns the decision and its LABEL. The label is the caller's
+        ``senselog.drop`` reason, so a drop always says which rule dropped it.
         """
-        if self._force_heuristic or self._classifier is None:
+        gate = self._gate
+        if gate is None:
             engaged = self._should_engage(text, t)
             label = "engaged-heuristic" if engaged else "dropped-heuristic"
         else:
-            decision = decide_engagement(
-                text, list(self._history), classifier=self._classifier, names=self._names
-            )
-            if decision is Decision.ENGAGE:
-                engaged = True
-                label = "name" if is_name_match(text, self._names) else "context"
-            elif decision is Decision.DROP:
-                engaged = False
-                label = "dropped"
-            else:  # Decision.DEGRADE — classifier unavailable, keep hearing.
+            verdict = gate.decide(text, t)
+            if verdict.decision is Decision.DEGRADE:
                 engaged = self._should_engage(text, t)
                 label = "degrade->heuristic"
+                if engaged:
+                    gate.note_engaged(text, t)
+            else:
+                engaged = verdict.decision is Decision.ENGAGE
+                label = verdict.label
 
         logger.info('engagement: %s :: "%s"', label, text[:40])
-        if engaged:
-            self._history.append(text)
-            del self._history[:-_HISTORY_MAXLEN]
-        return engaged
+        return engaged, label
 
     def _should_engage(self, text: str, t: float) -> bool:
         """The cheap fallback rule: named, or a clear sentence in an open window.

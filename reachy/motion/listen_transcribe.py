@@ -80,7 +80,6 @@ dependency.
 
 from __future__ import annotations
 
-import collections
 import logging
 import math
 import os
@@ -94,17 +93,12 @@ import numpy as np
 from reachy import senselog
 from reachy.motion.queue import MotionQueue
 from reachy.motion.sense_sample import SampleProvider, SenseSample
-from reachy.speech.engagement import Decision, decide_engagement
+from reachy.speech.engagement import ConversationGate, Decision
 from reachy.speech.events import EventBuffer, _doa_direction
-from reachy.speech.name_match import is_name_match
 from reachy.speech.stt import Transcriber
 
 #: Truthy strings recognised by the ``REACHY_ENGAGE_HEURISTIC`` escape hatch.
 _TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
-
-#: How many recent accepted utterances to pass to the classifier as conversation
-#: context.  A sane default; the exact count is a parked follow-up (issue #55).
-_HISTORY_MAXLEN = 6
 
 #: Words counted for the coherence gate (letters + intra-word apostrophes).
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
@@ -318,12 +312,25 @@ class TranscribeHook:
         #     classifier is injected, else stay byte-identical to the pure
         #     heuristic.  The escape hatch is read ONCE here so flipping it
         #     mid-run never matters. ---
-        self._classifier = classifier
         self._on_engage = on_engage
         self._force_heuristic = _env_truthy(os.environ.get("REACHY_ENGAGE_HEURISTIC"))
-        #: Recent accepted utterances, oldest-first, handed to the classifier as
-        #: conversation context (only appended on an ENGAGE decision).
-        self._history: collections.deque[str] = collections.deque(maxlen=_HISTORY_MAXLEN)
+        #: The stateful engagement gate (#105), or ``None`` when the pure heuristic
+        #: is in force. It replaces the plain accept-only deque this hook used to
+        #: keep, which was a one-way ratchet: a single false accept planted a
+        #: mid-conversation context that made the next accept more likely. Its two
+        #: thresholds are this hook's own ``engage_window_s`` / ``min_words``, so the
+        #: classifier path and the DEGRADE heuristic path share one definition of
+        #: "the conversation is still going" and one word floor.
+        self._gate: ConversationGate | None = (
+            None
+            if (self._force_heuristic or classifier is None)
+            else ConversationGate(
+                classifier=classifier,
+                names=self._names,
+                warm_window_s=self._engage_window_s,
+                min_context_words=self._min_words,
+            )
+        )
 
         #: Count of utterances fed to cognition (diagnostics / tests).
         self.transcripts = 0
@@ -487,42 +494,36 @@ class TranscribeHook:
           is set (read once at construction) OR no classifier was injected, the
           decision is exactly :meth:`_should_engage` (byte-identical to today's
           shipped behaviour, and zero classifier calls).
-        * **LLM-gate path** — otherwise :func:`~reachy.speech.engagement.decide_engagement`
-          decides against the recent conversation ``context``:
+        * **Gate path** — otherwise :class:`~reachy.speech.engagement.ConversationGate`
+          runs the name fast-path, the short-utterance rule and the warm-window
+          rule before spending at most one classifier call, and owns the
+          conversation state that used to be an accept-only ratchet here
+          (issue #105). Its labels are ``"name"`` / ``"context"`` on an engage
+          and ``"not-addressed"`` / ``"not-addressed-short"`` /
+          ``"not-addressed-cold"`` on a drop, so the journal says which rule
+          decided. :data:`~reachy.speech.engagement.Decision.DEGRADE` (classifier
+          unavailable) still falls back to :meth:`_should_engage` so the hearing
+          loop **never stalls**, and a heuristic accept is reported back to the
+          gate so a run of degraded turns cannot strand it cold.
 
-          - :data:`~reachy.speech.engagement.Decision.ENGAGE` → engage (label
-            ``"name"`` if the utterance fuzzy-matches the robot's name, else
-            ``"context"``);
-          - :data:`~reachy.speech.engagement.Decision.DROP` → drop (label
-            ``"dropped"``);
-          - :data:`~reachy.speech.engagement.Decision.DEGRADE` (classifier
-            unavailable) → fall back to :meth:`_should_engage` so the hearing
-            loop **never stalls** (label ``"degrade->heuristic"``).
-
-        The per-utterance outcome is logged (the observability label) and, on an
-        ENGAGE, the utterance is appended to the conversation ``_history`` so it
-        becomes context for the next decision.
+        The per-utterance outcome is logged (the observability label).
         """
-        if self._force_heuristic or self._classifier is None:
+        gate = self._gate
+        if gate is None:
             engaged = self._should_engage(text, t)
             label = "engaged-heuristic" if engaged else "dropped-heuristic"
         else:
-            decision = decide_engagement(
-                text, list(self._history), classifier=self._classifier, names=self._names
-            )
-            if decision is Decision.ENGAGE:
-                engaged = True
-                label = "name" if is_name_match(text, self._names) else "context"
-            elif decision is Decision.DROP:
-                engaged = False
-                label = "dropped"
-            else:  # Decision.DEGRADE — classifier unavailable, keep hearing.
+            verdict = gate.decide(text, t)
+            if verdict.decision is Decision.DEGRADE:
                 engaged = self._should_engage(text, t)
                 label = "degrade->heuristic"
+                if engaged:
+                    gate.note_engaged(text, t)
+            else:
+                engaged = verdict.decision is Decision.ENGAGE
+                label = verdict.label
 
         logger.info('engagement: %s :: "%s"', label, text[:40])
-        if engaged:
-            self._history.append(text)
         return engaged
 
     def _should_engage(self, text: str, t: float) -> bool:

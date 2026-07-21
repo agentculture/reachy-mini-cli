@@ -85,7 +85,14 @@ class _Media:
 
 
 class _Transcriber:
-    """A fake :class:`~reachy.speech.stt.Transcriber` recording call thread + count."""
+    """A fake :class:`~reachy.speech.stt.Transcriber` recording call thread + count.
+
+    ``done`` counts calls that have RETURNED, and is the barrier a multi-phase
+    test must wait on before mutating :attr:`text` for the next phase. ``calls``
+    is not sufficient: it increments on entry, so a test that mutates ``text``
+    after seeing it can still have that mutation read by the in-flight call —
+    handing the worker the *next* phase's transcript for the *current* audio.
+    """
 
     def __init__(
         self,
@@ -98,6 +105,7 @@ class _Transcriber:
         self.gate = gate
         self.error = error
         self.calls = 0
+        self.done = 0
         self.threads: set[int] = set()
 
     def transcribe_once(self, audio):
@@ -107,7 +115,9 @@ class _Transcriber:
             self.gate.wait(10.0)
         if self.error is not None:
             raise self.error
-        return self.text
+        text = self.text
+        self.done += 1
+        return text
 
 
 class _Classifier:
@@ -423,28 +433,68 @@ def test_the_name_fast_path_engages_with_zero_classifier_calls() -> None:
         driver.close()
 
 
-def test_ambient_speech_the_classifier_rejects_never_reaches_the_latch() -> None:
-    """Human-to-human chatter is dropped, at the cost of exactly one LLM call."""
-    classifier = _Classifier(verdict=False)
+def test_ambient_speech_from_cold_never_reaches_the_classifier() -> None:
+    """No conversation open -> ambient chatter is dropped with ZERO LLM calls (#105).
+
+    This is the measured failure mode: 45 minutes of human-to-human speech with
+    the robot's name never spoken. With no conversation for it to continue,
+    nothing the classifier could say is allowed to start one, so it is not asked.
+    """
+    classifier = _Classifier(verdict=True)  # maximally credulous — must not be consulted
     media = _Media()
     driver = _driver(media, transcriber=_Transcriber(text=AMBIENT), classifier=classifier)
     try:
         t = _speak(driver, media, T0)
-        assert _await(lambda: classifier.calls == 1)
+        assert _await(lambda: driver.submitted == 1)
         t = _idle(driver, media, t, ticks=10)
         assert driver.peek() is None
         assert driver.transcripts == 0
+        assert classifier.calls == 0
+    finally:
+        driver.close()
+
+
+def test_ambient_speech_the_classifier_rejects_never_reaches_the_latch() -> None:
+    """Inside an open conversation, chatter still costs exactly one LLM call to drop.
+
+    The warm window admits the utterance to the classifier; the classifier is
+    what says no. The 199 correct drops measured live are this path.
+    """
+    classifier = _Classifier(verdict=False)
+    transcriber = _Transcriber(text=NAMED)
+    media = _Media()
+    driver = _driver(media, transcriber=transcriber, classifier=classifier)
+    try:
+        # Open the conversation by name (fast path, zero classifier calls).
+        t = _speak(driver, media, T0)
+        assert _await(lambda: driver.transcripts == 1 and transcriber.done == 1)
+        assert classifier.calls == 0
+        t = _idle(driver, media, t)
+
+        transcriber.text = AMBIENT
+        t = _speak(driver, media, t)
+        assert _await(lambda: classifier.calls == 1)
+        t = _idle(driver, media, t, ticks=10)
+        assert driver.peek() is None
+        assert driver.transcripts == 1  # still just the named turn
     finally:
         driver.close()
 
 
 def test_addressed_speech_the_classifier_accepts_reaches_the_latch() -> None:
+    """A nameless follow-up inside an open conversation engages on the classifier's YES."""
     classifier = _Classifier(verdict=True)
+    transcriber = _Transcriber(text=NAMED)
     media = _Media()
-    driver = _driver(media, transcriber=_Transcriber(text=AMBIENT), classifier=classifier)
+    driver = _driver(media, transcriber=transcriber, classifier=classifier)
     try:
         t = _speak(driver, media, T0)
-        assert _await(lambda: driver.transcripts == 1)
+        assert _await(lambda: driver.transcripts == 1 and transcriber.done == 1)
+        t = _idle(driver, media, t)
+
+        transcriber.text = AMBIENT
+        t = _speak(driver, media, t)
+        assert _await(lambda: driver.transcripts == 2)
         driver(_ctx(t))
         assert driver.peek() == AMBIENT
         assert classifier.calls == 1
@@ -459,22 +509,24 @@ def test_a_raising_classifier_degrades_to_the_heuristic() -> None:
     media = _Media()
     driver = _driver(media, transcriber=transcriber, classifier=classifier)
     try:
-        # No conversation open yet -> the heuristic drops a coherent-but-unnamed line.
+        # No conversation open yet -> dropped before the classifier is reached.
         t = _speak(driver, media, T0)
-        assert _await(lambda: classifier.calls == 1)
+        assert _await(lambda: transcriber.done == 1)
         t = _idle(driver, media, t, ticks=10)
         assert driver.transcripts == 0
 
         # Name the robot: engages on the fast path and opens the window.
         transcriber.text = NAMED
         t = _speak(driver, media, t)
-        assert _await(lambda: driver.transcripts == 1)
+        assert _await(lambda: driver.transcripts == 1 and transcriber.done == 2)
         t = _idle(driver, media, t)
 
-        # A coherent follow-up inside the window now engages via the heuristic.
+        # A coherent follow-up inside the window reaches the (dead) classifier,
+        # degrades, and the heuristic accepts it — hearing never stalls.
         transcriber.text = AMBIENT
         t = _speak(driver, media, t)
         assert _await(lambda: driver.transcripts == 2)
+        assert classifier.calls == 1
         driver(_ctx(t))
         assert driver.peek() == AMBIENT
     finally:
@@ -506,7 +558,7 @@ def test_on_engage_fires_once_per_engaged_utterance_and_never_on_a_drop() -> Non
     )
     try:
         t = _speak(driver, media, T0)
-        assert _await(lambda: classifier.calls == 1)
+        assert _await(lambda: transcriber.done == 1)
         t = _idle(driver, media, t, ticks=10)
         assert fires == []  # dropped: no turn signal
 
@@ -514,6 +566,65 @@ def test_on_engage_fires_once_per_engaged_utterance_and_never_on_a_drop() -> Non
         t = _speak(driver, media, t)
         assert _await(lambda: driver.transcripts == 1)
         assert fires == [1]
+    finally:
+        driver.close()
+
+
+def test_a_false_accept_does_not_hold_the_driver_gate_open() -> None:
+    """THE #105 REGRESSION, end-to-end through the driver.
+
+    One accepted turn opens the conversation; then the short backchannels that
+    were measured engaging on the deployed box arrive one after another. The
+    classifier is maximally credulous (YES to everything), so if any of them
+    engages it is the gate's structure that failed, not the model.
+
+    Under the old ratchet each accept re-seeded a six-turn "mid-conversation"
+    context and the run stayed open indefinitely. Here only the opening turn
+    ever latches.
+    """
+    classifier = _Classifier(verdict=True)
+    transcriber = _Transcriber(text=NAMED)
+    media = _Media()
+    driver = _driver(media, transcriber=transcriber, classifier=classifier)
+    try:
+        t = _speak(driver, media, T0)
+        assert _await(lambda: driver.transcripts == 1 and transcriber.done == 1)
+        t = _idle(driver, media, t)
+
+        for index, text in enumerate(["No.", "Okay.", "Right.", "Yeah.", "Hold up."], start=2):
+            transcriber.text = text
+            t = _speak(driver, media, t)
+            assert _await(lambda: transcriber.done == index)
+            t = _idle(driver, media, t, ticks=10)
+
+        assert driver.transcripts == 1, "a short backchannel rode the open conversation"
+        assert classifier.calls == 0, "a backchannel must not even reach the classifier"
+    finally:
+        driver.close()
+
+
+def test_the_conversation_closes_once_it_goes_quiet() -> None:
+    """Past the engage window a nameless utterance drops with no classifier call.
+
+    The window is what stops a leak amplifying: once closed, only a fresh name
+    can reopen the conversation, so no run of credulous verdicts can keep it
+    alive on its own.
+    """
+    classifier = _Classifier(verdict=True)
+    transcriber = _Transcriber(text=NAMED)
+    media = _Media()
+    driver = _driver(media, transcriber=transcriber, classifier=classifier)
+    try:
+        t = _speak(driver, media, T0)
+        assert _await(lambda: driver.transcripts == 1 and transcriber.done == 1)
+
+        # Jump far past the 1.0 s test engage window.
+        transcriber.text = AMBIENT
+        t = _speak(driver, media, t + 60.0)
+        assert _await(lambda: transcriber.done == 2)
+        _idle(driver, media, t, ticks=10)
+        assert driver.transcripts == 1
+        assert classifier.calls == 0
     finally:
         driver.close()
 
@@ -803,3 +914,34 @@ def test_the_onset_scan_uses_the_same_threshold_as_the_vad() -> None:
     # The 0.05 lead-in is the room at night, not speech: onset lands in the
     # second half. Under the retired absolute 0.02 it would have landed at 0.
     assert driver._measure_onset(snapshot) >= 400
+
+
+def test_the_escape_hatch_builds_no_gate_at_all(monkeypatch) -> None:
+    """``REACHY_ENGAGE_HEURISTIC=1`` means no classifier is BUILT, not just unused.
+
+    The stronger structural guarantee behind the escape hatch: with it set there
+    is no gate object, so there is no code path on which a classifier call could
+    happen, whatever an injected classifier would have said.
+    """
+    monkeypatch.setenv("REACHY_ENGAGE_HEURISTIC", "1")
+    classifier = _Classifier(verdict=True)
+    transcriber = _Transcriber(text=AMBIENT)
+    media = _Media()
+    driver = _driver(media, transcriber=transcriber, classifier=classifier)
+    try:
+        assert driver._gate is None
+        t = _speak(driver, media, T0)
+        assert _await(lambda: transcriber.done == 1)
+        _idle(driver, media, t, ticks=10)
+        assert classifier.calls == 0
+    finally:
+        driver.close()
+
+
+def test_no_classifier_injected_builds_no_gate() -> None:
+    """Omitting the classifier is the same guarantee as the escape hatch."""
+    driver = _driver(_Media(), transcriber=_Transcriber(text=AMBIENT))
+    try:
+        assert driver._gate is None
+    finally:
+        driver.close()
