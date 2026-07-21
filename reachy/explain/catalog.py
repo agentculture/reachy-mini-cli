@@ -41,9 +41,7 @@ quickstart` for the install-and-start-real-mode sequence.
 - `reachy-mini-cli demo-mode <verb>` — start/stop a background loop that makes
   the robot feel alive (idle breathing, glances, antenna sway).
 - `reachy-mini-cli behavior <verb>` — compose behaviors on a 50 Hz loop
-  (`list`, `run`, `stop`, `status`, `engine`).
-- `reachy-mini-cli listen <verb>` — orient the head toward sound on a two-tier
-  SDK-first loop (`run`, `start`, `stop`, `restart`, `status`).
+  (`list`, `run`, `stop`, `status`, `engine`), including orienting toward sound.
 
 The `device`/`app`/`move` verbs speak to the Reachy daemon over a transport
 flavor (`--transport http` by default, `sdk` optional); a missing daemon yields a
@@ -99,7 +97,7 @@ commands that work with no robot attached. Read-only; supports `--json`.
     uv tool install 'reachy-mini-cli[daemon]'   # CLI + daemon binary + SDK
     reachy-mini-cli daemon start                # wakes the robot
     reachy-mini-cli device status               # verify it answers
-    reachy-mini-cli listen run                  # orient to sound (Ctrl-C to stop)
+    reachy-mini-cli behavior engine run         # the presence loop (Ctrl-C to stop)
     reachy-mini-cli daemon stop                 # when you are done
 
 ## Remote / HTTP-only — no local robot
@@ -110,7 +108,7 @@ commands that work with no robot attached. Read-only; supports `--json`.
 
 The bare install omits `reachy-mini` (its pycairo/gstreamer/pyaudio stack needs
 system libraries a bare box lacks); the `[daemon]` extra adds the daemon binary
-and SDK. See `reachy-mini-cli explain daemon` and `reachy-mini-cli explain listen`.
+and SDK. See `reachy-mini-cli explain daemon` and `reachy-mini-cli explain behavior`.
 
 ## Usage
 
@@ -453,9 +451,10 @@ blocked or unavailable sensing gets bounded grace and is never called physical
 release. The behavior self-completes and also has a finite lifetime backstop.
 
 This symbolic path owns motion only through engine arbitration. It does not run
-the legacy queue reaction or create a second `MotionQueue` owner. For
-sound-orienting, see `reachy-mini-cli explain listen`; that dedicated noun uses
-the daemon's smooth minjerk `goto` planner.
+the legacy queue reaction or create a second `MotionQueue` owner. Orienting
+toward sound is one of its own library behaviors (`orient-to-sound`) rather than
+a separate noun: it turns the head — and, past the head-only band, the body —
+toward the bearing of an addressed voice, on the same arbitrated 50 Hz loop.
 
 ## Verbs
 
@@ -613,7 +612,7 @@ hardware without a GPU:
   brightness centroid of the frame is computed; a significant shift in the centroid
   triggers a softer look toward the bright region.
 
-Like `listen`, `vision` mirrors the serial-motion-queue design: both tiers drive the
+Like `pat` and `sleep`, `vision` mirrors the serial-motion-queue design: both tiers drive the
 daemon's smooth minjerk `goto` planner strictly one move at a time, so turns are soft
 and never conflict. The loop runs only when the daemon is reachable and a camera frame
 is available; if either is absent it exits cleanly (exit 2) rather than crashing.
@@ -661,7 +660,7 @@ for a remote control box or to run `vision specs` without the SDK installed.
 - State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`: `vision.pid`
   and `vision.log`.
 - Only one thing should drive the robot at a time — don't run `vision` alongside
-  `listen`, `demo-mode`, or the behavior engine.
+  `demo-mode` or the behavior engine.
 
 ## Usage
 
@@ -738,131 +737,6 @@ assert this. Keep `say` as a pure TTS → playback pipe.
 """
 
 
-_LISTEN = """\
-# reachy-mini-cli listen
-
-Orient the robot toward sound in real time. `listen` is **SDK-first**: it streams
-live audio from the mic array via the `reachy_mini` SDK (the `sdk` transport is the
-default), so DoA and loudness are computed in-process — no round-trip to the daemon.
-The HTTP transport remains available via `--transport http` / `REACHY_TRANSPORT=http`
-for a control box talking to a remote daemon.
-
-## Two-tier reaction
-
-The loop runs two tiers simultaneously:
-
-**Tier 1 — antenna lean (always on):** A lightweight, near-continuous lean of the
-*antennas* (and head holds position) toward the incoming DoA on every tick. This gives
-the robot a subtle "perked ear" reaction to any live sound, even faint ambient noise,
-without moving the body.
-
-**Tier 2 — head→body turn (speech or loud snap):** On detected *speech* or a loud
-RMS transient ("snap") — a sudden noise spike above a ratio × floor threshold — the
-robot executes a slow, smooth head→body turn:
-
-1. The head turns toward the source first.
-2. If the source is beyond `--head-only-band` degrees from center, the body rotates
-   to face the source and the head re-centers, so the whole robot is re-oriented.
-
-A **latched-DoA guard** prevents stale angles from triggering a spurious turn: the
-daemon's DoA angle freezes at rest, so Tier-2 fires only on live speech/snap, never
-on the last angle left over from a previous sound.
-
-**Always-alive idle (between sounds):** when nothing reactive fires, the robot
-keeps gently moving — breathing, a slow gaze wander, and antenna sway — *around its
-current heading*, so it is never frozen. A robot that turned toward a sound stays
-rotated and keeps wandering there; after `--recenter-after` seconds of silence the
-head and body drift slowly back toward front (`--drift-speed` deg/s) rather than
-hard-snapping home. `--idle-energy 0` restores the old hold-still behaviour.
-
-The `SnapDetector` (`reachy/motion/snap.py`) implements the RMS spike detection,
-algorithm cited from `reachy_nova`'s `TrackingManager.detect_snap`.
-
-Unlike the behavior engine — which streams immediate `set_target` poses at 50 Hz
-(jerky for big reorienting turns) — this loop drives the smooth minjerk `goto`
-planner and runs moves strictly one at a time through a serial motion queue.
-
-It degrades gracefully: no mic, a DoA error, or (with `--speech-only`) no speech ⇒
-no reaction, no crash.
-
-## Verbs
-
-- `reachy-mini-cli listen run` — run the loop in the foreground (what `start` and
-  the process launch run). Ctrl-C stops it; `--max-ticks N` runs a fixed number of
-  ticks. Eases to center on start (preflight) and on stop.
-- `reachy-mini-cli listen start` — spawn the loop in the background, recording its
-  PID + log under the state dir. For `--transport http` it first preflights the
-  daemon's health route. Idempotent: reports `already-running` if a tracked loop
-  is alive.
-- `reachy-mini-cli listen stop` — SIGTERM the loop this CLI started (so it eases
-  back to center before exiting), escalating to SIGKILL past `--timeout`.
-- `reachy-mini-cli listen restart` — stop the tracked loop and relaunch it, so the
-  new process re-reads the tuning and the latest code.
-- `reachy-mini-cli listen status` — the loop's process state (running / stopped /
-  stale) and whether the daemon answers.
-- `reachy-mini-cli listen overview` — the verb summary.
-
-## Tuning
-
-Feel knobs (each defaults to a tuned value; unset keeps it):
-
-- `--gain X` — DoA-to-head-yaw scaling factor.
-- `--deadband DEG` — ignore sound within this angle of the current heading.
-- `--hold SECONDS` — after a Tier-2 turn, stay there this long before reconsidering.
-- `--speed DEG_PER_S` — slew speed for Tier-2 turns and for easing back to center.
-- `--recenter-after SECONDS` — silence grace before the head/body start drifting home.
-- `--idle-energy X` — liveliness of the always-alive idle motion (0 = hold still).
-- `--drift-speed DEG_PER_S` — how fast the head/body drift home after silence.
-- `--speech-only` — Tier-2 reacts only to detected speech (Tier-1 still runs).
-- `--antenna-max DEG` — maximum antenna lean angle for Tier-1.
-- `--body-yaw-max DEG` — maximum body yaw for Tier-2 body rotation.
-- `--head-only-band DEG` — source angles within this band stay head-only (no body
-  rotation); outside it the body turns and the head re-centers.
-- `--snap-ratio X` — RMS spike must be this many times the floor to count as a snap.
-- `--snap-floor RMS` — minimum floor RMS below which snap detection is suppressed.
-
-## Pat
-
-- `--pat` / `--no-pat` — fold proprioceptive head-pat detection into the loop
-  (on by default, `sdk`-only). The loop owns the single SDK client, so its
-  head-pose read-backs are fast enough to detect a pat; a separate `pat`
-  process would contend and be throttled.
-- `--press-threshold DEG` / `--min-presses N` — pat detector tuning.
-
-> `listen run` used to accept a `--live` flag that folded cognition, `vision`,
-> `sleep`, faces and scene description into this loop. That composition retired
-> — running every sense in one process is now the symbolic runtime's job
-> (`reachy-mini-cli behavior engine run`), and an AI agent attaches to it with
-> `reachy-mini-cli agent attach`.
-
-## Transport
-
-The `sdk` transport (default) streams mic audio via `reachy_mini` in-process —
-`numpy` is a base runtime dependency; `reachy-mini` comes from the `[sdk]` /
-`[daemon]` extra. The `http` transport polls
-the daemon's DoA endpoint instead; use it with `--transport http` or
-`REACHY_TRANSPORT=http` on a control box that talks to a remote daemon.
-
-## Notes
-
-- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`: `listen.pid`
-  and `listen.log`.
-- Only one thing should drive the robot at a time — don't run `listen` alongside
-  `demo-mode` or the behavior engine.
-
-## Usage
-
-    reachy-mini-cli daemon start                              # bring the daemon up
-    reachy-mini-cli listen run                                # foreground, SDK transport (default)
-    reachy-mini-cli listen run --transport http               # foreground, HTTP transport
-    reachy-mini-cli listen start --hold 3 --speech-only       # background, speech only
-    reachy-mini-cli listen start --antenna-max 25 --snap-ratio 4
-    reachy-mini-cli listen run --no-pat                       # sound-orienting only
-    reachy-mini-cli listen status --json
-    reachy-mini-cli listen stop                               # eases back to center
-"""
-
-
 _PAT = """\
 # reachy-mini-cli pat
 
@@ -871,7 +745,7 @@ a neutral baseline head pose, reads the *actual* head pose back each tick, and f
 the commanded-vs-actual deviation to a `PatDetector`. When the detector recognises a
 pat it fires an event and `PatReaction` enqueues a calm lean→nuzzle→settle gesture
 onto the shared serial `MotionQueue`, drained one move at a time to the robot by a
-background motion executor — the same architecture as `listen` and `sleep`.
+background motion executor — the same architecture as `sleep` and `vision`.
 
 Two **touch types**:
 
@@ -919,7 +793,7 @@ degrades motion to silent — the pat sensing loop keeps running. The queue is f
   plain dev machine to exercise the lean planner end-to-end.
 - `--ticks N` is handy for bounded ops runs or automated tests.
 - Only one thing should drive the robot at a time — don't run `pat` alongside
-  `demo-mode`, `listen`, or another motion source.
+  `demo-mode`, the behavior engine, or another motion source.
 
 ## Usage
 
@@ -946,7 +820,7 @@ alive idle when ALERT, a low-energy idle when DROWSY, and a near-still
 "sleep breathe" (slow body rock + gentle antenna breathing + a slight head
 droop) when ASLEEP. Moves are submitted onto the shared serial `MotionQueue` and
 drained one move at a time by a background motion executor — the same
-architecture as `listen` and `pat`.
+architecture as `pat` and `vision`.
 
 While the robot is ASLEEP the noun keeps the `sleep_active.flag` written (under
 the state dir) so other subsystems can quiet themselves; it is cleared the moment
@@ -989,7 +863,7 @@ transport at all.
 - State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`: `sleep.pid`,
   `sleep.log`, and the `sleep_active.flag`.
 - Only one thing should drive the robot at a time — don't run `sleep` alongside
-  `listen`, `demo-mode`, or another motion source.
+  `demo-mode`, the behavior engine, or another motion source.
 
 ## Usage
 
@@ -1211,13 +1085,6 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("behavior", "engine", "stop"): _BEHAVIOR,
     ("behavior", "engine", "status"): _BEHAVIOR,
     ("behavior", "engine", "run"): _BEHAVIOR,
-    ("listen",): _LISTEN,
-    ("listen", "overview"): _LISTEN,
-    ("listen", "run"): _LISTEN,
-    ("listen", "start"): _LISTEN,
-    ("listen", "stop"): _LISTEN,
-    ("listen", "restart"): _LISTEN,
-    ("listen", "status"): _LISTEN,
     ("vision",): _VISION,
     ("vision", "overview"): _VISION,
     ("vision", "run"): _VISION,

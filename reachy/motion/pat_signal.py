@@ -1,19 +1,32 @@
-"""Pat-active file flag.
+"""Pat-active file flag — now bench-local bookkeeping, not a coordination channel.
 
 Publishes a simple file-system flag that signals whether a ``pat`` reaction is
 currently in progress.  The flag lives under the same per-user state directory
 that every other piece of bookkeeping in this project uses (daemon PID file,
-listen/think supervisor PID files, the cognition-active flag, …).
+the sleep-active flag, the ``sleep`` supervisor's PID file, …).
 
 This mirrors :mod:`reachy.motion.sleep_signal` *exactly* in shape — only the
 flag file name and the symbol names differ.  The :func:`pat_active` context
 manager is the canonical way to set and clear the flag; the lower-level
 :func:`write` / :func:`clear` / :func:`is_active` functions are exposed for
-callers (e.g. the ``listen`` idle producer) that only need to *read* the signal.
+callers that only need to *read* the signal.
 
-While the flag is present the always-alive ``listen`` idle wander pauses
-entirely so the pat lean/snuggle reaction owns the motion — a scratch breaks
-stillness.
+**Scope, after task t22.**  The flag's one cross-process reader was the
+always-alive ``listen`` idle wander, which paused entirely while a pat reaction
+owned the motion.  That reader went with the ``listen`` NOUN, so **no other
+process consults this flag any more**: its only remaining read is ``pat run``'s
+own idempotent cleanup, in the very process that wrote it.  The module is kept
+rather than deleted because that writer and reader are both live code in a
+surviving noun; treat it as per-noun bookkeeping, not as arbitration.
+
+Nothing regressed by that loss.  Arbitration against a running behavior engine
+— the case that actually matters on the robot — is not advisory and never was
+this flag's job: ``pat run`` calls
+:func:`reachy.behavior.liveness.refuse_if_engine_live` before it constructs a
+transport, so it *refuses to start* beside a live engine rather than yielding to
+it.  Live patting reaches the robot through the engine's own pat sense
+(:mod:`reachy.behavior.pat_sense`), which never read this flag; standalone
+``pat run`` is the isolated bench check.
 
 Pure standard library — no new runtime dependency.
 """
@@ -25,8 +38,8 @@ from pathlib import Path
 from typing import Generator
 
 # Reuse the single source-of-truth state-dir resolver so every subsystem (the
-# daemon, the listen supervisor, the think supervisor, the cognition flag, and
-# now this flag) all land in the same directory.
+# daemon, the sleep supervisor, the sleep flag, and this flag) all land in the
+# same directory.
 from reachy.daemon import state_dir
 
 # Name of the flag file inside the state dir.

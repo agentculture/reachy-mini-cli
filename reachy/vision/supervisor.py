@@ -1,9 +1,11 @@
 """Run the ``vision`` loop as a tracked background process.
 
-The vision supervisor mirrors :mod:`reachy.motion.supervisor` exactly — it
-manages the visual-orienting :class:`~reachy.vision.producer.VisionProducer`
-loop as a detached background process tracked with a PID + log file under the
-same per-user state dir the daemon, demo-mode, and listen supervisors share.
+The vision supervisor manages the visual-orienting
+:class:`~reachy.vision.producer.VisionProducer` loop as a detached background
+process tracked with a PID + log file under the same per-user state dir the
+daemon, demo-mode, and sleep supervisors share. (It was originally written to
+mirror the ``listen`` loop's ``reachy.motion.supervisor`` exactly; that module
+retired with its noun, and this one is unchanged by the removal.)
 ``start`` / ``stop`` / ``restart`` / ``status`` are the public API; ``start``
 re-invokes this very CLI (``python -m reachy vision run``) so the loop keeps
 running after the launching command returns.

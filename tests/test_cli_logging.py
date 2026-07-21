@@ -5,15 +5,15 @@ until this module existed nothing ever attached a handler or called
 ``logging.basicConfig`` — so INFO-level traces were silently dropped by
 Python's "last resort" handler (WARNING+ only, see the stdlib docs for
 ``logging.Logger.callHandlers``). :func:`install_logging` fixes that for the
-long-running foreground loops (``listen run`` / ``sleep run``):
+long-running foreground loops (``behavior engine run`` / ``sleep run``):
 
 * it attaches exactly ONE ``StreamHandler(sys.stderr)`` to the ``"reachy"``
   logger (the common ancestor every ``reachy.*`` module logger propagates
   to), with a level resolved ``--log-level`` flag > ``REACHY_LOG_LEVEL`` env >
-  a caller-supplied default (``"INFO"`` for the three loops);
+  a caller-supplied default (``"INFO"`` for those loops);
 * a second call is a no-op for the handler — no duplicate handler object, no
   duplicate log lines;
-* the handler is stderr-only, by construction, so ``listen run --live
+* the handler is stderr-only, by construction, so ``behavior engine run
   --export -``'s stdout stays pure JSONL;
 * it severs propagation past the ``"reachy"`` logger (``propagate = False``,
   on the fresh AND the reuse path), so a foreign root handler — the unlocated
@@ -22,8 +22,10 @@ long-running foreground loops (``listen run`` / ``sleep run``):
   an ``INFO:reachy.sense:``-prefixed twin (#96) — receives ZERO ``reachy.*``
   records, culprit-independent.
 
-This file also covers the CLI wiring: ``listen run`` / ``sleep run`` each
-expose ``--log-level`` and call :func:`install_logging` at run entry.
+This file also covers the CLI wiring: ``behavior engine run`` / ``sleep run``
+each expose ``--log-level``, and ``sleep run`` calls :func:`install_logging` at
+run entry (``behavior engine run``'s own call is pinned by
+``tests/test_behavior_engine_composition.py``).
 """
 
 from __future__ import annotations
@@ -81,7 +83,7 @@ def test_install_logging_attaches_a_single_stderr_handler() -> None:
 def test_handler_targets_stderr_never_stdout() -> None:
     """Export purity: the handler must write to stderr, never stdout.
 
-    Under ``listen run --live --export -`` stdout is reserved for the pure
+    Under ``behavior engine run --export -`` stdout is reserved for the pure
     JSONL feed (see ``reachy.cli._export``) — a log line landing on stdout
     would corrupt that feed.
     """
@@ -254,14 +256,20 @@ def test_add_log_level_arg_accepts_the_flag() -> None:
     assert args.log_level == "DEBUG"
 
 
-# --- wiring: listen / sleep run each expose --log-level -------------------
+# --- wiring: behavior engine / sleep run each expose --log-level -----------
 
 
-def test_listen_run_parser_has_log_level_flag() -> None:
+def test_behavior_engine_run_parser_has_log_level_flag() -> None:
+    """The shared helper is wired on more than one verb, so it cannot drift.
+
+    ``listen run`` used to be the second verb here; it retired with the noun
+    (task t22) and ``behavior engine run`` — the loop that actually ships as the
+    boot presence — took its place.
+    """
     from reachy.cli import _build_parser
 
     parser = _build_parser()
-    args = parser.parse_args(["listen", "run", "--log-level", "DEBUG"])
+    args = parser.parse_args(["behavior", "engine", "run", "--log-level", "DEBUG"])
     assert args.log_level == "DEBUG"
 
 
@@ -274,43 +282,6 @@ def test_sleep_run_parser_has_log_level_flag() -> None:
 
 
 # --- wiring: cmd_*_run actually installs logging at run entry --------------
-
-
-class _FakeListenTransport:
-    """Mirrors ``tests/test_listen_cli.py``'s ``_FakeTransport``: records
-    gotos, no mic (``doa`` returns ``None``) so the loop reacts to nothing."""
-
-    name = "fake"
-
-    def __init__(self) -> None:
-        self.gotos: list[dict] = []
-
-    def move_goto(self, **kwargs: object) -> object:
-        self.gotos.append(kwargs)
-        return {"uuid": "x"}
-
-    def doa(self, *, timeout: float | None = None) -> object:
-        return None
-
-
-def test_listen_run_installs_logging_at_the_resolved_level(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
-    monkeypatch.delenv("REACHY_BASE_URL", raising=False)
-    monkeypatch.delenv("REACHY_TRANSPORT", raising=False)
-    import reachy.cli._commands.listen as listen_mod
-
-    tr = _FakeListenTransport()
-    monkeypatch.setattr(listen_mod, "get_transport", lambda args: tr)
-
-    from reachy.cli import main
-
-    rc = main(["listen", "run", "--log-level", "DEBUG", "--max-ticks", "1"])
-    assert rc == 0
-    logger = logging.getLogger(_LOGGER_NAME)
-    assert logger.level == logging.DEBUG
-    assert any(h.stream is sys.stderr for h in logger.handlers)
 
 
 class _SilentSleepSession:
