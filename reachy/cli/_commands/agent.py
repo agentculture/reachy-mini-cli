@@ -82,14 +82,32 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from reachy import senselog
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.cli._export import add_export_args, build_export_hook
 from reachy.cli._output import emit_diagnostic, emit_result
-from reachy.speech.events import SenseCue
+
+if TYPE_CHECKING:  # annotations only — never imported at runtime
+    from reachy.speech.events import SenseCue
+
+
+def _sense_cue():
+    """The :class:`~reachy.speech.events.SenseCue` type, imported on first use.
+
+    Deliberately NOT a module-scope import. ``_build_parser()`` registers this
+    noun, so a top-level ``from reachy.speech.events import SenseCue`` put the
+    cognition event bus in the import path of EVERY ``reachy`` invocation --
+    ``say run``, ``daemon status``, even ``--help``. ``say`` is specified as a
+    dumb TTS pipe and its boundary test forbids exactly that. Found by t24's
+    import-boundary suite.
+    """
+    from reachy.speech.events import SenseCue
+
+    return SenseCue
+
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +299,7 @@ class _RuntimeCueBuffer:
         ts = _event_ts(event)
         with self._lock:
             for text in cues:
-                self._buf.append(SenseCue(text=text, timestamp=ts))
+                self._buf.append(_sense_cue()(text=text, timestamp=ts))
         for text in cues:
             senselog.stage("cue", "runtime", uuid.uuid4().hex[:8], text)
         return len(cues)
@@ -302,7 +320,7 @@ class _RuntimeCueBuffer:
             return
         cue = str(text).strip()
         with self._lock:
-            self._buf.append(SenseCue(text=cue, timestamp=0.0))
+            self._buf.append(_sense_cue()(text=cue, timestamp=0.0))
         senselog.stage("cue", "forge", uuid.uuid4().hex[:8], cue)
 
     def snapshot(self) -> list[SenseCue]:

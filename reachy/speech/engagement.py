@@ -115,7 +115,6 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from reachy.speech import llm
 from reachy.speech.name_match import DEFAULT_THRESHOLD, is_name_match
 
 #: Canonical names the robot answers to.  Mirrors the listen/transcribe default.
@@ -215,7 +214,7 @@ class EngagementClassifier:
     def __init__(
         self,
         *,
-        complete_fn: Callable[..., str] = llm.complete,
+        complete_fn: Callable[..., str] | None = None,
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
@@ -242,6 +241,17 @@ class EngagementClassifier:
             The classifier instruction.  Defaults to
             :data:`ENGAGEMENT_SYSTEM_PROMPT`; override to tune behaviour.
         """
+        if complete_fn is None:
+            # Resolved HERE, not as a default argument, so importing this module
+            # does not pull the LLM client into every process that only wants
+            # ``ConversationGate`` / ``is_name_match``.  ``_build_parser()`` reaches
+            # this module through ``behavior.transcript_sense``, so a module-scope
+            # ``from reachy.speech import llm`` put an LLM client in the import
+            # path of EVERY ``reachy`` invocation — ``say run``, ``daemon status``,
+            # even ``--help``.  Found by t24's import-boundary suite.
+            from reachy.speech import llm
+
+            complete_fn = llm.complete
         self._complete_fn = complete_fn
         self._model = model
         self._base_url = base_url

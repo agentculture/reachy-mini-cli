@@ -183,7 +183,6 @@ import numpy as np
 from reachy import senselog
 from reachy.robot.audio_shape import to_mono
 from reachy.speech.engagement import ConversationGate, Decision
-from reachy.speech.events import _doa_direction
 from reachy.speech.stt import Transcriber
 
 logger = logging.getLogger(__name__)
@@ -1077,6 +1076,14 @@ class TranscriptSenseDriver:
         if not isinstance(angle, (int, float)) or isinstance(angle, bool):
             return None
         try:
+            # Imported HERE, not at module scope: this is one small bearing
+            # formatter, but ``reachy.speech.events`` carries the cognition
+            # EventBuffer with it. Because ``_build_parser()`` reaches this
+            # module, a top-level import put the event bus in the import path of
+            # every ``reachy`` invocation — which `say`'s dumb-pipe boundary test
+            # forbids outright. Found by t24's import-boundary suite.
+            from reachy.speech.events import _doa_direction
+
             return _doa_direction(float(angle))
         except Exception:  # noqa: BLE001 — a bad angle must never drop the words
             return None

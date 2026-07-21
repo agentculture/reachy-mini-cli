@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import ast
 import collections
+import json
 import subprocess  # nosec B404 — fixed argv, sys.executable, never shell=True
 import sys
 from pathlib import Path
@@ -503,34 +504,38 @@ def test_the_only_llm_edge_in_the_presence_runtime_is_the_engagement_gate() -> N
     )
 
 
-def test_building_the_cli_parser_loads_the_llm_client_today() -> None:
-    """KNOWN GAP, pinned so the fix is noticed — not a property we want.
+def test_building_the_cli_parser_loads_no_cognition_module() -> None:
+    """Building the CLI parser must not drag cognition into EVERY invocation.
 
-    The static edge above has an operational consequence worth stating plainly:
-    :func:`reachy.cli._build_parser` imports EVERY command module, including
-    ``_commands/behavior.py``, which imports
-    :mod:`reachy.behavior.transcript_sense`, which imports
-    :mod:`reachy.speech.engagement` at module scope, which imports the LLM
-    client. So **every** ``reachy`` invocation — ``say run``, ``daemon
-    status``, even ``--help`` — loads :mod:`reachy.speech.llm`.
+    ``_build_parser()`` imports every command module, so a single module-scope
+    import anywhere in the tree lands in the import path of ``say run``,
+    ``daemon status`` and even ``--help``.
 
-    It is already causing a visible defect: ``tests/test_say.py``'s
-    ``test_say_e2e_no_llm_no_senses_via_main`` asserts the ``say`` noun does not
-    freshly import the LLM client, and it fails whenever it runs in a pytest
-    worker that had not already loaded it (it survives ``-n auto`` only because
-    some earlier test in the same worker imports it first).
+    This WAS a real defect, found by this suite and fixed in the same arc. Two
+    module-scope imports put the LLM client and the cognition event bus on that
+    path: ``behavior.transcript_sense`` -> ``speech.engagement`` -> ``speech.llm``
+    (the engagement classifier's ``complete_fn`` default argument), and
+    ``_commands/agent.py`` -> ``speech.events`` for ``SenseCue``. Both are now
+    resolved lazily at first use.
 
-    The fix is a one-line move — make ``transcript_sense``'s
-    ``reachy.speech.engagement`` import function-local, exactly as
-    ``_engagement_classifier`` already does at the composition root — but it is
-    a production change owned elsewhere, so t24 reports rather than makes it.
-    When it lands, THIS test fails: delete it, and tighten
-    ``test_say_e2e_no_llm_no_senses_via_main`` back to an unconditional
-    assertion.
+    It was not merely cosmetic: ``tests/test_say.py``'s dumb-pipe boundary test
+    failed deterministically in a fresh pytest worker and survived ``-n auto``
+    only because an earlier test in the same worker imported the modules first —
+    an order-dependent flake in an out-of-scope noun.
+
+    Pinned by EQUALITY over the whole set, so re-widening fails loudly with the
+    offending module named.
     """
+    forbidden = (
+        "reachy.speech.llm",
+        "reachy.speech.events",
+        "reachy.speech.agent_turn",
+        "reachy.speech.tools",
+        "reachy.forge",
+    )
     code = (
-        "import sys; from reachy.cli import _build_parser; _build_parser();"
-        "print('reachy.speech.llm' in sys.modules)"
+        "import sys, json; from reachy.cli import _build_parser; _build_parser();"
+        f"print(json.dumps([m for m in {forbidden!r} if m in sys.modules]))"
     )
     proc = subprocess.run(  # nosec B603 — fixed argv, sys.executable, no shell
         [sys.executable, "-c", code],
@@ -539,11 +544,12 @@ def test_building_the_cli_parser_loads_the_llm_client_today() -> None:
         cwd=str(_REPO_ROOT),
         check=True,
     )
-    assert proc.stdout.strip() == "True", (
-        "building the CLI parser no longer loads reachy.speech.llm — the known "
-        "gap this test pins has been FIXED. Delete this test and restore "
-        "tests/test_say.py::test_say_e2e_no_llm_no_senses_via_main to an "
-        "unconditional assertion."
+    loaded = json.loads(proc.stdout.strip())
+    assert loaded == [], (
+        "building the CLI parser now loads cognition module(s): "
+        f"{loaded}. A module-scope import has crept back in; make it "
+        "function-local (or TYPE_CHECKING-only) so every reachy invocation "
+        "does not pay for cognition it will not use."
     )
 
 
