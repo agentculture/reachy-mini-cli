@@ -245,11 +245,41 @@ discards any standing backlog before going live (pulled at tick rate that
 FIFO serves seconds-stale audio, and its empty-queue `get_sample` blocks
 20 ms on the tick thread). `_AudioTap` swaps the pump's latch once per tick
 (at the top of `sense_reader`) and fans the concatenated chunk out — taking
-it twice would hand each consumer half the audio. **When you wire a new provider here you MUST extend
+it twice would hand each consumer half the audio. Every audio read — the
+pump's, the transcript driver's, and `HeldMediaClient.audio()` at the SDK
+boundary — is coerced through `reachy/robot/audio_shape.py` `to_mono`, NOT a
+bare `.reshape(-1)`: SDK 1.9 documents `get_audio_sample()` as `(N, 2)`, and
+flattening that interleaves both channels into one double-length stream the WAV
+header then mislabels. `to_mono` selects `AEC_CHANNEL` (0, `reachy_nova`'s
+choice) and passes a 1-D read through untouched. Measurement over 829 archived
+uploads says the deployed box delivers 1-D today, so this is a closed
+portability hazard, not a fixed bug. **When you wire a new provider here you MUST extend
 `reachy/behavior/sense.py`'s `_COMPOSED_PROVIDER_FIELDS` in the same change** —
 it is the one declared source of truth `behavior rules check` lints against, so
 a stale value makes the linter lie in one direction or the other.
 
+- **Transcript sense — the RMS predicate is a LOCATOR, never a content filter
+  (#108).** `transcript_sense.py` uses `_is_speech` to decide WHEN an utterance
+  starts and ends, and submits **one contiguous slice of the ring**
+  (`_clip_from`, mirroring `reachy_nova`'s `speech_events.py:263-265`
+  `full_buffer[clip_offset:]`). It used to append only the chunks that
+  individually cleared the threshold, so what reached the STT was the pre-roll
+  plus the loud frames butt-spliced with every quiet frame *inside* the
+  sentence excised — reproduced live: contiguous gave `'Richie, are you
+  there?'`, the same phrase gated at the live background gave `'Reaching
+  there.'`, then `'Return.'`, then `'Yeah.'` as the room got louder. The `0.02`
+  constant was cited from nova's onset threshold and then repurposed from
+  locator to filter; that inversion — not the number — was the bug, which is
+  why **#102's background-relative threshold is harmless rather than harmful
+  now and must NOT be reverted**. Three invariants hold this in place and each
+  is pinned by a test in `tests/test_behavior_transcript_contiguous.py`: the
+  ring is NOT cleared on emit (a `_consumed` watermark marks what was already
+  submitted, so audio is delivered exactly once *without* being destroyed —
+  clearing it wiped the runtime's own pre-roll, `pre_roll=0.02s buffered=512`
+  on back-to-back utterances in the live journal); `_discard_ring` is the ONLY
+  clear and only self-mute calls it; and `min_utterance_s` is a wall-clock
+  SPAN on the audio timeline, not a count of loud samples — measuring it over
+  loud samples is the same defect wearing a length test.
 - **Pat sense** — `reachy/robot/state_reader.py` `HeldStateReader` holds ONE
   `ReachyMini(media_backend='no_media')` client for the process lifetime
   (construct-on-first-read, explicit idempotent `close()` — an unclosed
