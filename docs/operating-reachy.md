@@ -1010,17 +1010,51 @@ calm rather than a demo reel:
 | id | fires on | does | bounded by |
 |---|---|---|---|
 | `pat-acknowledge` | `pat` — a proprioceptive touch | `pet-reaction` — settle into the petting, then signal release | self-completing, finite backstop |
-| `look-toward-sound` | `rms >= 0.02` — measured mic energy | `orient-to-sound` — the graded antenna/head/body ladder | `duration_s = 12`, `cooldown_s = 2` |
+| `look-toward-sound` | `rms_ratio >= 5` — mic energy 5x the room's own rolling background | `orient-to-sound` — the graded antenna/head/body ladder | `duration_s = 12`, `cooldown_s = 2` |
 | `greet-when-addressed` | `transcript` — an utterance that cleared the engagement gate | `speak` head-bob, and says *"I'm here."* | `duration_s = 1.6`, `cooldown_s = 12` |
 
 Three things worth knowing about that set:
 
 - **None of them keys on bare `speech`** — that flag reads true 45.8 % of the
   time in a quiet room with nobody speaking. `pat` is a physical measurement,
-  `rms` is measured energy handed to a behavior that corroborates it *again*
-  with its own dwell and latch guards, and `transcript` has already cleared the
-  layered engagement gate. A rule carries exactly one predicate, so the
-  corroboration has to live inside the field it keys on.
+  `rms_ratio` is measured energy handed to a behavior that corroborates it
+  *again* with its own dwell and latch guards, and `transcript` has already
+  cleared the layered engagement gate. A rule carries exactly one predicate, so
+  the corroboration has to live inside the field it keys on.
+- **Loudness is measured against the room, not against a number.** `rms_ratio`
+  is this tick's mic energy divided by a rolling median of the room's own
+  background. It has to be: measured over 24 h on one deployed robot, the still-
+  room background drifts **~25x** — p50 `0.004` by day, `0.0207` at night,
+  `0.034` with the runtime streaming — so the old absolute `rms >= 0.02` sat
+  *under* the night background (99.1 % of empty-room samples cleared it) while
+  any value above the night state would have deafened the daytime robot. A
+  ratio means the same thing in every room.
+- **The antenna lean is cheap; the head turn is earned.** Clearing `rms_ratio`
+  buys **tier 1**, an antenna lean, with the head untouched. **Tier 2** — the
+  head/body turn — additionally needs sound that is LOUD relative to the room
+  (`rms_ratio_loud`, 15x) or ONGOING (`sustain_s`, 1.5 s). That split is not
+  taste: in an ordinary room the old rule fired 203 times in 8 minutes, and in
+  the same session the pat sense recorded **zero** detections in 5 minutes,
+  because the pat sense suspends while another behavior owns the head. A head
+  that keeps turning cannot feel a pat.
+
+  A tier-2 promotion names which criterion earned it, so the journal answers
+  *why* the robot turned:
+
+  ```bash
+  journalctl --user -u reachy-runtime -f | grep 'event=tier2'
+  # [SENSE stage=orient source=doa event=tier2] promoted reason=sustained ratio=8.1x sustained=1.52s loud_at=15.0x
+  ```
+
+- **Hearing uses the same estimate, with a looser threshold.** Utterance
+  capture starts at **3x** the rolling background rather than 5x: a missed
+  utterance is gone forever, while a wasted capture costs one STT request that
+  comes back empty — so hearing should start on less evidence than turning.
+  The shipped absolute `0.02` survives as a *floor* under that ratio, so a
+  quiet room's capture behaviour is exactly what it always was. Before this, a
+  night-time robot held the capture gate permanently open and filled its
+  journal with `utterance start` → `dropped reason=stt-empty`: it was recording
+  its own hiss and posting it to the STT.
 - **`look-toward-sound` admits far more often than the robot actually moves.**
   With no credible bearing `orient-to-sound` abstains, so `feel-alive` keeps
   breathing through it and the head stays put. Admission is cheap; turning is
@@ -1394,12 +1428,23 @@ outranks it outright. With no sound it **abstains** rather than freezing, so
 silence the committed heading eases back to front before it lets go.
 
 Every knob (`gain`, `max_yaw`, `deadband`, `hold`, `head_only_band`,
-`rms_floor`, `dwell_s`, …) is a behavior parameter — retune it from the rule or
-the goal payload, no code change:
+`rms_ratio`, `rms_ratio_loud`, `sustain_s`, `dwell_s`, …) is a behavior
+parameter — retune it from the rule or the goal payload, no code change:
 
 ```bash
 reachy-mini-cli behavior list --json   # every orient-to-sound param, unit and default
 ```
+
+The three sound-admission knobs are additionally settable from the environment,
+for a box you tune without editing files (a systemd drop-in, the way the pat
+sense is already tuned): `REACHY_ORIENT_RMS_RATIO`,
+`REACHY_ORIENT_RMS_RATIO_LOUD`, `REACHY_ORIENT_SUSTAIN_S`. A `params` entry in a
+rules file always wins over the environment — a rules file is a version-
+controlled statement about this robot, an exported variable is not. The
+estimator behind them has two knobs of its own, both composition-time:
+`REACHY_RMS_BACKGROUND_S` (the rolling window, default 10 s) and
+`REACHY_RMS_SILENCE_FLOOR` (a denominator clamp that only ever bites on a muted
+mic).
 
 ### Speech — the `say` field gives a rule a voice
 

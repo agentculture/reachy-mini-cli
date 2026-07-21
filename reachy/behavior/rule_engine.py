@@ -144,6 +144,8 @@ def _field_present(sense: Sense, field: str) -> bool:
         return sense.doa_angle is not None
     if field == "rms":
         return sense.rms is not None
+    if field == "rms_ratio":
+        return sense.rms_ratio is not None
     if field == "pat":
         return sense.pat_event is not None
     if field == "face":
@@ -159,6 +161,7 @@ def _field_value(sense: Sense, field: str):
         "doa": sense.doa_angle,
         "speech": sense.speech_detected,
         "rms": sense.rms,
+        "rms_ratio": sense.rms_ratio,
         "pat": sense.pat_event,
         "face": sense.face,
         "frame_available": sense.frame_available,
@@ -238,11 +241,34 @@ class RuleEngine:
     """
 
     def __init__(
-        self, config: RulesConfig, *, id_prefix: str = "rule", lib=None, speech=None
+        self,
+        config: RulesConfig,
+        *,
+        id_prefix: str = "rule",
+        lib=None,
+        speech=None,
+        param_overrides: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self._config = config
         self._prefix = id_prefix
         self._lib = lib if lib is not None else behavior_library
+        #: ``{behavior_name: {param: value}}`` — a COMPOSITION-time overlay on
+        #: the library catalog's own defaults, resolved from the environment by
+        #: ``reachy.cli._commands.behavior`` (the ``REACHY_ORIENT_*`` knobs) and
+        #: injected here, so this module never reads the environment itself.
+        #:
+        #: Precedence, weakest first: library catalog default < THIS overlay <
+        #: active mode params < the rule's own ``params``. That ordering is the
+        #: point — an env override is a BOX-level tuning knob (the deployed
+        #: robot already tunes ``REACHY_PAT_*`` / ``REACHY_SELF_MOVING_*`` this
+        #: way through a systemd drop-in), while a rules file is an explicit,
+        #: version-controlled statement about this robot's behavior and must
+        #: win over an environment variable somebody exported once.
+        #:
+        #: An unknown behavior or an unknown param is IGNORED rather than
+        #: refused: the environment is not validated config, and a stale
+        #: exported variable must not stop a robot from booting.
+        self._param_overrides = dict(param_overrides or {})
         #: ``speech(text) -> None`` — the ACT-OUT seam a firing rule's ``say``
         #: is handed to, typically
         #: :meth:`reachy.behavior.speech_act.SpeechActuator.say`. Injected, and
@@ -477,6 +503,11 @@ class RuleEngine:
     def _build(self, rule: Rule):
         """Realise a react rule via the vetted library.build path (mode-swapped).
 
+        Params are layered weakest-first: the library catalog's defaults, then
+        the composition-time :attr:`_param_overrides` overlay, then the active
+        mode's params, then the rule's own — see the constructor's note on why
+        an environment overlay must lose to a rules file.
+
         The admitted :class:`~reachy.behavior.model.Lifetime` uses
         ``rule.duration_s`` as its ``duration`` when the rule carries one,
         overriding the target entry's own default; otherwise it falls back to
@@ -487,6 +518,9 @@ class RuleEngine:
         """
         entry = self._lib.LIBRARY[rule.behavior]
         params = entry.default_params()
+        for key, value in self._param_overrides.get(rule.behavior, {}).items():
+            if key in entry.params:  # an env overlay only moves a real behavior knob
+                params[key] = value
         for key, value in self._active_mode_params().items():
             if key in entry.params:  # a mode param only swaps a real behavior knob
                 params[key] = value

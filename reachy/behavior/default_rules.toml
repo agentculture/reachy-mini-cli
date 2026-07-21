@@ -72,27 +72,72 @@ run = "pet-reaction"
 cooldown_s = 5.0
 
 # --------------------------------------------------------------------------- #
-# SOUND — turn toward it, on measured energy rather than a flag               #
+# SOUND — turn toward it, on energy measured RELATIVE to the room             #
 # --------------------------------------------------------------------------- #
 #
-# Keyed on `rms`, not `speech`: loudness is a physical measurement of the mic,
-# so it works on a bare box with nothing else installed and no external service
-# reachable — which is exactly the fresh-install case these defaults exist for.
-# (`transcript` would be the stronger signal, but it needs a reachable STT
-# service; a default that silently does nothing without one is not a default.)
+# Keyed on loudness, not `speech`: loudness is a physical measurement of the
+# mic, so it works on a bare box with nothing else installed and no external
+# service reachable — which is exactly the fresh-install case these defaults
+# exist for. (`transcript` would be the stronger signal, but it needs a
+# reachable STT service; a default that silently does nothing without one is
+# not a default.)
 #
-# The `value` below is `OrientParams.rms_floor` — the same number
-# `orient-to-sound`'s OWN admission gate uses, itself the donor's
-# `SnapDetector.min_rms` "sound is present" floor. Stating it once here means
-# the rule never admits a behavior whose gate would immediately close again;
-# `tests/test_behavior_default_rules.py` pins the two together so the copy in
-# this file cannot drift from the behavior's default.
+# It keys on `rms_ratio`, NOT the raw `rms`, and that distinction is the whole
+# of issue #102. This rule used to read `rms >= 0.02` — one absolute number,
+# calibrated in one room. Measured on the deployed robot over 24 h
+# (`docs/verification/2026-07-21-live-verification-night.md` section 4) the mic
+# background drifts ~25x across conditions the SAME robot lives in:
+#
+#   daytime baseline .......................  p50 0.004   ->   0 % over 0.02
+#   night, no streaming ....................  p50 0.0207  ->  51.7 % over 0.02
+#   night, 50 Hz streaming (the normal one).  p50 0.034   ->  99.1 % over 0.02
+#   post-motion settle, 0-4 s ..............  p50 0.07-0.13 -> 100 % over 0.02
+#
+# So 0.02 sat UNDER the night background — every empty-room "fire" the operator
+# saw was the background, honestly reported — while any number above the night
+# state deafens the daytime robot. No absolute value is right in both rooms.
+# `rms_ratio` is this tick's loudness over a rolling median of the room's own
+# background (`reachy/behavior/rms_background.py`), so "loud" is a comparison
+# again: 5x the room, whatever the room happens to be.
+#
+# The `value` below is `OrientParams.rms_ratio` — the same number
+# `orient-to-sound`'s OWN admission gate uses, itself `SnapDetector`'s default
+# ratio (the companion the old 0.02 was originally separated FROM). Stating it
+# once here means the rule never admits a behavior whose gate would immediately
+# close again; `tests/test_behavior_default_rules.py` pins the two together so
+# the copy in this file cannot drift from the behavior's default. At the
+# measured daytime background the arithmetic is unchanged from what shipped:
+# 5 x 0.004 = 0.020.
+#
+# The other half of the tunable pair — the WINDOW the background is estimated
+# over — is `OrientParams.rms_background_s` (10 s), overridable at composition
+# with `REACHY_RMS_BACKGROUND_S`. A shorter window tracks a drifting room
+# faster and is more easily dominated by one utterance; a longer one is steadier
+# and slower to notice a genuinely new room.
 #
 # Admission is cheap even when it is wrong: with no credible sound
 # `orient-to-sound` ABSTAINS rather than freezing, so `feel-alive` keeps
 # breathing through it and the head never moves. The behavior's own graded
 # ladder (`CorroboratedGate` + `LatchedDoaGuard`) decides whether anything
 # actually turns — antenna lean, a bounded head nudge, or the deliberate turn.
+#
+# And that ladder is graded by COST, not just by evidence. This rule's `value`
+# admits TIER 1 — the antenna lean. TIER 2, the head/body turn, needs one more
+# thing: sound that is LOUD relative to the room (`rms_ratio_loud`, 15x) or
+# ONGOING (`sustain_s`, 1.5 s). The reason is measured, and it is not about
+# taste: in an ordinary room this rule fired 203 times in 8 minutes, and in the
+# same session the pat sense recorded ZERO detections in 5 minutes — the pat
+# sense suspends while another behavior owns the head, so a head that keeps
+# turning is a head that can never feel a pat. Making tier 2 rare is what makes
+# touch work.
+#
+# All three knobs are tunable here, per rule, e.g.
+#
+#   params = { rms_ratio = 6.0, rms_ratio_loud = 20.0, sustain_s = 2.0 }
+#
+# or on a deployed box via `REACHY_ORIENT_RMS_RATIO` /
+# `REACHY_ORIENT_RMS_RATIO_LOUD` / `REACHY_ORIENT_SUSTAIN_S` (a systemd drop-in,
+# no file edit). A `params` entry here always wins over the environment.
 #
 # `duration_s = 12` is derived, not chosen by feel: a full cycle is at most
 # `max_dur` (4 s) turning + `hold` (3 s) + `recenter_after` (4 s) easing home =
@@ -102,7 +147,7 @@ cooldown_s = 5.0
 # gate stays shut while the head is being driven.
 [[react]]
 id = "look-toward-sound"
-when = { field = "rms", op = "ge", value = 0.02 }
+when = { field = "rms_ratio", op = "ge", value = 5.0 }
 run = "orient-to-sound"
 duration_s = 12.0
 cooldown_s = 2.0

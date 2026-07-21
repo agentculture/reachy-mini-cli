@@ -52,11 +52,23 @@ would swivel the robot at nothing about half the time, pointing somewhere
 uncorrelated with anything real. :class:`CorroboratedGate` therefore requires,
 cheapest first:
 
-1. **Sound energy** — ``sense.rms >= rms_floor``. This is not a new invention:
-   it is the donor's own ``sound_present``, which was exactly
-   ``rms > SnapDetector.min_rms`` (0.02) in ``listen``'s audio tap. A quiet room
-   has no energy however the daemon's speech flag reads, so this alone converts
-   a coin flip into "only while something is actually audible".
+1. **Sound energy, RELATIVE to the room** — ``sense.rms_ratio >= rms_ratio``.
+   This started as the donor's own ``sound_present``, which was exactly
+   ``rms > SnapDetector.min_rms`` (0.02) in ``listen``'s audio tap, and shipped
+   here as an absolute ``rms_floor``. Hands-on measurement then killed the
+   absolute form (issue #102,
+   ``docs/verification/2026-07-21-live-verification-night.md`` section 4): the
+   mic background drifts ~25x across conditions one robot lives in within 24 h
+   — daytime p50 0.004, night-with-streaming p50 0.034 — so 0.02 sat UNDER the
+   night background (99.1 % of still-room samples cleared it) while anything
+   above the night state deafens the daytime robot. The conjunct is therefore a
+   RATIO over a rolling background estimate
+   (:class:`reachy.behavior.rms_background.RmsBackground`, computed upstream in
+   the sense layer and delivered as ``Sense.rms_ratio``), which restores the
+   shape ``SnapDetector`` always had: ``rms > ratio * rolling_avg``. A quiet
+   room has no energy ABOVE ITSELF however the daemon's speech flag reads, so
+   this alone converts a coin flip into "only while something is actually
+   audible", in every room rather than only the calibration room.
 2. **A bearing that holds still** — the angle must stay within ``dwell_tol_rad``
    for ``dwell_s`` before any HEAD-moving tier opens. The measured wander (35
    distinct angles across the full range in 60 s) cannot clear this; a person
@@ -75,7 +87,7 @@ inside a loud room passing the dwell test — is closed by
 :class:`LatchedDoaGuard`, which asks the different question of whether the angle
 has CHANGED at all. Read that class's docstring for what it does and does not
 defend; notably, on the daemon build actually measured it never fires, and
-``rms`` remains the conjunct that keeps a quiet room still.
+``rms_ratio`` remains the conjunct that keeps a quiet room still.
 
 The NOISE tier additionally carries an attack/release envelope
 (:class:`_NoiseEnvelope`): live-verified, a keyboard-click train flapped the
@@ -83,6 +95,16 @@ bare per-tick predicate at tick rate (22 ``NONE->NOISE`` opens in 1.3 s), so
 NOISE now opens only after ``noise_attack_ticks`` consecutive loud reads and
 closes only after ``noise_release_s`` of continuous quiet — see that class's
 docstring for the measured burst and the timing contract.
+
+The two tiers are also graded by COST (d6). Tier 1 is the antenna lean and
+leaves the head alone; tier 2 (the head/body turn) additionally requires a
+PROMOTION — sound that is LOUD relative to the room (``rms_ratio_loud``) or
+ONGOING (``sustain_s``). The measured reason is blunt: with the old absolute
+floor the rule fired 203 times in 8 minutes in an ordinary room, and the pat
+sense — which suspends while another behavior owns the head — recorded zero
+detections in 5 minutes. A head that keeps turning cannot feel a pat, so making
+tier 2 rare is what makes touch work. See :class:`CorroboratedGate`'s "Two
+tiers, and why tier 2 is rare".
 
 Pure standard library plus in-package value types. No transport, no
 ``reachy_mini``, no :mod:`reachy.motion` import.
@@ -97,6 +119,7 @@ from typing import Callable
 
 from reachy import senselog
 from reachy.behavior.model import Contribution, neutral_head
+from reachy.behavior.rms_background import DEFAULT_LOUD_RATIO, DEFAULT_RATIO, DEFAULT_WINDOW_S
 from reachy.behavior.sense import Sense, doa_angle_to_yaw
 
 #: The ``[SENSE stage=...]`` stage name every line this module logs carries.
@@ -140,7 +163,28 @@ class OrientParams:
     engaged_min_dur: float = 1.5  # duration floor for the deliberate engaged turn
     recenter_after: float = 4.0  # silence grace before the heading drifts home
     # -- admission gate (this port's own; see the module docstring) --------- #
-    rms_floor: float = 0.02  # the donor's ``sound_present`` floor (SnapDetector.min_rms)
+    # The two knobs that ARE the sound-admission contract (#102): how many times
+    # the room's own background a reading must stand, and how long a window that
+    # background is estimated over. They replace the retired absolute
+    # ``rms_floor = 0.02``, which no single value could make right in both the
+    # measured daytime and night rooms. Both read their defaults from
+    # :mod:`reachy.behavior.rms_background` rather than restating a number, so
+    # the gate, the estimator and the shipped rule cannot drift apart.
+    #
+    # ``rms_background_s`` is DECLARED here — it is half of "how many times over
+    # how long", and the admission contract should read in one place — but it is
+    # consumed by the sense-layer estimator, which is composed once per process
+    # (env ``REACHY_RMS_BACKGROUND_S``). Retuning it per behavior instance
+    # therefore does not move the estimator; retuning ``rms_ratio`` does move
+    # this gate. Stated plainly rather than left to be discovered.
+    #
+    # ``rms_ratio_loud`` / ``sustain_s`` are the TIER-2 promotion pair (d6): a
+    # head/body turn needs sound that is LOUD relative to the room, or ONGOING.
+    # See :class:`CorroboratedGate`'s "Two tiers, and why tier 2 is rare".
+    rms_ratio: float = DEFAULT_RATIO  # reading / rolling background, the admission point
+    rms_background_s: float = DEFAULT_WINDOW_S  # window the background is estimated over
+    rms_ratio_loud: float = DEFAULT_LOUD_RATIO  # reading / background that promotes on loudness
+    sustain_s: float = 1.5  # continuous sound above rms_ratio that promotes on persistence
     dwell_s: float = 0.6  # the bearing must hold this long before the head moves
     dwell_tol_rad: float = 0.12  # how far the bearing may move and still count as held
     latch_after_s: float = 8.0  # a BIT-IDENTICAL bearing this long is a wedged feed
@@ -348,7 +392,7 @@ class _NoiseEnvelope:
     throughout, because the rms reading genuinely alternates loud/quiet per
     tick on clicky sound. Every open commanded an antenna lean and every close
     removed it, so the operator saw sharp per-tick antenna twitching. The NOISE
-    tier was a bare per-tick predicate (doa finite AND ``rms >= rms_floor``)
+    tier was a bare per-tick predicate (doa finite AND the loudness conjunct)
     with zero temporal smoothing — SPEECH has an angular dwell, NOISE had
     nothing. This envelope is that missing smoothing:
 
@@ -365,32 +409,66 @@ class _NoiseEnvelope:
     hold — so the tier no longer collapses ~20 ms after its own lean starts.
     One lean per sound episode, held up to the release window.
 
-    Stateful in three scalars, O(1) per call; the clock is the ``now`` already
-    flowing through :meth:`CorroboratedGate._decide`, so it is deterministic
-    under an injected clock. It emits no log lines of its own — the tier
-    transitions :class:`OrientToSound` already logs are the observable trace,
-    and this envelope is exactly what bounds them to ~2 per episode.
+    Stateful in a handful of scalars, O(1) per call; the clock is the ``now``
+    already flowing through :meth:`CorroboratedGate._decide`, so it is
+    deterministic under an injected clock. It emits no log lines of its own —
+    the tier transitions :class:`OrientToSound` already logs are the observable
+    trace, and this envelope is exactly what bounds them to ~2 per episode.
+
+    Since d6 it also answers the ONGOING question. An episode's open window IS
+    "the sound is still going" — attack-debounced at the start, gap-tolerant in
+    the middle — so :meth:`sustained_for` is that duration, and the tier-2
+    promotion reads it rather than growing a third smoothing mechanism beside
+    this one and the angular dwell. :attr:`episodes` counts opens, which is what
+    lets a caller log once per episode instead of once per tick.
     """
 
     def __init__(self) -> None:
         self._streak = 0
         self._open = False
         self._quiet_since: float | None = None
+        self._open_since: float | None = None
+        self._episodes = 0
 
-    def loud(self, params: OrientParams) -> bool:
+    @property
+    def episodes(self) -> int:
+        """How many times this envelope has opened — a per-episode logging key."""
+        return self._episodes
+
+    @property
+    def open_since(self) -> float | None:
+        """When the current episode opened, or ``None`` while closed."""
+        return self._open_since
+
+    def sustained_for(self, now: float) -> float:
+        """How long the current sound episode has been running, in seconds.
+
+        ``0.0`` while closed. Because the release hold rides gaps shorter than
+        ``noise_release_s``, this measures the EPISODE, not an unbroken run of
+        loud ticks — which is what "ongoing sound" means to a listener and what
+        the tier-2 promotion needs. A per-tick-loud requirement would be
+        unsatisfiable on real speech, whose rms alternates loud/quiet at tick
+        rate (the measured click-train finding this envelope was built for).
+        """
+        if not self._open or self._open_since is None:
+            return 0.0
+        return max(0.0, now - self._open_since)
+
+    def loud(self, now: float, params: OrientParams) -> bool:
         """Record a loud read; return whether NOISE is open after it."""
         self._quiet_since = None
         if not self._open:
             self._streak += 1
             if self._streak >= max(1, int(params.noise_attack_ticks)):
-                self._open = True
+                self._begin(now)
         return self._open
 
-    def force_open(self) -> None:
+    def force_open(self, now: float) -> None:
         """A higher tier (SPEECH/ENGAGED) is live: the envelope opens by fiat."""
         self._streak = 0
         self._quiet_since = None
-        self._open = True
+        if not self._open:
+            self._begin(now)
 
     def quiet(self, now: float, params: OrientParams) -> bool:
         """Record a quiet read; return whether the release hold keeps NOISE open."""
@@ -407,6 +485,12 @@ class _NoiseEnvelope:
         self._streak = 0
         self._open = False
         self._quiet_since = None
+        self._open_since = None
+
+    def _begin(self, now: float) -> None:
+        self._open = True
+        self._open_since = now
+        self._episodes += 1
 
 
 class CorroboratedGate:
@@ -419,10 +503,53 @@ class CorroboratedGate:
     is O(1) per tick and deterministic under an injected clock.
 
     The envelope governs only the NOISE tier's open/close TIMING. The
-    transcript ENGAGED fast-path stays immediate, SPEECH escalation (dwell +
-    ``speech_detected``) evaluates exactly as before, and during the release
+    transcript ENGAGED fast-path stays immediate, and during the release
     hold the gate reports NOISE — a quiet gap has no meaningful bearing, so
     the lean relaxes when the tier actually closes, exactly once.
+
+    Two tiers, and why tier 2 is rare (d6)
+    ======================================
+    Live-verified on the deployed robot: with the absolute floor,
+    ``look-toward-sound`` fired **203 times in 8 minutes** in an ordinary room,
+    and in the same session the pat sense recorded **zero detections in 5
+    minutes**. Those two numbers are one finding. The pat sense is
+    ownership-gated AND stillness-gated (``CLAUDE.md``, "Pat sense"), so while
+    ``orient-to-sound`` owns the head it suspends and never re-baselines: **a
+    head that keeps turning is a head that can never feel a pat.** Making the
+    head move less is therefore not a cosmetic preference, it is what makes
+    touch work at all.
+
+    So the ladder is graded by COST, not just by evidence:
+
+    * **Tier 1 — the antenna lean** (``NOISE``). Sound standing at
+      ``rms_ratio`` above the room's rolling background, attack/release
+      smoothed by :class:`_NoiseEnvelope`. Cheap, subtle, and it leaves the
+      head alone, so it can afford to be common.
+    * **Tier 2 — the head/body turn** (``SPEECH``). Everything tier 1 needs,
+      plus ``speech_detected``, plus the angular dwell — and now, additionally,
+      a PROMOTION: the sound must be either **LOUD** (``rms_ratio_loud``, three
+      times the tier-1 ratio) or **ONGOING**
+      (:meth:`_NoiseEnvelope.sustained_for` at least ``sustain_s``). A
+      reflexive turn toward an unintelligible one-off is noise-chasing; the
+      promotion is what makes the head rare.
+
+    ``sustain_s`` defaults to 1.5 s against measurement, not feel: the
+    transient train that motivated :class:`_NoiseEnvelope` lasted **1.3 s**, so
+    the worst measured episode of pure clatter still cannot promote on the
+    ongoing branch, while a spoken sentence comfortably does. And a single
+    transient — a clap, a door — cannot reach tier 2 by ANY branch, loud
+    included, because the pre-existing 0.6 s angular dwell already refuses it.
+
+    ``ENGAGED`` keeps its immediate fast-path deliberately. An addressed
+    utterance is not "an unintelligible sound": it has already cleared the
+    layered engagement gate, which is the strongest corroboration the runtime
+    has, and it is by construction sustained speech aimed at the robot. The d6
+    argument — do not turn the head at noise — simply does not apply to it.
+
+    A promotion is logged ONCE PER EPISODE (keyed on
+    :attr:`_NoiseEnvelope.episodes`) and names which branch fired, so a journal
+    read after the fact can tell a turn earned by loudness from one earned by
+    persistence.
 
     Never raises: a hostile or partially-shaped snapshot resolves to
     :data:`OrientTier.NONE` (dropping any release hold — fail closed),
@@ -434,6 +561,7 @@ class CorroboratedGate:
         self._ref_angle: float | None = None
         self._ref_since: float = 0.0
         self._envelope = _NoiseEnvelope()
+        self._promoted_episode = -1
 
     def __call__(self, sense: Sense, now: float, params: OrientParams) -> OrientTier:
         try:
@@ -450,25 +578,50 @@ class CorroboratedGate:
             return self._quiet(now, params)
 
         # An ADDRESSED utterance already cleared the layered engagement gate, so it
-        # is corroboration in its own right — no dwell, no loudness threshold, and
-        # no attack debounce (the fast-path stays immediate).
+        # is corroboration in its own right — no dwell, no loudness threshold, no
+        # attack debounce and no tier-2 promotion (the fast-path stays immediate).
         if sense.transcript is not None:
             self._adopt(float(angle), now)
-            self._envelope.force_open()
+            self._envelope.force_open(now)
             return OrientTier.ENGAGED
 
-        rms = sense.rms
-        if rms is None or not (float(rms) >= params.rms_floor):
+        # RELATIVE, not absolute (#102): a cold estimator reports ``None`` and
+        # is treated exactly like silence — fail-closed, since with no
+        # background there is nothing for a reading to be loud against.
+        ratio = sense.rms_ratio
+        if ratio is None or not (float(ratio) >= params.rms_ratio):
             self._ref_angle = None
             return self._quiet(now, params)
 
         held_for = self._adopt(float(angle), now, tol=params.dwell_tol_rad)
-        noise_open = self._envelope.loud(params)
+        noise_open = self._envelope.loud(now, params)
         if sense.speech_detected and held_for >= params.dwell_s:
-            # The envelope governs only NOISE timing; escalation is untouched.
-            self._envelope.force_open()
-            return OrientTier.SPEECH
+            # Tier 2 costs the head, so it needs one more thing than tier 1 (d6).
+            if self._promotion(float(ratio), now, params) is not None:
+                self._envelope.force_open(now)
+                return OrientTier.SPEECH
         return OrientTier.NOISE if noise_open else OrientTier.NONE
+
+    def _promotion(self, ratio: float, now: float, params: OrientParams) -> str | None:
+        """Which tier-2 branch this reading earns, or ``None`` for "stay at tier 1"."""
+        sustained = self._envelope.sustained_for(now)
+        if ratio >= params.rms_ratio_loud:
+            reason = "loud"
+        elif sustained >= params.sustain_s:
+            reason = "sustained"
+        else:
+            return None
+        episode = self._envelope.episodes
+        if episode != self._promoted_episode:
+            self._promoted_episode = episode
+            senselog.stage(
+                STAGE,
+                "doa",
+                "tier2",
+                f"promoted reason={reason} ratio={ratio:.1f}x "
+                f"sustained={sustained:.2f}s loud_at={params.rms_ratio_loud:.1f}x",
+            )
+        return reason
 
     def _quiet(self, now: float, params: OrientParams) -> OrientTier:
         """A quiet or bearing-less read: NONE, unless the release hold rides it out."""
@@ -498,15 +651,17 @@ class LatchedDoaGuard:
     there is no audio path at all" — with ``sound_present`` being literally
     ``rms > SnapDetector.min_rms`` (``_audio`` in
     ``reachy.cli._commands.listen``). :class:`CorroboratedGate`'s first conjunct
-    IS that check, so the substance of the donor's latched-DoA guard is already
-    ported and this class does NOT re-implement it. (This port is also the
-    stricter of the two: the donor DEGRADED to the latched angle on an audio-less
-    profile, while the runtime refuses — there is always a mic here.)
+    IS that check — now in the RELATIVE form ``SnapDetector`` itself always used
+    (#102, see the module docstring) — so the substance of the donor's
+    latched-DoA guard is already ported and this class does NOT re-implement it.
+    (This port is also the stricter of the two: the donor DEGRADED to the
+    latched angle on an audio-less profile, while the runtime refuses — there is
+    always a mic here.)
 
     The half a floor+dwell gate cannot reach
     ========================================
     Dwell asks "is the bearing STEADY"; a wedged feed is *maximally* steady, so
-    the dwell conjunct votes YES **because of** the fault. ``rms`` (the held
+    the dwell conjunct votes YES **because of** the fault. ``rms_ratio`` (the held
     media client's mic) and ``doa_angle`` (the daemon's ``/api/state/doa`` route)
     are independent sources, so a wedged DoA route inside a room with real sound
     passes both of t8's conjuncts and parks the robot in a stuck stare — pointed
@@ -521,7 +676,7 @@ class LatchedDoaGuard:
     build we can observe, this guard never fires and a test pins that. It is a
     defence against a *different* state — a wedged pipeline, or another daemon
     build that latches at rest the way the donor's docstring said the daemon
-    did. It is emphatically NOT what keeps a quiet room still; ``rms`` is. Stated
+    did. It is emphatically NOT what keeps a quiet room still; ``rms_ratio`` is. Stated
     plainly because a guard nobody can trigger is easy to mistake for a guard
     that is doing the work.
 

@@ -61,6 +61,29 @@ Suppression is observable per TRANSITION, never per tick: the gate emits one
 many suppressed reads it held), per :mod:`reachy.senselog`'s "a drop always
 names its reason" discipline.
 
+The derived RELATIVE reading (issue #102)
+-----------------------------------------
+``rms`` above is a raw loudness and stays one — it is an honest measurement and
+other consumers read it. What ADMISSION keys on is now
+:class:`RmsSense`'s second, derived field: ``rms_ratio``, this tick's loudness
+over a rolling estimate of the room's own background
+(:class:`reachy.behavior.rms_background.RmsBackground`). The measured reason is
+in that module's docstring — the mic background drifts ~25x across conditions
+the same robot lives in within 24 h, so an absolute floor is either under the
+night background or above the daytime signal, never both.
+
+The comparison has to be made HERE, upstream of the predicate, because a
+:class:`reachy.behavior.rules.Rule` carries exactly ONE ``when`` predicate:
+"loud relative to the background" cannot be written as a conjunction in a rules
+file, so it has to arrive as a sense field that already means it.
+
+:class:`RmsSense` is what fans ONE mic read out to both: :meth:`RmsSense.pull`
+takes the reading once per tick (idempotent on the tick's clock value, the same
+contract ``_AudioTap`` gives the audio itself) and :meth:`RmsSense.rms` /
+:meth:`RmsSense.ratio` are plain latch peeks. Feeding the estimator twice for
+one tick would double-weight that tick in the background; recomputing the ratio
+from a stale latch would decouple the two fields of one snapshot.
+
 Degradation
 -----------
 Every failure mode — no client, a closed/absent holder, a raising read, a
@@ -76,10 +99,12 @@ exactly the pre-#95 behavior.
 from __future__ import annotations
 
 import math
+import time
 from typing import Any, Callable
 
 from reachy import senselog
-from reachy.behavior.sense import RmsProvider, SelfMovingProvider
+from reachy.behavior.rms_background import RmsBackground
+from reachy.behavior.sense import RmsProvider, RmsRatioProvider, SelfMovingProvider
 from reachy.motion.rms import compute_rms
 
 #: Zero-arg callable returning the latest raw mic chunk (an ndarray-like), or
@@ -151,12 +176,23 @@ class _MovingFloorGate:
         return measured
 
     def _is_moving(self) -> bool:
-        # A raising peek degrades to "not moving": the measured rms passes
-        # through unchanged — exactly the pre-#95 behavior, never a crash.
-        try:
-            return bool(self._moving())
-        except Exception:  # noqa: BLE001
-            return False
+        return peek_moving(self._moving)
+
+
+def peek_moving(moving: SelfMovingProvider | None) -> bool:
+    """The self-motion latch's value, tolerating absence and any failure.
+
+    A raising or missing peek degrades to "not moving": for the moving floor
+    that means the measured rms passes through unchanged (exactly the pre-#95
+    behavior), and for the background estimator it means the sample is learned.
+    Both are the pre-existing behavior, and neither is ever a crash.
+    """
+    if moving is None:
+        return False
+    try:
+        return bool(moving())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def rms_from_chunk(chunk: Any) -> float | None:
@@ -180,6 +216,97 @@ def rms_from_chunk(chunk: Any) -> float | None:
         return None
 
 
+class RmsSense:
+    """ONE mic read per tick, fanned out to the raw and the relative field.
+
+    :meth:`pull` performs the tick's single read: it takes the injected chunk,
+    maps it to a loudness, passes it through the #95 moving floor, and (when an
+    estimator is wired) folds it into the rolling background and latches the
+    resulting ratio. :meth:`rms` and :meth:`ratio` are then plain peeks of that
+    latch, directly usable as
+    ``SenseProviders(rms=sense.rms, rms_ratio=sense.ratio)``.
+
+    The split matters in both directions. Reading audio inside each provider
+    would consume the tick's chunk twice (the ``_AudioTap`` contract); folding
+    the sample into the background inside each provider would double-weight the
+    tick in the estimate; and deriving the ratio anywhere but from the SAME read
+    would let the two fields of one :class:`reachy.behavior.sense.Sense`
+    disagree. So the read happens once, here, at the top of the tick — the same
+    shape ``_AudioTap`` uses for the audio itself, restated one layer up.
+
+    *background* is optional: with none wired, :meth:`ratio` is permanently
+    ``None`` and nothing is estimated — the pre-#102 behavior, byte for byte.
+    *moving* is the self-motion latch peek, consulted twice per tick for two
+    different jobs: it gates the raw reading (#95) and it EXCLUDES the sample
+    from the background (#102, see :class:`RmsBackground`).
+
+    Never raises: an unreachable/raising audio source, a hostile chunk and a
+    raising ``moving`` peek all resolve to "no reading" for the tick.
+    """
+
+    def __init__(
+        self,
+        audio: AudioChunkProvider,
+        *,
+        moving: SelfMovingProvider | None = None,
+        moving_floor: float = DEFAULT_MOVING_FLOOR,
+        background: RmsBackground | None = None,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._audio = audio
+        self._moving = moving
+        self._gate = _MovingFloorGate(moving, moving_floor) if moving is not None else None
+        self._background = background
+        self._now = now
+        self._rms: float | None = None
+        self._ratio: float | None = None
+        self._pulled_at: float | None = None
+
+    @property
+    def background(self) -> RmsBackground | None:
+        """The rolling background estimator, or ``None`` when none is wired."""
+        return self._background
+
+    def pull(self, t: float | None = None) -> None:
+        """Take this tick's reading once. Idempotent on *t*; never raises.
+
+        Called with the engine's tick clock a repeated call within the same
+        tick is a no-op, so a second ``read_perception`` for the same tick
+        cannot feed the estimator twice. Called with no *t* (the standalone
+        provider path) every call is its own read.
+        """
+        if t is not None and t == self._pulled_at:
+            return
+        self._pulled_at = t
+        try:
+            chunk = self._audio()
+        except Exception:  # noqa: BLE001 — an unreachable source is "no reading"
+            chunk = None
+        measured = rms_from_chunk(chunk)
+        self._rms = measured if self._gate is None else self._gate.apply(measured)
+        if self._background is None:
+            return
+        self._ratio = self._background.observe(
+            self._rms,
+            t if t is not None else self._clock(),
+            excluded=peek_moving(self._moving),
+        )
+
+    def rms(self) -> float | None:
+        """This tick's raw (moving-floor gated) loudness — the ``rms`` provider."""
+        return self._rms
+
+    def ratio(self) -> float | None:
+        """This tick's loudness over the rolling background — the ``rms_ratio`` provider."""
+        return self._ratio
+
+    def _clock(self) -> float:
+        try:
+            return float(self._now())
+        except Exception:  # noqa: BLE001 — a broken clock must not crash the tick
+            return 0.0
+
+
 def make_rms_provider(
     audio: AudioChunkProvider,
     *,
@@ -201,15 +328,33 @@ def make_rms_provider(
     is below *moving_floor*, the reading is reported QUIET (``0.0``, never
     ``None``). With no *moving* seam wired the provider is byte-identical to
     the pre-#95 one — the gate is not even constructed.
+
+    This is the RAW-ONLY front: no background is estimated and no ratio is
+    derived. The engine composition builds a :class:`RmsSense` instead, because
+    it needs both fields off one read; this factory stays for callers (and
+    tests) that only want loudness.
     """
-    gate = _MovingFloorGate(moving, moving_floor) if moving is not None else None
+    sense = RmsSense(audio, moving=moving, moving_floor=moving_floor)
 
     def _provider() -> float | None:
-        try:
-            chunk = audio()
-        except Exception:  # noqa: BLE001
-            return None
-        measured = rms_from_chunk(chunk)
-        return measured if gate is None else gate.apply(measured)
+        sense.pull()
+        return sense.rms()
 
     return _provider
+
+
+def make_rms_providers(
+    audio: AudioChunkProvider,
+    *,
+    moving: SelfMovingProvider | None = None,
+    moving_floor: float = DEFAULT_MOVING_FLOOR,
+    background: RmsBackground | None = None,
+) -> tuple[RmsSense, RmsProvider, RmsRatioProvider]:
+    """Build the tick-coherent pair: ``(sense, rms_provider, ratio_provider)``.
+
+    The composition helper. The caller must drive ``sense.pull(t)`` once per
+    tick, at the top of its sense read and right after the audio tap's own
+    pull — the providers are latch peeks and read nothing on their own.
+    """
+    sense = RmsSense(audio, moving=moving, moving_floor=moving_floor, background=background)
+    return sense, sense.rms, sense.ratio

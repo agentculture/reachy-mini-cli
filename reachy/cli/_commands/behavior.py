@@ -76,7 +76,14 @@ from reachy.behavior.pat_sense import (
     PatSenseDriver,
 )
 from reachy.behavior.pose_feed import LastPoseHolder
-from reachy.behavior.rms_sense import DEFAULT_MOVING_FLOOR, MOVING_FLOOR_ENV, make_rms_provider
+from reachy.behavior.rms_background import (
+    DEFAULT_SILENCE_FLOOR,
+    DEFAULT_WINDOW_S,
+    SILENCE_FLOOR_ENV,
+    WINDOW_S_ENV,
+    RmsBackground,
+)
+from reachy.behavior.rms_sense import DEFAULT_MOVING_FLOOR, MOVING_FLOOR_ENV, make_rms_providers
 from reachy.behavior.rule_engine import STAGE as RULE_STAGE
 from reachy.behavior.rule_engine import TickBus
 from reachy.behavior.rules import RulesLoader
@@ -714,7 +721,7 @@ def cmd_rules_overview(args: argparse.Namespace) -> int:
                     "sense field nothing currently feeds — it validates but can never fire",
                     "'rules check' likewise warns on a rule keyed on bare 'speech', which "
                     "measured 45.8% true in a quiet room — pair it with a corroborating "
-                    "signal (transcript/rms/pat/face) instead",
+                    "signal (transcript/rms_ratio/rms/pat/face) instead",
                 ],
             },
         ],
@@ -899,7 +906,7 @@ def _boot_tick_seam() -> reload_driver.ReloadDriver | None:
         senselog.drop(RULE_STAGE, "rules", "boot", loader.last_error)
         if not (loader.current.react or loader.current.inhibit):
             return None
-    return reload_driver.ReloadDriver(loader)
+    return reload_driver.ReloadDriver(loader, param_overrides=_behavior_param_overrides())
 
 
 # --------------------------------------------------------------------------- #
@@ -1185,6 +1192,58 @@ def _rms_moving_floor() -> float:
             remediation=f"set {MOVING_FLOOR_ENV} to zero or more (or 'inf'), or unset it",
         )
     return value
+
+
+#: ``REACHY_*`` env name -> the ``orient-to-sound`` knob it tunes. The three d6
+#: admission knobs, and only those: the ratio that earns the antenna lean, and
+#: the LOUD/ONGOING pair that promotes to a head turn. Every other orient knob
+#: stays rules-file-only — a box tunes admission, a rules file states behavior.
+_ORIENT_PARAM_ENV: dict[str, str] = {
+    "REACHY_ORIENT_RMS_RATIO": "rms_ratio",
+    "REACHY_ORIENT_RMS_RATIO_LOUD": "rms_ratio_loud",
+    "REACHY_ORIENT_SUSTAIN_S": "sustain_s",
+}
+
+
+def _behavior_param_overrides() -> dict[str, dict[str, float]]:
+    """Resolve the ``REACHY_ORIENT_*`` knobs into a rule-engine param overlay.
+
+    Read at COMPOSITION time (the same pattern as ``REACHY_PAT_*`` /
+    ``REACHY_SELF_MOVING_*`` / :func:`_rms_background`), so
+    :mod:`reachy.behavior.orient` and :mod:`reachy.behavior.rule_engine` stay
+    environment-free and deterministic in tests. A malformed value is a clean
+    exit-1 user error, never a silent fallback — see :func:`_pat_float_env`.
+
+    The overlay loses to the rules file on purpose
+    (:class:`~reachy.behavior.rule_engine.RuleEngine`'s constructor note): this
+    is the surface for a box-local systemd drop-in, the way the deployed robot
+    already tunes the pat sense, not a way to override version-controlled
+    behavior config from a stray exported variable.
+    """
+    values: dict[str, float] = {}
+    for env_name, param in _ORIENT_PARAM_ENV.items():
+        if os.environ.get(env_name) is None:
+            continue
+        values[param] = _pat_float_env(env_name, 0.0)
+    return {"orient-to-sound": values} if values else {}
+
+
+def _rms_background() -> RmsBackground:
+    """Build the rolling background estimator (#102), honouring its env tuning.
+
+    Reads :data:`~reachy.behavior.rms_background.WINDOW_S_ENV` /
+    :data:`~reachy.behavior.rms_background.SILENCE_FLOOR_ENV` at composition
+    time — the same read-at-composition pattern as the ``REACHY_PAT_*`` and
+    ``REACHY_SELF_MOVING_*`` knobs above — so an operator who sets neither
+    composes the shipped defaults and the estimator module itself stays
+    environment-free. The RATIO is deliberately NOT an env knob here: it is the
+    admission point, and it lives where an operator can already see and override
+    it, in the ``look-toward-sound`` rule and ``OrientParams``.
+    """
+    return RmsBackground(
+        window_s=_pat_float_env(WINDOW_S_ENV, DEFAULT_WINDOW_S),
+        silence_floor=_pat_float_env(SILENCE_FLOOR_ENV, DEFAULT_SILENCE_FLOOR),
+    )
 
 
 #: How often the background keeper re-checks each held client's free
@@ -1534,16 +1593,24 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     leg (its own low-rate polling + failure-swallowing preserved), and every
     other field is a non-consuming PEEK of a driver's one-tick latch or held
     condition. A mic-less box reads EMPTY_SENSE for the DoA leg exactly as
-    before. Seven providers are wired, from five producers:
+    before. Eight providers are wired, from five producers:
 
     * ``pat_event`` / ``pat_state`` — two PEEKs of the ONE
       :class:`PatSenseDriver`, so both views describe one held reader and
       detector;
-    * ``rms`` — :func:`~reachy.behavior.rms_sense.make_rms_provider` over this
-      tick's shared mic chunk, gated by the self-motion latch below (#95): while
-      the engine commands motion and the measured rms sits under the moving
-      floor (:func:`_rms_moving_floor`), the reading reports quiet (0.0) so the
-      robot's own actuator noise can never re-admit ``look-toward-sound``;
+    * ``rms`` / ``rms_ratio`` — two PEEKs of the ONE
+      :class:`~reachy.behavior.rms_sense.RmsSense` over this tick's shared mic
+      chunk. ``rms`` is the raw loudness, gated by the self-motion latch below
+      (#95): while the engine commands motion and the measured rms sits under
+      the moving floor (:func:`_rms_moving_floor`), the reading reports quiet
+      (0.0) so the robot's own actuator noise can never re-admit
+      ``look-toward-sound``. ``rms_ratio`` is that same reading over a rolling
+      median of the room's own background (:func:`_rms_background`, #102) — the
+      field sound admission actually keys on, because the measured mic
+      background drifts ~25x within a day and no absolute floor is right in
+      both the daytime and the night room. The self-motion latch does double
+      duty: it also EXCLUDES the sample from the estimate, so self-noise is
+      neither heard nor learned as the room;
     * ``transcript`` — the :class:`TranscriptSenseDriver`'s one-tick latch of an
       ADDRESSED utterance (its STT round trip and engagement gate run on the
       driver's own worker thread, never here);
@@ -1554,7 +1621,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       peek the rms gate consults), so a rule can key on "am I commanding
       motion" directly.
 
-    Wiring these is what makes ``rms``/``face``/``frame_available``/
+    Wiring these is what makes ``rms``/``rms_ratio``/``face``/``frame_available``/
     ``transcript``/``self_moving`` FED fields: before this, each was a
     schema-valid ``rules.toml`` predicate that validated cleanly and then
     silently never fired. The declared truth ``behavior rules check`` lints
@@ -1740,9 +1807,22 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         media = _make_media_client()
         pump = AudioPump(media)
         audio_tap = _AudioTap(pump, media)
+        # ONE background estimator for the whole runtime (#102). Built here, not
+        # inside either consumer, because the orienting gate and the utterance
+        # capture gate must agree about what the room sounds like — two
+        # estimators fed from the same mic would differ only by their own bugs.
+        # They differ in THRESHOLD, not in estimate: capture starts at 3x the
+        # background, orienting's antenna lean at 5x.
+        background = _rms_background()
         transcript_driver = TranscriptSenseDriver(
             media=audio_tap,  # the shared per-tick chunk, never a second mic read
             classifier=_engagement_classifier(),
+            # The room's own floor, so an utterance starts on sound that stands
+            # ABOVE the room rather than above a number measured in 2026-07-20's
+            # quiet office. Live-verified defect: with the night background at
+            # 0.034 the absolute 0.02 gate never closed and the journal filled
+            # with `utterance start` -> `dropped reason=stt-empty`.
+            background=lambda: background.level,
             # Self-mute: the mic and the speaker share a room, so without this the
             # runtime transcribes its OWN voice, the transcript fires a rule, the
             # rule speaks, and the robot talks to itself forever. The actuator
@@ -1777,14 +1857,22 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         # ctx.pose — no SDK, no extra), consulted by the rms provider at read
         # time so the robot's own actuator noise reads quiet while it moves.
         self_motion = _make_self_motion()
+        # ONE mic read per tick, two sense fields off it (#102): the raw
+        # loudness (gated by the moving floor above) and its ratio over the
+        # rolling background. The self-motion latch does double duty here — it
+        # gates the raw reading AND excludes the sample from the background, so
+        # the robot's own noise can neither be heard nor learned as the room.
+        rms_sense, rms_provider, rms_ratio_provider = make_rms_providers(
+            audio_tap.audio,
+            moving=self_motion.is_moving,
+            moving_floor=_rms_moving_floor(),
+            background=background,  # the ONE estimator, shared with capture above
+        )
         providers = SenseProviders(
             pat_event=pat_driver.as_provider() if pat_driver is not None else None,
             pat_state=pat_driver.as_state_provider() if pat_driver is not None else None,
-            rms=make_rms_provider(
-                audio_tap.audio,
-                moving=self_motion.is_moving,
-                moving_floor=_rms_moving_floor(),
-            ),
+            rms=rms_provider,
+            rms_ratio=rms_ratio_provider,
             transcript=transcript_driver.as_provider(),
             face=face_driver.as_face_provider(),
             frame_available=face_driver.as_frame_available_provider(),
@@ -1793,9 +1881,14 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
 
         def sense_reader(t):
             # Take the tick's ONE audio latch swap first (no mic I/O — the pump
-            # owns that, #100), so the rms provider below and the transcript
+            # owns that, #100), so the rms sense below and the transcript
             # driver later in this same tick share the identical chunk.
             audio_tap.pull(t)
+            # Then the tick's ONE loudness read, off that chunk. Both rms
+            # providers are latch peeks; pulling here (and only here) is what
+            # keeps `rms` and `rms_ratio` two views of one measurement and the
+            # background estimator fed exactly once per tick.
+            rms_sense.pull(t)
             # DoA (throttled by the poller) as the base; every other field is a
             # non-consuming peek of a driver's latch or held condition.
             return read_perception(providers, base=doa_poller(t))

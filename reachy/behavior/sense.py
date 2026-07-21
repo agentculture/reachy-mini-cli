@@ -106,7 +106,15 @@ class Sense:
 
     - ``rms`` — mic loudness for the tick (the same loudness cue
       ``reachy.motion.listen.ListenProducer``'s ``SnapDetector`` reads), or
-      ``None`` when not sampled.
+      ``None`` when not sampled. Deliberately RAW: an honest measurement other
+      consumers read, never the admission predicate (see ``rms_ratio``).
+    - ``rms_ratio`` — the same tick's loudness over a rolling estimate of the
+      room's own background (:class:`reachy.behavior.rms_background.RmsBackground`),
+      or ``None`` when not sampled or the estimate is still cold. This is what
+      sound ADMISSION keys on, because the measured mic background drifts ~25x
+      across conditions one robot lives in within 24 h (issue #102) — so "loud"
+      has to be a comparison, and a one-predicate rule cannot express a
+      comparison, so it arrives already made.
     - ``pat_event`` — ``(touch_type, level)`` from a folded ``PatHook``
       detection this tick (mirrors
       ``EventBuffer.feed_pat(kind, level)``'s argument shape), or ``None``
@@ -144,6 +152,7 @@ class Sense:
     pat_state: PatState = UNAVAILABLE_PAT_STATE
     transcript: str | None = None
     self_moving: bool = False
+    rms_ratio: float | None = None
 
 
 # The "no reading" snapshot — what behaviors get when nothing senses, the poll
@@ -221,6 +230,7 @@ class DoaPoller:
 #: callable: this module only names the shape and never imports a concrete
 #: source (no ``reachy_mini``, no ``cv2``) — it stays a dependency-free leaf.
 RmsProvider = Callable[[], float | None]
+RmsRatioProvider = Callable[[], float | None]
 PatEventProvider = Callable[[], tuple[str, str] | None]
 PatStateProvider = Callable[[], PatState | None]
 FaceProvider = Callable[[], str | None]
@@ -252,6 +262,7 @@ class SenseProviders:
     pat_state: PatStateProvider | None = None
     transcript: TranscriptProvider | None = None
     self_moving: SelfMovingProvider | None = None
+    rms_ratio: RmsRatioProvider | None = None
 
 
 #: Predicate-field names (the ``Predicate.field`` vocabulary validated against
@@ -267,6 +278,7 @@ _ALWAYS_FED_FIELDS: frozenset[str] = frozenset({"doa", "speech"})
 #: name it feeds once a real callable is wired into it.
 _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
     "rms": "rms",
+    "rms_ratio": "rms_ratio",
     "pat_event": "pat",
     "face": "face",
     "frame_available": "frame_available",
@@ -277,8 +289,10 @@ _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
 #: Which of the optional :class:`SenseProviders` attributes the CURRENT engine
 #: composition (``_compose_run_seam`` in ``reachy.cli._commands.behavior``)
 #: actually wires a live provider for. Since t28 that is EVERY optional field:
-#: ``pat_event``/``pat_state`` (the folded pat-sense driver), ``rms`` (the shared
-#: per-tick mic chunk, gated by the #95 moving floor), ``transcript`` (the
+#: ``pat_event``/``pat_state`` (the folded pat-sense driver), ``rms`` and
+#: ``rms_ratio`` (two peeks of the ONE ``RmsSense`` over the shared per-tick mic
+#: chunk — the raw loudness gated by the #95 moving floor, and its ratio over
+#: the rolling background of #102), ``transcript`` (the
 #: transcript driver's one-tick latch of an addressed utterance),
 #: ``face``/``frame_available`` (the face driver's name latch and TTL-held
 #: camera condition) and ``self_moving`` (the self-motion driver's held latch
@@ -303,7 +317,7 @@ _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
 #: updating; nothing else duplicates this list, so the check can never drift
 #: from reality by forgetting a second copy.
 _COMPOSED_PROVIDER_FIELDS: frozenset[str] = frozenset(
-    {"pat_event", "rms", "face", "frame_available", "transcript", "self_moving"}
+    {"pat_event", "rms", "rms_ratio", "face", "frame_available", "transcript", "self_moving"}
 )
 
 #: The full set of predicate fields (``Predicate.field`` values) the current
@@ -359,6 +373,7 @@ def read_perception(
         doa_angle=base.doa_angle,
         speech_detected=base.speech_detected,
         rms=_peek(providers.rms, None),
+        rms_ratio=_peek(providers.rms_ratio, None),
         pat_event=_peek(providers.pat_event, None),
         face=_peek(providers.face, None),
         frame_available=bool(_peek(providers.frame_available, False)),

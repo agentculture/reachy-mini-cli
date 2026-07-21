@@ -143,7 +143,26 @@ _FALLBACK_RATE = 16000
 #: speech. Cited verbatim from the donor's onset threshold, itself cited from
 #: ``reachy_nova``'s speech event detector: the mic hands out float32 PCM already
 #: normalised to [-1, 1], so no int16 rescale applies.
+#:
+#: Since #102 this is a FLOOR under a relative threshold, not the threshold
+#: itself — see :data:`DEFAULT_SPEECH_RATIO` and :meth:`TranscriptSenseDriver.
+#: _speech_threshold`. Live-verified why: with the measured night background at
+#: p50 0.034 this absolute gate is permanently open, and the journal fills with
+#: ``utterance start`` -> ``dropped reason=stt-empty`` — the runtime recording
+#: silence and POSTing it to the STT. Kept as the floor so a QUIET room's
+#: capture behaviour is byte-identical to what shipped.
 DEFAULT_SPEECH_RMS = 0.02
+
+#: How many times the room's rolling background a chunk must stand to count as
+#: speech, when a background estimate is wired and warm. Deliberately LOOSER
+#: than orienting's :data:`reachy.behavior.rms_background.DEFAULT_RATIO` (5x):
+#: capture and orienting have asymmetric costs. A missed utterance is
+#: unrecoverable — the words are gone — while a wasted capture costs one STT
+#: POST that returns empty, so hearing should start on less evidence than
+#: turning the head does. 3x still clears the measured still-room spread, whose
+#: samples top out at ~2.5x their own median in every measured condition, so an
+#: empty room cannot start an utterance.
+DEFAULT_SPEECH_RATIO = 3.0
 
 #: Endpointing + pre-roll defaults, all carried over from the donor unchanged.
 DEFAULT_SILENCE_HOLD_S = 0.7
@@ -193,8 +212,13 @@ class TranscriptTuning:
 
     Endpointing (whole-utterance accumulation, one POST per utterance):
 
-    * ``speech_rms`` — RMS level a chunk must clear to count as speech (the
-      energy VAD that replaces the donor's unreliable daemon speech flag).
+    * ``speech_rms`` — absolute FLOOR under the speech threshold (the energy VAD
+      that replaces the donor's unreliable daemon speech flag).
+    * ``speech_ratio`` — times the room's rolling background a chunk must stand
+      to count as speech. The effective threshold is
+      ``max(speech_rms, speech_ratio * background)``, so a quiet room behaves
+      exactly as the donor did and a loud one stops capturing its own hiss
+      (#102). With no background seam wired, ``speech_rms`` alone applies.
     * ``silence_hold_s`` — pause length that ends an utterance and submits it.
     * ``max_utterance_s`` — hard cap that force-submits a long monologue.
     * ``min_utterance_s`` — floor below which a blip is dropped, never sent to
@@ -213,6 +237,7 @@ class TranscriptTuning:
     """
 
     speech_rms: float = DEFAULT_SPEECH_RMS
+    speech_ratio: float = DEFAULT_SPEECH_RATIO
     silence_hold_s: float = DEFAULT_SILENCE_HOLD_S
     max_utterance_s: float = DEFAULT_MAX_UTTERANCE_S
     min_utterance_s: float = DEFAULT_MIN_UTTERANCE_S
@@ -288,6 +313,7 @@ class TranscriptSenseDriver:
         classifier: Any | None = None,
         on_engage: Callable[[], None] | None = None,
         mute_until: Callable[[], float] | None = None,
+        background: Callable[[], float | None] | None = None,
         tuning: TranscriptTuning = TranscriptTuning(),
         names: tuple[str, ...] = DEFAULT_NAMES,
         clock: Callable[[], float] = time.monotonic,
@@ -300,6 +326,14 @@ class TranscriptSenseDriver:
         self._classifier = classifier
         self._on_engage = on_engage
         self._mute_until = mute_until if mute_until is not None else (lambda: 0.0)
+        #: Non-consuming peek at the room's rolling background level (#102),
+        #: wired at composition to the SAME
+        #: :class:`reachy.behavior.rms_background.RmsBackground` the orienting
+        #: gate reads — one estimator, two consumers with two different
+        #: thresholds, never two estimators that could disagree about the room.
+        #: ``None`` (or a ``None`` reading, i.e. a cold estimate) falls back to
+        #: the absolute floor, which is exactly the pre-#102 behaviour.
+        self._background = background
         self._tuning = tuning
         self._names = tuple(name.lower() for name in names)
         self._clock = clock
@@ -646,9 +680,37 @@ class TranscriptSenseDriver:
             # wrong rate makes the STT mis-decode and return nothing. No I/O.
             self._transcriber = Transcriber(sample_rate=self._rate)
 
+    def _speech_threshold(self) -> float:
+        """The rms a chunk must clear to count as speech, for THIS room (#102).
+
+        ``max(speech_rms, speech_ratio * background)``: the shipped absolute
+        value becomes a FLOOR under a relative threshold, which is the shape
+        :class:`reachy.motion.snap.SnapDetector` always had (``min_rms`` inside
+        a ratio test) and the shape the orienting gate now uses too. So capture
+        can never become LESS sensitive than what shipped, and can no longer sit
+        permanently open in a room whose background has drifted above it.
+
+        Never raises: a missing, raising or cold background peek falls back to
+        the floor — the pre-#102 behaviour — because a sense tap must not be
+        able to crash the 20 ms tick it runs on.
+        """
+        floor = float(self._tuning.speech_rms)
+        if self._background is None:
+            return floor
+        try:
+            level = self._background()
+        except Exception:  # noqa: BLE001 — a peek failure means "no estimate"
+            return floor
+        if level is None or not isinstance(level, (int, float)):
+            return floor
+        level = float(level)
+        if not math.isfinite(level) or level < 0.0:
+            return floor
+        return max(floor, level * float(self._tuning.speech_ratio))
+
     def _is_speech(self, chunk: np.ndarray) -> bool:
         """Energy VAD over the chunk (see the module docstring's deviation note)."""
-        return self._rms(chunk) >= self._tuning.speech_rms
+        return self._rms(chunk) >= self._speech_threshold()
 
     @staticmethod
     def _rms(chunk: np.ndarray) -> float:
@@ -711,9 +773,10 @@ class TranscriptSenseDriver:
         to the ring start when nothing clears the threshold.
         """
         win = self._onset_window
+        threshold = self._speech_threshold()
         for start in range(0, int(snapshot.size), win):
             window = snapshot[start : start + win]
-            if window.size and self._rms(window) >= self._tuning.speech_rms:
+            if window.size and self._rms(window) >= threshold:
                 return start
         return 0
 

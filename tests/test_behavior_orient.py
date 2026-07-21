@@ -45,14 +45,23 @@ from reachy.motion.listen import ListenParams, ListenProducer
 # Helpers                                                                     #
 # --------------------------------------------------------------------------- #
 
-#: A reading loud enough to clear the ported ``sound_present`` floor.
-LOUD = 0.2
-#: A reading below it — the quiet room the baseline probe measured.
-QUIET = 0.001
+#: A reading loud enough to clear the ported ``sound_present`` conjunct —
+#: expressed as ``Sense.rms_ratio``, i.e. how many times the room's OWN
+#: rolling background this tick stands at (#102). 20x is unambiguously
+#: something happening in any of the three measured rooms.
+LOUD = 20.0
+#: A reading below the room's background — the quiet room the baseline probe
+#: measured, which under a relative gate is simply "a quarter of the floor".
+QUIET = 0.25
 
 
-def _sense(*, angle=None, speech=False, rms=None, transcript=None) -> Sense:
-    return Sense(doa_angle=angle, speech_detected=speech, rms=rms, transcript=transcript)
+def _sense(*, angle=None, speech=False, rms_ratio=None, transcript=None) -> Sense:
+    return Sense(
+        doa_angle=angle,
+        speech_detected=speech,
+        rms_ratio=rms_ratio,
+        transcript=transcript,
+    )
 
 
 def _donor(**overrides) -> ListenProducer:
@@ -101,7 +110,7 @@ def test_gate_refuses_to_steer_on_the_measured_at_rest_signal() -> None:
     for i in range(120):
         flicker = bool(i % 2)  # ~46-50 % true, as measured
         angle = rng_angles[i % len(rng_angles)]
-        tiers.add(gate(_sense(angle=angle, speech=flicker, rms=QUIET), i * 0.5, params))
+        tiers.add(gate(_sense(angle=angle, speech=flicker, rms_ratio=QUIET), i * 0.5, params))
     assert tiers == {OrientTier.NONE}
 
 
@@ -114,7 +123,7 @@ def test_gate_refuses_a_wandering_angle_even_when_the_room_is_loud() -> None:
     params = OrientParams()
     angles = [0.2, 2.9, 1.0, 3.0, 0.1, 1.6, 2.7, 0.4]
     tiers = [
-        gate(_sense(angle=angles[i % len(angles)], speech=True, rms=LOUD), i * 0.5, params)
+        gate(_sense(angle=angles[i % len(angles)], speech=True, rms_ratio=LOUD), i * 0.5, params)
         for i in range(40)
     ]
     assert OrientTier.SPEECH not in tiers
@@ -127,10 +136,12 @@ def test_gate_reaches_the_speech_tier_once_the_bearing_holds_still() -> None:
     """
     gate = CorroboratedGate()
     params = OrientParams()
-    seen = [gate(_sense(angle=0.5, speech=True, rms=LOUD), t, params) for t in (0.0, 0.2, 0.4)]
+    seen = [
+        gate(_sense(angle=0.5, speech=True, rms_ratio=LOUD), t, params) for t in (0.0, 0.2, 0.4)
+    ]
     assert seen[0] is OrientTier.NONE  # the NOISE attack not yet earned (t35's envelope)
     assert seen[1] is OrientTier.NOISE  # dwell not yet earned
-    late = gate(_sense(angle=0.5, speech=True, rms=LOUD), params.dwell_s + 0.1, params)
+    late = gate(_sense(angle=0.5, speech=True, rms_ratio=LOUD), params.dwell_s + 0.1, params)
     assert late is OrientTier.SPEECH
 
 
@@ -147,8 +158,8 @@ def test_gate_engages_immediately_on_an_addressed_transcript() -> None:
 def test_gate_never_engages_without_a_bearing_to_steer_toward() -> None:
     gate = CorroboratedGate()
     params = OrientParams()
-    assert gate(_sense(transcript="hey reachy", rms=LOUD), 0.0, params) is OrientTier.NONE
-    assert gate(_sense(speech=True, rms=LOUD), 0.0, params) is OrientTier.NONE
+    assert gate(_sense(transcript="hey reachy", rms_ratio=LOUD), 0.0, params) is OrientTier.NONE
+    assert gate(_sense(speech=True, rms_ratio=LOUD), 0.0, params) is OrientTier.NONE
 
 
 def test_gate_is_an_injectable_seam_the_latched_doa_guard_plugs_into() -> None:
@@ -162,7 +173,7 @@ def test_gate_is_an_injectable_seam_the_latched_doa_guard_plugs_into() -> None:
         return OrientTier.NONE
 
     fn = OrientToSound(gate=veto_gate)
-    contribs = _drive(fn, _sense(angle=0.0, speech=True, rms=LOUD), ticks=10)
+    contribs = _drive(fn, _sense(angle=0.0, speech=True, rms_ratio=LOUD), ticks=10)
     assert calls  # the seam was consulted every tick
     assert all(c.head is None and c.body_yaw is None for c in contribs)
 
@@ -172,7 +183,7 @@ def test_a_raising_gate_leaves_the_robot_still_rather_than_killing_the_tick() ->
         raise RuntimeError("gate on fire")
 
     fn = OrientToSound(gate=boom)
-    contribs = _drive(fn, _sense(angle=0.0, speech=True, rms=LOUD), ticks=10)
+    contribs = _drive(fn, _sense(angle=0.0, speech=True, rms_ratio=LOUD), ticks=10)
     assert all(c.head is None and c.antennas is None for c in contribs)
 
 
@@ -182,9 +193,9 @@ def test_every_tier_transition_is_logged_once_and_never_per_tick(caplog) -> None
     silent no-op."""
     fn = make_orient_to_sound()
     with caplog.at_level("INFO", logger="reachy.sense"):
-        _drive(fn, _sense(angle=0.5, speech=True, rms=LOUD), ticks=50)  # NONE -> NOISE
-        _drive(fn, _sense(rms=QUIET), ticks=50, t0=1.0)  # NOISE -> NONE
-    lines = [r.getMessage() for r in caplog.records if "stage=orient" in r.getMessage()]
+        _drive(fn, _sense(angle=0.5, speech=True, rms_ratio=LOUD), ticks=50)  # NONE -> NOISE
+        _drive(fn, _sense(rms_ratio=QUIET), ticks=50, t0=1.0)  # NOISE -> NONE
+    lines = [r.getMessage() for r in caplog.records if "event=tier]" in r.getMessage()]
     # Four genuine transitions across 100 ticks: the ladder climbing once the
     # attack then the dwell are earned, demoting to the lean-only tier while the
     # release hold rides out the quiet, then closing when the hold expires.
@@ -193,6 +204,12 @@ def test_every_tier_transition_is_logged_once_and_never_per_tick(caplog) -> None
     assert "NOISE->SPEECH" in lines[1]
     assert "SPEECH->NOISE" in lines[2]  # the release hold keeps the lean, not the head tier
     assert "closed from=NOISE" in lines[3]
+    # ...plus exactly ONE tier-2 line, naming WHICH branch earned the head (d6):
+    # the journal has to answer "why did it turn?" after the fact, and the answer
+    # is either "it was loud" or "it kept going".
+    promotions = [r.getMessage() for r in caplog.records if "event=tier2]" in r.getMessage()]
+    assert len(promotions) == 1, promotions
+    assert "promoted reason=loud" in promotions[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -329,7 +346,7 @@ def test_orienting_eases_to_the_target_instead_of_snapping() -> None:
     runtime behavior must not step the commanded head in one tick.
     """
     fn = make_orient_to_sound()
-    sense = _sense(angle=0.0, transcript="hey reachy", rms=LOUD)  # engaged, far off-axis
+    sense = _sense(angle=0.0, transcript="hey reachy", rms_ratio=LOUD)  # engaged, far off-axis
     contribs = _drive(fn, sense, ticks=120)
     yaws = [c.head["yaw"] for c in contribs if c.head is not None]
     assert yaws, "the engaged tier must drive the head"
@@ -343,11 +360,11 @@ def test_orienting_holds_its_bearing_after_committing() -> None:
     head straight back (the donor's ``_hold_until``)."""
     params = OrientParams()
     fn = OrientToSound(params)
-    engaged = _sense(angle=0.0, transcript="hey reachy", rms=LOUD)
+    engaged = _sense(angle=0.0, transcript="hey reachy", rms_ratio=LOUD)
     _drive(fn, engaged, ticks=200)  # commit + settle
     committed = fn.head_yaw
     # A brand new bearing on the far side, inside the hold window: ignored.
-    other = _sense(angle=math.pi, transcript="over here", rms=LOUD)
+    other = _sense(angle=math.pi, transcript="over here", rms_ratio=LOUD)
     _drive(fn, other, ticks=5, t0=4.0)
     assert fn.target_head_yaw == pytest.approx(committed, abs=1e-6)
 
@@ -356,7 +373,7 @@ def test_orienting_abstains_with_no_sound_so_feel_alive_keeps_the_channels() -> 
     """A sound-reactive behavior with no sound yields rather than freezing —
     the abstention contract ``arbitrate`` implements."""
     fn = make_orient_to_sound()
-    contribs = _drive(fn, _sense(rms=QUIET), ticks=10)
+    contribs = _drive(fn, _sense(rms_ratio=QUIET), ticks=10)
     assert all(
         c.head is None and c.antennas is None and c.body_yaw is None and not c.done
         for c in contribs
@@ -369,9 +386,9 @@ def test_orienting_drifts_home_then_abstains_when_the_sound_stops() -> None:
     go of the channel."""
     params = OrientParams(recenter_after=0.5)
     fn = OrientToSound(params)
-    _drive(fn, _sense(angle=0.0, transcript="hey reachy", rms=LOUD), ticks=200)
+    _drive(fn, _sense(angle=0.0, transcript="hey reachy", rms_ratio=LOUD), ticks=200)
     assert abs(fn.head_yaw) > 5.0
-    quiet = _sense(rms=QUIET)
+    quiet = _sense(rms_ratio=QUIET)
     contribs = _drive(fn, quiet, ticks=1000, t0=4.0)
     assert abs(fn.head_yaw) == pytest.approx(0.0, abs=0.5)
     assert contribs[-1].head is None  # released the channel once home
@@ -387,8 +404,8 @@ def test_orienting_never_raises_on_a_hostile_sense_or_clock() -> None:
             raise RuntimeError("sensor on fire")
 
     assert fn(0.0, {}, Boom()).head is None  # type: ignore[arg-type]
-    assert fn(float("nan"), {}, _sense(rms=LOUD, angle=0.5)) is not None
-    assert fn(-5.0, {}, _sense(rms=LOUD, angle=0.5)) is not None
+    assert fn(float("nan"), {}, _sense(rms_ratio=LOUD, angle=0.5)) is not None
+    assert fn(-5.0, {}, _sense(rms_ratio=LOUD, angle=0.5)) is not None
 
 
 def test_library_params_retune_the_ladder_without_code_changes() -> None:
@@ -399,7 +416,7 @@ def test_library_params_retune_the_ladder_without_code_changes() -> None:
     fn = entry.build_fn()
     tight = dict(defaults, max_yaw=25.0, head_only_band=90.0)  # head-only, tighter clamp
     contribs = [
-        fn(i * 0.02, tight, _sense(angle=0.0, transcript="hi", rms=LOUD)) for i in range(300)
+        fn(i * 0.02, tight, _sense(angle=0.0, transcript="hi", rms_ratio=LOUD)) for i in range(300)
     ]
     yaws = [c.head["yaw"] for c in contribs if c.head is not None]
     assert yaws and max(abs(y) for y in yaws) == pytest.approx(25.0)
@@ -490,7 +507,7 @@ def test_orienting_loses_the_head_to_a_pat_reaction_in_a_live_engine() -> None:
     engine = Engine()
     engine.seed_base_layer(now=0.0, energy=1.0)
     engine.admit_behavior(_orient_behavior(), now=0.0)
-    loud = _sense(angle=0.0, transcript="hey reachy", rms=LOUD)
+    loud = _sense(angle=0.0, transcript="hey reachy", rms_ratio=LOUD)
     for i in range(200):
         tick = engine.compose_tick(i * 0.02, sense=loud)
     assert tick["ownership"]["head"] == "orient-1"
@@ -507,7 +524,7 @@ def test_orienting_yields_the_head_to_feel_alive_in_a_quiet_room() -> None:
     engine = Engine()
     engine.seed_base_layer(now=0.0, energy=1.0)
     engine.admit_behavior(_orient_behavior(), now=0.0)
-    quiet = _sense(rms=QUIET, speech=True, angle=1.08)  # the measured at-rest signal
+    quiet = _sense(rms_ratio=QUIET, speech=True, angle=1.08)  # the measured at-rest signal
     for i in range(50):
         ownership = engine.compose_tick(i * 0.02, sense=quiet)["ownership"]
         assert ownership["head"] == "feel-alive-1"
@@ -576,15 +593,18 @@ def test_a_malformed_params_dict_falls_back_per_key_instead_of_crashing() -> Non
     junk or missing value uses the default for THAT key, never aborts the tick."""
     fn = OrientToSound()
     junk = {"gain": "not-a-number", "max_yaw": None, "deadband": 4.0}
-    contribs = [fn(i * 0.02, junk, _sense(angle=0.0, transcript="hi", rms=LOUD)) for i in range(50)]
+    contribs = [
+        fn(i * 0.02, junk, _sense(angle=0.0, transcript="hi", rms_ratio=LOUD)) for i in range(50)
+    ]
     assert any(c.head is not None for c in contribs)
 
 
 def test_a_non_tier_verdict_or_a_broken_clock_is_treated_as_no_reading() -> None:
     fn = OrientToSound(gate=lambda sense, now, params: "very loud")  # not an OrientTier
-    assert fn(0.0, {}, _sense(angle=0.0, rms=LOUD)).head is None
+    assert fn(0.0, {}, _sense(angle=0.0, rms_ratio=LOUD)).head is None
     other = OrientToSound()
-    assert other(object(), {}, _sense(angle=0.0, rms=LOUD)).head is None  # type: ignore[arg-type]
+    bad_clock: float = object()  # type: ignore[assignment]
+    assert other(bad_clock, {}, _sense(angle=0.0, rms_ratio=LOUD)).head is None
     assert other.body_yaw == 0.0
 
 
@@ -592,7 +612,7 @@ def test_a_tier_without_a_bearing_commits_nothing() -> None:
     """A gate may open on evidence that carries no angle; the planner is then
     given nothing to steer toward and the behavior must simply not move."""
     fn = OrientToSound(gate=lambda sense, now, params: OrientTier.ENGAGED)
-    contribs = _drive(fn, _sense(rms=LOUD), ticks=20)
+    contribs = _drive(fn, _sense(rms_ratio=LOUD), ticks=20)
     assert all(c.head is None and c.antennas is None for c in contribs)
 
 
@@ -600,7 +620,7 @@ def test_orienting_contributes_a_complete_head_offset() -> None:
     """A composed head contribution must carry all six axes (the engine
     composes a COMPLETE pose; a partial dict would be a silent hole)."""
     fn = make_orient_to_sound()
-    contribs = _drive(fn, _sense(angle=0.0, transcript="hi", rms=LOUD), ticks=50)
+    contribs = _drive(fn, _sense(angle=0.0, transcript="hi", rms_ratio=LOUD), ticks=50)
     heads = [c.head for c in contribs if c.head is not None]
     assert heads
     assert all(set(h) == {"x", "y", "z", "roll", "pitch", "yaw"} for h in heads)
@@ -615,8 +635,11 @@ def test_orienting_contributes_a_complete_head_offset() -> None:
 # defence: `live = sound_present if sound_present is not None else (angle is not
 # None)` in `ListenProducer.update` is exactly "prefer live mic energy over the
 # latched angle", and `sound_present` is literally `rms > SnapDetector.min_rms`
-# (`_audio` in `reachy/cli/_commands/listen.py`). The gate's `rms >= rms_floor`
-# conjunct IS that check.
+# (`_audio` in `reachy/cli/_commands/listen.py`). The gate's loudness conjunct
+# IS that check — now in the RELATIVE form `SnapDetector` itself always used
+# (`rms > ratio * rolling_avg`), because the measured mic background drifts
+# ~25x within a day and the absolute half of that pair could only ever be
+# right in one room (#102).
 #
 # What t8 could NOT close, and named in its own docstring, is the case its dwell
 # conjunct actively REWARDS: a bearing that never changes is maximally "steady",
@@ -626,10 +649,10 @@ def test_orienting_contributes_a_complete_head_offset() -> None:
 # other stays live. The guard below removes that perverse incentive.
 
 
-def _cycle(fn, angles, *, speech=True, rms=LOUD, dt=0.02, t0=0.0):
+def _cycle(fn, angles, *, speech=True, rms_ratio=LOUD, dt=0.02, t0=0.0):
     """Drive a gate over a sequence of bearings, returning each verdict."""
     return [
-        fn(_sense(angle=a, speech=speech, rms=rms), t0 + i * dt, OrientParams())
+        fn(_sense(angle=a, speech=speech, rms_ratio=rms_ratio), t0 + i * dt, OrientParams())
         for i, a in enumerate(angles)
     ]
 
@@ -640,7 +663,7 @@ def test_a_frozen_bearing_is_refused_even_though_energy_and_dwell_both_pass() ->
     params = OrientParams()
     inner = CorroboratedGate()
     guarded = LatchedDoaGuard(CorroboratedGate())
-    sense = _sense(angle=1.082, speech=True, rms=LOUD)
+    sense = _sense(angle=1.082, speech=True, rms_ratio=LOUD)
     ticks = int((params.latch_after_s + 1.0) / 0.02)
 
     inner_verdicts = [inner(sense, i * 0.02, params) for i in range(ticks)]
@@ -659,7 +682,7 @@ def test_the_guard_never_weakens_the_inner_gate() -> None:
     guarded = LatchedDoaGuard(CorroboratedGate())
     angles = [0.3 + 0.05 * i for i in range(200)]  # never latches
     for i, angle in enumerate(angles):
-        sense = _sense(angle=angle, speech=True, rms=QUIET)  # quiet: inner says NONE
+        sense = _sense(angle=angle, speech=True, rms_ratio=QUIET)  # quiet: inner says NONE
         assert inner(sense, i * 0.02, params) is OrientTier.NONE
         assert guarded(sense, i * 0.02, params) is OrientTier.NONE
 
@@ -685,7 +708,7 @@ def test_the_measured_at_rest_trace_never_latches_this_guard() -> None:
     daemon build we can actually observe, this guard NEVER fires. It defends a
     wedged feed, which is a state this build does not currently produce. Said
     plainly here rather than hidden, so nobody mistakes it for the thing that
-    keeps a quiet room still — ``rms`` is what does that.
+    keeps a quiet room still — ``rms_ratio`` is what does that.
     """
     guarded = LatchedDoaGuard(CorroboratedGate())
     # 35 distinct values spanning the measured 0.000-3.124 rad range, cycled at
@@ -702,11 +725,11 @@ def test_the_measured_at_rest_trace_never_latches_this_guard() -> None:
 def test_a_missing_bearing_clears_the_latch_rather_than_holding_it() -> None:
     params = OrientParams()
     guarded = LatchedDoaGuard(CorroboratedGate())
-    sense = _sense(angle=1.082, speech=True, rms=LOUD)
+    sense = _sense(angle=1.082, speech=True, rms_ratio=LOUD)
     for i in range(int((params.latch_after_s + 1.0) / 0.02)):
         guarded(sense, i * 0.02, params)
     assert guarded.latched
-    guarded(_sense(angle=None, rms=LOUD), 100.0, params)
+    guarded(_sense(angle=None, rms_ratio=LOUD), 100.0, params)
     assert not guarded.latched
 
 
@@ -721,7 +744,7 @@ def test_a_raising_inner_gate_leaves_the_robot_still_rather_than_killing_the_tic
 
 def test_a_non_tier_inner_verdict_is_treated_as_no_reading() -> None:
     guarded = LatchedDoaGuard(lambda sense, now, params: "SPEECH")
-    assert guarded(_sense(angle=0.5, rms=LOUD), 0.0, OrientParams()) is OrientTier.NONE
+    assert guarded(_sense(angle=0.5, rms_ratio=LOUD), 0.0, OrientParams()) is OrientTier.NONE
 
 
 def test_the_latch_is_logged_on_entry_and_release_and_never_per_tick(caplog) -> None:
@@ -730,7 +753,7 @@ def test_the_latch_is_logged_on_entry_and_release_and_never_per_tick(caplog) -> 
     discipline exists to prevent. Exactly one line per EDGE."""
     params = OrientParams()
     guarded = LatchedDoaGuard(CorroboratedGate())
-    sense = _sense(angle=1.082, speech=True, rms=LOUD)
+    sense = _sense(angle=1.082, speech=True, rms_ratio=LOUD)
     with caplog.at_level("INFO", logger="reachy.sense"):
         for i in range(int((params.latch_after_s + 4.0) / 0.02)):
             guarded(sense, i * 0.02, params)
@@ -739,7 +762,7 @@ def test_the_latch_is_logged_on_entry_and_release_and_never_per_tick(caplog) -> 
         assert "reason=latched-doa" in latched_lines[0].getMessage()
         assert "stage=orient" in latched_lines[0].getMessage()
         caplog.clear()
-        guarded(_sense(angle=2.0, speech=True, rms=LOUD), 100.0, params)
+        guarded(_sense(angle=2.0, speech=True, rms_ratio=LOUD), 100.0, params)
     released = [r for r in caplog.records if "latched-doa" in r.getMessage()]
     assert len(released) == 1
     assert "released" in released[0].getMessage()
@@ -756,7 +779,7 @@ def test_the_shipped_gate_is_the_guard_wrapping_the_corroborated_gate() -> None:
 def test_a_frozen_bearing_never_reaches_the_head_through_the_shipped_behavior() -> None:
     """End to end: the wedged-feed stuck-stare the guard exists to prevent."""
     fn = make_orient_to_sound()
-    sense = _sense(angle=0.0, speech=True, rms=LOUD)
+    sense = _sense(angle=0.0, speech=True, rms_ratio=LOUD)
     contribs = [fn(i * 0.02, {}, sense) for i in range(int(40.0 / 0.02))]
     assert all(c.head is None for c in contribs[-200:])
 
@@ -768,9 +791,9 @@ def test_a_frozen_bearing_never_reaches_the_head_through_the_shipped_behavior() 
 # Live-verified defect (journal, 2026-07-21 01:25): a transient train (keyboard
 # clicks) made the NOISE tier flap at tick rate — 22 `NONE->NOISE` opens in
 # 1.3 s, one open/close per ~22 ms tick, with the #95 moving-floor gate CLOSED
-# throughout. The rms reading genuinely alternates loud/quiet per tick on
-# clicky sound, and the bare per-tick predicate (`doa finite AND rms >=
-# rms_floor`) had zero temporal smoothing — SPEECH has an angular dwell, NOISE
+# throughout. The loudness reading genuinely alternates loud/quiet per tick on
+# clicky sound, and the bare per-tick predicate (`doa finite AND the loudness
+# conjunct`) had zero temporal smoothing — SPEECH has an angular dwell, NOISE
 # had nothing. The envelope under test adds the missing attack (consecutive
 # loud calls before the tier opens) and release (continuous quiet before it
 # closes) timing.
@@ -791,16 +814,16 @@ def test_a_single_one_tick_click_never_opens_the_noise_tier() -> None:
     never open the tier at all: the attack needs consecutive loud calls."""
     gate = CorroboratedGate()
     params = OrientParams()
-    verdicts = [gate(_sense(angle=0.5, rms=LOUD), 0.0, params)]
+    verdicts = [gate(_sense(angle=0.5, rms_ratio=LOUD), 0.0, params)]
     for i in range(1, 50):
-        verdicts.append(gate(_sense(rms=QUIET), i * TICK_S, params))
+        verdicts.append(gate(_sense(rms_ratio=QUIET), i * TICK_S, params))
     assert set(verdicts) == {OrientTier.NONE}
 
 
 def test_sustained_sound_opens_noise_on_the_attack_tick_and_not_before() -> None:
     gate = CorroboratedGate()
     params = OrientParams()
-    verdicts = [gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params) for i in range(10)]
+    verdicts = [gate(_sense(angle=0.5, rms_ratio=LOUD), i * TICK_S, params) for i in range(10)]
     n = params.noise_attack_ticks
     assert all(v is OrientTier.NONE for v in verdicts[: n - 1])
     assert all(v is OrientTier.NOISE for v in verdicts[n - 1 :])
@@ -815,7 +838,10 @@ def test_a_per_tick_alternating_rms_train_opens_noise_once_and_holds() -> None:
     # Two loud ticks light the attack, then the per-tick alternation the click
     # train produced, for the rest of the measured 1.3 s burst.
     train = [LOUD, LOUD] + [QUIET if i % 2 else LOUD for i in range(63)]
-    verdicts = [gate(_sense(angle=0.5, rms=rms), i * TICK_S, params) for i, rms in enumerate(train)]
+    verdicts = [
+        gate(_sense(angle=0.5, rms_ratio=ratio), i * TICK_S, params)
+        for i, ratio in enumerate(train)
+    ]
     opens = sum(
         1
         for prev, cur in zip([OrientTier.NONE, *verdicts], verdicts)
@@ -832,13 +858,13 @@ def test_the_release_hold_closes_exactly_once_after_continuous_quiet() -> None:
     gate = CorroboratedGate()
     params = OrientParams()
     for i in range(10):
-        assert gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params) in (
+        assert gate(_sense(angle=0.5, rms_ratio=LOUD), i * TICK_S, params) in (
             OrientTier.NONE,
             OrientTier.NOISE,
         )
     quiet_start = 10 * TICK_S
     times = [quiet_start + j * TICK_S for j in range(100)]
-    verdicts = [gate(_sense(rms=QUIET), t, params) for t in times]
+    verdicts = [gate(_sense(rms_ratio=QUIET), t, params) for t in times]
     closes = sum(
         1
         for prev, cur in zip(verdicts, verdicts[1:])
@@ -859,19 +885,19 @@ def test_a_fresh_loud_reading_during_the_hold_resets_the_quiet_timer() -> None:
     now = 0.0
     for i in range(5):
         now = i * TICK_S
-        gate(_sense(angle=0.5, rms=LOUD), now, params)  # opens on the attack tick
+        gate(_sense(angle=0.5, rms_ratio=LOUD), now, params)  # opens on the attack tick
     base = now
     for j in range(1, 30):  # 0.58 s of quiet — inside the release window
-        assert gate(_sense(rms=QUIET), base + j * TICK_S, params) is OrientTier.NOISE
+        assert gate(_sense(rms_ratio=QUIET), base + j * TICK_S, params) is OrientTier.NOISE
     now = base + 30 * TICK_S
     # One fresh loud tick: still NOISE, and the quiet timer starts over (the
     # bearing may update exactly as it does today).
-    assert gate(_sense(angle=0.6, rms=LOUD), now, params) is OrientTier.NOISE
+    assert gate(_sense(angle=0.6, rms_ratio=LOUD), now, params) is OrientTier.NOISE
     quiet_start = now + TICK_S
     for k in range(34):  # another 0.66 s of quiet: inside a FRESH window
-        assert gate(_sense(rms=QUIET), quiet_start + k * TICK_S, params) is OrientTier.NOISE
+        assert gate(_sense(rms_ratio=QUIET), quiet_start + k * TICK_S, params) is OrientTier.NOISE
     late = quiet_start + params.noise_release_s + TICK_S
-    assert gate(_sense(rms=QUIET), late, params) is OrientTier.NONE
+    assert gate(_sense(rms_ratio=QUIET), late, params) is OrientTier.NONE
 
 
 def test_the_release_hold_reports_noise_not_the_higher_tier_it_fell_from() -> None:
@@ -883,9 +909,9 @@ def test_the_release_hold_reports_noise_not_the_higher_tier_it_fell_from() -> No
     t = 0.0
     for i in range(50):
         t = i * TICK_S
-        verdict = gate(_sense(angle=0.5, speech=True, rms=LOUD), t, params)
+        verdict = gate(_sense(angle=0.5, speech=True, rms_ratio=LOUD), t, params)
     assert verdict is OrientTier.SPEECH
-    assert gate(_sense(rms=QUIET), t + TICK_S, params) is OrientTier.NOISE
+    assert gate(_sense(rms_ratio=QUIET), t + TICK_S, params) is OrientTier.NOISE
 
 
 def test_engagement_stays_immediate_even_from_a_cold_envelope() -> None:
@@ -894,7 +920,7 @@ def test_engagement_stays_immediate_even_from_a_cold_envelope() -> None:
     gate = CorroboratedGate()
     params = OrientParams()
     assert gate(_sense(angle=0.5, transcript="hey reachy"), 0.0, params) is OrientTier.ENGAGED
-    assert gate(_sense(rms=QUIET), TICK_S, params) is OrientTier.NOISE
+    assert gate(_sense(rms_ratio=QUIET), TICK_S, params) is OrientTier.NOISE
 
 
 def test_speech_escalation_is_unchanged_while_the_envelope_holds() -> None:
@@ -903,14 +929,14 @@ def test_speech_escalation_is_unchanged_while_the_envelope_holds() -> None:
     gate = CorroboratedGate()
     params = OrientParams()
     for i in range(5):
-        gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params)  # open the envelope
+        gate(_sense(angle=0.5, rms_ratio=LOUD), i * TICK_S, params)  # open the envelope
     base = 5 * TICK_S
     for j in range(10):  # a sub-release quiet gap, riding the hold
-        assert gate(_sense(rms=QUIET), base + j * TICK_S, params) is OrientTier.NOISE
+        assert gate(_sense(rms_ratio=QUIET), base + j * TICK_S, params) is OrientTier.NOISE
     t0 = base + 10 * TICK_S
     ticks = int(params.dwell_s / TICK_S) + 2
     verdicts = [
-        gate(_sense(angle=1.0, speech=True, rms=LOUD), t0 + k * TICK_S, params)
+        gate(_sense(angle=1.0, speech=True, rms_ratio=LOUD), t0 + k * TICK_S, params)
         for k in range(ticks)
     ]
     assert verdicts[0] is OrientTier.NOISE  # held open — no re-attack after a gap
@@ -925,8 +951,8 @@ def test_the_moving_floor_gated_zero_rms_rides_the_release_hold() -> None:
     gate = CorroboratedGate()
     params = OrientParams()
     for i in range(3):
-        gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params)  # open
-    verdict = gate(_sense(angle=0.5, rms=0.0), 3 * TICK_S, params)
+        gate(_sense(angle=0.5, rms_ratio=LOUD), i * TICK_S, params)  # open
+    verdict = gate(_sense(angle=0.5, rms_ratio=0.0), 3 * TICK_S, params)
     assert verdict is OrientTier.NOISE
 
 
@@ -942,8 +968,8 @@ def test_tier_transitions_drop_from_per_tick_to_per_episode_on_a_click_train() -
     # The bearing wanders a little tick to tick (as the real feed does), so the
     # latched-DoA guard never reads it as frozen.
     verdicts = [
-        gate(_sense(angle=0.5 + 0.001 * (i % 5), rms=rms), i * TICK_S, params)
-        for i, rms in enumerate(train)
+        gate(_sense(angle=0.5 + 0.001 * (i % 5), rms_ratio=ratio), i * TICK_S, params)
+        for i, ratio in enumerate(train)
     ]
     transitions = sum(1 for a, b in zip(verdicts, verdicts[1:]) if a is not b)
     assert transitions == 2  # NONE->NOISE once, NOISE->NONE once
@@ -958,13 +984,178 @@ def test_a_hostile_snapshot_mid_hold_fails_closed_and_resets_the_envelope() -> N
     class Boom:
         doa_angle = property(lambda self: (_ for _ in ()).throw(RuntimeError("on fire")))
         transcript = None
-        rms = None
+        rms_ratio = None
         speech_detected = False
 
     gate = CorroboratedGate()
     params = OrientParams()
     for i in range(5):
-        gate(_sense(angle=0.5, rms=LOUD), i * TICK_S, params)  # open
+        gate(_sense(angle=0.5, rms_ratio=LOUD), i * TICK_S, params)  # open
     assert gate(Boom(), 5 * TICK_S, params) is OrientTier.NONE  # type: ignore[arg-type]
     # ... and the hold did not survive the fault: the next quiet tick is NONE.
-    assert gate(_sense(rms=QUIET), 6 * TICK_S, params) is OrientTier.NONE
+    assert gate(_sense(rms_ratio=QUIET), 6 * TICK_S, params) is OrientTier.NONE
+
+
+# --------------------------------------------------------------------------- #
+# 7. Tier 2 — the head/body turn is EARNED, not reflexive (d6)                #
+# --------------------------------------------------------------------------- #
+#
+# Live-verified defect (the capability-gate session on the deployed robot):
+# `look-toward-sound` fired 203 times in 8 minutes in an ordinary room, and in
+# the same session the pat sense recorded ZERO detections in 5 minutes. One
+# finding, not two: the pat sense is ownership-gated and stillness-gated, so
+# while `orient-to-sound` owns the head it suspends and never re-baselines. A
+# head that keeps turning cannot feel a pat.
+#
+# So the ladder is graded by COST. Tier 1 (the antenna lean) admits on sound
+# standing above the room. Tier 2 (the head/body turn) additionally requires a
+# PROMOTION: LOUD relative to the room (`rms_ratio_loud`) or ONGOING
+# (`sustain_s`). These tests pin that the promotion is real in both directions —
+# a moderate one-off stays at the lean, and both branches genuinely promote.
+
+#: A reading above the tier-1 ratio but BELOW the tier-2 loud ratio: audible,
+#: unremarkable — the case that used to turn the head and now must not.
+MODERATE = 8.0
+
+
+def _speech(*, angle=0.5, ratio=MODERATE):
+    return _sense(angle=angle, speech=True, rms_ratio=ratio)
+
+
+def _run(gate, sense, *, ticks, params=None, t0=0.0):
+    params = params if params is not None else OrientParams()
+    return [gate(sense, t0 + i * TICK_S, params) for i in range(ticks)]
+
+
+def test_moderate_sound_earns_the_antenna_lean_and_never_the_head() -> None:
+    """The d6 property: audible-but-unremarkable sound stays at tier 1.
+
+    Everything the OLD gate needed is satisfied here — above the tier-1 ratio,
+    ``speech_detected`` true, the bearing rock steady well past ``dwell_s`` —
+    and before d6 this WAS a head turn. It is now an antenna lean, for the whole
+    second: the promotion is what the head costs.
+    """
+    gate = CorroboratedGate()
+    params = OrientParams()
+    ticks = int(params.sustain_s / TICK_S) - 5  # deliberately short of ONGOING
+    verdicts = _run(gate, _speech(), ticks=ticks, params=params)
+    assert set(verdicts[2:]) == {OrientTier.NOISE}
+
+
+def test_ongoing_sound_promotes_to_the_head_once_it_has_lasted_long_enough() -> None:
+    """The ONGOING branch: keep talking and the robot eventually looks at you."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    verdicts = _run(gate, _speech(), ticks=int((params.sustain_s + 0.3) / TICK_S), params=params)
+    assert OrientTier.SPEECH in verdicts
+    first = verdicts.index(OrientTier.SPEECH)
+    # It waited: the promotion lands no earlier than `sustain_s` after the
+    # envelope opened (which is itself `noise_attack_ticks` in).
+    assert first * TICK_S >= params.sustain_s
+    assert set(verdicts[:first]) <= {OrientTier.NONE, OrientTier.NOISE}
+
+
+def test_loud_sound_promotes_without_waiting_for_it_to_be_ongoing() -> None:
+    """The LOUD branch: a shout does not have to keep going to be worth facing."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    loud = _speech(ratio=params.rms_ratio_loud + 1.0)
+    ticks = int(params.dwell_s / TICK_S) + 3  # dwell satisfied, sustain NOT
+    verdicts = _run(gate, loud, ticks=ticks, params=params)
+    assert verdicts[-1] is OrientTier.SPEECH
+    assert (ticks * TICK_S) < params.sustain_s  # promoted on loudness alone
+
+
+def test_a_single_transient_cannot_reach_the_head_by_either_branch() -> None:
+    """ "Not for a single transient like a clap" — pinned for the LOUD branch too.
+
+    A clap is by definition loud, so the loud branch alone would admit it. The
+    pre-existing 0.6 s angular dwell is what refuses it, and this test is here
+    so a future edit that "simplifies" the dwell away cannot silently turn the
+    robot into a clap-chaser.
+    """
+    gate = CorroboratedGate()
+    params = OrientParams()
+    clap = _speech(ratio=params.rms_ratio_loud * 4.0)
+    verdicts = _run(gate, clap, ticks=3, params=params)  # 60 ms — a transient
+    assert OrientTier.SPEECH not in verdicts
+
+
+def test_the_promotion_ratio_is_measured_against_the_room_not_an_absolute() -> None:
+    """The same ABSOLUTE loudness promotes in a quiet room and does not at night.
+
+    ``rms_ratio`` already carries the room (see ``rms_background.py``), so this
+    is really a statement that tier 2 reads that field and nothing else — no
+    absolute number sneaks back in at the promotion step.
+    """
+    params = OrientParams()
+    quiet_room = CorroboratedGate()  # 0.09 rms over a 0.004 background = 22x
+    night_room = CorroboratedGate()  # the same 0.09 over 0.034 = 2.6x
+    ticks = int(params.dwell_s / TICK_S) + 3
+    assert _run(quiet_room, _speech(ratio=0.09 / 0.004), ticks=ticks, params=params)[-1] is (
+        OrientTier.SPEECH
+    )
+    assert OrientTier.SPEECH not in _run(
+        night_room, _speech(ratio=0.09 / 0.034), ticks=ticks, params=params
+    )
+
+
+def test_an_addressed_utterance_still_reaches_the_head_immediately() -> None:
+    """ENGAGED keeps its fast-path: d6 is about noise, and words are not noise.
+
+    An utterance in ``sense.transcript`` already cleared the layered engagement
+    gate — the strongest corroboration the runtime has — so it needs neither
+    loudness nor persistence nor dwell.
+    """
+    gate = CorroboratedGate()
+    verdict = gate(_sense(angle=0.5, transcript="reachy, are you there"), 0.0, OrientParams())
+    assert verdict is OrientTier.ENGAGED
+
+
+def test_a_promotion_is_logged_once_per_episode_and_names_its_branch(caplog) -> None:
+    """The journal has to answer "why did it turn?" — bounded to one line."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        _run(gate, _speech(ratio=params.rms_ratio_loud + 1.0), ticks=200, params=params)
+    promotions = [r.getMessage() for r in caplog.records if "event=tier2]" in r.getMessage()]
+    assert len(promotions) == 1
+    assert "reason=loud" in promotions[0]
+    assert "loud_at=15.0x" in promotions[0]
+
+
+def test_a_second_episode_logs_its_own_promotion(caplog) -> None:
+    """Once per EPISODE, not once per process — a later turn is still traceable."""
+    gate = CorroboratedGate()
+    params = OrientParams()
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        _run(gate, _speech(), ticks=200, params=params)  # episode 1, ongoing branch
+        # A gap longer than the release hold closes the envelope for good.
+        _run(gate, _sense(rms_ratio=QUIET), ticks=100, params=params, t0=4.0)
+        _run(gate, _speech(), ticks=200, params=params, t0=8.0)  # episode 2
+    promotions = [r.getMessage() for r in caplog.records if "event=tier2]" in r.getMessage()]
+    assert len(promotions) == 2
+    assert all("reason=sustained" in line for line in promotions)
+
+
+def test_the_tier_two_knobs_are_exposed_as_operator_tunables() -> None:
+    """Both promotion criteria are catalog params, so a rules file tunes them."""
+    entry = library.LIBRARY["orient-to-sound"]
+    assert entry.params["rms_ratio"].default == pytest.approx(OrientParams().rms_ratio)
+    assert entry.params["rms_ratio_loud"].default == pytest.approx(OrientParams().rms_ratio_loud)
+    assert entry.params["sustain_s"].default == pytest.approx(OrientParams().sustain_s)
+
+
+def test_retuning_the_promotion_through_the_behaviors_params_dict_takes_effect() -> None:
+    """The live path a rules-file override travels: `params` -> `_resolve` -> gate."""
+    fn = make_orient_to_sound()
+    tuned = {"sustain_s": 0.1, "dwell_s": 0.0}
+    verdicts = [fn(i * TICK_S, tuned, _speech()) for i in range(30)]
+    assert any(c.head is not None for c in verdicts)  # the head moved: tier 2 fired
+
+
+def test_the_sustain_default_outlasts_the_measured_transient_burst() -> None:
+    """1.5 s is measured, not chosen: the click train that motivated the
+    envelope lasted 1.3 s, so the worst measured episode of pure clatter cannot
+    promote on the ongoing branch."""
+    assert OrientParams().sustain_s > 1.3
