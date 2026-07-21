@@ -85,8 +85,9 @@ def add_export_args(parser: argparse.ArgumentParser) -> None:
     """Register the shared ``--export`` / ``--export-blocks`` arguments on *parser*.
 
     One shared registration so every command mode presents an identical
-    surface. The caller decides any mode constraints (e.g. ``listen`` requires
-    ``--live`` for the feed to carry cognition blocks).
+    surface. The caller decides any mode constraints of its own; today
+    ``agent attach`` is the only registration site (and the cognition feed's
+    only producer).
     """
     parser.add_argument(
         "--export",

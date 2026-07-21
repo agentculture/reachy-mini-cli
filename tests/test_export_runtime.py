@@ -2,7 +2,7 @@
 
 Task t8 (issue #70 / ``symbolic-runtime-70``). A SEPARATE contract from the
 cognition feed (``reachy.export.events`` — ``thinking``/``message``/``emotion``,
-produced by ``think run --export -`` / ``listen run --live --export -``):
+produced by ``agent attach --export -``):
 decision c27 says an attached agent publishes ITS OWN cognition feed through
 that existing family, and this runtime feed carries ONLY the deterministic
 engine's own events — perception, rule decisions, sustained intents, motion.
