@@ -157,7 +157,7 @@ def live_exec_start(python: str | None = None) -> str:
     """ExecStart for the live presence unit: the folded live loop, agent-cognition by default.
 
     ``listen run --live --transcribe --cognition agent --voice-engine harmonic`` runs
-    the folded live loop (hearing + pat + think + vision + sleep in one loop) with STT
+    the folded live loop (hearing + pat + cognition + vision + sleep in one loop) with STT
     transcription on and cognition driven by the tool-use ``AgentTurnEngine`` (acting
     through ``speak`` / ``harmonics`` / ``apply_pose`` tool calls rather than the
     ``*emoji*``/``"speech"`` marker convention). ``--voice-engine harmonic`` is passed

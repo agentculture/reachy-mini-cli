@@ -739,19 +739,16 @@ def _rules_no_verb(args: argparse.Namespace) -> int:
 # expressions sub-noun — the pose catalog + distinctness check (t18)          #
 # --------------------------------------------------------------------------- #
 #
-# Ported from `think expressions` (`reachy/cli/_commands/think.py`), which is
-# being retired along with the rest of the LLM-cognition `think` noun. The
-# catalog itself (`reachy.speech.expressions`, backed by `expressions.toml`)
-# and the distinctness check (`reachy.speech.distinctness`) are NOT
-# LLM-coupled — a TOML table and a geometric distance function — and stay
-# needed afterward: `reachy.speech.tools`'s `apply_pose` tool (kept by `agent
-# attach`) imports the catalog directly. So the data survives but its only CLI
-# inspection surface would otherwise vanish with `think`; `behavior` is the
-# new home — the surviving presence noun, and already hosts a sibling
-# sub-noun (`rules`, just above) in exactly this "render + lint a file, no
-# running engine needed" shape. `think expressions` itself is untouched here
-# (a separate task deletes `think` wholesale) — the duplication between the
-# two homes is deliberate and temporary.
+# Ported from the retired `think expressions` sub-noun, which went with the
+# rest of the LLM-cognition `think` noun (t20). The catalog itself
+# (`reachy.speech.expressions`, backed by `expressions.toml`) and the
+# distinctness check (`reachy.speech.distinctness`) are NOT LLM-coupled — a
+# TOML table and a geometric distance function — and stayed needed
+# afterward: `reachy.speech.tools`'s `apply_pose` tool (kept by `agent
+# attach`) imports the catalog directly. So the data survives, and `behavior`
+# is now its ONE CLI inspection surface — the surviving presence noun, which
+# already hosts a sibling sub-noun (`rules`, just above) in exactly this
+# "render + lint a file, no running engine needed" shape.
 
 _EXPRESSIONS_VERBS = [
     "expressions / expressions list — list the expression catalog (emoji + pose descriptor)",

@@ -142,7 +142,7 @@ def test_jsonl_exporter_and_to_jsonl_imported_only_from_allowed_modules() -> Non
     Any other reachy/ module that imports these symbols would indicate a second,
     unintended structured-export path has been added — this test prevents that. The
     one CLI wiring point ``reachy/cli/_export.py`` builds the sink for *both*
-    ``think run`` and ``listen run --live`` so the two feeds can never drift.
+    ``listen run --live`` and ``agent attach`` so the two feeds can never drift.
 
     Note: docstring *mentions* (e.g. in cognition.py type-annotation prose) are
     allowed; only Python import statements are checked.
@@ -177,6 +177,6 @@ def test_jsonl_exporter_and_to_jsonl_imported_only_from_allowed_modules() -> Non
 
     assert not violations, (
         "JsonlExporter / to_jsonl imported from unexpected reachy/ modules "
-        "(only reachy/export/ and reachy/cli/_commands/think.py should import these):\n"
+        "(only reachy/export/ and reachy/cli/_export.py should import these):\n"
         + "\n".join(f"  {v}" for v in violations)
     )

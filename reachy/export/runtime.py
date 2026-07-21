@@ -2,7 +2,7 @@
 
 This is a **separate wire contract** from the cognition feed
 (:mod:`reachy.export.events` — ``thinking``/``message``/``emotion``, produced by
-``think run --export -`` / ``listen run --live --export -``). Decision c27 (the
+``listen run --live --export -`` / ``agent attach --export -``). Decision c27 (the
 ``symbolic-runtime-70`` spec): an attached agent publishes its OWN cognition feed
 through that existing family; THIS feed is the deterministic runtime's — the
 50 Hz :mod:`reachy.behavior.engine` loop and its rule evaluator

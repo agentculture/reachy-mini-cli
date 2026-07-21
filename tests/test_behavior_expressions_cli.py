@@ -1,17 +1,16 @@
-"""t18 — re-home the expression pose catalog verbs onto `behavior`.
+"""t18 — the expression pose catalog verbs, re-homed onto `behavior`.
 
-`think expressions {list,check,overview}` inspect `reachy.speech.expressions`'s
-TOML-backed pose catalog and `reachy.speech.distinctness`'s geometric
-similarity check — neither is LLM-coupled, and both stay needed after `think`
-retires (`reachy.speech.tools`'s `apply_pose` tool imports the catalog
-directly). This gives the catalog a new CLI home under `behavior` — the
-surviving presence noun, which already carries a sibling sub-noun (`rules`)
-in exactly this "render + lint a file, no running engine needed" shape.
+`behavior expressions {list,check,overview}` inspect
+`reachy.speech.expressions`'s TOML-backed pose catalog and
+`reachy.speech.distinctness`'s geometric similarity check — neither is
+LLM-coupled, and both outlived the retired `think` noun
+(`reachy.speech.tools`'s `apply_pose` tool imports the catalog directly).
+`behavior` — the surviving presence noun, which already carries a sibling
+sub-noun (`rules`) in exactly this "render + lint a file, no running engine
+needed" shape — is now the catalog's ONE CLI home.
 
-`think expressions` itself is untouched here — a later task in this arc
-retires the `think` noun wholesale. The duplication between the two homes is
-deliberate and temporary; this file only asserts the NEW `behavior expressions`
-surface. See `tests/test_think_expressions.py` for the original verb tests and
+t20 deleted `think expressions` (and with it the cross-home parity test that
+compared the two `--json` payloads), so this file is the whole surface. See
 `tests/test_behavior_rules_cli.py` for the sibling sub-noun's CLI conventions
 this mirrors.
 """
@@ -67,22 +66,9 @@ def test_expressions_list_json(capsys) -> None:
     assert all("descriptor" in e for e in payload["expressions"])
 
 
-def test_expressions_list_matches_think_expressions_list(capsys) -> None:
-    """Both homes read the SAME catalog and generate the SAME descriptors."""
-    rc = main(["behavior", "expressions", "--json"])
-    assert rc == 0
-    behavior_payload = json.loads(capsys.readouterr().out)
-
-    rc = main(["think", "expressions", "--json"])
-    assert rc == 0
-    think_payload = json.loads(capsys.readouterr().out)
-
-    assert behavior_payload == think_payload
-
-
 def test_bare_expressions_lists(capsys) -> None:
     """`behavior expressions` with no sub-verb lists the catalog (mirrors
-    `behavior rules` / `think expressions`'s bare-defaults-to-list idiom)."""
+    `behavior rules`'s bare-defaults-to-list idiom)."""
     rc = main(["behavior", "expressions"])
     assert rc == 0
     assert capsys.readouterr().out.strip()
@@ -111,7 +97,7 @@ def test_expressions_check_clean_json(capsys) -> None:
 def test_expressions_check_flags_a_near_duplicate_still_exits_zero(monkeypatch, capsys) -> None:
     """A flagged pair is a warning, not a gate — exit stays 0; --json ok=false
     is the machine-readable signal (mirrors `behavior rules check` / the
-    original `think expressions check`)."""
+    retired `think expressions check`)."""
     monkeypatch.setattr(behavior_cmd, "_find_too_similar", lambda cat: [("🤔", "😐", 0.12)])
     rc = main(["behavior", "expressions", "check", "--json"])
     assert rc == 0

@@ -553,9 +553,8 @@ pose catalog (`reachy.speech.expressions`, backed by `expressions.toml`) and
 runs its geometric distinctness check (`reachy.speech.distinctness`). Neither
 is LLM-coupled — a TOML table and a distance function — so this catalog
 tooling lives here rather than in a cognition noun: it is the same catalog
-`agent attach`'s `apply_pose` tool drives, and (for now, while the `think`
-noun is mid-retirement) `think expressions` also still serves the identical
-data.
+`agent attach`'s `apply_pose` tool drives, and `behavior` is its only CLI
+inspection surface.
 
 - `reachy-mini-cli behavior expressions` (alias `expressions list`) — every
   catalog emoji plus a generated pose descriptor: the pose's non-zero axes and
@@ -739,163 +738,6 @@ assert this. Keep `say` as a pure TTS → playback pipe.
 """
 
 
-_THINK_DEMO = """\
-# reachy-mini-cli think demo
-
-Run a scripted `*emoji* "speech"` stream through the real expression + TTS
-pipeline, so a human can verify the body-expression wiring on a live robot
-without a running LLM.
-
-The built-in script is:
-
-    *🤔* "I wonder what that sound was."
-    *👂* "There it is again, to my left."
-    *🙂* "Ah — it's just the fan."
-
-Each `*emoji*` marker enqueues exactly one calm gesture via
-`ExpressionProducer`; each quoted phrase is synthesized via the active voice
-engine (`--voice-engine {tts,harmonic}`, default `tts`; override with
-`REACHY_VOICE_ENGINE`) and played through the robot speaker. `harmonic` is an
-in-process, offline, non-speech voice — a note melody in Reachy's own identity
-signature, no TTS service needed (tune with `REACHY_HARMONIC_IDENTITY` /
-`REACHY_HARMONIC_ARTICULATION`). The cognition-active signal is raised for the
-duration of the demo so a co-running `listen` backs off its idle motion.
-
-## Usage
-
-    reachy-mini-cli think demo                            # built-in script, sdk transport
-    reachy-mini-cli think demo --transport http           # use HTTP playback
-    reachy-mini-cli think demo --script '*😮* "Oh!"'     # custom script
-    reachy-mini-cli think demo --voice-engine harmonic    # offline harmonic voice, no LLM
-    reachy-mini-cli think demo --json                     # machine-readable result
-
-## Manual verification
-
-See `docs/verification/think-body-expression.md` for the full on-robot checklist.
-
-## Exit codes
-
-- `0` — demo ran to completion
-- `1` — user error (bad script / args)
-- `2` — environment error (TTS unreachable, missing SDK extra, etc.)
-"""
-
-_THINK = """\
-# reachy-mini-cli think
-
-Think out loud about what the robot perceives. A continuous cognition loop: on
-each turn the robot's live senses are snapshotted into an event buffer, the LLM
-produces one or two first-person sentences, each sentence is synthesized via TTS
-and played through the speaker while the LLM is still generating the next one
-(sentence-streamed), so speech starts before the turn is complete.
-
-The sense feed mirrors `listen`: DoA (direction of arrival) and mic loudness
-are read per tick via the SDK transport (default) or the daemon's DoA HTTP route
-(`--transport http`). Both feed the `EventBuffer` through a `before_turn` hook.
-An empty buffer (no notable sounds since the last turn) is a no-op — no LLM call,
-no audio.
-
-Like `daemon`, `think` has both a foreground loop (`run`) and a tracked
-background process (`start`/`stop`/`restart`/`status`) managed by its own
-supervisor (`reachy/speech/supervisor.py`, distinct from `listen`'s).
-
-## Verbs
-
-- `reachy-mini-cli think run` — run the cognition loop in the foreground; Ctrl-C
-  stops it. `--max-turns N` stops after N spoken turns; `--max-ticks N` stops
-  after N loop iterations (idle turns included).
-- `reachy-mini-cli think start` — spawn the loop in the background, recording
-  its PID + log under the state dir.
-- `reachy-mini-cli think stop` — stop the loop this CLI started.
-- `reachy-mini-cli think restart` — stop and relaunch the background loop
-  (re-reads flags and latest code).
-- `reachy-mini-cli think status` — the loop's process state (running / stopped
-  / stale pid).
-- `reachy-mini-cli think expressions` — list the expression catalog (emoji +
-  pose descriptor); `expressions check` flags poses too similar to be distinct.
-- `reachy-mini-cli think overview` — this summary.
-
-## Expressions
-
-While thinking, the robot gestures: the LLM may emit `*emoji*` expression
-markers (and wraps spoken text in `"quotes"`). Each marker enqueues one calm
-gesture from the expression catalog onto a serial motion queue, drained one move
-at a time to the robot — `think` never streams `set_target` poses. The available
-emoji vocabulary is advertised to the LLM in its system prompt, pulled live from
-the catalog. Inspect the catalog with `think expressions` / `think expressions
-check`.
-
-## Cognition signal
-
-While `run` is active it publishes a file flag (`think_active.flag` under the
-state dir) so other subsystems (e.g. idle motion) can back off; the flag is
-cleared on every exit path, including Ctrl-C and errors.
-
-## LLM endpoint
-
-Configure with `--llm-base-url` / `REACHY_OPENAI_URL_BASE` (base URL),
-`--llm-model` / `REACHY_OPENAI_MODEL_ID` (model name), and `REACHY_OPENAI_API_KEY`
-(bearer key, only sent when present). The legacy `REACHY_LLM_BASE_URL` /
-`REACHY_LLM_MODEL` / `REACHY_LLM_API_KEY` names still work as a fallback. The
-client is a pure `urllib`-based streaming HTTP client (no new base dep; no
-`openai` SDK required).
-
-## TTS endpoint
-
-Same as `say`: `--tts-url` / `REACHY_TTS_URL`, `--voice` / `REACHY_TTS_VOICE`.
-`think` reuses `say`'s speech leg (`reachy.speech.tts.synthesize` +
-`reachy.speech.playback.play_audio`). Both flags are **tts-engine only**.
-
-## Voice engine
-
-`--voice-engine {tts,harmonic}` picks which speech backend voices each spoken
-sentence (default `tts`; override with `REACHY_VOICE_ENGINE`). `harmonic` is an
-in-process, offline, non-speech voice: each sentence renders to a short note
-melody in Reachy's own identity signature (no TTS service needed) — cognition,
-expressions, sensing, and the export feed are unaffected by the choice. Tune
-with `REACHY_HARMONIC_IDENTITY` (default `reachy`) / `REACHY_HARMONIC_ARTICULATION`
-(default `smooth`). The startup banner and `think status --json` (`voice_engine`
-field) report the active engine of a running loop. `think demo --voice-engine
-harmonic` exercises the same leg with no LLM — see
-`reachy-mini-cli explain think demo`.
-
-## Playback transport
-
-- `sdk` (default) — pushes PCM via `reachy_mini`; requires `[sdk]` / `[daemon]`.
-- `http` — sends PCM to the daemon's `/media/play` HTTP route.
-
-## Pacing
-
-`--turn-interval` (seconds between turns; default from `CognitionEngine`).
-`--max-turns` bounds a run to N spoken turns. `--max-ticks` bounds by loop
-iterations (useful for testing: idle ticks count, spoken turns don't).
-
-## Transport (sense feed)
-
-- `sdk` (default) — opens a `ReachyMini` media session in-process; reads real
-  DoA + mic RMS per tick.
-- `http` — polls the daemon's DoA route; no audio source (RMS treated as 0).
-
-## Notes
-
-- State lives under `$REACHY_STATE_DIR` or `$XDG_STATE_HOME/reachy`: `think.pid`
-  and `think.log`.
-- `think` has its own supervisor (`reachy/speech/supervisor.py`), separate from
-  `listen`'s `reachy/motion/supervisor.py` — they track different processes.
-
-## Usage
-
-    reachy-mini-cli daemon start                             # bring the daemon up
-    reachy-mini-cli think run                                # foreground loop (Ctrl-C to stop)
-    reachy-mini-cli think run --max-turns 3                  # stop after 3 spoken turns
-    reachy-mini-cli think run --voice-engine harmonic        # offline harmonic voice
-    reachy-mini-cli think start --llm-model mistral-small    # background process
-    reachy-mini-cli think status --json
-    reachy-mini-cli think stop
-    reachy-mini-cli think restart                            # apply code/config updates
-"""
-
-
 _LISTEN = """\
 # reachy-mini-cli listen
 
@@ -981,7 +823,7 @@ Feel knobs (each defaults to a tuned value; unset keeps it):
 
 ## Live mode
 
-- `--live` — fold `think` + `vision` + `sleep` into this one loop (alongside the
+- `--live` — fold cognition + `vision` + `sleep` into this one loop (alongside the
   head-pat hook), so every sense rides the one SDK media session and the one motion
   queue in one process. `sdk`-only. This is the loop the `live` boot presence runs.
 - `--transcribe` — (requires `--live`, `sdk`-only) transcribe nearby speech via the
@@ -1045,7 +887,7 @@ a neutral baseline head pose, reads the *actual* head pose back each tick, and f
 the commanded-vs-actual deviation to a `PatDetector`. When the detector recognises a
 pat it fires an event and `PatReaction` enqueues a calm lean→nuzzle→settle gesture
 onto the shared serial `MotionQueue`, drained one move at a time to the robot by a
-background motion executor — the same architecture as `listen` and `think`.
+background motion executor — the same architecture as `listen` and `sleep`.
 
 Two **touch types**:
 
@@ -1120,7 +962,7 @@ alive idle when ALERT, a low-energy idle when DROWSY, and a near-still
 "sleep breathe" (slow body rock + gentle antenna breathing + a slight head
 droop) when ASLEEP. Moves are submitted onto the shared serial `MotionQueue` and
 drained one move at a time by a background motion executor — the same
-architecture as `listen`, `think`, and `pat`.
+architecture as `listen` and `pat`.
 
 While the robot is ASLEEP the noun keeps the `sleep_active.flag` written (under
 the state dir) so other subsystems can quiet themselves; it is cleared the moment
@@ -1200,7 +1042,7 @@ talks to **systemd** (`systemctl --user`), so there is no `--transport` flag.
   the robot depend on it).
 - `reachy-demo-mode.service` — the idle `demo-mode run` presence loop.
 - `reachy-live.service` — the folded live loop (`listen run --live --transcribe
-  --voice-engine harmonic`): hearing + pat + think + vision + sleep in one
+  --voice-engine harmonic`): hearing + pat + cognition + vision + sleep in one
   process, speaking with the offline harmonic voice by default.
 - `reachy-runtime.service` — the AI-agnostic symbolic runtime (`behavior engine
   run`, the boot default per decision c19): the deterministic 50 Hz engine loads
@@ -1289,8 +1131,9 @@ Three composition seams:
   A missing or broken forge stack disables only this tool — cognition keeps
   running.
 - **OUTPUT** — `--export -` / `--export-blocks`: the agent publishes its OWN
-  `thinking`/`message`/`emotion` feed through the SAME exporter `think`/`listen`
-  use (decision c27: the runtime feed carries no cognition block). See
+  `thinking`/`message`/`emotion` feed through the SAME exporter `listen
+  run --live --export -` uses (decision c27: the runtime feed carries no
+  cognition block). See
   `docs/export-schema.md`.
 
 Like `daemon` / `service`, `agent` does not use a `--transport` — it talks to
@@ -1401,18 +1244,6 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("say",): _SAY,
     ("say", "overview"): _SAY,
     ("say", "run"): _SAY,
-    ("think",): _THINK,
-    ("think", "overview"): _THINK,
-    ("think", "run"): _THINK,
-    ("think", "start"): _THINK,
-    ("think", "stop"): _THINK,
-    ("think", "restart"): _THINK,
-    ("think", "status"): _THINK,
-    ("think", "expressions"): _THINK,
-    ("think", "expressions", "overview"): _THINK,
-    ("think", "expressions", "list"): _THINK,
-    ("think", "expressions", "check"): _THINK,
-    ("think", "demo"): _THINK_DEMO,
     ("pat",): _PAT,
     ("pat", "overview"): _PAT,
     ("pat", "run"): _PAT,

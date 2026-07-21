@@ -23,9 +23,10 @@ rotating body, a USB mic array (with direction-of-arrival), a camera, and a
 speaker. `reachy-mini-cli` exposes each capability as a **noun** you run from a
 shell or an agent loop: hold the hardware (`daemon`), feel alive when idle
 (`demo-mode`), orient to sound (`listen`) or sight (`vision`), speak in a TTS
-or offline harmonic voice (`say`), think out loud and move in step with its
-thoughts (`think`), feel a head pat (`pat`), and fall asleep when left alone
-(`sleep`). `listen run --live` folds every live sense into one loop, and
+or offline harmonic voice (`say`), feel a head pat (`pat`), and fall asleep
+when left alone (`sleep`). `listen run --live` folds every live sense — plus
+an LLM cognition loop that talks and moves in step with its thoughts — into
+one loop, and
 `service` makes one presence mode survive a reboot.
 
 ## Noun map
@@ -44,7 +45,6 @@ The complete robot surface. Every noun supports `--json`; run
 | [`listen`](docs/operating-reachy.md#senses-one-sdk-media-owner-at-a-time) | Two-tier sound orienting (antenna lean → head/body turn); `--live` folds every sense into one loop | `sdk` default |
 | `vision` | Turn toward motion or light (pure pixel math, no ML) | `sdk` default |
 | `say` | Dumb pipe: text → voice (TTS or offline harmonic) → speaker | `sdk` default |
-| `think` | LLM cognition loop: speaks (TTS or harmonic) + expresses; `--export` JSONL feed | `sdk` default |
 | `pat` | Feel a head pat and lean into it (no touch sensor) | `sdk` only |
 | `sleep` | Decay to sleep when idle; wake on sound / wake-word / pat | `sdk` default |
 | [`service`](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot) | Boot-persist exactly one presence mode (`demo` or `live`) via systemd `--user` | none (manages systemd) |
@@ -53,7 +53,7 @@ The complete robot surface. Every noun supports `--json`; run
 > ⚠️ **Before you run two behaviors at once, read
 > [the single-SDK-owner model](docs/operating-reachy.md#the-single-sdk-owner-model).**
 > The robot serves one in-process SDK client and one motion queue, each a
-> *single resource*: `listen`, `think`, `sleep`, `vision`, and `pat` are
+> *single resource*: `listen`, `sleep`, `vision`, and `pat` are
 > **mutually exclusive on the `sdk` transport**. This trips up humans and agents
 > repeatedly. The conflict matrix and the two ways to compose behaviors anyway
 > are in the guide.
@@ -97,29 +97,28 @@ reachy-mini-cli demo-mode start                                # feel-alive idle
 reachy-mini-cli listen run                                     # orient to sound (sdk; Ctrl-C to stop)
 reachy-mini-cli vision run                                     # orient to motion/light (sdk)
 reachy-mini-cli say run "Hello from Reachy"                    # text-to-speech
-reachy-mini-cli think run                                      # LLM cognition loop (speaks + moves)
 reachy-mini-cli pat run                                        # feel a head pat and lean in
 reachy-mini-cli sleep run                                      # fall asleep when idle, wake when addressed
 reachy-mini-cli listen run --live                              # ALL senses in one loop (the "live presence" mode)
 reachy-mini-cli daemon stop                                    # put it back down
 ```
 
-The background nouns (`demo-mode`, `listen`, `think`, `sleep`) also expose
+The background nouns (`demo-mode`, `listen`, `sleep`) also expose
 `start` / `stop` / `restart` / `status`; the sense nouns also expose `demo` (no
 robot needed). See `reachy-mini-cli explain <noun>`.
 
 ### The live loop and boot persistence
 
-`listen run --live` folds **think + vision + sleep** into `listen`'s single loop
-(alongside the head-pat hook), so every live sense rides **one** SDK media
+`listen run --live` folds **cognition + vision + sleep** into `listen`'s single
+loop (alongside the head-pat hook), so every live sense rides **one** SDK media
 session and **one** motion queue in **one** process — arbitrated by the
-`sleep > pat > think` priority flags. It is the supported way to run all the
+`sleep > pat > cognition` priority flags. It is the supported way to run all the
 senses at once (one media owner; see the single-SDK-owner model below).
 
 Add **`--transcribe`** and live cognition *hears words*: nearby speech is
 transcribed via the external STT service (model-gear / Parakeet at
 `REACHY_STT_URL`, default `localhost:9002`) and the recognised words flow into
-the think loop, so the robot reasons about *what* was said — not just that a
+the folded cognition loop, so the robot reasons about *what* was said — not just that a
 sound came from the left. Off by default (the live loop is unchanged when off);
 `--transcribe` requires `--live` and the `sdk` transport. A self-mute window
 means the robot never transcribes its own voice, and an unreachable STT degrades
@@ -133,9 +132,9 @@ reachy-mini-cli listen run --live --transcribe                 # hear words + re
 
 Add **`--voice-engine harmonic`** (or `REACHY_VOICE_ENGINE=harmonic`) and every
 spoken sentence is voiced as an offline note-melody instead of TTS — fully
-in-process, deterministic, no external service to reach. `say run`, `think
-run`/`demo`, and `listen run --live` all accept `--voice-engine
-{tts,harmonic}` (default `tts`); tune the voice with
+in-process, deterministic, no external service to reach. `say run` and
+`listen run --live` both accept `--voice-engine {tts,harmonic}` (default
+`tts`); tune the voice with
 `REACHY_HARMONIC_IDENTITY` / `REACHY_HARMONIC_ARTICULATION`. See
 [The harmonic voice](docs/operating-reachy.md#the-harmonic-voice) for the full
 picture.
@@ -164,15 +163,16 @@ See [Boot persistence](docs/operating-reachy.md#boot-persistence--one-presence-p
 
 ## Export feed
 
-`think run --export -` streams a live newline-delimited JSON (NDJSON) feed of
-what the robot is **thinking / saying / feeling** — one object per line. The
+`listen run --live --export -` streams a live newline-delimited JSON (NDJSON)
+feed of what the robot is **thinking / saying / feeling** — one object per
+line (`agent attach --export -` publishes the same three block types). The
 renderer stays **out of this repo** by design (the export decoupling boundary):
 `reachy-mini-cli` emits a documented contract, a separate consumer renders it.
 
 ```bash
-reachy-mini-cli think run --export -                              # all block types
-reachy-mini-cli think run --export - --export-blocks message,emotion
-reachy-mini-cli think run --export - | <your renderer>
+reachy-mini-cli listen run --live --export -                      # all block types
+reachy-mini-cli listen run --live --export - --export-blocks message,emotion
+reachy-mini-cli listen run --live --export - | <your renderer>
 ```
 
 Wire format: [`docs/export-schema.md`](docs/export-schema.md). For the renderer

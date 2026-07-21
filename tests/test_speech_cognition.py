@@ -1,4 +1,4 @@
-"""Tests for the think cognition engine (:mod:`reachy.speech.cognition`).
+"""Tests for the marker cognition engine (:mod:`reachy.speech.cognition`).
 
 All collaborators are faked — no live LLM, TTS, or robot, and no sleeps. Ordering
 guarantees are proven with :class:`threading.Event` gates so the suite is fully
@@ -16,11 +16,14 @@ The three acceptance criteria:
 
 from __future__ import annotations
 
+import ast
+import inspect
 import logging
 import threading
 
 import pytest
 
+import reachy.speech.cognition as cognition_mod
 from reachy.speech.cognition import CognitionEngine
 from reachy.speech.events import EventBuffer
 
@@ -512,3 +515,59 @@ def test_run_turn_no_cues_logs_no_sense_turn_line(caplog):
         assert engine.run_turn() is False
 
     assert _sense_records(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# Architectural boundary — the engine's ONLY motion seam is `express`
+# ---------------------------------------------------------------------------
+#
+# Moved here from the retired ``tests/test_think_boundary.py`` when the ``think``
+# noun was deleted (t20). The assertions are about ``reachy.speech.cognition``
+# itself, which survives ``think`` as the folded ``listen --live`` marker engine,
+# so the coverage moves rather than being dropped.
+
+
+def _imported_modules(module) -> set[str]:
+    """All dotted module names imported by *module* (Import + ImportFrom)."""
+    tree = ast.parse(inspect.getsource(module))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name)
+    return names
+
+
+def test_cognition_engine_does_not_import_motion() -> None:
+    """reachy.speech.cognition must not import reachy.motion at all.
+
+    The only motion seam is the injected ``express`` callback; the engine builds
+    no MotionAction, touches no MotionQueue, and never reaches a transport.
+    """
+    for name in _imported_modules(cognition_mod):
+        assert not name.startswith(
+            "reachy.motion"
+        ), f"cognition.py must not import reachy.motion (got {name!r})"
+    assert "motion" not in cognition_mod.__dict__
+
+
+def test_cognition_engine_drives_motion_only_via_express_callback() -> None:
+    """The engine source contains no direct transport.move_* call.
+
+    Motion is enqueued exclusively through the ``express`` callback; the engine
+    has no transport handle and issues no move itself.
+    """
+    src = inspect.getsource(cognition_mod)
+    assert "move_goto" not in src
+    assert "move_set_target" not in src
+    assert ".move_" not in src
+
+
+def test_cognition_adds_no_vision_expression_or_mood_store() -> None:
+    """The engine imports no vision-expression channel and no mood/persistence store."""
+    for name in _imported_modules(cognition_mod):
+        assert "vision" not in name, f"cognition must add no vision-driven expression ({name!r})"
+        assert "mood" not in name, f"cognition must add no mood store ({name!r})"
+        assert name not in {"sqlite3", "shelve", "pickle"}, f"no persistence store ({name!r})"

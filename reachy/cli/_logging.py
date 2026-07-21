@@ -1,5 +1,5 @@
-"""Shared logging setup for the long-running sense loops (``listen``/``think``/
-``sleep`` ``run``).
+"""Shared logging setup for the long-running sense loops (``listen``/``sleep``
+``run``).
 
 Every module in this codebase logs via ``logging.getLogger(__name__)``, but
 nothing ever attached a handler or called ``logging.basicConfig`` — so
@@ -57,8 +57,8 @@ def add_log_level_arg(parser: argparse.ArgumentParser, *, default: str = DEFAULT
     """Register the shared ``--log-level`` flag on *parser*.
 
     Mirrors the ``add_export_args`` / ``add_robot_args`` pattern (one shared
-    helper) so ``listen run`` / ``think run`` / ``sleep run`` present an
-    identical flag instead of drifting three ways.
+    helper) so ``listen run`` / ``sleep run`` present an identical flag
+    instead of drifting.
     """
     parser.add_argument(
         "--log-level",

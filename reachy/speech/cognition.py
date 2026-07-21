@@ -1,4 +1,4 @@
-"""The ``think`` cognition engine: accumulated sense events → spoken thought.
+"""The marker cognition engine: accumulated sense events → spoken thought.
 
 This module ties the Wave-1 speech primitives into one engine,
 :class:`CognitionEngine`, that turns the robot's perceptions into speech. It
