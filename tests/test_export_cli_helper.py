@@ -1,7 +1,9 @@
 """Tests for the shared export-hook CLI helper (``reachy.cli._export``).
 
-``think run`` and ``listen run --live`` both build their JSONL export sink through
-``build_export_hook`` so the two feeds are byte-identical. The helper:
+``agent attach`` builds its JSONL cognition sink through ``build_export_hook``, and
+``behavior engine run`` builds the separate runtime sink through the sibling
+``build_runtime_export_consumer``, so no command mode can grow a private feed. The
+helper:
 
 - returns ``None`` when ``--export`` is absent (the no-op default),
 - rejects any target other than ``-`` (stdout) with a clean exit-1 user error,
