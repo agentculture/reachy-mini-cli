@@ -687,6 +687,11 @@ the SDK's ~5 Hz DoA speech flag is still catching up are not lost:
    every flushed/discarded utterance so a previous utterance (or the robot's
    own voice) never bleeds into the next one's lead-in.
 
+> This describes the retiring `listen --live` loop. The symbolic runtime's
+> hearing has since been rebuilt around one **contiguous** clip per utterance,
+> and only self-mute clears its ring — see [one contiguous clip per
+> utterance](#hearing--one-contiguous-clip-per-utterance).
+
 This is a direct port of `reachy_nova`'s `SpeechEventDetector` design. The ring
 horizon, pre-roll, onset window, and threshold are constructor defaults on
 `TranscribeHook` (`ring_seconds=10.0`, `pre_roll_s=2.0`, `onset_window_s=0.01`,
@@ -1088,7 +1093,10 @@ Three things worth knowing about that set:
   quiet room's capture behaviour is exactly what it always was. Before this, a
   night-time robot held the capture gate permanently open and filled its
   journal with `utterance start` → `dropped reason=stt-empty`: it was recording
-  its own hiss and posting it to the STT.
+  its own hiss and posting it to the STT. The threshold decides **when the
+  robot starts listening**, and nothing else — it never decides which audio is
+  worth keeping (see [one contiguous clip per
+  utterance](#hearing--one-contiguous-clip-per-utterance) below).
 - **`look-toward-sound` admits far more often than the robot actually moves.**
   With no credible bearing `orient-to-sound` abstains, so `feel-alive` keeps
   breathing through it and the head stays put. Admission is cheap; turning is
@@ -1236,6 +1244,65 @@ fire/suppress line — is visible on stderr by default.
 > cleanly, but only fire where a provider feeds the field; the provider seams
 > (`reachy.behavior.sense.SenseProviders`) are the designed attach point when
 > that composition lands.
+
+### Hearing — one contiguous clip per utterance
+
+For a long time the robot could not hear a spoken sentence. It heard
+`"Yeah."` and `"Okay."` perfectly, and turned `"Reachy, are you there?"` into
+`"Ready, she"` — or into nothing at all, `dropped reason=stt-empty`. The STT
+service was fine (the same phrase, recorded and POSTed by hand, transcribed
+perfectly), the engagement gate was fine, and the shipped rule was fine.
+
+The fault was in what the runtime sent. It built each utterance out of **only
+the mic chunks that individually cleared the capture threshold**; a quieter
+chunk was buffered and then thrown away. So the WAV that reached the STT was
+the pre-roll followed by the loud frames butt-spliced together, with every
+unvoiced consonant, stop closure and inter-word gap *inside the sentence* cut
+out. That is also why short interjections survived: under the splice,
+everything became a short interjection.
+
+Measured against the real Parakeet with one phrase mixed to realistic mic
+levels:
+
+| what was sent | frames kept | transcript |
+|---|---|---|
+| the contiguous recording | 100 % | `Richie, are you there?` |
+| spliced, room background 0.020 | 42 % | `Reaching there.` |
+| spliced, room background 0.034 | 27 % | `Return.` |
+| spliced, normal voice across the room | 12 % | `Yeah.` |
+
+So the rule now is: **the capture threshold starts and ends an utterance; it
+never filters its contents.** The runtime keeps a rolling ring of everything
+the microphone produced and submits one unbroken slice of it — from the
+measured onset minus the pre-roll, through everything captured since. Three
+things follow that are worth knowing as an operator:
+
+- **The relative capture threshold is not the problem and was not reverted.**
+  With a contiguous clip, a background-relative threshold only decides when to
+  start listening, which is what it is for. Do not lower it to "hear more of
+  the sentence" — the sentence is already all there.
+- **The ring survives an emit.** It used to be wiped every time an utterance
+  was submitted, which destroyed the pre-roll for whatever was said next (the
+  journal showed `pre_roll=0.02s buffered=512` on back-to-back utterances).
+  Now only self-mute clears it, so the robot still cannot pre-roll its own
+  voice, and two consecutive sentences leave no gap between them.
+- **An utterance's length is its span, not its loud-sample count.** A sentence
+  that spends more time between its words than inside them is still a
+  sentence; the `min_utterance_s` floor no longer discards one as a blip.
+
+Confirming it on a real robot is a grep — every submitted utterance now says
+how long it was and how long the clip is:
+
+```bash
+journalctl --user -u reachy-runtime -f | grep 'stage=capture'
+# [SENSE stage=capture source=speech event=3f2a9c1e] utterance start pre_roll=1.83s buffered=160000
+# [SENSE stage=capture source=speech event=3f2a9c1e] utterance end span=1.42s clip=3.31s contiguous
+```
+
+`clip` should be roughly `span` plus the pre-roll and the closing pause. A
+`clip` much *shorter* than `span` would mean audio is being dropped inside the
+utterance again — that is the defect's signature, and it is now visible from
+the journal instead of only from a bad transcript.
 
 ### The pat sense
 

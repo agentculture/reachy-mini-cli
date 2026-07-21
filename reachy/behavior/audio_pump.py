@@ -49,8 +49,10 @@ The fix, following the transcript/face background-worker precedent
   live (naming the discarded backlog), client-lost, closed — and one
   per-episode overflow drop line. Never a per-chunk line.
 
-Import boundary: this module never imports ``reachy_mini`` — it only calls the
-injected source's ``audio()`` (duck-typed on
+Import boundary: this module never imports ``reachy_mini`` — its only non-stdlib
+imports are numpy and :mod:`reachy.robot.audio_shape` (pure numpy, the shared
+"what shape is one mic chunk" answer), and it only calls the injected source's
+``audio()`` (duck-typed on
 :class:`reachy.robot.media_client.HeldMediaClient`: ``None`` covers every
 "no audio" case and reads never raise, though the pump guards anyway) and peeks
 its free ``connected`` predicate to tell "empty" from "down". numpy is a base
@@ -72,6 +74,7 @@ from typing import Any, Callable
 import numpy as np
 
 from reachy import senselog
+from reachy.robot.audio_shape import to_mono
 
 logger = logging.getLogger(__name__)
 
@@ -275,20 +278,20 @@ class AudioPump:
                 self._beat()
 
     def _read(self) -> np.ndarray | None:
-        """One guarded source read, coerced to a 1-D float32 chunk or ``None``."""
+        """One guarded source read, coerced to a 1-D float32 chunk or ``None``.
+
+        The coercion is :func:`reachy.robot.audio_shape.to_mono`, not a bare
+        ``.reshape(-1)``: a multi-channel read must have a channel SELECTED, or
+        flattening interleaves both channels into one double-length stream.
+        """
         self.reads += 1
         try:
             raw = self._media.audio()
         except Exception:  # noqa: BLE001 — a raising source is "no audio"
             logger.debug("AudioPump: media read raised; no audio", exc_info=True)
             return None
-        if raw is None:
-            return None
-        try:
-            chunk = np.asarray(raw, dtype=np.float32).reshape(-1)
-        except (TypeError, ValueError):
-            return None
-        if chunk.size == 0:
+        chunk = to_mono(raw)
+        if chunk is None or chunk.size == 0:
             return None
         return chunk
 

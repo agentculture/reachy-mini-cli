@@ -136,6 +136,7 @@ import uuid
 from typing import Any, Callable
 
 from reachy import senselog
+from reachy.robot.audio_shape import to_mono
 from reachy.robot.transport import DEFAULT_BASE_URL
 
 logger = logging.getLogger(__name__)
@@ -328,11 +329,19 @@ class HeldMediaClient:
     # ------------------------------------------------------------------
 
     def audio(self) -> Any | None:
-        """Return one mic chunk (a ``np.float32`` ndarray), or ``None``.
+        """Return one mic chunk as a 1-D ``np.float32`` ndarray, or ``None``.
 
         ``None`` covers every "no audio" case: closed holder, absent SDK, inside
-        the retry backoff, construction just failed, or the read itself raised
-        (which drops the client and schedules a retry).
+        the retry backoff, construction just failed, the read itself raised
+        (which drops the client and schedules a retry), or the read returned a
+        shape no microphone produces.
+
+        **The channel is selected, never interleaved.** SDK 1.9 documents
+        ``get_audio_sample()`` as returning ``(N, 2)``; flattening that would
+        interleave both channels into one stream at twice the sample count.
+        :func:`reachy.robot.audio_shape.to_mono` picks the AEC channel instead
+        and passes a 1-D read through untouched — see that module for the
+        measurement showing which shape this box actually delivers today.
 
         Non-blocking on the real SDK surface — EXCEPT a first read that triggers
         the lazy construction, which blocks for order-of-seconds. On a tick
@@ -343,11 +352,12 @@ class HeldMediaClient:
         if media is None:
             return None
         try:
-            return media.get_audio_sample()
+            raw = media.get_audio_sample()
         # A read fault must degrade, not raise.
         except Exception as err:  # noqa: BLE001
             self._drop_client(reason=f"audio read failed ({err})")
             return None
+        return to_mono(raw)
 
     def frame(self) -> Any | None:
         """Return one camera frame (a BGR ndarray), or ``None``.

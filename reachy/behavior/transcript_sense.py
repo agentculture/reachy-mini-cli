@@ -82,6 +82,56 @@ throughout, and omitting the ``classifier`` argument does the same: in both
 cases no gate is built at all, so no classifier call is reachable.
 
 --------------------------------------------------------------------------
+The capture rule: the RMS predicate is a LOCATOR, never a content filter (#108)
+--------------------------------------------------------------------------
+The speech predicate decides **when to start and stop listening**. It does NOT
+decide which audio is worth keeping. Once an utterance is open, every chunk is
+retained, and what is submitted is **one contiguous slice of the ring** —
+``ring[clip_start:]`` — exactly as :mod:`reachy_nova`'s ``speech_events.py``
+(``:263-265``) emits ``full_buffer[clip_offset:]``.
+
+This is the fix for issue #108, and it is worth stating why, because the
+alternative reads as reasonable and is not. The module used to append **only
+chunks that individually cleared the threshold**; a quieter chunk fell through
+to :meth:`~TranscriptSenseDriver._maybe_submit_on_pause` and was discarded. So
+what reached the STT was::
+
+    [<=2 s contiguous pre-roll] + [the loud frames butt-spliced, quiet frames excised]
+
+Every unvoiced consonant, stop closure and inter-word gap *inside* the sentence
+was cut out and the survivors glued edge to edge. Reproduced live against the
+real Parakeet with one phrase mixed to realistic mic levels: contiguous gave
+``'Richie, are you there?'``; the same phrase gated at the live background
+(threshold 0.060, 42 % of frames kept) gave ``'Reaching there.'``; at 0.102 it
+gave ``'Return.'``; across a room, ``'Yeah.'``. That also explains the
+observation that puzzled the investigation most — *short interjections survive
+intact* — because under the gate **everything degenerates into an
+interjection**.
+
+The threshold constant itself was never wrong. ``0.02`` was cited from nova's
+``_DEFAULT_SILENCE_THRESHOLD``, which nova uses ONLY in ``_measure_onset``
+(``:237-254``) to locate where to begin backtracking. We kept the number and
+inverted its meaning, from *locator* to *content filter*. Citation drift, not
+a tuning error — which is why no amount of threshold tuning would have fixed
+it, and why the #102 background-relative threshold is **harmless rather than
+harmful** now: with contiguous capture it only decides when to START listening,
+which is what it was designed for. Do not revert it.
+
+Two consequences follow, and both are load-bearing:
+
+* **The ring is not cleared on emit** — only :meth:`~TranscriptSenseDriver.
+  _discard_ring` clears it, and only self-mute calls it. Clearing on emit
+  destroyed the runtime's own pre-roll; the live journal shows
+  ``pre_roll=0.02s buffered=512`` on back-to-back utterances. Instead a
+  ``_consumed`` watermark marks what has already been submitted, so audio is
+  delivered exactly once without being destroyed.
+* **``min_utterance_s`` is a SPAN, not a count of loud samples.** Measuring the
+  floor over "speech samples only" is the same defect wearing a different hat:
+  a sentence that spends more time between its words than inside them would be
+  discarded as a blip. The span is measured on the AUDIO timeline (sample
+  indices at the mic rate, so a tick-rate wobble cannot move it).
+
+--------------------------------------------------------------------------
 Deviations from the donor, and why
 --------------------------------------------------------------------------
 * **Voice activity is measured from the audio, not taken from the daemon's
@@ -131,6 +181,7 @@ from typing import Any, Callable
 import numpy as np
 
 from reachy import senselog
+from reachy.robot.audio_shape import to_mono
 from reachy.speech.engagement import ConversationGate, Decision
 from reachy.speech.events import _doa_direction
 from reachy.speech.stt import Transcriber
@@ -233,11 +284,16 @@ class TranscriptTuning:
     * ``silence_hold_s`` — pause length that ends an utterance and submits it.
     * ``max_utterance_s`` — hard cap that force-submits a long monologue.
     * ``min_utterance_s`` — floor below which a blip is dropped, never sent to
-      STT (measured over *speech* samples only, so pre-roll cannot pad it).
+      STT. Measured as the SPAN from the first speech sample to the last (#108),
+      not as a count of loud samples: a sentence with long inter-word gaps is
+      still a sentence. The pre-roll lead-in is outside the span, so it cannot
+      pad a blip past the floor.
 
     Pre-roll ring buffer + measured onset:
 
-    * ``ring_seconds`` — horizon of the rolling pre-speech audio buffer.
+    * ``ring_seconds`` — horizon of the rolling pre-speech audio buffer. While
+      an utterance is open the ring retains at least the open clip, so a long
+      sentence is never trimmed out from under itself.
     * ``pre_roll_s`` — lead-in kept before the measured onset.
     * ``onset_window_s`` — width of each RMS onset-scan analysis window.
 
@@ -353,13 +409,20 @@ class TranscriptSenseDriver:
         self._rate: int | None = None
         self._min_utt_samples = 0
         self._ring_max = 0
+        self._ring_hard_max = 0
         self._pre_roll_samples = 0
         self._onset_window = 1
 
         # --- tick-thread capture state (touched by NO other thread) -----------
-        self._utt: list[np.ndarray] = []
-        self._utt_samples = 0
-        self._utt_speech_samples = 0
+        #: Absolute sample index where the OPEN utterance's clip begins (its
+        #: measured onset minus the pre-roll), or ``None`` when none is open.
+        #: This replaces the old list of accumulated speech chunks: the ring is
+        #: the buffer, and an utterance is just a mark in it (#108).
+        self._clip_start: int | None = None
+        #: Absolute sample indices bounding the SPEECH inside the open clip —
+        #: the span ``min_utterance_s`` is measured over.
+        self._speech_begin = 0
+        self._speech_end = 0
         self._utt_started_t: float | None = None
         self._last_speech_t: float | None = None
         self._utt_direction: str | None = None
@@ -367,6 +430,11 @@ class TranscriptSenseDriver:
         self._ring: list[np.ndarray] = []
         self._ring_samples = 0
         self._ring_total = 0
+        #: Absolute sample index through which audio has already been submitted
+        #: (or deliberately discarded). Everything at or after it is still
+        #: eligible; everything before it is never re-scanned and never re-sent.
+        #: This is what lets the ring SURVIVE an emit instead of being wiped.
+        self._consumed = 0
 
         # --- the one-tick latch (written by the tick thread only) -------------
         self._latch: str | None = None
@@ -451,10 +519,13 @@ class TranscriptSenseDriver:
 
         if now < self._mute_until():
             # The robot is speaking: discard the partial utterance AND the ring,
-            # so its own voice is never pre-rolled nor transcribed.
-            if self._utt:
+            # so its own voice is never pre-rolled nor transcribed. This is the
+            # ONE path that clears the ring (#108) — everything else marks
+            # audio consumed and leaves it in place.
+            if self._clip_start is not None:
                 senselog.drop(_STAGE_CAPTURE, _SOURCE, self._event_id or "?", "self-mute")
             self._reset_utt()
+            self._discard_ring()
             return
 
         self._push_ring(chunk)
@@ -464,16 +535,17 @@ class TranscriptSenseDriver:
         self._maybe_submit_on_pause(now)
 
     def _on_speech_tick(self, ctx, chunk: np.ndarray, now: float) -> None:  # type: ignore[no-untyped-def]  # noqa: E501
-        """Accumulate one speech chunk, seeding the utterance on the rising edge."""
-        if self._utt_samples == 0:
-            # Rising edge: seed from the ring at the measured onset minus the
-            # pre-roll. The triggering chunk is already in the ring (pushed
-            # above), so it must NOT be appended again.
+        """Mark one speech chunk, opening the utterance on the rising edge.
+
+        Nothing is *accumulated* here — the chunk is already in the ring, and
+        the ring is what gets submitted. All this does is move the speech-span
+        end mark, which is why a quiet chunk mid-sentence costs nothing: it is
+        in the ring too, and the clip is contiguous over both.
+        """
+        if self._clip_start is None:
             self._begin_utterance(ctx, now, int(chunk.size))
         else:
-            self._utt.append(chunk)
-            self._utt_samples += int(chunk.size)
-            self._utt_speech_samples += int(chunk.size)
+            self._speech_end = self._ring_total
         self._last_speech_t = now
         started = self._utt_started_t
         if started is not None and (now - started) >= self._tuning.max_utterance_s:
@@ -482,7 +554,7 @@ class TranscriptSenseDriver:
     def _maybe_submit_on_pause(self, now: float) -> None:
         """End the utterance once speech has been absent for ``silence_hold_s``."""
         if (
-            self._utt
+            self._clip_start is not None
             and self._last_speech_t is not None
             and (now - self._last_speech_t) >= self._tuning.silence_hold_s
         ):
@@ -498,20 +570,38 @@ class TranscriptSenseDriver:
         This is the whole point of the module: the tick's involvement with a
         transcript ENDS here, at a ``put_nowait``. Everything downstream — the
         STT POST, the engagement classifier's call — happens on the worker.
-        """
-        speech_samples = self._utt_speech_samples
-        direction = self._utt_direction
-        utt = self._utt
-        event_id = self._event_id or "?"
-        self._reset_utt()
 
-        if not utt or speech_samples < self._min_utt_samples:
-            # A blip, not speech. The gate measures SPEECH samples only, so the
-            # pre-roll lead-in can never pad a blip past the floor.
+        The audio handed over is ONE CONTIGUOUS SLICE of the ring, from the
+        clip's measured start through everything captured since (#108). The ring
+        itself is left intact; only the ``_consumed`` watermark moves, so the
+        very next utterance still has real pre-roll to draw on.
+        """
+        clip_start = self._clip_start
+        direction = self._utt_direction
+        event_id = self._event_id or "?"
+        span = self._speech_end - self._speech_begin
+        self._reset_utt()
+        if clip_start is None:
+            return
+
+        audio = self._clip_from(clip_start)
+        # Consumed either way: audio is submitted at most once, and a blip we
+        # deliberately declined is not lead-in worth keeping for the next one.
+        self._consumed = self._ring_total
+
+        if audio.size == 0 or span < self._min_utt_samples:
+            # A blip, not a sentence. The floor is a SPAN (#108): silence inside
+            # an utterance counts toward its length, pre-roll outside it does not.
             senselog.drop(_STAGE_CAPTURE, _SOURCE, event_id, "min-utterance")
             return
 
-        audio = utt[0] if len(utt) == 1 else np.concatenate(utt)
+        rate = self._rate or _FALLBACK_RATE
+        senselog.stage(
+            _STAGE_CAPTURE,
+            _SOURCE,
+            event_id,
+            f"utterance end span={span / rate:.2f}s clip={audio.size / rate:.2f}s contiguous",
+        )
         self._ensure_worker()
         try:
             self._pending.put_nowait(_Utterance(audio, direction, now, event_id))
@@ -668,9 +758,15 @@ class TranscriptSenseDriver:
         """One mic chunk off the injected held client, degrading every failure.
 
         Returns ``None`` for "no audio this tick" — a cold/disconnected holder, a
-        read that raised, or a genuinely empty chunk. The first successful read
-        is also where the real mic sample rate is resolved: querying it earlier
-        could trigger the holder's blocking construction on this very thread.
+        read that raised, an unusable shape, or a genuinely empty chunk. The
+        first successful read is also where the real mic sample rate is
+        resolved: querying it earlier could trigger the holder's blocking
+        construction on this very thread.
+
+        Multi-channel reads have a channel SELECTED
+        (:func:`reachy.robot.audio_shape.to_mono`), never flattened: flattening
+        an ``(N, C)`` chunk interleaves its channels into one double-length
+        stream, which the WAV header then mislabels.
         """
         try:
             raw = self._media.audio()
@@ -678,13 +774,8 @@ class TranscriptSenseDriver:
         except Exception:  # noqa: BLE001
             logger.debug("TranscriptSenseDriver media read raised; no audio", exc_info=True)
             return None
-        if raw is None:
-            return None
-        try:
-            chunk = np.asarray(raw, dtype=np.float32).reshape(-1)
-        except (TypeError, ValueError):
-            return None
-        if chunk.size == 0:
+        chunk = to_mono(raw)
+        if chunk is None or chunk.size == 0:
             return None
         if self._rate is None:
             self._resolve_rate()
@@ -711,6 +802,19 @@ class TranscriptSenseDriver:
         self._ring_max = int(max(0.0, tuning.ring_seconds) * self._rate)
         self._pre_roll_samples = int(max(0.0, tuning.pre_roll_s) * self._rate)
         self._onset_window = max(1, int(tuning.onset_window_s * self._rate))
+        # The ceiling an OPEN utterance may hold the ring open to: the longest
+        # clip the endpointer can produce (pre-roll + the monologue cap + the
+        # closing pause) plus a second of slack. Bounded memory is not optional
+        # on a boot-persistent process.
+        self._ring_hard_max = int(
+            (
+                max(0.0, tuning.pre_roll_s)
+                + max(0.0, tuning.max_utterance_s)
+                + max(0.0, tuning.silence_hold_s)
+                + 1.0
+            )
+            * self._rate
+        )
         if self._transcriber is None:
             # Built with the REAL rate so the WAV header matches the audio; a
             # wrong rate makes the STT mis-decode and return nothing. No I/O.
@@ -755,26 +859,28 @@ class TranscriptSenseDriver:
         return float(np.sqrt(np.mean(np.square(chunk))))
 
     def _begin_utterance(self, ctx, now: float, speech_samples: int) -> None:  # type: ignore[no-untyped-def]  # noqa: E501
-        """Seed a new utterance with measured-onset pre-roll from the ring buffer.
+        """Open an utterance by MARKING where its clip starts in the ring.
 
-        Called on the VAD's rising edge. The triggering chunk is already in the
-        ring, so the seeded slice includes it. The onset is MEASURED (an RMS scan
-        of the buffered audio) and the utterance starts at ``onset - pre_roll``
-        clamped to the ring start, so a quiet leading phoneme is kept.
+        Called on the VAD's rising edge. Nothing is copied: the ring already
+        holds the triggering chunk and everything before it, so opening an
+        utterance is just recording an index. The onset is MEASURED (an RMS scan
+        of the buffered audio, never looking back past what has already been
+        submitted) and the clip starts at ``onset - pre_roll``, clamped to the
+        ring start, so a quiet leading phoneme is kept.
         """
         self._utt_started_t = now
         self._utt_direction = self._direction_of(ctx)
-        self._utt_speech_samples = int(speech_samples)
         self._event_id = uuid.uuid4().hex[:8]
+        self._speech_begin = self._ring_total - int(speech_samples)
+        self._speech_end = self._ring_total
 
         snapshot = self._concat_ring()  # one concat, rising edge only
         buffer_start = self._ring_total - self._ring_samples
-        onset_offset = self._measure_onset(snapshot)
+        scan_from = max(0, self._consumed - buffer_start)
+        onset_offset = self._measure_onset(snapshot, scan_from)
         onset_absolute = buffer_start + onset_offset
-        clip_start = max(buffer_start, onset_absolute - self._pre_roll_samples)
-        preroll = snapshot[clip_start - buffer_start :]
-        self._utt = [preroll] if preroll.size else []
-        self._utt_samples = int(preroll.size)
+        clip_start = max(buffer_start, self._consumed, onset_absolute - self._pre_roll_samples)
+        self._clip_start = clip_start
 
         rate = self._rate or _FALLBACK_RATE
         senselog.stage(
@@ -785,12 +891,41 @@ class TranscriptSenseDriver:
             f"buffered={self._ring_samples}",
         )
 
+    def _clip_from(self, clip_start: int) -> np.ndarray:
+        """The ring from *clip_start* to now, as ONE contiguous float32 array.
+
+        This is the emitted audio, and the whole of issue #108's fix: the slice
+        is unbroken, so every quiet frame *inside* the utterance — every stop
+        closure, unvoiced consonant and inter-word gap — reaches the STT with
+        the loud ones, in order. Mirrors ``reachy_nova``'s
+        ``speech_events.py:263-265`` (``full_buffer[clip_offset:]``).
+        """
+        snapshot = self._concat_ring()
+        buffer_start = self._ring_total - self._ring_samples
+        offset = max(0, min(int(snapshot.size), clip_start - buffer_start))
+        return snapshot[offset:]
+
+    def _retention(self) -> int:
+        """How many samples the ring must keep this tick.
+
+        Its rolling horizon normally; at least the OPEN clip while an utterance
+        is in progress, so a sentence longer than ``ring_seconds`` is not
+        trimmed out from under itself — bounded by :attr:`_ring_hard_max` so the
+        answer is always a number, never "however long this goes on".
+        """
+        base = self._ring_max
+        clip_start = self._clip_start
+        if clip_start is None:
+            return base
+        return max(base, min(self._ring_total - clip_start, self._ring_hard_max))
+
     def _push_ring(self, chunk: np.ndarray) -> None:
         """Append a chunk to the rolling pre-roll ring (cheap; trimmed by samples)."""
         self._ring.append(chunk)
         self._ring_samples += int(chunk.size)
         self._ring_total += int(chunk.size)
-        while len(self._ring) > 1 and self._ring_samples - self._ring[0].size >= self._ring_max:
+        keep = self._retention()
+        while len(self._ring) > 1 and self._ring_samples - self._ring[0].size >= keep:
             self._ring_samples -= int(self._ring.pop(0).size)
 
     def _concat_ring(self) -> np.ndarray:
@@ -801,38 +936,54 @@ class TranscriptSenseDriver:
             return self._ring[0]
         return np.concatenate(self._ring)
 
-    def _measure_onset(self, snapshot: np.ndarray) -> int:
-        """First window offset whose RMS clears the speech threshold, else 0.
+    def _measure_onset(self, snapshot: np.ndarray, start_at: int = 0) -> int:
+        """First window offset at/after *start_at* clearing the speech threshold.
 
         A MEASUREMENT over the buffered audio, not an assumed fixed offset, so
         the emitted clip's lead-in tracks where energy actually rises. Falls back
-        to the ring start when nothing clears the threshold.
+        to *start_at* when nothing clears the threshold. *start_at* is the
+        ``_consumed`` watermark: the scan must never reach back into audio a
+        previous utterance already carried, or the retained ring would re-send
+        the same words.
         """
         win = self._onset_window
         threshold = self._speech_threshold()
-        for start in range(0, int(snapshot.size), win):
+        floor = max(0, min(int(start_at), int(snapshot.size)))
+        for start in range(floor, int(snapshot.size), win):
             window = snapshot[start : start + win]
             if window.size and self._rms(window) >= threshold:
                 return start
-        return 0
+        return floor
 
     def _reset_utt(self) -> None:
-        """Clear the utterance accumulator AND the pre-roll ring.
+        """Close the open utterance. Leaves the ring alone (#108).
 
-        The ring goes with it so the next utterance's onset scan only sees audio
-        captured after this one ended (or after the robot stopped speaking) — no
-        bleed-through of previous words, or of the robot's own voice.
+        The ring is a rolling record of what the microphone produced; an
+        utterance is a pair of marks in it. Clearing the ring here destroyed the
+        pre-roll for whatever was said next (the live journal's
+        ``pre_roll=0.02s buffered=512`` on back-to-back utterances). Only
+        :meth:`_discard_ring` clears it, and only self-mute calls that.
         """
-        self._utt = []
-        self._utt_samples = 0
-        self._utt_speech_samples = 0
+        self._clip_start = None
+        self._speech_begin = 0
+        self._speech_end = 0
         self._utt_started_t = None
         self._last_speech_t = None
         self._utt_direction = None
         self._event_id = None
+
+    def _discard_ring(self) -> None:
+        """Throw the buffered audio away — the self-mute path, and only it.
+
+        ``_ring_total`` is a monotonic counter of everything ever captured, so
+        it is NOT reset: the absolute indices ``_consumed`` and ``_clip_start``
+        speak must stay comparable across a discard. Advancing ``_consumed`` to
+        it is what makes the robot's own voice unreachable from the next
+        utterance's onset scan.
+        """
         self._ring = []
         self._ring_samples = 0
-        self._ring_total = 0
+        self._consumed = self._ring_total
 
     # ------------------------------------------------------------------
     # Provider seam
