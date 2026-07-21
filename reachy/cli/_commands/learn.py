@@ -18,9 +18,10 @@ Purpose
 -------
 Operate the Reachy Mini robot from one agent-first CLI: bring the local daemon
 up, set up the device, manage apps, drive runtime motion (goto/wake/sleep), run
-demo mode and the 50 Hz behavior engine, and orient the head toward sound
-(SDK-first listen). Commands talk to the reachy-mini-daemon over HTTP (default)
-or the in-process reachy_mini SDK.
+demo mode, and run the 50 Hz symbolic behavior engine that composes every sense
+(touch, sound, heard words, faces) into one presence an AI agent can attach to.
+Commands talk to the reachy-mini-daemon over HTTP (default) or the in-process
+reachy_mini SDK.
 
 Install
 -------
@@ -48,6 +49,15 @@ Robot commands (talk to the Reachy daemon; --transport http|sdk)
   reachy-mini-cli demo-mode start    Make the robot feel alive (continuous).
                                      Also: stop/restart/status/run, config,
                                      install/enable/disable (systemd --user).
+  reachy-mini-cli behavior engine run  The symbolic presence runtime (50 Hz).
+                                     Also: behavior list/run/stop/status/
+                                     reload/goto/rules/expressions.
+  reachy-mini-cli vision run         Orient toward motion or light (pixels).
+  reachy-mini-cli say run "hi"       Text -> voice -> speaker.
+  reachy-mini-cli pat run            Bench check: feel a head pat.
+  reachy-mini-cli sleep run          Park the robot; wake when addressed.
+  reachy-mini-cli service enable runtime  Boot-persist one presence mode.
+  reachy-mini-cli agent attach       Attach an external AI agent to the runtime.
 
 Machine-readable output
 -----------------------
