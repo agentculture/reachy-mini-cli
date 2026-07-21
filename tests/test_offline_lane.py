@@ -14,6 +14,8 @@ that must survive with every network leg pointed nowhere:
     sleep/wake      -> test_sleep_wake_demo_walks_the_full_arc_with_no_robot
     rules           -> test_rules_file_changes_robot_behavior_in_a_bounded_run
     speak           -> test_speak_renders_and_plays_a_say_rule_with_every_endpoint_unreachable
+    hear            -> test_hearing_degrades_to_no_words_when_the_stt_is_unreachable
+                       test_hearing_admits_an_addressed_utterance_with_zero_llm_calls
 
 Every test below drives the SAME production seam a pre-existing, more thorough
 test file already proves (named in each test's docstring) — this file is
@@ -33,7 +35,10 @@ import contextlib
 import json
 import os
 import socket
+import time
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from reachy.behavior import library
@@ -43,7 +48,8 @@ from reachy.behavior.engine import run as engine_run
 from reachy.behavior.model import Lifetime, StopClass
 from reachy.behavior.rule_engine import compose_rule_seam
 from reachy.behavior.rules import RulesConfig
-from reachy.behavior.sense import Sense
+from reachy.behavior.sense import Sense, SenseProviders, read_perception
+from reachy.behavior.transcript_sense import TranscriptSenseDriver, TranscriptTuning
 from reachy.cli import main
 from reachy.motion.listen import ListenParams, ListenProducer
 from reachy.motion.pat import PatDetector
@@ -420,3 +426,182 @@ def test_speak_renders_and_plays_a_say_rule_with_every_endpoint_unreachable() ->
     assert samplerate == 16000
     assert len(pcm) > 1000, "the offline default voice rendered no audio"
     assert actuator.failures == 0
+
+
+# --------------------------------------------------------------------------- #
+# hear — words reach the sense snapshot, and a dead STT is silence not a stall #
+# --------------------------------------------------------------------------- #
+
+_MIC_RATE = 16000
+_MIC_CHUNK = 160  # 10 ms at 16 kHz — one tick's mic read
+_MIC_DT = 0.01
+
+#: An utterance that trips the engagement gate's NAME fast-path, so admission
+#: needs no classifier and therefore no endpoint. Used by BOTH hearing tests on
+#: purpose: it is the text most likely to reach the latch, so the degradation
+#: test below cannot pass merely because the gate would have dropped the words
+#: anyway — only the blocked socket can keep them out.
+_ADDRESSED = "reachy can you look at me"
+
+
+class _FakeMic:
+    """A stand-in ``HeldMediaClient`` handing out scripted mic chunks.
+
+    Mirrors ``tests/test_behavior_transcript_sense.py``'s ``_Media``. The mic is
+    the one thing that cannot be produced in-process, exactly as the speaker is
+    in the ``speak`` test above; everything downstream of it is production code.
+    """
+
+    def __init__(self) -> None:
+        self.samplerate = _MIC_RATE
+        self.channels = 1
+        self.next_chunk = None
+        self.calls = 0
+
+    def audio(self):
+        self.calls += 1
+        return self.next_chunk
+
+
+class _FakeStt:
+    """Stands in for the ONE network hop hearing has: the STT round-trip."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.calls = 0
+
+    def transcribe_once(self, audio):
+        self.calls += 1
+        return self.text
+
+
+class _RefusingClassifier:
+    """Fails the test if the optional LLM leg is consulted at all."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def judge(self, text, context):  # pragma: no cover — must never be reached
+        self.calls += 1
+        raise AssertionError("the engagement classifier was called offline")
+
+
+def _hearing_tuning() -> TranscriptTuning:
+    """Fast tuning so an utterance endpoints within a handful of 10 ms ticks."""
+    return TranscriptTuning(
+        silence_hold_s=0.03,
+        max_utterance_s=1.0,
+        min_utterance_s=0.02,
+        ring_seconds=0.5,
+        pre_roll_s=0.05,
+        min_words=3,
+        engage_window_s=1.0,
+    )
+
+
+def _tick_ctx(now: float):
+    return SimpleNamespace(now=now, tick=int(now * 100), sense=Sense())
+
+
+def _utterance(driver, mic: _FakeMic, t: float) -> float:
+    """Six loud ticks then quiet ticks until the utterance reaches the worker."""
+    for _ in range(6):
+        mic.next_chunk = np.full(_MIC_CHUNK, 0.5, dtype=np.float32)
+        driver(_tick_ctx(t))
+        t += _MIC_DT
+    submitted = driver.submitted
+    for _ in range(5):
+        mic.next_chunk = np.zeros(_MIC_CHUNK, dtype=np.float32)
+        driver(_tick_ctx(t))
+        t += _MIC_DT
+        if driver.submitted > submitted:
+            break
+    return t
+
+
+def _poll(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def test_hearing_degrades_to_no_words_when_the_stt_is_unreachable() -> None:
+    """Mirrors test_behavior_transcript_sense.py's
+    test_an_unreachable_stt_leaves_the_field_none_and_drops_no_ticks:
+
+    the REAL :class:`reachy.speech.stt.Transcriber` against a blocked socket.
+    Hearing is the one success-list path with a genuinely unavoidable network
+    leg, so its offline contract is a DEGRADATION contract: no words, no
+    exception, and — the part that matters at 50 Hz — not one dropped tick. The
+    runtime keeps breathing and reacting while it cannot hear.
+
+    ``submitted == 1`` is asserted first so the silence is provably the failed
+    round-trip and not a capture that never happened.
+    """
+    from reachy.speech.stt import Transcriber
+
+    mic = _FakeMic()
+    classifier = _RefusingClassifier()
+    driver = TranscriptSenseDriver(
+        media=mic,
+        transcriber=Transcriber(sample_rate=_MIC_RATE),
+        classifier=classifier,
+        tuning=_hearing_tuning(),
+    )
+    try:
+        t = _utterance(driver, mic, 100.0)
+        assert _poll(lambda: driver.submitted == 1), "the utterance never reached the STT worker"
+        # Give the worker a real window to publish. Polling for the ABSENCE of a
+        # result needs a deadline, or the assertion below would pass simply by
+        # reading the counter before the worker got round to writing it.
+        assert not _poll(
+            lambda: driver.transcripts > 0, timeout=0.5
+        ), "a blocked socket produced words"
+        for _ in range(20):
+            mic.next_chunk = np.zeros(_MIC_CHUNK, dtype=np.float32)
+            driver(_tick_ctx(t))
+            t += _MIC_DT
+
+        assert driver.peek() is None, "a blocked socket produced words"
+        assert driver.transcripts == 0
+        assert driver.ticks == mic.calls, "a tick was dropped while the STT was down"
+        assert classifier.calls == 0, "no words were heard, yet the LLM was consulted"
+    finally:
+        driver.close()
+
+
+def test_hearing_admits_an_addressed_utterance_with_zero_llm_calls() -> None:
+    """Mirrors test_behavior_transcript_sense.py's name-fast-path cases:
+
+    the other half of the offline hearing contract — what still WORKS with every
+    endpoint down. The engagement gate's name fast-path is pure ``difflib``
+    (:mod:`reachy.speech.name_match`), so an utterance that names the robot is
+    admitted with **zero** classifier calls and reaches the runtime's
+    :class:`~reachy.behavior.sense.Sense` snapshot. A classifier that raises on
+    contact is injected deliberately: if the optional LLM leg were ever
+    consulted on this path the test fails rather than quietly making a call the
+    lane forbids.
+
+    Only the STT round-trip is a stand-in — the same "one unavoidable hop"
+    concession the ``speak`` test above makes for the speaker.
+    """
+    mic = _FakeMic()
+    classifier = _RefusingClassifier()
+    driver = TranscriptSenseDriver(
+        media=mic,
+        transcriber=_FakeStt(_ADDRESSED),
+        classifier=classifier,
+        tuning=_hearing_tuning(),
+    )
+    try:
+        t = _utterance(driver, mic, 100.0)
+        assert _poll(lambda: driver.transcripts == 1), "the addressed utterance never landed"
+        driver(_tick_ctx(t))
+        providers = SenseProviders(transcript=driver.as_provider())
+        assert read_perception(providers).transcript == _ADDRESSED
+        assert classifier.calls == 0, "the name fast-path consulted the LLM"
+    finally:
+        driver.close()
