@@ -267,8 +267,10 @@ audio pump); an unclosed client hangs the process at interpreter exit.
 **Sense providers — all six wired.** `SenseProviders` carries `pat_event` /
 `pat_state` (two peeks of the ONE `PatSenseDriver`), `rms`
 (`behavior/rms_sense.py`), `transcript` (`behavior/transcript_sense.py`, a
-background STT worker + the #54/#56 engagement gate) and `face` /
-`frame_available` (`behavior/face_sense.py`, a background YuNet/SFace worker).
+background worker streaming mic audio to the lobes `/v1/realtime` session
+(`speech/realtime.py`, server-side VAD — see below) + the #54/#56 engagement
+gate) and `face` / `frame_available` (`behavior/face_sense.py`, a background
+YuNet/SFace worker).
 `rms` and the transcript driver are two consumers of ONE *consuming*
 audio read. Since #100 that read is `AudioPump.take()` — a background daemon
 thread (`behavior/audio_pump.py`) owns ALL `media.audio()` I/O, drains the
@@ -290,28 +292,60 @@ portability hazard, not a fixed bug. **When you wire a new provider here you MUS
 it is the one declared source of truth `behavior rules check` lints against, so
 a stale value makes the linter lie in one direction or the other.
 
-- **Transcript sense — the RMS predicate is a LOCATOR, never a content filter
-  (#108).** `transcript_sense.py` uses `_is_speech` to decide WHEN an utterance
-  starts and ends, and submits **one contiguous slice of the ring**
-  (`_clip_from`, mirroring `reachy_nova`'s `speech_events.py:263-265`
-  `full_buffer[clip_offset:]`). It used to append only the chunks that
-  individually cleared the threshold, so what reached the STT was the pre-roll
-  plus the loud frames butt-spliced with every quiet frame *inside* the
-  sentence excised — reproduced live: contiguous gave `'Richie, are you
-  there?'`, the same phrase gated at the live background gave `'Reaching
-  there.'`, then `'Return.'`, then `'Yeah.'` as the room got louder. The `0.02`
-  constant was cited from nova's onset threshold and then repurposed from
-  locator to filter; that inversion — not the number — was the bug, which is
-  why **#102's background-relative threshold is harmless rather than harmful
-  now and must NOT be reverted**. Three invariants hold this in place and each
-  is pinned by a test in `tests/test_behavior_transcript_contiguous.py`: the
-  ring is NOT cleared on emit (a `_consumed` watermark marks what was already
-  submitted, so audio is delivered exactly once *without* being destroyed —
-  clearing it wiped the runtime's own pre-roll, `pre_roll=0.02s buffered=512`
-  on back-to-back utterances in the live journal); `_discard_ring` is the ONLY
-  clear and only self-mute calls it; and `min_utterance_s` is a wall-clock
-  SPAN on the audio timeline, not a count of loud samples — measuring it over
-  loud samples is the same defect wearing a length test.
+- **Transcript sense — capture moved server-side (issue #115); the #108
+  lesson survives its own machinery.** `transcript_sense.py` used to decide
+  itself WHEN an utterance started and ended: a rolling pre-roll ring, a local
+  energy VAD (`_is_speech`), a silence-hold timer, a measured onset, a
+  wall-clock span floor — then one `POST /v1/audio/transcriptions` per
+  finished clip. **All of that capture machinery is gone, not retuned.** The
+  driver now streams every mic chunk, in order, exactly once, to ONE
+  long-lived lobes `/v1/realtime` WebSocket session
+  (`reachy/speech/realtime.py`'s `RealtimeTranscriber`, base64
+  `input_audio_buffer.append` JSON TEXT events — never a binary frame,
+  RFC 6455 primitives hand-rolled in `reachy/speech/realtime_wire.py`, cited
+  from lobes-cli's `scripts/realtime-smoke.py`), and the server's own
+  `server_vad` decides where the sentence ended
+  (`speech_started`/`speech_stopped`/`transcription.completed`). There is
+  **no local fallback** (a confirmed operator decision, spec claim c17): a
+  down session is a quiet, latched `session-down` drop, never a reversion to
+  local endpointing.
+
+  **What #108 taught still applies, one level up — the category error, not
+  the number, was the defect.** An energy predicate is a LOCATOR (it may say
+  *when* to start listening), never a *content filter* (it may never decide
+  *which audio is worth keeping*). The old code appended only the chunks that
+  individually cleared an RMS threshold, so every stop closure and inter-word
+  gap *inside* a sentence was excised and the survivors glued edge to edge —
+  reproduced live: contiguous audio gave `'Richie, are you there?'`, the same
+  phrase gated at the live background gave `'Reaching there.'`, then
+  `'Return.'`, then `'Yeah.'` as the room got louder. The `0.02` constant was
+  cited from `reachy_nova`'s onset threshold and then quietly repurposed from
+  locator to filter across the port — that inversion is what recurs if a
+  future capture path (local or otherwise) ever re-derives a threshold from a
+  donor without re-deriving *what the donor used it for*. A second, related
+  defect (issue #111) showed the fixed threshold itself was too high — 3x a
+  drifted night background landed at 0.102, above a normal voice at ~2 m, so
+  no utterance ever opened — and THAT is what #115's server-side move
+  actually resolves: not a third threshold value, but removing the decision
+  from the robot entirely. See [the operating guide's hearing
+  section](docs/operating-reachy.md#hearing--server-side-vad-replaces-local-endpointing)
+  for the full before/after evidence.
+
+  `tests/test_behavior_transcript_contiguous.py` was **re-scoped, not
+  deleted** (named in the t4/t6 PRs): it no longer asks "is the submitted clip
+  a contiguous slice?" (there is no clip any more) but pins the property that
+  outlived the local capture path — everything the microphone produces
+  reaches the session in order exactly once, an utterance boundary changes
+  nothing about the stream, self-mute is the one deliberate withholding (never
+  a filter), and structurally no energy predicate survives anywhere in the
+  capture path. `tests/fake_realtime_server.py` is the offline harness behind
+  this and every other realtime test (`test_realtime_wire.py`,
+  `test_realtime_client.py`, `test_behavior_transcript_realtime.py`,
+  `test_behavior_realtime_composition.py`) — an in-process, scriptable
+  loopback server covering the happy sequence and every named failure mode
+  (refused handshake, mid-stream close, a missed pong, a malformed event,
+  `vad_unavailable`, `stt_forward_failed`), stdlib-only and safe under
+  `pytest -n auto`.
 - **Pat sense** — `reachy/robot/state_reader.py` `HeldStateReader` holds ONE
   `ReachyMini(media_backend='no_media')` client for the process lifetime
   (construct-on-first-read, explicit idempotent `close()` — an unclosed
@@ -538,10 +572,16 @@ built-in self-mute and min-utterance shortcuts:
   classifier is even built. Useful for debugging or when the LLM endpoint is unavailable
   at boot. Omitting the `classifier` argument gives the same guarantee.
 
-STT itself is the shared `reachy/speech/stt.py` `Transcriber` (the model-gear /
-Parakeet `/v1/audio/transcriptions` leg, also reused by `sleep`'s wake-word
-`HttpSttBackend`), external behind `REACHY_STT_URL` (default `localhost:9002`)
-— no on-box model bundled.
+The runtime's own STT leg is no longer `reachy/speech/stt.py` — since the
+realtime arc (issue #115) `transcript_sense.py` speaks to
+`reachy/speech/realtime.py`'s `RealtimeTranscriber` instead (see [the
+`behavior` noun's transcript-sense
+notes](#behavior-noun--pat-sense-bounded-lifetimes-and-a-live-goto) above).
+`reachy/speech/stt.py`'s `Transcriber` (the model-gear / Parakeet
+`/v1/audio/transcriptions` leg, external behind `REACHY_STT_URL`, default
+`localhost:9002`, no on-box model bundled) survives as `sleep`'s wake-word
+backend ONLY (`HttpSttBackend`) — nothing under `reachy/behavior/` imports it
+any more.
 
 ### `say` noun — dumb TTS pipe
 
@@ -589,6 +629,16 @@ DOES own a voice and ears — deliberately ported — so it imports speech
 explicit allow-list and each entry states why it is not a language model. A
 companion test fails on a **dead** allow-list entry, so it cannot quietly
 re-widen. "The runtime contains no LLM" is **false** and a test says so.
+
+**The realtime arc moved which module carries transcription.**
+`reachy.speech.stt` LEFT `_BEHAVIOR_SPEECH_ALLOW` (nothing under
+`reachy/behavior/` imports it any more — it survives only as `sleep`'s
+wake-word backend, outside this boundary) and `reachy.speech.realtime` took
+its place, carrying the same justification (speech-to-text with the VAD
+upstream; it reports what was said and when, and decides nothing). This is
+exactly the "dead allow-list entry" failure mode the companion test guards:
+the swap had to update both the allow-list AND its justification map in the
+same change, or the dead-entry test would have caught the stale `stt` line.
 
 **Exactly one LLM edge survives inside the runtime**, pinned by EQUALITY so the
 suite fails in both directions: `reachy/speech/engagement.py`'s single-shot "is
@@ -694,12 +744,30 @@ runtime's `SpeechActuator`:
   σ) and returns pairs below the threshold. The neutral entry is excluded from
   pairwise comparison. Default threshold `0.5`; starter catalog passes cleanly.
   Driven by `behavior expressions check`.
-- **`reachy/speech/stt.py` + `engagement.py` + `name_match.py`** — the hearing
-  leg: one external `/v1/audio/transcriptions` POST per utterance plus the
-  layered engagement gate documented in [its own section
-  above](#the-engagement-gate--reachyspeechengagementpy).
-  Consumed by `reachy/behavior/transcript_sense.py` and (for the wake phrase
-  only) `reachy/sleep/wakeword.py`.
+- **`reachy/speech/realtime.py` + `realtime_wire.py`** — the runtime's hearing
+  leg since issue #115: `RealtimeTranscriber` holds ONE long-lived WebSocket
+  session against the lobes `/v1/realtime` route, streams mic audio as base64
+  `input_audio_buffer.append` JSON TEXT events (never binary), and surfaces
+  already-endpointed `Utterance`s once the server's `server_vad` says a
+  sentence ended — replacing the local energy-VAD capture path
+  `transcript_sense.py` used to own. `realtime_wire.py` is the pure-function
+  RFC 6455 framing + base64 append-event codec, hand-rolled and
+  cite-don't-import ported from lobes-cli's `scripts/realtime-smoke.py` (no
+  new dependency; `pyproject.toml` is untouched by this module). Every
+  failure — a refused handshake, a dead gateway, a malformed event, a named
+  server error (`vad_unavailable`, `stt_forward_failed`) — resolves to a named,
+  latched `senselog.drop` and a backoff reconnect, never an exception on the
+  caller's thread, mirroring `reachy.speech.stt.Transcriber`'s own
+  never-raise ethos. Consumed by `reachy/behavior/transcript_sense.py` only.
+- **`reachy/speech/stt.py` + `engagement.py` + `name_match.py`** — `stt.py`'s
+  `Transcriber` (one external `/v1/audio/transcriptions` POST per utterance)
+  is now consumed ONLY by `reachy/sleep/wakeword.py`'s wake-phrase backend —
+  nothing under `reachy/behavior/` reaches it any more. `engagement.py` +
+  `name_match.py` are unchanged and still the layered engagement gate
+  documented in [its own section
+  above](#the-engagement-gate--reachyspeechengagementpy), still consumed by
+  `reachy/behavior/transcript_sense.py`: admission of an already-arrived
+  transcript is exactly the surface the realtime arc left alone.
 - **`--export` / `--export-blocks` stdout JSONL sink** — `agent attach
   --export -` writes a live newline-delimited JSON (NDJSON) feed to stdout.
   Each line is one JSON object: `t` (block type), `ts` (unix timestamp), plus

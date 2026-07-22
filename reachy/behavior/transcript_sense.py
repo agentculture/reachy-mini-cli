@@ -1,12 +1,9 @@
 """Transcript sense for the 50 Hz behavior runtime — hearing WORDS, not just sound.
 
-The symbolic runtime senses direction, loudness and touch, but until now it had
-no path from the microphone to *what was actually said*: that capability lived
-only in the retired ``listen --live`` loop
-(``reachy.motion.listen_transcribe``, the donor for this module). This driver
-ports it onto the runtime's one tick seam, so a data-only rule (``when
-{field=transcript, op=is_true}``) and an externally attached agent can both
-reason about speech.
+The symbolic runtime senses direction, loudness and touch; this driver is the
+path from the microphone to *what was actually said*, so a data-only rule
+(``when {field=transcript, op=is_true}``) and an externally attached agent can
+both reason about speech.
 
 It is built exactly like :class:`reachy.behavior.pat_sense.PatSenseDriver` — a
 ``TickBus`` driver that WRITES a one-tick latch at the end of every tick, plus a
@@ -18,40 +15,79 @@ clear-BEFORE-process rule that holds on every path, so a transcript is delivered
 to exactly ONE sense snapshot and multiple peeks within a tick agree.
 
 --------------------------------------------------------------------------
+Endpointing lives on the SERVER now (the realtime arc, issue #115)
+--------------------------------------------------------------------------
+This driver used to decide *itself* where an utterance started and stopped: an
+energy VAD over a rolling pre-roll ring, a silence-hold timer, a monologue cap,
+a measured onset, a minimum-span floor — and then one
+``POST /v1/audio/transcriptions`` per finished clip. All of that is gone. The
+capture half is now:
+
+    tick: chunk = media.audio() -> realtime.submit_audio(chunk)
+    tick: utterance = realtime.take_utterance()  (or None)
+
+:class:`reachy.speech.realtime.RealtimeTranscriber` holds ONE long-lived
+WebSocket session to the lobes ``/v1/realtime`` route, streams every mic chunk
+into it, and lets the server's ``server_vad`` say where the sentence ended. What
+comes back is an already-endpointed :class:`~reachy.speech.realtime.Utterance`.
+The client is **injected**, never constructed here (see the ``realtime``
+parameter): this module opens no socket, imports no wire primitive, and does not
+own the session's lifecycle — the composition root starts and closes it, exactly
+as it does the held media client.
+
+**There is no fallback** (the arc's confirmed operator decision c17). When the
+session is down, hearing goes quiet and the client reconnects on its own
+schedule with its own latched ``session-down`` drop; nothing here re-endpoints
+locally. Keeping the old energy VAD as a standby would mean two capture paths
+whose disagreements only ever show up in the field.
+
+What #108 taught SURVIVES its machinery, and it is the reason this driver
+forwards audio rather than choosing it: an energy predicate is a **locator**,
+never a content filter. The old code appended only chunks that individually
+cleared the threshold, so every stop closure and inter-word gap *inside* a
+sentence was excised and the survivors glued edge to edge — live, that turned
+``'Richie, are you there?'`` into ``'Reaching there.'``, then ``'Return.'``,
+then ``'Yeah.'`` as the room got louder. Nothing here may reacquire the habit:
+**every sample the mic hands over goes to the session, in order, exactly once**,
+and the only audio deliberately withheld is the robot's own voice (below).
+
+--------------------------------------------------------------------------
 Why a background worker (the load-bearing difference from ``PatSenseDriver``)
 --------------------------------------------------------------------------
-A pat is sensed with arithmetic; a transcript costs a **network round-trip** —
-two, in fact, since the engagement classifier is also an HTTP call. Doing either
-inline would blow the 20 ms tick budget by orders of magnitude. This is not
-hypothetical: the deployed box already shows a reproducible startup overrun of
-**424.93-1212.66 ms against a 20 ms budget**, caused by exactly this class of
+A pat is sensed with arithmetic. The STT round-trip left this module with the
+session client, but the **engagement classifier is still a network call**, and
+doing it inline would blow the 20 ms tick budget by orders of magnitude. This is
+not hypothetical: the deployed box already shows a reproducible startup overrun
+of **424.93-1212.66 ms against a 20 ms budget** caused by exactly this class of
 on-thread blocking (a media client constructed on the tick thread —
 ``docs/verification/2026-07-20-retire-old-flow-baseline.md`` section 3).
 
-So the work is split across two threads with a queue between them:
+So the work is still split across two threads with a queue between them:
 
 * **The tick thread** (:meth:`__call__`) does only cheap, bounded work: read one
-  mic chunk from the injected held media client, push it into a rolling pre-roll
-  ring, run an energy VAD, and — when an utterance endpoints — hand the finished
-  buffer to the worker with a NON-BLOCKING ``put_nowait``. It also drains at most
-  one ready transcript into the latch. No socket is ever touched here.
+  mic chunk from the injected held media client, hand it to the session client's
+  O(1) ``submit_audio``, pop at most a few ready utterances with the equally
+  O(1) ``take_utterance``, and forward each to the worker with a NON-BLOCKING
+  ``put_nowait``. It also drains at most one admitted transcript into the latch.
+  **No socket is ever touched here** — the session client's own worker thread
+  owns the wire, and ``tests/test_behavior_transcript_realtime.py`` asserts that
+  structurally, over the AST, in both modules.
 * **The worker thread** (:meth:`_worker_loop`, started lazily on the first
-  submitted utterance) makes the single
-  :meth:`~reachy.speech.stt.Transcriber.transcribe_once` POST, runs the
-  engagement gate, fires ``on_engage``, and publishes an accepted transcript onto
-  the ready queue.
+  utterance) runs the engagement gate, fires ``on_engage``, and publishes an
+  accepted transcript onto the ready queue.
 
-Every queue is BOUNDED and every put is non-blocking: a wedged STT backs the
-pending queue up, and further utterances are dropped with a logged reason rather
-than growing memory or — far worse — blocking the tick. An unreachable STT
-therefore leaves the field ``None`` and drops **no ticks**.
+Every queue is BOUNDED and every put is non-blocking: a wedged classifier backs
+the pending queue up, and further utterances are dropped with a logged reason
+rather than growing memory or — far worse — blocking the tick. An unreachable
+gateway therefore leaves the field ``None`` and drops **no ticks**.
 
 --------------------------------------------------------------------------
 The engagement gate is reused, never reimplemented
 --------------------------------------------------------------------------
-Admission is :class:`reachy.speech.engagement.ConversationGate` — the #54/#56
-layered gate plus the #105 conversation state, shared with (not duplicated from)
-the donor:
+Admission is unchanged by the realtime arc: it is
+:class:`reachy.speech.engagement.ConversationGate` — the #54/#56 layered gate
+plus the #105 conversation state — receiving exactly the utterance shape it
+always did (a string plus the instant it was heard):
 
 1. **Name fast-path** — an utterance naming the robot (or a common STT
    mishearing of it) engages immediately, with ZERO classifier calls, and opens
@@ -82,79 +118,48 @@ throughout, and omitting the ``classifier`` argument does the same: in both
 cases no gate is built at all, so no classifier call is reachable.
 
 --------------------------------------------------------------------------
-The capture rule: the RMS predicate is a LOCATOR, never a content filter (#108)
+Self-mute moved to ARRIVAL, and it is now two guards, not one
 --------------------------------------------------------------------------
-The speech predicate decides **when to start and stop listening**. It does NOT
-decide which audio is worth keeping. Once an utterance is open, every chunk is
-retained, and what is submitted is **one contiguous slice of the ring** —
-``ring[clip_start:]`` — exactly as :mod:`reachy_nova`'s ``speech_events.py``
-(``:263-265``) emits ``full_buffer[clip_offset:]``.
+The mic and the speaker share a room, so without a self-mute the runtime
+transcribes its own voice, the transcript fires a rule, the rule speaks, and the
+robot talks to itself forever. :class:`reachy.behavior.speech_act.SpeechActuator`
+publishes the monotonic window its clip occupies; ``mute_until`` closes the loop.
 
-This is the fix for issue #108, and it is worth stating why, because the
-alternative reads as reasonable and is not. The module used to append **only
-chunks that individually cleared the threshold**; a quieter chunk fell through
-to :meth:`~TranscriptSenseDriver._maybe_submit_on_pause` and was discarded. So
-what reached the STT was::
+With server-side VAD that check cannot live where the audio is captured alone,
+because **the server's VAD cannot know when the robot is speaking**: an
+utterance it already committed can be transcribed and delivered while the
+speaker is mid-sentence. So:
 
-    [<=2 s contiguous pre-roll] + [the loud frames butt-spliced, quiet frames excised]
+* **Outbound** — while ``now < mute_until()`` the tick does not feed the session
+  (the robot's voice never reaches the server's VAD at all). Audio arrives 50
+  times a second, so that drop is LATCHED: one ``self-mute`` line per mute
+  episode, not fifty per second (the #99 journal-flood discipline the session
+  client applies to its own down state).
+* **Inbound** — a transcript whose ``Utterance.t`` (the monotonic instant it
+  ARRIVED, stamped by the session client) falls inside the mute window is
+  discarded with the same named ``self-mute`` reason before it can reach the
+  gate. That instant is on the same clock ``mute_until`` returns, which is what
+  makes the comparison meaningful without this module keeping a clock of its own.
 
-Every unvoiced consonant, stop closure and inter-word gap *inside* the sentence
-was cut out and the survivors glued edge to edge. Reproduced live against the
-real Parakeet with one phrase mixed to realistic mic levels: contiguous gave
-``'Richie, are you there?'``; the same phrase gated at the live background
-(threshold 0.060, 42 % of frames kept) gave ``'Reaching there.'``; at 0.102 it
-gave ``'Return.'``; across a room, ``'Yeah.'``. That also explains the
-observation that puzzled the investigation most — *short interjections survive
-intact* — because under the gate **everything degenerates into an
-interjection**.
-
-The threshold constant itself was never wrong. ``0.02`` was cited from nova's
-``_DEFAULT_SILENCE_THRESHOLD``, which nova uses ONLY in ``_measure_onset``
-(``:237-254``) to locate where to begin backtracking. We kept the number and
-inverted its meaning, from *locator* to *content filter*. Citation drift, not
-a tuning error — which is why no amount of threshold tuning would have fixed
-it, and why the #102 background-relative threshold is **harmless rather than
-harmful** now: with contiguous capture it only decides when to START listening,
-which is what it was designed for. Do not revert it.
-
-Two consequences follow, and both are load-bearing:
-
-* **The ring is not cleared on emit** — only :meth:`~TranscriptSenseDriver.
-  _discard_ring` clears it, and only self-mute calls it. Clearing on emit
-  destroyed the runtime's own pre-roll; the live journal shows
-  ``pre_roll=0.02s buffered=512`` on back-to-back utterances. Instead a
-  ``_consumed`` watermark marks what has already been submitted, so audio is
-  delivered exactly once without being destroyed.
-* **``min_utterance_s`` is a SPAN, not a count of loud samples.** Measuring the
-  floor over "speech samples only" is the same defect wearing a different hat:
-  a sentence that spends more time between its words than inside them would be
-  discarded as a blip. The span is measured on the AUDIO timeline (sample
-  indices at the mic rate, so a tick-rate wobble cannot move it).
+The inbound guard is deliberately blunt: a transcript of the HUMAN that happens
+to land mid-clip is discarded too. That is the safe direction — a lost turn
+costs one repetition, while a self-heard turn costs an unbounded feedback loop.
 
 --------------------------------------------------------------------------
 Deviations from the donor, and why
 --------------------------------------------------------------------------
-* **Voice activity is measured from the audio, not taken from the daemon's
-  speech flag.** The donor gated capture on ``SenseSample.speech`` (the SDK's
-  ~5 Hz speech flag). The runtime's equivalent, ``Sense.speech_detected``, was
-  measured on the deployed box as **true 45.8% of the time in a quiet room with
-  nobody speaking** (baseline section 2) — a coin-flip, useless as a capture
-  gate. So this module runs an RMS energy VAD over the chunk it already holds,
-  reusing the donor's own float-PCM silence threshold (the one its onset scan
-  uses). The pre-roll ring exists regardless, because an energy VAD also misses
-  the quiet leading phoneme of an utterance.
 * **The audio source is the injected held media client**, not a per-tick
   ``SenseSample``. The driver calls ``media.audio()`` once per tick and NEVER
   constructs a client, opens a media session, or imports the SDK — the runtime's
   composition root owns exactly one client and injects it (see
-  :mod:`reachy.robot.media_client`). Because a *first* read on a cold holder
-  blocks for order-of-seconds, that owner is expected to
-  :meth:`~reachy.robot.media_client.HeldMediaClient.warm_up` off-thread and pass
-  ``allow_inline_connect=False``; this driver only ever reads.
-* **The mic sample rate is resolved lazily, after a successful read.** Touching
-  ``media.samplerate`` on a cold holder can trigger construction, so it is read
-  only once ``audio()`` has already returned a chunk (proving the client is up).
-  Until then no sample-count threshold is needed, because there is no audio.
+  :mod:`reachy.robot.media_client`). In the composed runtime that injection is
+  the ``_AudioTap`` fan-out, so this is not a second consuming read (#100).
+* **The mic sample rate is resolved lazily, after a successful read**, and then
+  pushed into the session (``set_sample_rate``) — touching ``media.samplerate``
+  on a cold holder can trigger construction, so it is read only once ``audio()``
+  has already returned a chunk (proving the client is up). The rate rides the
+  session's connect URL and the server resamples from it, so a wrong rate
+  mis-times every VAD decision; it is never hard-coded here.
 * **``EventBuffer`` is gone.** The donor fed words into ``think``'s cognition
   buffer; here the accepted transcript becomes a latched perception field. Any
   cognition is external (``agent attach``), reading the same ``Sense``.
@@ -162,7 +167,7 @@ Deviations from the donor, and why
 Every failure degrades to "no words" and never raises out of the driver or the
 provider, mirroring :func:`reachy.behavior.sense._peek`.
 
-Standard library plus numpy and the existing speech engine — no new dependency.
+Standard library plus numpy and the existing speech engines — no new dependency.
 """
 
 from __future__ import annotations
@@ -183,13 +188,26 @@ import numpy as np
 from reachy import senselog
 from reachy.robot.audio_shape import to_mono
 from reachy.speech.engagement import ConversationGate, Decision
-from reachy.speech.stt import Transcriber
+from reachy.speech.realtime import Utterance
 
 logger = logging.getLogger(__name__)
 
 _STAGE_CAPTURE = "capture"
 _STAGE_TRANSCRIPT = "transcript"
 _SOURCE = "speech"
+
+#: Event id used for the LATCHED, stream-level capture lines (a continuous
+#: stream has no per-event identity; a per-chunk uuid would be noise).
+_STREAM_EVENT = "stream"
+
+#: Named drop reasons this module owns. The session client's own reasons
+#: (``session-down``, ``connect-failed``, ``queue-full``, ...) are emitted by
+#: :mod:`reachy.speech.realtime` and never duplicated here.
+REASON_SELF_MUTE = "self-mute"
+REASON_NO_SESSION = "no-realtime-session"
+REASON_EMPTY_TRANSCRIPT = "empty-transcript"
+REASON_GATE_BACKLOG = "gate-backlog"
+REASON_LATCH_BACKLOG = "latch-backlog"
 
 #: Truthy strings recognised by the ``REACHY_ENGAGE_HEURISTIC`` escape hatch.
 _TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
@@ -200,52 +218,26 @@ _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 #: Fallback mic rate used only until a real one can be read off the held client.
 _FALLBACK_RATE = 16000
 
-#: RMS level (float PCM, over one analysis window) a chunk must clear to count as
-#: speech. Cited verbatim from the donor's onset threshold, itself cited from
-#: ``reachy_nova``'s speech event detector: the mic hands out float32 PCM already
-#: normalised to [-1, 1], so no int16 rescale applies.
-#:
-#: Since #102 this is a FLOOR under a relative threshold, not the threshold
-#: itself — see :data:`DEFAULT_SPEECH_RATIO` and :meth:`TranscriptSenseDriver.
-#: _speech_threshold`. Live-verified why: with the measured night background at
-#: p50 0.034 this absolute gate is permanently open, and the journal fills with
-#: ``utterance start`` -> ``dropped reason=stt-empty`` — the runtime recording
-#: silence and POSTing it to the STT. Kept as the floor so a QUIET room's
-#: capture behaviour is byte-identical to what shipped.
-DEFAULT_SPEECH_RMS = 0.02
-
-#: How many times the room's rolling background a chunk must stand to count as
-#: speech, when a background estimate is wired and warm. Deliberately LOOSER
-#: than orienting's :data:`reachy.behavior.rms_background.DEFAULT_RATIO` (5x):
-#: capture and orienting have asymmetric costs. A missed utterance is
-#: unrecoverable — the words are gone — while a wasted capture costs one STT
-#: POST that returns empty, so hearing should start on less evidence than
-#: turning the head does. 3x still clears the measured still-room spread, whose
-#: samples top out at ~2.5x their own median in every measured condition, so an
-#: empty room cannot start an utterance.
-DEFAULT_SPEECH_RATIO = 3.0
-
-#: Endpointing + pre-roll defaults, all carried over from the donor unchanged.
-DEFAULT_SILENCE_HOLD_S = 0.7
-DEFAULT_MAX_UTTERANCE_S = 15.0
-DEFAULT_MIN_UTTERANCE_S = 0.3
-DEFAULT_RING_SECONDS = 10.0
-DEFAULT_PRE_ROLL_S = 2.0
-DEFAULT_ONSET_WINDOW_S = 0.01
+#: Engagement defaults (the only tuning left — endpointing is the server's).
 DEFAULT_MIN_WORDS = 3
 DEFAULT_ENGAGE_WINDOW_S = 20.0
 
 #: Canonical names the robot answers to (the donor's default).
 DEFAULT_NAMES: tuple[str, ...] = ("reachy", "robot")
 
-#: Bound on utterances awaiting transcription. Small on purpose: if the STT is
-#: wedged, queueing more is pointless — the words are already stale by the time
-#: they would be transcribed — and an unbounded queue is a memory leak.
+#: Bound on utterances awaiting the engagement gate. Small on purpose: if the
+#: classifier is wedged, queueing more is pointless — the words are already
+#: stale by the time they would be judged — and an unbounded queue is a leak.
 DEFAULT_PENDING_MAXSIZE = 4
 
 #: Bound on transcripts awaiting a tick to latch them. At 50 Hz the tick drains
 #: one every 20 ms, so this only ever fills if the engine has stopped ticking.
 DEFAULT_READY_MAXSIZE = 8
+
+#: How many ready utterances one tick may pop off the session client. Bounded so
+#: a burst can never turn one tick into an unbounded loop; at conversational
+#: rates the queue holds at most one.
+DEFAULT_MAX_TAKES_PER_TICK = 4
 
 #: How long :meth:`close` waits for the worker to finish its current request.
 DEFAULT_JOIN_TIMEOUT_S = 2.0
@@ -263,62 +255,37 @@ def _env_truthy(value: str | None) -> bool:
 
 @dataclass(frozen=True)
 class TranscriptTuning:
-    """Grouped numeric knobs tuning HOW :class:`TranscriptSenseDriver` endpoints.
+    """Grouped numeric knobs tuning HOW :class:`TranscriptSenseDriver` admits.
 
-    Split out of the constructor (as the donor's ``TranscribeTuning`` is) so the
-    SEAM parameters — media client, transcriber, classifier, callbacks — stay
-    individual while the pure-number cluster travels as one value object. Every
-    field keeps the donor's shipped default, so a bare ``TranscriptTuning()``
-    reproduces the retiring loop's capture behaviour.
+    Split out of the constructor so the SEAM parameters — media client, session
+    client, classifier, callbacks — stay individual while the pure-number
+    cluster travels as one value object.
 
-    Endpointing (whole-utterance accumulation, one POST per utterance):
-
-    * ``speech_rms`` — absolute FLOOR under the speech threshold (the energy VAD
-      that replaces the donor's unreliable daemon speech flag).
-    * ``speech_ratio`` — times the room's rolling background a chunk must stand
-      to count as speech. The effective threshold is
-      ``max(speech_rms, speech_ratio * background)``, so a quiet room behaves
-      exactly as the donor did and a loud one stops capturing its own hiss
-      (#102). With no background seam wired, ``speech_rms`` alone applies.
-    * ``silence_hold_s`` — pause length that ends an utterance and submits it.
-    * ``max_utterance_s`` — hard cap that force-submits a long monologue.
-    * ``min_utterance_s`` — floor below which a blip is dropped, never sent to
-      STT. Measured as the SPAN from the first speech sample to the last (#108),
-      not as a count of loud samples: a sentence with long inter-word gaps is
-      still a sentence. The pre-roll lead-in is outside the span, so it cannot
-      pad a blip past the floor.
-
-    Pre-roll ring buffer + measured onset:
-
-    * ``ring_seconds`` — horizon of the rolling pre-speech audio buffer. While
-      an utterance is open the ring retains at least the open clip, so a long
-      sentence is never trimmed out from under itself.
-    * ``pre_roll_s`` — lead-in kept before the measured onset.
-    * ``onset_window_s`` — width of each RMS onset-scan analysis window.
-
-    Engagement heuristic (the DEGRADE / no-classifier path only):
+    Both surviving fields belong to the **engagement heuristic** (the DEGRADE /
+    no-classifier path) and are also the two thresholds handed to the stateful
+    :class:`~reachy.speech.engagement.ConversationGate`, so the classifier path
+    and the fallback share ONE definition of each:
 
     * ``min_words`` — word-count floor for the "clear sentence" rule.
     * ``engage_window_s`` — how long a conversation stays open after an ENGAGE.
+
+    The endpointing cluster this class used to carry (``speech_rms`` /
+    ``speech_ratio`` / ``silence_hold_s`` / ``max_utterance_s`` /
+    ``min_utterance_s`` / ``ring_seconds`` / ``pre_roll_s`` / ``onset_window_s``)
+    is GONE, not defaulted: the lobes ``/v1/realtime`` session decides where an
+    utterance starts and stops (see the module docstring). A box that wants to
+    tune endpointing tunes the server's ``turn_detection`` config, not this.
     """
 
-    speech_rms: float = DEFAULT_SPEECH_RMS
-    speech_ratio: float = DEFAULT_SPEECH_RATIO
-    silence_hold_s: float = DEFAULT_SILENCE_HOLD_S
-    max_utterance_s: float = DEFAULT_MAX_UTTERANCE_S
-    min_utterance_s: float = DEFAULT_MIN_UTTERANCE_S
-    ring_seconds: float = DEFAULT_RING_SECONDS
-    pre_roll_s: float = DEFAULT_PRE_ROLL_S
-    onset_window_s: float = DEFAULT_ONSET_WINDOW_S
     min_words: int = DEFAULT_MIN_WORDS
     engage_window_s: float = DEFAULT_ENGAGE_WINDOW_S
 
 
 @dataclass(frozen=True)
-class _Utterance:
-    """One endpointed utterance handed across the queue to the worker."""
+class _Heard:
+    """One arrived transcript on its way to the engagement gate (worker-bound)."""
 
-    audio: Any
+    text: str
     direction: str | None
     t: float
     event_id: str
@@ -327,11 +294,12 @@ class _Utterance:
 class TranscriptSenseDriver:
     """A ``TickBus`` driver latching heard WORDS as a one-tick perception cue.
 
-    Construct one with the runtime's single held media client, register
-    :meth:`__call__` on the engine's ``tick_seam``, wire
-    ``SenseProviders(transcript=driver.as_provider())``, and call :meth:`close`
-    at shutdown (it stops the worker thread; it does NOT close the media client,
-    which the composition root owns).
+    Construct one with the runtime's single held media client and its single
+    realtime session client, register :meth:`__call__` on the engine's
+    ``tick_seam``, wire ``SenseProviders(transcript=driver.as_provider())``, and
+    call :meth:`close` at shutdown (it stops the worker thread; it does NOT close
+    the media client OR the session client, both of which the composition root
+    owns).
 
     Parameters
     ----------
@@ -342,12 +310,16 @@ class TranscriptSenseDriver:
         Because the holder's FIRST read can block for order-of-seconds, the owner
         should warm it up off-thread and construct it with
         ``allow_inline_connect=False``; this driver only reads.
-    transcriber:
-        The :class:`~reachy.speech.stt.Transcriber` doing the work (duck-typed on
-        ``transcribe_once``). Defaults to a real one, built lazily once the mic's
-        true sample rate is known so the WAV header matches the audio — a wrong
-        rate makes the STT mis-decode and return nothing. Construction performs no
-        network I/O.
+    realtime:
+        The :class:`~reachy.speech.realtime.RealtimeTranscriber` session client,
+        duck-typed on ``submit_audio(chunk)`` / ``take_utterance()`` (plus an
+        optional ``set_sample_rate``). Injected and NOT owned: the composition
+        root constructs it, calls ``start()`` before the first tick (a connect is
+        blocking work that belongs to setup), and closes it at shutdown.
+        ``None`` — the default — means the runtime has no hearing session wired:
+        the mic is still read (so a co-riding loudness provider sees the same
+        sample) and the transcript field stays permanently ``None``, announced
+        ONCE as a named ``no-realtime-session`` drop rather than silently.
     classifier:
         Optional :class:`~reachy.speech.engagement.EngagementClassifier`-like
         object (``judge(text, context) -> bool``) used by the layered gate.
@@ -360,8 +332,9 @@ class TranscriptSenseDriver:
         never stops the words reaching the latch.
     mute_until:
         Zero-arg callable returning the monotonic deadline until which the robot
-        is self-muted. While ``now < mute_until()`` the tick discards the chunk
-        AND the pre-roll ring, so the robot never transcribes its own voice.
+        is self-muted. While ``now < mute_until()`` the tick feeds the session no
+        audio, and any transcript that ARRIVES before that deadline is discarded
+        — see the module docstring's self-mute section for why it takes both.
         Defaults to "never muted".
     tuning:
         A :class:`TranscriptTuning`; see its docstring.
@@ -375,65 +348,36 @@ class TranscriptSenseDriver:
         self,
         *,
         media: Any,
-        transcriber: Any | None = None,
+        realtime: Any | None = None,
         classifier: Any | None = None,
         on_engage: Callable[[], None] | None = None,
         mute_until: Callable[[], float] | None = None,
-        background: Callable[[], float | None] | None = None,
         tuning: TranscriptTuning = TranscriptTuning(),
         names: tuple[str, ...] = DEFAULT_NAMES,
         clock: Callable[[], float] = time.monotonic,
         pending_maxsize: int = DEFAULT_PENDING_MAXSIZE,
         ready_maxsize: int = DEFAULT_READY_MAXSIZE,
         join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S,
+        max_takes_per_tick: int = DEFAULT_MAX_TAKES_PER_TICK,
     ) -> None:
         self._media = media
-        self._transcriber = transcriber
+        self._realtime = realtime
         self._on_engage = on_engage
         self._mute_until = mute_until if mute_until is not None else (lambda: 0.0)
-        #: Non-consuming peek at the room's rolling background level (#102),
-        #: wired at composition to the SAME
-        #: :class:`reachy.behavior.rms_background.RmsBackground` the orienting
-        #: gate reads — one estimator, two consumers with two different
-        #: thresholds, never two estimators that could disagree about the room.
-        #: ``None`` (or a ``None`` reading, i.e. a cold estimate) falls back to
-        #: the absolute floor, which is exactly the pre-#102 behaviour.
-        self._background = background
         self._tuning = tuning
         self._names = tuple(name.lower() for name in names)
         self._clock = clock
         self._join_timeout_s = max(0.0, float(join_timeout_s))
-
-        # --- rate-dependent sizes, resolved lazily after the first real read ---
-        self._rate: int | None = None
-        self._min_utt_samples = 0
-        self._ring_max = 0
-        self._ring_hard_max = 0
-        self._pre_roll_samples = 0
-        self._onset_window = 1
+        self._max_takes_per_tick = max(1, int(max_takes_per_tick))
 
         # --- tick-thread capture state (touched by NO other thread) -----------
-        #: Absolute sample index where the OPEN utterance's clip begins (its
-        #: measured onset minus the pre-roll), or ``None`` when none is open.
-        #: This replaces the old list of accumulated speech chunks: the ring is
-        #: the buffer, and an utterance is just a mark in it (#108).
-        self._clip_start: int | None = None
-        #: Absolute sample indices bounding the SPEECH inside the open clip —
-        #: the span ``min_utterance_s`` is measured over.
-        self._speech_begin = 0
-        self._speech_end = 0
-        self._utt_started_t: float | None = None
-        self._last_speech_t: float | None = None
-        self._utt_direction: str | None = None
-        self._event_id: str | None = None
-        self._ring: list[np.ndarray] = []
-        self._ring_samples = 0
-        self._ring_total = 0
-        #: Absolute sample index through which audio has already been submitted
-        #: (or deliberately discarded). Everything at or after it is still
-        #: eligible; everything before it is never re-scanned and never re-sent.
-        #: This is what lets the ring SURVIVE an emit instead of being wiped.
-        self._consumed = 0
+        #: The mic's real rate, resolved lazily after the first successful read
+        #: and then pushed into the session config.
+        self._rate: int | None = None
+        #: One-line-per-episode latches, so a per-chunk condition cannot flood
+        #: the journal (#99): the robot speaking, and no session wired at all.
+        self._muted_logged = False
+        self._no_session_logged = False
 
         # --- the one-tick latch (written by the tick thread only) -------------
         self._latch: str | None = None
@@ -442,7 +386,7 @@ class TranscriptSenseDriver:
         # --- the handoff ------------------------------------------------------
         self._pending: queue.Queue = queue.Queue(maxsize=max(1, int(pending_maxsize)))
         self._ready: queue.Queue = queue.Queue(maxsize=max(1, int(ready_maxsize)))
-        #: The background worker, started lazily on the first submitted utterance
+        #: The background worker, started lazily on the first arrived utterance
         #: so a runtime that never hears speech never spawns a thread.
         self.worker: threading.Thread | None = None
         self._closed = False
@@ -470,10 +414,20 @@ class TranscriptSenseDriver:
         )
         self._engaged_until = 0.0
 
-        #: Diagnostics / tests: ticks processed, utterances submitted to the
-        #: worker, transcripts that cleared the gate and reached the ready queue.
+        #: Diagnostics / tests: ticks processed, mic chunks handed to the
+        #: session, utterances submitted to the worker, utterances the worker has
+        #: finished judging (whatever the verdict), and transcripts that cleared
+        #: the gate and reached the ready queue.
+        #:
+        #: ``judged`` is the WORKER-side barrier: ``submitted`` says the tick
+        #: handed the words over, and a test that queues the next utterance on
+        #: that alone can overrun the bounded pending queue before the gate has
+        #: drained it — which is a real (and correctly named) ``gate-backlog``
+        #: drop, but a confusing way to fail a test about something else.
         self.ticks = 0
+        self.streamed = 0
         self.submitted = 0
+        self.judged = 0
         self.transcripts = 0
 
     # ------------------------------------------------------------------
@@ -481,12 +435,12 @@ class TranscriptSenseDriver:
     # ------------------------------------------------------------------
 
     def __call__(self, ctx) -> None:  # type: ignore[no-untyped-def]
-        """One tick: clear the latch, capture audio, and maybe adopt a ready transcript.
+        """One tick: clear the latch, stream audio, and maybe adopt a ready transcript.
 
         Never raises and never blocks on I/O. The latch is cleared first — a
         plain assignment that cannot fail, preserving the one-tick contract on
         every path — then the body runs under a broad guard so a misbehaving
-        media client degrades to "no words this tick".
+        media or session client degrades to "no words this tick".
         """
         # Clear-before-process (see PatSenseDriver's r2): a transcript latched
         # last tick has already been read by this tick's start-of-tick sense.
@@ -502,114 +456,184 @@ class TranscriptSenseDriver:
             logger.warning("TranscriptSenseDriver tick raised; transcript dropped", exc_info=True)
 
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
-        """The capture body, split out so :meth:`__call__` stays a thin guard."""
+        """The capture body, split out so :meth:`__call__` stays a thin guard.
+
+        Three bounded steps, in this order: latch what the worker finished, feed
+        the session this tick's audio, then collect whatever the server has
+        endpointed since the last tick.
+        """
         now = self._now(ctx)
         self._adopt_ready()
 
-        # Read the mic EVERY tick, even while muted or mid-drop, so the held
-        # client's buffer keeps draining and a co-riding loudness provider sees
-        # the same sample. Never a second reader, never a second session.
+        # Read the mic EVERY tick, even while muted or with no session, so the
+        # held client's buffer keeps draining and a co-riding loudness provider
+        # sees the same sample. Never a second reader, never a second session.
         chunk = self._read_audio()
-        if chunk is None:
-            # No audio this tick: it still counts as silence for endpointing, so
-            # an utterance that ends with the mic going quiet still submits.
-            self._maybe_submit_on_pause(now)
-            return
-
-        if now < self._mute_until():
-            # The robot is speaking: discard the partial utterance AND the ring,
-            # so its own voice is never pre-rolled nor transcribed. This is the
-            # ONE path that clears the ring (#108) — everything else marks
-            # audio consumed and leaves it in place.
-            if self._clip_start is not None:
-                senselog.drop(_STAGE_CAPTURE, _SOURCE, self._event_id or "?", "self-mute")
-            self._reset_utt()
-            self._discard_ring()
-            return
-
-        self._push_ring(chunk)
-        if self._is_speech(chunk):
-            self._on_speech_tick(ctx, chunk, now)
-            return
-        self._maybe_submit_on_pause(now)
-
-    def _on_speech_tick(self, ctx, chunk: np.ndarray, now: float) -> None:  # type: ignore[no-untyped-def]  # noqa: E501
-        """Mark one speech chunk, opening the utterance on the rising edge.
-
-        Nothing is *accumulated* here — the chunk is already in the ring, and
-        the ring is what gets submitted. All this does is move the speech-span
-        end mark, which is why a quiet chunk mid-sentence costs nothing: it is
-        in the ring too, and the clip is contiguous over both.
-        """
-        if self._clip_start is None:
-            self._begin_utterance(ctx, now, int(chunk.size))
-        else:
-            self._speech_end = self._ring_total
-        self._last_speech_t = now
-        started = self._utt_started_t
-        if started is not None and (now - started) >= self._tuning.max_utterance_s:
-            self._submit(now)  # cap a very long monologue
-
-    def _maybe_submit_on_pause(self, now: float) -> None:
-        """End the utterance once speech has been absent for ``silence_hold_s``."""
-        if (
-            self._clip_start is not None
-            and self._last_speech_t is not None
-            and (now - self._last_speech_t) >= self._tuning.silence_hold_s
-        ):
-            self._submit(now)
+        muted = now < self._mute_until()
+        if chunk is not None:
+            self._stream(chunk, muted=muted)
+        self._take_utterances(ctx, now)
 
     # ------------------------------------------------------------------
-    # The handoff — tick side (NON-BLOCKING BY CONSTRUCTION)
+    # Capture — outbound (TICK THREAD, O(1) BY CONSTRUCTION)
     # ------------------------------------------------------------------
 
-    def _submit(self, now: float) -> None:
-        """Hand the finished utterance to the worker; never blocks, never raises.
+    def _stream(self, chunk: np.ndarray, *, muted: bool) -> None:
+        """Hand one mic chunk to the session client. Never blocks, never raises.
 
-        This is the whole point of the module: the tick's involvement with a
-        transcript ENDS here, at a ``put_nowait``. Everything downstream — the
-        STT POST, the engagement classifier's call — happens on the worker.
-
-        The audio handed over is ONE CONTIGUOUS SLICE of the ring, from the
-        clip's measured start through everything captured since (#108). The ring
-        itself is left intact; only the ``_consumed`` watermark moves, so the
-        very next utterance still has real pre-roll to draw on.
+        This is the whole outbound path: no VAD, no ring, no threshold, no
+        decision about which audio is worth keeping (see the module docstring's
+        #108 note). ``submit_audio`` is one bounded ``put_nowait`` on the
+        client's queue; its worker thread owns the socket.
         """
-        clip_start = self._clip_start
-        direction = self._utt_direction
-        event_id = self._event_id or "?"
-        span = self._speech_end - self._speech_begin
-        self._reset_utt()
-        if clip_start is None:
+        if muted:
+            # The robot is speaking: its own voice must never reach the server's
+            # VAD. Latched — audio arrives 50x/s and one line per chunk is the
+            # #99 journal flood.
+            if not self._muted_logged:
+                self._muted_logged = True
+                senselog.drop(_STAGE_CAPTURE, _SOURCE, _STREAM_EVENT, REASON_SELF_MUTE)
+            return
+        self._muted_logged = False
+
+        client = self._realtime
+        if client is None:
+            if not self._no_session_logged:
+                self._no_session_logged = True
+                senselog.drop(_STAGE_CAPTURE, _SOURCE, _STREAM_EVENT, REASON_NO_SESSION)
+            return
+        try:
+            client.submit_audio(chunk)
+        # A duck-typed client that raises costs one chunk, never the tick.
+        except Exception:  # noqa: BLE001
+            logger.debug("TranscriptSenseDriver: submit_audio raised; chunk dropped", exc_info=True)
+            return
+        self.streamed += 1
+
+    def _read_audio(self) -> np.ndarray | None:
+        """One mic chunk off the injected held client, degrading every failure.
+
+        Returns ``None`` for "no audio this tick" — a cold/disconnected holder, a
+        read that raised, an unusable shape, or a genuinely empty chunk. The
+        first successful read is also where the real mic sample rate is
+        resolved: querying it earlier could trigger the holder's blocking
+        construction on this very thread.
+
+        Multi-channel reads have a channel SELECTED
+        (:func:`reachy.robot.audio_shape.to_mono`), never flattened: flattening
+        an ``(N, C)`` chunk interleaves its channels into one double-length
+        stream, and the session config declares one channel at one rate.
+        """
+        try:
+            raw = self._media.audio()
+        # A raising media client degrades, never propagates.
+        except Exception:  # noqa: BLE001
+            logger.debug("TranscriptSenseDriver media read raised; no audio", exc_info=True)
+            return None
+        chunk = to_mono(raw)
+        if chunk is None or chunk.size == 0:
+            return None
+        if self._rate is None:
+            self._resolve_rate()
+        return chunk
+
+    def _resolve_rate(self) -> None:
+        """Adopt the mic's real rate and carry it into the session config.
+
+        Called only after a successful :meth:`_read_audio`, which proves the
+        holder is connected — so this property read is free rather than a
+        blocking connect. The rate rides the session's connect URL and the
+        server resamples from it, so a rate that turns out to differ from the
+        one composition guessed is worth one clean, intentional reconnect
+        (:meth:`~reachy.speech.realtime.RealtimeTranscriber.set_sample_rate` is
+        a no-op when it already matches).
+        """
+        rate: Any = None
+        try:
+            rate = self._media.samplerate
+        except Exception:  # noqa: BLE001
+            rate = None
+        try:
+            self._rate = int(rate) if rate else _FALLBACK_RATE
+        except (TypeError, ValueError):
+            self._rate = _FALLBACK_RATE
+        setter = getattr(self._realtime, "set_sample_rate", None)
+        if not callable(setter):
+            return
+        try:
+            setter(self._rate)
+        except Exception:  # noqa: BLE001 — a rate push must never cost a tick
+            logger.debug("TranscriptSenseDriver: set_sample_rate raised", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Capture — inbound (TICK THREAD, NON-BLOCKING BY CONSTRUCTION)
+    # ------------------------------------------------------------------
+
+    def _take_utterances(self, ctx, now: float) -> None:  # type: ignore[no-untyped-def]
+        """Pop what the server endpointed since the last tick; bounded, never blocks."""
+        take = getattr(self._realtime, "take_utterance", None)
+        if not callable(take):
+            return
+        for _ in range(self._max_takes_per_tick):
+            try:
+                utterance = take()
+            # A duck-typed client that raises costs this tick's words, not the tick.
+            except Exception:  # noqa: BLE001
+                logger.debug("TranscriptSenseDriver: take_utterance raised", exc_info=True)
+                return
+            if utterance is None:
+                return
+            self._heard(ctx, utterance, now)
+
+    def _heard(self, ctx, utterance: Utterance, now: float) -> None:  # type: ignore[no-untyped-def]
+        """Admit one arrived utterance to the worker; the tick's part ENDS here.
+
+        Two cheap guards run on this thread because both are O(1) and both are
+        about *this instant*: an empty transcript is not words, and a transcript
+        that arrived while the robot was speaking is (probably) the robot. The
+        engagement gate — the only remaining network call — is the worker's.
+        """
+        event_id = uuid.uuid4().hex[:8]
+        text = getattr(utterance, "text", None)
+        if not isinstance(text, str) or not text.strip():
+            senselog.drop(_STAGE_CAPTURE, _SOURCE, event_id, REASON_EMPTY_TRANSCRIPT)
             return
 
-        audio = self._clip_from(clip_start)
-        # Consumed either way: audio is submitted at most once, and a blip we
-        # deliberately declined is not lead-in worth keeping for the next one.
-        self._consumed = self._ring_total
-
-        if audio.size == 0 or span < self._min_utt_samples:
-            # A blip, not a sentence. The floor is a SPAN (#108): silence inside
-            # an utterance counts toward its length, pre-roll outside it does not.
-            senselog.drop(_STAGE_CAPTURE, _SOURCE, event_id, "min-utterance")
+        t = self._arrival(utterance, now)
+        if t < self._mute_until():
+            # The server's VAD cannot know the robot was talking; this can.
+            senselog.drop(_STAGE_CAPTURE, _SOURCE, event_id, REASON_SELF_MUTE)
             return
 
-        rate = self._rate or _FALLBACK_RATE
-        senselog.stage(
-            _STAGE_CAPTURE,
-            _SOURCE,
-            event_id,
-            f"utterance end span={span / rate:.2f}s clip={audio.size / rate:.2f}s contiguous",
-        )
         self._ensure_worker()
         try:
-            self._pending.put_nowait(_Utterance(audio, direction, now, event_id))
+            self._pending.put_nowait(_Heard(text, self._direction_of(ctx), t, event_id))
         except queue.Full:
-            # A wedged/slow STT has backed the queue up. Dropping is correct:
-            # blocking would blow the tick budget, and the words are stale.
-            senselog.drop(_STAGE_CAPTURE, _SOURCE, event_id, "stt-backlog")
+            # A wedged/slow classifier has backed the queue up. Dropping is
+            # correct: blocking would blow the tick budget, and the words are
+            # stale by the time a wedged gate would judge them.
+            senselog.drop(_STAGE_CAPTURE, _SOURCE, event_id, REASON_GATE_BACKLOG)
             return
         self.submitted += 1
+        senselog.stage(
+            _STAGE_CAPTURE, _SOURCE, event_id, f"utterance chars={len(text)} (server vad)"
+        )
+
+    def _arrival(self, utterance: Utterance, now: float) -> float:
+        """The instant *utterance* arrived — its own stamp when usable, else *now*.
+
+        :attr:`reachy.speech.realtime.Utterance.t` is stamped by the session
+        client off the same monotonic clock ``mute_until`` speaks, which is what
+        makes the self-mute comparison meaningful across two threads without a
+        clock of our own. A duck-typed client that omits it falls back to this
+        tick's time rather than losing the words.
+        """
+        stamp = getattr(utterance, "t", None)
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+            value = float(stamp)
+            if math.isfinite(value):
+                return value
+        return now
 
     def _adopt_ready(self) -> None:
         """Latch at most one transcript the worker has finished. Never blocks."""
@@ -632,11 +656,11 @@ class TranscriptSenseDriver:
         self.worker.start()
 
     # ------------------------------------------------------------------
-    # The worker (BACKGROUND THREAD) — every network call lives here
+    # The worker (BACKGROUND THREAD) — the one remaining network call
     # ------------------------------------------------------------------
 
     def _worker_loop(self) -> None:
-        """Drain submitted utterances: transcribe, gate, publish. Never raises out."""
+        """Drain arrived utterances: gate, publish. Never raises out."""
         while True:
             job = self._pending.get()
             if job is _STOP:
@@ -646,17 +670,11 @@ class TranscriptSenseDriver:
             # A worker fault must cost one utterance, never the worker.
             except Exception:  # noqa: BLE001
                 logger.warning("TranscriptSenseDriver worker degraded", exc_info=True)
+            self.judged += 1
 
-    def _handle(self, job: _Utterance) -> None:
-        """Transcribe one utterance, run the engagement gate, publish if admitted."""
-        transcriber = self._transcriber
-        if transcriber is None:
-            return
-        text = transcriber.transcribe_once(job.audio)
-        if not text:
-            senselog.drop(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, "stt-empty")
-            return
-        engaged, label = self._decide(text, job.t)
+    def _handle(self, job: _Heard) -> None:
+        """Run the engagement gate over one utterance; publish it if admitted."""
+        engaged, label = self._decide(job.text, job.t)
         if not engaged:
             # Not addressed to the robot: ambient speech, a backchannel too short
             # to carry addressing signal, or no conversation open to continue.
@@ -666,19 +684,19 @@ class TranscriptSenseDriver:
             return
         self._notify_engaged()
         try:
-            self._ready.put_nowait((text, job.direction))
+            self._ready.put_nowait((job.text, job.direction))
         except queue.Full:
             # The engine has stopped draining. Drop the OLDEST so the latch
             # always carries the freshest words rather than a stale backlog.
             self._drop_oldest_ready()
             try:
-                self._ready.put_nowait((text, job.direction))
+                self._ready.put_nowait((job.text, job.direction))
             except queue.Full:
-                senselog.drop(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, "latch-backlog")
+                senselog.drop(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, REASON_LATCH_BACKLOG)
                 return
         self._engaged_until = job.t + self._tuning.engage_window_s
         self.transcripts += 1
-        senselog.stage(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, f'heard "{text[:60]}"')
+        senselog.stage(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, f'heard "{job.text[:60]}"')
 
     def _drop_oldest_ready(self) -> None:
         try:
@@ -750,241 +768,6 @@ class TranscriptSenseDriver:
         return coherent and t < self._engaged_until
 
     # ------------------------------------------------------------------
-    # Capture internals (TICK THREAD)
-    # ------------------------------------------------------------------
-
-    def _read_audio(self) -> np.ndarray | None:
-        """One mic chunk off the injected held client, degrading every failure.
-
-        Returns ``None`` for "no audio this tick" — a cold/disconnected holder, a
-        read that raised, an unusable shape, or a genuinely empty chunk. The
-        first successful read is also where the real mic sample rate is
-        resolved: querying it earlier could trigger the holder's blocking
-        construction on this very thread.
-
-        Multi-channel reads have a channel SELECTED
-        (:func:`reachy.robot.audio_shape.to_mono`), never flattened: flattening
-        an ``(N, C)`` chunk interleaves its channels into one double-length
-        stream, which the WAV header then mislabels.
-        """
-        try:
-            raw = self._media.audio()
-        # A raising media client degrades, never propagates.
-        except Exception:  # noqa: BLE001
-            logger.debug("TranscriptSenseDriver media read raised; no audio", exc_info=True)
-            return None
-        chunk = to_mono(raw)
-        if chunk is None or chunk.size == 0:
-            return None
-        if self._rate is None:
-            self._resolve_rate()
-        return chunk
-
-    def _resolve_rate(self) -> None:
-        """Adopt the mic's real rate and size every rate-dependent threshold.
-
-        Called only after a successful :meth:`_read_audio`, which proves the
-        holder is connected — so this property read is free rather than a
-        blocking connect.
-        """
-        rate: Any = None
-        try:
-            rate = self._media.samplerate
-        except Exception:  # noqa: BLE001
-            rate = None
-        try:
-            self._rate = int(rate) if rate else _FALLBACK_RATE
-        except (TypeError, ValueError):
-            self._rate = _FALLBACK_RATE
-        tuning = self._tuning
-        self._min_utt_samples = int(max(0.0, tuning.min_utterance_s) * self._rate)
-        self._ring_max = int(max(0.0, tuning.ring_seconds) * self._rate)
-        self._pre_roll_samples = int(max(0.0, tuning.pre_roll_s) * self._rate)
-        self._onset_window = max(1, int(tuning.onset_window_s * self._rate))
-        # The ceiling an OPEN utterance may hold the ring open to: the longest
-        # clip the endpointer can produce (pre-roll + the monologue cap + the
-        # closing pause) plus a second of slack. Bounded memory is not optional
-        # on a boot-persistent process.
-        self._ring_hard_max = int(
-            (
-                max(0.0, tuning.pre_roll_s)
-                + max(0.0, tuning.max_utterance_s)
-                + max(0.0, tuning.silence_hold_s)
-                + 1.0
-            )
-            * self._rate
-        )
-        if self._transcriber is None:
-            # Built with the REAL rate so the WAV header matches the audio; a
-            # wrong rate makes the STT mis-decode and return nothing. No I/O.
-            self._transcriber = Transcriber(sample_rate=self._rate)
-
-    def _speech_threshold(self) -> float:
-        """The rms a chunk must clear to count as speech, for THIS room (#102).
-
-        ``max(speech_rms, speech_ratio * background)``: the shipped absolute
-        value becomes a FLOOR under a relative threshold, which is the shape
-        :class:`reachy.motion.snap.SnapDetector` always had (``min_rms`` inside
-        a ratio test) and the shape the orienting gate now uses too. So capture
-        can never become LESS sensitive than what shipped, and can no longer sit
-        permanently open in a room whose background has drifted above it.
-
-        Never raises: a missing, raising or cold background peek falls back to
-        the floor — the pre-#102 behaviour — because a sense tap must not be
-        able to crash the 20 ms tick it runs on.
-        """
-        floor = float(self._tuning.speech_rms)
-        if self._background is None:
-            return floor
-        try:
-            level = self._background()
-        except Exception:  # noqa: BLE001 — a peek failure means "no estimate"
-            return floor
-        if level is None or not isinstance(level, (int, float)):
-            return floor
-        level = float(level)
-        if not math.isfinite(level) or level < 0.0:
-            return floor
-        return max(floor, level * float(self._tuning.speech_ratio))
-
-    def _is_speech(self, chunk: np.ndarray) -> bool:
-        """Energy VAD over the chunk (see the module docstring's deviation note)."""
-        return self._rms(chunk) >= self._speech_threshold()
-
-    @staticmethod
-    def _rms(chunk: np.ndarray) -> float:
-        if chunk.size == 0:
-            return 0.0
-        return float(np.sqrt(np.mean(np.square(chunk))))
-
-    def _begin_utterance(self, ctx, now: float, speech_samples: int) -> None:  # type: ignore[no-untyped-def]  # noqa: E501
-        """Open an utterance by MARKING where its clip starts in the ring.
-
-        Called on the VAD's rising edge. Nothing is copied: the ring already
-        holds the triggering chunk and everything before it, so opening an
-        utterance is just recording an index. The onset is MEASURED (an RMS scan
-        of the buffered audio, never looking back past what has already been
-        submitted) and the clip starts at ``onset - pre_roll``, clamped to the
-        ring start, so a quiet leading phoneme is kept.
-        """
-        self._utt_started_t = now
-        self._utt_direction = self._direction_of(ctx)
-        self._event_id = uuid.uuid4().hex[:8]
-        self._speech_begin = self._ring_total - int(speech_samples)
-        self._speech_end = self._ring_total
-
-        snapshot = self._concat_ring()  # one concat, rising edge only
-        buffer_start = self._ring_total - self._ring_samples
-        scan_from = max(0, self._consumed - buffer_start)
-        onset_offset = self._measure_onset(snapshot, scan_from)
-        onset_absolute = buffer_start + onset_offset
-        clip_start = max(buffer_start, self._consumed, onset_absolute - self._pre_roll_samples)
-        self._clip_start = clip_start
-
-        rate = self._rate or _FALLBACK_RATE
-        senselog.stage(
-            _STAGE_CAPTURE,
-            _SOURCE,
-            self._event_id,
-            f"utterance start pre_roll={(onset_absolute - clip_start) / rate:.2f}s "
-            f"buffered={self._ring_samples}",
-        )
-
-    def _clip_from(self, clip_start: int) -> np.ndarray:
-        """The ring from *clip_start* to now, as ONE contiguous float32 array.
-
-        This is the emitted audio, and the whole of issue #108's fix: the slice
-        is unbroken, so every quiet frame *inside* the utterance — every stop
-        closure, unvoiced consonant and inter-word gap — reaches the STT with
-        the loud ones, in order. Mirrors ``reachy_nova``'s
-        ``speech_events.py:263-265`` (``full_buffer[clip_offset:]``).
-        """
-        snapshot = self._concat_ring()
-        buffer_start = self._ring_total - self._ring_samples
-        offset = max(0, min(int(snapshot.size), clip_start - buffer_start))
-        return snapshot[offset:]
-
-    def _retention(self) -> int:
-        """How many samples the ring must keep this tick.
-
-        Its rolling horizon normally; at least the OPEN clip while an utterance
-        is in progress, so a sentence longer than ``ring_seconds`` is not
-        trimmed out from under itself — bounded by :attr:`_ring_hard_max` so the
-        answer is always a number, never "however long this goes on".
-        """
-        base = self._ring_max
-        clip_start = self._clip_start
-        if clip_start is None:
-            return base
-        return max(base, min(self._ring_total - clip_start, self._ring_hard_max))
-
-    def _push_ring(self, chunk: np.ndarray) -> None:
-        """Append a chunk to the rolling pre-roll ring (cheap; trimmed by samples)."""
-        self._ring.append(chunk)
-        self._ring_samples += int(chunk.size)
-        self._ring_total += int(chunk.size)
-        keep = self._retention()
-        while len(self._ring) > 1 and self._ring_samples - self._ring[0].size >= keep:
-            self._ring_samples -= int(self._ring.pop(0).size)
-
-    def _concat_ring(self) -> np.ndarray:
-        """Concatenate the ring into one float32 snapshot (rising edge only)."""
-        if not self._ring:
-            return np.zeros(0, dtype=np.float32)
-        if len(self._ring) == 1:
-            return self._ring[0]
-        return np.concatenate(self._ring)
-
-    def _measure_onset(self, snapshot: np.ndarray, start_at: int = 0) -> int:
-        """First window offset at/after *start_at* clearing the speech threshold.
-
-        A MEASUREMENT over the buffered audio, not an assumed fixed offset, so
-        the emitted clip's lead-in tracks where energy actually rises. Falls back
-        to *start_at* when nothing clears the threshold. *start_at* is the
-        ``_consumed`` watermark: the scan must never reach back into audio a
-        previous utterance already carried, or the retained ring would re-send
-        the same words.
-        """
-        win = self._onset_window
-        threshold = self._speech_threshold()
-        floor = max(0, min(int(start_at), int(snapshot.size)))
-        for start in range(floor, int(snapshot.size), win):
-            window = snapshot[start : start + win]
-            if window.size and self._rms(window) >= threshold:
-                return start
-        return floor
-
-    def _reset_utt(self) -> None:
-        """Close the open utterance. Leaves the ring alone (#108).
-
-        The ring is a rolling record of what the microphone produced; an
-        utterance is a pair of marks in it. Clearing the ring here destroyed the
-        pre-roll for whatever was said next (the live journal's
-        ``pre_roll=0.02s buffered=512`` on back-to-back utterances). Only
-        :meth:`_discard_ring` clears it, and only self-mute calls that.
-        """
-        self._clip_start = None
-        self._speech_begin = 0
-        self._speech_end = 0
-        self._utt_started_t = None
-        self._last_speech_t = None
-        self._utt_direction = None
-        self._event_id = None
-
-    def _discard_ring(self) -> None:
-        """Throw the buffered audio away — the self-mute path, and only it.
-
-        ``_ring_total`` is a monotonic counter of everything ever captured, so
-        it is NOT reset: the absolute indices ``_consumed`` and ``_clip_start``
-        speak must stay comparable across a discard. Advancing ``_consumed`` to
-        it is what makes the robot's own voice unreachable from the next
-        utterance's onset scan.
-        """
-        self._ring = []
-        self._ring_samples = 0
-        self._consumed = self._ring_total
-
-    # ------------------------------------------------------------------
     # Provider seam
     # ------------------------------------------------------------------
 
@@ -1022,9 +805,10 @@ class TranscriptSenseDriver:
     def close(self) -> None:
         """Stop the worker thread. Idempotent, never raises.
 
-        Does NOT close the media client: the composition root owns exactly one
-        and other senses read it too. After ``close()`` every tick is a no-op
-        that still clears the latch, so a late tick is always safe.
+        Does NOT close the media client or the realtime session client: the
+        composition root owns one of each, other senses read the media client
+        too, and the session outlives any single sense. After ``close()`` every
+        tick is a no-op that still clears the latch, so a late tick is safe.
         """
         if self._closed:
             return
@@ -1057,7 +841,7 @@ class TranscriptSenseDriver:
         """This tick's clock reading — ``ctx.now`` when usable, else the fallback.
 
         Unlike :class:`~reachy.behavior.pat_sense.PatSenseDriver` this driver
-        needs a real number (endpointing is entirely time-based), so a missing or
+        needs a real number (the self-mute window is time-based), so a missing or
         non-finite ``ctx.now`` falls back to the injected clock rather than
         degrading to ``None``.
         """

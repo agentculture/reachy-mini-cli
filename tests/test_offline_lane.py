@@ -14,7 +14,7 @@ that must survive with every network leg pointed nowhere:
     sleep/wake      -> test_sleep_wake_demo_walks_the_full_arc_with_no_robot
     rules           -> test_rules_file_changes_robot_behavior_in_a_bounded_run
     speak           -> test_speak_renders_and_plays_a_say_rule_with_every_endpoint_unreachable
-    hear            -> test_hearing_degrades_to_no_words_when_the_stt_is_unreachable
+    hear            -> test_hearing_degrades_to_no_words_when_the_realtime_session_is_unreachable
                        test_hearing_admits_an_addressed_utterance_with_zero_llm_calls
 
 Every test below drives the SAME production seam a pre-existing, more thorough
@@ -55,6 +55,7 @@ from reachy.motion.listen import ListenParams, ListenProducer
 from reachy.motion.pat import PatDetector
 from reachy.motion.pat_reaction import PatReaction
 from reachy.motion.queue import MotionQueue
+from reachy.speech.realtime import Utterance
 
 pytestmark = pytest.mark.offline
 
@@ -463,16 +464,28 @@ class _FakeMic:
         return self.next_chunk
 
 
-class _FakeStt:
-    """Stands in for the ONE network hop hearing has: the STT round-trip."""
+class _FakeSession:
+    """Stands in for the ONE network hop hearing has: the realtime session.
+
+    Mirrors :class:`reachy.speech.realtime.RealtimeTranscriber`'s two
+    tick-thread methods. :meth:`emit` is the offline stand-in for the SERVER's
+    VAD deciding a sentence ended — the decision that no longer happens on the
+    robot at all.
+    """
 
     def __init__(self, text: str) -> None:
         self.text = text
-        self.calls = 0
+        self.chunks = 0
 
-    def transcribe_once(self, audio):
-        self.calls += 1
-        return self.text
+    def submit_audio(self, audio) -> bool:
+        self.chunks += 1
+        return True
+
+    def take_utterance(self):
+        if self.text is None:
+            return None
+        text, self.text = self.text, None
+        return Utterance(text=text, t=0.0)
 
 
 class _RefusingClassifier:
@@ -487,35 +500,20 @@ class _RefusingClassifier:
 
 
 def _hearing_tuning() -> TranscriptTuning:
-    """Fast tuning so an utterance endpoints within a handful of 10 ms ticks."""
-    return TranscriptTuning(
-        silence_hold_s=0.03,
-        max_utterance_s=1.0,
-        min_utterance_s=0.02,
-        ring_seconds=0.5,
-        pre_roll_s=0.05,
-        min_words=3,
-        engage_window_s=1.0,
-    )
+    """Fast admission tuning (endpointing is the server's business now)."""
+    return TranscriptTuning(min_words=3, engage_window_s=1.0)
 
 
 def _tick_ctx(now: float):
     return SimpleNamespace(now=now, tick=int(now * 100), sense=Sense())
 
 
-def _utterance(driver, mic: _FakeMic, t: float) -> float:
-    """Six loud ticks then quiet ticks until the utterance reaches the worker."""
-    for _ in range(6):
+def _speak_into(driver, mic: _FakeMic, t: float, ticks: int = 6) -> float:
+    """Drive *ticks* ticks of live audio into the session."""
+    for _ in range(ticks):
         mic.next_chunk = np.full(_MIC_CHUNK, 0.5, dtype=np.float32)
         driver(_tick_ctx(t))
         t += _MIC_DT
-    submitted = driver.submitted
-    for _ in range(5):
-        mic.next_chunk = np.zeros(_MIC_CHUNK, dtype=np.float32)
-        driver(_tick_ctx(t))
-        t += _MIC_DT
-        if driver.submitted > submitted:
-            break
     return t
 
 
@@ -528,49 +526,54 @@ def _poll(predicate, timeout: float = 5.0) -> bool:
     return False
 
 
-def test_hearing_degrades_to_no_words_when_the_stt_is_unreachable() -> None:
+def test_hearing_degrades_to_no_words_when_the_realtime_session_is_unreachable() -> None:
     """Mirrors test_behavior_transcript_sense.py's
-    test_an_unreachable_stt_leaves_the_field_none_and_drops_no_ticks:
+    test_an_unreachable_realtime_session_leaves_the_field_none_and_drops_no_ticks:
 
-    the REAL :class:`reachy.speech.stt.Transcriber` against a blocked socket.
-    Hearing is the one success-list path with a genuinely unavoidable network
-    leg, so its offline contract is a DEGRADATION contract: no words, no
-    exception, and — the part that matters at 50 Hz — not one dropped tick. The
-    runtime keeps breathing and reacting while it cannot hear.
+    the REAL :class:`reachy.speech.realtime.RealtimeTranscriber` against a
+    blocked socket. Hearing is the one success-list path with a genuinely
+    unavoidable network leg, so its offline contract is a DEGRADATION contract:
+    no words, no exception, and — the part that matters at 50 Hz — not one
+    dropped tick. The runtime keeps breathing and reacting while it cannot hear.
 
-    ``submitted == 1`` is asserted first so the silence is provably the failed
-    round-trip and not a capture that never happened.
+    There is deliberately NO local fallback endpointer (the realtime arc's
+    operator decision c17), so "the gateway is down" means silence, not a
+    quietly different capture path. ``streamed`` is asserted first so the
+    silence is provably the failed session and not audio that was never offered.
     """
-    from reachy.speech.stt import Transcriber
+    from reachy.speech.realtime import RealtimeTranscriber
 
     mic = _FakeMic()
     classifier = _RefusingClassifier()
+    session = RealtimeTranscriber(
+        sample_rate=_MIC_RATE,
+        url="ws://127.0.0.1:1/v1/realtime",
+        backoff_initial_s=0.2,
+        backoff_max_s=0.2,
+    )
     driver = TranscriptSenseDriver(
         media=mic,
-        transcriber=Transcriber(sample_rate=_MIC_RATE),
+        realtime=session,
         classifier=classifier,
         tuning=_hearing_tuning(),
     )
     try:
-        t = _utterance(driver, mic, 100.0)
-        assert _poll(lambda: driver.submitted == 1), "the utterance never reached the STT worker"
-        # Give the worker a real window to publish. Polling for the ABSENCE of a
-        # result needs a deadline, or the assertion below would pass simply by
-        # reading the counter before the worker got round to writing it.
+        t = _speak_into(driver, mic, 100.0)
+        assert driver.streamed == 6, "the audio never reached the session client"
+        # Polling for the ABSENCE of a result needs a deadline, or the assertion
+        # would pass simply by reading the counter before anything could write it.
         assert not _poll(
             lambda: driver.transcripts > 0, timeout=0.5
         ), "a blocked socket produced words"
-        for _ in range(20):
-            mic.next_chunk = np.zeros(_MIC_CHUNK, dtype=np.float32)
-            driver(_tick_ctx(t))
-            t += _MIC_DT
+        t = _speak_into(driver, mic, t, ticks=20)
 
         assert driver.peek() is None, "a blocked socket produced words"
         assert driver.transcripts == 0
-        assert driver.ticks == mic.calls, "a tick was dropped while the STT was down"
+        assert driver.ticks == mic.calls, "a tick was dropped while the gateway was down"
         assert classifier.calls == 0, "no words were heard, yet the LLM was consulted"
     finally:
         driver.close()
+        session.close()
 
 
 def test_hearing_admits_an_addressed_utterance_with_zero_llm_calls() -> None:
@@ -585,19 +588,19 @@ def test_hearing_admits_an_addressed_utterance_with_zero_llm_calls() -> None:
     consulted on this path the test fails rather than quietly making a call the
     lane forbids.
 
-    Only the STT round-trip is a stand-in — the same "one unavoidable hop"
+    Only the realtime session is a stand-in — the same "one unavoidable hop"
     concession the ``speak`` test above makes for the speaker.
     """
     mic = _FakeMic()
     classifier = _RefusingClassifier()
     driver = TranscriptSenseDriver(
         media=mic,
-        transcriber=_FakeStt(_ADDRESSED),
+        realtime=_FakeSession(_ADDRESSED),
         classifier=classifier,
         tuning=_hearing_tuning(),
     )
     try:
-        t = _utterance(driver, mic, 100.0)
+        t = _speak_into(driver, mic, 100.0)
         assert _poll(lambda: driver.transcripts == 1), "the addressed utterance never landed"
         driver(_tick_ctx(t))
         providers = SenseProviders(transcript=driver.as_provider())

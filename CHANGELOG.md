@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.0] - 2026-07-22
+
+### Added
+
+- `reachy/speech/realtime_wire.py` — hand-rolled stdlib RFC 6455 framing plus the OpenAI-shaped base64 `input_audio_buffer.append` codec, cited from lobes-cli `scripts/realtime-smoke.py` (no new dependency).
+- `reachy/speech/realtime.py` — `RealtimeTranscriber`, a worker-thread WebSocket session against the lobes `/v1/realtime` endpoint: streams mic audio as base64 append events, consumes server-side VAD boundaries and transcripts, and reconnects with bounded backoff. Never raises into its caller; every failure is a named `senselog` drop.
+- `tests/fake_realtime_server.py` — an in-process, loopback-socket fake `/v1/realtime` server with scripted happy and failure scenarios, so the whole hearing path is testable offline.
+- `REACHY_REALTIME_URL` / `REACHY_REALTIME_API_KEY` — explicit endpoint and key for the hearing session, falling back to `REACHY_OPENAI_URL_BASE` / `REACHY_OPENAI_API_KEY`.
+
+### Changed
+
+- Utterance endpointing moved server-side (issues #115, #111): `TranscriptSenseDriver` no longer decides when an utterance starts and ends from a local energy threshold — it streams audio to the realtime session and consumes endpointed transcripts. Admission is unchanged: the engagement gate still judges every utterance exactly as before.
+- The runtime streams mic audio as base64 `input_audio_buffer.append` JSON text frames; no binary audio frames are sent anywhere (the coordinated lobes#151 wire break).
+- `behavior engine run` composes and starts one `RealtimeTranscriber` at composition time (never on the tick thread), carries the mic-reported sample rate into the session, feeds it from the existing `_AudioTap` fan-out, and closes it with the rest of the runtime resources.
+- Zero-LLM boundary: `reachy.speech.stt` left `_BEHAVIOR_SPEECH_ALLOW` (nothing under `reachy/behavior/` imports it now) and `reachy.speech.realtime` took its place; the engagement classifier remains the one LLM edge.
+- `REACHY_STT_URL` no longer affects the runtime's hearing — it is now only `sleep`'s wake-word backend.
+
+### Fixed
+
+- A normal speaking voice across the room no longer goes unheard (#111): the local start threshold that landed at 0.102 against a drifted background no longer decides capture at all.
+- `RealtimeTranscriber._connect` is fully guarded — an unexpected fault costs one reconnect attempt rather than killing the session worker permanently while still reporting a latched session-down.
+
 ## [0.42.0] - 2026-07-21
 
 ### Added

@@ -119,6 +119,7 @@ from reachy.robot.media_client import HeldMediaClient
 from reachy.robot.state_reader import HeldStateReader
 from reachy.speech.distinctness import find_too_similar as _find_too_similar
 from reachy.speech.expressions import NEUTRAL_KEY, Catalog
+from reachy.speech.realtime import RealtimeTranscriber
 
 logger = logging.getLogger(__name__)
 
@@ -1256,6 +1257,84 @@ _KEEPER_JOIN_TIMEOUT_S = 2.0
 
 _WARM_STAGE = "warmup"
 
+#: ``senselog`` source for the hearing session's own composition-time lines.
+_REALTIME_LABEL = "realtime"
+
+#: Mic rate the hearing session STARTS at when the held media client cannot
+#: report a real one at composition time — a cold holder (the daemon may not be
+#: up yet) reports ``None`` rather than blocking, by construction.
+#:
+#: It is a starting guess, never a lie the session keeps: the rate rides the
+#: session's connect URL and the server resamples from it, so
+#: :class:`~reachy.behavior.transcript_sense.TranscriptSenseDriver` pushes the
+#: REAL rate through ``set_sample_rate`` after its first successful read, which
+#: costs one clean, intentional reconnect. The fallback is announced (a named
+#: ``mic-rate-unknown`` drop), never silent — a session quietly mis-declaring a
+#: 48 kHz mic as 16 kHz mis-times every server-side VAD decision, and that is
+#: exactly the failure that would otherwise present as "hearing is just bad".
+DEFAULT_MIC_SAMPLE_RATE = 16000
+
+
+def _mic_sample_rate(source) -> int:
+    """The mic's REAL rate for the hearing session, or the announced fallback.
+
+    *source* is the composed :class:`_AudioTap` (which duck-types the held media
+    client's ``samplerate``). Under ``allow_inline_connect=False`` that property
+    is a free read: it reports ``None`` on a cold holder instead of triggering
+    the blocking construction, so calling it here cannot stall setup.
+
+    A missing/unusable rate returns :data:`DEFAULT_MIC_SAMPLE_RATE` and says so
+    on both channels — a log line for a human and a named ``senselog`` drop for
+    the journal. See that constant's note for why silence would be wrong.
+    """
+    try:
+        rate = source.samplerate
+    except Exception as err:  # noqa: BLE001 — a rate probe must never block boot
+        logger.debug("behavior: mic samplerate probe raised (%s); assuming unknown", err)
+        rate = None
+    try:
+        value = int(rate) if rate else 0
+    except (TypeError, ValueError):
+        value = 0
+    if value > 0:
+        senselog.stage(_WARM_STAGE, _REALTIME_LABEL, "setup", f"mic rate {value} Hz")
+        return value
+    logger.info(
+        "behavior: mic sample rate unknown at composition (media not up yet); the hearing "
+        "session starts at %d Hz and re-negotiates on the first real mic read",
+        DEFAULT_MIC_SAMPLE_RATE,
+    )
+    senselog.drop(
+        _WARM_STAGE,
+        _REALTIME_LABEL,
+        "setup",
+        f"mic-rate-unknown (session assumes {DEFAULT_MIC_SAMPLE_RATE} Hz until the first read)",
+    )
+    return DEFAULT_MIC_SAMPLE_RATE
+
+
+def _make_realtime_client(sample_rate: int) -> RealtimeTranscriber:
+    """Build the runtime's ONE hearing session client — a test-injection seam.
+
+    The sibling of :func:`_make_state_reader` / :func:`_make_media_client`, and
+    the same discipline: everything about WHICH gateway is resolved inside
+    :class:`~reachy.speech.realtime.RealtimeTranscriber` from the environment
+    (``REACHY_REALTIME_URL`` / ``REACHY_REALTIME_API_KEY``, falling back to the
+    shared ``REACHY_OPENAI_*`` gateway pair), so this stays a bare constructor
+    call and an unusable endpoint is a clean exit-1 ``CliError`` at SETUP rather
+    than a mid-session surprise.
+
+    Only the rate is passed, because only composition knows it: it is a required
+    constructor argument with no default on purpose (a hard-coded 16000 against
+    a 48 kHz mic mis-times every VAD decision). See :func:`_mic_sample_rate`.
+
+    Composed UNCONDITIONALLY, like the rest of the sense stack: the client is
+    pure stdlib + numpy, needs no ``[sdk]`` extra, and a gateway that is not
+    there is a LATCHED ``session-down`` (one line, then quiet) plus its own
+    bounded reconnect backoff — never an exception and never a per-tick flood.
+    """
+    return RealtimeTranscriber(sample_rate=sample_rate)
+
 
 def _make_state_reader() -> HeldStateReader:
     """Build the held, media-free SDK pose reader — a test-injection seam.
@@ -1498,10 +1577,25 @@ class _RuntimeResources:
     racing a half-played clip against a closing media client. The audio pump
     (#100) closes after the drivers and BEFORE the media client it reads, so its
     final guarded read still lands on a live-ish holder rather than a closed one.
+
+    The hearing session client is released just after the drivers that feed it,
+    for the same reason the SDK clients are released at all: it owns a socket
+    and a worker thread, and an unclosed one leaks the thread and can hang the
+    process at interpreter exit. Its ``close()`` is idempotent and bounded (it
+    shuts the socket down under a parked worker and joins with a timeout), so a
+    session that never connected costs nothing here.
     """
 
     def __init__(
-        self, *, pose_reader=None, media=None, drivers=(), keeper=None, speech=None, pump=None
+        self,
+        *,
+        pose_reader=None,
+        media=None,
+        drivers=(),
+        keeper=None,
+        speech=None,
+        pump=None,
+        realtime=None,
     ):
         self.pose_reader = pose_reader
         self.media = media
@@ -1509,6 +1603,7 @@ class _RuntimeResources:
         self.keeper = keeper
         self.speech = speech
         self.pump = pump
+        self.realtime = realtime
         self._closed = False
 
     def close(self) -> None:
@@ -1521,6 +1616,8 @@ class _RuntimeResources:
             self._release(self.speech.close, "speech actuator")
         for driver in self.drivers:
             self._release(driver.close, f"{type(driver).__name__}")
+        if self.realtime is not None:
+            self._release(self.realtime.close, "realtime session")
         if self.pump is not None:
             self._release(self.pump.close, "audio pump")
         if self.media is not None:
@@ -1609,8 +1706,9 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       duty: it also EXCLUDES the sample from the estimate, so self-noise is
       neither heard nor learned as the room;
     * ``transcript`` — the :class:`TranscriptSenseDriver`'s one-tick latch of an
-      ADDRESSED utterance (its STT round trip and engagement gate run on the
-      driver's own worker thread, never here);
+      ADDRESSED utterance (endpointing + transcription happen on the lobes
+      ``/v1/realtime`` session, and the engagement gate on the driver's own
+      worker thread — never here);
     * ``face`` / ``frame_available`` — the :class:`FaceSenseDriver`'s one-tick
       name latch and TTL-held camera condition (detection likewise runs on that
       driver's worker);
@@ -1643,6 +1741,23 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     ``sense_reader``) and both read that concatenated chunk. Neither module
     opens an audio source of its own; both take an injected one, and this is
     the only place that decides there is exactly one.
+
+    Hearing rides ONE session, opened HERE (issue #115)
+    ---------------------------------------------------
+    The transcript sense no longer endpoints utterances locally: the runtime
+    holds ONE :class:`~reachy.speech.realtime.RealtimeTranscriber` session to the
+    lobes ``/v1/realtime`` route, streams every mic chunk into it, and takes back
+    already-endpointed utterances decided by the server's ``server_vad``. That
+    client is constructed and ``start()``-ed HERE, after the media warm-up and
+    before the first tick, for the reasons spelled out at the call site: only a
+    warmed holder can report the mic's REAL rate (which rides the session's
+    connect URL — see :func:`_mic_sample_rate`), and spawning a worker plus a
+    blocking first connect is setup work, never tick work.
+
+    The audio it streams is the SAME per-tick chunk the rms providers see: the
+    driver reads the injected :class:`_AudioTap`, exactly as before, and hands
+    that chunk to the session's O(1) ``submit_audio``. Nothing here opens a
+    second ``media.audio()`` reader — the pump is still the only one (#100).
 
     Held clients: warmed HERE, before the first tick
     ------------------------------------------------
@@ -1712,10 +1827,11 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       snapshot on change; it reads the fixed ``ctx.sense`` so its position is
       immaterial, appended last so the sense block trails the decisions.
 
-    The returned ``resources`` bundles every held client and worker-owning driver
-    the caller MUST ``close()`` at shutdown (an unclosed client hangs the process
-    at interpreter exit, whatever its profile — see
-    :mod:`reachy.robot.state_reader`).
+    The returned ``resources`` bundles every held client, worker-owning driver
+    and session the caller MUST ``close()`` at shutdown (an unclosed client hangs
+    the process at interpreter exit, whatever its profile — see
+    :mod:`reachy.robot.state_reader`; the hearing session leaks its worker thread
+    the same way).
     """
     doa_poller = DoaPoller(lambda: read_doa(transport))
 
@@ -1762,6 +1878,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     # `Restart=on-failure` never restarts. So the whole construction is guarded
     # and releases what it opened before re-raising.
     reader = media = transcript_driver = face_driver = keeper = speech = pump = None
+    realtime = None
     try:
         # The voice, first: built and STARTED here on the setup thread so no tick
         # ever pays for thread creation, and so a malformed REACHY_VOICE_ENGINE /
@@ -1797,35 +1914,23 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
                 pat_kwargs["release_after_s"] = release_after
             pat_driver = PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
 
-        # The ONE media owner, and the two senses that read through it. Composed
-        # unconditionally: both degrade to permanently-quiet without their extras.
-        # The pump is CONSTRUCTED here but started only after the media warm-up
-        # below, so its backlog drain measures a real appsink queue (#100).
+        # The ONE media owner, and the senses that read through it (the face
+        # driver here; the audio pair — rms and the transcript driver — through
+        # the single `_AudioTap` below). Composed unconditionally: every piece
+        # degrades to permanently-quiet without its extra. The pump is
+        # CONSTRUCTED here but started only after the media warm-up below, so its
+        # backlog drain measures a real appsink queue (#100).
         media = _make_media_client()
         pump = AudioPump(media)
         audio_tap = _AudioTap(pump, media)
-        # ONE background estimator for the whole runtime (#102). Built here, not
-        # inside either consumer, because the orienting gate and the utterance
-        # capture gate must agree about what the room sounds like — two
-        # estimators fed from the same mic would differ only by their own bugs.
-        # They differ in THRESHOLD, not in estimate: capture starts at 3x the
-        # background, orienting's antenna lean at 5x.
+        # ONE background estimator for the whole runtime (#102), feeding the
+        # `rms_ratio` field the orienting gate keys on: the measured mic
+        # background drifts ~25x within a day, so no absolute floor is right in
+        # both the daytime and the night room. It no longer feeds a capture gate
+        # — utterance endpointing is the lobes server's `server_vad` now — so
+        # this is a single-consumer estimate, built here because that is where
+        # the one mic tap lives.
         background = _rms_background()
-        transcript_driver = TranscriptSenseDriver(
-            media=audio_tap,  # the shared per-tick chunk, never a second mic read
-            classifier=_engagement_classifier(),
-            # The room's own floor, so an utterance starts on sound that stands
-            # ABOVE the room rather than above a number measured in 2026-07-20's
-            # quiet office. Live-verified defect: with the night background at
-            # 0.034 the absolute 0.02 gate never closed and the journal filled
-            # with `utterance start` -> `dropped reason=stt-empty`.
-            background=lambda: background.level,
-            # Self-mute: the mic and the speaker share a room, so without this the
-            # runtime transcribes its OWN voice, the transcript fires a rule, the
-            # rule speaks, and the robot talks to itself forever. The actuator
-            # publishes the window its clip occupies; this closes the loop.
-            mute_until=speech.mute_until,
-        )
         recognition = build_face_recognition()
         face_driver = FaceSenseDriver(
             media=media,
@@ -1848,6 +1953,40 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         # pump thread owns every `media.audio()` call, drains the appsink's
         # standing backlog, and the tick thread only ever swaps its latch (#100).
         pump.start()
+
+        # HEARING. Built here — after the media warm-up, before the first tick —
+        # for two reasons that are one reason:
+        #
+        # * the session's `input_sample_rate` rides its connect URL, and a warmed
+        #   holder is the only thing that can report the mic's REAL rate; asking
+        #   a cold one yields None and the announced 16 kHz guess (which the
+        #   driver then corrects with one intentional reconnect);
+        # * `start()` spawns the session worker, and thread creation plus the
+        #   first blocking connect are exactly the setup-shaped work t27/t28
+        #   moved OFF the tick thread after measuring 425-1213 ms overruns
+        #   against a 20 ms budget. The worker does the connecting; `start()`
+        #   itself returns immediately and is idempotent.
+        #
+        # A gateway that is not up yet is NORMAL, not a fault: the client latches
+        # ONE `session-down` line and reconnects on its own bounded backoff. No
+        # second retry layer belongs here, and there is deliberately no local
+        # fallback endpointer (confirmed decision c17) — when the session is
+        # down, hearing is simply quiet.
+        realtime = _make_realtime_client(_mic_sample_rate(audio_tap))
+        realtime.start()
+        transcript_driver = TranscriptSenseDriver(
+            media=audio_tap,  # the shared per-tick chunk, never a second mic read
+            # The ONE hearing session. Injected, never constructed by the driver:
+            # this composition root owns its lifecycle (start above, close in
+            # `_RuntimeResources`), exactly as it owns the two held SDK clients.
+            realtime=realtime,
+            classifier=_engagement_classifier(),
+            # Self-mute: the mic and the speaker share a room, so without this the
+            # runtime transcribes its OWN voice, the transcript fires a rule, the
+            # rule speaks, and the robot talks to itself forever. The actuator
+            # publishes the window its clip occupies; this closes the loop.
+            mute_until=speech.mute_until,
+        )
 
         holder = LastPoseHolder()
         # The self-motion latch (#95): composed UNCONDITIONALLY (it reads only
@@ -1932,6 +2071,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             keeper=keeper,
             speech=speech,
             pump=pump,
+            realtime=realtime,
         )
     except BaseException:
         _RuntimeResources(
@@ -1941,6 +2081,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             keeper=keeper,
             speech=speech,
             pump=pump,
+            realtime=realtime,
         ).close()
         raise
     return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), resources

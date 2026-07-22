@@ -80,9 +80,15 @@ def _pop_tuning(kwargs: dict) -> TranscriptTuning:
 def _make_hook(**kwargs) -> TranscriptSenseDriver:
     """Build a driver suitable for driving ``_should_engage`` directly.
 
-    Injects a never-reading media client and a trivially-failing transcriber (we
-    never drive a full tick here — we only call ``_should_engage`` directly on
-    the constructed object, and it starts no worker thread).
+    Injects a never-reading media client and no session client at all (we never
+    drive a full tick here — we only call ``_should_engage`` directly on the
+    constructed object, and it starts no worker thread).
+
+    The two lines this helper lost when capture moved to server-side VAD were
+    both CAPTURE plumbing, never admission: an STT stub for the round-trip that
+    no longer happens in this module, and a ``min_utterance_s=0.0`` floor that
+    the server owns now. Every assertion in this file is untouched — the
+    heuristic under test takes only ``(text, t)``.
     """
 
     class _NullMedia:
@@ -91,18 +97,8 @@ def _make_hook(**kwargs) -> TranscriptSenseDriver:
         def audio(self):
             return None
 
-    class _NullTranscriber:
-        def transcribe_once(self, audio):  # noqa: ARG002
-            return None
-
-    kwargs.setdefault("min_utterance_s", 0.0)
     tuning = _pop_tuning(kwargs)
-    return TranscriptSenseDriver(
-        media=_NullMedia(),
-        transcriber=_NullTranscriber(),
-        tuning=tuning,
-        **kwargs,
-    )
+    return TranscriptSenseDriver(media=_NullMedia(), tuning=tuning, **kwargs)
 
 
 def _stamp_window(hook: TranscriptSenseDriver, last_accepted_t: float) -> None:
