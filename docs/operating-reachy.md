@@ -346,9 +346,13 @@ What "working" looks like:
   is no antenna response to clear sound at all, you are almost certainly hitting
   the [`~/.asoundrc` gotcha](#the-asoundrc-mic-array-gotcha) below — the SDK
   opened but found no live mic source.
-- Say *"Reachy, are you there?"* **close to the robot** and expect
-  `[SENSE stage=capture source=speech …] utterance end span=… clip=… contiguous`,
-  then a `greet-when-addressed` fire and an audible chirp.
+- Say *"Reachy, are you there?"* **close to the robot** — with the lobes
+  gateway's `/v1/realtime` route reachable, not just the daemon; see [Hearing
+  over the lobes realtime session](#hearing-over-the-lobes-realtime-session)
+  — and expect
+  `[SENSE stage=realtime source=speech event=…] speech stopped (server vad) reason=…`
+  followed by `[SENSE stage=transcript source=speech event=…] heard "…"`, then
+  a `greet-when-addressed` fire and an audible chirp.
 - `reachy-mini-cli <noun> status --json` (for `demo-mode` / `vision` / `sleep`,
   and `behavior engine status`) reports the background process + health.
 
@@ -416,12 +420,14 @@ vars override the built-in default.
 | `REACHY_SPEECH_TRANSPORT` | `http` | How the behavior runtime's voice reaches the speaker: `http` (upload + play via the daemon) or `sdk` (push PCM in-process). Falls back to `REACHY_TRANSPORT`; `http` is the default because the media-profile SDK client is currently unconstructable on the robot (issue #94) | `behavior/speech_act.py` |
 | `REACHY_HARMONIC_IDENTITY` | `reachy` | Harmonic voice identity signature (root pitch + instrument) | `speech/harmonic.py` |
 | `REACHY_HARMONIC_ARTICULATION` | `smooth` | Harmonic rendering style: `discrete` / `speechy` / `smooth` / `alien` | `speech/harmonic.py` |
-| `REACHY_OPENAI_URL_BASE` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `agent attach`'s cognition and the engagement classifier (legacy: `REACHY_LLM_BASE_URL`) | `speech/llm.py` |
+| `REACHY_OPENAI_URL_BASE` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `agent attach`'s cognition and the engagement classifier (legacy: `REACHY_LLM_BASE_URL`). **Also the runtime's HEARING endpoint fallback** since the realtime arc (issue #115): an `http(s)` value here is mapped to `ws(s)://…/v1/realtime` whenever `REACHY_REALTIME_URL` is unset. Pointing this at a chat-only gateway with no `/v1/realtime` route gets a refused handshake and a deaf robot — see [Hearing over the lobes realtime session](#hearing-over-the-lobes-realtime-session) | `speech/llm.py`, `speech/realtime.py` |
 | `REACHY_OPENAI_MODEL_ID` | `default` | LLM model id for that cognition — must be a model the endpoint serves (legacy: `REACHY_LLM_MODEL`) | `speech/llm.py` |
-| `REACHY_OPENAI_API_KEY` | (unset) | Bearer key for the LLM endpoint, only sent when present (legacy: `REACHY_LLM_API_KEY`) | `speech/llm.py` |
+| `REACHY_OPENAI_API_KEY` | (unset) | Bearer key for the LLM endpoint, only sent when present (legacy: `REACHY_LLM_API_KEY`). Also the hearing session's Bearer fallback — see `REACHY_REALTIME_API_KEY` below | `speech/llm.py`, `speech/realtime.py` |
 | `REACHY_OPENAI_EMBED_MODEL_ID` | `Qwen/Qwen3-Embedding-0.6B` | Embedding model id the behavior stash uses for semantic search | `stash/embeddings.py` |
+| `REACHY_REALTIME_URL` | (unset — derives from `REACHY_OPENAI_URL_BASE`) | Split-deployment override for the hearing session's endpoint: a `ws(s)://` URL is taken verbatim, an `http(s)://` value is mapped onto `/v1/realtime`. Wins over `REACHY_OPENAI_URL_BASE` whenever it is SET (even to a value that turns out unusable) | `speech/realtime.py` |
+| `REACHY_REALTIME_API_KEY` | (unset — falls back to `REACHY_OPENAI_API_KEY`) | Split-deployment override for the hearing session's Bearer key. **Trap:** precedence is by PRESENCE, not truthiness — setting this to `""` means "this gateway needs no auth" and does **not** fall through to `REACHY_OPENAI_API_KEY`; only *leaving it unset* falls through | `speech/realtime.py` |
 | `REACHY_ENGAGE_HEURISTIC` | (unset) | Truthy (`1`/`true`/`yes`/`on`) forces the pure-`difflib` engagement heuristic: **no LLM classifier is built at all**, giving a provably zero-LLM presence | `behavior/transcript_sense.py`, `cli/_commands/behavior.py` |
-| `REACHY_STT_URL` | `http://localhost:9002` | OpenAI-compatible STT (Parakeet) — the runtime's hearing and `sleep`'s wake-word | `speech/stt.py`, `sleep/wakeword.py` |
+| `REACHY_STT_URL` | `http://localhost:9002` | OpenAI-compatible STT (Parakeet) — **`sleep`'s wake-word backend only.** Since the realtime arc (issue #115) this no longer affects the runtime's hearing at all; tuning it for `behavior engine run` is a dead knob | `speech/stt.py`, `sleep/wakeword.py` |
 | `REACHY_STT_PHRASE` | `hey reachy` | Wake phrase matched against the STT transcript | `sleep/wakeword.py` |
 | `REACHY_STT_LANGUAGE` | `en` | STT language hint | `speech/stt.py`, `sleep/wakeword.py` |
 | `REACHY_STT_TIMEOUT` | `2.0` (seconds) | Per-request STT socket timeout (kept short so a transcription never stalls a loop) | `speech/stt.py`, `sleep/wakeword.py` |
@@ -735,8 +741,11 @@ noun.
 > **Where this lives now.** This pipeline was originally built inside the
 > folded `listen run --live` loop. That composition root and the `listen` noun
 > are both gone; the sense engines were ported onto the symbolic runtime's
-> 50 Hz tick — the pre-roll hearing into `reachy/behavior/transcript_sense.py`,
-> faces into `reachy/behavior/face_sense.py` — and the `[SENSE]` log grammar is
+> 50 Hz tick — hearing into `reachy/behavior/transcript_sense.py` (its capture
+> half has since moved again, to the lobes `/v1/realtime` session — see
+> [Hearing over the lobes realtime
+> session](#hearing-over-the-lobes-realtime-session)), faces into
+> `reachy/behavior/face_sense.py` — and the `[SENSE]` log grammar is
 > unchanged. Two donors did **not** survive the move: the periodic VLM scene
 > description (`SceneHook`) and the motion/light → cognition cue feed
 > (`VisionHook`'s `feed_vision` call). The pixel `vision` noun itself is
@@ -757,48 +766,158 @@ The camera path itself needed a separate repair before any of the vision/face/
 scene work could ship — see [the camera-path repair](#the-camera-path-repair-sdk--19)
 below.
 
-### Hearing the whole sentence: pre-roll capture
+> **Speech capture has moved again since the table above.** The pre-roll ring
+> described there was itself retired by the realtime arc (issue #115):
+> utterance endpointing is no longer decided on the robot at all. See [Hearing
+> over the lobes realtime session](#hearing-over-the-lobes-realtime-session)
+> immediately below for the current design, and [Hearing — server-side VAD
+> replaces local
+> endpointing](#hearing--server-side-vad-replaces-local-endpointing) later in
+> this guide for the before/after evidence.
 
-`TranscriptSenseDriver` (`reachy/behavior/transcript_sense.py`) keeps a rolling
-ring buffer of the raw mic chunks — fed on **every** non-self-muted tick,
-*before* the speech gate — so the words spoken while the speech detector is
-still catching up are not lost:
+### Hearing over the lobes realtime session
 
-1. Every tick's chunk is pushed onto a ~10 s ring (trimmed by total samples,
-   one cheap append per tick — no per-tick concatenation). While an utterance
-   is open the ring retains at least the open clip, so a long sentence is never
-   trimmed out from under itself.
-2. On the speech gate's **rising edge**, the onset is *measured*, not assumed: a
-   scan of the buffered audio in 10 ms RMS windows finds the first window whose
-   energy clears the threshold — `max(speech_rms, speech_ratio × background)`,
-   i.e. an absolute floor of `0.02` (float PCM) or **3x** the room's own rolling
-   background, whichever is higher.
-3. The utterance is seeded starting at `onset − pre_roll` (default **2.0 s**,
-   clamped to the ring's start), so the leading words the lagging gate missed
-   are still in the clip.
-4. The whole utterance transcribes in **one** POST on a pause
-   (`silence_hold_s`, 0.7 s) or at `max_utterance_s` (15 s), as one contiguous
-   slice — see [one contiguous clip per
-   utterance](#hearing--one-contiguous-clip-per-utterance), which is the rule
-   that makes the difference between hearing a sentence and hearing `"Return."`.
-   The ring is **not** wiped on emit (that would destroy the next utterance's
-   pre-roll); only self-mute clears it, so the robot still cannot pre-roll its
-   own voice.
+`TranscriptSenseDriver` (`reachy/behavior/transcript_sense.py`) no longer
+decides *when* an utterance starts or stops. It streams **every** mic chunk —
+in order, exactly once, whether or not anyone is speaking — to ONE long-lived
+WebSocket session against the lobes `/v1/realtime` route
+(`reachy/speech/realtime.py`'s `RealtimeTranscriber`), and the *server's*
+`server_vad` (Silero) decides where a sentence begins and ends:
 
-This is a direct port of `reachy_nova`'s `SpeechEventDetector` design. Every
-knob is a field of `TranscriptTuning` (`ring_seconds=10.0`, `pre_roll_s=2.0`,
-`onset_window_s=0.01`, `min_utterance_s=0.3`, `min_words=3`,
-`engage_window_s=20.0`) — there is no CLI flag for any of them; tune them in
-code if a deployment needs different values. The self-mute window is checked
-first, so the robot never pre-rolls or transcribes its own voice.
+```text
+tick: chunk = media.audio()            -> realtime.submit_audio(chunk)
+tick: utterance = realtime.take_utterance()   (or None)
+```
 
-> **Known limitation, stated honestly.** A normal speaking voice from **across
-> the room** may not clear the capture gate at all, so no utterance opens and
-> there is nothing in the journal but silence. Close range is verified working
-> end to end. The agreed fix is server-side voice-activity detection, not
-> lowering the threshold — a lower threshold reopens the night-time
-> "recording its own hiss" failure below without making a distant voice any
-> more separable from the room.
+Each chunk goes out as an OpenAI-shaped JSON **TEXT** frame —
+`{"type": "input_audio_buffer.append", "audio": "<base64 PCM16 mono LE>"}` —
+never a binary frame (hand-rolled RFC 6455 in `reachy/speech/realtime_wire.py`,
+cited from lobes-cli's `scripts/realtime-smoke.py`; no new dependency —
+`pyproject.toml` stays `numpy` + `harmonics-cli` only). The session consumes
+`session.created`, `input_audio_buffer.speech_started` /
+`...speech_stopped`, `conversation.item.input_audio_transcription.completed`,
+and named `error` events (`vad_unavailable`, `stt_forward_failed`); it never
+sends `response.create` and ignores any `response.*` event that arrives —
+this wire is a **microphone, not a conversation** (the runtime's voice stays
+`reachy/behavior/speech_act.py`).
+
+**Endpointing tuning moved off the box.** The whole local-tuning family this
+section used to describe — `speech_rms`, `speech_ratio`, `silence_hold_s`,
+`min_utterance_s`, `ring_seconds`, `pre_roll_s`, `onset_window_s` — is **gone,
+not defaulted**. `TranscriptTuning` today carries only the two knobs the
+*engagement* gate needs (`min_words`, `engage_window_s`; see [the engagement
+gate](#senses-one-sdk-media-owner-at-a-time) below) — there is nothing left
+to tune about *when an utterance opens*. A box that wants different sentence
+boundaries tunes the **server's** `turn_detection` config; there is no local
+knob for it any more.
+
+**Configuration** — the endpoint and auth derive from what the box already
+exports, by presence, not by truthiness:
+
+```text
+url      explicit arg  >  REACHY_REALTIME_URL  >  REACHY_OPENAI_URL_BASE
+                                                   (http(s) mapped to ws(s) + /v1/realtime)
+                                               >  ws://localhost:8001/v1/realtime
+api key  explicit arg  >  REACHY_REALTIME_API_KEY  >  REACHY_OPENAI_API_KEY
+```
+
+> **The trap.** A set-but-**empty** `REACHY_REALTIME_API_KEY` means "this
+> gateway needs no auth" and does **not** fall through to
+> `REACHY_OPENAI_API_KEY` — only *leaving it unset* falls through. The same
+> rule holds for the URL pair. This mirrors `reachy/speech/llm.py`'s own
+> precedence for the same reason: an explicitly-set empty value is a decision,
+> not an accident.
+>
+> **`REACHY_OPENAI_URL_BASE` is now a hearing endpoint too.** Before this arc
+> it was read only for `agent attach`'s cognition and the engagement
+> classifier; the realtime client falls back to it whenever
+> `REACHY_REALTIME_URL` is unset. An operator who points it at a chat-only
+> gateway with no `/v1/realtime` route gets a refused handshake and a deaf
+> robot — a plausible-looking config that silently breaks hearing while
+> cognition keeps working.
+>
+> **`REACHY_STT_URL` no longer does anything here.** It used to be the
+> runtime's STT endpoint; since this arc it is read only by `sleep`'s
+> wake-word backend (`reachy/sleep/wakeword.py`). Tuning it for
+> `behavior engine run` is a dead knob.
+
+**The mic-rate line at boot.** The session's `input_sample_rate` query param
+carries the mic's REAL rate — a hard-coded guess would mis-time every
+server-side VAD decision on a mic that is not actually 16 kHz. Composition
+reports which rate it used:
+
+```text
+[SENSE stage=warmup source=realtime event=setup] mic rate 16000 Hz
+[SENSE stage=warmup source=realtime event=setup] dropped reason=mic-rate-unknown; session assumes 16000 Hz until the first read
+```
+
+The second line is **normal**, not a fault, when the daemon is not up yet at
+composition time (a cold media holder reports no rate rather than blocking
+setup to find out). The session starts at the announced 16 kHz guess and
+self-corrects the moment the first real mic chunk is read, via one silent,
+intentional reconnect (`RealtimeTranscriber.set_sample_rate`) — no
+session-down drop, because nothing failed.
+
+**Failure modes and their journal signature.** Every session fault resolves
+to a NAMED, LATCHED drop on `stage=realtime source=speech` — the cause, then
+the latched state, exactly once per episode (the #99 journal-flood
+discipline: audio arrives 50×/s, so a line per chunk would flood the log):
+
+```text
+[SENSE stage=realtime source=speech event=sess1] dropped reason=handshake-refused (HTTP 401)
+[SENSE stage=realtime source=speech event=sess1] dropped reason=session-down
+[SENSE stage=realtime source=speech event=sess2] session up url=ws://localhost:8001/v1/realtime?input_sample_rate=16000 (recovered)
+```
+
+`handshake-refused (HTTP …)`, `connect-failed (…)` and `stream-closed (…)`
+are the three causes; recovery is always exactly ONE `session up url=…` line.
+**Read the latch correctly: "no more `session-down` lines" does NOT mean the
+session recovered** — every further failed attempt *while already down* is
+silent by design, so an operator has to grep for the *recovery* line, not the
+absence of the drop, to know hearing is back:
+
+```bash
+# hearing session lifecycle: connects, drops, recoveries
+journalctl --user -u reachy-runtime.service -f | grep 'stage=realtime'
+
+# has it EVER recovered since the last drop? (absence of this ≠ still down)
+journalctl --user -u reachy-runtime.service --since "10 min ago" | grep 'session up url='
+
+# the mic rate the session negotiated at boot
+journalctl --user -u reachy-runtime.service -b | grep 'stage=warmup source=realtime'
+
+# every utterance the server endpointed, before the engagement gate judges it
+journalctl --user -u reachy-runtime.service -f | grep 'stage=capture source=speech'
+```
+
+**No fallback, by deliberate operator decision.** When the session is down —
+the gateway is not up yet, mid-run disconnect, an un-adapted client against a
+post-cutover fleet — the runtime hears **nothing** at all. There is no local
+endpointer standing by to take over; that path was removed, not kept as a
+degrade target (spec claim c17). The client reconnects on its own bounded
+exponential backoff in the background, so recovery needs no restart, but
+between the drop and the recovery there is a real silent window, not a
+degraded one.
+
+**Two dependencies, not one.** Hearing now needs BOTH the daemon (mic audio
+still arrives through the one held `HeldMediaClient`, unchanged) AND the
+lobes gateway answering `/v1/realtime`. The boot unit
+(`reachy-runtime.service`) `Requires=`/`After=` the daemon unit but does
+**not** order against the gateway — a gateway that comes up later (or never)
+is exactly the "normal, not a fault" case above, not a boot failure.
+
+> **Deployment trip hazard.** `reachy-runtime.service`'s generated unit gets
+> **no new `Environment=` directive** for the realtime endpoint. A
+> boot-persistent robot that needs a non-default gateway must add
+> `REACHY_REALTIME_URL` (or `REACHY_OPENAI_URL_BASE`) — and, if the gateway is
+> not the default `localhost:8001`, `REACHY_REALTIME_API_KEY` /
+> `REACHY_OPENAI_API_KEY` — via a systemd `environment.d` drop-in, the SAME
+> mechanism already used for the LLM pair (`~/.config/environment.d/10-reachy-llm.conf`;
+> see [Agent model choice](#agent-model-choice--cortex-or-muse) for the shape
+> of that file and how a `loginctl` re-login or reboot picks it up). This is
+> the single most likely thing to bite a deployment: the box runs, breathes,
+> feels pats and speaks — and simply never hears anything, with the only clue
+> a `session-down` line naming a refused or unreachable connection.
 
 ### The `[SENSE]` log grammar — and how to grep it
 
@@ -814,7 +933,7 @@ parseable line on a dedicated `reachy.sense` logger (`reachy/senselog.py`):
 For example:
 
 ```text
-[SENSE stage=capture source=speech event=3f2a9c1e] utterance start pre_roll=1.83s buffered=160000
+[SENSE stage=capture source=speech event=3f2a9c1e] utterance chars=23 (server vad)
 [SENSE stage=cue source=vision event=9b1e2a04] motion on the right
 [SENSE stage=turn source=agent event=7c4410aa] cue_count=2
 [SENSE stage=action source=speak event=1a90ffcc] tool call dispatched
@@ -824,9 +943,11 @@ For example:
 
 A **dropped** event uses the same shape via `senselog.drop(...)` and always
 names the reason — it is never a silent no-op. Reasons seen in this codebase
-today include `self-mute`, `min-utterance`, `cooldown` (face re-announce),
-`vlm-unreachable` (scene), `audio-muted` (a muted TTS/harmonic tool call), and
-`tool-error`, plus a forge validator's own joined rejection reasons.
+today include `self-mute`, `session-down` (the hearing session — see [Hearing
+over the lobes realtime session](#hearing-over-the-lobes-realtime-session)),
+`cooldown` (face re-announce), `vlm-unreachable` (scene), `audio-muted` (a
+muted TTS/harmonic tool call), and `tool-error`, plus a forge validator's own
+joined rejection reasons.
 
 **Turning the logging on** is a separate fix in its own right: before this
 pass, nothing in the codebase ever called `logging.basicConfig` or attached a
@@ -1168,18 +1289,18 @@ Three things worth knowing about that set:
   # [SENSE stage=orient source=doa event=tier2] promoted reason=sustained ratio=8.1x sustained=1.52s loud_at=15.0x
   ```
 
-- **Hearing uses the same estimate, with a looser threshold.** Utterance
-  capture starts at **3x** the rolling background rather than 5x: a missed
-  utterance is gone forever, while a wasted capture costs one STT request that
-  comes back empty — so hearing should start on less evidence than turning.
-  The shipped absolute `0.02` survives as a *floor* under that ratio, so a
-  quiet room's capture behaviour is exactly what it always was. Before this, a
-  night-time robot held the capture gate permanently open and filled its
-  journal with `utterance start` → `dropped reason=stt-empty`: it was recording
-  its own hiss and posting it to the STT. The threshold decides **when the
-  robot starts listening**, and nothing else — it never decides which audio is
-  worth keeping (see [one contiguous clip per
-  utterance](#hearing--one-contiguous-clip-per-utterance) below).
+- **Hearing no longer has a local capture threshold of its own.** This bullet
+  used to describe a separate, looser RMS ratio (3x the rolling background,
+  against `look-toward-sound`'s 5x) that decided when an utterance started.
+  That threshold is **retired**, not lowered further: the realtime arc
+  (issue #115) moved utterance endpointing to the lobes gateway's own
+  `server_vad`, so the robot streams mic audio continuously and the *server*
+  decides when a sentence starts and stops — see [Hearing over the lobes
+  realtime session](#hearing-over-the-lobes-realtime-session) and [Hearing —
+  server-side VAD replaces local
+  endpointing](#hearing--server-side-vad-replaces-local-endpointing). The
+  `rms_ratio` thresholds above (5x / 15x) are for `orient-to-sound` alone; they
+  have no hearing-side counterpart to compare against any more.
 - **`look-toward-sound` admits far more often than the robot actually moves.**
   With no credible bearing `orient-to-sound` abstains, so `feel-alive` keeps
   breathing through it and the head stays put. Admission is cheap; turning is
@@ -1328,24 +1449,18 @@ fire/suppress line — is visible on stderr by default.
 > `face` needs the `[vision]` extra; without it the field stays permanently
 > quiet rather than crashing the loop.
 
-### Hearing — one contiguous clip per utterance
+### Hearing — server-side VAD replaces local endpointing
 
-For a long time the robot could not hear a spoken sentence. It heard
-`"Yeah."` and `"Okay."` perfectly, and turned `"Reachy, are you there?"` into
-`"Ready, she"` — or into nothing at all, `dropped reason=stt-empty`. The STT
-service was fine (the same phrase, recorded and POSTed by hand, transcribed
-perfectly), the engagement gate was fine, and the shipped rule was fine.
+The robot's hearing carries two fixed defects in its history, and the second
+one changed *where* endpointing happens at all — worth reading in order,
+because the fix that landed is not "retune the threshold again."
 
-The fault was in what the runtime sent. It built each utterance out of **only
-the mic chunks that individually cleared the capture threshold**; a quieter
-chunk was buffered and then thrown away. So the WAV that reached the STT was
-the pre-roll followed by the loud frames butt-spliced together, with every
-unvoiced consonant, stop closure and inter-word gap *inside the sentence* cut
-out. That is also why short interjections survived: under the splice,
-everything became a short interjection.
-
-Measured against the real Parakeet with one phrase mixed to realistic mic
-levels:
+**Round one (issue #108): the capture threshold was filtering content, not
+just locating it.** The runtime used to build each utterance out of only the
+mic chunks that individually cleared an RMS threshold; a quieter chunk was
+buffered and then thrown away. So the clip that reached STT was the loud
+frames butt-spliced together, with every unvoiced consonant, stop closure and
+inter-word gap *inside the sentence* cut out:
 
 | what was sent | frames kept | transcript |
 |---|---|---|
@@ -1354,38 +1469,69 @@ levels:
 | spliced, room background 0.034 | 27 % | `Return.` |
 | spliced, normal voice across the room | 12 % | `Yeah.` |
 
-So the rule now is: **the capture threshold starts and ends an utterance; it
-never filters its contents.** The runtime keeps a rolling ring of everything
-the microphone produced and submits one unbroken slice of it — from the
-measured onset minus the pre-roll, through everything captured since. Three
-things follow that are worth knowing as an operator:
+The fix at the time: stop filtering, and submit one unbroken slice from a
+measured onset through everything captured since — a threshold may say *when*
+to start listening, never *which audio is worth keeping*.
 
-- **The relative capture threshold is not the problem and was not reverted.**
-  With a contiguous clip, a background-relative threshold only decides when to
-  start listening, which is what it is for. Do not lower it to "hear more of
-  the sentence" — the sentence is already all there.
-- **The ring survives an emit.** It used to be wiped every time an utterance
-  was submitted, which destroyed the pre-roll for whatever was said next (the
-  journal showed `pre_roll=0.02s buffered=512` on back-to-back utterances).
-  Now only self-mute clears it, so the robot still cannot pre-roll its own
-  voice, and two consecutive sentences leave no gap between them.
-- **An utterance's length is its span, not its loud-sample count.** A sentence
-  that spends more time between its words than inside them is still a
-  sentence; the `min_utterance_s` floor no longer discards one as a blip.
+**Round two (issue #111): the fixed threshold was still too high to open at
+all.** With the splice gone, the *relative* start threshold `#102` had chosen
+— `speech_ratio = 3.0 × the rolling background` — was re-measured end to end
+against the live Parakeet and turned out to sit **above a normal voice from
+across the room**:
 
-Confirming it on a real robot is a grep — every submitted utterance now says
-how long it was and how long the clip is:
+| scenario | speaker RMS | background | start threshold | result |
+|---|---|---|---|---|
+| at the robot | — | 0.020 | 0.060 | `'Ricci, are you there?'` heard |
+| at the robot | — | 0.034 | 0.102 | `'Ricci, are you there?'` heard |
+| normal voice, across the room | 0.05 | 0.034 | **0.102** | **no utterance at all** — 2 of 92 chunks cleared the gate, span below the minimum floor |
 
-```bash
-journalctl --user -u reachy-runtime -f | grep 'stage=capture'
-# [SENSE stage=capture source=speech event=3f2a9c1e] utterance start pre_roll=1.83s buffered=160000
-# [SENSE stage=capture source=speech event=3f2a9c1e] utterance end span=1.42s clip=3.31s contiguous
-```
+From the operator's side, a threshold that never opens is indistinguishable
+from a deaf robot: there is nothing in the journal but silence, because
+nothing was ever submitted.
 
-`clip` should be roughly `span` plus the pre-roll and the closing pause. A
-`clip` much *shorter* than `span` would mean audio is being dropped inside the
-utterance again — that is the defect's signature, and it is now visible from
-the journal instead of only from a bad transcript.
+**The fix this time is not a third threshold value — it is removing the
+decision from the robot.** Issue #111's own options list named the eventual
+answer directly: *"defer to server-side VAD when lobes#149 lands, and stop
+making this decision locally at all."* That shipped alongside a second,
+independently forcing event: lobes#151 migrated the `/v1/realtime` audio-in
+wire from raw binary frames to OpenAI-shaped base64 `input_audio_buffer.append`
+JSON events, and the operator accepted this as a **strict, coordinated
+cutover — "no dual-format grace window on the server, by decision"**
+(issue #115). An un-adapted client cannot stream to a post-cutover fleet at
+all, so the wire break and the deafness defect were fixed by the same piece of
+work: the client now streams continuously and lets the gateway's own
+`server_vad` decide sentence boundaries, which structurally removes the local
+threshold that #111 measured as too high — see [Hearing over the lobes
+realtime session](#hearing-over-the-lobes-realtime-session) above for exactly
+how.
+
+**What the #149 comparison actually shows.** The five-word question that a
+client-side threshold once shattered into `"Ready, she"` was re-run against
+the new wire and round-tripped as ONE whole utterance server-side —
+transcribed as `"Ricci, are you there?"` (the `"Ricci"` vs `"Reachy"` gap is
+Parakeet mishearing a proper noun in synthesized audio, an ASR vocabulary
+miss, not an endpointing failure — a materially different problem from the
+one this arc fixes).
+
+> **What is actually evidenced here, stated precisely (the #108 evidence
+> rule).** The 7/7-passing runs above (`lobes-cli`
+> `docs/evidence/2026-07-21-accept-realtime-spark.txt`, at reachy's native
+> 16 kHz mic rate, and `2026-07-22-accept-realtime-voice-to-voice-spark.txt`'s
+> ears-only section, 7/7 on the NEW base64 wire) validate the **lobes gateway
+> and its own smoke script** — the server's 101-upgrade, its `server_vad`
+> segmentation by the real Silero model, and the full event sequence over one
+> connection. They do **not** exercise `reachy-mini-cli`'s own
+> `RealtimeTranscriber` client, and every run used synthesized Chatterbox
+> audio, never a real microphone. This repo's client is proven today only by
+> its own offline tests against a scripted fake server
+> (`tests/fake_realtime_server.py`, `tests/test_realtime_client.py`,
+> `tests/test_behavior_realtime_composition.py`) and the composition tests.
+> The live, on-robot, spoken-across-the-room acceptance run — issue #115's own
+> acceptance criteria — has **not happened**: it is blocked on issue #94 (the
+> daemon's media/`webrtcsink` signalling path), tracked in issue #116, and it
+> will land as a dated, versioned transcript under `docs/verification/`
+> before this surface is described as validated anywhere in this repo. See
+> [Status & follow-ups](#status--follow-ups) for the current honest state.
 
 ### The pat sense
 
@@ -2185,17 +2331,22 @@ one arbitrated motion channel. This is the loop the
 to park the robot. None of them is a way to run everything at once — and `pat`
 and `sleep` refuse outright to start beside a live engine. See
 [Event-based senses pipeline](#event-based-senses-pipeline) above for the
-pre-roll hearing, the `[SENSE]` log grammar, and the `forge`
+realtime hearing session, the `[SENSE]` log grammar, and the `forge`
 self-extension loop.
 
-The runtime *hears the words*: nearby speech is transcribed via the external STT
-service (model-gear / Parakeet at `REACHY_STT_URL`, default `localhost:9002`) and
-latched onto the tick's `transcript` sense field, so a rule reacts to *what* was
-said rather than only that a sound arrived from a direction. A self-mute window
-after each spoken clip stops the robot transcribing its own voice, and an
-unreachable STT degrades to "no words" without stalling the loop. It is *not* a
-dialogue/turn-taking assistant and *not* the wake-word path — words are one more
-perception, and STT stays external (no on-box model bundled).
+The runtime *hears the words*: mic audio streams continuously to the lobes
+`/v1/realtime` WebSocket session (`REACHY_REALTIME_URL` /
+`REACHY_OPENAI_URL_BASE`; see [Hearing over the lobes realtime
+session](#hearing-over-the-lobes-realtime-session)), whose server-side VAD
+decides where each utterance starts and stops and returns the transcript,
+latched onto the tick's `transcript` sense field so a rule reacts to *what*
+was said rather than only that a sound arrived from a direction. A self-mute
+window around each spoken clip stops the robot transcribing its own voice, and
+a down session degrades to "no words" without stalling the loop — with no
+local fallback endpointer standing by. It is *not* a dialogue/turn-taking
+assistant and *not* the wake-word path — words are one more perception, and
+`REACHY_STT_URL` (the wake-word backend's own endpoint) has no bearing on this
+noun at all.
 
 The engagement gate that decides which utterances reach the `transcript` sense
 field is **layered, cheapest-first**:
@@ -2383,12 +2534,22 @@ intentional — the contract is the API, the renderer is a swappable client.
 
 ## Status & follow-ups
 
-This guide is verified against the code as of this writing, and the presence
-runtime has been verified on the deployed robot: it breathes, feels a pat and
-reacts, leans its antennas toward sound, hears an addressed sentence spoken
-close by and answers it audibly. The one part of the bring-up still confirmed
-only by hand is the daemon's `~/.asoundrc` behaviour and its exact log strings,
+This guide is verified against the code as of this writing. Before the
+realtime hearing migration, the presence runtime was verified live on the
+deployed robot: it breathes, feels a pat and reacts, leans its antennas
+toward sound, and speaks. The one part of the bring-up still confirmed only
+by hand is the daemon's `~/.asoundrc` behaviour and its exact log strings,
 because those live in the daemon binary rather than in this repo.
+
+> **Hearing specifically has NOT been re-verified live since moving to the
+> lobes `/v1/realtime` session.** The client's own offline tests pass, and the
+> lobes gateway's server-side VAD + wire behavior is independently evidenced
+> from the lobes side — but the on-robot, spoken-across-the-room acceptance
+> run is tracked, not yet run (blocked on issue #94, tracked in #116). See
+> [Hearing — server-side VAD replaces local
+> endpointing](#hearing--server-side-vad-replaces-local-endpointing) for
+> exactly what is and is not evidenced today before you rely on this noun, or
+> tell someone else it "just works."
 
 What is honestly **not** delivered, so you do not go looking for it:
 
@@ -2396,9 +2557,14 @@ What is honestly **not** delivered, so you do not go looking for it:
   antenna lean; the turn path is implemented and reachable by configuration
   but never promoted in practice. Vision-corroborated turning is the successor
   — see [Orienting](#orienting--orient-to-sound-turns-toward-what-it-hears).
-- **A voice from across the room may not open an utterance at all.** Close
-  range is verified; the fix is server-side VAD, not threshold tuning — see
-  [hearing](#hearing-the-whole-sentence-pre-roll-capture).
+- **Whether a voice from across the room now opens an utterance is
+  unverified live, not confirmed.** Local endpointing — the thing that made
+  this fail before — has been removed structurally (issue #111/#115); that
+  is a design claim backed by the lobes gateway's own evidence, not yet by a
+  live run of this repo's client. See [Hearing — server-side VAD replaces
+  local
+  endpointing](#hearing--server-side-vad-replaces-local-endpointing) for the
+  precise boundary between what is evidenced and what is expected.
 - **Scene description and vision→cognition cues have no runtime composition.**
   Both engines are in the tree; nothing wires them today — see [Vision, faces
   and scene](#vision-faces-and-scene-become-events).
