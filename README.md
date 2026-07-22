@@ -133,17 +133,21 @@ snapshot — and `REACHY_ENGAGE_HEURISTIC=1` removes it entirely, giving a box a
 provably zero-LLM presence. See
 [the zero-token rationale](docs/operating-reachy.md#the-zero-token-rationale).
 
-Nearby speech is transcribed via the external STT service (model-gear /
-Parakeet at `REACHY_STT_URL`, default `localhost:9002`) and reaches the rules
-as a `transcript` sense field, so a rule can react to *what* was said — not
-just that a sound came from the left. A self-mute window means the robot never
-transcribes its own voice, and an unreachable STT degrades to "no words" rather
-than stalling the loop. It is **not** a chat/turn-taking assistant — words are
-one more perception. Two honest boundaries: the shipped reaction to bare
-**sound** is an antenna lean only — the head does not turn (the turn path is
-implemented and reachable by configuration, just not defaulted on) — and a
-normal speaking voice from across the room may not open an utterance at all
-(close range is verified; the fix is server-side VAD, not threshold tuning).
+Mic audio streams continuously to the lobes `/v1/realtime` WebSocket session
+(`REACHY_REALTIME_URL` / `REACHY_OPENAI_URL_BASE`), whose server-side VAD
+decides where each utterance starts and stops; the resulting transcript
+reaches the rules as a `transcript` sense field, so a rule can react to *what*
+was said — not just that a sound came from the left. A self-mute window means the robot never
+transcribes its own voice, and a down session degrades to "no words" rather
+than stalling the loop — there is no local fallback endpointer. It is **not**
+a chat/turn-taking assistant — words are one more perception. One honest
+boundary: the shipped reaction to bare **sound** is an antenna lean only — the
+head does not turn (the turn path is implemented and reachable by
+configuration, just not defaulted on). See [Hearing over the lobes realtime
+session](docs/operating-reachy.md#hearing-over-the-lobes-realtime-session) for
+the design and [Hearing — server-side VAD replaces local
+endpointing](docs/operating-reachy.md#hearing--server-side-vad-replaces-local-endpointing)
+for what is and is not evidenced live today.
 
 ```bash
 reachy-mini-cli behavior engine run                            # the deterministic presence
