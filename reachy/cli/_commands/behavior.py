@@ -1308,7 +1308,7 @@ def _mic_sample_rate(source) -> int:
         _WARM_STAGE,
         _REALTIME_LABEL,
         "setup",
-        f"mic-rate-unknown; session assumes {DEFAULT_MIC_SAMPLE_RATE} Hz until the first read",
+        f"mic-rate-unknown (session assumes {DEFAULT_MIC_SAMPLE_RATE} Hz until the first read)",
     )
     return DEFAULT_MIC_SAMPLE_RATE
 

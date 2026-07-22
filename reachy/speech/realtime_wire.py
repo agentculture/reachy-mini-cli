@@ -181,7 +181,7 @@ def build_frame(opcode: int, payload: bytes = b"", *, mask: bool = True) -> byte
     65535 bytes), or a 64-bit extended length (marker 127, anything larger).
     """
     header = bytearray()
-    header.append(0x80 | (opcode & 0x0F))  # FIN=1, RSV=0
+    header.append(0x80 | (opcode & 0x0F))  # FIN bit set, reserved bits clear
     length = len(payload)
     mask_bit = 0x80 if mask else 0x00
     if length < 126:

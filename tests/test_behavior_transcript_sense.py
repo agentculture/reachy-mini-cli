@@ -986,9 +986,10 @@ def test_the_retired_background_seam_is_gone_from_the_signature() -> None:
     import inspect
 
     assert "background" not in inspect.signature(TranscriptSenseDriver).parameters
+    media, realtime = _Media(), _Realtime()
     with pytest.raises(TypeError):
         TranscriptSenseDriver(  # type: ignore[call-arg]
-            media=_Media(), realtime=_Realtime(), background=lambda: 0.034
+            media=media, realtime=realtime, background=lambda: 0.034
         )
 
 
@@ -1051,8 +1052,16 @@ def test_the_transcript_rule_schema_is_untouched_by_the_realtime_arc() -> None:
         assert _load(when).react[0].when.field == "transcript"
 
     assert "transcript" in CORROBORATING_SENSE_FIELDS
-    assert {"is_true", "is_false", "absent_for", "eq", "ne", "lt", "gt", "le", "ge"} == set(
-        COMPARATORS
-    ), "the comparator set moved — the realtime arc must not touch the rule schema"
+    assert set(COMPARATORS) == {
+        "is_true",
+        "is_false",
+        "absent_for",
+        "eq",
+        "ne",
+        "lt",
+        "gt",
+        "le",
+        "ge",
+    }, "the comparator set moved — the realtime arc must not touch the rule schema"
     # The documented gap, pinned so it cannot change unnoticed in either direction.
     assert _load({"field": "transcript", "op": "eq", "value": "hi"}).react[0].when.op == "eq"

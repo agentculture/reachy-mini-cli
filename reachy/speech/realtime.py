@@ -178,6 +178,13 @@ REALTIME_API_KEY_ENV = "REACHY_REALTIME_API_KEY"
 OPENAI_URL_BASE_ENV = "REACHY_OPENAI_URL_BASE"
 OPENAI_API_KEY_ENV = "REACHY_OPENAI_API_KEY"
 
+#: Repo-wide "no key" sentinel — the placeholder local OpenAI-compatible servers
+#: use for an unauthenticated endpoint. Matches ``reachy.forge.client``'s
+#: ``_NO_KEY_SENTINEL`` and the same guard in ``speech/llm.py``, ``speech/tts.py``
+#: and ``stash/embeddings.py``, so a shared ``REACHY_OPENAI_API_KEY=EMPTY`` never
+#: becomes a literal ``Authorization: Bearer EMPTY`` header.
+NO_KEY_SENTINEL = "EMPTY"
+
 #: The lobes gateway on the same box (cortex/senses/realtime all share :8001).
 DEFAULT_GATEWAY_URL = "http://localhost:8001"
 
@@ -302,6 +309,11 @@ def resolve_realtime_base_url(url: str | None = None) -> str:
     )
 
 
+def _key_or_none(value: str) -> str | None:
+    """``None`` for an empty key or the ``EMPTY`` sentinel, else the key itself."""
+    return None if value == NO_KEY_SENTINEL else (value or None)
+
+
 def resolve_realtime_api_key(api_key: str | None = None) -> str | None:
     """The bearer key: explicit > ``REACHY_REALTIME_API_KEY`` > ``REACHY_OPENAI_API_KEY``.
 
@@ -310,13 +322,22 @@ def resolve_realtime_api_key(api_key: str | None = None) -> str | None:
     sending the gateway key. Returns ``None`` when no key applies, in which
     case no ``Authorization`` header is sent at all — matching the gateway's
     documented unauthenticated default.
+
+    The literal :data:`NO_KEY_SENTINEL` (``"EMPTY"``) counts as no key, exactly
+    as in :mod:`reachy.speech.llm`, :mod:`reachy.speech.tts`,
+    :mod:`reachy.stash.embeddings` and :mod:`reachy.forge.client`. Local
+    OpenAI-compatible servers conventionally take ``EMPTY`` as the placeholder
+    for "unauthenticated", so honouring it here is what stops a shared
+    ``REACHY_OPENAI_API_KEY=EMPTY`` from putting a literal
+    ``Authorization: Bearer EMPTY`` on the handshake — which a gateway that
+    expects the header omitted will refuse.
     """
     if api_key is not None:
-        return api_key or None
+        return _key_or_none(api_key)
     for name in (REALTIME_API_KEY_ENV, OPENAI_API_KEY_ENV):
         value = _env_present(name)
         if value is not None:
-            return value or None
+            return _key_or_none(value)
     return None
 
 
@@ -704,22 +725,41 @@ class RealtimeTranscriber:
                     break
                 attempts = 0 if self._attempt_connect() else attempts + 1
                 continue
-            try:
-                self._pump()
-            except _SessionLost as lost:
-                stable = (self._clock() - self._connected_at) >= self._stable_after_s
-                self._teardown_socket(graceful=lost.intentional)
-                if lost.intentional:
-                    attempts = 0
-                else:
-                    self._enter_down(lost.reason, lost.detail)
-                    attempts = 0 if stable else attempts + 1
-            except Exception:  # noqa: BLE001 - the worker must outlive any fault
-                logger.warning("realtime: session pump raised", exc_info=True)
-                self._teardown_socket()
-                self._enter_down(REASON_STREAM_CLOSED, "unexpected pump failure")
-                attempts += 1
+            attempts = self._pump_once(attempts)
         self._teardown_socket(graceful=True)
+
+    def _pump_once(self, attempts: int) -> int:
+        """Pump one session until it ends; return the next backoff attempt count.
+
+        Split out of :meth:`_run` so the loop reads as its three states (connect,
+        pump, shut down) rather than carrying the recovery arithmetic inline.
+        """
+        try:
+            self._pump()
+        except _SessionLost as lost:
+            return self._after_session_lost(lost, attempts)
+        except Exception:  # noqa: BLE001 - the worker must outlive any fault
+            logger.warning("realtime: session pump raised", exc_info=True)
+            self._teardown_socket()
+            self._enter_down(REASON_STREAM_CLOSED, "unexpected pump failure")
+            return attempts + 1
+        return attempts
+
+    def _after_session_lost(self, lost: "_SessionLost", attempts: int) -> int:
+        """Tear the session down and decide whether this counts against backoff.
+
+        An INTENTIONAL end (a rate re-negotiation) is not a fault: it neither
+        latches ``session-down`` nor advances the backoff. An unintentional one
+        does both — unless the session had been up for ``stable_after_s``, in
+        which case the backoff restarts from zero rather than compounding across
+        an outage that already recovered once.
+        """
+        stable = (self._clock() - self._connected_at) >= self._stable_after_s
+        self._teardown_socket(graceful=lost.intentional)
+        if lost.intentional:
+            return 0
+        self._enter_down(lost.reason, lost.detail)
+        return 0 if stable else attempts + 1
 
     def _attempt_connect(self) -> bool:
         """:meth:`_connect` under a total guard — the worker must outlive any fault.

@@ -306,9 +306,12 @@ def test_close_mid_stream_drops_the_connection_abruptly_after_n_frames() -> None
         client.send_append(b"\x02\x03")
 
         # No graceful CLOSE frame arrives — the socket just dies (EOF or reset).
-        with pytest.raises((wire.FrameReadError, ConnectionError, OSError)):
+        def drain_until_dead() -> None:
             for _ in range(5):
                 client.read_frame()
+
+        with pytest.raises((wire.FrameReadError, ConnectionError, OSError)):
+            drain_until_dead()
         client.close()
 
     assert len(server.append_payloads) >= 2

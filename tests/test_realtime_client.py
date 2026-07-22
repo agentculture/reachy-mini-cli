@@ -26,6 +26,7 @@ that wedges the worker fails the test instead of hanging the suite.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import socket
 import threading
@@ -37,6 +38,7 @@ import pytest
 from reachy.cli._errors import CliError
 from reachy.speech import realtime_wire as wire
 from reachy.speech.realtime import (
+    NO_KEY_SENTINEL,
     OPENAI_API_KEY_ENV,
     OPENAI_URL_BASE_ENV,
     REALTIME_API_KEY_ENV,
@@ -625,6 +627,38 @@ def test_resolve_realtime_api_key_precedence(monkeypatch: pytest.MonkeyPatch) ->
     assert resolve_realtime_api_key() is None
 
 
+def test_the_empty_sentinel_never_becomes_a_bearer_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EMPTY`` is the repo-wide "no key" placeholder, on every source of the key.
+
+    Local OpenAI-compatible servers use the literal ``EMPTY`` for an
+    unauthenticated endpoint, and ``speech/llm.py``, ``speech/tts.py``,
+    ``stash/embeddings.py`` and ``forge/client.py`` all already honour it. The
+    realtime client shares ``REACHY_OPENAI_API_KEY`` with those, so failing to
+    honour it here would put a literal ``Authorization: Bearer EMPTY`` on the
+    handshake of any box configured that way.
+    """
+    monkeypatch.setenv(OPENAI_API_KEY_ENV, NO_KEY_SENTINEL)
+    assert resolve_realtime_api_key() is None
+    monkeypatch.setenv(REALTIME_API_KEY_ENV, NO_KEY_SENTINEL)
+    assert resolve_realtime_api_key() is None
+    assert resolve_realtime_api_key(NO_KEY_SENTINEL) is None
+
+
+def test_no_authorization_header_is_sent_for_the_empty_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end: an ``EMPTY``-keyed box completes a handshake with NO auth header."""
+    monkeypatch.delenv(REALTIME_URL_ENV, raising=False)
+    monkeypatch.setenv(OPENAI_API_KEY_ENV, NO_KEY_SENTINEL)
+    with FakeRealtimeServer(Scenario.HAPPY_PATH) as server:
+        with RealtimeTranscriber(sample_rate=16000, url=server.url) as client:
+            _wait_until(lambda: client.sessions >= 1)
+        headers = {k.lower(): v for k, v in (server.handshake_headers or {}).items()}
+        assert "authorization" not in headers
+
+
 def test_connect_url_sets_the_sample_rate_query_without_losing_the_path() -> None:
     assert connect_url("ws://box:8001/v1/realtime", 16000) == (
         "ws://box:8001/v1/realtime?input_sample_rate=16000"
@@ -804,5 +838,5 @@ def test_audio_queued_long_before_a_session_is_discarded_as_stale() -> None:
 
 def test_the_utterance_record_is_frozen() -> None:
     utterance = Utterance(text="hi", t=1.0, item_id="item_1", session_id="sess_1")
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         utterance.text = "no"  # type: ignore[misc]
