@@ -835,27 +835,49 @@ def test_the_moving_floor_quiets_rms_through_the_composed_seam(_isolated, monkey
 
 
 def test_a_rule_keyed_on_transcript_fires_through_the_composed_seam(_isolated, monkeypatch):
-    """t11's provider, live: an addressed utterance is captured, endpointed,
-    transcribed on the worker thread and latched into ``Sense.transcript``, and a
-    rule keyed on ``transcript`` fires.
+    """t11's provider, live: an utterance the SERVER endpointed is taken off the
+    session, admitted on the worker thread and latched into ``Sense.transcript``,
+    and a rule keyed on ``transcript`` fires.
 
-    The STT leg is faked (no network); everything else — the energy VAD, the
-    pre-roll ring, endpointing on a pause, the worker handoff, the engagement
-    gate's name fast-path — is the real driver running on the real composed seam.
-    The tick loop is synchronised to the worker through the driver's own
-    ``submitted``/``transcripts`` counters rather than a bare sleep, so the
-    handoff is awaited deterministically instead of raced.
+    The realtime session is faked (no socket); everything else — the per-tick
+    audio fan-out into the session, the worker handoff, the engagement gate's
+    name fast-path, the one-tick latch — is the real driver running on the real
+    composed seam. The tick loop is synchronised to the worker through the
+    driver's own ``submitted``/``transcripts`` counters rather than a bare
+    sleep, so the handoff is awaited deterministically instead of raced.
     """
     from reachy.behavior.transcript_sense import TranscriptSenseDriver as _RealDriver
+    from reachy.speech.realtime import Utterance
 
-    class _FakeTranscriber:
-        def transcribe_once(self, *_args, **_kwargs):
-            return "hey reachy are you there"
+    class _FakeSession:
+        """The lobes ``/v1/realtime`` session, offline: audio in, words out.
+
+        Commits ONE turn once it has been fed enough audio, which is the only
+        part of the server's VAD this test needs to stand in for.
+        """
+
+        def __init__(self, after: int = 20) -> None:
+            self.after = after
+            self.chunks = 0
+            self._emitted = False
+
+        def submit_audio(self, audio) -> bool:
+            self.chunks += 1
+            return True
+
+        def take_utterance(self):
+            if self._emitted or self.chunks < self.after:
+                return None
+            self._emitted = True
+            return Utterance(text="hey reachy are you there", t=0.0)
+
+        def set_sample_rate(self, rate: int) -> None:
+            return None
 
     built: list[_RealDriver] = []
 
     def _make(**kwargs):
-        driver = _RealDriver(**{**kwargs, "transcriber": _FakeTranscriber()})
+        driver = _RealDriver(**{**kwargs, "realtime": _FakeSession()})
         built.append(driver)
         return driver
 
@@ -864,8 +886,8 @@ def test_a_rule_keyed_on_transcript_fires_through_the_composed_seam(_isolated, m
 
     loud = np.full(320, 0.3, dtype=np.float32)
     quiet = np.zeros(320, dtype=np.float32)
-    # 50 ticks of speech (1.0 s, clearing the 0.3 s floor) then silence, which
-    # endpoints the utterance after the 0.7 s hold.
+    # Audio flows every tick now: what is speech is the server's call, not this
+    # module's, so the fixture only has to keep the mic producing.
     media = _FakeMedia(chunk=lambda n: loud if n <= 50 else quiet)
     _inject_holders(monkeypatch, _FakePoseReader(), media)
 
@@ -882,7 +904,7 @@ def test_a_rule_keyed_on_transcript_fires_through_the_composed_seam(_isolated, m
     _run_seam(_rules_driver("transcript"), events=events, max_ticks=140, sleep=_await_worker)
 
     assert built, "the composition never built a transcript driver"
-    assert built[0].submitted >= 1, "no utterance was endpointed and submitted"
+    assert built[0].submitted >= 1, "no server-endpointed utterance reached the worker"
     assert _fired(events, "transcript"), "no rule.fire for transcript"
 
 
