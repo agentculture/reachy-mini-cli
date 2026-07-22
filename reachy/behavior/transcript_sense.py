@@ -336,12 +336,6 @@ class TranscriptSenseDriver:
         audio, and any transcript that ARRIVES before that deadline is discarded
         — see the module docstring's self-mute section for why it takes both.
         Defaults to "never muted".
-    background:
-        **Retired seam, accepted and ignored.** It fed the local energy VAD's
-        room-relative threshold (#102); the server's VAD endpoints now, so
-        nothing consumes it. It stays in the signature only so the composition
-        root can drop the argument in its own change (plan task t5) rather than
-        this one, and goes away with it.
     tuning:
         A :class:`TranscriptTuning`; see its docstring.
     names:
@@ -358,7 +352,6 @@ class TranscriptSenseDriver:
         classifier: Any | None = None,
         on_engage: Callable[[], None] | None = None,
         mute_until: Callable[[], float] | None = None,
-        background: Callable[[], float | None] | None = None,
         tuning: TranscriptTuning = TranscriptTuning(),
         names: tuple[str, ...] = DEFAULT_NAMES,
         clock: Callable[[], float] = time.monotonic,
@@ -371,11 +364,6 @@ class TranscriptSenseDriver:
         self._realtime = realtime
         self._on_engage = on_engage
         self._mute_until = mute_until if mute_until is not None else (lambda: 0.0)
-        if background is not None:
-            logger.debug(
-                "TranscriptSenseDriver: the background seam is retired (server-side VAD "
-                "endpoints now); ignoring it"
-            )
         self._tuning = tuning
         self._names = tuple(name.lower() for name in names)
         self._clock = clock
