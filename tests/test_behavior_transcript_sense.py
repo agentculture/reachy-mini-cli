@@ -973,30 +973,23 @@ def test_the_module_imports_no_sdk_and_constructs_no_media_client() -> None:
     assert "RealtimeTranscriber(" not in source
 
 
-def test_the_retired_background_seam_is_still_accepted_and_ignored() -> None:
-    """A transitional kindness to the composition root, and nothing more.
+def test_the_retired_background_seam_is_gone_from_the_signature() -> None:
+    """t5 removed the transitional seam AND the composition root's argument.
 
     ``background`` fed the local energy VAD's room-relative threshold (#102).
-    The server's VAD endpoints now, so nothing consumes it — but the runtime's
-    composition still passes it until plan task t5 rewrites that call, and a
-    ``TypeError`` there would take the whole runtime down. It is accepted,
-    ignored, and goes away with t5.
+    The server's VAD endpoints now, so nothing consumes it; t4 kept the keyword
+    accepted-and-ignored only so the runtime's composition could drop it in its
+    OWN change rather than a cross-task one. Both halves landed in t5, so the
+    keyword is a ``TypeError`` again — the honest answer to "this knob does
+    nothing", and a guard against it being re-added by muscle memory.
     """
-    media = _Media()
-    session = _Realtime()
-    driver = TranscriptSenseDriver(
-        media=media,
-        realtime=session,
-        background=lambda: 0.034,
-        tuning=_tuning(),
-    )
-    try:
-        t = _hear(driver, media, session, NAMED, T0)
-        assert _await(lambda: driver.transcripts == 1)
-        driver(_ctx(t))
-        assert driver.peek() == NAMED
-    finally:
-        driver.close()
+    import inspect
+
+    assert "background" not in inspect.signature(TranscriptSenseDriver).parameters
+    with pytest.raises(TypeError):
+        TranscriptSenseDriver(  # type: ignore[call-arg]
+            media=_Media(), realtime=_Realtime(), background=lambda: 0.034
+        )
 
 
 def test_transcript_is_a_rule_testable_sense_field() -> None:

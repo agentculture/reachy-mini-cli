@@ -103,6 +103,38 @@ def _no_live_daemon_media_gate(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_realtime_gateway(monkeypatch: pytest.MonkeyPatch):
+    """No test may open a hearing session against a REAL lobes gateway.
+
+    Since the realtime arc (#115), ``behavior engine run``'s composition builds
+    and ``start()``s ONE :class:`~reachy.speech.realtime.RealtimeTranscriber` —
+    unconditionally, and before the first tick. Its endpoint resolves from
+    ``REACHY_REALTIME_URL``, then ``REACHY_OPENAI_URL_BASE``, then
+    ``ws://localhost:8001/v1/realtime``. On a developer box BOTH fallbacks name a
+    live service (the machine that motivated this fixture has
+    ``REACHY_OPENAI_URL_BASE`` exported *and* something listening on :8001), so
+    without this every composition test would open a real WebSocket session
+    against it — a hidden network dependency and a source of machine-dependent
+    flakiness, on top of the ``offline`` lane's own guard which only covers
+    ``offline``-marked tests.
+
+    So the explicit override is pointed at the same guaranteed-unreachable
+    loopback the ``offline`` guard uses. Composition still builds and starts the
+    client (the code under test is untouched); the connect is simply refused
+    immediately and locally — the same NORMAL "gateway not up yet" outcome a
+    booting robot sees, latched to one ``session-down`` line.
+
+    Tests that DO want a real session either construct the client with an
+    explicit ``url=``, which wins over any env (``tests/test_realtime_client.py``,
+    ``tests/test_behavior_transcript_realtime.py``), or re-set this same variable
+    with their own function-scoped ``monkeypatch``, which likewise wins and is
+    undone at teardown.
+    """
+    monkeypatch.setenv("REACHY_REALTIME_URL", "ws://127.0.0.1:1/v1/realtime")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_reachy_logging():
     """Never let one test's installed log handler outlive it.
 
