@@ -29,8 +29,10 @@ snapshot was taken:
   :mod:`reachy.speech.harmonic` / :mod:`~reachy.speech.voice` /
   :mod:`~reachy.speech.playback`.
 * **t11 gave the runtime ears** — :mod:`reachy.behavior.transcript_sense`
-  imports :mod:`reachy.speech.stt` / :mod:`~reachy.speech.events` /
-  :mod:`~reachy.speech.engagement`.
+  imports :mod:`reachy.speech.realtime` / :mod:`~reachy.speech.events` /
+  :mod:`~reachy.speech.engagement`. (It imported :mod:`reachy.speech.stt` until
+  the realtime arc moved endpointing to the server; the HTTP transcriber now
+  has no importer inside ``reachy/behavior/`` at all.)
 
 A test that banned all of ``reachy.speech`` would fail on shipped, intended
 code. So the boundary below forbids what actually matters — a **language
@@ -171,9 +173,15 @@ _BEHAVIOR_SPEECH_ALLOW = {
         "output only, decides nothing"
     ),
     # ---- the runtime's HEARING (ported by t11) — words in, admission ---------
-    "reachy.speech.stt": (
-        "the Parakeet /v1/audio/transcriptions leg: speech-to-TEXT. A "
-        "transcriber reports what was said; it does not decide what to do"
+    "reachy.speech.realtime": (
+        "the lobes /v1/realtime session client: a microphone on a WebSocket. "
+        "Speech-to-TEXT with the VAD upstream — it reports what was said and "
+        "when it arrived, and decides nothing. It reaches no model: its only "
+        "imports are senselog, cli._errors, robot.audio_shape, realtime_wire, "
+        "numpy and the stdlib. It REPLACED the reachy.speech.stt entry when the "
+        "capture half moved to server-side endpointing (issue #115) — nothing "
+        "in reachy/behavior/ imports the HTTP transcriber any more, though "
+        "reachy/sleep/wakeword.py still does, outside this boundary"
     ),
     "reachy.speech.events": (
         "``_doa_direction`` only — a pure bearing-to-'from the left' formatter"

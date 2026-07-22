@@ -702,7 +702,7 @@ class RealtimeTranscriber:
             if self._sock is None:
                 if attempts and not self._sleep(self._backoff_for(attempts)):
                     break
-                attempts = 0 if self._connect() else attempts + 1
+                attempts = 0 if self._attempt_connect() else attempts + 1
                 continue
             try:
                 self._pump()
@@ -720,6 +720,25 @@ class RealtimeTranscriber:
                 self._enter_down(REASON_STREAM_CLOSED, "unexpected pump failure")
                 attempts += 1
         self._teardown_socket(graceful=True)
+
+    def _attempt_connect(self) -> bool:
+        """:meth:`_connect` under a total guard — the worker must outlive any fault.
+
+        :meth:`_connect` handles the failure types a socket really raises
+        (``OSError``/``ValueError``), but it is the ONE call in :meth:`_run` that
+        used to sit outside a ``try``: anything else escaping it killed the
+        session worker outright and silently, so the client stopped reconnecting
+        forever while still reporting a latched ``session-down``. Same posture as
+        the pump's guard below.
+        """
+        try:
+            return self._connect()
+        except Exception:  # noqa: BLE001 - a connect fault costs one attempt, not the worker
+            logger.warning("realtime: connect raised", exc_info=True)
+            self._teardown_socket()
+            self.connect_failures += 1
+            self._enter_down(REASON_CONNECT_FAILED, "unexpected connect failure")
+            return False
 
     def _backoff_for(self, attempts: int) -> float:
         delay = self._backoff_initial_s * (2 ** max(0, attempts - 1))
