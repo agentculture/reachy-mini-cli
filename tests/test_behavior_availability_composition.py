@@ -132,8 +132,17 @@ def test_state_json_reports_face_available_with_the_vision_extra(_isolated, monk
     assert state[STATE_KEY]["face"] == {"available": True, "reason": None}
 
 
-def test_the_bare_ci_box_reports_every_sense_dead_with_a_named_reason(_isolated):
-    """No monkeypatching at all — CI has neither extra, and says so, sense by sense."""
+def test_the_bare_ci_box_reports_every_sense_dead_with_a_named_reason(_isolated, monkeypatch):
+    """A bare box — neither extra — says so, sense by sense.
+
+    The bare condition is INJECTED rather than read off the running interpreter:
+    reading the real environment made this pass on bare CI and fail on any dev
+    box that happens to have ``[sdk]`` installed, which is a property of the
+    machine, not of the code under test.
+    """
+    monkeypatch.setattr(face_sense, "_find_spec", lambda name: None)
+    monkeypatch.setattr(sense_availability, "_find_spec", lambda name: None)
+
     state = _run_engine()
     block = state[STATE_KEY]
     assert set(block) == set(AVAILABILITY_SENSES)
