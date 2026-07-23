@@ -38,6 +38,7 @@ corrected file into the already-running engine without a restart.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import math
@@ -113,6 +114,7 @@ from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from reachy.cli._export import add_runtime_export_args, build_runtime_export_consumer
 from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
+from reachy.export.mqtt import NervousPublisher, broker_url
 from reachy.export.runtime import SenseSnapshotDriver
 from reachy.motion.pat import PatDetector
 from reachy.robot import DEFAULT_BASE_URL, DEFAULT_TIMEOUT, INTERPOLATIONS
@@ -1375,6 +1377,99 @@ def _make_speech_actuator() -> SpeechActuator:
     return SpeechActuator()
 
 
+#: ``(module, attribute)`` naming the **events-cli** client class — the ONE
+#: binding point for the nervous system's transport.
+#:
+#: The broker and its client belong to the sibling ``events-cli`` project
+#: (``agentculture/events-cli#3``); this repo ships no MQTT library and takes no
+#: dependency on one (see CLAUDE.md's events-cli decision record). As of this
+#: writing **that wheel does not exist**, so :func:`_import_events_client`
+#: resolves to ``None`` on every box and the whole leg is a named no-op. When the
+#: wheel ships, this constant already names it: the only change is the
+#: construction line in :func:`_make_events_client` (should its signature differ)
+#: plus the ``pyproject.toml`` base dep and a ``uv lock``.
+EVENTS_CLIENT_IMPORT = ("events_cli", "EventsClient")
+
+
+def _import_events_client(spec: tuple[str, str] = EVENTS_CLIENT_IMPORT):
+    """Resolve the events-cli client class LAZILY, or ``None`` when absent.
+
+    Total by construction: an absent package, a broken package, or a wheel that
+    renamed the class all resolve to ``None`` — never an ``ImportError`` on the
+    caller. That is what makes the publisher composable UNCONDITIONALLY on a box
+    where events-cli is simply not installed yet, which is every box today.
+
+    Deliberately NOT a module-scope import: ``_build_parser()`` imports this
+    module for *every* invocation (``say run``, ``daemon status``, ``--help``),
+    and a hard import of an optional package there would put its cost — or its
+    absence — on all of them. *spec* is injectable so both directions are
+    testable without touching ``sys.modules``.
+    """
+    module_name, attr = spec
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as err:  # noqa: BLE001 — an optional package must never raise here
+        logger.debug("behavior: events-cli client unavailable (%s: %s)", type(err).__name__, err)
+        return None
+    return getattr(module, attr, None)
+
+
+def _make_events_client():
+    """Build the events-cli client for this run, or ``None`` — a test seam.
+
+    The sibling of :func:`_make_state_reader` / :func:`_make_media_client` /
+    :func:`_make_realtime_client`, and the same discipline: everything about
+    WHICH broker is resolved from the environment
+    (:func:`~reachy.export.mqtt.broker_url`, i.e. ``REACHY_MQTT_URL`` defaulting
+    to ``localhost:1883``), read HERE at composition time so the publisher module
+    stays environment-free.
+
+    A ``None`` return is the NORMAL no-broker profile, not a fault:
+    :class:`~reachy.export.mqtt.NervousPublisher` names it once
+    (``dropped reason=no-client``) and every publish becomes a no-op. A
+    constructor that raises is the same class of outcome and gets the same
+    answer — the detail goes to the module logger, and the ONE named
+    ``senselog`` drop still comes from the publisher, so a degraded bus is
+    always exactly one greppable line.
+    """
+    factory = _import_events_client()
+    if factory is None:
+        return None
+    url = broker_url()
+    try:
+        return factory(url)
+    except Exception as err:  # noqa: BLE001 — a broken client must not block boot
+        logger.warning(
+            "behavior: events-cli client construction failed for %s (%s: %s); "
+            "the nervous-system bus is disabled for this run",
+            url,
+            type(err).__name__,
+            err,
+        )
+        return None
+
+
+def _make_nervous_publisher() -> tuple[NervousPublisher, object | None]:
+    """Build + start the nervous-system publisher; report its client alongside.
+
+    Composed UNCONDITIONALLY — no flag, no env gate on whether to compose (only
+    on WHERE to publish). That is load-bearing rather than tidy: the deployed
+    ``reachy-runtime.service`` ``ExecStart`` carries no ``--export``, so a leg
+    gated behind a flag would never run on the robot at all.
+
+    ``start()`` is total (it configures the Last Will, connects, and reports one
+    named drop for an absent/incompatible/unreachable broker), so there is
+    nothing to guard here. The client comes back too because it answers a
+    different question than "did we connect": whether a broker path exists AT
+    ALL for this process, which is what decides if a
+    :class:`~reachy.export.runtime.SenseSnapshotDriver` is worth a tick.
+    """
+    client = _make_events_client()
+    publisher = NervousPublisher(client)
+    publisher.start()
+    return publisher, client
+
+
 def _make_media_client() -> HeldMediaClient:
     """Build the ONE held media client (mic + camera) — a test-injection seam.
 
@@ -1585,6 +1680,20 @@ class _RuntimeResources:
     process at interpreter exit. Its ``close()`` is idempotent and bounded (it
     shuts the socket down under a parked worker and joins with a timeout), so a
     session that never connected costs nothing here.
+
+    Two book-ends were added by the nervous-system arc, and both sit OUTSIDE the
+    client ordering above because neither depends on it:
+
+    * ``metrics`` is flushed FIRST. :class:`~reachy.behavior.tick_metrics.
+      TickMetrics` logs overruns per EPISODE (#121), and at the sustained 77%
+      overrun rate measured on the box an episode may never close on its own —
+      so without this flush the whole tail of a run would have no count/mean/max
+      in the journal at all. It is pure logging, it cannot fail into anything
+      else, and doing it first means the summary lands ahead of the teardown's
+      own lines.
+    * ``publisher`` is stopped LAST. Stopping flips the retained availability
+      topic false and closes the session gracefully (no Last Will), so it wants
+      to outlive every other step that might still have something to say.
     """
 
     def __init__(
@@ -1597,6 +1706,8 @@ class _RuntimeResources:
         speech=None,
         pump=None,
         realtime=None,
+        metrics=None,
+        publisher=None,
     ):
         self.pose_reader = pose_reader
         self.media = media
@@ -1605,12 +1716,16 @@ class _RuntimeResources:
         self.speech = speech
         self.pump = pump
         self.realtime = realtime
+        self.metrics = metrics
+        self.publisher = publisher
         self._closed = False
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        if self.metrics is not None:
+            self._release(self.metrics.close, "tick metrics")
         if self.keeper is not None:
             self._release(self.keeper.stop, "holder keeper")
         if self.speech is not None:
@@ -1625,6 +1740,8 @@ class _RuntimeResources:
             self._release(self.media.close, "media client")
         if self.pose_reader is not None:
             self._release(self.pose_reader.close, "pose reader")
+        if self.publisher is not None:
+            self._release(self.publisher.stop, "nervous publisher")
 
     @staticmethod
     def _release(close, what: str) -> None:
@@ -1847,7 +1964,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         # drivers. The pose reader is still warmed at setup — the probe ticks at
         # the same 50 Hz and would take the same startup overrun otherwise.
         reader = _make_state_reader()
-        keeper = None
+        keeper = publisher = None
         try:  # release the held client if composition fails — see the note below
             _warm_holder(reader, label="state")
             shared_reader = SharedPoseReader(reader.read)
@@ -1861,20 +1978,29 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
                 ProbeNamespaceGuard(control.CommandSpool(namespace=INTENT_NAMESPACE)),
                 ProbeDriver(mode, shared_reader, emit=probe_emit),
             ]
-            consumers = []
-            if runtime_consumer is not None:
+            # The nervous system rides the probe path too: `--probe-mode` is
+            # still an engine run, and "unconditional, no flag" admits no
+            # exception. It stays observation-only — the publisher reads the
+            # bus, it never drives anything. See the main path below for why
+            # the SNAPSHOT DRIVER (and only it) is gated on a usable consumer.
+            publisher, events_client = _make_nervous_publisher()
+            consumers = [runtime_consumer] if runtime_consumer is not None else []
+            consumers.append(publisher.as_tick_consumer())
+            if runtime_consumer is not None or events_client is not None:
                 drivers.append(SenseSnapshotDriver())
-                consumers.append(runtime_consumer)
             bus = TickBus(drivers=drivers, consumers=consumers)
             keeper = _HolderKeeper([("state", reader)])
             keeper.start()
+            metrics = TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))
         except BaseException:
-            _RuntimeResources(pose_reader=reader, keeper=keeper).close()
+            _RuntimeResources(pose_reader=reader, keeper=keeper, publisher=publisher).close()
             raise
         return (
             probe_sense_reader,
-            TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)),
-            _RuntimeResources(pose_reader=reader, keeper=keeper),
+            metrics,
+            _RuntimeResources(
+                pose_reader=reader, keeper=keeper, metrics=metrics, publisher=publisher
+            ),
         )
 
     # Everything below OPENS resources (two held SDK clients, two worker-owning
@@ -1885,7 +2011,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     # `Restart=on-failure` never restarts. So the whole construction is guarded
     # and releases what it opened before re-raising.
     reader = media = transcript_driver = face_driver = keeper = speech = pump = None
-    realtime = None
+    realtime = publisher = None
     try:
         # The voice, first: built and STARTED here on the setup thread so no tick
         # ever pays for thread creation, and so a malformed REACHY_VOICE_ENGINE /
@@ -2078,11 +2204,35 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             )
             if d is not None
         ]
-        consumers = []
-        if runtime_consumer is not None:
+        # THE NERVOUS SYSTEM (the runtime feed on an event bus).
+        #
+        # Built and started HERE, unconditionally and with no flag: the deployed
+        # `reachy-runtime.service` ExecStart carries no `--export`, so a leg
+        # gated behind a flag would never run on the robot. Configuration is
+        # REACHY_MQTT_URL and nothing else. A missing events-cli package, an
+        # incompatible client or an unreachable broker each resolve to ONE named
+        # `[SENSE stage=nervous source=mqtt ...] dropped reason=…` line and
+        # no-op publishes — the runtime is byte-for-byte unaffected.
+        #
+        # It is a bus CONSUMER, not a driver: it reads what the drivers already
+        # publish through `ctx.emit` and never touches the head, the media
+        # session or the clock. That is why it does not appear in the driver
+        # list above and why it cannot perturb the tick.
+        publisher, events_client = _make_nervous_publisher()
+        consumers = [runtime_consumer] if runtime_consumer is not None else []
+        consumers.append(publisher.as_tick_consumer())
+        # `SenseSnapshotDriver` is the one piece that costs a TICK, so it is the
+        # one piece gated — on whether anything can actually consume it, never
+        # on `--export`. Before the bus existed that condition and "is --export
+        # set" were the same question; they no longer are, and using the flag
+        # would leave the boot runtime (no `--export`) publishing rules and
+        # motions but no perception at all — exactly the transcript/face flips
+        # an external subscriber exists to see. With BOTH a client and
+        # `--export` there is still exactly ONE driver feeding two consumers.
+        if runtime_consumer is not None or events_client is not None:
             drivers.append(SenseSnapshotDriver())
-            consumers.append(runtime_consumer)
         bus = TickBus(drivers=drivers, consumers=consumers)
+        metrics = TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))
         resources = _RuntimeResources(
             pose_reader=reader,
             media=media,
@@ -2091,6 +2241,8 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             speech=speech,
             pump=pump,
             realtime=realtime,
+            metrics=metrics,
+            publisher=publisher,
         )
     except BaseException:
         _RuntimeResources(
@@ -2101,9 +2253,10 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             speech=speech,
             pump=pump,
             realtime=realtime,
+            publisher=publisher,
         ).close()
         raise
-    return sense_reader, TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz)), resources
+    return sense_reader, metrics, resources
 
 
 def _probe_engine_is_fresh() -> bool:
@@ -2241,6 +2394,30 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         sense_reader, tick_seam, resources = _compose_run_seam(
             transport, config, rules_driver, runtime_consumer, probe=probe
         )
+        # Mirror the standing `state.json` payload onto RETAINED bus topics, so
+        # a late subscriber immediately sees current state instead of waiting
+        # for the next change. Purely ADDITIVE by construction: the wrapper runs
+        # the disk write FIRST and unconditionally (see
+        # `NervousPublisher.state_writer`), so a dead bus can never cost the
+        # runtime its state file — and because both surfaces receive the
+        # identical object, the bus is a transport for the ONE builder's truth,
+        # never a second source of it. Patched on the spool INSTANCE, which
+        # `ProbeCommandGuard` also delegates to at call time.
+        #
+        # KNOWN LIMIT, stated rather than hidden: this mirrors the ENGINE's own
+        # per-tick snapshot (`updated`/`compose_hz`/`active`/`ownership`/`doa`).
+        # The seam RIDERS that augment the same file — `SenseAvailabilityDriver`
+        # (`senses`) and `IntentDriver` (`intents`) — each construct their own
+        # `CommandSpool`, so their read-modify-write never passes through this
+        # object and those two keys reach `state.json` but not the retained
+        # tree. Closing that gap means injecting this spool as their
+        # `main_control`, which is a change to their composition rather than to
+        # this wrapper; it is deliberately left out of the additive-by-design
+        # step above. `tests/test_behavior_nervous_composition.py` pins the gap
+        # so it cannot quietly become permanent.
+        publisher = getattr(resources, "publisher", None)
+        if publisher is not None:
+            spool.write_state = publisher.state_writer(spool.write_state)
 
         def _emit(event: dict) -> None:
             if json_mode and runtime_consumer is None:
