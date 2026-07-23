@@ -356,6 +356,31 @@ What "working" looks like:
 - `reachy-mini-cli <noun> status --json` (for `demo-mode` / `vision` / `sleep`,
   and `behavior engine status`) reports the background process + health.
 
+### The monitor-speaker test vector — driving hearing without a human voice
+
+The "say *'Reachy, are you there?'*" step above does not actually require a
+person in the room. **The monitor speaker is exempt from Reachy's own AEC —
+only the robot's OWN speaker channel is echo-cancelled**
+(`reachy/robot/audio_shape.py` selects `AEC_CHANNEL = 0`, the channel the
+robot's mic array attributes to its own output). Any OTHER speaker in the
+room — a monitor, an HDMI output, a phone — is not cancelled at all, so
+playing synthesized speech out of it is a valid, **automatable** way to speak
+*to* Reachy: hearing tests (the `#122` verify session, full acceptance runs)
+can drive the robot with TTS out the monitor instead of requiring a human
+voice. Concrete hardware on the dev box: `card 0: NVIDIA HDMI` (the monitor)
+vs `card 2: Reachy Mini Audio` (the robot) — pointing `aplay` (or any player)
+at card 0 drives the robot's hearing exactly as a nearby human voice would.
+
+> **The inverse does NOT work.** A speaker→mic loopback cannot validate the
+> robot's OWN playback, precisely because AEC cancels it — that is the whole
+> point of the channel selection above. A 2026-07-23 loopback measurement
+> found `rms_ratio 0.92`: the mic went *quieter* during the robot's own
+> playback, while the sound was plainly audible in the room to a human ear.
+> Verify the robot's own voice with the daemon's ALSA playback log line
+> (`Using ALSA device reachymini_audio_sink for playback`, see [the
+> ALSA-sharing fact](#speech--the-say-field-gives-a-rule-a-voice)) plus a
+> human ear — never with mic RMS.
+
 ---
 
 ## The `~/.asoundrc` mic-array gotcha
@@ -417,7 +442,7 @@ vars override the built-in default.
 | `REACHY_TTS_ROUTE` | `chatterbox` | Which TTS wire protocol to speak: `chatterbox` (`{REACHY_TTS_URL}/v1/audio/synthesize`) or `openai` (`{REACHY_OPENAI_URL_BASE}/v1/audio/speech`). The generated `runtime` unit bakes `openai` in as an `Environment=` directive | `speech/tts.py`, `service/units.py` |
 | `REACHY_TTS_MODEL` | `ResembleAI/chatterbox` | Model id sent on the `openai` TTS route | `speech/tts.py` |
 | `REACHY_VOICE_ENGINE` | `tts` for `say`; **`harmonic`** for the behavior runtime | Speech backend: `tts` or `harmonic`. The symbolic runtime defaults the other way on purpose — its voice must work with nothing reachable | `speech/voice.py`, `behavior/speech_act.py` |
-| `REACHY_SPEECH_TRANSPORT` | `http` | How the behavior runtime's voice reaches the speaker: `http` (upload + play via the daemon) or `sdk` (push PCM in-process). Falls back to `REACHY_TRANSPORT`; `http` is the default because the media-profile SDK client is currently unconstructable on the robot (issue #94) | `behavior/speech_act.py` |
+| `REACHY_SPEECH_TRANSPORT` | `http` | How the behavior runtime's voice reaches the speaker: `http` (upload + play via the daemon) or `sdk` (push PCM in-process). Falls back to `REACHY_TRANSPORT`; `http` is the default because the daemon and the runtime share `/dev/snd/pcmC2D0p` through the `reachymini_audio_sink` ALSA plugin device — not because the SDK path is broken (issue #94 is closed) | `behavior/speech_act.py` |
 | `REACHY_HARMONIC_IDENTITY` | `reachy` | Harmonic voice identity signature (root pitch + instrument) | `speech/harmonic.py` |
 | `REACHY_HARMONIC_ARTICULATION` | `smooth` | Harmonic rendering style: `discrete` / `speechy` / `smooth` / `alien` | `speech/harmonic.py` |
 | `REACHY_OPENAI_URL_BASE` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `agent attach`'s cognition and the engagement classifier (legacy: `REACHY_LLM_BASE_URL`). **Also the runtime's HEARING endpoint fallback** since the realtime arc (issue #115): an `http(s)` value here is mapped to `ws(s)://…/v1/realtime` whenever `REACHY_REALTIME_URL` is unset. Pointing this at a chat-only gateway with no `/v1/realtime` route gets a refused handshake and a deaf robot — see [Hearing over the lobes realtime session](#hearing-over-the-lobes-realtime-session) | `speech/llm.py`, `speech/realtime.py` |
@@ -1838,10 +1863,21 @@ identity and articulation knobs, which apply here unchanged).
 
 **Playback goes through the daemon by default.** Audio is uploaded to the
 daemon and played there (`REACHY_SPEECH_TRANSPORT=http`, the default) rather
-than through an in-process SDK media session. That is deliberate: on the
-deployed robot a media-profile SDK client currently cannot be constructed at
-all (`ConnectionRefusedError`, issue #94) while the daemon's HTTP API answers
-normally, and the daemon route needs no `[sdk]` extra. Set
+than through an in-process SDK media session. That default is NOT because the
+SDK path is broken — issue #94 (a media-profile SDK client failing to
+construct) is **closed**: measured 2026-07-23, `HeldMediaClient` warms up in
+1032 ms and delivers 9/10 camera frames plus live mic audio, and the runtime
+does this unprompted on every boot. The real reason is **ALSA sharing**: the
+daemon and the runtime hold `/dev/snd/pcmC2D0p` *simultaneously* through the
+`reachymini_audio_sink` plugin device defined in `~/.asoundrc`. The
+single-SDK-owner model (see [above](#the-single-sdk-owner-model)) constrains
+the *media session* — the single-consumer SDK client — not the *ALSA sink*,
+so playback via the daemon's HTTP route was never in contention with the
+runtime's held client. Verified 2026-07-23: with the runtime live and holding
+media, `POST /api/media/sounds/upload` → 200 and `POST /api/media/play_sound`
+→ 200, the daemon logged `Using ALSA device reachymini_audio_sink for
+playback`, and a human in the room confirmed the clip was audible. The
+daemon route needs no `[sdk]` extra, which is why it stays the default; set
 `REACHY_SPEECH_TRANSPORT=sdk` to push PCM through the SDK instead — one
 variable, no code change.
 
