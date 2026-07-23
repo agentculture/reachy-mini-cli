@@ -1783,7 +1783,14 @@ def _engagement_classifier():
         return None
 
 
-def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_consumer, probe=None):
+def _compose_run_seam(
+    transport,
+    config: EngineConfig,
+    rules_driver,
+    runtime_consumer,
+    probe=None,
+    main_control=None,
+):
     """Build ``behavior engine run``'s sense reader + tick seam + owned resources.
 
     Composes runtime sense/act pieces onto the engine's ONE per-tick seam and
@@ -1947,6 +1954,15 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       engine publishes its own snapshot BEFORE the seam runs, so a rider that
       augments the file wants to be the tick's final word. It reads nothing off
       ``ctx``, so this is ordering hygiene rather than a correctness constraint.
+
+    Both state RIDERS — ``availability`` (``senses``) and ``intent_driver``
+    (``intents``) — take *main_control* as their state spool. When
+    ``cmd_engine_run`` passes the engine's own ``CommandSpool``, and that spool's
+    ``write_state`` is later wrapped with the nervous-system ``state_writer``,
+    the riders' merged writes reach the retained bus tree as well as disk (t14,
+    closing the h21/c36 mirror gap). ``None`` (the default) leaves each rider to
+    build its own spool — the pre-t14 shape used by the composition unit tests.
+    The probe path below composes NEITHER rider, so it never mirrors these keys.
     * ``SenseSnapshotDriver`` last (export only) — publishes the tick's perception
       snapshot on change; it reads the fixed ``ctx.sense`` so its position is
       immaterial, appended last so the sense block trails the decisions.
@@ -2170,9 +2186,19 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             rules_driver.set_speech(speech.say)
 
         goto_lane = GotoLane(start_pose_provider=holder.as_start_pose_provider())
+        # Both state RIDERS below take the engine's OWN `main_control` spool
+        # (injected by `cmd_engine_run` — `None` here defaults each to its own,
+        # the pre-t14 shape used by unit tests). This is what closes the h21/c36
+        # gap: the engine wraps THIS spool's `write_state` with the nervous-system
+        # `state_writer` AFTER composition, so a rider holding the same instance
+        # mirrors its merged `intents`/`senses` write onto the retained bus tree,
+        # not just onto disk. The riders look up `self._main.write_state` at TICK
+        # time, so the later patch is picked up regardless of construction order
+        # (pinned by `test_riders_pick_up_a_state_writer_patched_after_...`).
         intent_driver = IntentDriver(
             mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
             known_modes=rules_driver.known_modes if rules_driver is not None else None,
+            main_control=main_control,
         )
         # Register the GOTO kind into the intent driver's OWN registry (which already
         # carries the four intent defaults) so all five kinds share one registry.
@@ -2187,7 +2213,8 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
             runtime_probes(
                 pat_composed=pat_driver is not None,
                 face_recognizer_ready=recognition is not None,
-            )
+            ),
+            main_control=main_control,
         )
         drivers = [
             d
@@ -2392,7 +2419,7 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         # separate from the cognition feed and carries runtime events only.
         runtime_consumer = build_runtime_export_consumer(args)
         sense_reader, tick_seam, resources = _compose_run_seam(
-            transport, config, rules_driver, runtime_consumer, probe=probe
+            transport, config, rules_driver, runtime_consumer, probe=probe, main_control=spool
         )
         # Mirror the standing `state.json` payload onto RETAINED bus topics, so
         # a late subscriber immediately sees current state instead of waiting
@@ -2404,17 +2431,19 @@ def cmd_engine_run(args: argparse.Namespace) -> int:
         # never a second source of it. Patched on the spool INSTANCE, which
         # `ProbeCommandGuard` also delegates to at call time.
         #
-        # KNOWN LIMIT, stated rather than hidden: this mirrors the ENGINE's own
-        # per-tick snapshot (`updated`/`compose_hz`/`active`/`ownership`/`doa`).
-        # The seam RIDERS that augment the same file — `SenseAvailabilityDriver`
-        # (`senses`) and `IntentDriver` (`intents`) — each construct their own
-        # `CommandSpool`, so their read-modify-write never passes through this
-        # object and those two keys reach `state.json` but not the retained
-        # tree. Closing that gap means injecting this spool as their
-        # `main_control`, which is a change to their composition rather than to
-        # this wrapper; it is deliberately left out of the additive-by-design
-        # step above. `tests/test_behavior_nervous_composition.py` pins the gap
-        # so it cannot quietly become permanent.
+        # This patch lands AFTER `_compose_run_seam` builds the two state riders
+        # (`SenseAvailabilityDriver` -> `senses`, `IntentDriver` -> `intents`),
+        # yet both mirror their keys onto the bus all the same: they were handed
+        # THIS very `spool` as `main_control` above, and each looks up
+        # `self._main.write_state` at TICK time rather than capturing a bound
+        # method at construction — so the wrapped writer is picked up regardless
+        # of the patch order (t14; pinned by
+        # `test_riders_pick_up_a_state_writer_patched_after_their_construction`
+        # and the strict-equality `test_the_retained_state_tree_equals_state_json_
+        # including_rider_keys`). This is what closes the h21/c36 gap the prior
+        # revision only pinned: the retained `reachy/state/*` tree now equals the
+        # on-disk `state.json`, `senses` and `intents` included. The probe path
+        # composes NO riders, so it still mirrors only the engine snapshot.
         publisher = getattr(resources, "publisher", None)
         if publisher is not None:
             spool.write_state = publisher.state_writer(spool.write_state)
