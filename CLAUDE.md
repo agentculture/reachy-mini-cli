@@ -426,9 +426,15 @@ a stale value makes the linter lie in one direction or the other.
   decisions, not conveniences: the voice is `harmonic` (in-process, offline —
   deliberately NOT `speech/voice.py`'s own `tts` default, so a box with
   nothing reachable still speaks); playback defaults to the daemon's `http`
-  route (the media-profile SDK client is unconstructable on the robot today,
-  issue #94 — `REACHY_SPEECH_TRANSPORT=sdk` flips it back with no code
-  change); and a persistently dead sink latches off for 30 s and RETRIES
+  route — not because the SDK path is broken (issue #94 is CLOSED: measured
+  2026-07-23, `HeldMediaClient` warms in 1032 ms and delivers 9/10 camera
+  frames plus live mic audio on every boot) but because the daemon and the
+  runtime hold `/dev/snd/pcmC2D0p` **simultaneously**, through the
+  `reachymini_audio_sink` ALSA plugin device (`~/.asoundrc`) — the
+  single-SDK-owner model constrains the *media session*, not the *ALSA sink*,
+  so the daemon route was never in contention with the runtime's held client
+  (`REACHY_SPEECH_TRANSPORT=sdk` flips it back with no code change); and a
+  persistently dead sink latches off for 30 s and RETRIES
   (time-bounded, unlike `AgentTurnEngine`'s permanent latch, because a
   boot-persistent robot must survive a daemon restart un-muted).
   `mute_until()` is wired at composition into `TranscriptSenseDriver`'s
@@ -1078,6 +1084,30 @@ disables only the tool; cognition keeps running.
   reader (one logged warning) when `[sdk]` is absent, so `_compose_run_seam`
   composes the pat stack unconditionally rather than gating on an SDK-import
   probe.
+- **Events-cli decision record (nervous-system arc, not yet shipped).** The
+  runtime's coming MQTT publisher leg (the `reachy/events/{source}/{type}` +
+  retained `reachy/state/{key}` fan-out) settles two dependency questions
+  ahead of the build, both 2026-07-24 user decisions:
+  - **The broker is owned by the sibling `events-cli` project, not this
+    repo.** `reachy-mini-cli` ships no compose file and never operates
+    Mosquitto — it consumes `REACHY_MQTT_URL` (default `localhost:1883`)
+    exactly as it already consumes the lobes gateway and the STT/TTS
+    services, and degrades gracefully (one named `senselog.drop`, zero
+    errors) when the broker is absent. Our consumer requirements (direct
+    MQTT port access, loopback bind, retained + LWT + QoS0) are filed on
+    `agentculture/events-cli#3` so the two arcs parallelize.
+  - **The client is `events-cli` the package, imported — never `paho-mqtt`
+    or any MQTT library directly.** The transport underneath (`paho`, or a
+    complete no-deps rewrite) is events-cli's internal concern once outside
+    this repo. This is an explicit amendment to the keep-base-light rule
+    above: **once events-cli publishes its first wheel**, `events-cli`
+    becomes a **third** base runtime dependency, joining `numpy` and
+    `harmonics-cli` (pure wheel, `py>=3.12` — the composition unblock; `uv
+    lock` rides the same change). **As of this writing that wheel does not
+    exist yet** — `events-cli` is NOT in `pyproject.toml`, and the publisher
+    module codes against an injected client seam precisely so its tests run
+    on a fake today and composition binds the real import in one line once
+    the dependency lands.
 - **Python ≥ 3.12** (uses `X | None`, `tomllib`, etc.).
 - **Every PR bumps the version**, even docs/config/CI-only changes — the
   `version-check` CI job blocks the merge otherwise (it compares
