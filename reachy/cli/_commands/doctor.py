@@ -7,7 +7,21 @@ Mirrors the two invariants ``steward doctor`` verifies for a mesh agent:
 * **backend-consistency** — the declared ``backend`` matches the prompt file
   (``claude`` → ``CLAUDE.md``, ``acp`` → ``AGENTS.md``, ``gemini`` → ``GEMINI.md``).
 
-Plus a **skills-present** check (the vendored ``.claude/skills/`` kit). Read-only.
+Plus a **skills-present** check (the vendored ``.claude/skills/`` kit) and a
+**sense_extras** check (issue #120a) — whether the ``[vision]`` extra (opencv)
+is importable, which is what the behavior runtime's ``face`` /
+``frame_available`` senses need. That last one is this module's first
+cross-cutting concern: `doctor` is otherwise identity-only and imports nothing
+from ``reachy.behavior`` / ``reachy.robot``, so the check stays a light
+import-PROBE (``importlib.util.find_spec``) rather than pulling in the sense
+stack. Read-only.
+
+**Why sense_extras exists.** A box installed without ``[vision]`` degrades
+``face``/``frame_available`` to permanently ``None`` after exactly one latched
+boot warning (``reachy/behavior/face_sense.py``) — the camera hardware is
+healthy the whole time, but nothing observable says so. That single boot line
+was the only evidence anywhere on a deployed robot for weeks (issue #120).
+``doctor`` now makes it a standing, queryable diagnostic instead.
 
 Reports the rubric-shaped contract
 ``{healthy, checks: [{id, passed, severity, message, remediation}]}`` so the
@@ -19,6 +33,8 @@ exits 0 — there is nothing to diagnose.
 from __future__ import annotations
 
 import argparse
+from importlib.util import find_spec as _find_spec
+from typing import Callable
 
 from reachy.cli._commands.whoami import find_culture_yaml, read_agent_fields
 from reachy.cli._output import emit_result
@@ -30,8 +46,46 @@ _PROMPT_FILE = {
     "gemini": "GEMINI.md",
 }
 
+# The two working install forms for the [vision] extra, cited verbatim in the
+# sense_extras remediation. `uv tool install` has NO `--extra` flag — it fails
+# with `unexpected argument '--extra'` — so extras must live inside the
+# requirement spec instead; the natural-looking `--extra vision` silently
+# isn't a thing, which is how the deployed box in issue #120 ended up without
+# the extra in the first place. Keep both forms; do not "simplify" to one.
+_PIP_INSTALL_FORM = "pip install 'reachy-mini-cli[vision]'"
+_UV_TOOL_INSTALL_FORM = 'uv tool install --force --editable ".[daemon,vision]"'
 
-def _diagnose() -> dict[str, object]:
+
+def _cv2_available() -> bool:
+    """Whether the ``[vision]`` extra (opencv) is importable.
+
+    An import PROBE via :func:`importlib.util.find_spec` — never a real
+    ``import cv2`` — so calling this costs nothing even on the default,
+    identity-only ``doctor`` path. Mirrors the probe
+    ``reachy/behavior/face_sense.py``'s :func:`build_face_recognition` uses.
+    A malformed parent package on the path can raise from ``find_spec``
+    itself; that is treated the same as "not installed" rather than crashing
+    ``doctor``.
+    """
+    try:
+        return _find_spec("cv2") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _diagnose(*, cv2_probe: Callable[[], bool] | None = None) -> dict[str, object]:
+    """Run every check and return the rubric-shaped report.
+
+    ``cv2_probe`` is an injection seam for the ``sense_extras`` check
+    (issue #120a): pass a fake callable in a test instead of simulating a
+    missing module by evicting ``sys.modules`` entries, which pollutes
+    sibling tests under ``pytest -n auto``. Left ``None`` (the default), the
+    module-level :func:`_cv2_available` is looked up **fresh at call time**
+    (a plain name reference in the function body, not a bound default
+    argument) — so a test may equally ``monkeypatch.setattr`` that module
+    attribute and drive the real CLI entry point (``cmd_doctor`` / ``main``)
+    end to end, still without touching ``sys.modules``.
+    """
     cfg = find_culture_yaml()
     if cfg is None:
         check = {
@@ -88,6 +142,33 @@ def _diagnose() -> dict[str, object]:
             ),
             "remediation": (
                 "" if has_skills else "vendor the skill kit (see docs/skill-sources.md)"
+            ),
+        }
+    )
+
+    # 3. sense_extras: the [vision] extra (opencv) the face/frame_available
+    # senses need (issue #120a — see the module docstring for why this exists).
+    probe = cv2_probe if cv2_probe is not None else _cv2_available
+    has_cv2 = bool(probe())
+    checks.append(
+        {
+            "id": "sense_extras",
+            "passed": has_cv2,
+            "severity": "warning",
+            "message": (
+                "[vision] extra (opencv) installed; face/frame_available senses available"
+                if has_cv2
+                else "[vision] extra (opencv) missing; face/frame_available senses stay "
+                "permanently unavailable (issue #120)"
+            ),
+            "remediation": (
+                ""
+                if has_cv2
+                else (
+                    f"{_PIP_INSTALL_FORM}; on a `uv tool install` deploy, note it has no "
+                    f"--extra flag — put extras inside the requirement spec instead: "
+                    f"{_UV_TOOL_INSTALL_FORM}"
+                )
             ),
         }
     )
