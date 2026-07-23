@@ -81,6 +81,18 @@ noise). A driver built with no recognizer is fully functional otherwise: it
 spawns no worker, ``face`` stays permanently ``None``, and ``frame_available``
 keeps working — the frame-validity leg is numpy-only and needs no cv2 at all.
 
+That once-only warning is the right LOG policy and it stays exactly as it was.
+Issue #120 is what happens when it is the ONLY copy of the fact: the deployed
+box lacked the extra, logged its one line at boot, and six hours of journal
+afterwards held nothing distinguishing "no face has been in view" from "this
+sense has been dead since boot". So the *reason* is now also readable as a
+value — :func:`vision_unavailable_reason` and
+:func:`face_recognition_unavailable_reason` return the NAMED strings
+:data:`VISION_EXTRA_ABSENT` / :data:`VISION_STACK_UNAVAILABLE`, which
+:mod:`reachy.behavior.sense_availability` publishes into the runtime's standing
+``state.json``. Same discipline as ``senselog.drop``: a dead sense always names
+its reason.
+
 Every other failure degrades the same way, never raising out of the driver or a
 provider (mirroring :class:`reachy.behavior.pat_sense.PatSenseDriver` and
 :func:`reachy.behavior.sense._peek`): a raising media client, a raising
@@ -139,6 +151,58 @@ _VALID_CHANNELS = (1, 3, 4)
 #: because the extra's absence is a property of the process, not of a driver.
 _VISION_WARNED = False
 
+#: NAMED reason: the ``[vision]`` extra (opencv) is not installed at all. The
+#: string an operator can act on — ``pip install 'reachy-mini-cli[vision]'`` —
+#: and the exact value issue #120's deployed box would have reported.
+VISION_EXTRA_ABSENT = "vision-extra-absent"
+
+#: NAMED reason: opencv IS importable but the recognizer pair could not be
+#: built (a broken vision stack, missing model files, ...). A *different* fact
+#: from the one above and a different fix, so it gets its own name rather than
+#: being folded into it.
+VISION_STACK_UNAVAILABLE = "vision-stack-unavailable"
+
+
+def vision_unavailable_reason(find_spec: Callable[[str], object] | None = None) -> str | None:
+    """:data:`VISION_EXTRA_ABSENT` when opencv is absent, else ``None``.
+
+    The probe half of the degradation contract, exposed as a VALUE so the fact
+    outlives the one-shot boot warning (issue #120 — see the module docstring).
+    Pure: no import of cv2, no side effect, no latch consulted or set, so it is
+    equally correct before :func:`build_face_recognition` has ever run and long
+    after its warning has been spent.
+
+    ``find_spec`` is the injectable seam (a test drives both directions with no
+    install); ``None`` resolves the module-level probe **at call time**, so
+    monkeypatching ``face_sense._find_spec`` works too. A default ARGUMENT would
+    bind the function object at definition time and silently ignore the
+    monkeypatch — the same trap ``EngagementClassifier``'s ``complete_fn=None``
+    avoids.
+    """
+    probe = _find_spec if find_spec is None else find_spec
+    return VISION_EXTRA_ABSENT if probe("cv2") is None else None
+
+
+def face_recognition_unavailable_reason(
+    recognizer_ready: bool, *, find_spec: Callable[[str], object] | None = None
+) -> str | None:
+    """The NAMED reason the ``face`` cue cannot recognise anyone, or ``None``.
+
+    Precedence is deliberate and load-bearing: a MISSING extra is reported ahead
+    of a failed build, because the missing extra is *why* the build failed and is
+    the only one of the two an operator can fix with one install. ``[vision]``
+    present but ``recognizer_ready`` false is then a genuinely different fault
+    and says so.
+
+    :param recognizer_ready: whether :func:`build_face_recognition` returned a
+        pair (the composition root knows; this module deliberately does not
+        cache it, so no stale answer can survive a rebuild).
+    """
+    reason = vision_unavailable_reason(find_spec=find_spec)
+    if reason is not None:
+        return reason
+    return None if recognizer_ready else VISION_STACK_UNAVAILABLE
+
 
 def usable_frame(frame: object) -> bool:
     """Whether *frame* is an image a detector could actually consume.
@@ -183,7 +247,9 @@ def build_face_recognition(
     are passed through for test isolation when given.
     """
     global _VISION_WARNED  # noqa: PLW0603 — one process-wide warning, by design
-    if _find_spec("cv2") is None:
+    # The SAME probe the availability block reads, so the boot log and the
+    # standing `state.json` reason can never disagree about why face is dead.
+    if vision_unavailable_reason() is not None:
         if not _VISION_WARNED:
             _VISION_WARNED = True
             logger.warning(
@@ -587,8 +653,12 @@ class FaceSenseDriver:
 __all__ = [
     "FaceSenseDriver",
     "build_face_recognition",
+    "face_recognition_unavailable_reason",
     "usable_frame",
+    "vision_unavailable_reason",
     "DEFAULT_DETECT_INTERVAL",
     "DEFAULT_FRAME_TTL_S",
     "DEFAULT_REANNOUNCE_COOLDOWN",
+    "VISION_EXTRA_ABSENT",
+    "VISION_STACK_UNAVAILABLE",
 ]

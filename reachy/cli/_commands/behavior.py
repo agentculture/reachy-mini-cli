@@ -103,6 +103,7 @@ from reachy.behavior.sense import (
     read_doa,
     read_perception,
 )
+from reachy.behavior.sense_availability import SenseAvailabilityDriver, runtime_probes
 from reachy.behavior.speech_act import SpeechActuator
 from reachy.behavior.tick_metrics import TickMetrics, budget_from_hz
 from reachy.behavior.transcript_sense import TranscriptSenseDriver
@@ -1789,8 +1790,8 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
     Act-in seams (the ONE TickBus, in driver order)
     -----------------------------------------------
     ``[rules_driver, intent_driver, pat_driver, transcript_driver, face_driver,
-    self_motion, holder, goto_lane]`` (with a :class:`SenseSnapshotDriver`
-    appended when exporting):
+    self_motion, holder, goto_lane, availability]`` (with a
+    :class:`SenseSnapshotDriver` appended when exporting):
 
     * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
       decisions (admit/evict, drain the intent + goto command spools). The GOTO
@@ -1823,6 +1824,12 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
       it admits a goto. Running the holder first means a goto admitted THIS tick
       (from a command the intent driver just drained) seeds its minjerk start from
       this tick's freshest pose instead of last tick's stale one.
+    * ``availability`` — the per-sense structural availability block (#120b),
+      merged additively into the SAME ``state.json`` the engine's heartbeat
+      writes. Placed last among the always-on riders because it is a WRITER: the
+      engine publishes its own snapshot BEFORE the seam runs, so a rider that
+      augments the file wants to be the tick's final word. It reads nothing off
+      ``ctx``, so this is ordering hygiene rather than a correctness constraint.
     * ``SenseSnapshotDriver`` last (export only) — publishes the tick's perception
       snapshot on change; it reads the fixed ``ctx.sense`` so its position is
       immaterial, appended last so the sense block trails the decisions.
@@ -2045,6 +2052,17 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
         # carries the four intent defaults) so all five kinds share one registry.
         intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
 
+        # Per-sense availability into the standing `state.json` (#120b). A seam
+        # RIDER, not an `Engine.state()` key: which providers got wired, and
+        # whether each one's extra is installed, is composition-time knowledge
+        # the engine has no access to. It rides last so it is the tick's final
+        # writer, exactly as `engine.py`'s pre-seam state write invites.
+        availability = SenseAvailabilityDriver(
+            runtime_probes(
+                pat_composed=pat_driver is not None,
+                face_recognizer_ready=recognition is not None,
+            )
+        )
         drivers = [
             d
             for d in (
@@ -2056,6 +2074,7 @@ def _compose_run_seam(transport, config: EngineConfig, rules_driver, runtime_con
                 self_motion,
                 holder,
                 goto_lane,
+                availability,
             )
             if d is not None
         ]
