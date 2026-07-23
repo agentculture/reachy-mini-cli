@@ -45,7 +45,7 @@ import math
 import os
 import threading
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from reachy import senselog
 from reachy.behavior import control, library, liveness, reload_driver
@@ -1361,20 +1361,30 @@ def _make_state_reader() -> HeldStateReader:
     return HeldStateReader(allow_inline_connect=False)
 
 
-def _make_speech_actuator() -> SpeechActuator:
+def _make_speech_actuator(
+    *, media_session_provider: Callable[[], Any] | None = None
+) -> SpeechActuator:
     """Build the runtime's ONE voice — a test-injection seam.
 
     Everything about WHICH voice and WHICH speaker is resolved inside
     :class:`~reachy.behavior.speech_act.SpeechActuator` from the environment
-    (``REACHY_VOICE_ENGINE``, ``REACHY_SPEECH_TRANSPORT``), so this stays a bare
-    constructor call and a malformed variable fails at SETUP with a clean
-    ``CliError`` rather than mid-utterance on the worker thread.
+    (``REACHY_VOICE_ENGINE``, ``REACHY_SPEECH_TRANSPORT``), so this stays a
+    near-bare constructor call and a malformed variable fails at SETUP with a
+    clean ``CliError`` rather than mid-utterance on the worker thread.
+
+    The ONE thing the environment cannot supply is *media_session_provider*: the
+    voice's ``sdk`` route plays through the runtime's HELD media client rather
+    than opening a second one, and only composition knows that object. It
+    arrives as a LATE-BOUND zero-arg callable — resolved per utterance on the
+    speech worker — because this actuator is deliberately built BEFORE the media
+    client exists (see :func:`_compose_run_seam`).
 
     Unlike the two held SDK clients, the actuator is composed with no degrade
     path to worry about: its shipped voice is the in-process harmonic synth, so
-    a box with no ``[sdk]`` extra, no network and no TTS still has one.
+    a box with no ``[sdk]`` extra, no network and no TTS still has one, and a
+    provider that yields nothing falls back to the daemon ``http`` route.
     """
-    return SpeechActuator()
+    return SpeechActuator(media_session_provider=media_session_provider)
 
 
 #: ``(module, attribute)`` naming the **events-cli** client class — the ONE
@@ -2033,7 +2043,20 @@ def _compose_run_seam(
         # ever pays for thread creation, and so a malformed REACHY_VOICE_ENGINE /
         # REACHY_SPEECH_TRANSPORT is a clean startup error. `say()` is O(1) and
         # non-blocking; every slow leg (synthesis, playback) runs on its worker.
-        speech = _make_speech_actuator()
+        #
+        # Its speaker is the runtime's OWN held media client, not a second one
+        # (spec claim c16) — but that client is constructed further down, and the
+        # speech-first ordering above is deliberate and must not be swapped. So
+        # the seam is LATE-BOUND: this closure reads the `media` local at PLAY
+        # time, on the speech worker, by which point the holder is warm. A
+        # `None` (holder not up, no `[sdk]` extra, or a mid-run drop) means the
+        # daemon http route — never a second SDK client, which is the whole
+        # point. `getattr` keeps an injected fake holder without the accessor
+        # from raising; it simply reads as "no session".
+        def _held_media_session():
+            return getattr(media, "media_session", None) if media is not None else None
+
+        speech = _make_speech_actuator(media_session_provider=_held_media_session)
         speech.start()
         # The pat sense stack ships ON after the hands-on #80 gate finding: the
         # complete command must hold still before sensing, which removes wander

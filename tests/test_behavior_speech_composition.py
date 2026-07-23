@@ -111,8 +111,8 @@ def test_compose_run_seam_builds_starts_and_owns_a_speech_actuator(_isolated, mo
     built: list = []
     real_factory = behavior_mod._make_speech_actuator
 
-    def factory():
-        actuator = real_factory()
+    def factory(**kwargs):
+        actuator = real_factory(**kwargs)
         actuator._play = lambda pcm, *, samplerate: None
         built.append(actuator)
         return actuator
@@ -145,7 +145,7 @@ def test_the_speech_actuator_is_wired_into_the_rules_driver(_isolated, monkeypat
     monkeypatch.setattr(
         behavior_mod,
         "_make_speech_actuator",
-        lambda: type(
+        lambda **_kwargs: type(
             "_Stub",
             (),
             {
@@ -175,8 +175,8 @@ def test_the_actuator_self_mute_is_wired_into_the_transcript_driver(_isolated, m
     built: list = []
     real_factory = behavior_mod._make_speech_actuator
 
-    def factory():
-        actuator = real_factory()
+    def factory(**kwargs):
+        actuator = real_factory(**kwargs)
         actuator._play = lambda pcm, *, samplerate: None
         built.append(actuator)
         return actuator
@@ -227,7 +227,7 @@ def test_a_say_rule_makes_the_composed_runtime_speak_off_the_tick_thread(
     speaker = _RecordingPlay()
     actuators: list[SpeechActuator] = []
 
-    def factory():
+    def factory(**_kwargs):
         actuator = SpeechActuator(play=speaker)
         actuators.append(actuator)
         return actuator
