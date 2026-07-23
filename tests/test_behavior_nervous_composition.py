@@ -173,6 +173,22 @@ def _stable(lines: list[str]) -> list[dict]:
     return [_scrub(json.loads(line)) for line in lines]
 
 
+def _retained_state_tree(client) -> dict:
+    """Reassemble the retained ``reachy/state/*`` tree the way a subscriber would.
+
+    A retained topic carries its LAST value, so we fold the publish log keeping
+    the newest payload per topic. The publisher-owned ``online`` key is dropped —
+    it is availability metadata the runtime never writes to ``state.json`` (c36),
+    so it has no counterpart on disk to compare against.
+    """
+    tree: dict = {}
+    for p in client.published:
+        if p.topic.startswith("reachy/state/") and p.retain:
+            tree[p.topic.rsplit("/", 1)[-1]] = json.loads(p.payload)
+    tree.pop(M.ONLINE_KEY, None)
+    return tree
+
+
 # --------------------------------------------------------------------------- #
 # 1. Criterion 1 — composed on EVERY engine run, no flag                      #
 # --------------------------------------------------------------------------- #
@@ -515,18 +531,22 @@ def test_the_state_json_mirror_is_additive_to_the_disk_write(_isolated, monkeypa
         assert json.loads(retained[key]) == on_disk[key]
 
 
-def test_the_state_mirror_covers_the_engine_snapshot_but_not_the_seam_riders(
-    _isolated, monkeypatch
-):
-    """A KNOWN, deliberate limit — pinned so it cannot quietly become permanent.
+def test_the_retained_state_tree_equals_state_json_including_rider_keys(_isolated, monkeypatch):
+    """h21/c36, the positive form: the two surfaces MIRROR each other, byte-for-byte.
 
-    The mirror wraps the engine's own spool, so the engine's per-tick snapshot
-    reaches the retained tree. The two seam riders that additively augment the
-    SAME file — ``SenseAvailabilityDriver`` (``senses``) and ``IntentDriver``
-    (``intents``) — each construct their own ``CommandSpool``, so their
-    read-modify-write never passes through the wrapped object. Closing the gap
-    is a change to THEIR composition, not to the wrapper; until then this test
-    states exactly how far the mirror reaches.
+    This replaces t7's known-gap pin. The gap was that the two seam riders
+    (``SenseAvailabilityDriver`` -> ``senses``, ``IntentDriver`` -> ``intents``)
+    read-modify-wrote ``state.json`` through their OWN spool, so those keys
+    reached disk but never the bus. t14 injects the engine's
+    ``state_writer``-wrapped spool INSTANCE into both riders as their
+    ``main_control``, so every merged write now flows through the same wrapped
+    writer.
+
+    The assertion is strict EQUALITY, not a subset: the retained
+    ``reachy/state/*`` tree a late subscriber would reassemble (minus the
+    publisher-owned ``online`` key) equals the on-disk ``state.json`` — with
+    ``senses`` and ``intents`` present on BOTH. One builder, two transports, no
+    drift.
     """
     from reachy.behavior import control
     from reachy.behavior.sense_availability import STATE_KEY
@@ -535,15 +555,158 @@ def test_the_state_mirror_covers_the_engine_snapshot_but_not_the_seam_riders(
     assert main(["behavior", "engine", "run", "--max-ticks", "5"]) == 0
 
     on_disk = control.read_state()
-    assert STATE_KEY in on_disk, "t3's rider stopped writing its block to state.json"
-    retained_keys = {
-        p.topic.rsplit("/", 1)[-1] for p in client.published if p.topic.startswith("reachy/state/")
+    assert isinstance(on_disk, dict)
+    # The two rider keys are the whole point — assert they are on disk before
+    # comparing, so a rider silently going dark reads as a clear failure.
+    assert STATE_KEY in on_disk, "the availability rider stopped writing its block"
+    assert "intents" in on_disk, "the intent rider stopped writing its view"
+
+    assert _retained_state_tree(client) == on_disk
+
+
+def test_state_json_still_carries_the_full_three_way_disk_merge(_isolated, monkeypatch):
+    """No regression: the three writers still merge onto ONE file, all keys intact.
+
+    The engine snapshot (``updated``/``compose_hz``/``active``/``ownership``/
+    ``doa``), the availability rider (``senses``) and the intent rider
+    (``intents``) all land in the SAME ``state.json`` — injecting the shared
+    spool changed WHERE their writes are also mirrored, never WHETHER they reach
+    disk.
+    """
+    from reachy.behavior import control
+
+    _inject_client(monkeypatch, FakeEventsClient())
+    assert main(["behavior", "engine", "run", "--max-ticks", "5"]) == 0
+
+    on_disk = control.read_state()
+    assert set(on_disk) >= {
+        "updated",
+        "compose_hz",
+        "active",
+        "ownership",
+        "doa",
+        "senses",
+        "intents",
     }
-    assert {"active", "ownership", "compose_hz", "updated"} <= retained_keys
-    assert STATE_KEY not in retained_keys, (
-        "the rider-augmented block now reaches the bus — good, but update this test "
-        "and the KNOWN LIMIT note in cmd_engine_run deliberately"
+
+
+def test_the_probe_path_mirrors_only_the_engine_snapshot(_isolated, monkeypatch, tmp_path):
+    """Hazard 2, empirically: the observation-only probe composes NO riders.
+
+    ``--probe-mode`` is still an engine run, so the engine's own snapshot is
+    mirrored (it writes through the same wrapped spool). But the probe seam omits
+    ``IntentDriver`` and ``SenseAvailabilityDriver`` entirely, so ``senses`` and
+    ``intents`` have no writer and can never reach the retained tree there. The
+    ``main_control`` injection must not change that.
+    """
+    client = _inject_client(monkeypatch, FakeEventsClient())
+    output = tmp_path / "probe.jsonl"
+    assert (
+        main(
+            [
+                "behavior",
+                "engine",
+                "run",
+                "--probe-mode",
+                "held",
+                "--probe-output",
+                str(output),
+                "--max-ticks",
+                "5",
+            ]
+        )
+        == 0
     )
+    retained = _retained_state_tree(client)
+    assert "ownership" in retained, "the engine snapshot must still be mirrored on the probe path"
+    assert "senses" not in retained
+    assert "intents" not in retained
+
+
+def test_the_probe_seam_composes_no_state_riders(_isolated, monkeypatch):
+    """The composition-level companion to the run above (hazard 2).
+
+    Directly asserts the probe seam carries neither state rider, so the injection
+    change cannot silently push a rider — and its own spool — onto the probe
+    path.
+    """
+    from reachy.behavior.intents import IntentDriver
+    from reachy.behavior.sense_availability import SenseAvailabilityDriver
+
+    _inject_client(monkeypatch, FakeEventsClient())
+    _sense, tick_seam, resources = _compose(probe=("held", lambda record: None))
+    try:
+        drivers = _drivers_of(tick_seam)
+        offenders = [
+            type(d).__name__
+            for d in drivers
+            if isinstance(d, (IntentDriver, SenseAvailabilityDriver))
+        ]
+        assert offenders == [], offenders
+    finally:
+        resources.close()
+
+
+class _MinimalIntentCtx:
+    """The smallest ``ctx`` ``IntentDriver.on_tick`` touches with an empty spool,
+    no standing goal and no inhibitions — it never dereferences these, but a
+    stub keeps the tick honest rather than relying on that."""
+
+    now = 0.0
+    tick = 0
+
+    def active_names(self):
+        return []
+
+    def emit(self, _event):
+        return None
+
+
+def test_riders_pick_up_a_state_writer_patched_after_their_construction(tmp_path, monkeypatch):
+    """Hazard 1, proven not assumed: the patch lands AFTER the riders are built.
+
+    ``cmd_engine_run`` constructs the riders inside ``_compose_run_seam`` and
+    only THEN patches ``spool.write_state`` with the publisher's
+    ``state_writer``. Because each rider looks up ``self._main.write_state`` at
+    TICK time (never captures a bound method at construction), a patch applied
+    after construction is still picked up. A rider that snapshotted the writer
+    early would miss it — and this test would fail. Asserted against a REAL
+    ``NervousPublisher`` + fake client, so the merged payloads genuinely reach
+    the bus.
+    """
+    monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
+    from reachy.behavior import control
+    from reachy.behavior.intents import IntentDriver
+    from reachy.behavior.sense_availability import (
+        STATE_KEY,
+        SenseAvailabilityDriver,
+        runtime_probes,
+    )
+    from reachy.export.mqtt import NervousPublisher
+
+    spool = control.CommandSpool()
+    # Build BOTH riders holding the shared spool, while write_state is still the
+    # plain bound method.
+    availability = SenseAvailabilityDriver(
+        runtime_probes(pat_composed=True, face_recognizer_ready=False),
+        main_control=spool,
+    )
+    intents = IntentDriver(main_control=spool)
+
+    # Now patch the instance, exactly as cmd_engine_run does — AFTER construction.
+    client = FakeEventsClient()
+    publisher = NervousPublisher(client)
+    publisher.start()
+    spool.write_state = publisher.state_writer(spool.write_state)
+    try:
+        availability(None)
+        intents.on_tick(_MinimalIntentCtx())
+    finally:
+        publisher.stop()
+
+    retained = _retained_state_tree(client)
+    assert STATE_KEY in retained, "availability write did not reach the post-patch writer"
+    assert "intents" in retained, "intents write did not reach the post-patch writer"
 
 
 def test_the_state_mirror_survives_a_dead_bus(_isolated, monkeypatch):
