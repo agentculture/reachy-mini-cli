@@ -124,6 +124,13 @@ EVENT_OVERRUN_SUMMARY = "overrun-summary"
 #: streak it lands inside.
 SPIKE_MULTIPLIER = 5.0
 
+#: Consecutive in-budget ticks required before an overrun episode is declared
+#: over.  One is not enough: measured on the live robot the loop alternates
+#: over/under budget, so single-tick closing produced 3-4 tick episodes and
+#: TWO log lines each (entry + summary) -- 578 summaries in 60 s, defeating the
+#: whole point of #121.  At 50 Hz this is one second of calm.
+DEFAULT_CALM_TICKS_TO_CLOSE = 50
+
 
 def _noop_emit(_event: dict) -> None:
     """Default ``.emit`` when the wrapped seam exposes none."""
@@ -174,12 +181,15 @@ class TickMetrics:
         *,
         budget_s: float,
         duration_clock: Callable[[], float] = time.perf_counter,
+        calm_ticks_to_close: int = DEFAULT_CALM_TICKS_TO_CLOSE,
     ) -> None:
         self._inner = inner
         self.budget_s = budget_s
         self._duration_clock = duration_clock
         self.overruns = 0
         # -- open-episode state (#121, ported #99 shape) ------------------ #
+        self._calm_ticks_to_close = max(1, int(calm_ticks_to_close))
+        self._calm_ticks = 0
         self._streak_open = False
         self._streak_ticks = 0
         self._streak_sum_ms = 0.0
@@ -203,9 +213,20 @@ class TickMetrics:
             elapsed = self._duration_clock() - start
             if elapsed > self.budget_s:
                 self.overruns += 1
+                self._calm_ticks = 0
                 self._record_overrun(ctx, elapsed)
             else:
-                self._close_episode()
+                # HYSTERESIS -- load-bearing, measured on the live robot.
+                # Closing an episode on the FIRST in-budget tick makes the
+                # suppression useless in the real regime: ticks alternate
+                # over/under budget, so streaks are 3-4 ticks long and each
+                # one costs an entry line PLUS a summary line -- 578 summaries
+                # in 60 s on spark-f8a9, worse per streak than the single line
+                # it replaced.  A streak is only really over once the loop has
+                # stayed inside budget for a while.
+                self._calm_ticks += 1
+                if self._calm_ticks >= self._calm_ticks_to_close:
+                    self._close_episode()
 
     # -- episode bookkeeping (#121) ---------------------------------------- #
 

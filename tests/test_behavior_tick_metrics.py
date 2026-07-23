@@ -205,7 +205,11 @@ def test_a_fast_tick_between_two_slow_ticks_closes_and_reopens_a_streak(caplog) 
     # tick1 slow (0.03) opens a streak + entry line; tick2 fast (0.001) closes
     # it + summary line; tick3 slow (0.029) opens a NEW streak + entry line.
     clock = _DurationClock([0.030, 0.001, 0.029])
-    metrics = TickMetrics(lambda _ctx: None, budget_s=budget_s, duration_clock=clock)
+    # calm_ticks_to_close=1: this test is about the open/close mechanic itself,
+    # not about the shipped hysteresis (pinned by the alternating-regime test).
+    metrics = TickMetrics(
+        lambda _ctx: None, budget_s=budget_s, duration_clock=clock, calm_ticks_to_close=1
+    )
 
     with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
         _run(metrics, [0.030, 0.001, 0.029])
@@ -288,7 +292,9 @@ def test_closing_summary_carries_count_mean_and_max_vs_budget(caplog) -> None:
     # Three overruns (21, 30, 24 ms) then one fast tick (5ms) closes the streak.
     durations = [0.021, 0.030, 0.024, 0.005]
     clock = _DurationClock(durations)
-    metrics = TickMetrics(lambda _ctx: None, budget_s=budget_s, duration_clock=clock)
+    metrics = TickMetrics(
+        lambda _ctx: None, budget_s=budget_s, duration_clock=clock, calm_ticks_to_close=1
+    )
 
     with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
         _run(metrics, durations)
@@ -314,7 +320,9 @@ def test_overruns_counter_is_exact_regardless_of_suppression(caplog) -> None:
     # (a second streak).
     durations = [0.025] * 50 + [0.005] * 10 + [0.03] * 5
     clock = _DurationClock(durations)
-    metrics = TickMetrics(lambda _ctx: None, budget_s=budget_s, duration_clock=clock)
+    metrics = TickMetrics(
+        lambda _ctx: None, budget_s=budget_s, duration_clock=clock, calm_ticks_to_close=10
+    )
 
     with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
         _run(metrics, durations)
@@ -544,3 +552,26 @@ def test_bounded_run_with_a_fast_driver_emits_no_overrun_lines(caplog) -> None:
     assert fast_calls["n"] == 5
     assert _sense_lines(caplog) == []
     assert metrics.overruns == 0
+
+
+def test_the_live_alternating_regime_stays_one_episode(caplog) -> None:
+    """The regime measured on the robot, which single-tick closing got wrong.
+
+    Ticks alternate over/under budget rather than overrunning in long blocks.
+    With ``calm_ticks_to_close=1`` this produced a 3-4 tick episode -- and TWO
+    lines per episode -- roughly every 5 ticks: 578 summaries in 60 s live,
+    worse per episode than the single line #121 set out to replace. With the
+    shipped hysteresis the whole run is ONE episode.
+    """
+    budget_s = 0.02
+    # 600 ticks: 4 over, 1 under, repeating -- the shape seen in the journal.
+    durations = ([0.021] * 4 + [0.010]) * 120
+    clock = _DurationClock(durations)
+    metrics = TickMetrics(lambda _ctx: None, budget_s=budget_s, duration_clock=clock)
+
+    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+        _run(metrics, durations)
+
+    assert metrics.overruns == 480  # every overrunning tick still counted
+    assert len(_overrun_lines(caplog)) == 1  # one entry for the whole run
+    assert len(_summary_lines(caplog)) == 0  # never calm long enough to close
