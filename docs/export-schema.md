@@ -497,8 +497,9 @@ every publish a silent no-op and the app runs unaffected), tightened with this
 repo's senselog discipline: nothing here may ever raise into the 50 Hz tick
 thread, and nothing here may ever fail *silently*.
 
-Every fault path resolves to one `[SENSE stage=nervous source=mqtt
-event=<id>] dropped reason=<reason>` line — greppable, and named from a fixed
+Every fault path resolves to one
+`[SENSE stage=nervous source=mqtt event=<id>] dropped reason=<reason>`
+line — greppable, and named from a fixed
 vocabulary (`no-client`, `client-incompatible`, `connect-failed`,
 `broker-unreachable`, `publish-failed`, `unserializable-payload`,
 `state-key-reserved`, `state-not-a-mapping`, `unknown-event-type`,
