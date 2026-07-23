@@ -575,3 +575,36 @@ def test_the_live_alternating_regime_stays_one_episode(caplog) -> None:
     assert metrics.overruns == 480  # every overrunning tick still counted
     assert len(_overrun_lines(caplog)) == 1  # one entry for the whole run
     assert len(_summary_lines(caplog)) == 0  # never calm long enough to close
+
+
+def test_a_long_open_episode_checkpoints_instead_of_going_silent(caplog) -> None:
+    """A never-closing episode must still report itself.
+
+    With hysteresis the live engine legitimately never closes its episode, so
+    without a checkpoint the journal shows ONE line at boot and nothing after —
+    an operator cannot tell a healthy engine from one wedged in permanent
+    overrun. That is the silent-no-op class #120 was about; do not trade the
+    flood for silence.
+    """
+    budget_s = 0.02
+    durations = [0.021] * 1000
+    clock = _DurationClock(durations)
+    metrics = TickMetrics(
+        lambda _ctx: None,
+        budget_s=budget_s,
+        duration_clock=clock,
+        checkpoint_every_ticks=250,
+    )
+
+    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+        _run(metrics, durations)
+
+    checkpoints = [
+        r.getMessage() for r in caplog.records if "event=overrun-ongoing" in r.getMessage()
+    ]
+    assert len(checkpoints) == 4  # 1000 ticks / 250
+    assert "overrun streak ongoing" in checkpoints[0]
+    assert "count=250" in checkpoints[0]
+    assert len(_overrun_lines(caplog)) == 1  # still just the one entry line
+    assert len(_summary_lines(caplog)) == 0  # never closed
+    assert metrics.overruns == 1000

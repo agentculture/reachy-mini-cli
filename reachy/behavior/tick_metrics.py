@@ -117,6 +117,11 @@ EVENT_OVERRUN = "overrun"
 #: substring match) — see the module docstring's streak-summary bullet.
 EVENT_OVERRUN_SUMMARY = "overrun-summary"
 
+#: Emitted periodically while an overrun episode is still OPEN, so a long-lived
+#: episode reports itself instead of going silent.  Distinct token from
+#: ``overrun-summary`` so a grep can tell "still going" from "ended".
+EVENT_OVERRUN_CHECKPOINT = "overrun-ongoing"
+
 #: A tick this many times over budget always reports immediately, even
 #: mid-streak — the spike-bypass rule that keeps the 425-1213 ms startup-stall
 #: class (21x-61x over budget, see ``docs/verification/
@@ -130,6 +135,13 @@ SPIKE_MULTIPLIER = 5.0
 #: TWO log lines each (entry + summary) -- 578 summaries in 60 s, defeating the
 #: whole point of #121.  At 50 Hz this is one second of calm.
 DEFAULT_CALM_TICKS_TO_CLOSE = 50
+
+#: Ticks between checkpoint lines while an episode is still open.  With
+#: hysteresis a live engine can legitimately never close its episode, and a
+#: journal that then shows ONE line at boot and nothing after cannot
+#: distinguish a healthy engine from one wedged in permanent overrun.  At
+#: 50 Hz this is one line every 30 seconds.
+DEFAULT_CHECKPOINT_EVERY_TICKS = 1500
 
 
 def _noop_emit(_event: dict) -> None:
@@ -182,6 +194,7 @@ class TickMetrics:
         budget_s: float,
         duration_clock: Callable[[], float] = time.perf_counter,
         calm_ticks_to_close: int = DEFAULT_CALM_TICKS_TO_CLOSE,
+        checkpoint_every_ticks: int = DEFAULT_CHECKPOINT_EVERY_TICKS,
     ) -> None:
         self._inner = inner
         self.budget_s = budget_s
@@ -189,6 +202,7 @@ class TickMetrics:
         self.overruns = 0
         # -- open-episode state (#121, ported #99 shape) ------------------ #
         self._calm_ticks_to_close = max(1, int(calm_ticks_to_close))
+        self._checkpoint_every_ticks = max(1, int(checkpoint_every_ticks))
         self._calm_ticks = 0
         self._streak_open = False
         self._streak_ticks = 0
@@ -254,6 +268,14 @@ class TickMetrics:
         self._streak_end_tick = tick
         if opening or is_spike:
             self._log_overrun(tick, elapsed_ms, budget_ms)
+        elif self._streak_ticks % self._checkpoint_every_ticks == 0:
+            # A long-lived episode must not go SILENT.  With hysteresis the
+            # live engine legitimately never closes its episode, so without
+            # this the journal shows one line at boot and nothing ever after
+            # -- an operator cannot tell a healthy engine from one wedged in
+            # permanent overrun.  That is the same silent-no-op class #120 was
+            # about, so the episode reports itself periodically while open.
+            self._emit_summary(event=EVENT_OVERRUN_CHECKPOINT, verb="ongoing")
 
     def _close_episode(self) -> None:
         """Emit the closing summary for an open streak, then reset it.
@@ -269,14 +291,14 @@ class TickMetrics:
         self._emit_summary()
         self._reset_streak()
 
-    def _emit_summary(self) -> None:
+    def _emit_summary(self, *, event: str = EVENT_OVERRUN_SUMMARY, verb: str = "ended") -> None:
         budget_ms = self.budget_s * 1000.0
         mean_ms = self._streak_sum_ms / self._streak_ticks
         senselog.stage(
             STAGE,
             SOURCE,
-            EVENT_OVERRUN_SUMMARY,
-            f"overrun streak ended tick={self._streak_end_tick} "
+            event,
+            f"overrun streak {verb} tick={self._streak_end_tick} "
             f"count={self._streak_ticks} mean_ms={mean_ms:.2f} "
             f"max_ms={self._streak_max_ms:.2f} budget_ms={budget_ms:.2f}",
         )
