@@ -247,9 +247,41 @@ Every healthy start logs
 `dropped reason=broker-unreachable (no session after connect)` immediately
 followed by `connected`. Cosmetic, self-correcting, and exactly as filed.
 
+### PASS — the reTerminal panel renders live bus events (c27, h15)
+
+The t11 subscriber (`reterminal-cli`, PR #20) driven against this broker and
+this runtime, then read back off the physical e-paper:
+
+```json
+{"host": "reterminal-e1001.local",
+ "lines": {"1": ":| neutral",
+           "2": "04:40:35 listening… (quiet) | 04:40:34 speech on the left |…"}}
+```
+
+The panel read `reterminal / ready` beforehand; the operator confirmed the new
+content on the device by eye. Sound bearing arrives as a human-readable
+direction, the emoji folds to ASCII (the panel font cannot draw it), and the
+footer comes from retained state. `78 events, 7 renders, 0 duplicates (live)` —
+the at-least-once dedupe holding, and the render rate decoupled from the event
+rate.
+
+So the full chain is demonstrated end to end: **robot sense -> 50 Hz runtime ->
+MQTT bus -> subscriber -> physical panel**, across two repos and a device, with
+the single-consumer SDK media session held by exactly one process.
+
+Two faults surfaced only by running it live, neither reachable by any unit test:
+
+- a clean shutdown reported `lost the broker session; the panel now reads STALE`
+  and the summary ended `(stale)`, because paho fires `on_disconnect` for a
+  deliberate disconnect too and `summary()` ran after teardown. Fixed in
+  reterminal-cli with a test asserting the guard does not blunt the signal it
+  protects.
+- a short `--ticks` run can finish BEFORE the first messages arrive and report
+  `0 events` on a busy bus. A brief subscribe is therefore not a valid health
+  check; the re-run returned 81 events.
+
 ### Still deferred
 
 | criterion | why |
 |---|---|
-| reTerminal panel rendering live events (c27, h15) | the t11 subscriber is committed but unpushed/undeployed |
 | 30-minute soak, `.overruns` exact (h6 live half) | clock started 19:07:34; the tick runs a steady ~21.1 ms against a 20 ms budget (the accepted slow-tick posture), so overrun lines accrue continuously rather than as O(10) events |
