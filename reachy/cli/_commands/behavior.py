@@ -1808,6 +1808,106 @@ def _engagement_classifier():
         return None
 
 
+def _attach_nervous_system(drivers: list, runtime_consumer):
+    """Wire the publisher onto a driver list; return ``(publisher, consumers)``.
+
+    Shared by both composition paths because they wire it IDENTICALLY, and a
+    second copy of this is exactly how the two paths drift apart.
+
+    ``SenseSnapshotDriver`` is the one piece that costs a TICK, so it is the one
+    piece gated — on whether anything can actually consume it, never on
+    ``--export``. "Can consume" means the publisher could still publish at some
+    point in this run (``publishing_enabled``), NOT merely that a client object
+    exists: a client disabled at ``start()`` never publishes again, so paying a
+    tick to feed it is pure waste. Before the bus existed that condition and "is
+    ``--export`` set" were the same question; they no longer are, and using the
+    flag would leave the boot runtime (no ``--export``) publishing rules and
+    motions but no perception at all — exactly the transcript/face flips an
+    external subscriber exists to see. With BOTH a client and ``--export`` there
+    is still exactly ONE driver feeding two consumers.
+    """
+    publisher = _make_nervous_publisher()
+    consumers = [runtime_consumer] if runtime_consumer is not None else []
+    consumers.append(publisher.as_tick_consumer())
+    if runtime_consumer is not None or publisher.publishing_enabled:
+        drivers.append(SenseSnapshotDriver())
+    return publisher, consumers
+
+
+def _build_pat_sense_driver(reader) -> "PatSenseDriver":
+    """Build the pat sense driver for *reader*, applying only REAL overrides.
+
+    ``detector`` and ``hp_tau`` are passed ONLY when actually overridden.
+    Occupying a keyword with its own default looks like a no-op but is not: a
+    caller injecting its own detector or high-pass (every pet-runtime
+    integration test does) would collide on it. Env overrides must be additive —
+    absent env leaves the driver's own defaults alone.
+
+    The *reader* is constructed by the caller, not here: it is a held SDK client,
+    and the caller's failure path can only release what it already holds.
+    """
+    still_hold_s, still_eps = _pat_still_tuning()
+    pat_kwargs: dict = {
+        "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
+        "still_eps": still_eps,  # REACHY_PAT_STILL_EPS override (t2)
+    }
+    override = _pat_detector()
+    if override is not None:
+        pat_kwargs["detector"] = override  # REACHY_PAT_*_PRESS_DEG overrides
+    hp_tau = _pat_float_override(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
+    if hp_tau is not None:
+        pat_kwargs["hp_tau"] = hp_tau
+    release_after = _pat_float_override(_RELEASE_AFTER_ENV, RELEASE_AFTER_S)
+    if release_after is not None:
+        pat_kwargs["release_after_s"] = release_after
+    return PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
+
+
+def _compose_probe_seam(probe, config: EngineConfig, doa_poller, runtime_consumer):
+    """The ``--probe-mode`` composition: observation-only, its own early return.
+
+    Deliberately separate from the main seam rather than a branch inside it: it
+    omits rules, ordinary pat classification, intents, goto and the pose holder,
+    so almost nothing is shared beyond the pose reader and the bus. Keeping it
+    here means the main seam reads as one linear composition instead of one
+    wrapped in a large alternative.
+
+    The pose reader is still warmed at setup — the probe ticks at the same 50 Hz
+    and would take the same startup overrun otherwise.
+    """
+    reader = _make_state_reader()
+    keeper = publisher = None
+    try:  # release the held client if composition fails — see the main path's note
+        _warm_holder(reader, label="state")
+        shared_reader = SharedPoseReader(reader.read)
+        mode, probe_emit = probe
+        providers = SenseProviders()
+
+        def probe_sense_reader(t):
+            return read_perception(providers, base=doa_poller(t))
+
+        drivers = [
+            ProbeNamespaceGuard(control.CommandSpool(namespace=INTENT_NAMESPACE)),
+            ProbeDriver(mode, shared_reader, emit=probe_emit),
+        ]
+        # The nervous system rides the probe path too: `--probe-mode` is still an
+        # engine run, and "unconditional, no flag" admits no exception. It stays
+        # observation-only — the publisher reads the bus, it never drives anything.
+        publisher, consumers = _attach_nervous_system(drivers, runtime_consumer)
+        bus = TickBus(drivers=drivers, consumers=consumers)
+        keeper = _HolderKeeper([("state", reader)])
+        keeper.start()
+        metrics = TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))
+    except BaseException:
+        _RuntimeResources(pose_reader=reader, keeper=keeper, publisher=publisher).close()
+        raise
+    return (
+        probe_sense_reader,
+        metrics,
+        _RuntimeResources(pose_reader=reader, keeper=keeper, metrics=metrics, publisher=publisher),
+    )
+
+
 def _compose_run_seam(
     transport,
     config: EngineConfig,
@@ -2001,48 +2101,7 @@ def _compose_run_seam(
     doa_poller = DoaPoller(lambda: read_doa(transport))
 
     if probe is not None:
-        # Observation-only: no media owner, no sense providers, no acting
-        # drivers. The pose reader is still warmed at setup — the probe ticks at
-        # the same 50 Hz and would take the same startup overrun otherwise.
-        reader = _make_state_reader()
-        keeper = publisher = None
-        try:  # release the held client if composition fails — see the note below
-            _warm_holder(reader, label="state")
-            shared_reader = SharedPoseReader(reader.read)
-            mode, probe_emit = probe
-            providers = SenseProviders()
-
-            def probe_sense_reader(t):
-                return read_perception(providers, base=doa_poller(t))
-
-            drivers = [
-                ProbeNamespaceGuard(control.CommandSpool(namespace=INTENT_NAMESPACE)),
-                ProbeDriver(mode, shared_reader, emit=probe_emit),
-            ]
-            # The nervous system rides the probe path too: `--probe-mode` is
-            # still an engine run, and "unconditional, no flag" admits no
-            # exception. It stays observation-only — the publisher reads the
-            # bus, it never drives anything. See the main path below for why
-            # the SNAPSHOT DRIVER (and only it) is gated on a usable consumer.
-            publisher = _make_nervous_publisher()
-            consumers = [runtime_consumer] if runtime_consumer is not None else []
-            consumers.append(publisher.as_tick_consumer())
-            if runtime_consumer is not None or publisher.publishing_enabled:
-                drivers.append(SenseSnapshotDriver())
-            bus = TickBus(drivers=drivers, consumers=consumers)
-            keeper = _HolderKeeper([("state", reader)])
-            keeper.start()
-            metrics = TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))
-        except BaseException:
-            _RuntimeResources(pose_reader=reader, keeper=keeper, publisher=publisher).close()
-            raise
-        return (
-            probe_sense_reader,
-            metrics,
-            _RuntimeResources(
-                pose_reader=reader, keeper=keeper, metrics=metrics, publisher=publisher
-            ),
-        )
+        return _compose_probe_seam(probe, config, doa_poller, runtime_consumer)
 
     # Everything below OPENS resources (two held SDK clients, two worker-owning
     # drivers, the keeper thread, the audio pump thread). A raise part-way
@@ -2079,27 +2138,10 @@ def _compose_run_seam(
         # sensing. REACHY_PAT_SENSE=0 is the explicit sensing rollback.
         pat_driver = None
         if _pat_sense_enabled():
+            # The reader is built HERE, before anything else can raise, so the
+            # guard below releases a client it is guaranteed to be holding.
             reader = _make_state_reader()
-            still_hold_s, still_eps = _pat_still_tuning()
-            pat_kwargs: dict = {
-                "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
-                "still_eps": still_eps,  # REACHY_PAT_STILL_EPS override (t2)
-            }
-            # `detector` and `hp_tau` are passed ONLY when actually overridden.
-            # Occupying a keyword with its own default looks like a no-op but is
-            # not: a caller injecting its own detector or high-pass (every
-            # pet-runtime integration test does) would collide on it. Env overrides
-            # must be additive — absent env leaves the driver's own defaults alone.
-            override = _pat_detector()
-            if override is not None:
-                pat_kwargs["detector"] = override  # REACHY_PAT_*_PRESS_DEG overrides
-            hp_tau = _pat_float_override(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
-            if hp_tau is not None:
-                pat_kwargs["hp_tau"] = hp_tau
-            release_after = _pat_float_override(_RELEASE_AFTER_ENV, RELEASE_AFTER_S)
-            if release_after is not None:
-                pat_kwargs["release_after_s"] = release_after
-            pat_driver = PatSenseDriver(reader=reader.read, **pat_kwargs)  # default detector (#79)
+            pat_driver = _build_pat_sense_driver(reader)
 
         # The ONE media owner, and the senses that read through it (the face
         # driver here; the audio pair — rms and the transcript driver — through
@@ -2283,23 +2325,7 @@ def _compose_run_seam(
         # publish through `ctx.emit` and never touches the head, the media
         # session or the clock. That is why it does not appear in the driver
         # list above and why it cannot perturb the tick.
-        publisher = _make_nervous_publisher()
-        consumers = [runtime_consumer] if runtime_consumer is not None else []
-        consumers.append(publisher.as_tick_consumer())
-        # `SenseSnapshotDriver` is the one piece that costs a TICK, so it is the
-        # one piece gated — on whether anything can actually consume it, never
-        # on `--export`. "Can consume" means the publisher could still publish
-        # at some point in this run (`publishing_enabled`), NOT merely that a
-        # client object exists: a client disabled at `start()` never publishes
-        # again, so paying a tick to feed it is pure waste.
-        # Before the bus existed that condition and "is --export
-        # set" were the same question; they no longer are, and using the flag
-        # would leave the boot runtime (no `--export`) publishing rules and
-        # motions but no perception at all — exactly the transcript/face flips
-        # an external subscriber exists to see. With BOTH a client and
-        # `--export` there is still exactly ONE driver feeding two consumers.
-        if runtime_consumer is not None or publisher.publishing_enabled:
-            drivers.append(SenseSnapshotDriver())
+        publisher, consumers = _attach_nervous_system(drivers, runtime_consumer)
         bus = TickBus(drivers=drivers, consumers=consumers)
         metrics = TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))
         resources = _RuntimeResources(
