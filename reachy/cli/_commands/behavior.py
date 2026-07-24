@@ -1473,8 +1473,8 @@ def _make_events_client():
         return None
 
 
-def _make_nervous_publisher() -> tuple[NervousPublisher, object | None]:
-    """Build + start the nervous-system publisher; report its client alongside.
+def _make_nervous_publisher() -> NervousPublisher:
+    """Build + start the nervous-system publisher.
 
     Composed UNCONDITIONALLY — no flag, no env gate on whether to compose (only
     on WHERE to publish). That is load-bearing rather than tidy: the deployed
@@ -1483,15 +1483,16 @@ def _make_nervous_publisher() -> tuple[NervousPublisher, object | None]:
 
     ``start()`` is total (it configures the Last Will, connects, and reports one
     named drop for an absent/incompatible/unreachable broker), so there is
-    nothing to guard here. The client comes back too because it answers a
-    different question than "did we connect": whether a broker path exists AT
-    ALL for this process, which is what decides if a
-    :class:`~reachy.export.runtime.SenseSnapshotDriver` is worth a tick.
+    nothing to guard here. Whether a :class:`~reachy.export.runtime.
+    SenseSnapshotDriver` is worth a tick is then read off
+    :attr:`~reachy.export.mqtt.NervousPublisher.publishing_enabled` — which
+    answers "could this ever publish again?" rather than merely "is a client
+    object present", so a client that exists but was disabled at ``start()``
+    (connect raised, or an incompatible shape) correctly stops costing ticks.
     """
-    client = _make_events_client()
-    publisher = NervousPublisher(client)
+    publisher = NervousPublisher(_make_events_client())
     publisher.start()
-    return publisher, client
+    return publisher
 
 
 def _make_media_client() -> HeldMediaClient:
@@ -2023,10 +2024,10 @@ def _compose_run_seam(
             # exception. It stays observation-only — the publisher reads the
             # bus, it never drives anything. See the main path below for why
             # the SNAPSHOT DRIVER (and only it) is gated on a usable consumer.
-            publisher, events_client = _make_nervous_publisher()
+            publisher = _make_nervous_publisher()
             consumers = [runtime_consumer] if runtime_consumer is not None else []
             consumers.append(publisher.as_tick_consumer())
-            if runtime_consumer is not None or events_client is not None:
+            if runtime_consumer is not None or publisher.publishing_enabled:
                 drivers.append(SenseSnapshotDriver())
             bus = TickBus(drivers=drivers, consumers=consumers)
             keeper = _HolderKeeper([("state", reader)])
@@ -2282,18 +2283,22 @@ def _compose_run_seam(
         # publish through `ctx.emit` and never touches the head, the media
         # session or the clock. That is why it does not appear in the driver
         # list above and why it cannot perturb the tick.
-        publisher, events_client = _make_nervous_publisher()
+        publisher = _make_nervous_publisher()
         consumers = [runtime_consumer] if runtime_consumer is not None else []
         consumers.append(publisher.as_tick_consumer())
         # `SenseSnapshotDriver` is the one piece that costs a TICK, so it is the
         # one piece gated — on whether anything can actually consume it, never
-        # on `--export`. Before the bus existed that condition and "is --export
+        # on `--export`. "Can consume" means the publisher could still publish
+        # at some point in this run (`publishing_enabled`), NOT merely that a
+        # client object exists: a client disabled at `start()` never publishes
+        # again, so paying a tick to feed it is pure waste.
+        # Before the bus existed that condition and "is --export
         # set" were the same question; they no longer are, and using the flag
         # would leave the boot runtime (no `--export`) publishing rules and
         # motions but no perception at all — exactly the transcript/face flips
         # an external subscriber exists to see. With BOTH a client and
         # `--export` there is still exactly ONE driver feeding two consumers.
-        if runtime_consumer is not None or events_client is not None:
+        if runtime_consumer is not None or publisher.publishing_enabled:
             drivers.append(SenseSnapshotDriver())
         bus = TickBus(drivers=drivers, consumers=consumers)
         metrics = TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))

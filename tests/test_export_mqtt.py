@@ -810,3 +810,41 @@ def test_the_gate_never_suppresses_a_value_that_returns_to_an_earlier_one() -> N
 
     sent = {p.topic: json.loads(p.payload) for p in client.published}
     assert sent["reachy/state/mode"] == "idle"
+
+
+def test_a_failed_publish_is_retried_on_the_next_identical_snapshot() -> None:
+    """The change gate must not make a swallowed publish failure permanent.
+
+    `_publish_raw` deliberately tolerates `client.publish()` raising — that is
+    the seam's never-reach-the-tick contract. If the gate recorded the payload
+    as published anyway, the dropped message would be suppressed on every later
+    identical snapshot, leaving that retained topic stale or absent until its
+    value happened to change or a reconnect cleared the ledger. Retained state
+    has to be self-healing on the NEXT tick instead.
+    """
+    pub, client = _live_publisher()
+    state = {"updated": 1.0, "compose_hz": 50.0, "ownership": {"head": None}}
+    client.published.clear()  # drop the availability publish from connect
+
+    client.raise_on_publish = RuntimeError("transport hiccup")
+    pub.publish_state(dict(state))
+    assert _state_topics(client) == [], "nothing was accepted"
+
+    client.raise_on_publish = None
+    client.published.clear()
+    pub.publish_state(dict(state))  # the SAME state, unchanged
+
+    retried = {t for t in _state_topics(client)}
+    assert "reachy/state/compose_hz" in retried, "a dropped key must be retried"
+    assert "reachy/state/ownership" in retried
+    assert pub.failed_publishes > 0, "the failure was still named, not hidden"
+
+
+def test_a_key_accepted_once_is_still_not_republished_when_unchanged() -> None:
+    """The retry path must not blunt the gate it lives inside."""
+    pub, client = _live_publisher()
+    state = {"updated": 1.0, "compose_hz": 50.0}
+    pub.publish_state(dict(state))
+    client.published.clear()
+    pub.publish_state(dict(state))
+    assert _state_topics(client) == []

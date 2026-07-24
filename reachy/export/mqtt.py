@@ -362,6 +362,19 @@ class NervousPublisher:
         """True when publishes are no-ops (no client, or no live session)."""
         return self._disabled or not self._online
 
+    @property
+    def publishing_enabled(self) -> bool:
+        """Could this publisher EVER publish again in this process?
+
+        Distinct from :attr:`degraded` on purpose, and the distinction is the
+        whole point: "the broker is not up yet" is degraded but still enabled —
+        a session may land on any later tick — whereas an absent, incompatible
+        or unconstructable client is disabled for the life of the run and
+        nothing will change that. A caller deciding whether some per-tick work
+        is worth doing at all must read THIS, not ``degraded``.
+        """
+        return not self._disabled
+
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> bool:
@@ -550,17 +563,35 @@ class NervousPublisher:
                     elif self._published_state.get(segment) == payload:
                         continue
                 pending.append((segment, payload))
-                self._published_state[segment] = payload
         # Publish OUTSIDE the lock: each call is an O(1) enqueue by contract, but
         # the tick thread must never hold a lock across a client call.
-        for segment, payload in pending:
-            self._publish_raw(f"{self._state_root}/{segment}", payload, retain=True)
+        #
+        # The ledger is updated only for what was ACTUALLY accepted. Recording
+        # before publishing would make a swallowed publish failure permanent:
+        # the seam deliberately tolerates `publish()` raising, so a dropped
+        # message would still be marked delivered and every later identical
+        # snapshot suppressed — leaving that retained topic stale or absent
+        # until its value happened to change, or a reconnect cleared the
+        # ledger. Retained state must be self-healing on the NEXT tick.
+        delivered = [
+            (segment, payload)
+            for segment, payload in pending
+            if self._publish_raw(f"{self._state_root}/{segment}", payload, retain=True)
+        ]
+        if delivered:
+            with self._lock:
+                self._published_state.update(delivered)
 
-    def _publish_raw(self, topic: str, payload: str, *, retain: bool) -> None:
-        """The ONE call into the client. O(1) by the contract required of it."""
+    def _publish_raw(self, topic: str, payload: str, *, retain: bool) -> bool:
+        """The ONE call into the client. O(1) by the contract required of it.
+
+        Returns whether the client ACCEPTED the message. The retained-state gate
+        reads this: a message the client refused must not be recorded as
+        published, or the gate would suppress every retry of it.
+        """
         client = self._client
         if client is None or self._disabled:
-            return
+            return False
         try:
             client.publish(topic, payload, qos=QOS, retain=retain)
         except Exception as err:  # noqa: BLE001 - a publish must never reach the tick
@@ -569,8 +600,9 @@ class NervousPublisher:
                 REASON_PUBLISH_FAILED,
                 f"topic={topic} ({type(err).__name__}: {err})",
             )
-            return
+            return False
         self.published += 1
+        return True
 
     def _note_client_connected(self) -> None:
         """The optional ``set_on_connect`` seam — may run on the client's thread."""

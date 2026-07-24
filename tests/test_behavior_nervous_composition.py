@@ -887,3 +887,37 @@ def test_the_probe_seam_is_flushed_too(_isolated, monkeypatch):
         assert resources.metrics is tick_seam
     finally:
         resources.close()
+
+
+def test_a_permanently_disabled_publisher_does_not_cost_a_tick(_isolated, monkeypatch):
+    """A client that exists but was disabled at start() must not be fed.
+
+    `publisher.start()` hard-disables publishing for the whole run when the
+    client is incompatible or its `connect()` raises. Gating the snapshot driver
+    on "a client object exists" kept paying a tick to build snapshots that were
+    then dropped — the one degradation mode where the cost is pure waste. The
+    gate reads `publishing_enabled` instead, which answers "could this ever
+    publish again?"
+    """
+    client = FakeEventsClient()
+    client.raise_on_connect = RuntimeError("broker library exploded")
+    _inject_client(monkeypatch, client)
+
+    publisher = behavior_mod._make_nervous_publisher()
+    assert publisher.publishing_enabled is False, "a raising connect disables the run"
+    assert main(["behavior", "engine", "run", "--max-ticks", "3"]) == 0
+
+
+def test_a_broker_that_is_merely_not_up_yet_still_earns_its_tick(_isolated, monkeypatch):
+    """The distinction that makes the gate correct rather than merely cheaper.
+
+    "Not connected yet" is NOT "disabled": a session may land on any later tick,
+    and a runtime that stopped producing snapshots in the meantime would have
+    nothing to publish when it did.
+    """
+    client = FakeEventsClient(autoconnect=False)
+    _inject_client(monkeypatch, client)
+
+    publisher = behavior_mod._make_nervous_publisher()
+    assert publisher.publishing_enabled is True, "a quiet broker is not a disabled one"
+    assert publisher.degraded is True, "…though it IS degraded until a session lands"
