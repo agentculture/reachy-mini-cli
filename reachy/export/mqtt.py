@@ -109,6 +109,17 @@ ONLINE_PAYLOAD = "true"
 OFFLINE_PAYLOAD = "false"
 #: The ``{type}`` segment for a perception snapshot, which carries no action.
 SENSE_EVENT_TYPE = "snapshot"
+#: State keys that describe the state rather than BEING it, and so must not
+#: drive a publish on their own.
+#:
+#: ``updated`` is a per-tick timestamp: it differs on every single tick, so a
+#: plain per-key change gate would let it alone republish at the full tick rate
+#: and defeat the whole point (issue #126). Riding along with a substantive
+#: change instead gives the retained topic a sharper meaning than it had on
+#: disk — ``reachy/state/updated`` is *when the state last CHANGED*, which is
+#: what a last-value topic should carry. Liveness is NOT this topic's job and
+#: never was: that is retained ``reachy/state/online`` plus the Last Will.
+STATE_METADATA_KEYS: frozenset[str] = frozenset({"updated"})
 #: At-most-once for every topic: a dropped event under load matches the
 #: drop-don't-block ethos, and retained state is self-healing by retention.
 QOS = 0
@@ -318,6 +329,10 @@ class NervousPublisher:
         self._stopped = False
         self._reported: set[str] = set()
         self._last_state: dict | None = None
+        #: segment -> last SERIALIZED payload actually published on this session.
+        #: Cleared on every (re)connect: a fresh broker session holds none of our
+        #: retained values, so everything must go out again.
+        self._published_state: dict[str, str] = {}
         #: Observability counters (also what the O(1) tests read).
         self.published = 0
         self.failed_publishes = 0
@@ -485,17 +500,60 @@ class NervousPublisher:
             kind = _segment(getattr(event, "action", ""))
         return f"{self._events_root}/{_segment(block)}/{kind}"
 
-    def _publish_state_payload(self, state: dict) -> None:
+    def _encode_state(self, state: dict) -> dict[str, str]:
+        """Serialize each top-level key, naming (and skipping) what cannot go."""
+        encoded: dict[str, str] = {}
         for key, value in state.items():
             segment = _segment(key)
             if segment == ONLINE_KEY:
                 self._drop(REASON_RESERVED_STATE_KEY, f"key={key!r}")
                 continue
             try:
-                payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                encoded[segment] = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             except (TypeError, ValueError) as err:
                 self._drop(REASON_UNSERIALIZABLE, f"key={key!r} ({type(err).__name__})")
-                continue
+        return encoded
+
+    def _publish_state_payload(self, state: dict, *, force: bool = False) -> None:
+        """Publish the retained state tree, skipping keys that did not change.
+
+        The engine rewrites ``state.json`` every tick, so an ungated mirror
+        republished the whole tree at 50 Hz — measured live at 520 messages per
+        key per 10 s, of which ``compose_hz`` had ONE distinct value and
+        ``active`` had twenty (issue #126). Retained topics are persisted by the
+        broker and delivered to every subscriber, so that is disk churn and
+        wake-ups spent re-sending a value the topic already holds. A retained
+        topic is a LAST VALUE, and re-sending an identical last value is a no-op
+        with a cost.
+
+        *force* republishes everything regardless — the reconnect path needs it,
+        because a fresh broker session holds none of our retained values.
+        """
+        encoded = self._encode_state(state)
+        # Metadata keys ride along with a real change instead of driving one; see
+        # STATE_METADATA_KEYS for why a bare timestamp must not defeat the gate.
+        with self._lock:
+            # Nothing published yet on this session means there is nothing to
+            # REPEAT, so the first write always goes out whole — a gate that
+            # suppresses repeats must never suppress the original.
+            substantive_changed = not self._published_state or any(
+                self._published_state.get(segment) != payload
+                for segment, payload in encoded.items()
+                if segment not in STATE_METADATA_KEYS
+            )
+            pending: list[tuple[str, str]] = []
+            for segment, payload in encoded.items():
+                if not force:
+                    if segment in STATE_METADATA_KEYS:
+                        if not substantive_changed:
+                            continue
+                    elif self._published_state.get(segment) == payload:
+                        continue
+                pending.append((segment, payload))
+                self._published_state[segment] = payload
+        # Publish OUTSIDE the lock: each call is an O(1) enqueue by contract, but
+        # the tick thread must never hold a lock across a client call.
+        for segment, payload in pending:
             self._publish_raw(f"{self._state_root}/{segment}", payload, retain=True)
 
     def _publish_raw(self, topic: str, payload: str, *, retain: bool) -> None:
@@ -546,6 +604,10 @@ class NervousPublisher:
             # A fresh session earns a fresh report budget: a SECOND outage must
             # be named again rather than swallowed by the first one's latch.
             self._reported.clear()
+            # …and a fresh retained ledger: the broker we just (re)connected to
+            # holds none of our retained values, so nothing may be suppressed as
+            # "already published". The republish below is unconditional.
+            self._published_state.clear()
             cached = self._last_state
         senselog.stage(
             STAGE,
@@ -555,7 +617,10 @@ class NervousPublisher:
         )
         self._publish_raw(self._online_topic, ONLINE_PAYLOAD, retain=True)
         if cached is not None:
-            self._publish_state_payload(cached)
+            # force: a new session starts with an empty retained tree on the
+            # broker, so a late subscriber must receive every key even though
+            # none of them CHANGED from this publisher's point of view.
+            self._publish_state_payload(cached, force=True)
         return True
 
     def _disable(self, reason: str, extra: str = "") -> None:

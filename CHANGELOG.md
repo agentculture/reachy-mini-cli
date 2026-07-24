@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.1] - 2026-07-24
+
+### Fixed
+
+- **The retained `reachy/state/*` tree no longer republishes at tick rate (issue #126).** The engine rewrites `state.json` every tick, so the bus mirror inherited that rate and resent the whole retained tree at 50 Hz — measured on the live robot at 520 messages per key per 10 s, of which `compose_hz` had exactly ONE distinct value and `active` had twenty. Retained messages are persisted by the broker and delivered to every subscriber, so those were disk writes and consumer wake-ups spent re-sending a value the topic already held. A key is now published only when its serialized value changed. Measured live after the fix: state traffic fell from ~3584 to 55 messages per 10 s (~65x), and `state/active` publishes exactly 20 times — equal to the distinct-payload count measured independently beforehand, so the gate emits precisely the real changes.
+- Two deliberate exceptions keep that gate honest. `updated` is a per-tick timestamp, so it RIDES ALONG with a substantive change rather than triggering one — otherwise it alone would have republished at full tick rate and defeated the purpose; this also sharpens the retained topic's meaning to *when state last changed*, with liveness left to `state/online` + the Last Will. And every (re)connect republishes the whole tree unconditionally, as does the first publish of a session: a fresh broker session holds none of our retained values, so a gate that suppresses repeats must never suppress the original.
+
 ## [0.44.0] - 2026-07-24
 
 ### Added

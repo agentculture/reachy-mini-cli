@@ -458,6 +458,29 @@ next change. A value that fails to serialize (e.g. a stray binary field) is
 dropped by name (`reason=unserializable-payload`) without losing the other
 keys in the same snapshot.
 
+**A key is published only when its value CHANGED** (issue #126). The engine
+rewrites `state.json` every tick, so an ungated mirror republished the whole
+tree at 50 Hz — measured live at 520 messages per key per 10 s, of which
+`compose_hz` had exactly one distinct value. A retained topic *is* a last
+value, so re-sending an identical one is a no-op with a real cost: the broker
+persists retained messages, and every subscriber wakes for each one. Two
+deliberate exceptions keep that gate honest:
+
+- **`updated` rides along; it never triggers.** It is a per-tick timestamp, so
+  a plain per-key gate would let it alone republish at full tick rate and
+  defeat the purpose. It is therefore published only when some other key also
+  changed — which gives the retained topic a sharper meaning than it had on
+  disk: `reachy/state/updated` is *when the state last changed*. Liveness is
+  not this topic's job; that is `reachy/state/online` plus the Last Will.
+- **Every (re)connect republishes the whole tree, unconditionally.** A fresh
+  broker session holds none of our retained values, so "unchanged since I last
+  published" is the wrong question there — a late subscriber would otherwise be
+  served an empty tree. The first publish of a session is likewise never
+  suppressed: a gate that suppresses repeats must not suppress the original.
+
+Consumers need no change either way — this only removes duplicate deliveries of
+a value the topic already held.
+
 #### `reachy/state/online` — availability, publisher-owned and reserved
 
 A retained `true`/`false` topic the publisher itself owns:

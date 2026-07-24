@@ -694,3 +694,119 @@ def test_a_publisher_used_as_a_runtime_sink_matches_the_exporter_shape() -> None
     pub.emit(MotionEvent(action="admit", behavior="nod", channels=["head"], ts=1.0, tick=3))
     assert client.topics()[-1] == "reachy/events/motion/admit"
     assert json.loads(client.published[-1].payload)["behavior"] == "nod"
+
+
+# --------------------------------------------------------------------------- #
+# The retained-state change gate (issue #126)                                 #
+# --------------------------------------------------------------------------- #
+#
+# The engine rewrites ``state.json`` EVERY TICK, so an ungated mirror republished
+# the whole retained tree at 50 Hz. Measured on the live robot: 520 messages per
+# key per 10 s, of which ``compose_hz`` had ONE distinct value and ``active`` had
+# twenty. Retained topics are persisted by the broker and delivered to every
+# subscriber, so those are disk writes and consumer wake-ups spent re-sending a
+# value the topic already holds.
+#
+# No unit test could have caught it: the fake records publishes without cost and
+# nothing asserted a rate. These tests pin the rate, not just the content.
+
+
+def _state_topics(client) -> list[str]:
+    return [p.topic for p in client.published if p.topic.startswith("reachy/state/")]
+
+
+def test_an_unchanged_state_payload_publishes_once_not_once_per_tick() -> None:
+    """The regression itself: 50 identical writes must cost ONE publish per key."""
+    pub, client = _live_publisher()
+    state = {"updated": 1.0, "compose_hz": 50.0, "ownership": {"head": "feel-alive-1"}}
+
+    for _ in range(50):
+        pub.publish_state(dict(state))
+
+    published = [t for t in _state_topics(client) if t != "reachy/state/online"]
+    assert sorted(published) == [
+        "reachy/state/compose_hz",
+        "reachy/state/ownership",
+        "reachy/state/updated",
+    ], f"an unchanged state republished: {published}"
+
+
+def test_only_the_key_that_changed_is_republished() -> None:
+    pub, client = _live_publisher()
+    pub.publish_state({"updated": 1.0, "compose_hz": 50.0, "ownership": {"head": None}})
+    client.published.clear()
+
+    pub.publish_state({"updated": 2.0, "compose_hz": 50.0, "ownership": {"head": "gesture-1"}})
+
+    assert sorted(_state_topics(client)) == [
+        "reachy/state/ownership",  # changed
+        "reachy/state/updated",  # metadata, rides along with the real change
+    ], "compose_hz was unchanged and must not have been resent"
+
+
+def test_a_bare_timestamp_change_publishes_nothing() -> None:
+    """``updated`` differs every tick; alone it must not defeat the gate.
+
+    This is the whole of issue #126 in one assertion — a per-key gate that
+    treated ``updated`` like any other key would still have republished at the
+    full tick rate, on that one topic, forever.
+    """
+    pub, client = _live_publisher()
+    pub.publish_state({"updated": 1.0, "compose_hz": 50.0})
+    client.published.clear()
+
+    for tick in range(2, 40):
+        pub.publish_state({"updated": float(tick), "compose_hz": 50.0})
+
+    assert _state_topics(client) == [], "a moving timestamp alone must publish nothing"
+
+
+def test_the_timestamp_is_republished_when_something_real_changes() -> None:
+    """It rides along, so a consumer reading it sees when state last CHANGED."""
+    pub, client = _live_publisher()
+    pub.publish_state({"updated": 1.0, "compose_hz": 50.0})
+    client.published.clear()
+
+    pub.publish_state({"updated": 9.0, "compose_hz": 25.0})
+
+    sent = {p.topic: json.loads(p.payload) for p in client.published}
+    assert sent["reachy/state/updated"] == 9.0
+    assert sent["reachy/state/compose_hz"] == 25.0
+
+
+def test_a_reconnect_republishes_every_key_even_when_nothing_changed() -> None:
+    """The gate must never suppress the reconnect republish.
+
+    A fresh broker session holds NONE of our retained values, so "unchanged
+    since I last published" is exactly the wrong question there — a late
+    subscriber would be served an empty tree.
+    """
+    pub, client = _live_publisher()
+    state = {"updated": 1.0, "compose_hz": 50.0, "ownership": {"head": None}}
+    pub.publish_state(dict(state))
+    client.published.clear()
+
+    client.go_offline()
+    pub.publish_state(dict(state))
+    client.go_online()
+    pub.publish_state(dict(state))  # identical state, brand-new session
+
+    republished = {t for t in _state_topics(client)}
+    assert republished == {
+        "reachy/state/online",
+        "reachy/state/updated",
+        "reachy/state/compose_hz",
+        "reachy/state/ownership",
+    }, "a reconnect must resend the whole tree regardless of the gate"
+
+
+def test_the_gate_never_suppresses_a_value_that_returns_to_an_earlier_one() -> None:
+    """A -> B -> A must publish three times: the topic's last value really changed."""
+    pub, client = _live_publisher()
+    pub.publish_state({"updated": 1.0, "mode": "idle"})
+    pub.publish_state({"updated": 2.0, "mode": "busy"})
+    client.published.clear()
+    pub.publish_state({"updated": 3.0, "mode": "idle"})
+
+    sent = {p.topic: json.loads(p.payload) for p in client.published}
+    assert sent["reachy/state/mode"] == "idle"
