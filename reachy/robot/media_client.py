@@ -324,6 +324,38 @@ class HeldMediaClient:
         """
         return self._client is not None
 
+    @property
+    def media_session(self) -> Any | None:
+        """The live SDK media manager, or ``None``. **Never constructs.**
+
+        The fan-OUT counterpart to :meth:`audio` / :meth:`frame`: the runtime's
+        VOICE (:mod:`reachy.behavior.speech_act`) pushes PCM through THIS
+        manager instead of opening a second ``ReachyMini`` of its own, which the
+        single-SDK-owner model forbids. Composition injects a provider closing
+        over this property; see ``_compose_run_seam``.
+
+        Deliberately a free read like :attr:`connected`, never
+        :meth:`_ensure_media`: a caller on another thread must not be able to
+        trigger the blocking construction, and "not warmed yet" is a perfectly
+        good answer the voice handles by using the daemon route instead.
+
+        **Safe to read off-thread**, which the class's own thread-use note does
+        not otherwise grant. Two things make it so, and both are narrow:
+
+        * it is a plain attribute read (atomic under CPython), so a concurrent
+          drop or re-warm yields the old manager, ``None``, or the new one —
+          never a torn value; and
+        * the caller uses the manager's OUTPUT path
+          (``start_playing`` / ``push_audio_sample``), which a live probe
+          (spark-f8a9, 2026-07-24) showed does not contend with the INPUT path
+          this holder's own reads use: 198 clean reads with zero errors while a
+          worker thread pushed a clip concurrently.
+
+        Anything beyond that — calling :meth:`warm_up`, :meth:`close`, or the
+        read methods from a second thread — remains unsupported.
+        """
+        return self._media
+
     # ------------------------------------------------------------------
     # public API — reads
     # ------------------------------------------------------------------

@@ -289,17 +289,33 @@ def test_degrades_to_doa_only_when_sdk_absent(_isolated, monkeypatch, capsys):
 
 
 # --------------------------------------------------------------------------- #
-# 4. Boundary: no speech.llm import, no media_session call                    #
+# 4. Boundary: no speech.llm import, no SECOND media client                   #
 # --------------------------------------------------------------------------- #
 
 
-def test_composition_module_does_not_import_speech_llm_or_touch_media_session():
+def test_composition_module_does_not_import_speech_llm_or_open_a_second_media_client():
+    """The composition stays cognition-free and never opens a SECOND media client.
+
+    This used to grep for the literal ``media_session`` being ABSENT. That proxy
+    expired: the runtime's voice now plays through the ONE held media client's
+    session (t10), so the composition names it legitimately. The invariant the
+    grep stood for was never "the string is absent" — it was **the
+    single-SDK-owner model**: pose reads come from the media-FREE held reader,
+    and nothing here opens a media client of its own. Both are asserted
+    directly below, which is strictly stronger than the old string check:
+    ``_open_sdk_media`` is the actual second-client opener
+    (``reachy.speech.playback``), and referencing it here is the real defect the
+    old assertion was reaching for.
+    """
     import reachy.cli._commands.behavior as behavior_mod
 
     for name in _imported_modules(behavior_mod):
         assert "speech.llm" not in name, f"behavior.py must not import speech.llm ({name!r})"
     src = inspect.getsource(behavior_mod)
-    assert "media_session" not in src, "the runtime composition must never touch a media_session"
+    assert "_open_sdk_media" not in src, (
+        "the composition must never open a SECOND media client — the voice plays "
+        "through the ONE held client injected via media_session_provider"
+    )
     # The pose source is the media-free held reader, positively (not a media session).
     assert "HeldStateReader" in src
 

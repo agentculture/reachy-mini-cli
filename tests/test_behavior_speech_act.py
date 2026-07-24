@@ -506,17 +506,23 @@ def test_an_unknown_voice_engine_is_a_clean_user_error(monkeypatch):
     assert excinfo.value.code == 1
 
 
-def test_the_default_playback_transport_is_http_and_is_overridable(monkeypatch):
+def test_the_default_playback_transport_is_sdk_and_is_overridable(monkeypatch):
+    """t10 moved the default to ``sdk`` — played through the HELD media client.
+
+    See ``tests/test_behavior_speech_held_client.py`` for why (spec claim c16:
+    the voice must not depend on daemon media state), and for the proof that the
+    ``sdk`` route reaches the held session rather than opening a second client.
+    """
     monkeypatch.delenv(SPEECH_TRANSPORT_ENV, raising=False)
     monkeypatch.delenv("REACHY_TRANSPORT", raising=False)
-    assert RUNTIME_DEFAULT_TRANSPORT == "http"
-    assert resolve_playback_transport() == "http"
-
-    monkeypatch.setenv("REACHY_TRANSPORT", "sdk")
+    assert RUNTIME_DEFAULT_TRANSPORT == "sdk"
     assert resolve_playback_transport() == "sdk"
-    monkeypatch.setenv(SPEECH_TRANSPORT_ENV, "http")
-    assert resolve_playback_transport() == "http"  # the specific var wins
-    assert resolve_playback_transport("sdk") == "sdk"  # explicit beats both
+
+    monkeypatch.setenv("REACHY_TRANSPORT", "http")
+    assert resolve_playback_transport() == "http"
+    monkeypatch.setenv(SPEECH_TRANSPORT_ENV, "sdk")
+    assert resolve_playback_transport() == "sdk"  # the specific var wins
+    assert resolve_playback_transport("http") == "http"  # explicit beats both
 
 
 def test_an_unknown_playback_transport_is_a_clean_user_error(monkeypatch):
