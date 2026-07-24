@@ -135,6 +135,39 @@ def _no_live_realtime_gateway(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_event_broker(monkeypatch: pytest.MonkeyPatch):
+    """No test may publish onto a REAL event broker.
+
+    The third sibling of the two guards above, and it earned its place the same
+    way they did — by the suite actually doing the damage. The moment
+    ``events-cli`` became a base dependency, ``_import_events_client`` started
+    resolving for real, so every composition test built a live client against
+    ``REACHY_MQTT_URL`` (default ``localhost:1883``) and published to whatever
+    was listening. On this box that is the deployed Mosquitto: a full ``pytest``
+    run wrote the suite's synthetic ticks onto the robot's own
+    ``reachy/events/**`` tree and left RETAINED ``reachy/state/*`` values behind,
+    which outlive the test process by design and are what a real consumer reads
+    on connect. A late subscriber would have been served test fixtures as the
+    robot's current pose.
+
+    So the broker address is pointed at the same guaranteed-unreachable loopback
+    the realtime guard uses. Composition still builds the client and still calls
+    ``connect()`` — the code under test is untouched — and the connection is
+    simply refused immediately and locally, which is the NORMAL "broker not up
+    yet" outcome the publisher already reports as one named
+    ``broker-unreachable`` drop. paho's network loop runs on a daemon thread, so
+    a test that leaves a client open cannot hang interpreter exit.
+
+    Tests that DO want a specific broker re-set this same variable with their own
+    function-scoped ``monkeypatch`` (which wins and is undone at teardown), or
+    inject a fake client outright (``tests/fake_events_client.py`` — still the
+    right tool for asserting what got published).
+    """
+    monkeypatch.setenv("REACHY_MQTT_URL", "127.0.0.1:1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_reachy_logging():
     """Never let one test's installed log handler outlive it.
 

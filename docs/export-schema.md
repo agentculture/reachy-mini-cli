@@ -373,8 +373,21 @@ composition step binds the real events-cli client at process start. Without a
 client injected — or with one that does not satisfy that surface, or an
 unreachable broker — the publisher degrades to one named, greppable drop and
 every publish becomes a silent no-op; the 50 Hz tick is never affected. The
-eventual client is events-cli's own importable package — never `paho-mqtt` (or
-any other MQTT library) added to this repo.
+client is events-cli's own importable package — never `paho-mqtt` (or any other
+MQTT library) imported here.
+
+Since `events-cli>=0.9` (2026-07-24) that client is a **base dependency**, and
+it is **adapted rather than driven directly**: the shipped
+`events_cli.EventClient` spells three of those names differently
+(`is_connected`, `close`, and a constructor-time Last Will with no
+post-construction setter). `reachy/export/events_client.py` is the one module
+that knows the difference — it presents the surface above and defers building
+the vendor client until `connect()`, the only moment at which the will is known.
+So a future events-cli API change costs one file, and the publisher's contract
+here is unaffected. Note the degradation is **quiet by design**: a wrong binding
+is a `client-incompatible` drop, not a crash, so only a check against a real
+broker proves the binding is right — a fake shaped like this contract will
+always agree with it.
 
 ### Broker location
 

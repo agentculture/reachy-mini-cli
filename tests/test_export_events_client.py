@@ -1,0 +1,287 @@
+"""The events-cli binding: does the vendor's real client drive our publisher?
+
+``tests/test_export_mqtt.py`` proves :class:`~reachy.export.mqtt.NervousPublisher`
+against a fake shaped like the surface this repo DECLARES. That is the right
+test for the publisher and the wrong test for the binding: a fake built from our
+own protocol agrees with us by construction, so it cannot notice that the
+shipped ``events_cli.EventClient`` names things differently
+(``is_connected``/``close``, and a constructor-time Last Will).
+
+This module tests the other side — that
+:mod:`reachy.export.events_client` turns the REAL vendor shape into the declared
+one, and that our own fail-closed probe accepts the result. The end-to-end case
+at the bottom runs the actual vendor class with no broker running, which is the
+check that fails loudly if events-cli ever changes its API again.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pytest
+
+from reachy.export import events_client as EC
+from reachy.export import mqtt as M
+
+# --------------------------------------------------------------------------- #
+# A double shaped like the VENDOR (not like our protocol)                     #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Will:
+    """Mirrors ``events_cli.Will`` — resolved from the factory's own module."""
+
+    topic: str
+    payload: str = ""
+    qos: int = 0
+    retain: bool = False
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    ok: bool
+    connected: bool
+    reason: str
+
+
+class VendorDouble:
+    """The vendor's surface exactly: ``is_connected``, ``close``, will-at-init."""
+
+    instances: list["VendorDouble"] = []
+
+    def __init__(self, host, port, *, connect=True, will=None, **kwargs):
+        self.host = host
+        self.port = port
+        self.will = will
+        self.kwargs = kwargs
+        self.published: list[tuple] = []
+        self.closed = 0
+        self.raise_on_close: Exception | None = None
+        self.publish_ok = True
+        self._connected = bool(connect)
+        VendorDouble.instances.append(self)
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def connect(self) -> None:
+        # The vendor exposes this too — the double mirrors its surface exactly,
+        # so the "raw class fails our probe" test names only the REAL gaps.
+        self._connected = True
+
+    def publish(self, topic, payload, *, qos=0, retain=False):
+        self.published.append((topic, payload, qos, retain))
+        return PublishResult(ok=self.publish_ok, connected=self._connected, reason="ok")
+
+    def close(self) -> None:
+        self.closed += 1
+        self._connected = False
+        if self.raise_on_close is not None:
+            raise self.raise_on_close
+
+
+@pytest.fixture(autouse=True)
+def _clear_instances():
+    VendorDouble.instances.clear()
+    yield
+    VendorDouble.instances.clear()
+
+
+def _adapter(url: str = "localhost:1883") -> EC.EventsCliClient:
+    return EC.EventsCliClient(url, factory=VendorDouble)
+
+
+# --------------------------------------------------------------------------- #
+# 1. The probe that guards the whole leg                                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_adapter_satisfies_our_own_required_client_surface():
+    """The test that would have caught the vendor mismatch.
+
+    ``missing_client_members`` is what the publisher runs at ``start()``; a
+    non-empty result disables the bus with ``reason=client-incompatible``.
+    Handing it the RAW vendor class fails that probe — handing it the adapter
+    must not.
+    """
+    assert M.missing_client_members(_adapter()) == ()
+
+
+def test_the_raw_vendor_class_does_not_satisfy_it_which_is_why_the_adapter_exists():
+    """Pins the reason this module exists, so deleting it fails loudly."""
+    raw = VendorDouble("localhost", 1883)
+    missing = M.missing_client_members(raw)
+    assert set(missing) == {"connected", "will_set", "disconnect"}
+
+
+# --------------------------------------------------------------------------- #
+# 2. URL parsing                                                              #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("localhost:1883", ("localhost", 1883)),
+        ("10.0.0.9:1884", ("10.0.0.9", 1884)),
+        ("mqtt://broker.local:1883", ("broker.local", 1883)),
+        ("tcp://127.0.0.1:1885/", ("127.0.0.1", 1885)),
+        ("broker.local", ("broker.local", 1883)),
+        ("broker.local:not-a-port", ("broker.local", 1883)),
+        ("broker.local:0", ("broker.local", 1883)),
+        ("broker.local:99999", ("broker.local", 1883)),
+    ],
+)
+def test_broker_urls_parse_into_host_and_port(url, expected):
+    assert EC.parse_broker_url(url) == expected
+
+
+def test_a_malformed_url_never_raises_at_composition_time():
+    """A typo in REACHY_MQTT_URL degrades the bus; it must not stop the robot."""
+    assert EC.parse_broker_url("") == ("localhost", EC.DEFAULT_PORT)
+
+
+# --------------------------------------------------------------------------- #
+# 3. The two-step protocol becomes a one-step constructor                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_nothing_is_constructed_until_connect():
+    """Composition must not touch the network — the client is built by connect()."""
+    adapter = _adapter()
+    assert VendorDouble.instances == []
+    assert adapter.connected is False
+
+
+def test_will_set_before_connect_reaches_the_vendor_constructor():
+    """The whole trick: our two-step protocol maps onto their constructor arg."""
+    adapter = _adapter()
+    adapter.will_set("reachy/state/online", "false", qos=0, retain=True)
+    adapter.connect()
+    vendor = VendorDouble.instances[-1]
+    assert vendor.will == Will(topic="reachy/state/online", payload="false", qos=0, retain=True)
+    assert (vendor.host, vendor.port) == ("localhost", 1883)
+
+
+def test_connect_is_idempotent():
+    adapter = _adapter()
+    adapter.connect()
+    adapter.connect()
+    assert len(VendorDouble.instances) == 1
+
+
+def test_will_set_after_connect_is_refused_not_silently_dropped(caplog):
+    """It cannot take effect — the broker learns the will as the session opens."""
+    adapter = _adapter()
+    adapter.connect()
+    with caplog.at_level("WARNING"):
+        adapter.will_set("reachy/state/online", "false")
+    assert "will_set after connect" in caplog.text
+
+
+def test_connect_without_the_vendor_raises_into_the_publishers_named_drop(monkeypatch):
+    """``start()`` wraps this into ``connect-failed`` — never into the tick."""
+    # Force the "vendor absent" branch without touching sys.modules.
+    monkeypatch.setattr(EC, "VENDOR_IMPORT", ("reachy_no_such_events_pkg", "EventClient"))
+    adapter = EC.EventsCliClient("localhost:1883", factory=None)
+    with pytest.raises(RuntimeError):
+        adapter.connect()
+
+
+# --------------------------------------------------------------------------- #
+# 4. Liveness, publishing, shutdown                                           #
+# --------------------------------------------------------------------------- #
+
+
+def test_connected_maps_onto_the_vendors_is_connected():
+    adapter = _adapter()
+    adapter.connect()
+    assert adapter.connected is True
+    VendorDouble.instances[-1]._connected = False
+    assert adapter.connected is False
+
+
+def test_publish_delegates_with_qos_and_retain_intact():
+    adapter = _adapter()
+    adapter.connect()
+    adapter.publish("reachy/state/pose", '{"x":1}', qos=0, retain=True)
+    assert VendorDouble.instances[-1].published == [("reachy/state/pose", '{"x":1}', 0, True)]
+
+
+def test_publish_before_connect_is_a_no_op_not_a_crash():
+    _adapter().publish("reachy/events/sense/snapshot", "{}")  # must not raise
+
+
+def test_a_not_ok_publish_result_never_raises_into_the_caller():
+    """QoS 0 under a dropped session: the vendor reports, we do not escalate."""
+    adapter = _adapter()
+    adapter.connect()
+    VendorDouble.instances[-1].publish_ok = False
+    adapter.publish("reachy/events/sense/snapshot", "{}")  # must not raise
+
+
+def test_disconnect_closes_the_vendor_session():
+    adapter = _adapter()
+    adapter.connect()
+    adapter.disconnect()
+    assert VendorDouble.instances[-1].closed == 1
+    assert adapter.connected is False
+
+
+def test_a_raising_close_is_swallowed_at_shutdown():
+    adapter = _adapter()
+    adapter.connect()
+    VendorDouble.instances[-1].raise_on_close = RuntimeError("socket already gone")
+    adapter.disconnect()  # must not raise
+
+
+def test_disconnect_without_connect_is_a_no_op():
+    _adapter().disconnect()  # must not raise
+
+
+# --------------------------------------------------------------------------- #
+# 5. Against the REAL vendor, with no broker running                          #
+# --------------------------------------------------------------------------- #
+
+real_events_cli = pytest.importorskip("events_cli")
+
+
+def test_the_real_vendor_class_is_where_we_say_it_is():
+    module_name, attr = EC.VENDOR_IMPORT
+    assert module_name == "events_cli"
+    assert getattr(real_events_cli, attr, None) is not None
+
+
+def test_the_real_client_satisfies_the_declared_surface_through_the_adapter():
+    """The binding, end to end, on a port with nothing listening.
+
+    Port 1 is reserved and never a broker, so this exercises the real paho
+    machinery in its broker-down state without depending on a live broker —
+    the suite stays hermetic and safe under ``pytest -n auto``.
+    """
+    adapter = EC.EventsCliClient("127.0.0.1:1")
+    assert M.missing_client_members(adapter) == ()
+    adapter.will_set("reachy/state/online", "false", qos=0, retain=True)
+    adapter.connect()
+    try:
+        # Never connected, so publishing is a documented no-op — and crucially
+        # it does not raise, which is the contract the 50 Hz tick depends on.
+        adapter.publish("reachy/events/sense/snapshot", "{}")
+        assert adapter.connected is False
+    finally:
+        adapter.disconnect()
+
+
+def test_a_publisher_on_a_dead_broker_degrades_to_one_named_drop(caplog):
+    """The whole leg, real client, no broker: named degradation, no exception."""
+    adapter = EC.EventsCliClient("127.0.0.1:1")
+    publisher = M.NervousPublisher(adapter)
+    with caplog.at_level("INFO"):
+        assert publisher.start() is False
+    publisher.emit(object())
+    publisher.publish_state({"pose": {"x": 1}})
+    publisher.stop()
+    assert M.REASON_BROKER_UNREACHABLE in caplog.text
+    assert M.REASON_CLIENT_INCOMPATIBLE not in caplog.text

@@ -498,16 +498,71 @@ def test_h10_the_repo_still_contains_no_server_code() -> None:
     assert importers == _SOCKET_IMPORTERS
 
 
-def test_h10_no_mqtt_library_became_a_dependency() -> None:
-    """This repo imports the events-cli client; it never speaks MQTT itself."""
+_MQTT_LIBRARIES = ("paho", "gmqtt", "amqtt", "asyncio-mqtt", "hbmqtt")
+
+
+def test_h10_no_mqtt_library_became_a_direct_dependency() -> None:
+    """This repo imports the events-cli client; it never speaks MQTT itself.
+
+    Stated precisely, because ``events-cli`` landing as a base dep DID bring an
+    MQTT library into the resolved tree: ``paho-mqtt`` is a base dependency *of
+    events-cli*. That is the recorded 2026-07-24 decision working as intended —
+    "the transport underneath is events-cli's internal concern once outside this
+    repo" — not a breach of it. What must stay true is that *this* repo never
+    names one and never imports one, so the transport can be swapped (paho, or a
+    no-deps rewrite) without a line changing here.
+    """
     import tomllib
 
     with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
         project = tomllib.load(fh)["project"]
-    assert project["dependencies"] == ["numpy>=1.24", "harmonics-cli>=0.8"]
-    flat = json.dumps(project.get("optional-dependencies", {}))
-    for banned in ("paho", "gmqtt", "amqtt", "asyncio-mqtt"):
+    assert project["dependencies"] == ["numpy>=1.24", "harmonics-cli>=0.8", "events-cli>=0.9"]
+    flat = json.dumps(project.get("optional-dependencies", {})) + json.dumps(
+        project["dependencies"]
+    )
+    for banned in _MQTT_LIBRARIES:
         assert banned not in flat
+
+
+def test_h10_no_module_in_this_repo_imports_an_mqtt_library() -> None:
+    """The stronger form of the same invariant, checked against the source."""
+    offenders: list[str] = []
+    for path in sorted((REPO_ROOT / "reachy").rglob("*.py")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("#", '"', "'")):
+                continue
+            if re.match(rf"^(import|from)\s+({'|'.join(_MQTT_LIBRARIES)})\b", stripped):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}: {stripped}")
+    assert offenders == []
+
+
+def test_exactly_one_module_names_the_vendor_package() -> None:
+    """``reachy/export/events_client.py`` is the ONE point of vendor coupling.
+
+    Checked by NAME rather than by import statement, because the binding is
+    deliberately lazy (``importlib.import_module`` off a constant) — there is no
+    literal ``import events_cli`` anywhere, and a grep for one would pass
+    vacuously forever. A second module naming the package would mean the
+    vendor's shape had leaked past the adapter, which is exactly what let the
+    API mismatch (``is_connected``/``close``, will-at-construction) stay
+    invisible until the wheel actually shipped.
+    """
+    namers = {
+        str(path.relative_to(REPO_ROOT))
+        for path in sorted((REPO_ROOT / "reachy").rglob("*.py"))
+        # \b matters: the adapter MODULE is `events_client`, and a plain
+        # substring test would match every reference to it.
+        if re.search(r"\bevents_cli\b", path.read_text(encoding="utf-8"))
+    }
+    assert namers == {"reachy/export/events_client.py"}
+
+
+def test_the_composition_binding_is_an_alias_not_a_second_copy() -> None:
+    """One constant, aliased — two copies of a vendor path drift apart."""
+    from reachy.export import events_client
+
+    assert behavior_mod.EVENTS_CLIENT_IMPORT is events_client.VENDOR_IMPORT
 
 
 def test_the_state_json_mirror_is_additive_to_the_disk_write(_isolated, monkeypatch):

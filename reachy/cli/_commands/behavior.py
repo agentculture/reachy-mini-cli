@@ -114,6 +114,7 @@ from reachy.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 from reachy.cli._export import add_runtime_export_args, build_runtime_export_consumer
 from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
+from reachy.export.events_client import VENDOR_IMPORT, EventsCliClient
 from reachy.export.mqtt import NervousPublisher, broker_url
 from reachy.export.runtime import SenseSnapshotDriver
 from reachy.motion.pat import PatDetector
@@ -1391,29 +1392,39 @@ def _make_speech_actuator(
 #: binding point for the nervous system's transport.
 #:
 #: The broker and its client belong to the sibling ``events-cli`` project
-#: (``agentculture/events-cli#3``); this repo ships no MQTT library and takes no
-#: dependency on one (see CLAUDE.md's events-cli decision record). As of this
-#: writing **that wheel does not exist**, so :func:`_import_events_client`
-#: resolves to ``None`` on every box and the whole leg is a named no-op. When the
-#: wheel ships, this constant already names it: the only change is the
-#: construction line in :func:`_make_events_client` (should its signature differ)
-#: plus the ``pyproject.toml`` base dep and a ``uv lock``.
-EVENTS_CLIENT_IMPORT = ("events_cli", "EventsClient")
+#: (``agentculture/events-cli#3``); this repo ships no MQTT library and speaks
+#: no wire protocol (see CLAUDE.md's events-cli decision record). The wheel
+#: shipped on 2026-07-24 as ``events-cli>=0.9`` and is now a base dependency,
+#: so this spec resolves on a normal install.
+#:
+#: The class it names is NOT driven directly: its surface differs from the one
+#: :mod:`reachy.export.mqtt` declares (``is_connected``/``close``, and a
+#: constructor-time Last Will), so :mod:`reachy.export.events_client` adapts it
+#: and is the only module in this repo that names the vendor. This is an ALIAS
+#: of that module's constant, deliberately — two copies of a vendor's import
+#: path are two things to update and one of them will be missed.
+EVENTS_CLIENT_IMPORT = VENDOR_IMPORT
 
 
 def _import_events_client(spec: tuple[str, str] = EVENTS_CLIENT_IMPORT):
-    """Resolve the events-cli client class LAZILY, or ``None`` when absent.
+    """Resolve a ``factory(url)`` for the bus client LAZILY, or ``None``.
 
     Total by construction: an absent package, a broken package, or a wheel that
     renamed the class all resolve to ``None`` — never an ``ImportError`` on the
     caller. That is what makes the publisher composable UNCONDITIONALLY on a box
-    where events-cli is simply not installed yet, which is every box today.
+    where events-cli is not installed (the bare HTTP profile, or a CI runner).
+
+    What comes back is the ADAPTER
+    (:class:`~reachy.export.events_client.EventsCliClient`), not the vendor
+    class — the vendor is checked for presence here and driven from that one
+    module. Constructing the adapter never touches the network: it records the
+    broker address and builds the real client later, inside ``connect()``, which
+    is the only point at which the Last Will is known.
 
     Deliberately NOT a module-scope import: ``_build_parser()`` imports this
     module for *every* invocation (``say run``, ``daemon status``, ``--help``),
-    and a hard import of an optional package there would put its cost — or its
-    absence — on all of them. *spec* is injectable so both directions are
-    testable without touching ``sys.modules``.
+    and a hard import there would put the cost on all of them. *spec* is
+    injectable so both directions are testable without touching ``sys.modules``.
     """
     module_name, attr = spec
     try:
@@ -1421,7 +1432,10 @@ def _import_events_client(spec: tuple[str, str] = EVENTS_CLIENT_IMPORT):
     except Exception as err:  # noqa: BLE001 — an optional package must never raise here
         logger.debug("behavior: events-cli client unavailable (%s: %s)", type(err).__name__, err)
         return None
-    return getattr(module, attr, None)
+    if getattr(module, attr, None) is None:
+        logger.debug("behavior: %s exposes no %r", module_name, attr)
+        return None
+    return EventsCliClient
 
 
 def _make_events_client():

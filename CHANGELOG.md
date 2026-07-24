@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.0] - 2026-07-24
+
+### Added
+
+- **The nervous-system bus is bound to a real client.** `events-cli>=0.9` shipped on 2026-07-24 and is now the **third base runtime dependency**, joining `numpy` and `harmonics-cli` — all pure wheels. `behavior engine run` now publishes the runtime feed to `reachy/events/{source}/{type}` and retained standing state to `reachy/state/{key}` on a live broker, verified end to end against the deployed Mosquitto.
+- **`reachy/export/events_client.py`** — the ONE module that names the vendor. The shipped `events_cli.EventClient` does not match the surface `reachy/export/mqtt.py` declares (`is_connected` not `connected`, `close` not `disconnect`, and the Last Will is a constructor argument with no post-construction setter), so `EventsCliClient` adapts one to the other and defers building the vendor client until `connect()` — the only moment at which the will is known. A future vendor API change costs this one file. `behavior.py`'s `EVENTS_CLIENT_IMPORT` is an alias of its `VENDOR_IMPORT`, not a second copy, and a test pins the single-namer rule.
+- `tests/test_export_events_client.py` — 26 tests covering the adapter, including the check a fake cannot make: the REAL vendor class driven through the real paho machinery against a dead port, asserting it satisfies `missing_client_members()`. A fake shaped like our own protocol agrees with us by construction, which is exactly why the vendor mismatch was invisible until the wheel shipped.
+
+### Changed
+
+- The base dependency set is now `numpy` + `harmonics-cli` + `events-cli`. `paho-mqtt` enters the resolved tree as events-cli's OWN base dep — the recorded 2026-07-24 decision working as intended, not a breach of it. This repo still names no MQTT library and imports none, now checked two ways: the dependency pin and a source scan for MQTT imports.
+- CLAUDE.md and `docs/export-schema.md` updated from "the wheel does not exist yet" to the shipped binding, including the warning that a wrong binding degrades **quietly** (a named `client-incompatible` drop, not a crash), so only a live-broker check can prove it right.
+
+### Fixed
+
+- **The test suite no longer publishes onto a real event broker.** The moment events-cli became a base dependency, every composition test built a live client against `REACHY_MQTT_URL` (default `localhost:1883`) — a full run wrote the suite's synthetic ticks onto the deployed robot's own `reachy/events/**` tree and left RETAINED `reachy/state/*` values behind, which outlive the test process and are what a late subscriber reads on connect. `tests/conftest.py`'s new `_no_live_event_broker` autouse guard pins the broker at a dead loopback, alongside the existing daemon-media and realtime-gateway guards.
+
 ## [0.43.0] - 2026-07-22
 
 ### Added

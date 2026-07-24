@@ -1084,9 +1084,9 @@ disables only the tool; cognition keeps running.
   reader (one logged warning) when `[sdk]` is absent, so `_compose_run_seam`
   composes the pat stack unconditionally rather than gating on an SDK-import
   probe.
-- **Events-cli decision record (nervous-system arc, not yet shipped).** The
-  runtime's coming MQTT publisher leg (the `reachy/events/{source}/{type}` +
-  retained `reachy/state/{key}` fan-out) settles two dependency questions
+- **Events-cli decision record (nervous-system arc — SHIPPED 2026-07-24).** The
+  runtime's MQTT publisher leg (the `reachy/events/{source}/{type}` +
+  retained `reachy/state/{key}` fan-out) settled two dependency questions
   ahead of the build, both 2026-07-24 user decisions:
   - **The broker is owned by the sibling `events-cli` project, not this
     repo.** `reachy-mini-cli` ships no compose file and never operates
@@ -1100,14 +1100,38 @@ disables only the tool; cognition keeps running.
     or any MQTT library directly.** The transport underneath (`paho`, or a
     complete no-deps rewrite) is events-cli's internal concern once outside
     this repo. This is an explicit amendment to the keep-base-light rule
-    above: **once events-cli publishes its first wheel**, `events-cli`
-    becomes a **third** base runtime dependency, joining `numpy` and
-    `harmonics-cli` (pure wheel, `py>=3.12` — the composition unblock; `uv
-    lock` rides the same change). **As of this writing that wheel does not
-    exist yet** — `events-cli` is NOT in `pyproject.toml`, and the publisher
-    module codes against an injected client seam precisely so its tests run
-    on a fake today and composition binds the real import in one line once
-    the dependency lands.
+    above: `events-cli>=0.9` shipped on 2026-07-24 and IS now the **third**
+    base runtime dependency, joining `numpy` and `harmonics-cli` (pure wheel,
+    `py>=3.12`). It carries `paho-mqtt` as its OWN base dep, so an MQTT
+    library does enter the resolved tree — that is the decision working, not a
+    breach of it. What stays true, and is machine-checked
+    (`test_h10_no_mqtt_library_became_a_direct_dependency` plus a source scan
+    for MQTT imports): this repo names no MQTT library and imports none, so
+    the transport can be swapped without a line changing here.
+  - **The vendor is adapted, not driven directly —
+    `reachy/export/events_client.py` is the ONE module that names
+    `events_cli`.** The plan expected a one-line binding; the shipped
+    `events_cli.EventClient` does not match the surface
+    `reachy/export/mqtt.py` declares (`is_connected` not `connected`, `close`
+    not `disconnect`, and the Last Will is a **constructor argument** with no
+    post-construction setter). Both shapes are defensible — theirs makes the
+    will-before-connect ordering unskippable — so `EventsCliClient` adapts one
+    to the other and defers building the vendor client until `connect()`,
+    which is the only point at which the will is known. Keep that coupling in
+    the one file: `behavior.py`'s `EVENTS_CLIENT_IMPORT` is an **alias** of
+    `VENDOR_IMPORT`, not a second copy, and a test pins the single-namer rule.
+    Our own fail-closed probe (`missing_client_members`) is what caught the
+    mismatch — it would have disabled the bus with a named
+    `client-incompatible` drop rather than crashing, which is the design
+    working, but it degrades **quietly**, so a live-broker check is the only
+    thing that proves the binding is right.
+  - **The suite must never reach a real broker.** `tests/conftest.py`'s
+    `_no_live_event_broker` autouse guard pins `REACHY_MQTT_URL` at a dead
+    loopback, alongside the daemon-media and realtime-gateway guards. This is
+    not hypothetical: the first full run after the dep landed published the
+    suite's synthetic ticks onto the deployed robot's own tree and left
+    RETAINED `reachy/state/*` values behind, which a late subscriber would
+    have read as the robot's current pose.
 - **Python ≥ 3.12** (uses `X | None`, `tomllib`, etc.).
 - **Every PR bumps the version**, even docs/config/CI-only changes — the
   `version-check` CI job blocks the merge otherwise (it compares
