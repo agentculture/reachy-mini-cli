@@ -48,8 +48,6 @@ class PublishResult:
 class VendorDouble:
     """The vendor's surface exactly: ``is_connected``, ``close``, will-at-init."""
 
-    instances: list["VendorDouble"] = []
-
     def __init__(self, host, port, *, connect=True, will=None, **kwargs):
         self.host = host
         self.port = port
@@ -60,7 +58,6 @@ class VendorDouble:
         self.raise_on_close: Exception | None = None
         self.publish_ok = True
         self._connected = bool(connect)
-        VendorDouble.instances.append(self)
 
     @property
     def is_connected(self) -> bool:
@@ -82,15 +79,28 @@ class VendorDouble:
             raise self.raise_on_close
 
 
-@pytest.fixture(autouse=True)
-def _clear_instances():
-    VendorDouble.instances.clear()
-    yield
-    VendorDouble.instances.clear()
+class _Factory(list):
+    """A vendor factory that records what it built, scoped to ONE test.
+
+    Replaces a class-level ``VendorDouble.instances`` registry: that was shared
+    mutable state needing an autouse fixture to reset it between tests, and one
+    forgotten reset would have coupled tests invisibly. A list per test cannot.
+    """
+
+    def __call__(self, host, port, **kwargs):
+        made = VendorDouble(host, port, **kwargs)
+        self.append(made)
+        return made
+
+    # `_build_will` resolves the vendor's `Will` from the factory's module, so
+    # the callable must report this module rather than `list`'s.
+    __module__ = __name__
 
 
-def _adapter(url: str = "localhost:1883") -> EC.EventsCliClient:
-    return EC.EventsCliClient(url, factory=VendorDouble)
+def _adapter(url: str = "localhost:1883") -> tuple[EC.EventsCliClient, _Factory]:
+    """The adapter under test, plus the doubles its factory builds."""
+    factory = _Factory()
+    return EC.EventsCliClient(url, factory=factory), factory
 
 
 # --------------------------------------------------------------------------- #
@@ -106,7 +116,8 @@ def test_the_adapter_satisfies_our_own_required_client_surface():
     Handing it the RAW vendor class fails that probe — handing it the adapter
     must not.
     """
-    assert M.missing_client_members(_adapter()) == ()
+    adapter, _built = _adapter()
+    assert M.missing_client_members(adapter) == ()
 
 
 def test_the_raw_vendor_class_does_not_satisfy_it_which_is_why_the_adapter_exists():
@@ -150,31 +161,31 @@ def test_a_malformed_url_never_raises_at_composition_time():
 
 def test_nothing_is_constructed_until_connect():
     """Composition must not touch the network — the client is built by connect()."""
-    adapter = _adapter()
-    assert VendorDouble.instances == []
+    adapter, built = _adapter()
+    assert built == []
     assert adapter.connected is False
 
 
 def test_will_set_before_connect_reaches_the_vendor_constructor():
     """The whole trick: our two-step protocol maps onto their constructor arg."""
-    adapter = _adapter()
+    adapter, built = _adapter()
     adapter.will_set("reachy/state/online", "false", qos=0, retain=True)
     adapter.connect()
-    vendor = VendorDouble.instances[-1]
+    vendor = built[-1]
     assert vendor.will == Will(topic="reachy/state/online", payload="false", qos=0, retain=True)
     assert (vendor.host, vendor.port) == ("localhost", 1883)
 
 
 def test_connect_is_idempotent():
-    adapter = _adapter()
+    adapter, built = _adapter()
     adapter.connect()
     adapter.connect()
-    assert len(VendorDouble.instances) == 1
+    assert len(built) == 1
 
 
 def test_will_set_after_connect_is_refused_not_silently_dropped(caplog):
     """It cannot take effect — the broker learns the will as the session opens."""
-    adapter = _adapter()
+    adapter, built = _adapter()
     adapter.connect()
     with caplog.at_level("WARNING"):
         adapter.will_set("reachy/state/online", "false")
@@ -196,49 +207,49 @@ def test_connect_without_the_vendor_raises_into_the_publishers_named_drop(monkey
 
 
 def test_connected_maps_onto_the_vendors_is_connected():
-    adapter = _adapter()
+    adapter, built = _adapter()
     adapter.connect()
     assert adapter.connected is True
-    VendorDouble.instances[-1]._connected = False
+    built[-1]._connected = False
     assert adapter.connected is False
 
 
 def test_publish_delegates_with_qos_and_retain_intact():
-    adapter = _adapter()
+    adapter, built = _adapter()
     adapter.connect()
     adapter.publish("reachy/state/pose", '{"x":1}', qos=0, retain=True)
-    assert VendorDouble.instances[-1].published == [("reachy/state/pose", '{"x":1}', 0, True)]
+    assert built[-1].published == [("reachy/state/pose", '{"x":1}', 0, True)]
 
 
 def test_publish_before_connect_is_a_no_op_not_a_crash():
-    _adapter().publish("reachy/events/sense/snapshot", "{}")  # must not raise
+    _adapter()[0].publish("reachy/events/sense/snapshot", "{}")  # must not raise
 
 
 def test_a_not_ok_publish_result_never_raises_into_the_caller():
     """QoS 0 under a dropped session: the vendor reports, we do not escalate."""
-    adapter = _adapter()
+    adapter, built = _adapter()
     adapter.connect()
-    VendorDouble.instances[-1].publish_ok = False
+    built[-1].publish_ok = False
     adapter.publish("reachy/events/sense/snapshot", "{}")  # must not raise
 
 
 def test_disconnect_closes_the_vendor_session():
-    adapter = _adapter()
+    adapter, built = _adapter()
     adapter.connect()
     adapter.disconnect()
-    assert VendorDouble.instances[-1].closed == 1
+    assert built[-1].closed == 1
     assert adapter.connected is False
 
 
 def test_a_raising_close_is_swallowed_at_shutdown():
-    adapter = _adapter()
+    adapter, built = _adapter()
     adapter.connect()
-    VendorDouble.instances[-1].raise_on_close = RuntimeError("socket already gone")
+    built[-1].raise_on_close = RuntimeError("socket already gone")
     adapter.disconnect()  # must not raise
 
 
 def test_disconnect_without_connect_is_a_no_op():
-    _adapter().disconnect()  # must not raise
+    _adapter()[0].disconnect()  # must not raise
 
 
 # --------------------------------------------------------------------------- #

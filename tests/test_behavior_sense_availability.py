@@ -29,6 +29,7 @@ The three acceptance criteria, and the tests that carry them:
 from __future__ import annotations
 
 import json
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -114,8 +115,12 @@ def test_available_and_unavailable_render_the_wire_shape():
 
 
 def test_sense_availability_is_frozen():
-    with pytest.raises(Exception):  # noqa: B017 - dataclasses raise FrozenInstanceError
-        AVAILABLE.available = False  # type: ignore[misc]
+    # A LOCAL instance, not the module-level AVAILABLE: the assignment is meant
+    # to fail, but a reader cannot tell that from the call site, and neither can
+    # a linter — so do not appear to mutate a shared constant.
+    probe = SenseAvailability(available=True, reason=None)
+    with pytest.raises(FrozenInstanceError):
+        probe.available = False  # type: ignore[misc]
 
 
 # --------------------------------------------------------------------------- #
@@ -407,7 +412,7 @@ def test_face_recognition_reason_prefers_the_missing_extra_over_a_broken_stack(m
 def test_the_vision_warning_stays_once_only(monkeypatch, caplog):
     """Criterion 3: the log latch is UNCHANGED — the block is a second copy, not a swap."""
     monkeypatch.setattr(face_sense, "_find_spec", lambda name: None)
-    face_sense._VISION_WARNED = False
+    monkeypatch.setattr(face_sense, "_VISION_WARNED", False)
     with caplog.at_level("WARNING", logger="reachy.behavior.face_sense"):
         assert face_sense.build_face_recognition() is None
         assert face_sense.build_face_recognition() is None
@@ -420,5 +425,5 @@ def test_the_vision_warning_stays_once_only(monkeypatch, caplog):
 def test_the_reason_survives_the_spent_warning_latch(monkeypatch):
     """The whole point of #120b: after the one boot line, the fact is still readable."""
     monkeypatch.setattr(face_sense, "_find_spec", lambda name: None)
-    face_sense._VISION_WARNED = True  # the boot line is long gone
+    monkeypatch.setattr(face_sense, "_VISION_WARNED", True)  # the boot line is long gone
     assert face_sense.vision_unavailable_reason() == face_sense.VISION_EXTRA_ABSENT
