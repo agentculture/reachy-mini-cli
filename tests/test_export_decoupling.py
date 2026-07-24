@@ -7,7 +7,7 @@ export feed and a specific consumer (e.g. a reTerminal renderer library), or add
 a new base runtime dependency, or adds a network server inside the export package.
 
 Four assertions:
-1. Base runtime deps are exactly ``["numpy>=1.24", "harmonics-cli>=0.8"]`` — no other
+1. Base runtime deps are exactly the three pure wheels — no other
    base dep is added.
 2. No ``import reterminal`` / ``from reterminal`` statement in any ``reachy/**/*.py``.
 3. No server/network-library import inside ``reachy/export/*.py``.
@@ -59,20 +59,19 @@ def _is_import_line(line: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_base_deps_numpy_only() -> None:
-    """[project].dependencies must be exactly the two allowed base deps.
+def test_base_deps_are_the_three_pure_wheels() -> None:
+    """[project].dependencies must be exactly the three allowed base deps.
 
-    ``numpy`` (RMS loudness detector) and ``harmonics-cli`` (harmonic voice
-    backend) are both pure wheels with no engine-package transitive stack — no
-    other base dep may be added.
+    ``numpy`` (RMS loudness detector), ``harmonics-cli`` (harmonic voice
+    backend) and ``events-cli`` (the nervous-system bus client) are all pure
+    wheels with no engine-package transitive stack — no other base dep may be
+    added.
     """
+    expected = ["numpy>=1.24", "harmonics-cli>=0.8", "events-cli>=0.9"]
     with PYPROJECT.open("rb") as fh:
         project = tomllib.load(fh)["project"]
     deps: list[str] = project["dependencies"]
-    assert deps == [
-        "numpy>=1.24",
-        "harmonics-cli>=0.8",
-    ], f"Expected base deps to be ['numpy>=1.24', 'harmonics-cli>=0.8'], got: {deps!r}"
+    assert deps == expected, f"Expected base deps to be {expected!r}, got: {deps!r}"
 
 
 # ---------------------------------------------------------------------------

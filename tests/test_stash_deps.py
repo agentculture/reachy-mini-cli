@@ -1,7 +1,7 @@
 """Task t4 acceptance criterion 3: the stash package adds no new base dependency.
 
 Reads ``pyproject.toml`` directly and asserts ``[project.dependencies]`` is
-EXACTLY ``numpy`` + ``harmonics-cli`` — the stash's embeddings client (stdlib
+EXACTLY the three allowed pure wheels — the stash's embeddings client (stdlib
 ``urllib``) and cosine search (the already-base ``numpy``) introduce nothing new.
 """
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 PYPROJECT = Path(__file__).parent.parent / "pyproject.toml"
 
-_EXPECTED_BASE_DEPS = {"numpy>=1.24", "harmonics-cli>=0.8"}
+_EXPECTED_BASE_DEPS = {"numpy>=1.24", "harmonics-cli>=0.8", "events-cli>=0.9"}
 
 
 def _base_deps() -> list[str]:
@@ -21,7 +21,7 @@ def _base_deps() -> list[str]:
     return data["project"]["dependencies"]
 
 
-def test_base_dependencies_are_exactly_numpy_and_harmonics_cli():
+def test_base_dependencies_are_exactly_the_three_pure_wheels():
     deps = _base_deps()
     assert set(deps) == _EXPECTED_BASE_DEPS, (
         f"base [project.dependencies] changed: {deps!r} — the behavior stash "

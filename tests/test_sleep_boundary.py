@@ -353,21 +353,23 @@ class TestBaseDependencies:
         ), f"reachy-mini must stay an extra, not a base dep: {base}"
 
     def test_numpy_is_only_non_stdlib_base_dep(self) -> None:
-        """numpy and harmonics-cli are the only non-stdlib base deps allowed.
+        """numpy, harmonics-cli and events-cli are the only non-stdlib base deps.
 
         This test lists the known allowed base deps and fails if an unexpected
         package appears (alerting the reviewer to an accidental dep addition).
-        ``harmonics-cli`` was added as a base dep in t2 (deviation d1) — it is a
-        pure wheel with no transitive engine-package stack, unlike ``reachy-mini``.
+        ``harmonics-cli`` was added as a base dep in t2 (deviation d1) and
+        ``events-cli`` with the nervous-system arc — both pure wheels with no
+        transitive engine-package stack, unlike ``reachy-mini``.
         """
         base = self._project()["dependencies"]
         # Packages allowed at base level (edit here if an intentional addition is made).
-        allowed_prefixes = ("numpy", "harmonics-cli")
+        allowed_prefixes = ("numpy", "harmonics-cli", "events-cli")
         for dep in base:
             dep_name = dep.split(">=")[0].split("==")[0].split("[")[0].strip().lower()
             assert any(dep_name.startswith(p) for p in allowed_prefixes), (
                 f"Unexpected base dependency {dep!r} — sleep must not add new "
-                "base runtime deps beyond numpy/harmonics-cli; move it to an optional extra"
+                "base runtime deps beyond numpy/harmonics-cli/events-cli; "
+                "move it to an optional extra"
             )
 
     def test_openwakeword_is_not_a_base_dep(self) -> None:

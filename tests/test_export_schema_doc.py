@@ -109,6 +109,15 @@ def _documented_export_commands() -> set[tuple[str, ...]]:
     commands: set[tuple[str, ...]] = set()
     for raw in _CODE_SPAN_RE.findall(_doc_text()):
         span = " ".join(raw.split())
+        # A span carrying a markdown link target is prose, not a command.
+        # ``_CODE_SPAN_RE`` pairs backticks SEQUENTIALLY, so a fenced block
+        # (three backticks, whose empty pairs the regex cannot match) shifts
+        # the pairing and can capture a run of prose as one "span". A
+        # cross-reference whose anchor happens to contain ``--export``
+        # (e.g. ``#runtime-event-feed-behavior-engine-run---export--``) then
+        # reads as a documented command and the guard fails on prose.
+        if "](" in span:
+            continue
         tokens = span.split(" ")
         if not tokens:
             continue

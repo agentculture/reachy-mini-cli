@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.1] - 2026-07-24
+
+### Fixed
+
+- **The retained `reachy/state/*` tree no longer republishes at tick rate (issue #126).** The engine rewrites `state.json` every tick, so the bus mirror inherited that rate and resent the whole retained tree at 50 Hz — measured on the live robot at 520 messages per key per 10 s, of which `compose_hz` had exactly ONE distinct value and `active` had twenty. Retained messages are persisted by the broker and delivered to every subscriber, so those were disk writes and consumer wake-ups spent re-sending a value the topic already held. A key is now published only when its serialized value changed. Measured live after the fix: state traffic fell from ~3584 to 55 messages per 10 s (~65x), and `state/active` publishes exactly 20 times — equal to the distinct-payload count measured independently beforehand, so the gate emits precisely the real changes.
+- Two deliberate exceptions keep that gate honest. `updated` is a per-tick timestamp, so it RIDES ALONG with a substantive change rather than triggering one — otherwise it alone would have republished at full tick rate and defeated the purpose; this also sharpens the retained topic's meaning to *when state last changed*, with liveness left to `state/online` + the Last Will. And every (re)connect republishes the whole tree unconditionally, as does the first publish of a session: a fresh broker session holds none of our retained values, so a gate that suppresses repeats must never suppress the original.
+
+## [0.44.0] - 2026-07-24
+
+### Added
+
+- **The nervous-system bus is bound to a real client.** `events-cli>=0.9` shipped on 2026-07-24 and is now the **third base runtime dependency**, joining `numpy` and `harmonics-cli` — all pure wheels. `behavior engine run` now publishes the runtime feed to `reachy/events/{source}/{type}` and retained standing state to `reachy/state/{key}` on a live broker, verified end to end against the deployed Mosquitto.
+- **`reachy/export/events_client.py`** — the ONE module that names the vendor. The shipped `events_cli.EventClient` does not match the surface `reachy/export/mqtt.py` declares (`is_connected` not `connected`, `close` not `disconnect`, and the Last Will is a constructor argument with no post-construction setter), so `EventsCliClient` adapts one to the other and defers building the vendor client until `connect()` — the only moment at which the will is known. A future vendor API change costs this one file. `behavior.py`'s `EVENTS_CLIENT_IMPORT` is an alias of its `VENDOR_IMPORT`, not a second copy, and a test pins the single-namer rule.
+- `tests/test_export_events_client.py` — 26 tests covering the adapter, including the check a fake cannot make: the REAL vendor class driven through the real paho machinery against a dead port, asserting it satisfies `missing_client_members()`. A fake shaped like our own protocol agrees with us by construction, which is exactly why the vendor mismatch was invisible until the wheel shipped.
+
+### Changed
+
+- The base dependency set is now `numpy` + `harmonics-cli` + `events-cli`. `paho-mqtt` enters the resolved tree as events-cli's OWN base dep — the recorded 2026-07-24 decision working as intended, not a breach of it. This repo still names no MQTT library and imports none, now checked two ways: the dependency pin and a source scan for MQTT imports.
+- CLAUDE.md and `docs/export-schema.md` updated from "the wheel does not exist yet" to the shipped binding, including the warning that a wrong binding degrades **quietly** (a named `client-incompatible` drop, not a crash), so only a live-broker check can prove it right.
+
+### Fixed
+
+- **The test suite no longer publishes onto a real event broker.** The moment events-cli became a base dependency, every composition test built a live client against `REACHY_MQTT_URL` (default `localhost:1883`) — a full run wrote the suite's synthetic ticks onto the deployed robot's own `reachy/events/**` tree and left RETAINED `reachy/state/*` values behind, which outlive the test process and are what a late subscriber reads on connect. `tests/conftest.py`'s new `_no_live_event_broker` autouse guard pins the broker at a dead loopback, alongside the existing daemon-media and realtime-gateway guards.
+
 ## [0.43.0] - 2026-07-22
 
 ### Added

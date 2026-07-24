@@ -30,17 +30,47 @@ independent *duration* clock — wall-clock, monotonic, real time —
 :data:`time.perf_counter` by default, but injectable (``duration_clock=``) so
 tests can script exact readings without sleeping for real.
 
-Emitted line
-------------
-On overrun (measured duration ``> budget_s``) this module emits exactly one
-``[SENSE stage=rule source=tick event=overrun]`` line via
-:mod:`reachy.senselog`, naming the measured and budgeted duration in
-milliseconds — consistent with how :mod:`reachy.behavior.rule_engine` names its
-own lines (``stage="rule"``; here ``source="tick"``/``event="overrun"`` since
-there is no sense field or rule id for a tick-budget observation). A tick
-within budget logs nothing — same "silent unless notable" convention as
-:mod:`reachy.behavior.rule_engine`'s no-match ticks. The running overrun count
-is kept on ``.overruns`` for a status readout or a test assertion.
+Overruns are logged per EPISODE, not per tick (#121, porting the #99 fix)
+---------------------------------------------------------------------------
+This is a LOGGING defect fix, not a latency fix: a slow tick is acceptable —
+work that does not fit one 20 ms tick is fine to pick up on the next tick(s).
+Logging every overrunning tick unconditionally is what is wrong. Measured on
+the deployed box (2026-07-23): 69,696 ``[SENSE ... event=overrun]`` lines over
+a 30-minute window, 77.4% of ticks, ~39 lines/second — enough to bury real
+events and make ``journalctl | grep`` time out at 120 s.
+
+:mod:`reachy.behavior.rule_engine` solved exactly this defect class for #99
+(see its module docstring and ``_suppress``/``_release_suppression``); this
+module ports that shape onto its own single "reason" (there is only one kind
+of overrun here, unlike a rule's several suppression reasons):
+
+* the FIRST overrun tick of a streak emits the usual
+  ``[SENSE stage=rule source=tick event=overrun]`` line — UNCHANGED format
+  from before this fix, naming the measured and budgeted duration in
+  milliseconds;
+* every CONTINUING tick of the same streak is counted (``.overruns`` still
+  increments) but logged silently — this is the flood-prevention step;
+* the first non-overrunning tick after a streak closes it with ONE
+  ``[SENSE stage=rule source=tick event=overrun-summary]`` line naming the
+  streak's tick count, mean duration, max duration and the budget;
+* a tick whose duration exceeds :data:`SPIKE_MULTIPLIER` times the budget
+  (5x) ALWAYS reports immediately, even mid-streak, bypassing suppression —
+  so the 425-1213 ms startup-stall class (21x-61x over budget) stays visible
+  and is never hidden inside a streak summary;
+* an episode still open when the runtime stops is not silently lost: calling
+  :meth:`TickMetrics.close` flushes it with the same closing-summary line.
+  ``rule_engine``'s own #99 fix has a documented edge here — a streak open at
+  loop stop emits no summary, only its entry line — but for a tick-overrun
+  streak that edge matters more: at a sustained 77% overrun rate the streak
+  may never close on its own, so a caller that never flushes it would show no
+  usable count/mean/max for however long the process ran overrun. ``close()``
+  is idempotent, so calling it from a shutdown path that may run more than
+  once (or a path that also races an already-closed streak) is always safe.
+
+``.overruns`` is UNCHANGED semantics throughout: it is the exact count of
+every tick whose measured duration exceeded budget, independent of how many
+of those ticks were logged versus suppressed — the status/test readout must
+never lie about how bad things really are, only the JOURNAL gets quieter.
 
 ``ctx.emit`` pass-through
 --------------------------
@@ -61,6 +91,8 @@ Composition (how ``cmd_engine_run`` would wire this — not yet wired; see
     tick_seam = TickBus(drivers=drivers, consumers=consumers)  # existing composition
     tick_seam = TickMetrics(tick_seam, budget_s=budget_from_hz(config.compose_hz))
     engine_run(transport, config, tick_seam=tick_seam, ...)
+    ...
+    tick_seam.close()  # shutdown: flush any overrun streak still open
 
 Pure standard library (``time``/``logging`` via :mod:`reachy.senselog`) plus
 in-package imports; nothing here touches ``reachy_mini`` or a network.
@@ -79,6 +111,37 @@ from reachy.behavior.rule_engine import STAGE
 #: has neither a sense field nor a rule id.
 SOURCE = "tick"
 EVENT_OVERRUN = "overrun"
+#: The episode-closing summary's ``event=`` token (#121, porting #99's
+#: ``_release_suppression`` line). Deliberately a distinct token from
+#: :data:`EVENT_OVERRUN` (not just a suffix a caller could confuse via a loose
+#: substring match) — see the module docstring's streak-summary bullet.
+EVENT_OVERRUN_SUMMARY = "overrun-summary"
+
+#: Emitted periodically while an overrun episode is still OPEN, so a long-lived
+#: episode reports itself instead of going silent.  Distinct token from
+#: ``overrun-summary`` so a grep can tell "still going" from "ended".
+EVENT_OVERRUN_CHECKPOINT = "overrun-ongoing"
+
+#: A tick this many times over budget always reports immediately, even
+#: mid-streak — the spike-bypass rule that keeps the 425-1213 ms startup-stall
+#: class (21x-61x over budget, see ``docs/verification/
+#: 2026-07-20-retire-old-flow-baseline.md`` section 3) visible no matter what
+#: streak it lands inside.
+SPIKE_MULTIPLIER = 5.0
+
+#: Consecutive in-budget ticks required before an overrun episode is declared
+#: over.  One is not enough: measured on the live robot the loop alternates
+#: over/under budget, so single-tick closing produced 3-4 tick episodes and
+#: TWO log lines each (entry + summary) -- 578 summaries in 60 s, defeating the
+#: whole point of #121.  At 50 Hz this is one second of calm.
+DEFAULT_CALM_TICKS_TO_CLOSE = 50
+
+#: Ticks between checkpoint lines while an episode is still open.  With
+#: hysteresis a live engine can legitimately never close its episode, and a
+#: journal that then shows ONE line at boot and nothing after cannot
+#: distinguish a healthy engine from one wedged in permanent overrun.  At
+#: 50 Hz this is one line every 30 seconds.
+DEFAULT_CHECKPOINT_EVERY_TICKS = 1500
 
 
 def _noop_emit(_event: dict) -> None:
@@ -120,6 +183,8 @@ class TickMetrics:
     Attributes:
         overruns: the running count of ticks whose measured duration exceeded
             ``budget_s`` — readable for a status readout or a test assertion.
+            Exact and unaffected by streak suppression (see the module
+            docstring).
     """
 
     def __init__(
@@ -128,11 +193,22 @@ class TickMetrics:
         *,
         budget_s: float,
         duration_clock: Callable[[], float] = time.perf_counter,
+        calm_ticks_to_close: int = DEFAULT_CALM_TICKS_TO_CLOSE,
+        checkpoint_every_ticks: int = DEFAULT_CHECKPOINT_EVERY_TICKS,
     ) -> None:
         self._inner = inner
         self.budget_s = budget_s
         self._duration_clock = duration_clock
         self.overruns = 0
+        # -- open-episode state (#121, ported #99 shape) ------------------ #
+        self._calm_ticks_to_close = max(1, int(calm_ticks_to_close))
+        self._checkpoint_every_ticks = max(1, int(checkpoint_every_ticks))
+        self._calm_ticks = 0
+        self._streak_open = False
+        self._streak_ticks = 0
+        self._streak_sum_ms = 0.0
+        self._streak_max_ms = 0.0
+        self._streak_end_tick: object = None
 
     def __call__(self, ctx) -> None:
         """Invoke the wrapped seam once, timing it; log + count on overrun.
@@ -151,12 +227,103 @@ class TickMetrics:
             elapsed = self._duration_clock() - start
             if elapsed > self.budget_s:
                 self.overruns += 1
-                self._log_overrun(ctx, elapsed)
+                self._calm_ticks = 0
+                self._record_overrun(ctx, elapsed)
+            else:
+                # HYSTERESIS -- load-bearing, measured on the live robot.
+                # Closing an episode on the FIRST in-budget tick makes the
+                # suppression useless in the real regime: ticks alternate
+                # over/under budget, so streaks are 3-4 ticks long and each
+                # one costs an entry line PLUS a summary line -- 578 summaries
+                # in 60 s on spark-f8a9, worse per streak than the single line
+                # it replaced.  A streak is only really over once the loop has
+                # stayed inside budget for a while.
+                self._calm_ticks += 1
+                if self._calm_ticks >= self._calm_ticks_to_close:
+                    self._close_episode()
 
-    def _log_overrun(self, ctx, elapsed: float) -> None:
+    # -- episode bookkeeping (#121) ---------------------------------------- #
+
+    def _record_overrun(self, ctx, elapsed: float) -> None:
+        """Fold one overrunning tick into the open episode (or open a new one).
+
+        Always updates the streak's count/sum/max — ``.overruns`` and this
+        bookkeeping never lie about the true extent of the streak, only the
+        JOURNAL LINE for a continuing, non-spike tick is suppressed (the #99
+        flood fix, see the module docstring).
+        """
         tick = getattr(ctx, "tick", "?")
         elapsed_ms = elapsed * 1000.0
         budget_ms = self.budget_s * 1000.0
+        is_spike = elapsed_ms > budget_ms * SPIKE_MULTIPLIER
+        opening = not self._streak_open
+        if opening:
+            self._streak_open = True
+            self._streak_ticks = 0
+            self._streak_sum_ms = 0.0
+            self._streak_max_ms = 0.0
+        self._streak_ticks += 1
+        self._streak_sum_ms += elapsed_ms
+        self._streak_max_ms = max(self._streak_max_ms, elapsed_ms)
+        self._streak_end_tick = tick
+        if opening or is_spike:
+            self._log_overrun(tick, elapsed_ms, budget_ms)
+        elif self._streak_ticks % self._checkpoint_every_ticks == 0:
+            # A long-lived episode must not go SILENT.  With hysteresis the
+            # live engine legitimately never closes its episode, so without
+            # this the journal shows one line at boot and nothing ever after
+            # -- an operator cannot tell a healthy engine from one wedged in
+            # permanent overrun.  That is the same silent-no-op class #120 was
+            # about, so the episode reports itself periodically while open.
+            self._emit_summary(event=EVENT_OVERRUN_CHECKPOINT, verb="ongoing")
+
+    def _close_episode(self) -> None:
+        """Emit the closing summary for an open streak, then reset it.
+
+        A no-op when no episode is open, so an ordinary in-budget tick stays
+        exactly as silent as before this fix. Called both from the normal
+        tick path (the first in-budget tick after a streak) and from
+        :meth:`close` (the shutdown-flush path) — the two share one summary
+        shape so a flushed streak reads identically to a naturally-closed one.
+        """
+        if not self._streak_open:
+            return
+        self._emit_summary()
+        self._reset_streak()
+
+    def _emit_summary(self, *, event: str = EVENT_OVERRUN_SUMMARY, verb: str = "ended") -> None:
+        budget_ms = self.budget_s * 1000.0
+        mean_ms = self._streak_sum_ms / self._streak_ticks
+        senselog.stage(
+            STAGE,
+            SOURCE,
+            event,
+            f"overrun streak {verb} tick={self._streak_end_tick} "
+            f"count={self._streak_ticks} mean_ms={mean_ms:.2f} "
+            f"max_ms={self._streak_max_ms:.2f} budget_ms={budget_ms:.2f}",
+        )
+
+    def _reset_streak(self) -> None:
+        self._streak_open = False
+        self._streak_ticks = 0
+        self._streak_sum_ms = 0.0
+        self._streak_max_ms = 0.0
+        self._streak_end_tick = None
+
+    def close(self) -> None:
+        """Flush an overrun streak still open, e.g. when the runtime shuts down.
+
+        Improves on ``rule_engine``'s #99 edge (a streak open at loop stop
+        emits no summary) rather than replicating it: at a sustained high
+        overrun rate a streak may never close on its own, so without this the
+        whole run's tail could be invisible in the journal. Idempotent — a
+        second call, or a call when no episode is open, is a safe no-op — so a
+        caller may wire this into a teardown path that could run more than
+        once (mirroring ``_RuntimeResources.close``'s own idempotency).
+        """
+        self._close_episode()
+
+    def _log_overrun(self, tick, elapsed_ms: float, budget_ms: float) -> None:
         senselog.stage(
             STAGE,
             SOURCE,

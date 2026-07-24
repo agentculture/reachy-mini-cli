@@ -52,30 +52,53 @@ runtime resolves through :func:`resolve_runtime_voice_engine` instead;
 configurable ALTERNATIVE. TTS is never required for the default install.
 
 --------------------------------------------------------------------------
-Playback is INJECTED, and defaults to the daemon's HTTP route
+Playback is INJECTED, and plays through the ONE HELD media client
 --------------------------------------------------------------------------
 :mod:`reachy.speech.playback` offers two transports and this module hard-wires
 neither — ``play`` is a plain injected callable, and the default binding picks
 its transport from :data:`SPEECH_TRANSPORT_ENV` / ``REACHY_TRANSPORT`` /
 :data:`RUNTIME_DEFAULT_TRANSPORT`.
 
-The shipped default is ``"http"``, for three reasons:
+The shipped default is ``"sdk"``, pushing PCM through the media session the
+runtime **already owns** — :class:`reachy.robot.media_client.HeldMediaClient`,
+resolved through the injected ``media_session_provider``. That is the whole
+point of the seam: without a provider the ``sdk`` path would call
+``playback._open_sdk_media()`` and open a **SECOND** ``ReachyMini``, which the
+single-SDK-owner model forbids. Speech is therefore a fan-OUT leg of the one
+client, exactly as ``rms`` and the transcript sense are fan-IN legs of it.
 
-1. **``sdk`` is dead on the deployed robot.** Constructing a media-profile
-   ``ReachyMini`` fails with ``ConnectionRefusedError: [Errno 111]`` even with
-   the runtime stopped (issue #94), while the daemon's HTTP API answers
-   normally. A default nothing can currently exercise is not a default.
-2. **The daemon already owns the speaker.** Routing playback through it is
-   single-owner-CONSISTENT: the runtime's one ``HeldMediaClient`` stays the
-   sole in-process SDK media owner and speech opens no second client of its
-   own. (Using that held client would be the other single-owner answer, but it
-   is exactly the object #94 kills.)
-3. **It needs no extra.** Pure ``urllib``, so a bare ``pip install
-   reachy-mini-cli`` box can speak — which is the same property that made the
-   harmonic voice the default.
+Two facts make this the right default, and neither is the retired #94 premise:
 
-Set ``REACHY_SPEECH_TRANSPORT=sdk`` to flip back once #94 is resolved; that is
-a one-variable change with no code edit.
+1. **Issue #94 is CLOSED.** A media-profile client is not "unconstructable" on
+   the deployed robot — the runtime warms that very client on every boot
+   (measured 2026-07-23: ``HeldMediaClient`` up in 1032 ms, 9/10 camera frames
+   and live mic audio). The earlier ``"http"`` default was justified by that
+   stale premise; it no longer holds.
+2. **The push tolerates the speech worker thread** (live probe, spark-f8a9,
+   2026-07-24, deviation d2): pushing a clip from a worker thread while a
+   reader thread concurrently drained ``client.audio()`` gave 198 clean reads,
+   ZERO read errors and no reader stall — the SDK's input-read and output-push
+   paths do not contend. ``push_audio_sample`` buffers and returns in ~8 ms for
+   a 5.76 s clip, so it never blocks. This is why the hand-off is a direct call
+   rather than a pump-style output seam mirroring
+   :class:`reachy.behavior.audio_pump.AudioPump`.
+
+Using the held client removes the voice's dependency on **daemon media state**
+entirely, which is the durable fix beneath #122's quick ``http`` re-enable.
+
+``http`` remains one variable away (``REACHY_SPEECH_TRANSPORT=http``) and is
+also the automatic fallback when the provider yields no session — a holder that
+has not warmed yet, or a box with no ``[sdk]`` extra at all. Falling back there
+rather than to ``_open_sdk_media()`` is deliberate: opening a second client is
+the defect being removed, and the daemon route reaches the SAME physical
+speaker. The two routes were never in contention, because the daemon and the
+runtime hold ``/dev/snd/pcmC2D0p`` *simultaneously* through the
+``reachymini_audio_sink`` ALSA plugin device (``~/.asoundrc``) — the
+single-SDK-owner model constrains the *media session*, not the *ALSA sink*
+(verified 2026-07-23, and the reason the ``http`` route works at all while the
+runtime holds media). It also needs no extra: pure ``urllib``, so a bare
+``pip install reachy-mini-cli`` box still has a voice — the same property that
+made the harmonic voice the default.
 
 --------------------------------------------------------------------------
 Self-mute
@@ -86,6 +109,14 @@ shaped exactly for :class:`reachy.behavior.transcript_sense.TranscriptSenseDrive
 ``mute_until`` seam, so the runtime cannot transcribe itself and talk back to
 its own voice — the feedback loop the retiring loop's ``play_audio`` wrapper
 also had to close.
+
+It is a SECOND line of defence, not the only one. Whenever the voice plays
+through the robot's own speaker — which both routes above do — the hardware
+already cancels it: the mic read selects the AEC channel
+(:data:`reachy.robot.audio_shape.AEC_CHANNEL`), so the robot's own output is
+subtracted from what it hears and it structurally cannot transcribe itself.
+Self-mute is kept anyway because it costs nothing, is transport-agnostic, and
+does not depend on AEC being correctly configured on a given box.
 
 Standard library plus the existing speech engine — no new dependency, and
 nothing here imports ``reachy_mini``.
@@ -121,7 +152,7 @@ RUNTIME_DEFAULT_VOICE_ENGINE = "harmonic"
 #: specifically; falls back to the general ``REACHY_TRANSPORT``.
 SPEECH_TRANSPORT_ENV = "REACHY_SPEECH_TRANSPORT"
 #: The shipped playback transport — see the module docstring for why.
-RUNTIME_DEFAULT_TRANSPORT = "http"
+RUNTIME_DEFAULT_TRANSPORT = "sdk"
 _VALID_TRANSPORTS = ("sdk", "http")
 
 #: Daemon base URL for the ``http`` playback transport.
@@ -177,7 +208,9 @@ def resolve_playback_transport(name: str | None = None) -> str:
 
     The speech-specific variable wins over the general one so an operator can
     keep the engine on ``--transport sdk`` while routing only AUDIO through the
-    daemon (the useful configuration while issue #94 is open).
+    daemon — the escape hatch if the held client's session is ever unavailable
+    on a given box. (This used to read "while issue #94 is open"; #94 is closed
+    and the held-client route is now the default — see the module docstring.)
 
     Raises a clean exit-1 :class:`CliError` for anything else — resolved at
     SETUP so a typo is a startup error, never a mid-utterance surprise.
@@ -198,25 +231,79 @@ def resolve_playback_transport(name: str | None = None) -> str:
 
 
 def make_default_play(
-    *, transport: str | None = None, base_url: str | None = None
+    *,
+    transport: str | None = None,
+    base_url: str | None = None,
+    media_session_provider: Callable[[], Any] | None = None,
 ) -> Callable[..., None]:
     """Build the default playback callable — ``play(pcm, *, samplerate)``.
 
     Binds :func:`reachy.speech.playback.play_audio` to a transport resolved
     once, here, at setup. ``reachy.speech.playback`` is imported lazily so a
     module-level import of this file never drags the audio stack in.
+
+    Args:
+        media_session_provider: a zero-arg callable returning the runtime's ONE
+            held media session (or ``None``). Resolved at **play time**, on the
+            worker thread — never captured here — because the composition root
+            builds this actuator BEFORE the media client exists, and because a
+            mid-run reconnect swaps the session underneath us. See the module
+            docstring for why the ``sdk`` route must use the held client rather
+            than let ``playback._open_sdk_media()`` open a second one.
+
+    The ``sdk`` route degrades in ONE direction only: no session means the
+    daemon ``http`` route, never a second SDK client. A provider that raises is
+    treated identically — a broken holder is a degradation, not a lost
+    utterance.
     """
     resolved_transport = resolve_playback_transport(transport)
     resolved_base = base_url or os.environ.get(BASE_URL_ENV) or DEFAULT_BASE_URL
+    announced_fallback = False
+
+    def _held_session() -> Any | None:
+        if media_session_provider is None:
+            return None
+        try:
+            return media_session_provider()
+        except Exception as err:  # noqa: BLE001 — a broken holder must not lose the clip
+            logger.warning("speech: held media session provider raised (%s); using http", err)
+            return None
 
     def _play(pcm: bytes, *, samplerate: int) -> None:
+        nonlocal announced_fallback
         from reachy.speech.playback import play_audio
+
+        if resolved_transport != "sdk":
+            play_audio(
+                pcm,
+                samplerate=samplerate,
+                transport=resolved_transport,
+                base_url=resolved_base,
+            )
+            return
+
+        session = _held_session()
+        if session is None:
+            # No held session: the holder has not warmed yet, it dropped, or
+            # this box has no `[sdk]` extra at all. Fall back to the daemon —
+            # the SAME physical speaker (shared ALSA sink) — rather than open a
+            # second media client, which is the defect this seam removes.
+            if not announced_fallback:
+                announced_fallback = True
+                logger.info(
+                    "speech: no held media session yet; playing through the daemon http "
+                    "route at %s (no second SDK client is ever opened)",
+                    resolved_base,
+                )
+            play_audio(pcm, samplerate=samplerate, transport="http", base_url=resolved_base)
+            return
 
         play_audio(
             pcm,
             samplerate=samplerate,
-            transport=resolved_transport,
+            transport="sdk",
             base_url=resolved_base,
+            media_session=session,
         )
 
     return _play
@@ -242,6 +329,15 @@ class SpeechActuator:
         play: ``play(pcm, *, samplerate) -> None``. Defaults to
             :func:`make_default_play`. INJECTED on purpose — see the module
             docstring on why neither transport is hard-wired.
+        media_session_provider: zero-arg callable yielding the runtime's ONE
+            held media session, used only when *play* is left to the default.
+            The ``sdk`` route plays through it instead of opening a second SDK
+            client; ``None`` (or a provider returning ``None``) falls back to
+            the daemon ``http`` route. Resolved per utterance on the worker
+            thread — see :func:`make_default_play`.
+        base_url: daemon base URL for the ``http`` route, when *play* is left
+            to the default. Defaults to ``REACHY_BASE_URL`` /
+            :data:`DEFAULT_BASE_URL`.
         queue_maxsize: bounded hand-off depth (:data:`DEFAULT_QUEUE_MAXSIZE`).
         failure_latch: consecutive render failures before the sink latches off.
         retry_after_s: how long a latched-off sink stays off.
@@ -262,6 +358,8 @@ class SpeechActuator:
         synthesize: Callable[..., bytes] | None = None,
         samplerate: int | None = None,
         play: Callable[..., None] | None = None,
+        media_session_provider: Callable[[], Any] | None = None,
+        base_url: str | None = None,
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
         failure_latch: int = DEFAULT_FAILURE_LATCH,
         retry_after_s: float = DEFAULT_RETRY_AFTER_S,
@@ -277,7 +375,14 @@ class SpeechActuator:
             )
         else:
             self.voice = voice if voice is not None else resolve_runtime_voice_engine()
-        self._play = play if play is not None else make_default_play()
+        self._play = (
+            play
+            if play is not None
+            else make_default_play(
+                base_url=base_url,
+                media_session_provider=media_session_provider,
+            )
+        )
         self._clock = clock
         self._failure_latch = max(1, int(failure_latch))
         self._retry_after_s = max(0.0, float(retry_after_s))

@@ -417,6 +417,18 @@ wheels = [
 ]
 
 [[package]]
+name = "events-cli"
+version = "0.9.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "paho-mqtt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0e/ab/3970e755f662717a30615ed77aca99b99de04068fe3c125c8a49880b682b/events_cli-0.9.0.tar.gz", hash = "sha256:444f9e248bff268206698e7d3f11caad74ec4a5614e70e1921b36f4dec0fa928", size = 297094, upload-time = "2026-07-24T14:36:56.973Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/75/5f/bc7d476825d63337da4920b0c2a3c0375a76ec65a36a6eff11bfa0b601c7/events_cli-0.9.0-py3-none-any.whl", hash = "sha256:5c001c7a4dd72424d8dd0c66449fe39f22c4c1a4d2786f9b12190194400a03cb", size = 67904, upload-time = "2026-07-24T14:36:56.052Z" },
+]
+
+[[package]]
 name = "execnet"
 version = "2.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1300,6 +1312,15 @@ wheels = [
 ]
 
 [[package]]
+name = "paho-mqtt"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/39/15/0a6214e76d4d32e7f663b109cf71fb22561c2be0f701d67f93950cd40542/paho_mqtt-2.1.0.tar.gz", hash = "sha256:12d6e7511d4137555a3f6ea167ae846af2c7357b10bc6fa4f7c3968fc1723834", size = 148848, upload-time = "2024-04-29T19:52:55.591Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/cb/00451c3cf31790287768bb12c6bec834f5d292eaf3022afc88e14b8afc94/paho_mqtt-2.1.0-py3-none-any.whl", hash = "sha256:6db9ba9b34ed5bc6b6e3812718c7e06e2fd7444540df2455d2c51bd58808feee", size = 67219, upload-time = "2024-04-29T19:52:48.345Z" },
+]
+
+[[package]]
 name = "pathspec"
 version = "1.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1850,9 +1871,10 @@ wheels = [
 
 [[package]]
 name = "reachy-mini-cli"
-version = "0.43.0"
+version = "0.44.1"
 source = { editable = "." }
 dependencies = [
+    { name = "events-cli" },
     { name = "harmonics-cli" },
     { name = "numpy" },
 ]
@@ -1882,6 +1904,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "events-cli", specifier = ">=0.9" },
     { name = "harmonics-cli", specifier = ">=0.8" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "opencv-python-headless", marker = "extra == 'vision'", specifier = ">=4.9,<5" },

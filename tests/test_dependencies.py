@@ -62,8 +62,12 @@ def test_opencv_is_in_vision_extra():
     ), f"opencv-python-headless not found in the [vision] extra: {extras.get('vision')}"
 
 
-def test_base_deps_are_exactly_numpy_and_harmonics_cli():
-    """The base install stays exactly numpy + harmonics-cli — no engine package creeps in."""
+def test_base_deps_are_exactly_the_three_pure_wheels():
+    """The base install stays exactly the three pure wheels — no engine package creeps in."""
     deps = _base_deps()
     names = {d.split(">=")[0].split("==")[0].strip() for d in deps}
-    assert names == {"numpy", "harmonics-cli"}, f"unexpected base dependency set: {names}"
+    assert names == {
+        "numpy",
+        "harmonics-cli",
+        "events-cli",
+    }, f"unexpected base dependency set: {names}"

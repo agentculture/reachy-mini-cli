@@ -352,3 +352,247 @@ for raw_line in sys.stdin:
 - **No LLM-shaped block exists in this schema.** A rules-driven run's zero-token
   property can be verified directly from the feed: capture it and assert every
   line's `t` is one of `sense` / `rule` / `intent` / `motion`.
+
+## Nervous System Bus (MQTT)
+
+This is a **third, additive channel** — not a replacement for either NDJSON
+feed above. `behavior engine run` composes `reachy.export.mqtt.NervousPublisher`
+(`reachy/export/mqtt.py`) to republish the same runtime-feed events, plus the
+engine's standing `state.json`, onto an MQTT-shaped event bus, so an external
+service (the reTerminal panel, a logging pipeline, a future subscriber) can
+observe Reachy's senses without touching the SDK, without importing any Python
+from this package, and without contending for the single SDK media session the
+runtime holds.
+
+**The broker and its client are not shipped by this repo.** They belong to the
+sibling **events-cli** project (requirements tracked at
+`agentculture/events-cli#3`); this repo ships no MQTT library and no wire code —
+it declares only the narrow client surface it needs (`connected`, `will_set`,
+`connect`, `disconnect`, `publish`, and the optional `set_on_connect`) and a
+composition step binds the real events-cli client at process start. Without a
+client injected — or with one that does not satisfy that surface, or an
+unreachable broker — the publisher degrades to one named, greppable drop and
+every publish becomes a silent no-op; the 50 Hz tick is never affected. The
+client is events-cli's own importable package — never `paho-mqtt` (or any other
+MQTT library) imported here.
+
+Since `events-cli>=0.9` (2026-07-24) that client is a **base dependency**, and
+it is **adapted rather than driven directly**: the shipped
+`events_cli.EventClient` spells three of those names differently
+(`is_connected`, `close`, and a constructor-time Last Will with no
+post-construction setter). `reachy/export/events_client.py` is the one module
+that knows the difference — it presents the surface above and defers building
+the vendor client until `connect()`, the only moment at which the will is known.
+So a future events-cli API change costs one file, and the publisher's contract
+here is unaffected. Note the degradation is **quiet by design**: a wrong binding
+is a `client-incompatible` drop, not a crash, so only a check against a real
+broker proves the binding is right — a fake shaped like this contract will
+always agree with it.
+
+### Broker location
+
+The client reaches the broker at `REACHY_MQTT_URL`, defaulting to
+`localhost:1883` — a loopback default; a remote consumer is an explicit,
+documented opt-in, never the default.
+
+### Topic map
+
+Two trees under one root (`reachy` by default, injectable at composition):
+
+| Topic                            | Retained | QoS | Contents                                     |
+|-----------------------------------|----------|-----|-----------------------------------------------|
+| `reachy/events/{source}/{type}`   | No       | 0   | One message per runtime-feed event             |
+| `reachy/state/{key}`              | Yes      | 0   | One message per top-level `state.json` key     |
+| `reachy/state/online`             | Yes      | 0   | Publisher-owned availability (`true`/`false`)  |
+
+Every publish on both trees is **QoS 0** (at-most-once): a dropped message
+under load matches the drop-don't-block ethos the rest of the runtime follows,
+and the retained-state topics are self-healing by retention — a late
+subscriber gets the current value regardless of a missed message in between.
+
+#### `reachy/events/{source}/{type}` — the runtime feed, republished
+
+`{source}` is the runtime-feed block type (`sense`, `rule`, `intent`, `motion`
+— see [Runtime Event Feed](#runtime-event-feed-behavior-engine-run---export--)
+above) and `{type}` is that block's action:
+
+| `{source}` | `{type}` values                                          |
+|------------|-----------------------------------------------------------|
+| `sense`    | `snapshot` (a `sense` block carries no action of its own) |
+| `rule`     | `fire`, `suppress`                                        |
+| `intent`   | `declare`, `update`, `clear`, `applied`, `blocked`         |
+| `motion`   | `admit`, `evict`, `goto`                                  |
+
+The **payload is `runtime_to_jsonl(event)`'s output, verbatim** — the exact
+same serializer, byte-identical, that produces every line of the stdout
+`behavior engine run --export -` feed documented above. One serializer, two
+transports: a topic's payload and the corresponding NDJSON line for the same
+event cannot drift, because nothing here re-derives the wire shape. A consumer
+that already parses the stdout runtime feed can parse this topic's payload
+with the exact same code.
+
+Topic segments are **sanitised**: `/`, `+`, `#`, and any other character
+outside `[0-9A-Za-z._-]` are replaced with `-` before a segment is built, so a
+malformed rule id or behavior name can never smuggle a wildcard or a separator
+into the topic tree and publish outside its own subtree. An event whose `t`
+value is not one of `sense` / `rule` / `intent` / `motion` never reaches a
+topic at all — it is dropped by name (`reason=unknown-event-type`) instead of
+silently skipped.
+
+Not retained: the event stream is a stream, so a subscriber that connects
+mid-run sees nothing until the next event.
+
+#### `reachy/state/{key}` — retained standing state
+
+One retained message per top-level key of the engine's `state.json` payload —
+today that is `updated`, `compose_hz`, `active`, `ownership`, `doa`, `intents`,
+and (since #120b) `senses`. The publisher never derives this state itself: it
+wraps the ONE existing writer (`CommandSpool.write_state`, fed by
+`Engine.state()` and the `intents`/`senses` seam riders), so the bus is a
+transport for the same truth `behavior status` reads off disk, never a second
+source of it. Each value is published as compact JSON
+(`json.dumps(value, ensure_ascii=False, separators=(",", ":"))`) under
+`reachy/state/{key}`, retained, so a subscriber that connects mid-run
+immediately receives the current value of every key without waiting for the
+next change. A value that fails to serialize (e.g. a stray binary field) is
+dropped by name (`reason=unserializable-payload`) without losing the other
+keys in the same snapshot.
+
+**A key is published only when its value CHANGED** (issue #126). The engine
+rewrites `state.json` every tick, so an ungated mirror republished the whole
+tree at 50 Hz — measured live at 520 messages per key per 10 s, of which
+`compose_hz` had exactly one distinct value. A retained topic *is* a last
+value, so re-sending an identical one is a no-op with a real cost: the broker
+persists retained messages, and every subscriber wakes for each one. Two
+deliberate exceptions keep that gate honest:
+
+- **`updated` rides along; it never triggers.** It is a per-tick timestamp, so
+  a plain per-key gate would let it alone republish at full tick rate and
+  defeat the purpose. It is therefore published only when some other key also
+  changed — which gives the retained topic a sharper meaning than it had on
+  disk: `reachy/state/updated` is *when the state last changed*. Liveness is
+  not this topic's job; that is `reachy/state/online` plus the Last Will.
+- **Every (re)connect republishes the whole tree, unconditionally.** A fresh
+  broker session holds none of our retained values, so "unchanged since I last
+  published" is the wrong question there — a late subscriber would otherwise be
+  served an empty tree. The first publish of a session is likewise never
+  suppressed: a gate that suppresses repeats must not suppress the original.
+
+Consumers need no change either way — this only removes duplicate deliveries of
+a value the topic already held.
+
+#### `reachy/state/online` — availability, publisher-owned and reserved
+
+A retained `true`/`false` topic the publisher itself owns:
+
+- `true`, retained, published the moment a broker session is live — on first
+  connect, and again on every reconnect.
+- The publisher configures an MQTT **Last Will** on this same topic — payload
+  `false`, retained — **before** it connects, so an ungraceful death
+  (`kill -9`, a severed link) flips the topic to `false` even though the
+  runtime never got the chance to say so itself.
+- `false`, retained, on a graceful shutdown too, so a clean stop and a crash
+  both leave the same honest value.
+
+This is how a consumer distinguishes *live* state from *stale retained
+state*: every other `reachy/state/*` topic keeps serving its last known value
+forever once its publisher goes away, and `online` is the one topic that says
+whether to trust them right now.
+
+`online` is a **reserved** key name: a `state.json` payload that ever contains
+a top-level `online` key has that key refused (named drop,
+`reason=state-key-reserved`) rather than allowed to publish over the
+publisher's own availability topic and shadow it.
+
+### No media on the bus — text references only
+
+**Events and state never carry inline media.** A `sense`/`rule`/`intent`/
+`motion` payload, and every `state.json` value mirrored onto
+`reachy/state/{key}`, may reference media only as **text** — a file path, a
+URL, or a memory-link handle (e.g. `/var/lib/reachy/frames/0042.jpg` or
+`memlink://reachy/audio/9f2a`) — never as inline binary or a base64 blob.
+Camera frames and mic audio move out-of-band; the bus only ever announces
+*where* they are.
+
+This is a **structural** guarantee, not a convention an event author has to
+remember: no runtime event field is binary-typed, serialization is
+`json.dumps` with no `default=` (so a `bytes` value cannot be encoded at all —
+it fails and is dropped by name, `reason=unserializable-payload`, before it
+reaches a client), and neither the event model nor the publisher module
+imports a media codec (`base64`, `binascii`, an imaging library). An external
+consumer can validate a captured payload against this rule directly: a plain
+path/handle string passes; a `data:` media URI, a long uninterrupted base64
+run, or a raw binary value all fail it. `tests/test_nervous_media_boundary.py`
+enforces all three layers (schema, wire, and seam) and is the authority if
+this section and the code ever disagree.
+
+### Degradation
+
+Ported from `reachy_nova`'s `nova_mqtt.py` design (an unreachable broker makes
+every publish a silent no-op and the app runs unaffected), tightened with this
+repo's senselog discipline: nothing here may ever raise into the 50 Hz tick
+thread, and nothing here may ever fail *silently*.
+
+Every fault path resolves to one
+`[SENSE stage=nervous source=mqtt event=<id>] dropped reason=<reason>`
+line — greppable, and named from a fixed
+vocabulary (`no-client`, `client-incompatible`, `connect-failed`,
+`broker-unreachable`, `publish-failed`, `unserializable-payload`,
+`state-key-reserved`, `state-not-a-mapping`, `unknown-event-type`,
+`disconnect-failed`). Each distinct reason is reported **once per session**;
+the report latch clears on the next successful connect, so a second outage in
+a later session is named again rather than swallowed by the first one's
+report.
+
+**Connect and reconnect are reported as `senselog.stage` lines** (`"connected"`
+the first time, `"reconnected — republishing retained state"` on every
+subsequent one) — **but an in-run loss of the broker session is reported as a
+`senselog.drop`**, naming `reason=broker-unreachable`. Do not assume all three
+transitions get the same "something happened, and it's fine" stage-line
+treatment: a session going down is, by construction, exactly what turns every
+subsequent publish into a no-op, so it carries the same shape as every other
+degrade path instead. Both share the fixed `[SENSE …]` line format, so a
+consumer grepping for `stage=nervous` sees the whole lifecycle either way. A
+*graceful* shutdown (the publisher's own `stop()`) is a third, separate case:
+it publishes the retained `false` availability message, calls the client's
+`disconnect()` (a raising `disconnect()` is itself a named drop,
+`reason=disconnect-failed`, never an exception), and then emits its own
+`"publisher stopped"` stage line — deliberate shutdown reports as a stage
+event; an unplanned session loss reports as a drop.
+
+### Reading the bus
+
+A minimal sketch using any MQTT client library (not shipped by this repo —
+there is none to import):
+
+```python
+def on_message(client, userdata, msg):
+    if msg.topic == "reachy/state/online":
+        live = msg.payload.decode() == "true"
+        print("ONLINE" if live else "OFFLINE (stale retained state below)")
+    elif msg.topic.startswith("reachy/events/"):
+        # payload is one runtime-feed line, byte-identical to the stdout feed
+        event = json.loads(msg.payload)
+        print(f"[{event['ts']:.1f}] {msg.topic} {event}")
+    elif msg.topic.startswith("reachy/state/"):
+        key = msg.topic.rsplit("/", 1)[-1]
+        print(f"STATE {key} = {json.loads(msg.payload)}")
+
+client.subscribe("reachy/events/#")
+client.subscribe("reachy/state/#")
+```
+
+### Nervous Bus Notes
+
+- The topic root is injectable at composition (`reachy` by default) — a
+  multi-robot deployment can give each robot its own root.
+- QoS is 0 everywhere on this bus; there is no QoS 1/2 delivery guarantee
+  anywhere in it.
+- Every payload on both trees is compact JSON (`ensure_ascii=False`,
+  `separators=(",", ":")`), matching the stdout feeds' formatting.
+- The event-tree payload vocabulary is exactly the [Runtime Event
+  Feed](#runtime-event-feed-behavior-engine-run---export--) schema above —
+  this section adds transport and topic structure, not a new wire format.
+- Nothing in this module imports an MQTT/transport library
+  (`paho`/`gmqtt`/`asyncio_mqtt`/`aiomqtt`/`amqtt`/`hbmqtt`/`socket`/`ssl`);
+  the transport is entirely the injected client's responsibility.
