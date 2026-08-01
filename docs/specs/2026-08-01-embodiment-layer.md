@@ -42,6 +42,12 @@
 - The layer media endpoints are an INJECTABLE SEAM with two profiles: the robot path (the c19 runtime tee for mic + the daemon http route for the speaker) and the bench path — the dev-box webcam microphone in, monitor speakers out, with browser-style AEC on capture — so the whole layer is testable on this box with no robot attached.
   - instruction: Inject audio source and sink as constructor seams on the layer; bench profile binds dev-box devices, robot profile binds the tee socket + daemon http playback; select by config/env only.
   - honesty: The same layer code runs the bench profile (webcam mic + monitor speakers + browser-style AEC) and the robot profile (tee + daemon route) by configuration only — no forked code paths.
+- Layer-authored rules are NAMESPACED (a distinguishing id prefix, e.g. embody-\*) and written ATOMICALLY (temp + rename of the overlay), never rewriting operator- or shipped-layer rules — so they are enumerable and removable as a set, and an operator edit can never be clobbered by a layer write (rules.py merges per rule id; the overlay file itself has no lock).
+  - honesty: After any sequence of layer writes, operator-authored rules are byte-identical, and one command (or grep by prefix) enumerates exactly the rules the layer created.
+- The layer ships the repo observability contract: the same thinking/message/emotion NDJSON export agent attach has, plus named senselog-style drops for every failure mode (dead session, dead LLM, dead playback, refused rule/action) — no silent no-op anywhere, and a disconnecting export consumer never kills the layer.
+  - honesty: Every named failure mode appears as a named drop/log line and on the export feed in bench test; killing the export consumer mid-conversation leaves the layer running.
+- The tee fans out the ONE per-tick chunk `_AudioTap` already takes — never a second take() on the AudioPump (the documented half-audio defect class) — and a slow or dead tee consumer DROPS chunks via a bounded queue, never backpressuring the 20 ms tick.
+  - honesty: With a wedged tee consumer the runtime tick budget and its own hearing are unaffected (measured on-box), and the audio the layer receives is the same chunk stream `_AudioTap` fanned out.
 
 ## Honesty conditions
 
@@ -54,7 +60,9 @@
 - The operator starts and stops the layer from this box with one command each way, and the lobes site/ harness serves as the bench conversation partner without modification.
 - Each after-state capability appears in the acceptance evidence: a spoken conversation, face + clip seeing, a rule-fire spoken reaction, and at least one execution of each direct-operation action class.
 - The before-state is cited, not assumed: on today's main, agent attach has no transcript cue and publish-only voice (reachy/cli/`_commands`/agent.py), and issue #93 is still open — no external surface carries heard words.
-- Disabling the layer returns the robot to today's behavior with no residue (no orphaned process, socket, or unit state), and swapping the worker/senses model needs only configuration.
+- Disabling the layer removes every process, socket, and unit trace, and swapping the worker/senses model needs only configuration; layer-authored embody-\* rules deliberately PERSIST (q6: teaching survives disable) and stay enumerable and removable by prefix.
+- A red-team transcript (asking for shell, out-of-range motion, an unbounded loop, an over-long say) shows every attempt refused by the existing validators, with each refusal visible in the export feed.
+- A real clip sent as video content parts to model=worker over the deployed gateway returns a correct description BEFORE the clip pipeline is built (a wave-1 probe task in the plan).
 
 ## Success signals
 
@@ -67,6 +75,7 @@
 - The harness never opens an SDK media session or a second ReachyMini (single-SDK-owner model); every sense arrives via the feed, the bus, or the spool result surfaces; it never calls `refuse_if_engine_live` — a live engine is its precondition, not its rival.
 - The zero-LLM boundary stays machine-checked: cognition imports in the new command module are function-local (the parser forbidden-set pin, tests/`test_zero_llm_boundary.py`), `_commands`/behavior.py never gains an import edge to the harness, and nothing lands in reachy/behavior/ or reachy/motion/ — under exactly these conditions a second cognition root is legal today.
 - reachy/service/manager.py `_PRESENCE` stays the closed demo/runtime pair — adding a harness unit there would disable the very runtime the harness needs; its unit, if any, is orthogonal.
+- The blast radius of a hostile or confused utterance is bounded by the action set and the EXISTING fail-closed validators: rules validation (code-smell refusal, bounded lifetimes, 500-char say cap), per-axis goto bounds + the 10 s duration cap, `run_behavior` unbounded-lifetime refusal — and the layer has no shell, filesystem, or network tools to widen it. An ungated ear never widens actuation.
 
 ## Non-goals
 
@@ -77,6 +86,7 @@
 
 - Without changing Reachy code means: the decision loop and every existing condition stay untouched and runnable; additive export-surface legs (an out-of-band media tee or clip reference) are sanctioned attach points, not violations.
 - The Import question resolves: the harness composes by importing reachy modules exactly as agent attach does, and its direct-operation tools call the same in-process seams (intents spool submit, rules overlay write + reload spool, tts + playback) — no subprocess, no shell anywhere in the layer.
+- Video-over-API works end-to-end on the deployed stack: the live gateway advertises `video_understanding` as a worker-role responsibility (probed 2026-08-01: proxied to thor, ready=true, loaded=false so the first call pays a model load), but the wire format — video content parts through the chat-completions relay — is unproven until a real clip round-trips.
 
 ## Scope exploration
 
@@ -106,10 +116,25 @@
   - seeds: `c4`
 - `s13` — `lobes-cli site/ (Astro realtime browser harness)`: The working duplex example the user pointed at: mic in, event stream, audio out against /v1/realtime — local-only, never deployed, CI only builds it; proves the official-OpenAI-shaped duplex loop end-to-end against lobes
   - seeds: `c17`
+- `s14` — `challenge pass / adjacent-systems lens: reachy/behavior/speech_act.py mute_until + the engagement gate vs the layer voice`: The runtime self-mute covers only ITS OWN SpeechActuator speech; the layer speaking via the daemon route is invisible to it, so the runtime may transcribe the layer voice and even name-match on it — seeded the double-voice question (q7); AEC coverage of daemon-route playback is unverified (park v5 already tracks AEC sufficiency)
+- `s15` — `challenge pass / unstated-assumptions lens: deployed lobes /capabilities (live GET probe 2026-08-01)`: worker advertises `image_understanding` + `video_understanding` (proxied to thor, ready, lazy-loaded); senses is proxied to orin not thor (deployment drift the role-name selection makes harmless); /v1/models returns an empty list keyless — the video capability is advertised but the content-part wire format is unproven, seeding the probe-gated assumption
+  - seeds: `c30`
+- `s16` — `challenge pass / actors-and-lifecycle lens: rules overlay merge semantics (rules.py per-id merge, tombstones) vs h20 no-residue`: Layer-authored rules PERSIST in the overlay after the layer stops — they run inside the runtime — which contradicts a broad reading of h20 (no residue on disable); seeded the namespacing requirement and the persist-or-sweep question (q6)
+  - seeds: `c26`
+- `s17` — `challenge pass / security lens: goto_intent bounds, rules fail-closed validation, the tool registry surface`: An ungated ear feeding an LLM with actuation is a prompt-injection surface; existing validators (per-axis bounds, 10 s cap, bounded lifetimes, code-smell refusal, say cap) bound the blast radius and the no-shell tool set closes the rest — seeded the containment boundary and the action-authorization question (q8)
+  - seeds: `c28`
+- `s18` — `challenge pass / concurrency lens: behavior/audio_pump.py _AudioTap single-take contract; clip rider; motion path`: The tee must fan out the one per-tick chunk (a second take() halves everyone audio — documented defect class), seeding c29; CLEAN on the clip rider (`face_sense` background-worker pattern keeps encoding off the tick) and on motion (layer actions ride the spool into engine arbitration, no MotionQueue contention)
+  - seeds: `c29`
+- `s19` — `challenge pass / observability-containment lens: agent attach --export precedent + the senselog ethos`: The spec had NO observability requirement for the layer — a conversational robot with an invisible mind is undebuggable and violates the every-drop-named house rule; seeded the export-contract requirement
+  - seeds: `c27`
+- `s20` — `challenge pass / reversibility-rollback lens: supervisor stop, rules tombstones (enabled=false), set_inhibition, behavior stop`: CLEAN: one-command stop kills the layer; tombstones can disable any rule; inhibition and behavior stop bound motion — the only reversibility gap found is q6 (whether layer rules outlive the layer), already raised
 
 ## Decisions
 
 - The embodiment layer lives under the agent noun — a new verb beside attach.
+- Layer-authored rules PERSIST after disable — the robot keeps what it was taught; disable removes only process, socket, and unit state (q6).
+- Double-voice v1 = accept and observe: the runtime rule-say voice and the layer voice both stay live; coordination becomes a follow-up only if the acceptance evidence shows real collisions (q7).
+- Action authorization v1 = anyone may command: containment comes from the c28 boundary, not from speaker identity; face-corroborated authorization is a parked follow-up (q8).
 
 ## Open parks
 
@@ -117,6 +142,11 @@
 - [unknown_nonblocking] lobes-cli issue 161 — a tool call emitted on a request carrying no tools is parsed and dropped, returning content null — may bite an alternating tools/no-tools harness loop; verify against the deployed gateway before relying on mixed turns.
 - [unknown_nonblocking] Clip length X seconds for the rolling video clip is a tunable, undecided.
 - [unknown_nonblocking] Whether hardware AEC alone suffices without a self-mute seam: the runtime still wires `mute_until` into its transcript sense despite the AEC channel (reachy/robot/`audio_shape.py` `AEC_CHANNEL` 0) — verify live before dropping self-mute for the layer.
+- [unknown_nonblocking] Mouth playback mechanics: the daemon route is upload+play per clip, so v1 plays per-response accumulated audio (utterance-level latency); mid-response chunked streaming and barge-in (unvalidated upstream — lobes 0.54.1 pacing fix never re-validated) are undecided.
+- [unknown_nonblocking] Clip retention: the rolling clip under the state dir must be bounded (overwrite-in-place, ring of N, or TTL) — policy undecided, unbounded growth is not an option.
+- [unknown_nonblocking] Bench resample chain: webcam mics deliver 44.1/48 kHz while the session negotiates 24 k/16 k `input_sample_rate` — a bench-profile config/resample concern, not a design fork.
+- [follow_up] Voice coordination (layer-yields or runtime-yields) — pick one only if the acceptance evidence shows real double-voice collisions (q7 decision).
+- [follow_up] Face-corroborated action authorization (operator-only direct-operation commands) — the q8 v1 decision leaves this as the natural hardening step.
 
 ## Resolved vagueness
 
