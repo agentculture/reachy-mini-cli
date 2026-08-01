@@ -1,0 +1,174 @@
+{"t": 0.001, "session": "meta", "type": "probe_start", "duration_s": 80.0, "wav": "/usr/share/sounds/speech-dispatcher/dummy-message.wav", "sample_rate": 16000}
+{"t": 0.006, "session": "B", "type": "connected", "url": "ws://localhost:8001/v1/realtime?input_sample_rate=16000"}
+{"t": 0.006, "session": "B", "type": "session.created", "session_id": "sess_8ed776d4d240432e9196a426", "config": {"input_audio_format": "pcm16", "input_sample_rate": 16000, "channels": 1, "turn_detection": "server_vad", "aec_mode": "none", "system_prompt": "You are the voice of this machine. You are being spoken to out loud and your reply is read back aloud by a text-to-speech voice, so answer in one or two short spoken sentences. No markdown, no lists, no code blocks, no emoji \u2014 just what you would say."}}
+{"t": 0.006, "session": "A", "type": "log", "logger": "reachy.sense", "level": "INFO", "message": "[SENSE stage=realtime source=speech event=sess1] session up url=ws://localhost:8001/v1/realtime?input_sample_rate=16000"}
+{"t": 0.006, "session": "A", "type": "log", "logger": "reachy.sense", "level": "INFO", "message": "[SENSE stage=realtime source=speech event=sess1] session.created rate=16000 vad=server_vad"}
+{"t": 0.252, "session": "A", "type": "log", "logger": "reachy.sense", "level": "INFO", "message": "[SENSE stage=realtime source=speech event=sess1] speech started (server vad)"}
+{"t": 0.252, "session": "B", "type": "input_audio_buffer.speech_started", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_df3f9b38b25c43369fd649e3", "timestamp_ms": 5788040, "item_id": "item_fe8ca5ba84a54a8684b85a73", "at_ms": 256}
+{"t": 2.015, "session": "B", "type": "sent_response.create"}
+{"t": 30.019, "session": "B", "type": "input_audio_buffer.speech_stopped", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_7468a69b747346108cab7feb", "timestamp_ms": 5817801, "item_id": "item_fe8ca5ba84a54a8684b85a73", "at_ms": 30016, "reason": "max_turn"}
+{"t": 30.025, "session": "A", "type": "log", "logger": "reachy.sense", "level": "INFO", "message": "[SENSE stage=realtime source=speech event=sess1] speech stopped (server vad) reason=max_turn"}
+{"t": 30.228, "session": "B", "type": "conversation.item.input_audio_transcription.completed", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_0df30afe48de4de7ae139d9f", "timestamp_ms": 5818014, "item_id": "item_fe8ca5ba84a54a8684b85a73", "text": "Golar Shapsich Deeps Shall Skull Shall Ser Shapsich Deeps Dod Nimo Heriner Golar Shapsich Deeps Shall Ser Shap Sich Deeps Shall Skull Shadows Rob Shaws Golar Shap Sich Deeps Shall Skull Shall Ser Shap Sich Deeps Shall Smith Musnes Life No Shall Sir Z Shall Snar Shattles Nedenafnekby Simil Mark Doislaff Guller like Ash Seal Himp Besketz Lojnonga by Skivananda Nikroser Shap Sich Deepser's Mistake Lojnonga by Madiset Gallery"}
+{"t": 30.238, "session": "B", "type": "response.created", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_cbbb6075fbab446896134049", "timestamp_ms": 5818015, "response_id": "resp_2f12c9b389ca4cfab63e6086", "item_id": "item_fe8ca5ba84a54a8684b85a73"}
+{"t": 30.249, "session": "B", "type": "input_audio_buffer.speech_started", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_8029b770768a47f1af234257", "timestamp_ms": 5818031, "item_id": "item_5e7a8e87b8b54cae887ca3f6", "at_ms": 30048}
+{"t": 30.35, "session": "A", "type": "log", "logger": "reachy.sense", "level": "INFO", "message": "[SENSE stage=realtime source=speech event=utt1] utterance chars=467"}
+{"t": 30.35, "session": "A", "type": "utterance", "text": "This is the dummy output module. It seems your speech dispatcher is working, but none of its output modules is, except me. Please check out your log file to see what the problem is. You can find it in slash run slash user slash 1000 something slash speech dispatcher slash log slash speech dispatcher log slash var slash log slash speech dispatcher slash speech dispatcher log or in your home in dot speech dispatcher slash log slash speech dispatcher log this is the", "session_id": "sess_f0d6101b6dfc47db919a08e6", "item_id": "item_e7620b18b1fb4efdbabeabf4"}
+{"t": 30.371, "session": "A", "type": "log", "logger": "reachy.sense", "level": "INFO", "message": "[SENSE stage=realtime source=speech event=sess1] speech started (server vad)"}
+{"t": 34.659, "session": "B", "type": "response.text.done", "response_id": "resp_2f12c9b389ca4cfab63e6086", "text": "I am sorry, but I cannot understand the language or words you are using. Could you please rephrase your request in English?"}
+{"t": 40.562, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 40.562, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 40.562, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 40.562, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 40.562, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 40.662, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 40.761, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 40.862, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 40.962, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.062, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.162, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.262, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.363, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.462, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.561, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.662, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.762, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.862, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 41.962, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.062, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.162, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.262, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.362, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.462, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.562, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.662, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.761, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.862, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 42.962, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.062, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.162, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.262, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.362, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.461, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.562, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.662, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.762, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.862, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 43.962, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.062, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.162, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.262, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.362, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.462, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.563, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.661, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.762, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.862, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 44.961, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.062, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.162, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.261, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.362, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.462, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.562, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.663, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.762, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.862, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 45.962, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.062, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.162, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.262, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.362, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.462, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.562, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.662, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.762, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.875, "session": "B", "type": "response.audio.delta", "response_id": "resp_2f12c9b389ca4cfab63e6086", "b64_chars": 6400}
+{"t": 46.885, "session": "B", "type": "response.done", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_a79ef606f8b34596a1ee8f4e", "timestamp_ms": 5834663, "response_id": "resp_2f12c9b389ca4cfab63e6086"}
+{"t": 60.057, "session": "B", "type": "input_audio_buffer.speech_stopped", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_dbae5551c3a34067a404299a", "timestamp_ms": 5847839, "item_id": "item_5e7a8e87b8b54cae887ca3f6", "at_ms": 60032, "reason": "max_turn"}
+{"t": 60.065, "session": "A", "type": "log", "logger": "reachy.sense", "level": "INFO", "message": "[SENSE stage=realtime source=speech event=sess1] speech stopped (server vad) reason=max_turn"}
+{"t": 60.194, "session": "B", "type": "conversation.item.input_audio_transcription.completed", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_4b7e6db97e434d4cb33c7aa7", "timestamp_ms": 5847982, "item_id": "item_5e7a8e87b8b54cae887ca3f6", "text": "Such deeps, shall skull, shall search at such deeps. Donohurinero, Golarshap sich deeps, shall search at such deeps, shall skull shall serve shalls, gollershack such deeps, shall skull shall search at such deeps, shall sniff musnes life now, shall serve shall snar shalls, ned enough, necky, similar mark with the research life seal. Himp basket says Lujnomba by Seven and the Nietzsche Deepser is me stick. Lojnamba by United Ziset, Golar Shapsich."}
+{"t": 60.204, "session": "B", "type": "response.created", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_7da6395090bf431c8f3c866b", "timestamp_ms": 5847982, "response_id": "resp_f0a3c8f3560a460498e9df3b", "item_id": "item_5e7a8e87b8b54cae887ca3f6"}
+{"t": 60.206, "session": "B", "type": "input_audio_buffer.speech_started", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_59f1178a269b4153bc9f6a54", "timestamp_ms": 5847994, "item_id": "item_fd81085104ca4c519515934c", "at_ms": 60064}
+{"t": 60.306, "session": "A", "type": "log", "logger": "reachy.sense", "level": "INFO", "message": "[SENSE stage=realtime source=speech event=utt2] utterance chars=468"}
+{"t": 60.306, "session": "A", "type": "utterance", "text": "Dummy output module. It seems your speech dispatcher is working, but none of its output modules is, except me. Please check out your log file to see what the problem is. You can find it in slash run slash user slash 1000 something slash speech dispatcher slash log slash speech dispatcher log slash var slash log slash speech dispatcher slash speech dispatcher log or in your home in dot speech dispatcher slash log slash speech dispatcher log this is the dummy output", "session_id": "sess_f0d6101b6dfc47db919a08e6", "item_id": "item_2665456833134d0e88229dab"}
+{"t": 60.307, "session": "A", "type": "log", "logger": "reachy.sense", "level": "INFO", "message": "[SENSE stage=realtime source=speech event=sess1] speech started (server vad)"}
+{"t": 65.06, "session": "B", "type": "response.text.done", "response_id": "resp_f0a3c8f3560a460498e9df3b", "text": "I am still unable to understand these words as they do not form coherent sentences in English. Please try to explain what you need in simpler terms."}
+{"t": 68.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 68.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 68.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 68.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 68.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 68.574, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 68.674, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 68.774, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 68.875, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 68.973, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.074, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.174, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.274, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.373, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.574, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.674, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.774, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.874, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 69.974, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.074, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.174, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.273, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.373, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.573, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.674, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.774, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.873, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 70.973, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.073, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.174, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.274, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.373, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.473, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.573, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.673, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.773, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.873, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 71.974, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.075, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.173, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.273, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.374, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.574, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.673, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.773, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.874, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 72.974, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.074, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.173, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.274, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.373, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.574, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.674, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.774, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.874, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 73.973, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.074, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.174, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.274, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.373, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.474, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.574, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.673, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.774, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.874, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 74.973, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 75.074, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 75.174, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 75.273, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 6400}
+{"t": 75.374, "session": "B", "type": "response.audio.delta", "response_id": "resp_f0a3c8f3560a460498e9df3b", "b64_chars": 3840}
+{"t": 75.374, "session": "B", "type": "response.done", "session_id": "sess_8ed776d4d240432e9196a426", "event_id": "event_1d909b0f6cb2477285f837ae", "timestamp_ms": 5863162, "response_id": "resp_f0a3c8f3560a460498e9df3b"}
+{"t": 80.001, "session": "A", "type": "utterance", "text": "This is the dummy output module. It seems your speech dispatcher is working, but none of its output modules is, except me. Please check out your log file to see what the problem is. You can find it in slash run slash user slash 1000 something slash speech dispatcher slash log slash speech dispatcher log slash var slash log slash speech dispatcher slash speech dispatcher log or in your home in dot speech dispatcher slash log slash speech dispatcher log this is the", "session_id": "sess_f0d6101b6dfc47db919a08e6", "item_id": "item_e7620b18b1fb4efdbabeabf4"}
+{"t": 80.001, "session": "A", "type": "utterance", "text": "Dummy output module. It seems your speech dispatcher is working, but none of its output modules is, except me. Please check out your log file to see what the problem is. You can find it in slash run slash user slash 1000 something slash speech dispatcher slash log slash speech dispatcher log slash var slash log slash speech dispatcher slash speech dispatcher log or in your home in dot speech dispatcher slash log slash speech dispatcher log this is the dummy output", "session_id": "sess_f0d6101b6dfc47db919a08e6", "item_id": "item_2665456833134d0e88229dab"}
+{"t": 85.016, "session": "B", "type": "socket_closed"}
+{"t": 85.016, "session": "meta", "type": "probe_end", "duration_s": 80.0, "elapsed_s": 85.009, "session_b": {"connected": true, "session_id": "sess_8ed776d4d240432e9196a426", "armed": true, "event_counts": {"session.created": 1, "input_audio_buffer.speech_started": 3, "input_audio_buffer.speech_stopped": 2, "conversation.item.input_audio_transcription.completed": 2, "response.created": 2, "response.text.done": 2, "response.audio.delta": 142, "response.done": 2}}}
