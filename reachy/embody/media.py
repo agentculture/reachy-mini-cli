@@ -133,8 +133,9 @@ Import boundary
 No ``reachy_mini`` import anywhere in this file (``tests/test_embody_media.py``
 pins this with an AST scan, not merely a run-time probe — a lazy import buried
 in a branch nobody exercises would not be caught by import-time inspection
-alone). The only reachy imports are :func:`reachy.daemon.state_dir` (the tee
-socket's default location), :func:`reachy.speech.playback.play_audio` (the
+alone). The only reachy imports are :func:`reachy.behavior.control.behavior_dir`
+(the tee socket's default location — never ``reachy.daemon`` itself, which owns
+the daemon's ``start``/``stop``), :func:`reachy.speech.playback.play_audio` (the
 sanctioned daemon-http sink, always called with ``transport="http"``),
 :mod:`reachy.senselog` (named drops) and :mod:`reachy.cli._errors` (the shared
 error contract for a genuinely bad profile string). No ``subprocess``, no
@@ -742,10 +743,17 @@ def _default_tee_socket_path() -> Path:
     convention pending task t4's writer, not a hard contract this reader
     enforces — override with :data:`ENV_TEE_SOCKET` if the writer lands at a
     different path.
-    """
-    from reachy.daemon import state_dir
 
-    return state_dir() / "behavior" / DEFAULT_TEE_SOCKET_NAME
+    Resolved through :func:`reachy.behavior.control.behavior_dir` rather than
+    ``reachy.daemon.state_dir`` on purpose: ``reachy.daemon`` also owns
+    ``start``/``stop`` for the daemon OS process, and no module in this package
+    may hold a reference to that — a layer that can stop the daemon has a
+    blast radius wider than its sanctioned action set. The spool loader is the
+    sanctioned route to the same path (see ``tests/test_embody_redteam.py``).
+    """
+    from reachy.behavior.control import behavior_dir
+
+    return behavior_dir() / DEFAULT_TEE_SOCKET_NAME
 
 
 def build_media(
