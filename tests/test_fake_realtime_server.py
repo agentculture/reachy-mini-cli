@@ -8,6 +8,16 @@ harness through a REAL loopback socket using
 :mod:`reachy.speech.realtime_wire`'s client-side helpers directly (no mock),
 which cross-validates wave 1's primitives against real bytes on a real wire —
 exactly what the module docstring promises.
+
+Extended for the embodiment-layer plan's task t3 (2026-08-01) with the
+``response.*`` family: the "--- response.* family" section below round-trips
+``response.create`` arming plus every inbound ``response.*`` event this wire
+now speaks, using the same :class:`_TestClient` (grown one
+``send_response_create`` method) against the three new
+:class:`~tests.fake_realtime_server.Scenario` members. No production session
+client drives this family yet (that is a later task); these tests play the
+client themselves, proving the codec + fake server pair is usable end to end
+before one exists.
 """
 
 from __future__ import annotations
@@ -21,10 +31,27 @@ import time
 import pytest
 
 from reachy.speech import realtime_wire as wire
-from tests.fake_realtime_server import DEFAULT_TRANSCRIPT, FakeRealtimeServer, Scenario
+from tests.fake_realtime_server import (
+    DEFAULT_RESPONSE_AUDIO,
+    DEFAULT_RESPONSE_CHUNK_BYTES,
+    DEFAULT_RESPONSE_TEXT,
+    DEFAULT_TRANSCRIPT,
+    FakeRealtimeServer,
+    Scenario,
+)
 
 _CONNECT_TIMEOUT = 5.0
-_IO_TIMEOUT = 5.0
+#: The response.* "arm and wait" scenarios (embodiment-layer plan, task t3)
+#: give the SERVER up to ``FakeRealtimeServer``'s own ``_DEFAULT_WAIT_TIMEOUT``
+#: (5.0 s) to notice the client's ``response.create`` before proceeding
+#: anyway — a CLIENT-side read bound equal to that value leaves zero margin
+#: for scheduling delay under a fully-loaded ``pytest -n auto`` run (measured
+#: flaky at 5.0/5.0; a real-world contended box can genuinely eat several
+#: seconds of thread-scheduling latency on TOP of the server's own wait).
+#: 15.0 s gives 3x headroom over the server's worst case while costing
+#: nothing in the overwhelmingly common fast path, where every read returns
+#: in well under a second.
+_IO_TIMEOUT = 15.0
 
 
 class _TestClient:
@@ -99,6 +126,9 @@ class _TestClient:
 
     def send_append(self, pcm: bytes) -> None:
         self.send_frame(wire.OPCODE_TEXT, wire.build_append_event(pcm).encode("utf-8"))
+
+    def send_response_create(self) -> None:
+        self.send_frame(wire.OPCODE_TEXT, wire.build_response_create_event().encode("utf-8"))
 
     def close(self) -> None:
         """Drain any pending inbound bytes (e.g. the server's own trailing WS
@@ -533,3 +563,213 @@ def test_stop_is_idempotent() -> None:
     server.start()
     server.stop(timeout=2.0)
     server.stop(timeout=2.0)  # calling twice must not raise
+
+
+# --- response.* family (embodiment-layer plan, task t3) ---------------------------
+
+
+def test_response_happy_path_sequence_and_default_text() -> None:
+    with FakeRealtimeServer(Scenario.RESPONSE_HAPPY_PATH) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+
+        client.send_response_create()
+
+        created = client.read_event()
+        assert created["type"] == "response.created"
+        assert created["response_id"] == server.last_response_id
+        assert created["response_id"]
+
+        text_done = client.read_event()
+        assert text_done["type"] == "response.text.done"
+        assert text_done["response_id"] == created["response_id"]
+        assert text_done["text"] == DEFAULT_RESPONSE_TEXT
+
+        deltas = []
+        event = client.read_event()
+        while event["type"] == "response.audio.delta":
+            deltas.append(event)
+            event = client.read_event()
+        done = event
+        assert done["type"] == "response.done"
+        assert done["response_id"] == created["response_id"]
+
+        client.close()
+
+    # Multiple chunks (the DEFAULT_RESPONSE_CHUNK_BYTES default splits
+    # DEFAULT_RESPONSE_AUDIO into more than one) reassemble CONTIGUOUSLY —
+    # order preserved, nothing dropped, nothing duplicated.
+    assert len(deltas) > 1
+    assembled = b"".join(base64.b64decode(delta["delta"]) for delta in deltas)
+    assert assembled == DEFAULT_RESPONSE_AUDIO
+    assert server.response_create_count == 1
+
+
+def test_response_happy_path_honours_custom_text_and_audio_and_chunk_size() -> None:
+    audio = bytes(range(32, 32 + 20))  # 20 bytes, deliberately not a chunk_bytes multiple
+    with FakeRealtimeServer(
+        Scenario.RESPONSE_HAPPY_PATH,
+        response_text="a custom scripted reply",
+        response_audio=audio,
+        response_chunk_bytes=6,
+    ) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        client.send_response_create()
+        client.read_event()  # response.created
+        text_done = client.read_event()
+        assert text_done["text"] == "a custom scripted reply"
+
+        deltas = []
+        event = client.read_event()
+        while event["type"] == "response.audio.delta":
+            deltas.append(event)
+            event = client.read_event()
+        assert event["type"] == "response.done"
+        client.close()
+
+    # ceil(20 / 6) == 4 chunks, the last one short — order-preserving reassembly.
+    assert len(deltas) == 4
+    assembled = b"".join(base64.b64decode(delta["delta"]) for delta in deltas)
+    assert assembled == audio
+
+
+def test_response_happy_path_proceeds_even_if_response_create_never_arrives() -> None:
+    """Mirrors PING_EXPECT_PONG's "make the wait observable, never hang the
+    connection" contract: a client that connects but never arms still gets a
+    deterministic, bounded scenario (the point being the WAIT is what is
+    tested here, not that arming is required for a session to function)."""
+    with FakeRealtimeServer(Scenario.RESPONSE_HAPPY_PATH, wait_timeout=0.2) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        # Deliberately never send response.create.
+        created = client.read_event()
+        assert created["type"] == "response.created"
+        client.close()
+    assert server.response_create_count == 0
+    assert server.wait_for_response_create(timeout=0) is False
+
+
+def test_response_interrupted_delivers_one_partial_chunk_then_truncates() -> None:
+    with FakeRealtimeServer(Scenario.RESPONSE_INTERRUPTED) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        client.send_response_create()
+
+        client.read_event()  # response.created
+        client.read_event()  # response.text.done
+        delta = client.read_event()
+        assert delta["type"] == "response.audio.delta"
+
+        interrupted = client.read_event()
+        assert interrupted["type"] == "response.interrupted"
+        assert interrupted["response_id"] == delta["response_id"]
+        assert interrupted["truncated"] is True
+
+        # A graceful close follows — never a response.done for an interrupted reply.
+        fin, opcode, _payload = client.read_frame()
+        assert fin is True
+        assert opcode == wire.OPCODE_CLOSE
+        client.close()
+
+    types = [event["type"] for event in server.sent_events]
+    assert "response.done" not in types
+    assert types.count("response.audio.delta") == 1
+
+
+def test_response_audio_delta_malformed_scenario_decodes_the_envelope_but_not_the_field() -> None:
+    """decode_event() (the wire-shape codec) never raises — this event
+    decodes cleanly as an object with a ``type``. The malformedness is one
+    level deeper, in the ``"delta"`` field's CONTENT, exactly mirroring how
+    :attr:`~tests.fake_realtime_server.FakeRealtimeServer.malformed_append_count`
+    already covers the inbound direction: a caller extracting PCM must guard
+    its own ``base64.b64decode`` call, and that guard must never raise past it."""
+    with FakeRealtimeServer(Scenario.RESPONSE_AUDIO_DELTA_MALFORMED) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        client.send_response_create()
+        client.read_event()  # response.created
+        client.read_event()  # response.text.done
+
+        delta_event = client.read_event()
+        assert delta_event["type"] == "response.audio.delta"
+        assert isinstance(delta_event["delta"], str)
+
+        decoded: bytes | None
+        try:
+            decoded = base64.b64decode(delta_event["delta"], validate=True)
+        except ValueError:
+            decoded = None
+        assert decoded is None
+
+        # A graceful close follows — the malformed event does not hang the session.
+        fin, opcode, _payload = client.read_frame()
+        assert fin is True
+        assert opcode == wire.OPCODE_CLOSE
+        client.close()
+
+
+def test_response_create_count_and_wait_for_response_create_observability() -> None:
+    with FakeRealtimeServer(Scenario.RESPONSE_HAPPY_PATH) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        assert server.wait_for_response_create(timeout=0) is False
+        client.send_response_create()
+        assert server.wait_for_response_create(timeout=5.0) is True
+        for _ in range(2 + DEFAULT_RESPONSE_CHUNK_BYTES):  # generous upper bound
+            event = client.read_event()
+            if event["type"] == "response.done":
+                break
+        client.close()
+    assert server.response_create_count == 1
+
+
+def test_last_response_id_is_populated_and_opaque() -> None:
+    with FakeRealtimeServer(Scenario.RESPONSE_HAPPY_PATH) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        client.send_response_create()
+        event = client.read_event()
+        while event["type"] != "response.done":
+            event = client.read_event()
+        client.close()
+    assert isinstance(server.last_response_id, str) and server.last_response_id
+    assert server.last_response_id != server.last_session_id
+    assert server.last_response_id != server.last_item_id
+
+
+# --- the client-side send surface, over a LIVE round trip (h13) -------------------
+
+
+def test_the_live_send_surface_is_exactly_append_and_response_create() -> None:
+    """Complements the AST-level pin in ``test_realtime_wire.py``
+    (``test_the_wire_modules_outbound_frame_type_family_is_exactly_two_members``):
+    drives a real client through BOTH outbound frame kinds against the fake
+    server and checks the server only ever decoded those two ``type`` values —
+    a live wire-level pin alongside the static source-level one."""
+    with FakeRealtimeServer(Scenario.RESPONSE_HAPPY_PATH) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        client.send_append(b"\x01\x02\x03\x04")
+        client.send_response_create()
+        event = client.read_event()
+        while event["type"] != "response.done":
+            event = client.read_event()
+        client.close()
+
+    seen_types: set[str] = set()
+    for opcode, payload in server.received_frames:
+        if opcode != wire.OPCODE_TEXT:
+            continue
+        decoded = wire.decode_event(payload)
+        if decoded is not None:
+            seen_types.add(decoded["type"])
+    assert seen_types == {wire.APPEND_EVENT_TYPE, wire.RESPONSE_CREATE_EVENT_TYPE}

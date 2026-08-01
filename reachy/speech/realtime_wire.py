@@ -44,10 +44,23 @@ Wire contract (agentculture/reachy-mini-cli#115)
   via :func:`build_handshake_request`'s ``extra_headers``.
 - Inbound JSON text-frame events this wire produces: ``session.created``,
   ``input_audio_buffer.speech_started``, ``input_audio_buffer.speech_stopped``,
-  ``conversation.item.input_audio_transcription.completed``, and named
-  ``error`` events (``vad_unavailable``, ``stt_forward_failed``).
+  ``conversation.item.input_audio_transcription.completed``, named
+  ``error`` events (``vad_unavailable``, ``stt_forward_failed``), and — once a
+  session is ARMED (see below) — the ``response.*`` family:
+  ``response.created``, ``response.text.done``, ``response.audio.delta``
+  (base64 PCM16, chunked), ``response.done``, ``response.interrupted``.
   :func:`decode_event` decodes any of these generically; it is the session
   client's job (not this module's) to branch on ``type``.
+- **Arming the duplex half** (embodiment-layer plan, task t3): sending
+  :func:`build_response_create_event`'s ``response.create`` frame is the ONE
+  opt-in trigger for the ``response.*`` family — the donor server
+  (``lobes-cli``'s ``lobes/realtime/_conversation.py`` ``ConversationBridge``)
+  starts DISARMED, so a session that never sends it gets exactly the #115
+  ears-only sequence above and nothing else. This is the third and LAST
+  outbound frame kind this wire ever builds, alongside session config (query
+  params, not a frame at all) and :func:`build_append_event` — see
+  :func:`build_response_create_event`'s own docstring for the h13 boundary
+  this pins.
 
 Stdlib only: ``base64``, ``hashlib``, ``json``, ``os``, ``struct``,
 ``urllib.parse`` — the dependency lists in ``pyproject.toml`` are untouched by
@@ -83,6 +96,10 @@ REALTIME_PATH = "/v1/realtime"
 
 #: The one audio-out event type this wire sends (never a binary frame).
 APPEND_EVENT_TYPE = "input_audio_buffer.append"
+
+#: The one arming frame this wire sends to opt a session into the duplex
+#: half (embodiment-layer plan, task t3) — see :func:`build_response_create_event`.
+RESPONSE_CREATE_EVENT_TYPE = "response.create"
 
 
 class FrameReadError(Exception):
@@ -240,9 +257,14 @@ def read_frame(recv_exact: Callable[[int], bytes]) -> tuple[bool, int, bytes]:
 
 
 # ---------------------------------------------------------------------------
-# Base64 append-event codec (audio-in only — this wire is ears-only, issue
-# #115's non-goals: no response.create is ever sent, so there is no
-# response.audio.delta leg to decode here).
+# Base64 append-event codec (audio-in) + the response.create arming frame
+# (audio-out opt-in). Issue #115 shipped ears-only, where this section built
+# only the append side; the embodiment-layer plan's task t3 adds the one
+# outbound frame — response.create — that arms a session for the response.*
+# family (response.created / response.text.done / response.audio.delta /
+# response.done / response.interrupted). Decoding an inbound response.* event
+# needs no new function: :func:`decode_event` below already handles any event
+# type generically, exactly as it always has.
 # ---------------------------------------------------------------------------
 
 
@@ -257,6 +279,26 @@ def build_append_event(pcm: bytes) -> str:
     return json.dumps({"type": APPEND_EVENT_TYPE, "audio": base64.b64encode(pcm).decode("ascii")})
 
 
+def build_response_create_event() -> str:
+    """Wrap the ``response.create`` arming frame as JSON TEXT ready to send.
+
+    Alongside session config (query params — see :func:`derive_realtime_ws_url`,
+    never a frame) and :func:`build_append_event`, this is the only other
+    outbound frame kind this wire ever builds: the h13 boundary
+    (``tests/test_realtime_wire.py``'s
+    ``test_the_wire_modules_outbound_frame_type_family_is_exactly_two_members``)
+    pins that no third kind is ever added here. Tool calls never travel over
+    this socket — see the embodiment-layer spec's scope/boundaries.
+
+    Carries no body: the donor server's own opt-in check (``lobes-cli``'s
+    ``lobes/realtime/_conversation.py`` ``is_response_create``) reads only
+    ``type``, so this function takes no arguments. Safe to send more than
+    once — arming is idempotent on the server side, and this function itself
+    has no state to make idempotent.
+    """
+    return json.dumps({"type": RESPONSE_CREATE_EVENT_TYPE})
+
+
 def decode_event(payload: bytes | str) -> dict | None:
     """Decode one inbound TEXT-frame payload into an event dict, or ``None`` if malformed.
 
@@ -264,11 +306,19 @@ def decode_event(payload: bytes | str) -> dict | None:
     ``None`` rather than an exception: invalid UTF-8 bytes, text that is not
     valid JSON, JSON whose top-level value is not an object (e.g. an array,
     string, or number), and an object with a missing/non-string/empty
-    ``"type"`` field. This function only validates the wire *shape* — the
-    session client (t3) is responsible for branching on ``type`` and handling
-    each of ``session.created`` / ``input_audio_buffer.speech_started`` /
+    ``"type"`` field. This function only validates the wire *shape* — a
+    session client is responsible for branching on ``type`` and handling each
+    of ``session.created`` / ``input_audio_buffer.speech_started`` /
     ``input_audio_buffer.speech_stopped`` /
-    ``conversation.item.input_audio_transcription.completed`` / ``error``.
+    ``conversation.item.input_audio_transcription.completed`` / ``error`` /
+    and, once armed (:func:`build_response_create_event`), ``response.created``
+    / ``response.text.done`` / ``response.audio.delta`` / ``response.done`` /
+    ``response.interrupted``. This function stops at the envelope: a
+    ``response.audio.delta`` whose ``"delta"`` field is present but not valid
+    base64 still decodes here (the shape is fine) — a caller that wants the
+    PCM bytes back must base64-decode that field itself and handle a
+    ``ValueError``, exactly as the append side's own ``"audio"`` field is
+    decoded ad hoc by its caller, never inside this function.
     """
     if isinstance(payload, bytes):
         try:
