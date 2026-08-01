@@ -24,10 +24,13 @@ import pytest
 
 from reachy.speech import llm
 
-# The verified cortex model (tool_use responsibility, parser qwen3_coder). We pin
-# it explicitly so the test asserts tool-calling even when the box env is pinned to
-# the senses (Gemma) role for day-to-day live cognition.
-_CORTEX_MODEL = "sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP"
+# The cortex ROLE (tool_use responsibility, parser qwen3_coder). We name the role
+# rather than a served model id so the test asserts tool-calling even when the box
+# env is pinned to the senses (Gemma) role for day-to-day live cognition — and so a
+# gateway-side model promotion cannot break it. Pinning the id drifted once already:
+# `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` 404ed after lobes promoted cortex to
+# `unsloth/Qwen3.6-27B-NVFP4`. lobes' resolve_model accepts role names by contract.
+_CORTEX_MODEL = "cortex"
 
 _PROBE_TIMEOUT = 3.0
 _CALL_TIMEOUT = 30.0
