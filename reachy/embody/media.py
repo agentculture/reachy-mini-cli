@@ -11,11 +11,11 @@ all — through ordinary dev-box devices.
 Two profiles, selected by CONFIG/ENV ONLY (:func:`resolve_profile`,
 :data:`ENV_PROFILE`), never by a code fork:
 
-* **robot** — source: the runtime's audio TEE, a raw mono PCM16 stream over a
-  unix ``SOCK_STREAM`` socket under ``state_dir()`` (the writer side is task
-  t4's ``reachy/behavior/audio_tee.py``, built in the same wave; this module
-  owns only the READER and depends on the documented wire, never on that
-  module, so the two land independently). Sink: the daemon's HTTP media route
+* **robot** — source: the runtime's audio TEE — one self-describing JSON header
+  line, then contiguous little-endian **float32** mono samples, over a unix
+  ``SOCK_STREAM`` socket under ``state_dir()``. The writer is
+  :mod:`reachy.behavior.audio_tee`, and this module **cites its constants**
+  (see "One definition of the wire" below). Sink: the daemon's HTTP media route
   via :func:`reachy.speech.playback.play_audio` with ``transport="http"``
   passed EXPLICITLY on every call — see "Why transport is hard-coded" below.
 * **bench** — source: the dev-box microphone (a USB webcam mic, typically
@@ -54,6 +54,27 @@ exists to prevent. :class:`_RobotHttpSinkBackend` therefore names
 and ``reachy_mini`` never enters ``sys.modules`` because the sdk leg's lazy
 import is simply never reached. ``tests/test_embody_media.py`` asserts both
 halves of this.
+
+One definition of the wire — cited, never re-derived
+------------------------------------------------------
+The reader and the writer are the two ends of ONE pipe, and they were first
+built independently against two different descriptions of it: the writer's
+header + float32, and a headerless int16 stream this module had inferred. That
+does not fail loudly — a reader would have parsed the header's ASCII as audio
+and then misread float32 as int16, so the layer would have appeared to *hear
+noise* rather than to be broken, and neither side's tests could catch it
+because no test connected them. Two things follow, and both are enforced:
+
+* every wire fact comes from ``reachy.behavior.audio_tee`` by import —
+  :data:`~reachy.behavior.audio_tee.SAMPLE_DTYPE`,
+  :data:`~reachy.behavior.audio_tee.BYTES_PER_SAMPLE`,
+  :data:`~reachy.behavior.audio_tee.WIRE_NAME`/``WIRE_VERSION``/``WIRE_FORMAT``,
+  :data:`~reachy.behavior.audio_tee.HEADER_TERMINATOR` and the socket PATH
+  (:func:`~reachy.behavior.audio_tee.socket_path`, so one
+  ``REACHY_AUDIO_TEE_SOCKET`` moves both ends and neither can half-move);
+* the two ends are connected in a real end-to-end test
+  (``tests/test_embody_tee_integration.py``) rather than each being fed a
+  payload it framed itself.
 
 Rate normalisation — resolved here, once (plan risk r7)
 ---------------------------------------------------------
@@ -133,9 +154,11 @@ Import boundary
 No ``reachy_mini`` import anywhere in this file (``tests/test_embody_media.py``
 pins this with an AST scan, not merely a run-time probe — a lazy import buried
 in a branch nobody exercises would not be caught by import-time inspection
-alone). The only reachy imports are :func:`reachy.behavior.control.behavior_dir`
-(the tee socket's default location — never ``reachy.daemon`` itself, which owns
-the daemon's ``start``/``stop``), :func:`reachy.speech.playback.play_audio` (the
+alone). The only reachy imports are :mod:`reachy.behavior.audio_tee` (the wire
+constants + the socket path — never ``reachy.daemon`` itself, which owns the
+daemon's ``start``/``stop``; the tee module resolves the state dir on this
+module's behalf, and ``tests/test_embody_redteam.py`` asserts no layer module
+ever NAMES ``reachy.daemon``), :func:`reachy.speech.playback.play_audio` (the
 sanctioned daemon-http sink, always called with ``transport="http"``),
 :mod:`reachy.senselog` (named drops) and :mod:`reachy.cli._errors` (the shared
 error contract for a genuinely bad profile string). No ``subprocess``, no
@@ -145,6 +168,7 @@ tee) or the lazily-imported ``sounddevice`` (the bench devices) only.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
@@ -155,6 +179,14 @@ from typing import Any, Callable
 
 import numpy as np
 
+from reachy.behavior.audio_tee import BYTES_PER_SAMPLE as TEE_BYTES_PER_SAMPLE
+from reachy.behavior.audio_tee import DEFAULT_SOCKET_NAME as _WRITER_SOCKET_NAME
+from reachy.behavior.audio_tee import HEADER_TERMINATOR as TEE_HEADER_TERMINATOR
+from reachy.behavior.audio_tee import SAMPLE_DTYPE as TEE_SAMPLE_DTYPE
+from reachy.behavior.audio_tee import WIRE_FORMAT as TEE_WIRE_FORMAT
+from reachy.behavior.audio_tee import WIRE_NAME as TEE_WIRE_NAME
+from reachy.behavior.audio_tee import WIRE_VERSION as TEE_WIRE_VERSION
+from reachy.behavior.audio_tee import socket_path as tee_socket_path
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.senselog import drop as senselog_drop
 from reachy.senselog import stage as senselog_stage
@@ -190,8 +222,12 @@ ENV_BENCH_SAMPLE_RATE = "REACHY_EMBODY_BENCH_SAMPLE_RATE"
 #: variable for the same daemon.
 ENV_BASE_URL = "REACHY_BASE_URL"
 
-#: The runtime's measured mic rate (see the module docstring) — also the
-#: default normalisation target, so the robot profile resamples nothing.
+#: FALLBACK native rate for the robot source, used only when the tee's header
+#: announces ``samplerate: null`` (a cold media holder that cannot report one
+#: yet). The header is authoritative whenever it carries a rate — see
+#: :class:`_RobotTeeSourceBackend`. 16000 Hz is the runtime's measured mic rate
+#: (see the module docstring) and also the default normalisation target, so the
+#: robot profile resamples nothing.
 DEFAULT_ROBOT_SAMPLE_RATE = 16000
 DEFAULT_TARGET_SAMPLE_RATE = 16000
 #: A typical USB webcam mic's native rate, used only when the bench device
@@ -202,13 +238,43 @@ DEFAULT_BENCH_SAMPLE_RATE_FALLBACK = 48000
 #: overhead in the PortAudio binding.
 DEFAULT_BENCH_BLOCKSIZE = 1024
 
-DEFAULT_TEE_SOCKET_NAME = "audio_tee.sock"
+#: The tee socket's filename — CITED from the writer, never spelled again here.
+#: Kept as a public name because it is part of this module's own surface; the
+#: default PATH comes from the writer's resolver (:func:`_default_tee_socket_path`).
+DEFAULT_TEE_SOCKET_NAME = _WRITER_SOCKET_NAME
+
 DEFAULT_HTTP_TIMEOUT = 10.0
 
 _ROBOT_RECV_BYTES = 4096
 _ROBOT_CONNECT_TIMEOUT = 0.5
 _ROBOT_READ_TIMEOUT = 0.05
 _ROBOT_RETRY_BACKOFF = 2.0
+
+#: Wire versions this reader knows how to consume. A tuple, not a set: a
+#: version field of ``[1]`` (or any other unhashable JSON value) must be
+#: REFUSED, not raise ``TypeError`` inside the membership test.
+UNDERSTOOD_WIRE_VERSIONS = (TEE_WIRE_VERSION,)
+
+#: Cap on the header line. The writer's header is well under 200 bytes, so this
+#: is not a limit a real tee can hit — it exists so a peer that never sends a
+#: newline is REFUSED rather than buffered without bound.
+MAX_HEADER_BYTES = 4096
+
+#: NAMED refusal reasons for the tee's header, following this module's
+#: ``reason (detail)`` convention. Split two ways because the fixes differ: an
+#: INVALID header means whatever is on that socket is not this protocol at all
+#: (unparseable, not an object, or no line inside the cap); a FOREIGN one is
+#: well-formed but announces a stream / version / format / channel count this
+#: reader cannot consume. Either way the reader disconnects and backs off — it
+#: never falls through to reading the bytes as samples.
+TEE_HEADER_INVALID = "tee-header-invalid"
+TEE_HEADER_FOREIGN = "tee-header-foreign"
+#: The header's ``samplerate`` was ``null`` (or unusable) — a LEGITIMATE header
+#: the writer emits when a cold media holder cannot report a rate yet. The
+#: reader keeps reading against its configured fallback, and says so, because
+#: every later consumer is now working off a configured guess rather than the
+#: mic's real rate.
+TEE_RATE_UNKNOWN = "tee-rate-unknown"
 
 #: NAMED reasons a bench backend is unavailable, mirroring
 #: ``reachy/behavior/face_sense.py``'s ``VISION_EXTRA_ABSENT`` /
@@ -394,27 +460,44 @@ class EmbodyMedia:
 
 
 class _RobotTeeSourceBackend:
-    """Reads raw mono PCM16 chunks off the runtime's tee unix socket.
+    """Reads the runtime's audio tee: one JSON header line, then float32 mono.
 
-    Wire format this reader is written against (the shared contract, not
-    something this module infers from the writer): a ``SOCK_STREAM`` unix
-    domain socket carrying a headerless stream of little-endian int16 mono
-    samples — the tee-fanned chunk bytes back to back, no length prefix, no
-    per-chunk framing, no in-band sample-rate. Two things follow directly:
+    The wire is :mod:`reachy.behavior.audio_tee`'s, and this class does not
+    restate it — it imports it (see the module docstring's "One definition of
+    the wire"). A ``SOCK_STREAM`` unix socket carrying::
 
-    * A single ``recv()`` may land mid-sample (an odd trailing byte), so it is
-      buffered and prefixed onto the next read rather than dropped — the
-      float32 conversion below never desyncs from the byte stream.
-    * The sample rate is NOT on the wire, so it is a configuration constant
-      this module owns (:data:`DEFAULT_ROBOT_SAMPLE_RATE`, overridable via
-      :data:`ENV_ROBOT_SAMPLE_RATE` if a deployment's tee writer captures at a
-      different rate than the documented default).
+        {"stream":"reachy-audio-tee","version":1,"format":"f32le",
+         "channels":1,"samplerate":16000}\\n
+        <little-endian float32 samples, contiguous, in production order>
+
+    Three consequences, each load-bearing:
+
+    * **The header is read first, in full, and validated.** It is the one thing
+      a hearer cannot guess, so an absent, truncated, unparseable or foreign
+      header is a NAMED refusal (:data:`TEE_HEADER_INVALID` /
+      :data:`TEE_HEADER_FOREIGN`) plus a disconnect and a backoff retry —
+      never "start reading samples anyway", which is precisely how ASCII header
+      bytes would arrive at a caller as audio.
+    * **The rate comes off the wire.** ``samplerate`` in the header wins over
+      the configured ``native_sample_rate``, which survives only as the
+      fallback for the header's legitimate ``null`` (a cold media holder that
+      cannot report one yet) — announced with :data:`TEE_RATE_UNKNOWN`, never
+      silently assumed.
+    * **A read may land mid-sample.** A sample is
+      :data:`~reachy.behavior.audio_tee.BYTES_PER_SAMPLE` (4) bytes, not 2, so
+      the remainder is buffered and prefixed onto the next read. An off-by-one
+      here shifts every sample after it — the whole stream, silently — which is
+      why ``tests/test_embody_tee_integration.py`` drives this against real
+      ``recv`` sizes that are coprime with the sample size.
 
     Connection is lazy and backed off exactly like
     ``reachy.robot.media_client.HeldMediaClient``: a socket that does not exist
     yet (the tee not started, or absent entirely on a bare box) is the ORDINARY
     resting state, reported once via a latched drop, never a raised exception
     and never a retry storm.
+
+    :param native_sample_rate: the FALLBACK rate, used only for a header that
+        announces ``samplerate: null``.
     """
 
     def __init__(
@@ -439,6 +522,15 @@ class _RobotTeeSourceBackend:
         self._pending = b""
         self._next_attempt_t: float | None = None
         self._reported_down = False
+        #: Per-CONNECTION header state — reset on every connect, because a
+        #: restarted writer may legitimately announce a different rate.
+        self._header_buf = b""
+        self._header_seen = False
+        self._stream_rate = self._native_sample_rate
+        #: Last reported header refusal, so a peer that is permanently not a
+        #: tee costs ONE line rather than one per backoff period. Cleared by a
+        #: header that parses, so a NEW fault is always reported.
+        self._header_fault: str | None = None
 
     def _ensure_connected(self) -> bool:
         if self._sock is not None:
@@ -464,7 +556,7 @@ class _RobotTeeSourceBackend:
             return False
         sock.settimeout(self._read_timeout)
         self._sock = sock
-        self._pending = b""
+        self._reset_stream_state()
         if self._reported_down:
             senselog_stage(
                 _STAGE,
@@ -479,12 +571,27 @@ class _RobotTeeSourceBackend:
         self._reported_down = False
         return True
 
+    def _reset_stream_state(self) -> None:
+        """Forget everything about the previous connection's byte stream."""
+        self._pending = b""
+        self._header_buf = b""
+        self._header_seen = False
+        self._stream_rate = self._native_sample_rate
+
     def read_native(self) -> tuple[np.ndarray, int] | None:
+        """One chunk of mono float32 samples plus the stream's rate, or ``None``.
+
+        ``None`` is every "nothing this call" case — not connected, nothing
+        ready, header still arriving, or a refusal that has already been named.
+        Never raises.
+        """
         if not self._ensure_connected():
             return None
-        assert self._sock is not None  # narrowed by _ensure_connected
+        sock = self._sock
+        if sock is None:  # unreachable: _ensure_connected returned True
+            return None
         try:
-            data = self._sock.recv(self._recv_bytes)
+            data = sock.recv(self._recv_bytes)
         except (TimeoutError, socket.timeout):
             return None  # nothing ready this poll — ordinary, not a drop
         except OSError as err:
@@ -493,17 +600,127 @@ class _RobotTeeSourceBackend:
         if not data:
             self._drop("tee-closed")
             return None
-        data = self._pending + data
-        usable = len(data) - (len(data) % 2)
-        self._pending = data[usable:]
+        if not self._header_seen:
+            data = self._consume_header(data)
+            if data is None:
+                return None
+        return self._decode(data)
+
+    # -- the header ----------------------------------------------------
+
+    def _consume_header(self, data: bytes) -> bytes | None:
+        """Take the header line off the front; return the SAMPLE bytes after it.
+
+        ``None`` means no samples this call: the line is still arriving (a
+        ``recv`` may split it anywhere, header included) or it was refused.
+        """
+        buffered = self._header_buf + data
+        line, terminator, rest = buffered.partition(TEE_HEADER_TERMINATOR)
+        if not terminator:
+            if len(buffered) > MAX_HEADER_BYTES:
+                self._refuse_header(
+                    TEE_HEADER_INVALID, f"no header line in the first {len(buffered)} bytes"
+                )
+                return None
+            self._header_buf = buffered
+            return None
+        self._header_buf = b""
+        refusal = self._accept_header(line)
+        if refusal is not None:
+            self._refuse_header(*refusal)
+            return None
+        return rest
+
+    def _accept_header(self, line: bytes) -> tuple[str, str] | None:
+        """Validate one header line. ``None`` accepts it; else (reason, detail).
+
+        Fail-closed on every field the wire declares, because each one silently
+        changes how the bytes after it must be read.
+        """
+        try:
+            header = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return (TEE_HEADER_INVALID, "the first line is not JSON")
+        # ``type(...) is`` rather than ``isinstance``: this module is pinned
+        # isinstance-free (tests/test_embody_media.py), and an exact-type check
+        # is the stricter reading anyway.
+        if type(header) is not dict:
+            return (TEE_HEADER_INVALID, f"the header is {type(header).__name__}, not an object")
+        stream = header.get("stream")
+        if stream != TEE_WIRE_NAME:
+            return (TEE_HEADER_FOREIGN, f"stream={stream!r} (expected {TEE_WIRE_NAME!r})")
+        version = header.get("version")
+        if version not in UNDERSTOOD_WIRE_VERSIONS:
+            return (
+                TEE_HEADER_FOREIGN,
+                f"version={version!r} (understood: {list(UNDERSTOOD_WIRE_VERSIONS)})",
+            )
+        wire_format = header.get("format")
+        if wire_format != TEE_WIRE_FORMAT:
+            return (TEE_HEADER_FOREIGN, f"format={wire_format!r} (expected {TEE_WIRE_FORMAT!r})")
+        channels = header.get("channels", 1)
+        if channels != 1:
+            return (TEE_HEADER_FOREIGN, f"channels={channels!r} (this reader is mono)")
+        self._header_seen = True
+        self._header_fault = None
+        self._stream_rate = self._resolve_stream_rate(header.get("samplerate"))
+        senselog_stage(
+            _STAGE,
+            _SOURCE_ROBOT_SRC,
+            uuid.uuid4().hex[:8],
+            f"tee header accepted (format={wire_format} rate={self._stream_rate} Hz)",
+        )
+        return None
+
+    def _resolve_stream_rate(self, announced: object) -> int:
+        """The header's rate, or the configured fallback — announced either way."""
+        try:
+            rate = int(announced) if announced is not None else None
+        except (TypeError, ValueError):
+            rate = None
+        if rate is not None and rate > 0:
+            return rate
+        senselog_drop(
+            _STAGE,
+            _SOURCE_ROBOT_SRC,
+            uuid.uuid4().hex[:8],
+            f"{TEE_RATE_UNKNOWN} (header samplerate={announced!r}; "
+            f"using the configured {self._native_sample_rate} Hz)",
+        )
+        return self._native_sample_rate
+
+    def _refuse_header(self, reason: str, detail: str) -> None:
+        """Name it, disconnect, back off — never consume the bytes as audio."""
+        report = self._header_fault != reason
+        self._close_socket()
+        self._reset_stream_state()
+        self._header_fault = reason
+        self._next_attempt_t = self._now() + self._retry_backoff
+        if report:
+            senselog_drop(_STAGE, _SOURCE_ROBOT_SRC, uuid.uuid4().hex[:8], f"{reason} ({detail})")
+
+    # -- the samples ---------------------------------------------------
+
+    def _decode(self, data: bytes) -> tuple[np.ndarray, int] | None:
+        """Whole float32 samples only; the trailing part-sample waits for more.
+
+        The wire is already mono float32, so there is no conversion here at
+        all — an int16 round-trip would only lose precision.
+        """
+        buffered = self._pending + data
+        usable = len(buffered) - (len(buffered) % TEE_BYTES_PER_SAMPLE)
+        self._pending = buffered[usable:]
         if usable == 0:
             return None
-        pcm16 = np.frombuffer(data[:usable], dtype="<i2")
-        samples = (pcm16.astype(np.float32) / 32768.0).copy()
-        return samples, self._native_sample_rate
+        # ``astype`` copies, so the result owns writable memory rather than
+        # aliasing the read-only buffer ``frombuffer`` returns, and it converts
+        # the wire's explicit little-endian dtype to the machine's own.
+        samples = np.frombuffer(buffered[:usable], dtype=TEE_SAMPLE_DTYPE).astype(np.float32)
+        return samples, self._stream_rate
 
     def _drop(self, reason: str) -> None:
         self._close_socket()
+        self._reset_stream_state()
         self._next_attempt_t = self._now() + self._retry_backoff
         senselog_drop(_STAGE, _SOURCE_ROBOT_SRC, uuid.uuid4().hex[:8], reason)
 
@@ -736,24 +953,28 @@ class _BenchSpeakerSinkBackend:
 
 
 def _default_tee_socket_path() -> Path:
-    """``state_dir()/behavior/audio_tee.sock`` — the documented convention.
+    """Exactly where the WRITER binds — :func:`reachy.behavior.audio_tee.socket_path`.
 
-    ``behavior/`` mirrors where the runtime already keeps its other cross-
-    process artefacts (``rules.toml``, the intents spool). The exact name is a
-    convention pending task t4's writer, not a hard contract this reader
-    enforces — override with :data:`ENV_TEE_SOCKET` if the writer lands at a
-    different path.
+    Not a path this module derives in parallel. It used to be
+    ``state_dir()/behavior/audio_tee.sock`` while the writer bound
+    ``state_dir()/audio_tee.sock``: two files, no pipe, and nothing that could
+    notice — the reader simply never found a socket and reported its ordinary
+    ``tee-unavailable`` resting state forever. Calling the writer's own resolver
+    also means one ``REACHY_AUDIO_TEE_SOCKET`` moves BOTH ends together, so a
+    bench run (or the suite's own per-worker guard) cannot half-move the pipe.
 
-    Resolved through :func:`reachy.behavior.control.behavior_dir` rather than
+    Reached through :mod:`reachy.behavior.audio_tee` rather than
     ``reachy.daemon.state_dir`` on purpose: ``reachy.daemon`` also owns
     ``start``/``stop`` for the daemon OS process, and no module in this package
-    may hold a reference to that — a layer that can stop the daemon has a
-    blast radius wider than its sanctioned action set. The spool loader is the
-    sanctioned route to the same path (see ``tests/test_embody_redteam.py``).
-    """
-    from reachy.behavior.control import behavior_dir
+    may hold a reference to that — a layer that can stop the daemon has a blast
+    radius wider than its sanctioned action set (see
+    ``tests/test_embody_redteam.py``). The tee module resolves the state dir on
+    this module's behalf.
 
-    return behavior_dir() / DEFAULT_TEE_SOCKET_NAME
+    :data:`ENV_TEE_SOCKET` remains an embody-specific override for the unusual
+    case of a reader pointed somewhere else deliberately.
+    """
+    return tee_socket_path()
 
 
 def build_media(
