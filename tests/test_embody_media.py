@@ -53,6 +53,20 @@ def _pcm16_bytes(values: list[int]) -> bytes:
     return np.array(values, dtype="<i2").tobytes()
 
 
+def _tee_stream(samples: list[float], *, samplerate: int | None = 16000) -> bytes:
+    """One tee wire image: the writer's own header line, then float32 samples.
+
+    Built with :func:`reachy.behavior.audio_tee.header_bytes` rather than a
+    hand-written JSON literal — a test that re-derives the wire is exactly how
+    the reader and the writer drifted apart in the first place. The pipe itself
+    is exercised end to end in ``tests/test_embody_tee_integration.py``; these
+    tests only need a byte image of it.
+    """
+    from reachy.behavior.audio_tee import SAMPLE_DTYPE, header_bytes
+
+    return header_bytes(samplerate) + np.array(samples, dtype=SAMPLE_DTYPE).tobytes()
+
+
 def _sense_lines(caplog, *, logger_name: str = "reachy.sense") -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == logger_name]
 
@@ -268,7 +282,7 @@ def test_build_media_returns_the_same_wrapper_types_for_both_profiles(
     """
     if profile == media.PROFILE_ROBOT:
         sock_path = tmp_path / "tee.sock"
-        _serve_unix_socket_once(sock_path, _pcm16_bytes([10, -20, 30]), keep_open_s=0.3)
+        _serve_unix_socket_once(sock_path, _tee_stream([0.1, -0.2, 0.3]), keep_open_s=0.3)
         play_calls: list[dict] = []
         monkeypatch.setattr(media, "play_audio", lambda pcm, **kw: play_calls.append(kw))
         built = media.build_media(
@@ -302,16 +316,17 @@ def test_build_media_returns_the_same_wrapper_types_for_both_profiles(
 # ---------------------------------------------------------------------------
 
 
-def test_robot_source_reconstructs_contiguous_pcm16_across_short_reads(tmp_path):
+def test_robot_source_reconstructs_contiguous_samples_across_short_reads(tmp_path):
     """Chunks arrive contiguous, mono, in order — even split mid-sample by the OS.
 
-    ``recv_bytes`` is set deliberately small so the 10-byte payload (5 int16
-    samples) cannot arrive in one ``recv()`` call, exercising the pending-byte
-    buffer that survives a read landing mid-sample.
+    ``recv_bytes`` is set deliberately small (and not a multiple of the wire's
+    4-byte sample) so neither the header nor the 20-byte payload can arrive in
+    one ``recv()`` call, exercising the pending-byte buffer that survives a read
+    landing mid-sample.
     """
     sock_path = tmp_path / "tee.sock"
-    original = [100, -200, 300, -400, 500]
-    _serve_unix_socket_once(sock_path, _pcm16_bytes(original), keep_open_s=0.3)
+    original = [0.1, -0.2, 0.3, -0.4, 0.5]
+    _serve_unix_socket_once(sock_path, _tee_stream(original), keep_open_s=0.3)
 
     backend = media._RobotTeeSourceBackend(
         sock_path,
@@ -334,8 +349,7 @@ def test_robot_source_reconstructs_contiguous_pcm16_across_short_reads(tmp_path)
         backend.close()
 
     assert got.size == len(original), f"expected {len(original)} samples, got {got.size}"
-    expected = np.array(original, dtype=np.float32) / 32768.0
-    assert np.allclose(got, expected, atol=1e-4)
+    assert np.array_equal(got, np.array(original, dtype=np.float32))
 
 
 def test_robot_source_degrades_when_the_tee_socket_is_absent(tmp_path, caplog):
@@ -355,7 +369,7 @@ def test_embody_source_resamples_robot_reads_when_target_differs(tmp_path):
     default only because native == target; this proves it is not special-cased
     out of the code path)."""
     sock_path = tmp_path / "tee.sock"
-    _serve_unix_socket_once(sock_path, _pcm16_bytes([1000] * 48), keep_open_s=0.3)
+    _serve_unix_socket_once(sock_path, _tee_stream([0.03] * 48, samplerate=48000), keep_open_s=0.3)
     backend = media._RobotTeeSourceBackend(sock_path, native_sample_rate=48000, connect_timeout=1.0)
     source = media.EmbodySource(backend, target_sample_rate=16000)
     try:
