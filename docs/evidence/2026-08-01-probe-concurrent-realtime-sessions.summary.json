@@ -1,0 +1,36 @@
+{
+  "duration_s": 80.0,
+  "elapsed_s": 85.009,
+  "session_a": {
+    "connected": true,
+    "sessions": 1,
+    "connect_failures": 0,
+    "submitted": 4000,
+    "sent": 4000,
+    "dropped": 0,
+    "utterances": 2,
+    "ignored_events": 0,
+    "session_down": false,
+    "utterance_texts": [
+      "This is the dummy output module. It seems your speech dispatcher is working, but none of its output modules is, except me. Please check out your log file to see what the problem is. You can find it in slash run slash user slash 1000 something slash speech dispatcher slash log slash speech dispatcher log slash var slash log slash speech dispatcher slash speech dispatcher log or in your home in dot speech dispatcher slash log slash speech dispatcher log this is the",
+      "Dummy output module. It seems your speech dispatcher is working, but none of its output modules is, except me. Please check out your log file to see what the problem is. You can find it in slash run slash user slash 1000 something slash speech dispatcher slash log slash speech dispatcher log slash var slash log slash speech dispatcher slash speech dispatcher log or in your home in dot speech dispatcher slash log slash speech dispatcher log this is the dummy output",
+      "This is the dummy output module. It seems your speech dispatcher is working, but none of its output modules is, except me. Please check out your log file to see what the problem is. You can find it in slash run slash user slash 1000 something slash speech dispatcher slash log slash speech dispatcher log slash var slash log slash speech dispatcher slash speech dispatcher log or in your home in dot speech dispatcher slash log slash speech dispatcher log this is the",
+      "Dummy output module. It seems your speech dispatcher is working, but none of its output modules is, except me. Please check out your log file to see what the problem is. You can find it in slash run slash user slash 1000 something slash speech dispatcher slash log slash speech dispatcher log slash var slash log slash speech dispatcher slash speech dispatcher log or in your home in dot speech dispatcher slash log slash speech dispatcher log this is the dummy output"
+    ]
+  },
+  "session_b": {
+    "connected": true,
+    "session_id": "sess_8ed776d4d240432e9196a426",
+    "armed": true,
+    "event_counts": {
+      "session.created": 1,
+      "input_audio_buffer.speech_started": 3,
+      "input_audio_buffer.speech_stopped": 2,
+      "conversation.item.input_audio_transcription.completed": 2,
+      "response.created": 2,
+      "response.text.done": 2,
+      "response.audio.delta": 142,
+      "response.done": 2
+    }
+  }
+}
