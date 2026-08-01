@@ -168,6 +168,34 @@ def _no_live_event_broker(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_audio_tee_socket(monkeypatch: pytest.MonkeyPatch, tmp_path_factory):
+    """No test may bind — or unlink — the REAL runtime's audio-tee socket.
+
+    The fourth sibling of the three guards above, filed before it could do the
+    damage they each did. ``behavior engine run`` composes
+    :class:`~reachy.behavior.audio_tee.AudioTee` unconditionally, and its path
+    defaults to ``state_dir()/audio_tee.sock`` — which on this box is the socket
+    the DEPLOYED runtime is serving to its embodiment layer. A composition test
+    that does not set ``REACHY_STATE_DIR`` would bind there, and a tee that owns
+    the path removes it on ``close()``: the suite would quietly cut a live
+    consumer's only way back in.
+
+    (The tee already refuses a path a live listener answers on — that guard is
+    real and tested — but it degrades QUIETLY, which is exactly why it must not
+    be the only thing standing between the suite and the robot.)
+
+    So every test gets the socket pointed at its xdist worker's own temp dir
+    (``tmp_path_factory`` is per-worker, so parallel workers never collide).
+    Tests that care about the path re-set this same variable with their own
+    function-scoped ``monkeypatch``, which wins and is undone at teardown.
+    """
+    from reachy.behavior.audio_tee import SOCKET_ENV
+
+    monkeypatch.setenv(SOCKET_ENV, str(tmp_path_factory.getbasetemp() / "audio_tee.sock"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_reachy_logging():
     """Never let one test's installed log handler outlive it.
 

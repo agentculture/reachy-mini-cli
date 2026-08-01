@@ -470,8 +470,19 @@ def test_h9_no_new_media_audio_or_get_frame_caller_appears() -> None:
 
 
 #: Modules allowed to import ``socket``. Pinned by equality (h10): the runtime is
-#: a publishing CLIENT — the broker listens, we never do.
-_SOCKET_IMPORTERS = {"reachy/speech/realtime.py"}
+#: a publishing CLIENT — the broker listens, we never do. The audio tee joined
+#: this set with the embodiment layer's t4: it is a LOCAL ``AF_UNIX`` sink under
+#: the state dir (spec claim c19), i.e. an IPC endpoint on a filesystem path, not
+#: a network service. See :data:`_LOCAL_IPC_LISTENERS` for the exemption's price.
+_SOCKET_IMPORTERS = {"reachy/speech/realtime.py", "reachy/behavior/audio_tee.py"}
+
+#: The ONE file allowed to ``bind``/``listen``. The claim h10 stands for is "no
+#: NETWORK server code", and a unix-domain socket is not one — so rather than
+#: loosen the token ban for everyone, the exemption is one named file and it is
+#: paid for by :func:`test_h10_the_only_listener_is_a_local_unix_socket`, which
+#: asserts something STRICTLY STRONGER for that file than the token scan could:
+#: every socket it opens is ``AF_UNIX``, and no network family appears at all.
+_LOCAL_IPC_LISTENERS = {"reachy/behavior/audio_tee.py"}
 
 _SERVER_TOKENS = re.compile(
     r"\b(socketserver|http\.server|serve_forever|create_server|start_server|SO_REUSEADDR)\b"
@@ -492,10 +503,36 @@ def test_h10_the_repo_still_contains_no_server_code() -> None:
                 continue
             if re.match(r"^(import|from)\s+socket\b", stripped):
                 importers.add(rel)
-            if _SERVER_TOKENS.search(line):
+            if _SERVER_TOKENS.search(line) and rel not in _LOCAL_IPC_LISTENERS:
                 offenders.append(f"{rel}: {stripped}")
     assert offenders == []
     assert importers == _SOCKET_IMPORTERS
+
+
+def test_h10_the_only_listener_is_a_local_unix_socket() -> None:
+    """The price of the one ``bind``/``listen`` exemption, paid in a stronger check.
+
+    The audio tee listens so the embodiment layer can HEAR without opening a
+    second SDK media session (the single-SDK-owner model). What must stay true is
+    that it listens on a filesystem path and nowhere else: no ``AF_INET``, no
+    port, nothing a remote host could reach. Asserted over the AST — every
+    ``socket.socket(...)`` in the file names ``AF_UNIX`` as its family — plus a
+    source scan for any network family name at all.
+    """
+    for rel in sorted(_LOCAL_IPC_LISTENERS):
+        source = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        families = {
+            node.args[0].attr
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "socket"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+        }
+        assert families == {"AF_UNIX"}, f"{rel} opens non-unix sockets: {sorted(families)}"
+        for banned in ("AF_INET", "AF_INET6", "AF_NETLINK", "getaddrinfo", "gethostbyname"):
+            assert banned not in source, f"{rel} names {banned} — that is a network listener"
 
 
 _MQTT_LIBRARIES = ("paho", "gmqtt", "amqtt", "asyncio-mqtt", "hbmqtt")
