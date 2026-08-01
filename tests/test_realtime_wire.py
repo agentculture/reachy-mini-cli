@@ -384,6 +384,65 @@ def test_build_append_event_is_valid_json_text_ready_for_a_text_frame() -> None:
     assert base64.b64decode(decoded["audio"]) == pcm
 
 
+# --- response.create arming frame (embodiment-layer plan, task t3) --------------
+
+
+def test_build_response_create_event_is_exactly_the_bare_type_object() -> None:
+    text = wire.build_response_create_event()
+    assert json.loads(text) == {"type": "response.create"}
+    assert json.loads(text) == {"type": wire.RESPONSE_CREATE_EVENT_TYPE}
+
+
+def test_build_response_create_event_takes_no_arguments_and_is_stable() -> None:
+    # No body, no per-call state: every call renders identically.
+    assert wire.build_response_create_event() == wire.build_response_create_event()
+
+
+def test_build_response_create_event_is_valid_json_text_ready_for_a_text_frame() -> None:
+    """The literal shape a TEXT frame carries, exactly like the append event's
+    own round-trip test above — build, frame, read, decode."""
+    text = wire.build_response_create_event()
+    assert isinstance(text, str)
+    frame = wire.build_frame(wire.OPCODE_TEXT, text.encode("utf-8"), mask=True)
+    fin, opcode, payload = wire.read_frame(_reader_from(frame))
+    assert fin is True
+    assert opcode == wire.OPCODE_TEXT
+    decoded = wire.decode_event(payload)
+    assert decoded is not None
+    assert decoded["type"] == wire.RESPONSE_CREATE_EVENT_TYPE
+
+
+def test_the_wire_modules_outbound_frame_type_family_is_exactly_two_members() -> None:
+    """h13 (embodiment-layer spec): the client-side SEND surface is session
+    config (query params — never a frame, see :func:`derive_realtime_ws_url`),
+    ``input_audio_buffer.append`` and ``response.create`` — no other frame
+    type may ever be built here, so tool calls can never travel over this
+    socket.
+
+    An AST scan is a stronger pin than calling the two known ``build_*``
+    functions and checking their output: it finds every dict literal in the
+    module with a ``"type"`` key (resolving a ``Name`` value like
+    ``APPEND_EVENT_TYPE`` through the module's own globals) and asserts the
+    resulting set is exactly the two allowed constants — so a THIRD outbound
+    builder added anywhere in this file, under any name, fails this test
+    immediately rather than waiting for someone to remember to update it.
+    """
+    tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
+    module_globals = vars(wire)
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if not (isinstance(key, ast.Constant) and key.value == "type"):
+                continue
+            if isinstance(value, ast.Name) and isinstance(module_globals.get(value.id), str):
+                found.add(module_globals[value.id])
+            elif isinstance(value, ast.Constant) and isinstance(value.value, str):
+                found.add(value.value)
+    assert found == {wire.APPEND_EVENT_TYPE, wire.RESPONSE_CREATE_EVENT_TYPE}
+
+
 # --- decode_event: never raises on malformed input ------------------------------
 
 
@@ -426,13 +485,20 @@ def test_decode_event_returns_none_for_a_non_object_top_level_json_value(wrong_s
 
 def test_decode_event_recognises_every_consumed_event_type_shape() -> None:
     """Sanity check against the exact contract: every event type this wire is
-    documented to consume decodes cleanly."""
+    documented to consume decodes cleanly — including the response.* family
+    (embodiment-layer plan, task t3): decode_event is generic by design, so
+    these need no special-casing, but the contract is worth pinning by name."""
     for event_type in (
         "session.created",
         "input_audio_buffer.speech_started",
         "input_audio_buffer.speech_stopped",
         "conversation.item.input_audio_transcription.completed",
         "error",
+        "response.created",
+        "response.text.done",
+        "response.audio.delta",
+        "response.done",
+        "response.interrupted",
     ):
         decoded = wire.decode_event(json.dumps({"type": event_type}))
         assert decoded is not None
