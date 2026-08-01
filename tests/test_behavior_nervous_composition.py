@@ -471,7 +471,11 @@ def test_h9_no_new_media_audio_or_get_frame_caller_appears() -> None:
 
 #: Modules allowed to import ``socket``. Pinned by equality (h10): the runtime is
 #: a publishing CLIENT — the broker listens, we never do.
-_SOCKET_IMPORTERS = {"reachy/speech/realtime.py"}
+#: ``reachy/embody/media.py`` (embodiment-layer task t6) joined this set for the
+#: same reason: it CONNECTS to the runtime's tee unix socket to read audio — it
+#: never binds or listens, so the ``offenders`` check below (which scans the
+#: whole package unconditionally for ``.bind(``/``.listen(``) still stays empty.
+_SOCKET_IMPORTERS = {"reachy/speech/realtime.py", "reachy/embody/media.py"}
 
 _SERVER_TOKENS = re.compile(
     r"\b(socketserver|http\.server|serve_forever|create_server|start_server|SO_REUSEADDR)\b"
