@@ -23,6 +23,16 @@ Three acceptance criteria are pinned here, and each names its tests:
    failure is a named drop plus a backoff reconnect, never a raise.
 3. **the mute seam exists and defaults OFF** — the AEC decision, flippable by
    configuration alone.
+
+A fourth section was added by the foreground-Gemma arc's task t6 (spec claims
+c6/c12, honesty h5/h10): **chunked, cancellable playback** — response audio
+spoken as chunk groups as the deltas arrive, a skip-remaining cancel that
+empties the queue within one chunk boundary, playback that never runs on the
+session pump, and the pre-t6 guarantee that a reply cut before any chunk
+played is never spoken. It leans on the fake server's
+``RESPONSE_HOLD_BEFORE_DONE`` scenario, which withholds ``response.done`` (so
+"played before done" is expressible at all) and PINGs while it holds (so
+"a wedged mouth starves no keepalive" is expressible at all).
 """
 
 from __future__ import annotations
@@ -144,15 +154,22 @@ class _Source:
 
 
 class _Sink:
-    """Records every ``play(pcm16, samplerate=...)`` call, optionally blocking."""
+    """Records every ``play(pcm16, samplerate=...)`` call, optionally blocking.
+
+    ``threads`` records which thread each call ran on, because "playback never
+    runs on the session pump" is a pinned property, not a convention (the robot
+    sink's daemon-HTTP route is a seconds-long round trip).
+    """
 
     def __init__(self, *, block: threading.Event | None = None, boom: bool = False) -> None:
         self.calls: list[tuple[bytes, int]] = []
+        self.threads: list[str] = []
         self.entered = threading.Event()
         self._block = block
         self._boom = boom
 
     def __call__(self, pcm16_bytes: bytes, *, samplerate: int) -> None:
+        self.threads.append(threading.current_thread().name)
         self.entered.set()
         if self._boom:
             raise RuntimeError("sink fault")
@@ -837,6 +854,12 @@ def test_a_raising_playback_sink_is_a_named_drop_and_the_session_survives(
         finally:
             client.close()
     assert client.take_response() is not None
+    # A chunk the sink threw away is never counted as heard: the measurement
+    # is what the sink CONFIRMED, which is what makes it usable as truth.
+    assert client.played_bytes == 0
+    progress = client.playback_progress("resp_boom")
+    assert progress is not None
+    assert (progress.played_bytes, progress.skipped_bytes) == (0, 2)
 
 
 def test_no_playback_sink_at_all_is_a_named_drop_not_a_crash(
@@ -931,6 +954,377 @@ def test_mute_during_playback_withholds_audio_while_the_mouth_is_busy(
             release.set()
             client.close()
     assert _count_reason(sense_log, REASON_SELF_MUTE) == 1  # latched per episode
+
+
+# --------------------------------------------------------------------------- #
+# t6 — chunked, cancellable playback (spec c6/c12, honesty h5/h10)             #
+# --------------------------------------------------------------------------- #
+#
+# Three acceptance criteria, each named by its tests below:
+#
+# 1. response audio plays as CHUNK GROUPS as the deltas arrive (not
+#    accumulate-then-play), and a skip-remaining cancel empties the queue
+#    within one chunk boundary;
+# 2. the session pump and the keepalive are never starved by playback — ``play``
+#    stays on its dedicated thread;
+# 3. a reply cancelled BEFORE any chunk played is still never spoken and never
+#    recorded as spoken (the pre-t6 behaviour, preserved exactly).
+#
+# The chunk size is a ``Limits`` bound, so every test here picks a tiny one
+# (8 bytes = 4 PCM16 samples) and drives the fake server's matching 8-byte
+# deltas: the SHIPPED default is a second of speech, which no offline test
+# should have to synthesize.
+
+_HOLD = Scenario.RESPONSE_HOLD_BEFORE_DONE
+_TEST_CHUNK_BYTES = 8
+_LONG_REPLY = bytes(range(48))  # six 8-byte chunks
+
+
+def _chunked(server: FakeRealtimeServer | None = None, **kwargs) -> RealtimeDuplexSession:
+    """A session whose playback chunk is one fake-server delta."""
+    kwargs.setdefault("playback_chunk_bytes", _TEST_CHUNK_BYTES)
+    kwargs.setdefault("playback_first_chunk_bytes", _TEST_CHUNK_BYTES)
+    kwargs.setdefault("backoff_initial_s", 5.0)
+    kwargs.setdefault("backoff_max_s", 5.0)
+    return _session(server, **kwargs)
+
+
+def _hold_server(**kwargs) -> FakeRealtimeServer:
+    kwargs.setdefault("response_audio", _LONG_REPLY)
+    kwargs.setdefault("response_chunk_bytes", _TEST_CHUNK_BYTES)
+    kwargs.setdefault("wait_timeout", _TIMEOUT)
+    return FakeRealtimeServer(_HOLD, **kwargs)
+
+
+def _feed_deltas(client: RealtimeDuplexSession, response_id: str, audio: bytes, step: int) -> None:
+    """Dispatch ``response.created`` + one delta per *step* bytes, nothing more.
+
+    The direct-dispatch escape hatch ``_feed_response`` already documents: a
+    scripted scenario cannot hold a socket open across an arbitrary test-driven
+    cancel, and these tests need to interleave a cancel with the delta stream.
+    """
+    client._dispatch_event({"type": "response.created", "response_id": response_id})
+    for start in range(0, len(audio), step):
+        client._dispatch_event(_delta_event(response_id, audio[start : start + step]))
+
+
+def test_response_audio_plays_as_chunk_groups_while_the_reply_is_still_arriving() -> None:
+    """Criterion 1a: spoken as the deltas arrive, NOT accumulated until done.
+
+    The hold scenario withholds ``response.done``, so a client that still
+    accumulated the whole reply would have spoken nothing at all here.
+    """
+    sink = _Sink()
+    with _hold_server() as server:
+        client = _chunked(server, play=sink)
+        client.start()
+        try:
+            assert _wait_until(lambda: len(sink.calls) >= 6)
+            # ... and the reply record does not even exist yet.
+            assert client.responses == 0
+            assert "response.done" not in [event["type"] for event in server.sent_events]
+        finally:
+            server.release_response_done()
+            client.close()
+    assert sink.played == _LONG_REPLY
+    assert [len(pcm) for pcm, _rate in sink.calls] == [_TEST_CHUNK_BYTES] * 6
+    assert {rate for _pcm, rate in sink.calls} == {DEFAULT_OUTPUT_SAMPLE_RATE}
+
+
+def test_a_sub_chunk_reply_is_still_spoken_whole_when_the_server_says_done() -> None:
+    """The remainder is flushed at ``response.done``: chunking never eats a tail."""
+    sink = _Sink()
+    audio = bytes(range(20))  # deliberately not a multiple of the chunk size
+    with FakeRealtimeServer(
+        Scenario.RESPONSE_HAPPY_PATH,
+        response_audio=audio,
+        response_chunk_bytes=4,
+        wait_timeout=_TIMEOUT,
+    ) as server:
+        client = _chunked(server, play=sink)
+        client.start()
+        try:
+            assert _wait_until(lambda: client.responses >= 1)
+            assert _wait_until(lambda: len(sink.played) == len(audio))
+        finally:
+            client.close()
+    assert sink.played == audio
+    assert [len(pcm) for pcm, _rate in sink.calls] == [8, 8, 4]
+
+
+def test_a_skip_remaining_cancel_empties_the_playback_queue_within_one_chunk(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """Criterion 1b: ``cancel_playback()`` skips everything still queued.
+
+    The sink blocks INSIDE the first chunk, so the cut lands with one chunk
+    already committed to the speaker and five queued behind it. Exactly the
+    committed one is heard — that is what "within one chunk boundary" means,
+    and it is the whole reason chunk size is a tunable bound.
+    """
+    release = threading.Event()
+    sink = _Sink(block=release)
+    with _hold_server() as server:
+        client = _chunked(server, play=sink)
+        client.start()
+        try:
+            assert sink.entered.wait(timeout=_TIMEOUT)  # chunk 1 is in the speaker
+            assert _wait_until(lambda: client.chunks_queued >= 6)
+            cut = client.cancel_playback()
+            assert client.chunks_cancelled == 5  # synchronous: the queue is empty NOW
+        finally:
+            release.set()
+            server.release_response_done()
+            client.close()
+
+    assert sink.played == _LONG_REPLY[:_TEST_CHUNK_BYTES]
+    assert cut.cancelled is True
+    assert cut.skipped_bytes == 40
+    # Measured at the sink: the boundary chunk was still in flight, so it is
+    # reported as such rather than counted as heard (t7 estimates inside it).
+    assert cut.played_bytes == 0
+    assert cut.in_flight_bytes == _TEST_CHUNK_BYTES
+    assert _count_reason(sense_log, duplex.REASON_PLAYBACK_CANCELLED) == 1
+
+
+def test_a_cancel_also_refuses_the_chunks_of_that_reply_that_have_not_arrived_yet() -> None:
+    """Skip-remaining outlives the queue: the cut reply stops FEEDING too.
+
+    Otherwise "stop talking" would only skip what happened to be buffered and
+    the robot would carry on the moment the next delta landed.
+    """
+    sink = _Sink()
+    client = _chunked(url=_dead_url(), play=sink)
+    client.start()
+    try:
+        _feed_deltas(client, "resp_cut", _LONG_REPLY[:8], _TEST_CHUNK_BYTES)
+        assert _wait_until(lambda: len(sink.calls) == 1)
+        client.cancel_playback()
+        for start in range(8, len(_LONG_REPLY), _TEST_CHUNK_BYTES):
+            client._dispatch_event(
+                _delta_event("resp_cut", _LONG_REPLY[start : start + _TEST_CHUNK_BYTES])
+            )
+        client._dispatch_event({"type": "response.done", "response_id": "resp_cut"})
+        assert _wait_until(lambda: client.responses >= 1)
+    finally:
+        client.close()
+
+    assert sink.played == _LONG_REPLY[:8]
+    assert client.chunks_queued == 1
+    # The RECORD still carries every byte the server sent — what the room heard
+    # is the measurement, not the record (the said/unsaid split t7 builds on).
+    response = client.take_response()
+    assert response is not None
+    assert response.audio == _LONG_REPLY
+    progress = client.playback_progress("resp_cut")
+    assert progress is not None
+    assert progress.played_bytes == 8
+    assert progress.cancelled is True
+
+
+def test_a_server_barge_in_mid_reply_skips_the_remainder_and_keeps_the_played_prefix(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """``response.interrupted`` is the server-side half of the same cut.
+
+    Also the measurement t7 consumes: the cut reply's own progress record says
+    what the room got (one chunk, confirmed by the sink) and what it never got
+    (the other five), against a RECORD that still carries the whole reply.
+    """
+    release = threading.Event()
+    sink = _Sink(block=release)
+    client = _chunked(url=_dead_url(), play=sink)
+    client.start()
+    try:
+        _feed_deltas(client, "resp_barge", _LONG_REPLY, _TEST_CHUNK_BYTES)
+        assert sink.entered.wait(timeout=_TIMEOUT)
+        assert _wait_until(lambda: client.chunks_queued >= 6)
+        client._dispatch_event({"type": "response.interrupted", "response_id": "resp_barge"})
+        assert client.chunks_cancelled == 5
+        release.set()
+        assert _wait_until(lambda: client.played >= 1)
+    finally:
+        release.set()
+        client.close()
+
+    assert sink.played == _LONG_REPLY[:_TEST_CHUNK_BYTES]
+    assert _count_reason(sense_log, REASON_RESPONSE_INTERRUPTED) == 1
+    response = client.take_response()
+    assert response is not None
+    assert response.interrupted is True
+    assert response.audio == _LONG_REPLY
+    progress = client.playback_progress("resp_barge")
+    assert progress is not None
+    assert progress.played_bytes == _TEST_CHUNK_BYTES
+    assert progress.skipped_bytes == len(_LONG_REPLY) - _TEST_CHUNK_BYTES
+    assert progress.in_flight_bytes == 0
+    assert progress.cancelled is True
+
+
+def test_a_reply_cut_before_any_chunk_played_is_never_spoken(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """Criterion 3: the pre-t6 behaviour, preserved exactly.
+
+    At the SHIPPED chunk size a short reply never reaches a chunk boundary
+    before the barge-in, so nothing was ever handed to the mouth: the reply is
+    published with ``interrupted=True`` (which is what
+    ``_commands/agent.py``'s ``_response_tap`` keys on to keep it out of the
+    already-said record) and the speaker stays silent.
+    """
+    sink = _Sink()
+    with FakeRealtimeServer(Scenario.RESPONSE_INTERRUPTED, wait_timeout=_TIMEOUT) as server:
+        client = _session(server, play=sink, backoff_initial_s=5.0, backoff_max_s=5.0)
+        client.start()
+        try:
+            assert _wait_until(lambda: client.responses >= 1)
+        finally:
+            client.close()
+
+    assert sink.calls == []
+    assert client.played == 0
+    assert client.played_bytes == 0
+    assert _count_reason(sense_log, REASON_RESPONSE_INTERRUPTED) == 1
+    response = client.take_response()
+    assert response is not None
+    assert response.interrupted is True
+    progress = client.playback_progress(response.response_id)
+    assert progress is not None
+    assert (progress.played_bytes, progress.queued_bytes, progress.in_flight_bytes) == (0, 0, 0)
+
+
+def test_playback_runs_only_on_the_dedicated_mouth_thread() -> None:
+    """Criterion 2a: ``play`` never runs on the session pump. Six chunks, six
+    calls, one thread — and it is not the worker."""
+    sink = _Sink()
+    with _hold_server() as server:
+        client = _chunked(server, play=sink)
+        client.start()
+        try:
+            assert _wait_until(lambda: len(sink.calls) >= 6)
+        finally:
+            server.release_response_done()
+            client.close()
+    assert set(sink.threads) == {duplex.PLAYBACK_THREAD_NAME}
+    assert duplex.WORKER_THREAD_NAME not in set(sink.threads)
+
+
+def test_a_blocking_mouth_starves_neither_the_session_pump_nor_the_keepalive() -> None:
+    """Criterion 2b: with the sink WEDGED inside a chunk, the session still
+    answers the server's PINGs and still forwards fresh microphone audio.
+
+    The hold scenario PINGs throughout precisely so this can key on a pong that
+    arrives strictly AFTER the mouth blocked, rather than on a cumulative count
+    that a fast client could have satisfied beforehand.
+    """
+    release = threading.Event()
+    sink = _Sink(block=release)
+    source = _Source()
+    with _hold_server(hold_ping_interval_s=0.02) as server:
+        client = _chunked(server, play=sink, read_audio=source, stale_drain_max_chunks=0)
+        client.start()
+        try:
+            assert sink.entered.wait(timeout=_TIMEOUT)  # the mouth is WEDGED
+            pongs = server.pong_count
+            assert _wait_until(lambda: server.pong_count > pongs)  # keepalive alive
+            source.offer(_chunk())
+            assert _wait_until(lambda: len(server.append_payloads) >= 1)  # pump alive
+        finally:
+            release.set()
+            server.release_response_done()
+            client.close()
+    assert server.append_payloads == [_expected_bytes(_chunk())]
+    assert client.pongs_sent >= 1
+
+
+def test_a_playback_overrun_truncates_the_tail_rather_than_leaving_a_hole(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """A full mouth queue stops FEEDING that reply instead of dropping a chunk
+    out of its middle: speech that stops early is honest, speech with a hole in
+    it is a defect. Named, latched, and the tail is never spoken."""
+    release = threading.Event()
+    sink = _Sink(block=release)
+    client = _chunked(url=_dead_url(), play=sink, playback_maxsize=1)
+    client.start()
+    try:
+        _feed_deltas(client, "resp_full", _LONG_REPLY, _TEST_CHUNK_BYTES)
+        client._dispatch_event({"type": "response.done", "response_id": "resp_full"})
+        assert _wait_until(lambda: _count_reason(sense_log, duplex.REASON_PLAYBACK_QUEUE_FULL) >= 1)
+        release.set()
+        assert _wait_until(lambda: client.played >= 1)
+    finally:
+        release.set()
+        client.close()
+
+    played = sink.played
+    assert played, "the chunks that fit were still spoken"
+    assert _LONG_REPLY.startswith(played), "a hole was played, not a truncation"
+    assert len(played) < len(_LONG_REPLY)
+    assert _count_reason(sense_log, duplex.REASON_PLAYBACK_QUEUE_FULL) == 1  # latched
+
+
+def test_the_playback_chunk_bounds_are_documented_defaults_in_limits() -> None:
+    """The chunk size is a ``Limits`` value with a ``DEFAULT_*`` constant, so
+    t1's measured per-chunk daemon round trip can retune it in one place."""
+    limits = duplex.Limits()
+    assert limits.playback_chunk_bytes == duplex.DEFAULT_PLAYBACK_CHUNK_BYTES
+    assert limits.playback_first_chunk_bytes == duplex.DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES
+    # A whole number of PCM16 samples (a half-sample chunk would click), and
+    # one second of speech at the output rate: the cut latency an interjection
+    # pays against the round trip the daemon route pays.
+    assert duplex.DEFAULT_PLAYBACK_CHUNK_BYTES % 2 == 0
+    assert duplex.DEFAULT_PLAYBACK_CHUNK_BYTES == DEFAULT_OUTPUT_SAMPLE_RATE * 2
+    # The first chunk is smaller, so the robot starts speaking sooner.
+    assert duplex.DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES % 2 == 0
+    assert 0 < duplex.DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES <= duplex.DEFAULT_PLAYBACK_CHUNK_BYTES
+
+
+def test_the_first_chunk_can_be_smaller_so_speech_starts_sooner() -> None:
+    """Injectable, and independently: the first group is its own bound."""
+    sink = _Sink()
+    with _hold_server() as server:
+        client = _chunked(server, play=sink, playback_first_chunk_bytes=4)
+        client.start()
+        try:
+            assert _wait_until(lambda: len(sink.calls) >= 2)
+        finally:
+            server.release_response_done()
+            client.close()
+    assert [len(pcm) for pcm, _rate in sink.calls][:2] == [4, 8]
+
+
+def test_cancel_playback_is_a_clean_noop_when_the_mouth_is_idle(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """Safe from any thread, before ``start`` and after ``close``, and silent
+    when there is nothing to cut — a cancel that skipped nothing is not a drop."""
+    client = _chunked(url=_dead_url(), play=_Sink())
+    progress = client.cancel_playback()
+    client.close()
+    assert client.cancel_playback().skipped_bytes == 0
+    assert progress.skipped_bytes == 0
+    assert progress.played_bytes == 0
+    assert _count_reason(sense_log, duplex.REASON_PLAYBACK_CANCELLED) == 0
+
+
+def test_the_playback_progress_record_is_frozen() -> None:
+    progress = duplex.PlaybackProgress(
+        response_id="resp_1",
+        queued_bytes=8,
+        played_bytes=8,
+        in_flight_bytes=0,
+        skipped_bytes=0,
+        cancelled=False,
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        progress.played_bytes = 0  # type: ignore[misc]
+
+
+def test_playback_progress_is_none_for_a_reply_this_session_never_saw() -> None:
+    client = _chunked(url=_dead_url())
+    assert client.playback_progress("resp_never") is None
+    assert client.playback_progress() is None
 
 
 # --------------------------------------------------------------------------- #
@@ -1209,6 +1603,8 @@ def test_limits_defaults_match_the_documented_module_constants() -> None:
     assert limits.utterance_maxsize == duplex.DEFAULT_UTTERANCE_MAXSIZE
     assert limits.response_maxsize == duplex.DEFAULT_RESPONSE_MAXSIZE
     assert limits.playback_maxsize == duplex.DEFAULT_PLAYBACK_MAXSIZE
+    assert limits.playback_chunk_bytes == duplex.DEFAULT_PLAYBACK_CHUNK_BYTES
+    assert limits.playback_first_chunk_bytes == duplex.DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES
     assert limits.max_response_bytes == duplex.DEFAULT_MAX_RESPONSE_BYTES
     assert limits.stale_drain_max_chunks == duplex.DEFAULT_STALE_DRAIN_MAX_CHUNKS
     assert limits.connect_timeout_s == duplex.DEFAULT_CONNECT_TIMEOUT_S
