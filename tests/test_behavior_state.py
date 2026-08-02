@@ -104,7 +104,7 @@ def test_state_reader_degrades_reader_returning_none():
 
 def test_state_reader_both_raise_still_returns_a_snapshot_with_ts():
     def _boom():
-        raise Exception("dead")  # noqa: TRY002
+        raise Exception("dead")
 
     reader = StateReader(joints_fn=_boom, head_pose_fn=_boom, now=lambda: 99.0)
     snap = reader()

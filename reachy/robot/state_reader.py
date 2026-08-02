@@ -233,7 +233,7 @@ class HeldStateReader:
         try:
             pose = self._client.get_current_head_pose()  # type: ignore[attr-defined]
         # A read fault must degrade, not raise.
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             self._drop_client(reason=f"read failed ({err})")
             return None
         return _euler_pitch_yaw(pose)
@@ -280,7 +280,7 @@ class HeldStateReader:
         try:
             self._client = reachy_mini_cls(media_backend="no_media")
         # A construction fault must degrade, not raise.
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             self._next_attempt_t = now + self._retry_backoff
             logger.warning("HeldStateReader: construction failed (%s); will retry", err)
             self._log_transition(
@@ -310,7 +310,7 @@ class HeldStateReader:
                 continue
             try:
                 method()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # Teardown must never raise — and a raising close() should not
                 # stop us trying disconnect() as the fallback (review finding).
                 logger.warning("HeldStateReader: %s() raised during release", method_name)

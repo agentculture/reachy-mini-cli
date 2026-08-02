@@ -989,7 +989,7 @@ Three composition seams:
   present too but publish-only — they feed the cognition feed's
   `message`/`emotion` blocks without the external client touching the robot.
 - **SELF-EXTENSION** — the `forge` tool hands a natural-language goal to a coder
-  model (`FORGE_BASE_URL` / `FORGE_MODEL`, default the lobes gateway's `qwen3`).
+  model (`FORGE_BASE_URL` / `FORGE_MODEL`, default the lobes gateway's `cortex` role).
   What comes back is **never trusted**: it must clear a fail-closed, AST-only
   validator — which never imports or executes the code — before it is
   auto-activated and hot-registered, becoming callable on the **next** turn with

@@ -504,7 +504,7 @@ def test_sleep_arc_wake_word_wakes_when_audio_on() -> None:
     fired = {"i": 0}
 
     class _WakeWordDetector:
-        def update(self, sense, audio) -> bool:  # noqa: ANN001
+        def update(self, sense, audio) -> bool:
             fired["i"] += 1
             return fired["i"] >= 5
 
@@ -538,7 +538,7 @@ def test_sleep_arc_pat_only_does_not_consult_wake_word() -> None:
     calls = {"n": 0}
 
     class _SpyDetector:
-        def update(self, sense, audio) -> bool:  # noqa: ANN001
+        def update(self, sense, audio) -> bool:
             calls["n"] += 1
             return False
 
@@ -630,14 +630,12 @@ def test_sleep_run_no_audio_wake_sdk_pat_only_bounded(
     polled = {"n": 0}
 
     class _QuietPatWake:
-        def __init__(
-            self, *, read_head_pose, commanded_pose, detector=None
-        ) -> None:  # noqa: ANN001
+        def __init__(self, *, read_head_pose, commanded_pose, detector=None) -> None:
             # Prove the wiring: the SDK head-pose read-back is the source.
             assert getattr(read_head_pose, "__self__", None) is fake
             self._commanded = commanded_pose
 
-        def poll(self, *, now=None) -> bool:  # noqa: ANN001
+        def poll(self, *, now=None) -> bool:
             polled["n"] += 1
             self._commanded()  # reads the moving commanded pose (must not raise)
             return False
@@ -694,7 +692,7 @@ def test_sleep_start_no_audio_wake_spawns_flag(monkeypatch: pytest.MonkeyPatch, 
         returncode = None
         pid = 5555
 
-        def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001
+        def __init__(self, cmd, **kwargs) -> None:
             captured.append(list(cmd))
 
         def poll(self) -> None:
@@ -724,7 +722,7 @@ def test_sleep_start_no_audio_wake_absent_by_default(
         returncode = None
         pid = 5556
 
-        def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001
+        def __init__(self, cmd, **kwargs) -> None:
             captured.append(list(cmd))
 
         def poll(self) -> None:
@@ -753,7 +751,7 @@ def test_sleep_restart_no_audio_wake_spawns_flag(monkeypatch: pytest.MonkeyPatch
         returncode = None
         pid = 5557
 
-        def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001
+        def __init__(self, cmd, **kwargs) -> None:
             captured.append(list(cmd))
 
         def poll(self) -> None:

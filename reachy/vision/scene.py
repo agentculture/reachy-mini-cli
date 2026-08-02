@@ -55,8 +55,11 @@ ENV_API_KEY = "REACHY_OPENAI_API_KEY"
 #: The NEW env this task adds: the scene/vision model id (the lobes *senses* role).
 ENV_VISION_MODEL = "REACHY_VISION_MODEL_ID"
 
-#: Default vision model — the lobes senses role (Gemma-4 12B), proven live.
-DEFAULT_VISION_MODEL = "coolthor/gemma-4-12B-it-NVFP4A16"
+#: Default vision model: the lobes gateway's senses ROLE (issue #132) — never a
+#: served id, so a model promotion cannot break it (the sibling forge default
+#: suffered exactly that drift; see reachy.forge.client.DEFAULT_FORGE_MODEL).
+#: Proven live 2026-08-02: resolves to the Gemma-4 12B backend today.
+DEFAULT_VISION_MODEL = "senses"
 #: Default endpoint — the same daemon-local default :mod:`reachy.speech.llm`
 #: uses; the deployed box points ``REACHY_OPENAI_URL_BASE`` at the lobes gateway.
 DEFAULT_BASE_URL = "http://localhost:8000"
@@ -157,7 +160,7 @@ def _encode_jpeg(
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
     except SceneError:
         raise
-    except Exception as err:  # noqa: BLE001 — any cv2/array error is a describe failure
+    except Exception as err:  # any cv2/array error is a describe failure
         raise SceneError(f"failed to JPEG-encode the camera frame: {err}") from err
     if not ok:
         raise SceneError("failed to JPEG-encode the camera frame")
@@ -255,7 +258,7 @@ def describe_frame(frame: object, *, transport=None, cfg: SceneConfig | None = N
         text = post(messages, cfg)
     except SceneError:
         raise
-    except Exception as err:  # noqa: BLE001 — normalise any transport error to SceneError
+    except Exception as err:  # normalise any transport error to SceneError
         raise SceneError(f"scene description request failed: {err}") from err
 
     if not isinstance(text, str) or not text.strip():

@@ -227,7 +227,7 @@ transport. Deep notes for the non-trivial nouns follow in
 | `sleep` | `_commands/sleep.py` | `reachy/sleep/{state,stimulus,wake,patwake,wakeword,supervisor}.py`, `reachy/motion/{sleep,sleep_signal}.py` | `sdk` default |
 | `service` | `_commands/service.py` | `reachy/service/{units,manager}.py` (`ServiceManager`, systemd `--user`) | none (systemd) |
 | `agent attach` | `_commands/agent.py` | `reachy/speech/{agent_turn,tools,intent_tools,events}.py` + `reachy/forge/*`, over `--feed` + the intents spool | none (feeds + spool) |
-| `agent embody` (+ `start`/`stop`/`restart`/`status`) | `_commands/agent.py` (`_compose_embody_seam`, `cmd_agent_embody*`) | `reachy/embody/{media,tools,cues,engine,supervisor}.py` + `reachy/speech/realtime_duplex.py`, consuming the runtime's `behavior/{audio_tee,clip_rider}.py` legs | none (tee socket, feed/bus, spools, daemon `http`) |
+| `agent embody` (+ `start`/`stop`/`restart`/`status`) | `_commands/agent.py` (`_compose_embody_seam`, `cmd_agent_embody*`) | `reachy/embody/{media,tools,cues,engine,attention,supervisor}.py` + `reachy/speech/realtime_duplex.py`, consuming the runtime's `behavior/{audio_tee,clip_rider}.py` legs | none (tee socket, feed/bus, spools, daemon `http`) |
 
 ## Noun internals
 
@@ -912,15 +912,74 @@ profile.
 **`reachy/embody/engine.py` — cue-triggered, streaming, and it never gives up.**
 Several seams are cited verbatim from `AgentTurnEngine` (bounded history, the
 `run(max_turns=, stop=, before_turn=)` shape, export-before-dispatch,
-`max_tool_rounds`). Two are deliberately NOT inherited: there is **no permanent
+`max_tool_rounds`). One is deliberately NOT inherited: there is **no permanent
 failure latch** (that engine mutes itself for the process lifetime after a
 failure streak; a layer that goes permanently quiet because the gateway blipped
 is indistinguishable from one that crashed, so every failure here is a named,
-counted drop and the next turn retries), and **no snapshot-only buffer** — a
-turn is TRIGGERED by an arriving cue or utterance, which is what makes "the
-robot's own rule fired, so it says something about it" possible at all.
+counted drop and the next turn retries). A turn is TRIGGERED rather than
+polled, which is what makes "the robot's own rule fired, so it says something
+about it" possible at all — but **not by everything that arrives** (issue #143).
+Measured live: 187 cues in ~40 s produced 23 turns and 19 queue-full
+drops, mix 145 "speech from the left/ahead/right" + 44 "loud sound" + **zero**
+rule fires. The layer has its OWN ears, so those cues duplicated what the
+duplex session already heard, at tick rate rather than utterance rate. So
+intake is THREE classes, routed at `_CueReader` by t6's
+`cues.classified_cues_for_line`: an utterance TRIGGERS, an ALERT (a rule fire)
+TRIGGERS, and every CONTEXT cue (`sense`/`intent`/`motion`, and a rule
+SUPPRESSION) lands in a bounded park the next turn DRAINS and that never causes
+one. That park is where `AgentTurnEngine`'s snapshot-only buffer IS cited (cues
+arriving during a turn accumulate for the next); what is added on top is
+COALESCING keyed on the cue TEXT — the vocabulary is closed
+(`reachy/runtime_cues.py`), so equal text means the same fact happened again,
+and 145 lines reach the model as `speech from the left (x145)`. Two bounds
+contain the ALERT class, because `rules.py` permits `cooldown_s=0` and several
+rules can fire in one tick: the trigger buffer is drained WHOLE (ten fires
+inside one turn window cost a second turn, never ten) and
+`DEFAULT_MIN_ALERT_INTERVAL_S` (5.0 s) bounds alert-TRIGGERED turns — inside
+it an alert is DEFERRED, never dropped, and an utterance lifts the bound
+outright. `submit_cue` defaults to CONTEXT on purpose: a caller that has not
+thought about which lane a cue belongs to must not be able to wake the mind up
+by accident. Every turn's senselog line and its exported `thinking` text OPEN
+with `triggers=T context=N coalesced-from=M` — a silent coalescer is
+indistinguishable from a dropper — and `docs/export-schema.md` documents both
+(the block SHAPE did not move; no key was added or removed).
 `note_spoken` feeds the layer's own speech back as CONTEXT, never as a trigger:
-a robot that treats its own voice as a perception talks to itself. Both lanes
+a robot that treats its own voice as a perception talks to itself.
+
+**The heard class is gated on ATTENTION (issue #148), and the gate is
+`reachy/embody/attention.py` — never the wire.** Two states: COLD, where only
+an utterance that NAMES the robot wakes a turn, and WARM, where anything does,
+until `Limits.attention_window_s` (45.0 s) passes with nothing heard and
+nothing spoken. Four things about it are load-bearing:
+
+- **It reaches `reachy/speech/name_match.py`, NOT `engagement.py`.**
+  `is_name_match` is pure `difflib` + `re`; `engagement.py` additionally
+  carries the single-shot LLM classifier whose importer set
+  `tests/test_zero_llm_boundary.py` pins BY EQUALITY, so adding the layer
+  there is a separate decision and must not ride along on a wake-word feature.
+  The gate's `DEFAULT_NAMES` is therefore a deliberate duplicate of
+  engagement's, with a test pinning the two tuples equal.
+- **Only a NAME opens; being heard and speaking both EXTEND.** A refused
+  utterance changes no state, so ambient chatter cannot warm the robot up by
+  being refused often enough — and `note_spoken` extends a live window but
+  never opens one. That asymmetry is not fastidiousness: the duplex session is
+  armed once and the SERVER answers every committed utterance ("every
+  committed turn on this session gets a spoken reply",
+  `docs/evidence/2026-08-02-t14-live-acceptance.md`), so `note_spoken` fires
+  for replies to the very chatter the gate just refused. A voice that could
+  open attention would be a robot waking itself up — engagement.py's
+  one-way-ratchet defect (199 correct drops, 39 accepts, *all wrong*) arriving
+  through a door the runtime never had.
+- **Attention gates the EAR, never the robot's own reactions.** An ALERT (a
+  rule fire) still triggers a turn from cold, and does not open the window
+  either.
+- **It bounds cost and manners, never blast radius.** Anyone in the room can
+  open it by saying one word out loud, so containment still rests entirely on
+  the closed action set and the fail-closed validators —
+  `tests/test_embody_redteam.py`'s docstring now says exactly that, and
+  distinguishes the ungated WIRE from the attention-gated LAYER.
+
+Both lanes
 stream, and the stall detector is armed on **inter-chunk idle, never total
 elapsed** — measured, the gateway takes 9-18 s to first content with thinking
 on while the largest gap BETWEEN deltas anywhere is 0.275 s
@@ -945,7 +1004,11 @@ coexist with the runtime's hearing session at all (~85 s, zero cross-talk), but
 it deliberately did NOT test two armed sessions and upstream
 `TTS_VOICE_CONCURRENCY` defaults to 1. It is **UNGATED by construction** — no
 engagement/name-match module is reachable in its import closure, asserted three
-ways — and `play` runs on a DEDICATED thread, never the socket pump, because
+ways, and that stayed true when the LAYER gained an attention gate (#148): the
+wire's job is to surface what was said, and deciding whether that is worth
+waking a mind for belongs one level up, in `reachy/embody/attention.py`. Do not
+"simplify" by moving the gate down here — three pins fail immediately, and
+correctly. `play` runs on a DEDICATED thread, never the socket pump, because
 the robot sink's daemon-HTTP route is a seconds-long upload-then-play round
 trip: charging that to the pump stops the ears, starves the keepalive and gets
 the session dropped. Exactly three frame kinds may leave the socket (session

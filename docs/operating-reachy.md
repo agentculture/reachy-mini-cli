@@ -2432,18 +2432,24 @@ graph LR
   reply comes back as audio deltas that get played out. Only three frame kinds
   ever leave the socket (session config, audio append, `response.create`) — no
   tool call rides it, because lobes parks socket tool-calling upstream.
-  **Hearing here is UNGATED**: unlike the runtime's transcript sense it runs no
-  engagement gate and no name match, so it hears every voice in the room,
-  including utterances the runtime would drop as ambient. That is structural,
-  not a setting — nothing in the module's import closure reaches either gate.
+  **Hearing here is UNGATED**: unlike the runtime's transcript sense the
+  session runs no engagement gate and no name match, so it hears every voice in
+  the room, including utterances the runtime would drop as ambient. That is
+  structural, not a setting — nothing in the module's import closure reaches
+  either gate. What the layer *does* with what it heard is a separate decision
+  taken one level up: since issue #148, only an utterance naming the robot
+  wakes a turn from cold — see [saying its
+  name](#saying-its-name--the-attention-window).
 - **PERCEPTION — the runtime's own events, as cues.** The layer reads the same
   `sense`/`rule`/`intent`/`motion` lines `agent attach` reads and maps them to
   short first-person cues. **A rule firing is the headline input**, not an
   afterthought: it is what lets the robot answer out loud about its own
-  reflexes. The MQTT bus is the intended primary route; `events-cli` is
-  publish-only today (it ships no `subscribe` surface at all), so intake
-  degrades — with one named drop, never silently — to tailing the NDJSON feed
-  from `--feed <path|->`.
+  reflexes — and since issue #143 it is also, together with a heard utterance,
+  the *only* thing that starts a turn (see [what is worth a
+  turn](#what-is-worth-a-turn--the-three-input-classes) below). The MQTT bus is
+  the intended primary route; `events-cli` is publish-only today (it ships no
+  `subscribe` surface at all), so intake degrades — with one named drop, never
+  silently — to tailing the NDJSON feed from `--feed <path|->`.
 - **COGNITION — every call streams.** Turns go over
   `/v1/chat/completions` with `stream=true`, model per request. Streaming is
   not a style choice: with thinking enabled the deployed gateway took **9–18 s**
@@ -2461,11 +2467,137 @@ graph LR
   `harmonics`, `create_rule`. There is no shell, no filesystem tool, no network
   tool, and no way to register a sixth.
 
+### What is worth a turn — the three input classes
+
+Perception arriving is not the same as perception worth thinking about, and the
+first shipped version conflated them. Measured on the box on 2026-08-02 with
+the bus bridged into `--feed`:
+
+```text
+187 cues in ~40 s  ->  23 turns  ->  19 input-queue-full drops
+cue mix: 145 x "speech from the left/ahead/right", 44 x "loud sound",
+         0 rule fires
+```
+
+Twenty-three streaming LLM calls in forty seconds, and **not one** of them was
+prompted by something the robot decided — the whole flood was sense snapshots
+arriving at tick rate. Those cues also told the layer nothing new: it has its
+own ears, so "speech from the left" duplicates what the duplex session is
+already hearing, one utterance at a time. What the layer genuinely cannot
+learn on its own is what the *runtime* decided, and that is low-rate by nature.
+
+So intake splits three ways (issue #143):
+
+| Class | Events | Effect |
+|---|---|---|
+| heard | an utterance from the duplex session | runs a turn |
+| **alert** | a **rule fire** | runs a turn |
+| **context** | `sense`, `intent`, `motion`, and rule **suppressions** | parked, drained by the next turn, **never** causes one |
+
+The context park **coalesces on the cue text**, so 145 near-identical lines
+reach a turn as one fact with a count — `speech from the left (x145)` — and a
+turn's prompt keeps them in a section of their own (`Meanwhile, in the
+background:`) so the model can tell what woke it up from what was merely going
+on. Parked context alone never causes a turn; if none ever runs, it is simply
+never read, which is the right outcome for ambient background.
+
+Alerts get their own containment, because `cooldown_s = 0` is legal and
+several rules can fire in one tick — otherwise the same flood walks back in
+through the one door left open. Two bounds, both on *turns* rather than cues:
+
+- alerts arriving while a turn is pending or running **coalesce into the one
+  turn that drains them next**, so ten fires inside one turn window cost a
+  second turn, never ten;
+- a **minimum interval of 5 s between alert-triggered turns**. Inside it an
+  alert is *deferred*, never dropped — it stays pending and rides the next
+  turn. The first alert after a quiet stretch is never delayed, and an
+  utterance is exempt outright: a person talking is not rate-limited, and the
+  alerts waiting with it ride that turn too.
+
+None of this is silent. Every turn's journal line and its exported `thinking`
+block open with what the turn drained:
+
+```text
+[SENSE stage=turn source=embody event=1a2b3c4d] turn triggers=1 context=6 coalesced-from=187
+```
+
+`coalesced-from` is how many raw cues those `context` lines stand for — the
+number that distinguishes a park that folded a flood from one that quietly
+threw it away. Watch it with:
+
+```bash
+journalctl --user -f | grep 'stage=turn source=embody'
+```
+
+### Saying its name — the attention window
+
+The heard class has one more condition on it, and it is the one an operator
+notices first: **the robot ignores you until you say its name.** Measured on a
+real conversation on 2026-08-02, six operator utterances produced 49 turns —
+the three-class policy above fixed the runtime-cue half of that, and this fixes
+the other half. Nothing distinguished *someone addressed the robot* from
+*someone spoke near the robot*, so every sentence in the room cost a streaming
+LLM call and, through the duplex session, a spoken reply.
+
+| state | what wakes a turn | how it ends |
+|---|---|---|
+| **cold** | only an utterance that names the robot — "reachy" (or "robot") | — |
+| **warm** | any utterance | nothing heard **and** nothing spoken for **45 s** |
+
+Three things follow from that table, and each is worth knowing before you
+decide the robot is broken:
+
+- **The window is refreshed by both sides.** Every admitted utterance *and*
+  every answer the layer speaks pushes the deadline out, so a real
+  back-and-forth never drops out mid-exchange — including while the robot is
+  taking a long turn of its own. The name is only needed to *start*.
+- **Only a name opens it.** Ambient chatter cannot warm the robot up by being
+  refused often enough, and neither can the robot's own voice: the duplex
+  session is armed once and the server answers every committed utterance, so a
+  reply spoken while cold — to a conversation the layer is not part of —
+  extends nothing. A robot that could wake itself with its own voice would
+  never go quiet again. This is the same failure the runtime's engagement gate
+  measured the hard way (199 correct drops, 39 accepts, *all wrong*, from a
+  history that could only accumulate reasons to say yes).
+- **A rule fire still wakes it from cold.** Attention gates the *ear*, never
+  the robot's own reactions — patting its head still produces a turn, and it
+  may still speak about what it just did.
+
+The name matcher is the runtime's, so the mishearings it already forgives
+("richie", "reachie", "richy") work here too, and the everyday `r`-words its
+phonetic guard closed ("really", "reality", "route", …) still do not wake
+anything.
+
+Every outcome is named on the journal:
+
+```text
+[SENSE stage=turn source=embody event=8f0c21ab] attention open (name) for 45s
+[SENSE stage=turn source=embody event=1d4e77b0] dropped reason=not-addressed-cold ("could you pass me the salt")
+```
+
+`not-addressed-cold` is deliberately the same label the runtime's transcript
+sense uses for the same situation, so one grep answers "why did it ignore me?"
+on both hearing paths:
+
+```bash
+tail -f "$STATE/embody.log" | grep -E 'attention open|not-addressed-cold'
+```
+
+The window length is `Limits.attention_window_s` in
+`reachy/embody/engine.py` (45 s; `0` means name-only forever). It is longer
+than the runtime's 20 s transcript window on purpose — a *spoken* exchange
+spends most of its time on things a transcript stream never pays for: the
+robot's own multi-round turn, seconds of synthesized speech, and the human
+listening to it before replying. There is no CLI flag for it yet.
+
 ### Containment — an ungated ear does not widen actuation
 
-The layer hears everyone, so containment cannot depend on *who* is speaking. It
-depends on what the layer can reach at all, and every tool wraps a surface that
-**already validates fail-closed**, with no second copy of any bound:
+The layer hears everyone, so containment cannot depend on *who* is speaking.
+(Attention decides whose speech is worth a *turn*; it is a state anyone in the
+room can open by saying one word out loud, so it bounds cost and manners, never
+blast radius.) Containment depends on what the layer can reach at all, and
+every tool wraps a surface that **already validates fail-closed**, with no
+second copy of any bound:
 
 | Tool | The existing gate it goes through |
 |---|---|
@@ -2605,6 +2737,100 @@ grep -n 'id = "embody-' "$RULES"      # exactly what the layer taught the robot
 ```
 
 Delete those blocks and `reachy-mini-cli behavior reload` to forget them.
+
+### The bus bridge — `scripts/embody_bus_feed.py`
+
+[The four channels](#the-four-channels) above names the MQTT bus as the
+layer's PRIMARY intake — but `events-cli>=0.9` ships no `subscribe` surface
+at all (verified live), so `reachy/embody/cues.py`'s own
+`resolve_bus_subscriber` always resolves to `None` and the layer falls back
+to tailing a feed file. `scripts/embody_bus_feed.py` is what makes the bus
+route real today: it speaks `paho-mqtt` directly — already in the resolved
+dependency tree as `events-cli`'s own base dependency, so nothing new gets
+installed — and writes matching runtime events onto the same FIFO the
+layer's `--feed` fallback already knows how to tail. It lives in `scripts/`,
+outside the `reachy` package, specifically so it *can* import an MQTT
+library at all without moving the zero-MQTT-library line this repo has
+drawn for its own code (`test_h10_no_mqtt_library_became_a_direct_dependency`
+/ `test_h10_no_module_in_this_repo_imports_an_mqtt_library` are scoped to
+`reachy/`, not `scripts/`).
+
+```bash
+reachy-mini-cli behavior engine run &                              # the runtime (no --export needed)
+python3 scripts/embody_bus_feed.py ~/.local/state/reachy/embody-feed.fifo &
+reachy-mini-cli agent embody --feed ~/.local/state/reachy/embody-feed.fifo --export -
+```
+
+**The last-writer-EOF lifecycle — why the FIFO is opened `O_RDWR`, not
+`O_WRONLY`.** This bit the layer once already, live: the bridge exited
+during testing, the FIFO lost its last writer, the layer's `--feed` reader
+hit EOF on its very next read, and `should_stop` ended the run — the layer
+died alongside a process it does not even know exists. `open_feed_fifo`
+opens `O_RDWR | O_NONBLOCK`, and both halves of that choice are
+load-bearing:
+
+- **`O_NONBLOCK` makes the open itself never block or fail, regardless of
+  which process starts first.** A plain `O_WRONLY` open blocks until a
+  reader shows up — or, with `O_NONBLOCK` added, fails outright with
+  `ENXIO` if no reader is there yet — so a writer-only bridge would have to
+  poll and retry depending on whether it started before or after the layer.
+  `O_RDWR` is a Linux-specific FIFO exception: the open always succeeds
+  immediately, whether or not anyone else has the FIFO open yet.
+- **`O_RDWR` makes the bridge's OWN descriptor count as a reader of the
+  FIFO for as long as the bridge lives**, which is what keeps the pipe from
+  going writer-less — and any *other* reader from seeing EOF — purely
+  because the layer's own `--feed` attachment restarts or is briefly
+  detached. The bridge never reads from this descriptor itself; holding the
+  read end open is pure bookkeeping, not a second consumer competing for
+  bytes.
+
+That second property has a hard edge worth stating plainly: it protects the
+FIFO from the *layer's* churn, not from the *bridge's own exit*. The
+bridge's descriptor is itself the FIFO's writer while the bridge runs — the
+moment the bridge process itself exits (crash, `Ctrl-C`, a supervisor
+stopping it), that descriptor closes, the FIFO reaches zero writers, and the
+layer's blocked read returns `b""` — EOF — which is exactly the failure
+that motivated this section. No FIFO can survive its last writer
+disappearing; the fix is operational, not a code change to the FIFO itself
+— run the bridge under something that restarts it (a `systemctl --user`
+unit you define locally; the repo ships none, matching [the layer's own
+no-unit-in-repo rule](#lifecycle--one-command-each-way-and-what-deliberately-survives)).
+`tests/test_embody_bus_feed.py` pins both bullets directly against a real
+FIFO — no mock, no thread: a second reader gets `BlockingIOError` (no data
+yet), never EOF, while the bridge's descriptor stays open, and gets a
+genuine `b""` the instant it closes.
+
+**The default source filter — `rule,intent,motion`, `REACHY_BUS_FEED_SOURCES`
+to override.** The bridge subscribes `reachy/events/<source>/#` per source
+in the filter (or the single `reachy/events/#` when the filter contains
+`*`). `sense` is excluded by default because forwarding it unfiltered
+flooded the layer, measured: 187 cues and 23 turns in roughly 40 seconds,
+19 `input-queue-full` drops, and not one rule fire in the mix — the flood
+was entirely sense. **State this precisely: the filter is an interim
+mitigation, not the fix.** A bridge process is the wrong layer to own the
+runtime's trigger policy, and filtering here does nothing for an operator
+who feeds the layer from the runtime's own `--export -` instead of this
+bridge. Issue #143 moves that policy into `EmbodyTurnEngine` itself, where
+it belongs.
+
+**The events-only topic filter.** Every filter the bridge can produce is
+scoped under `reachy/events/` — it subscribes `reachy/events/<source>/#`
+(or `reachy/events/#`) and never `reachy/state/#`, the runtime's RETAINED
+state tree. That is a safety property, not an oversight: a bridge that also
+subscribed the retained tree would replay the robot's last-known pose/state
+into a cue the instant it reconnects, as if that state had *just* changed.
+`tests/test_embody_bus_feed.py` asserts this structurally over every filter
+the topic-selection function can produce, not just the default case.
+
+**Byte-identical passthrough.** `on_message` never parses or re-serializes
+a payload — it writes `msg.payload + b"\n"` verbatim, because the runtime
+already publishes `reachy/events/<source>/<type>` payloads shaped exactly
+like a feed line ([`docs/export-schema.md`](export-schema.md)). The bridge
+is a pipe, not a translator; `cues_for_line` on the layer side is what
+actually interprets the bytes, identically whether they arrived over the
+bus or the feed-tail fallback. A full FIFO (nobody draining) is a named,
+counted drop — `BlockingIOError` is caught, never allowed to stall the bus
+client's own thread.
 
 ### Observability — every failure is named twice
 
@@ -2752,6 +2978,9 @@ The CLI never leaks a Python traceback — every failure is a structured
 | `agent embody` starts, then exits almost immediately | The `--feed` reader ran out of lines (a finite file), which ends the run | Point `--feed` at a live writer (`behavior engine run --export -`) or a FIFO you hold open; a finite file is only useful for a replay |
 | The layer runs but never hears anything (`stage=embody` shows no tee connection) | No runtime is writing the tee, or the two ends resolved different socket paths | Start `behavior engine run`; if you set `REACHY_AUDIO_TEE_SOCKET`, set it for **both** processes — one variable moves both ends by design |
 | The layer speaks but the robot never moves | The action was refused, not lost — every refusal is a tool result *and* a feed block | Grep the layer's output for `dropped reason=` and the `thinking` block's tool results; the shipped validators refuse out-of-range axes, unbounded lifetimes and over-long `say` fail-closed |
+| The layer runs a lot of turns but takes none of them | It is thinking about ambient sense cues rather than about anything the robot decided. This is the pre-#143 shape; a current build cannot do it | Confirm the build: `[SENSE stage=turn source=embody …] turn triggers=… context=…` on every turn is the current one. See [what is worth a turn](#what-is-worth-a-turn--the-three-input-classes) |
+| The layer hears you (`stage=duplex` shows the utterance) but never answers, and the log says `not-addressed-cold` | Attention is cold: since #148 only an utterance naming the robot starts a conversation | Say "reachy" — the next 45 s of talk needs no name, and every answer it speaks extends that. See [saying its name](#saying-its-name--the-attention-window) |
+| The layer runs **no** turns while the runtime is clearly busy | Since #143 only a heard utterance or a **rule fire** starts a turn; `sense`/`intent`/`motion` lines park as context and never trigger. A busy runtime firing no rules is silence by design | Check the feed for `"t":"rule","action":"fire"` lines. No fires and nobody talking = no turns, correctly. `context=N coalesced-from=M` on the next turn proves the background was still being collected |
 | `service status` reports `mode=retired` | A retired unit (`reachy-live.service` / `reachy-listen.service`) is still enabled on this box | Back up `~/.config/systemd/user/reachy-*.service*`, then run `service enable runtime` — the purge is part of every `service` verb |
 | `--no-audio-wake` / `--wake pat` exits `2` on `http` | Pat-wake needs the head-pose read-back, which is `sdk`-only | Use the `sdk` transport for pat-based wake |
 | `device state` / `head_pose`-based ops fail on `http` | The `http` transport cannot read the head pose back | Use the `sdk` transport for pose read-back |
@@ -3051,9 +3280,13 @@ What is honestly **not** delivered, so you do not go looking for it:
   `enable_thinking` is off by design (it costs 9–18 s to first output), so the
   block carries cues, reply text, tool calls and results only. The seam is
   dormant, not broken.
-- **`events-cli` cannot subscribe yet**, so the layer's bus intake always falls
-  back to tailing the runtime's NDJSON feed. That is a reported gap with a
-  named drop, not a patched-around one.
+- **`events-cli` cannot subscribe yet**, so `reachy/embody/cues.py`'s own bus
+  intake always falls back to tailing the runtime's NDJSON feed with no
+  injected subscriber. That remains a reported gap with a named drop, not a
+  patched-around one — [the bus bridge](#the-bus-bridge--scriptsembody_bus_feedpy)
+  (`scripts/embody_bus_feed.py`) works around it from OUTSIDE the package by
+  speaking `paho-mqtt` directly, so an operator gets the bus route today, but
+  the package-level gap itself is unchanged.
 
 Pointers:
 
@@ -3064,6 +3297,9 @@ Pointers:
   that survives and how to remove it
 - [The embodiment layer](#the-embodiment-layer--agent-embody) — the optional
   conversational mind (`agent embody`) that switches on and off beside it
+- [The bus bridge](#the-bus-bridge--scriptsembody_bus_feedpy) —
+  `scripts/embody_bus_feed.py`, the MQTT-to-FIFO bridge that makes the
+  layer's primary intake usable today
 - Per-noun flag reference: `reachy-mini-cli explain <noun>`
 - Export wire format: [`docs/export-schema.md`](export-schema.md)
 - SDK-transport rationale: [`docs/adr-0001-sdk-transport-extra.md`](adr-0001-sdk-transport-extra.md)

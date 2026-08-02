@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
+import inspect
 import json
 import os
 from pathlib import Path
@@ -38,6 +40,7 @@ import pytest
 
 from reachy.behavior.goto_intent import GOTO
 from reachy.embody import engine as engine_mod
+from reachy.embody.cues import CueClass
 from reachy.embody.engine import (
     DROP_REASONS,
     ENV_SENSES_MODEL,
@@ -141,17 +144,43 @@ def _speak_call(text: str, call_id: str = "call_1") -> ToolCall:
     return ToolCall(id=call_id, name=SPEAK, arguments={"text": text}, arguments_json=payload)
 
 
+#: Every :class:`~reachy.embody.engine.Limits` / :class:`~reachy.embody.engine.
+#: RequestConfig` field name (issue #141/S107) — used to translate the flat,
+#: per-field kwargs most tests already pass (e.g. ``max_pending=2``,
+#: ``base_url=...``) into the ``limits=`` / ``request=`` keywords the
+#: constructor takes now, so the individual test bodies below did not have to
+#: change.
+_LIMIT_FIELDS = {field.name for field in dataclasses.fields(engine_mod.Limits)}
+_REQUEST_FIELDS = {field.name for field in dataclasses.fields(engine_mod.RequestConfig)}
+
+
 def _build(**kwargs) -> EmbodyTurnEngine:
     """An engine with every collaborator faked unless the test says otherwise.
 
     Passing ``base_url=`` means the test wants the REAL streaming client against
     a loopback server, so no ``turn_fn`` double is substituted in that case.
+
+    The engine comes back with its ATTENTION WINDOW ALREADY OPEN (issue #148).
+    The shipped gate starts cold — only an utterance naming the robot wakes a
+    turn — but every test in this module is about streaming, model selection,
+    the tool loop or the export contract and says whatever it likes to the
+    engine. ``tests/test_embody_attention.py`` owns attention; opening the
+    window once here beats sprinkling the robot's name through forty unrelated
+    assertions and pretending they were about being addressed.
     """
     kwargs.setdefault("registry", RecordingRegistry())
     if "base_url" not in kwargs:
         kwargs.setdefault("turn_fn", ScriptedTurn(TurnResult(content="ok", finish_reason="stop")))
     kwargs.setdefault("models", EmbodyModels(worker="worker", senses="senses"))
-    return EmbodyTurnEngine(**kwargs)
+    limit_kwargs = {name: kwargs.pop(name) for name in list(kwargs) if name in _LIMIT_FIELDS}
+    if limit_kwargs:
+        kwargs.setdefault("limits", engine_mod.Limits(**limit_kwargs))
+    request_kwargs = {name: kwargs.pop(name) for name in list(kwargs) if name in _REQUEST_FIELDS}
+    if request_kwargs:
+        kwargs.setdefault("request", engine_mod.RequestConfig(**request_kwargs))
+    engine = EmbodyTurnEngine(**kwargs)
+    engine.attention.note_addressed()
+    return engine
 
 
 # =========================================================================== #
@@ -336,7 +365,7 @@ def test_the_streamed_reasoning_reaches_the_engine() -> None:
 def test_the_turn_uses_the_worker_model_and_ask_uses_the_senses_model() -> None:
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     engine = _build(turn_fn=turn)
-    engine.submit_cue("a behavior rule fired (pat-acknowledge)")
+    engine.submit_cue("a behavior rule fired (pat-acknowledge)", cue_class=CueClass.ALERT)
     engine.run_turn()
     engine.ask("describe the clip")
 
@@ -369,8 +398,11 @@ def test_resolving_and_running_never_mutate_the_environment(monkeypatch) -> None
     before = dict(os.environ)
 
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    # The one engine in this module built WITHOUT ``_build`` (the point is the
+    # bare, default-configured engine), so its attention gate is genuinely cold
+    # and the utterance has to name the robot to reach a model at all (#148).
     engine = EmbodyTurnEngine(registry=RecordingRegistry(), turn_fn=turn)
-    engine.submit_utterance("hello")
+    engine.submit_utterance("reachy, hello")
     engine.run_turn()
     engine.ask("and?")
 
@@ -472,6 +504,7 @@ def test_a_named_refusal_reaches_the_model_verbatim(tmp_path) -> None:
 
 
 def test_every_turn_emits_one_thinking_block_carrying_its_cues() -> None:
+    """Triggers first, then whatever context the turn drained (issue #143)."""
     sink = Sink()
     turn = ScriptedTurn(TurnResult(content="quiet", finish_reason="stop"))
     engine = _build(turn_fn=turn, export=sink.hook())
@@ -481,7 +514,7 @@ def test_every_turn_emits_one_thinking_block_carrying_its_cues() -> None:
 
     thinking = sink.of_type("thinking")
     assert len(thinking) == 1
-    assert thinking[0].cues == ["felt a gentle scratch on the head", 'heard: "who\'s there?"']
+    assert thinking[0].cues == ['heard: "who\'s there?"', "felt a gentle scratch on the head"]
     assert "quiet" in thinking[0].text
     assert thinking[0].ts == 1234.5
 
@@ -588,18 +621,19 @@ def test_cues_and_utterances_are_both_rendered_into_the_turn() -> None:
 def test_input_is_consumed_by_the_turn_that_ran() -> None:
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     engine = _build(turn_fn=turn)
-    engine.submit_cue("something happened")
+    engine.submit_utterance("something happened")
     engine.run_turn()
     assert engine.pending == 0
     assert engine.run_turn() is False
 
 
 def test_the_input_buffer_is_bounded_and_names_its_drop(caplog) -> None:
+    """The TRIGGER buffer's bound; the context park keeps its own (#143)."""
     engine = _build(max_pending=2)
     with caplog.at_level("INFO", logger="reachy.sense"):
-        assert engine.submit_cue("one") is True
-        assert engine.submit_cue("two") is True
-        assert engine.submit_cue("three") is False
+        assert engine.submit_utterance("one") is True
+        assert engine.submit_utterance("two") is True
+        assert engine.submit_utterance("three") is False
 
     assert engine.dropped_inputs == 1
     assert REASON_INPUT_QUEUE_FULL in caplog.text
@@ -695,7 +729,7 @@ def test_run_stops_on_the_stop_predicate() -> None:
         return calls["n"] > 3
 
     def before_turn() -> None:
-        engine.submit_cue("tick")
+        engine.submit_utterance("tick")
 
     ran = engine.run(stop=stop, before_turn=before_turn)
     assert ran == 3
@@ -704,7 +738,7 @@ def test_run_stops_on_the_stop_predicate() -> None:
 def test_run_bounded_by_max_turns() -> None:
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     engine = _build(turn_fn=turn, sleep=lambda _s: None)
-    ran = engine.run(max_turns=2, before_turn=lambda: engine.submit_cue("tick"))
+    ran = engine.run(max_turns=2, before_turn=lambda: engine.submit_utterance("tick"))
     assert ran == 2
 
 
@@ -712,18 +746,23 @@ def test_the_cancel_seam_is_handed_to_the_stream() -> None:
     """A closing layer aborts an in-flight stream rather than waiting it out."""
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     engine = _build(turn_fn=turn, cancel=lambda: True)
-    engine.submit_cue("tick")
+    engine.submit_utterance("tick")
     engine.run_turn()
     assert callable(turn.calls[0]["kwargs"]["cancel"])
     assert turn.calls[0]["kwargs"]["cancel"]() is True
 
 
 def test_submit_cues_takes_what_the_cue_mapper_returns() -> None:
-    """The composition root hands ``cues_for_line``'s list straight in."""
+    """The composition root hands ``classified_cues_for_line``'s list straight in.
+
+    Routing by class is ``tests/test_embody_input_policy.py``'s subject; what
+    this pins is the shape — a blank cue is still refused, and a caller with no
+    classification to give still gets its cues taken.
+    """
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     engine = _build(turn_fn=turn)
     assert engine.submit_cues(["a rule fired", "", "felt a gentle scratch"]) == 2
-    assert engine.pending == 2
+    assert engine.parked == 2
 
 
 def test_noting_an_empty_reply_is_a_no_op() -> None:
@@ -737,7 +776,7 @@ def test_a_turn_that_produces_nothing_at_all_is_named(caplog) -> None:
     """No text, no reasoning, no tool call — a silence the journal can explain."""
     turn = ScriptedTurn(TurnResult(content="", finish_reason="stop"))
     engine = _build(turn_fn=turn)
-    engine.submit_cue("a camera frame is available")
+    engine.submit_utterance("what can you see?")
     with caplog.at_level("INFO", logger="reachy.sense"):
         engine.run_turn()
     assert "silent-turn" in caplog.text
@@ -780,13 +819,13 @@ def test_a_modifier_is_never_mistaken_for_the_expression() -> None:
 def test_max_tokens_is_forwarded_only_when_set() -> None:
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     engine = _build(turn_fn=turn, max_tokens=256)
-    engine.submit_cue("tick")
+    engine.submit_utterance("tick")
     engine.run_turn()
     assert turn.calls[0]["kwargs"]["max_tokens"] == 256
 
     plain = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     other = _build(turn_fn=plain)
-    other.submit_cue("tick")
+    other.submit_utterance("tick")
     other.run_turn()
     assert "max_tokens" not in plain.calls[0]["kwargs"]
 
@@ -794,7 +833,7 @@ def test_max_tokens_is_forwarded_only_when_set() -> None:
 def test_run_without_a_producer_stops_rather_than_spinning() -> None:
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     engine = _build(turn_fn=turn, sleep=lambda _s: None)
-    engine.submit_cue("only one")
+    engine.submit_utterance("only one")
     assert engine.run(max_turns=5) == 1
 
 
@@ -819,3 +858,140 @@ def test_the_goto_tool_name_is_imported_not_retyped() -> None:
     """A drift canary: the engine's voice-tool set names the shipped constants."""
     assert GOTO not in engine_mod.DEFAULT_VOICE_TOOLS
     assert SPEAK in engine_mod.DEFAULT_VOICE_TOOLS
+
+
+# =========================================================================== #
+# issue #141/S107 — bounds/request config live in frozen dataclasses,         #
+# seams stay explicit                                                        #
+# =========================================================================== #
+#
+# Sonar's CONFIGURED threshold for this project (queried live against
+# SonarCloud, not assumed from the rule's language-wide default of 7) is
+# 13 authorized parameters ("Method __init__ has 21 parameters, which is
+# greater than the 13 authorized"). Moving only the 8 fields the issue names
+# by example (max_tool_rounds, history_maxlen, max_pending, spoken_maxlen and
+# the several timeouts) into Limits leaves this constructor at 17 — still
+# over. :class:`~reachy.embody.engine.RequestConfig` is the second grouping
+# that closes the remaining gap: not a seam (no field is callable) and not a
+# resource/time bound either, but equally not an injected collaborator, so it
+# belongs on the "grouped" side of the seam/non-seam line the issue draws.
+
+
+def test_limits_defaults_match_the_documented_module_constants() -> None:
+    """The refactor must not change a single default — only where it lives."""
+    limits = engine_mod.Limits()
+    assert limits.idle_timeout_s == engine_mod.DEFAULT_IDLE_TIMEOUT_S
+    assert limits.max_tool_rounds == engine_mod.DEFAULT_MAX_TOOL_ROUNDS
+    assert limits.history_maxlen == engine_mod.DEFAULT_HISTORY_MAXLEN
+    assert limits.max_pending == engine_mod.DEFAULT_MAX_PENDING
+    assert limits.max_context == engine_mod.DEFAULT_MAX_CONTEXT
+    assert limits.min_alert_interval_s == engine_mod.DEFAULT_MIN_ALERT_INTERVAL_S
+    assert limits.spoken_maxlen == engine_mod.DEFAULT_SPOKEN_MAXLEN
+    assert limits.turn_interval == engine_mod.DEFAULT_TURN_INTERVAL
+
+
+def test_limits_is_frozen() -> None:
+    limits = engine_mod.Limits()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        limits.max_pending = 1  # type: ignore[misc]
+
+
+def test_request_config_defaults_match_the_documented_module_constants() -> None:
+    """Same guarantee as Limits: grouping must not change a single default."""
+    request = engine_mod.RequestConfig()
+    assert request.system_prompt == engine_mod.DEFAULT_EMBODY_SYSTEM_PROMPT
+    assert request.base_url is None
+    assert request.api_key is None
+    assert request.temperature == engine_mod.DEFAULT_TEMPERATURE
+    assert request.max_tokens is None
+    assert request.enable_thinking is False
+
+
+def test_request_config_is_frozen() -> None:
+    request = engine_mod.RequestConfig()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        request.temperature = 1.0  # type: ignore[misc]
+
+
+def test_the_constructor_keeps_seams_explicit_and_moves_bounds_and_request_config_out() -> None:
+    """S107's fix: bounds and request config each collapse to one keyword."""
+    params = inspect.signature(EmbodyTurnEngine.__init__).parameters
+    names = set(params) - {"self"}
+
+    assert names.isdisjoint(_LIMIT_FIELDS), "a bound is still a bare parameter"
+    assert names.isdisjoint(_REQUEST_FIELDS), "a request field is still a bare parameter"
+    assert {"limits", "request"} <= names
+
+    seams = {
+        "registry",
+        "turn_fn",
+        "export",
+        "models",
+        "on_content",
+        "on_reasoning",
+        "cancel",
+        "now_fn",
+        "sleep",
+    }
+    assert seams <= names, "an injectable seam must stay an explicit parameter"
+    assert all(params[name].kind is inspect.Parameter.KEYWORD_ONLY for name in names)
+
+
+def test_the_constructor_clears_this_projects_configured_s107_threshold() -> None:
+    """The hard acceptance criterion: not "fewer parameters", but under the gate.
+
+    13 is this project's CONFIGURED ``python:S107`` threshold, queried live
+    against SonarCloud rather than assumed — the language-wide default (7)
+    would be the wrong number to pin here.
+    """
+    params = inspect.signature(EmbodyTurnEngine.__init__).parameters
+    count = len(params) - 1  # exclude self
+    assert count <= 13, f"{count} parameters still exceeds the 13 authorized"
+
+
+def test_a_bound_passed_through_limits_reaches_the_engine() -> None:
+    """Behavioural proof, not just a signature check: the value actually takes."""
+    engine = _build(limits=engine_mod.Limits(max_pending=1))
+    assert engine.submit_utterance("first") is True
+    assert engine.submit_utterance("second") is False
+    assert engine.dropped_inputs == 1
+
+
+def test_a_field_passed_through_request_config_reaches_the_engine() -> None:
+    """Behavioural proof for the second grouping, mirroring the Limits one."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, request=engine_mod.RequestConfig(max_tokens=99))
+    engine.submit_utterance("tick")
+    engine.run_turn()
+    assert turn.calls[0]["kwargs"]["max_tokens"] == 99
+
+
+# =========================================================================== #
+# issue #139/h9 — ask() carries a multimodal clip question with no branching  #
+# =========================================================================== #
+#
+# The wiring itself (clip -> ask() -> CONTEXT, never a trigger) is task t11's
+# job and lives entirely in tests/test_agent_embody.py, alongside
+# reachy.cli._commands.agent.build_clip_question (the content-shaping helper
+# that reads the clip file — deliberately NOT in this module, since this
+# module's own model-config claim, "the engine reads no file", is machine-
+# checked by an AST scan a few tests up). What belongs HERE is ask()'s own
+# contract: it forwards whatever content it is given verbatim, string or an
+# OpenAI-style multimodal list, with no branching of its own.
+
+
+def test_ask_forwards_multimodal_content_verbatim_no_branching() -> None:
+    """ask() must not care whether prompt is a string or a content list."""
+    script = Script(chunks=[content_chunk("a red square"), finish()])
+    with FakeChatServer(script=script) as server:
+        engine = _build(base_url=server.base_url)
+        content = [
+            {"type": "text", "text": "describe this clip"},
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,QUJD"}},
+        ]
+        answer = engine.ask(content)
+
+    assert answer == "a red square"
+    sent_messages = server.requests[0]["messages"]
+    user_message = next(m for m in sent_messages if m["role"] == "user")
+    assert user_message["content"] == content

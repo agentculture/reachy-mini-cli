@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     # cannot outlive the bound even if a get_frame() call hangs (issue #28).
     hard_cap = max(1.0, args.duration + args.margin)
 
-    def _on_timeout(_signum, _frame):  # noqa: ANN001 - signal handler
+    def _on_timeout(_signum, _frame):  # signal handler
         print(
             f"\nerror: hard timeout ({hard_cap:.0f}s) reached — get_frame likely hung",
             file=sys.stderr,

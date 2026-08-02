@@ -244,7 +244,7 @@ def _play_sdk(
     # Resample to the speaker's real output rate (the SDK does not do this for us).
     try:
         target_rate = int(media_session.get_output_audio_samplerate())
-    except Exception:  # noqa: BLE001 — any backend hiccup falls back to the known rate
+    except Exception:  # any backend hiccup falls back to the known rate
         target_rate = _SDK_OUTPUT_RATE_FALLBACK
     if target_rate <= 0:
         target_rate = _SDK_OUTPUT_RATE_FALLBACK

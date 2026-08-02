@@ -89,8 +89,8 @@ def _iter_argparse_paths(
 
     def walk(p: argparse.ArgumentParser, prefix: tuple[str, ...]) -> None:
         found[prefix] = p
-        for action in p._actions:  # noqa: SLF001 - argparse has no public walk API
-            if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+        for action in p._actions:  # argparse has no public walk API
+            if isinstance(action, argparse._SubParsersAction):
                 for name, subparser in action.choices.items():
                     walk(subparser, prefix + (name,))
 
@@ -177,9 +177,7 @@ def test_documented_producer_commands_accept_export() -> None:
         parser = live.get(path)
         if parser is None:  # covered by the test above
             continue
-        options = {
-            opt for action in parser._actions for opt in action.option_strings
-        }  # noqa: SLF001
+        options = {opt for action in parser._actions for opt in action.option_strings}
         for flag in ("--export", "--export-blocks"):
             if flag not in options:
                 missing.append(f"{' '.join(path)}: {flag}")

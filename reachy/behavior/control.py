@@ -325,5 +325,5 @@ class KindRegistry:
         except CliError as err:
             detail = err.message if not err.remediation else f"{err.message} ({err.remediation})"
             return {"ok": False, "op": kind, "error": detail}
-        except Exception as err:  # noqa: BLE001 - a bad handler never breaks the drain
+        except Exception as err:  # a bad handler never breaks the drain
             return {"ok": False, "op": kind, "error": f"{type(err).__name__}: {err}"}

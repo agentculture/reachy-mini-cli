@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.0] - 2026-08-02
+
+### Added
+
+- `reachy/embody/attention.py` — a wake-word attention gate for the embodiment layer (#148). Saying "reachy" opens the ear; a 45 s warm window, refreshed by both utterances heard and answers spoken, keeps it open; silence returns it to name-only. A rule fire still triggers while cold — attention gates the ear, not the robot's own reactions. The gate lives in the layer and uses the pure `name_match` matcher, so `realtime_duplex.py` stays ungated by construction and no LLM edge is added.
+- A named, latched `camera-stream-ended` drop when the camera stops producing frames while the runtime reports itself healthy (#138). Keyed on frame STALENESS, not on the connection flag, which stays true across a dead GStreamer pipeline. Detect only — recovery stays out until an in-process EOS recovery is probed.
+- `scripts/embody_bus_feed.py` lands in-repo with tests and operating-guide docs — the MQTT-to-FIFO bridge that is the layer's only bus intake while events-cli ships no subscribe surface. Its O_RDWR FIFO hold, source filter and events-only topic filter are now pinned rather than folklore.
+- The clip -> `ask()` perception lane (#139 h9): the runtime's rolling clip reference reaches the senses model on a background poller, and the answer enters the turn as CONTEXT — never a trigger. `ask()` gains its first caller.
+
+### Changed
+
+- `EmbodyTurnEngine` no longer treats every runtime event as a turn trigger (#143). Three input classes: an utterance or an ALERT cue (a rule fire) triggers a turn; sense, intent, motion and rule suppressions accumulate in a bounded, coalescing context park the next turn drains. Alerts coalesce into a pending turn and are bounded by a minimum interval, so the flood cannot return through the front door. Replaying the measured 40 s window (187 cues, 0 rule fires) now produces 0 turns instead of 23.
+- The camera frame is read at 10 Hz instead of once per 50 Hz tick (#137, #145). No consumer needs faster than 8 fps, and the per-tick read sustained the runtime ~5% over its 20 ms budget for as long as frames flowed — attributed live and verified gone.
+- Both fat constructors group their bounds into frozen `Limits` / `RequestConfig` dataclasses (#141): `EmbodyTurnEngine` and `RealtimeDuplexSession` drop from 24 and 23 parameters to 12 each. Injectable seams stay explicit keyword-only parameters — the count was a symptom of the seam-injection design, not carelessness.
+- 300 inert `# noqa:` markers naming lint codes this repo's flake8 cannot emit are gone (#142); the 20 load-bearing ones survive byte-identical and every word of explanatory prose is kept. Verified AST-identical across all 86 changed files.
+- Executable model defaults name gateway ROLES, not served model ids (#132): forge's default moves from the dead `qwen3` alias to `cortex`, and the scene leg's pinned Gemma id to `senses`. A role name survives a model promotion; a served id does not.
+
+### Fixed
+
+- `agent attach`'s `speak` and `harmonics` tools enforce `MAX_SAY_CHARS`, refusing fail-closed rather than truncating (#133) — the one surface that bypassed a cap enforced everywhere else on the same action.
+- A 404 handshake on the runtime's hearing leg is named `realtime-lane-unavailable` instead of a generic refusal (#134), pointing at `/v1/capabilities` `stt.feasible`. A configuration state now reads as one, not as a flaky gateway.
+- `demo-mode stop` and `daemon stop` can no longer signal an unrelated process (#136). Both guards matched `/proc` cmdline SUBSTRINGS, so any process launched from a path containing the project name satisfied them — reproduced pre-fix delivering SIGTERM and SIGKILL to a real innocent bystander.
+- `agent embody start` no longer silently discards `--feed` and `--media-profile` written before the subcommand (#147). Argparse applied the sub-parser's defaults over the parent's parsed values, so the layer spawned reading stdin — `/dev/null` for a detached process — connected its tee, armed a realtime session, and exited with every log line reading as success.
+- The wedged-consumer audio-tee test no longer flakes (#135). The assertion was captured 24/24 under load: the test waited on a counter the writer bumps BEFORE emitting the line it then asserted on. Fixed at cause; the tee itself was never at fault and no timeout was widened.
+
 ## [0.45.0] - 2026-08-02
 
 ### Added

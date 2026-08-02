@@ -17,7 +17,9 @@ This module is the single owner of that machinery. It is deliberately
 the noun's own supervisor and is passed in here:
 
 * **Identity tokens.** Each noun names the exact argv tokens its spawn line
-  carries (see :func:`has_argv_tokens`); nothing here guesses them.
+  carries (see :func:`has_argv_tokens`); nothing here guesses them. A caller
+  launched as a console script rather than as ``python -m reachy <verb>`` names
+  program basenames instead (see :func:`has_argv_basename`).
 * **Wording.** :class:`ProcessLabels` carries the five operator-facing strings
   the messages differ by, so ``sleep`` still says "no tracked sleep pid" and the
   engine still says "no tracked engine pid".
@@ -45,7 +47,7 @@ import subprocess  # nosec B404 - only ever spawns the argv its caller built (th
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 
@@ -132,6 +134,21 @@ def poll_until_gone(
     return not is_alive(pid)
 
 
+def _argv_tokens(pid: int) -> set[str] | None:
+    """*pid*'s real argv as a token set, or ``None`` if ``/proc`` will not say.
+
+    ``/proc/<pid>/cmdline`` is NUL-separated, so splitting on NUL recovers the
+    argv the kernel holds rather than a string a reader has to guess back apart.
+    This is the single place in the package that reads it — both predicates
+    below are the same lookup asking a different question of the same tokens.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return {token.decode("utf-8", "replace") for token in raw.split(b"\x00") if token}
+
+
 def has_argv_tokens(pid: int, tokens: Iterable[str]) -> bool:
     """Is *pid*'s command line one of ours — does its argv carry every token?
 
@@ -163,12 +180,48 @@ def has_argv_tokens(pid: int, tokens: Iterable[str]) -> bool:
     """
     if not Path("/proc").is_dir():
         return True
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
+    argv = _argv_tokens(pid)
+    if argv is None:
         return False
-    argv = {token.decode("utf-8", "replace") for token in raw.split(b"\x00") if token}
     return all(token in argv for token in tokens)
+
+
+def has_argv_basename(pid: int, names: Iterable[str]) -> bool:
+    """Is *pid* one of ours — is the BASENAME of any argv token one of *names*?
+
+    The companion :func:`has_argv_tokens` cannot serve a process launched as a
+    **console script** rather than as ``python -m reachy <verb>``, and the live
+    ``reachy-mini-daemon`` is exactly that. Measured on the deployed robot, its
+    ``/proc/<pid>/cmdline`` is::
+
+        /home/…/uv/tools/reachy-mini-cli/bin/python3
+        /home/…/uv/tools/reachy-mini-cli/bin/reachy-mini-daemon
+
+    Two facts fall out, and between them they rule out every cheaper rule.
+    argv[0] is the INTERPRETER, so an argv[0]-only test misses the real daemon
+    entirely; and the binary arrives at argv[1] as an ABSOLUTE PATH, so an
+    exact-token test misses it too. The substring form this replaced (issue
+    #136) erred the other way — ``"reachy_mini" in cmdline`` is satisfied by
+    anything launched out of the sibling ``…/git/reachy_mini`` checkout, a real
+    directory on the box this ships to. A basename is the one part of an argv
+    token that names the PROGRAM instead of where it happens to live.
+
+    *names* are ALTERNATIVES — one match is enough — where ``tokens`` above are
+    a conjunction. A binary has one name; a verb line is identified only by the
+    combination of its words.
+
+    ``/proc`` handling matches its sibling exactly, including the direction of
+    the residual risk: this can only refuse to signal a process that WAS ours
+    (reported as ``reused``, PID file cleared, operator told) — never signal one
+    that was not.
+    """
+    if not Path("/proc").is_dir():
+        return True
+    argv = _argv_tokens(pid)
+    if argv is None:
+        return False
+    wanted = set(names)
+    return any(PurePosixPath(token).name in wanted for token in argv)
 
 
 def process_state(pid: int | None, *, is_alive: Callable[[int], bool]) -> str:

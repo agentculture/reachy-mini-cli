@@ -153,10 +153,10 @@ class _Handler(BaseHTTPRequestHandler):
     # is exactly how an SSE body of unknown length terminates here.
     protocol_version = "HTTP/1.0"
 
-    def log_message(self, *_args: object) -> None:  # noqa: D102 - silence the test log
+    def log_message(self, *_args: object) -> None:  # silence the test log
         return
 
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's naming
+    def do_POST(self) -> None:  # BaseHTTPRequestHandler's naming
         owner: "FakeChatServer" = self.server.owner  # type: ignore[attr-defined]
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""

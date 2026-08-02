@@ -165,6 +165,13 @@ class _Sink:
         return b"".join(pcm for pcm, _rate in self.calls)
 
 
+#: :class:`~reachy.speech.realtime_duplex.Limits` field names (issue #141/
+#: S107) — lets this module's tests keep passing flat bounds
+#: (``backoff_initial_s=5.0``) while the constructor itself now takes only
+#: ``limits=``.
+_LIMIT_FIELDS = {field.name for field in dataclasses.fields(duplex.Limits)}
+
+
 def _session(server: FakeRealtimeServer | None = None, **kwargs) -> RealtimeDuplexSession:
     """A CONSTRUCTED (not started) session, pointed at *server* unless given a url."""
     if server is not None:
@@ -173,6 +180,9 @@ def _session(server: FakeRealtimeServer | None = None, **kwargs) -> RealtimeDupl
     kwargs.setdefault("read_audio", lambda: None)
     kwargs.setdefault("backoff_initial_s", 0.02)
     kwargs.setdefault("backoff_max_s", 0.05)
+    limit_kwargs = {name: kwargs.pop(name) for name in list(kwargs) if name in _LIMIT_FIELDS}
+    if limit_kwargs:
+        kwargs.setdefault("limits", duplex.Limits(**limit_kwargs))
     return RealtimeDuplexSession(**kwargs)
 
 
@@ -1186,3 +1196,50 @@ def test_an_unusable_url_scheme_is_a_clean_setup_error() -> None:
 
     with pytest.raises(CliError):
         _session(url="ftp://box/realtime")
+
+
+# --------------------------------------------------------------------------- #
+# issue #141/S107 — bounds live in one frozen Limits, seams stay explicit      #
+# --------------------------------------------------------------------------- #
+
+
+def test_limits_defaults_match_the_documented_module_constants() -> None:
+    """The refactor must not change a single default — only where it lives."""
+    limits = duplex.Limits()
+    assert limits.utterance_maxsize == duplex.DEFAULT_UTTERANCE_MAXSIZE
+    assert limits.response_maxsize == duplex.DEFAULT_RESPONSE_MAXSIZE
+    assert limits.playback_maxsize == duplex.DEFAULT_PLAYBACK_MAXSIZE
+    assert limits.max_response_bytes == duplex.DEFAULT_MAX_RESPONSE_BYTES
+    assert limits.stale_drain_max_chunks == duplex.DEFAULT_STALE_DRAIN_MAX_CHUNKS
+    assert limits.connect_timeout_s == duplex.DEFAULT_CONNECT_TIMEOUT_S
+    assert limits.frame_timeout_s == duplex.DEFAULT_FRAME_TIMEOUT_S
+    assert limits.poll_interval_s == duplex.DEFAULT_POLL_INTERVAL_S
+    assert limits.backoff_initial_s == duplex.DEFAULT_BACKOFF_INITIAL_S
+    assert limits.backoff_max_s == duplex.DEFAULT_BACKOFF_MAX_S
+    assert limits.stable_after_s == duplex.DEFAULT_STABLE_AFTER_S
+    assert limits.join_timeout_s == duplex.DEFAULT_JOIN_TIMEOUT_S
+
+
+def test_limits_is_frozen() -> None:
+    limits = duplex.Limits()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        limits.max_response_bytes = 1  # type: ignore[misc]
+
+
+def test_the_constructor_keeps_seams_explicit_and_moves_only_bounds_into_limits() -> None:
+    """S107's fix: bounds collapse into one keyword, injectable seams do not."""
+    params = inspect.signature(RealtimeDuplexSession.__init__).parameters
+    names = set(params) - {"self"}
+
+    assert names.isdisjoint(_LIMIT_FIELDS), "a bound is still a bare parameter"
+    assert "limits" in names
+
+    seams = {"read_audio", "play", "on_utterance", "on_response", "clock"}
+    assert seams <= names, "an injectable seam must stay an explicit parameter"
+    assert all(params[name].kind is inspect.Parameter.KEYWORD_ONLY for name in names)
+
+
+def test_a_bound_passed_through_limits_reaches_the_session() -> None:
+    """Behavioural proof, not just a signature check: the value actually takes."""
+    client = _session(read_audio=lambda: None, limits=duplex.Limits(join_timeout_s=0.0))
+    assert client._join_timeout_s == 0.0

@@ -1,8 +1,9 @@
 """Blast radius of the embodiment layer (task t7, spec boundary c28).
 
-The layer's ear is UNGATED on purpose — it hears every voice in the room,
-including a hostile or confused one — so the containment claim cannot rest on
-who is speaking. It rests on two things, and this module machine-checks both:
+The layer's EAR is UNGATED on purpose — the duplex session surfaces every voice
+in the room, including a hostile or confused one — so the containment claim
+cannot rest on who is speaking. It rests on two things, and this module
+machine-checks both:
 
 1. **There is no shell.** The action set is closed, and no module of the layer
    package can reach a process-spawning primitive or a dynamic ``exec``. An AST
@@ -18,6 +19,28 @@ who is speaking. It rests on two things, and this module machine-checks both:
 The four red-team requests from the plan (a shell request, an out-of-range
 goto, an unbounded loop, and a 501-character utterance) each appear below
 against EVERY surface that could carry them.
+
+Attention (issue #148) changed WHO gets a turn, and changed NOTHING here
+--------------------------------------------------------------------------
+:mod:`reachy.embody.attention` now gates which heard utterance wakes the mind:
+cold, only the robot's name; warm, anything, until a window of quiet closes it
+again. Read the two halves of that sentence separately, because only one of
+them is about this module:
+
+* the **wire** is still ungated — ``reachy/speech/realtime_duplex.py`` reaches
+  no gate in its whole import closure and surfaces every utterance to its
+  caller, which ``tests/test_realtime_duplex.py`` pins three ways. Nothing here
+  or there changed;
+* the **layer** now decides, after hearing, whether an utterance is worth a
+  turn. That is a cost-and-manners decision, not a security boundary.
+
+So the argument above stands exactly as written, and it is worth being explicit
+about why: attention is a two-state machine any speaker in the room can open by
+saying one word, out loud, uninvited. A containment claim resting on it would
+be a claim that the attacker will not say "reachy" — which is not a claim at
+all. Containment is still the closed action set and the fail-closed validators,
+which is why every test below still submits its hostile request directly to the
+tool surface rather than through a conversation.
 """
 
 from __future__ import annotations

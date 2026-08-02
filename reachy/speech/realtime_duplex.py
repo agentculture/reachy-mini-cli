@@ -246,6 +246,7 @@ from reachy.speech.realtime import (
 #: re-export, not a leftover".
 __all__ = [
     "DEFAULT_OUTPUT_SAMPLE_RATE",
+    "Limits",
     "PlaySink",
     "ReadAudio",
     "RealtimeDuplexSession",
@@ -371,6 +372,48 @@ DEFAULT_JOIN_TIMEOUT_S = 2.0
 #: How long the mouth thread parks between queue polls (bounds close()).
 _PLAYBACK_POLL_S = 0.05
 
+# --------------------------------------------------------------------------- #
+# Bounds, grouped into one frozen home (issue #141, python:S107)              #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Limits:
+    """:class:`RealtimeDuplexSession`'s numeric bounds, out of the constructor's kwargs.
+
+    Every field here was a bare keyword parameter on
+    :class:`RealtimeDuplexSession` before this task; the constructor's OTHER
+    parameters are injected SEAMS (``read_audio``, ``play``, ``on_utterance``,
+    ``on_response``, ``clock``) or per-deployment identity/configuration
+    (``sample_rate``, ``output_sample_rate``, ``mute_during_playback``,
+    ``url``, ``api_key``, ``arm_on_connect``) — none of those moved. This
+    class does not re-explain each bound: the reasoning behind every default
+    lives with its ``DEFAULT_*`` constant above (the one documented home this
+    module already keeps), and every field here simply carries that same
+    constant forward unchanged, so the refactor cannot silently change a
+    number while moving it.
+    """
+
+    #: Bounded queue depths — see :data:`DEFAULT_UTTERANCE_MAXSIZE` and
+    #: neighbours: the oldest entry is evicted on overflow, never the newest.
+    utterance_maxsize: int = DEFAULT_UTTERANCE_MAXSIZE
+    response_maxsize: int = DEFAULT_RESPONSE_MAXSIZE
+    playback_maxsize: int = DEFAULT_PLAYBACK_MAXSIZE
+    #: Cap on ONE reply's accumulated audio.
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
+    #: Connect-time backlog drain bound.
+    stale_drain_max_chunks: int = DEFAULT_STALE_DRAIN_MAX_CHUNKS
+    #: Socket budgets.
+    connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S
+    frame_timeout_s: float = DEFAULT_FRAME_TIMEOUT_S
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S
+    #: Reconnect policy.
+    backoff_initial_s: float = DEFAULT_BACKOFF_INITIAL_S
+    backoff_max_s: float = DEFAULT_BACKOFF_MAX_S
+    stable_after_s: float = DEFAULT_STABLE_AFTER_S
+    #: Bounded thread join at :meth:`RealtimeDuplexSession.close`.
+    join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S
+
 
 class PlaySink(Protocol):
     """The ``play`` seam: raw PCM16 mono LE bytes at an explicit rate.
@@ -448,12 +491,12 @@ class RealtimeDuplexSession(_SessionObservables):
         url / api_key: explicit endpoint + bearer, else the shared
             ``REACHY_REALTIME_*`` / ``REACHY_OPENAI_*`` precedence.
         arm_on_connect: send ``response.create`` on ``session.created``.
-        utterance_maxsize / response_maxsize / playback_maxsize: bounded queues.
-        max_response_bytes: cap on ONE reply's accumulated audio.
-        stale_drain_max_chunks: connect-time backlog drain bound.
-        connect_timeout_s / frame_timeout_s / poll_interval_s: socket budgets.
-        backoff_initial_s / backoff_max_s / stable_after_s: reconnect policy.
-        join_timeout_s: bounded thread join at :meth:`close`.
+        limits: the session's numeric bounds — the three queue depths, the
+            reply-audio cap, the connect-time stale-drain bound, the socket
+            timeouts and the reconnect/backoff policy — grouped into one
+            frozen :class:`Limits` (issue #141/``python:S107``). Every field
+            keeps the exact default it had as a bare parameter; see
+            :class:`Limits` for what each one bounds.
         on_utterance / on_response: optional taps, fired on the WORKER thread
             and guarded — a raising callback is logged and swallowed.
         clock: injectable monotonic clock.
@@ -474,18 +517,7 @@ class RealtimeDuplexSession(_SessionObservables):
         url: str | None = None,
         api_key: str | None = None,
         arm_on_connect: bool = True,
-        utterance_maxsize: int = DEFAULT_UTTERANCE_MAXSIZE,
-        response_maxsize: int = DEFAULT_RESPONSE_MAXSIZE,
-        playback_maxsize: int = DEFAULT_PLAYBACK_MAXSIZE,
-        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
-        stale_drain_max_chunks: int = DEFAULT_STALE_DRAIN_MAX_CHUNKS,
-        connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
-        frame_timeout_s: float = DEFAULT_FRAME_TIMEOUT_S,
-        poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
-        backoff_initial_s: float = DEFAULT_BACKOFF_INITIAL_S,
-        backoff_max_s: float = DEFAULT_BACKOFF_MAX_S,
-        stable_after_s: float = DEFAULT_STABLE_AFTER_S,
-        join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S,
+        limits: Limits | None = None,
         on_utterance: Callable[[Utterance], None] | None = None,
         on_response: Callable[[Response], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -498,20 +530,27 @@ class RealtimeDuplexSession(_SessionObservables):
         self._output_sample_rate = max(1, int(output_sample_rate))
         self._mute_during_playback = bool(mute_during_playback)
         self._arm_on_connect = bool(arm_on_connect)
-        self._max_response_bytes = max(0, int(max_response_bytes))
-        self._stale_drain_max_chunks = max(0, int(stale_drain_max_chunks))
-        self._connect_timeout_s = max(0.1, float(connect_timeout_s))
-        self._frame_timeout_s = max(0.1, float(frame_timeout_s))
-        self._poll_interval_s = max(0.001, float(poll_interval_s))
-        self._stable_after_s = max(0.0, float(stable_after_s))
-        self._join_timeout_s = max(0.0, float(join_timeout_s))
+        self._limits = limits if limits is not None else Limits()
+        self._max_response_bytes = max(0, int(self._limits.max_response_bytes))
+        self._stale_drain_max_chunks = max(0, int(self._limits.stale_drain_max_chunks))
+        self._connect_timeout_s = max(0.1, float(self._limits.connect_timeout_s))
+        self._frame_timeout_s = max(0.1, float(self._limits.frame_timeout_s))
+        self._poll_interval_s = max(0.001, float(self._limits.poll_interval_s))
+        self._stable_after_s = max(0.0, float(self._limits.stable_after_s))
+        self._join_timeout_s = max(0.0, float(self._limits.join_timeout_s))
         self._on_utterance = on_utterance
         self._on_response = on_response
         self._clock = clock
 
-        self._utterances: queue.Queue = queue.Queue(maxsize=max(1, int(utterance_maxsize)))
-        self._responses: queue.Queue = queue.Queue(maxsize=max(1, int(response_maxsize)))
-        self._playback: queue.Queue = queue.Queue(maxsize=max(1, int(playback_maxsize)))
+        self._utterances: queue.Queue = queue.Queue(
+            maxsize=max(1, int(self._limits.utterance_maxsize))
+        )
+        self._responses: queue.Queue = queue.Queue(
+            maxsize=max(1, int(self._limits.response_maxsize))
+        )
+        self._playback: queue.Queue = queue.Queue(
+            maxsize=max(1, int(self._limits.playback_maxsize))
+        )
 
         self.worker: threading.Thread | None = None
         self.mouth: threading.Thread | None = None
@@ -524,8 +563,8 @@ class RealtimeDuplexSession(_SessionObservables):
             STAGE,
             SOURCE,
             is_closed=lambda: self._closed,
-            backoff_initial_s=backoff_initial_s,
-            backoff_max_s=backoff_max_s,
+            backoff_initial_s=self._limits.backoff_initial_s,
+            backoff_max_s=self._limits.backoff_max_s,
         )
 
         # --- worker-thread state ------------------------------------------- #
@@ -702,7 +741,7 @@ class RealtimeDuplexSession(_SessionObservables):
             self._teardown_socket()
             self._state.mark_down(lost.reason, lost.detail)
             return 0 if stable else attempts + 1
-        except Exception:  # noqa: BLE001 - the worker must outlive any fault
+        except Exception:  # the worker must outlive any fault
             logger.warning("duplex: session pump raised", exc_info=True)
             self._teardown_socket()
             self._state.mark_down(REASON_STREAM_CLOSED, "unexpected pump failure")
@@ -818,7 +857,7 @@ class RealtimeDuplexSession(_SessionObservables):
         """One guarded ``read_audio()`` call. Never raises; a fault is latched."""
         try:
             chunk = self._read_audio()
-        except Exception:  # noqa: BLE001 - a broken source must not end the session
+        except Exception:  # a broken source must not end the session
             if not self._source_failed_logged:
                 self._source_failed_logged = True
                 self._state.drop(REASON_SOURCE_FAILED, "read_audio raised")
@@ -995,7 +1034,7 @@ class RealtimeDuplexSession(_SessionObservables):
         self._speaking = True
         try:
             play(audio, samplerate=self._output_sample_rate)
-        except Exception:  # noqa: BLE001 - a dead speaker must not end the session
+        except Exception:  # a dead speaker must not end the session
             self.playback_failures += 1
             if not self._playback_failed_logged:
                 self._playback_failed_logged = True
@@ -1038,7 +1077,7 @@ class RealtimeDuplexSession(_SessionObservables):
             return
         try:
             callback(item)
-        except Exception:  # noqa: BLE001 - a tap must not kill the session
+        except Exception:  # a tap must not kill the session
             logger.warning("duplex: %s callback raised", name, exc_info=True)
 
     def _teardown_socket(self, *, graceful: bool = False) -> None:

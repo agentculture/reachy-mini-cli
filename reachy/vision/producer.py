@@ -269,7 +269,7 @@ class VisionProducer:
             return self.transport.get_frame()  # type: ignore[attr-defined]
         except CliError:
             raise
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             raise CliError(
                 code=EXIT_ENV_ERROR,
                 message=f"could not read a camera frame: {err}",

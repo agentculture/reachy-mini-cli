@@ -290,10 +290,22 @@ def test_a_wedged_consumer_never_blocks_the_offering_thread(tee_path, caplog):
             "offer() blocked — a wedged consumer backpressured the offering "
             "thread, which on the runtime is the 20 ms tick"
         )
-        assert _wait(lambda: tee.dropped > 0), "a wedged consumer never produced a drop"
-        assert any(
-            tee_mod.REASON_CONSUMER_SLOW in line for line in _drop_reasons(caplog)
+        # WAIT on the LINE, then read the counter — never the other way round.
+        # ``_report_consumer_drops`` bumps ``tee.dropped`` under the lock and
+        # only THEN emits the named line (``audio_tee.py``'s
+        # ``self.dropped += run`` / ``self._drop(...)`` pair), so waiting on the
+        # counter and reading ``caplog`` once asserted an ordering between two
+        # threads that nothing guarantees: any preemption in that window shows
+        # the test a bumped counter and an empty log. Reproduced as
+        # ``AssertionError: the drop was not NAMED consumer-slow: []`` — 24
+        # failures over 2400 repeats at ``-n auto`` under 28 spinners, every one
+        # of them with ``count=296`` on the log line pytest then printed under
+        # "Captured log call" (issue #135). The named line is the LATER of the
+        # two writes, so a wait on it makes the counter read below sound.
+        assert _wait(
+            lambda: any(tee_mod.REASON_CONSUMER_SLOW in line for line in _drop_reasons(caplog))
         ), f"the drop was not NAMED consumer-slow: {_drop_reasons(caplog)}"
+        assert tee.dropped > 0, "a wedged consumer never produced a drop"
         assert tee.clients == 1, "a slow consumer was disconnected rather than dropped"
     finally:
         if consumer is not None:

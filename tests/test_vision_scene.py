@@ -72,7 +72,7 @@ class _FakeResp:
 
 
 def _fake_urlopen(raw: str, capture: dict | None = None):
-    def _open(req, timeout=None):  # noqa: ANN001
+    def _open(req, timeout=None):
         if capture is not None:
             capture["req"] = req
             capture["timeout"] = timeout
@@ -100,11 +100,13 @@ def test_scene_config_reads_openai_env(monkeypatch) -> None:
     assert cfg.model == "custom-vlm"
 
 
-def test_scene_config_default_model_is_the_gemma_senses_role(monkeypatch) -> None:
+def test_scene_config_default_model_is_the_senses_role(monkeypatch) -> None:
+    """issue #132: the default names the gateway ROLE, never the served id behind
+    it — a served id (like the sibling forge default's old ``qwen3``) 404s the
+    moment lobes promotes it; a role name survives the promotion."""
     monkeypatch.delenv("REACHY_VISION_MODEL_ID", raising=False)
     cfg = scene.SceneConfig.from_env()
-    assert cfg.model == scene.DEFAULT_VISION_MODEL
-    assert "gemma" in cfg.model.lower()
+    assert cfg.model == scene.DEFAULT_VISION_MODEL == "senses"
 
 
 def test_scene_config_is_legacy_free(monkeypatch) -> None:
@@ -229,7 +231,7 @@ def test_post_chat_no_auth_header_for_empty_sentinel(monkeypatch) -> None:
 
 
 def test_post_chat_http_error_becomes_scene_error(monkeypatch) -> None:
-    def _open(req, timeout=None):  # noqa: ANN001
+    def _open(req, timeout=None):
         raise urllib.error.HTTPError("http://x", 500, "err", {}, None)
 
     monkeypatch.setattr(scene.urllib.request, "urlopen", _open)
@@ -240,7 +242,7 @@ def test_post_chat_http_error_becomes_scene_error(monkeypatch) -> None:
 
 
 def test_post_chat_url_error_becomes_scene_error(monkeypatch) -> None:
-    def _open(req, timeout=None):  # noqa: ANN001
+    def _open(req, timeout=None):
         raise urllib.error.URLError("connection refused")
 
     monkeypatch.setattr(scene.urllib.request, "urlopen", _open)

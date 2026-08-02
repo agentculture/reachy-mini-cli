@@ -3,8 +3,9 @@
 Covers task t12 acceptance criterion 1 (+ the fail-closed wiring of 2/3): a
 ``dispatch(goal, context, improve)`` that runs the whole coder-model round-trip
 on a background daemon thread, POSTs chat/completions to ``FORGE_BASE_URL`` /
-``FORGE_MODEL`` (default: the lobes gateway on :8001 and model ``qwen3``) with an
-optional bearer key, and turns EVERY failure path — unreachable endpoint,
+``FORGE_MODEL`` (default: the lobes gateway on :8001 and the gateway's
+``cortex`` ROLE, issue #132) with an optional bearer key, and turns EVERY
+failure path — unreachable endpoint,
 timeout, unparseable reply, missing fence, bad name, failed stage, rejecting or
 raising or unavailable validator, or an unexpected internal bug — into a loud
 ``forge/rejected`` event, never an exception on the caller's thread. The HTTP
@@ -119,13 +120,16 @@ def test_happy_path_stages_and_emits_staged(state):
 # ---------------------------------------------------------------------------
 
 
-def test_posts_to_default_lobes_gateway_url_and_qwen3(state):
+def test_posts_to_default_lobes_gateway_url_and_cortex_role(state):
+    """issue #132: the default model is the ``cortex`` ROLE, never a served id —
+    a served id (the old default, ``qwen3``) 404s the moment lobes promotes it;
+    a role name survives the promotion (live-probed 2026-08-02)."""
     pub = _Recorder()
     transport = _FakeTransport(response=_reply(_GOOD_CONTENT))
     _run(ForgeClient(pub, validator=lambda d: (True, []), transport=transport), "g")
     url, payload, headers, _timeout = transport.calls[0]
     assert url == "http://localhost:8001/v1/chat/completions"
-    assert payload["model"] == "qwen3"
+    assert payload["model"] == "cortex"
     assert "Authorization" not in headers
 
 

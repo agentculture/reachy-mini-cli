@@ -31,6 +31,7 @@ import sys
 import time
 from pathlib import Path
 
+from reachy import procsup
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 
 # Reuse the daemon's generic process primitives + state dir so demo-mode and the
@@ -53,6 +54,9 @@ DEFAULT_STOP_TIMEOUT = 10.0
 # How finely the loop slices its inter-tick sleep so a stop signal lands fast.
 _SLEEP_SLICE = 0.25
 _STATUS_NOT_RUNNING = "not running"
+# The exact argv tokens build_run_command's spawn line carries — see
+# reachy.procsup.has_argv_tokens for why this is a token set and not a substring.
+_IDENTITY_TOKENS = ("reachy", "demo-mode")
 
 
 # --------------------------------------------------------------------------- #
@@ -208,19 +212,15 @@ def _wait_gone(pid: int, timeout: float) -> bool:
 def _is_our_process(pid: int) -> bool:
     """Best-effort guard against PID reuse: is ``pid`` actually a demo-mode loop?
 
-    Reads ``/proc/<pid>/cmdline`` on Linux (the spawn line contains
-    ``demo-mode``). If ``/proc`` is unavailable we cannot verify, so we trust the
-    pid file. If ``/proc`` exists but the process is gone or clearly isn't ours,
-    return False so :func:`stop` never signals an unrelated recycled pid.
+    The spawn line is ``<python> -m reachy demo-mode run ...``, so ``reachy`` and
+    ``demo-mode`` each appear as their OWN argv element — see
+    :data:`_IDENTITY_TOKENS` and :func:`reachy.procsup.has_argv_tokens` for the
+    exact-token rule. The substring form this replaced (issue #136) tested the
+    flattened command line, which also scans the interpreter path and every
+    argument: a file named ``demo-mode.md`` on someone else's command line was
+    enough to make this loop's ``stop`` escalate to SIGKILL on it.
     """
-    if not Path("/proc").is_dir():
-        return True
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return False
-    cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
-    return "demo-mode" in cmdline or "demo_mode" in cmdline
+    return procsup.has_argv_tokens(pid, _IDENTITY_TOKENS)
 
 
 def build_run_command(

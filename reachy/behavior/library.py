@@ -180,7 +180,7 @@ _BODY = frozenset({"body_yaw"})
 _ORIENT_DEFAULTS = OrientParams()
 
 
-def _ORIENT_PARAM(name: str, unit: str, help: str) -> Param:  # noqa: N802 - table-local helper
+def _ORIENT_PARAM(name: str, unit: str, help: str) -> Param:  # table-local helper
     """A ``Param`` whose default is read off :class:`OrientParams`, never retyped."""
     return Param(getattr(_ORIENT_DEFAULTS, name), unit, help)
 

@@ -119,6 +119,47 @@ provider (mirroring :class:`reachy.behavior.pat_sense.PatSenseDriver` and
 ``camera_available``, a raising detector or store, a closed driver — each is "no
 reading" for that tick.
 
+--------------------------------------------------------------------------
+Camera-stream-ended staleness (issue #138) — DETECT ONLY
+--------------------------------------------------------------------------
+Live evidence, 2026-08-02: the daemon's GStreamer pipeline EOS'd and no camera
+frame arrived again for **1h45m**, while the runtime kept ticking, rules kept
+firing, and ``state.json`` stayed fresh — nothing distinguished "the room is
+quiet" from "the camera is dead" until an operator noticed by eye and
+restarted the service by hand.
+
+The connection-level signal cannot see this: ``HeldMediaClient.connected``
+stays ``True`` across a dead pipeline (only the daemon's own supervisor
+would notice the process exited, and it did not exit), so a supervisor
+polling ``connected`` to decide whether to re-warm never fires. The only
+honest signal left is **how long ago the last USABLE frame arrived**, so
+:meth:`FaceSenseDriver._check_stream_staleness` watches
+:attr:`_last_frame_at` directly, on every read attempt where the client still
+claims to be connected AND camera-available (see :meth:`_update_frame`).
+:data:`DEFAULT_STREAM_STALE_S` is ten times :data:`DEFAULT_FRAME_TTL_S` and a
+hundred times :data:`DEFAULT_FRAME_INTERVAL_S` — comfortably past either
+magnitude, so ordinary TTL flicker or single-SDK-owner contention (which
+still throttles to ~1 fps, never to zero) can never trip it, while it still
+names a dead stream in well under a minute rather than the 1h45m an operator
+went unwarned.
+
+A camera that **legitimately never existed** — no camera at all, or one that
+has simply never produced a single usable frame yet — must never trip this:
+:attr:`_last_frame_at` starts ``None`` and only a real frame ever sets it, so
+"stale since the beginning of time" is structurally impossible to reach. The
+drop is emitted through :mod:`reachy.senselog` exactly once per silent
+episode (a fresh usable frame clears the latch, so a LATER episode is
+reported again, mirroring :class:`reachy.speech.realtime._SessionState`'s
+``session-down``/recovered discipline) — never once per tick, which at 50 Hz
+would flood the journal for as long as the pipeline stays dead.
+
+This is **detection only**, a deliberate boundary (spec claim c21): nobody
+has probed whether a GStreamer EOS is recoverable in-process at all, so
+:meth:`_check_stream_staleness` does nothing but read state and call
+:func:`reachy.senselog.drop` — it never touches :meth:`HeldMediaClient.warm_up`,
+never constructs a client, and never signals the composition root to rebuild
+or restart anything.
+
 Stdlib plus numpy (already a base dependency, used only for the frame-shape
 guard). No cv2 at import time, no ``reachy_mini``, no transport: the engine and
 store are injected, and :func:`build_face_recognition` imports the real ones
@@ -135,7 +176,15 @@ from typing import Any, Callable
 
 import numpy as np
 
+from reachy import senselog
+
 logger = logging.getLogger(__name__)
+
+#: Senselog ``stage`` every line from this module carries — shared with
+#: ``clip_rider``'s modality on purpose (``grep 'stage=vision'`` shows both).
+STAGE = "vision"
+#: Senselog ``source`` every line from this module carries.
+SOURCE = "face"
 
 #: Minimum wall-clock gap (seconds) between two detections on the worker thread.
 #: YuNet+SFace is heavy; ~2 Hz is ample for catching a face entering the frame,
@@ -147,12 +196,38 @@ DEFAULT_DETECT_INTERVAL: float = 0.5
 #: would re-fire its rule every detection cycle.
 DEFAULT_REANNOUNCE_COOLDOWN: float = 30.0
 
+#: Minimum seconds between ``media.frame()`` reads on the tick thread.
+#: 10 Hz: above the fastest real consumer (the rolling clip's
+#: :data:`~reachy.behavior.clip_rider.DEFAULT_ENCODE_FPS`, 8 fps) and an order of
+#: magnitude inside :data:`DEFAULT_FRAME_TTL_S`, so a held ``frame_available``
+#: can never go stale between reads. Reading once per tick instead cost a
+#: sustained ~5% tick-budget overrun for as long as frames flowed — see issue
+#: #145 and ``docs/evidence/2026-08-02-t8-tick-overrun-attribution.md``.
+DEFAULT_FRAME_INTERVAL_S: float = 0.1
+
 #: How long a successfully read frame keeps ``frame_available`` true (seconds).
 #: The camera is slower than the 50 Hz tick and a steady-state read returns
 #: ``None`` whenever nothing is ready, so the condition is held rather than
 #: pulsed — 1 s is many camera periods but still collapses promptly when the
 #: camera genuinely stops.
 DEFAULT_FRAME_TTL_S: float = 1.0
+
+#: How long the last USABLE frame may go unrefreshed — while the injected
+#: client still reports itself connected and camera-available — before the
+#: pipeline is presumed to have died silently (issue #138). Ten times
+#: :data:`DEFAULT_FRAME_TTL_S` and a hundred times
+#: :data:`DEFAULT_FRAME_INTERVAL_S`: comfortably past either magnitude, so
+#: ordinary TTL flicker or single-SDK-owner contention (still ~1 fps, never
+#: zero) can never trip it, while it still names a dead stream in well under a
+#: minute against the 1h45m an operator went unwarned live on 2026-08-02. See
+#: the module docstring's "Camera-stream-ended staleness" section.
+DEFAULT_STREAM_STALE_S: float = 10.0
+
+#: NAMED reason for the latched drop :meth:`FaceSenseDriver._check_stream_staleness`
+#: emits: frames were flowing and then stopped while the client still claims to
+#: be there. DETECT ONLY — see the module docstring; nothing on this path
+#: constructs, rebuilds or restarts a media client or pipeline.
+REASON_STREAM_ENDED = "camera-stream-ended"
 
 #: How long the worker parks between iterations when idle. Bounded so
 #: :meth:`FaceSenseDriver.close` joins promptly.
@@ -240,7 +315,7 @@ def usable_frame(frame: object) -> bool:
         return False
     try:
         arr = np.asarray(frame)
-    except Exception:  # noqa: BLE001 — an unconvertible object is just not a frame
+    except Exception:  # an unconvertible object is just not a frame
         return False
     if arr.dtype == object or arr.ndim not in (2, 3) or arr.size == 0:
         return False
@@ -266,7 +341,7 @@ def build_face_recognition(
     stays importable with no opencv installed. ``models_dir`` / ``store_base_dir``
     are passed through for test isolation when given.
     """
-    global _VISION_WARNED  # noqa: PLW0603 — one process-wide warning, by design
+    global _VISION_WARNED  # one process-wide warning, by design
     # The SAME probe the availability block reads, so the boot log and the
     # standing `state.json` reason can never disagree about why face is dead.
     if vision_unavailable_reason() is not None:
@@ -283,7 +358,7 @@ def build_face_recognition(
 
         engine = FaceEngine(models_dir=models_dir) if models_dir is not None else FaceEngine()
         store = FaceStore(base_dir=store_base_dir) if store_base_dir is not None else FaceStore()
-    except Exception:  # noqa: BLE001 — a broken vision stack disables the cue, nothing more
+    except Exception:  # a broken vision stack disables the cue, nothing more
         if not _VISION_WARNED:
             _VISION_WARNED = True
             logger.warning(
@@ -356,6 +431,13 @@ class FaceSenseDriver:
     frame_ttl_s:
         How long a read frame holds ``frame_available`` true. Default
         :data:`DEFAULT_FRAME_TTL_S`.
+    stream_stale_s:
+        How long the last usable frame may go unrefreshed, while the client
+        still claims to be connected and camera-available, before a latched
+        :data:`REASON_STREAM_ENDED` drop is emitted (issue #138; see the
+        module docstring's "Camera-stream-ended staleness" section). Default
+        :data:`DEFAULT_STREAM_STALE_S`. DETECT ONLY — never triggers a
+        reconnect or rebuild.
     clock:
         The worker's cadence clock (default :func:`time.monotonic`). The tick
         thread uses ``ctx.now`` instead, so the driver inherits the engine's
@@ -375,6 +457,8 @@ class FaceSenseDriver:
         detect_interval: float = DEFAULT_DETECT_INTERVAL,
         reannounce_cooldown: float = DEFAULT_REANNOUNCE_COOLDOWN,
         frame_ttl_s: float = DEFAULT_FRAME_TTL_S,
+        frame_interval_s: float = DEFAULT_FRAME_INTERVAL_S,
+        stream_stale_s: float = DEFAULT_STREAM_STALE_S,
         clock: Callable[[], float] = time.monotonic,
         start_worker: bool = True,
     ) -> None:
@@ -384,6 +468,9 @@ class FaceSenseDriver:
         self._detect_interval = max(0.0, float(detect_interval))
         self._reannounce_cooldown = max(0.0, float(reannounce_cooldown))
         self._frame_ttl_s = max(0.0, float(frame_ttl_s))
+        self._frame_interval_s = max(0.0, float(frame_interval_s))
+        self._stream_stale_s = max(0.0, float(stream_stale_s))
+        self._last_read_at: float | None = None
         self._clock = clock
 
         #: Tick thread -> worker: the latest validated frame to detect on.
@@ -402,6 +489,10 @@ class FaceSenseDriver:
         #: The TTL-held ``frame_available`` condition and its freshness anchor.
         self._frame_available = False
         self._last_frame_at: float | None = None
+        #: One-episode latch for the #138 ``camera-stream-ended`` drop — cleared
+        #: the moment a fresh usable frame arrives, so a LATER silent episode is
+        #: reported again rather than only the first one for the process's life.
+        self._stream_ended_logged = False
         #: Count of face cues latched this run (diagnostics / tests).
         self.events = 0
 
@@ -431,7 +522,7 @@ class FaceSenseDriver:
         self._face = None
         try:
             self._process(ctx)
-        except Exception:  # noqa: BLE001 — a sense tap must never crash the loop
+        except Exception:  # a sense tap must never crash the loop
             logger.warning("FaceSenseDriver tick raised; face cue dropped", exc_info=True)
 
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
@@ -447,17 +538,47 @@ class FaceSenseDriver:
 
     def _update_frame(self, now: float | None) -> None:
         """Peek one frame, gate it (#73), publish it, and refresh the condition."""
-        if not self._connected() or not self._camera_available():
-            # A camera-less robot: the condition collapses at once — no TTL hold,
-            # nothing to be stale about.
+        if not self._read_due(now):
+            # Not due: hold the condition on its TTL rather than re-reading. The
+            # interval is many times shorter than the TTL, so a held condition is
+            # never stale — see :meth:`_read_due`.
+            self._frame_available = self._within_ttl(now)
+            return
+        if not self._connected():
+            # NO CLIENT IS HELD — not warmed yet, dropped, or mid-backoff. That
+            # is a different condition from a camera whose stream ended, and the
+            # two must not share a name: a reconnect window would otherwise
+            # report `camera-stream-ended` every time, which is precisely the
+            # kind of misleading diagnosis #138 exists to remove.
             self._frame_available = False
-            self._last_frame_at = None
+            return
+        if not self._camera_available():
+            # A client IS held and the camera is gone beneath it. On a
+            # camera-less robot that is the ordinary resting state; after a
+            # stream has run it is the #138 failure, and measured on the
+            # deployed box it is the shape a died GStreamer pipeline takes —
+            # the daemon reports camera_available FALSE, which is why a detector
+            # watching only the believed-present path never fired on it.
+            #
+            # `_last_frame_at` is deliberately NOT cleared: it is the evidence a
+            # stream existed, and clearing it would re-exempt the loss as "a
+            # camera that never was". One that genuinely never existed still has
+            # it `None`, so that exemption is untouched.
+            self._frame_available = False
+            self._check_stream_staleness(now)
             return
 
+        # Stamped only where a read is actually attempted: a disconnected or
+        # camera-less tick must not consume the interval, or a client that comes
+        # back would wait one out before its first frame.
+        self._last_read_at = now
         frame = self._read_frame()
         if usable_frame(frame):
             self._last_frame_at = now
             self._frame_available = True
+            # A real frame ends any silent episode — the NEXT one gets its own
+            # report rather than being swallowed by an old latch (#138).
+            self._stream_ended_logged = False
             self._fan_out_frame(frame)
             if self._recognizer_ready:
                 self._input.publish(frame)
@@ -466,6 +587,27 @@ class FaceSenseDriver:
         # A None or degenerate frame is a NON-READING, never a fault (#73): the
         # condition simply rides its TTL until frames genuinely stop.
         self._frame_available = self._within_ttl(now)
+        self._check_stream_staleness(now)
+
+    def _read_due(self, now: float | None) -> bool:
+        """Whether enough time has passed since the last ``frame()`` read.
+
+        The read is the one leg of this driver that runs ON the tick thread, and
+        it used to run every tick — 50 Hz against consumers that need at most 8
+        (issue #145). Measured on the deployed box, that sustained the whole 20 ms
+        budget about 5% over for as long as frames flowed
+        (``docs/evidence/2026-08-02-t8-tick-overrun-attribution.md``).
+
+        A clock-less tick reads every time: without ``ctx.now`` there is no
+        interval to measure, and declining to read would silence the sense.
+        """
+        if now is None or self._frame_interval_s <= 0.0:
+            return True
+        last = self._last_read_at
+        if last is None:
+            return True
+        # A clock that jumped backwards reads now rather than waiting it out.
+        return not (0.0 <= now - last < self._frame_interval_s)
 
     def _within_ttl(self, now: float | None) -> bool:
         """Whether the last good frame is still recent enough to hold the condition."""
@@ -476,6 +618,33 @@ class FaceSenseDriver:
             return False
         elapsed = now - last
         return 0.0 <= elapsed <= self._frame_ttl_s
+
+    def _check_stream_staleness(self, now: float | None) -> None:
+        """Latch :data:`REASON_STREAM_ENDED` once frames stop for :data:`DEFAULT_STREAM_STALE_S`.
+
+        DETECT ONLY (issue #138): reads :attr:`_last_frame_at` and calls
+        :func:`reachy.senselog.drop` — nothing more. It never touches
+        ``warm_up``, never constructs a client, never reconnects, rebuilds or
+        restarts a pipeline; see the module docstring's "Camera-stream-ended
+        staleness" section for why that boundary is deliberate here.
+
+        Only reached from the branch of :meth:`_update_frame` where the client
+        still claims to be connected and camera-available but the read produced
+        no usable frame — the camera is BELIEVED present, which is what makes a
+        long silence meaningful rather than an ordinary camera-less reading.
+        ``_last_frame_at is None`` (no frame has EVER arrived — a camera that
+        never existed, never streamed, or is still warming up) is exempt by
+        construction: there is no "stream" to have ended.
+        """
+        if self._stream_ended_logged or now is None:
+            return
+        last = self._last_frame_at
+        if last is None:
+            return
+        if now - last < self._stream_stale_s:
+            return
+        self._stream_ended_logged = True
+        senselog.drop(STAGE, SOURCE, "stream", REASON_STREAM_ENDED)
 
     def _connected(self) -> bool:
         """The one FREE liveness check — and the reason it is checked FIRST.
@@ -495,7 +664,7 @@ class FaceSenseDriver:
             return False
         try:
             return bool(getattr(self._media, "connected", True))
-        except Exception:  # noqa: BLE001 — a raising probe is not a liveness verdict
+        except Exception:  # a raising probe is not a liveness verdict
             logger.debug("FaceSenseDriver liveness probe raised; assuming live", exc_info=True)
             return True
 
@@ -510,7 +679,7 @@ class FaceSenseDriver:
             return False
         try:
             return bool(getattr(self._media, "camera_available", True))
-        except Exception:  # noqa: BLE001 — a raising probe is not a camera verdict
+        except Exception:  # a raising probe is not a camera verdict
             logger.debug("FaceSenseDriver camera probe raised; assuming a camera", exc_info=True)
             return True
 
@@ -521,7 +690,7 @@ class FaceSenseDriver:
             return None
         try:
             return media.frame()  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001 — a read fault degrades, never propagates
+        except Exception:  # a read fault degrades, never propagates
             logger.debug("FaceSenseDriver frame read raised; no frame this tick", exc_info=True)
             return None
 
@@ -545,7 +714,7 @@ class FaceSenseDriver:
         for sink in self._frame_sinks:
             try:
                 sink(frame)
-            except Exception as err:  # noqa: BLE001 — a fan-out consumer must never break the tick
+            except Exception as err:  # a fan-out consumer must never break the tick
                 logger.debug("FaceSenseDriver: frame sink raised (%s); frame not delivered", err)
 
     # -- match leg ------------------------------------------------------ #
@@ -586,7 +755,7 @@ class FaceSenseDriver:
         while not self._stop.is_set():
             try:
                 self._worker_tick()
-            except Exception:  # noqa: BLE001 — never let the worker die on a bad frame
+            except Exception:  # never let the worker die on a bad frame
                 logger.warning("FaceSenseDriver worker tick raised; continuing", exc_info=True)
             self._stop.wait(_POLL_INTERVAL)
 
@@ -620,14 +789,14 @@ class FaceSenseDriver:
         """
         try:
             detection = self._engine.detect(frame)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("FaceSenseDriver detection raised; skipping frame", exc_info=True)
             return None
         if detection is None:
             return None
         try:
             match = self._store.match(detection.embedding)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("FaceSenseDriver store match raised; skipping frame", exc_info=True)
             return None
         if match is None:
@@ -704,8 +873,11 @@ __all__ = [
     "usable_frame",
     "vision_unavailable_reason",
     "DEFAULT_DETECT_INTERVAL",
+    "DEFAULT_FRAME_INTERVAL_S",
     "DEFAULT_FRAME_TTL_S",
     "DEFAULT_REANNOUNCE_COOLDOWN",
+    "DEFAULT_STREAM_STALE_S",
+    "REASON_STREAM_ENDED",
     "VISION_EXTRA_ABSENT",
     "VISION_STACK_UNAVAILABLE",
 ]

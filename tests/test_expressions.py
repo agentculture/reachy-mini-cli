@@ -149,7 +149,7 @@ def test_get_pose_does_not_raise() -> None:
     for key in ["🦄", "🎸", "", "bogus", "😀😀😀"]:
         try:
             get_pose(key)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             pytest.fail(f"get_pose({key!r}) unexpectedly raised {exc!r}")
 
 

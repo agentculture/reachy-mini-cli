@@ -45,8 +45,11 @@ logger = logging.getLogger(__name__)
 
 #: Default coder endpoint: the local lobes gateway (its cortex/coder route on :8001).
 DEFAULT_FORGE_BASE_URL = "http://localhost:8001/v1"
-#: Default model name sent in the chat-completions request (matches nova).
-DEFAULT_FORGE_MODEL = "qwen3"
+#: Default model: the lobes gateway's cortex ROLE (issue #132) — never a served
+#: id. A role name survives a model promotion; the served id nova's default
+#: named (``qwen3``) does not — live-probed 2026-08-02, it now 404s
+#: (``model_not_found``) while ``cortex`` and ``senses`` both resolve.
+DEFAULT_FORGE_MODEL = "cortex"
 DEFAULT_TIMEOUT = 120.0
 
 PROMPT_TEMPLATE = (
@@ -308,7 +311,7 @@ class ForgeClient:
     def _run(self, goal: str, context: dict, improve: str | None) -> None:
         try:
             self._run_inner(goal, context, improve)
-        except Exception as err:  # noqa: BLE001 - last-resort safety net
+        except Exception as err:  # last-resort safety net
             self._reject(None, [f"internal error: {err}"])
 
     def _run_inner(self, goal: str, context: dict, improve: str | None) -> None:
@@ -356,7 +359,7 @@ class ForgeClient:
             return self._transport(url, payload, headers, self._timeout)
         except TimeoutError as err:
             self._reject(None, [f"request timed out: {err}"])
-        except Exception as err:  # noqa: BLE001 - any transport failure is a rejection
+        except Exception as err:  # any transport failure is a rejection
             self._reject(None, [f"endpoint unreachable: {err}"])
         return None
 
@@ -395,7 +398,7 @@ class ForgeClient:
             return
         try:
             ok, reasons = validator(skill_dir)
-        except Exception as err:  # noqa: BLE001 - a buggy validator must not activate anything
+        except Exception as err:  # a buggy validator must not activate anything
             self._reject(name, [f"validator error: {err}"], skill_dir)
             return
         if not ok:

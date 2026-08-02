@@ -160,7 +160,7 @@ class _MotionExecutor:
         # Degrade, never crash the pat loop: capture any transport error from this
         # background thread. The loop owns SIGINT/SIGTERM, so catch Exception (not
         # BaseException) to let KeyboardInterrupt/SystemExit propagate correctly.
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._error.append(exc)
 
     def start(self) -> None:

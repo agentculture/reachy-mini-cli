@@ -276,7 +276,7 @@ class RmsBackground:
         """
         try:
             return self._observe(rms, now, excluded)
-        except Exception:  # noqa: BLE001 — a sense tap must never crash the tick
+        except Exception:  # a sense tap must never crash the tick
             return None
 
     def _observe(self, rms, now, excluded: bool) -> float | None:

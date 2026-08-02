@@ -326,7 +326,7 @@ class SenseAvailabilityDriver:
     def _probe(self, name: str) -> SenseAvailability:
         try:
             verdict = self._probes[name]()
-        except Exception:  # noqa: BLE001 — an unanswerable question is not a yes
+        except Exception:  # an unanswerable question is not a yes
             logger.warning("availability probe for %r raised; reporting dead", name, exc_info=True)
             return unavailable(PROBE_ERROR)
         if not isinstance(verdict, SenseAvailability):
@@ -336,11 +336,11 @@ class SenseAvailabilityDriver:
 
     # -- TickBus driver ------------------------------------------------------ #
 
-    def __call__(self, ctx=None) -> None:  # noqa: ARG002 - ctx unused, kept for the seam shape
+    def __call__(self, ctx=None) -> None:  # ctx unused, kept for the seam shape
         """One tick: republish the block if the file no longer carries it."""
         try:
             self._publish()
-        except Exception:  # noqa: BLE001 — a sense tap must never crash the loop
+        except Exception:  # a sense tap must never crash the loop
             logger.warning("sense availability publish raised; skipping this tick", exc_info=True)
 
     def _publish(self) -> None:

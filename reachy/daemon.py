@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from reachy import procsup
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.robot.transport import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
 
@@ -38,6 +39,9 @@ DEFAULT_WAIT_TIMEOUT = 30.0
 _POLL_INTERVAL = 0.25
 # Shared status literal (one definition; avoids Sonar S1192 duplicate-string).
 _STATUS_NOT_RUNNING = "not running"
+# The daemon is a console script, so its identity is the BASENAME of an argv
+# token rather than a whole token — see reachy.procsup.has_argv_basename.
+_IDENTITY_BASENAMES = (DAEMON_BINARY,)
 
 
 def state_dir() -> Path:
@@ -126,19 +130,20 @@ def is_alive(pid: int) -> bool:
 def _is_our_daemon(pid: int) -> bool:
     """Best-effort guard against PID reuse: is ``pid`` actually a reachy daemon?
 
-    Reads ``/proc/<pid>/cmdline`` on Linux. If ``/proc`` is unavailable (non-Linux)
-    we cannot verify, so we trust the pid file and return True. If ``/proc`` exists
-    but the process is gone or clearly isn't a reachy daemon, return False so
-    :func:`stop` never signals an unrelated process that recycled the pid.
+    The live daemon carries the interpreter at argv[0] and
+    ``…/bin/reachy-mini-daemon`` at argv[1], so its identity is the BASENAME of
+    an argv token — see :data:`_IDENTITY_BASENAMES` and
+    :func:`reachy.procsup.has_argv_basename` for why neither argv[0] alone nor
+    an exact-token match reaches it. The substring form this replaced (issue
+    #136) additionally accepted ``reachy_mini`` anywhere in the flattened
+    command line, which the sibling ``…/git/reachy_mini`` checkout satisfies for
+    every process launched out of it.
+
+    A ``REACHY_DAEMON_CMD`` override naming some other program is refused rather
+    than signalled, which is the safe direction: the cost is an operator told
+    "reused, left untouched", not an innocent process taking a SIGKILL.
     """
-    if not Path("/proc").is_dir():
-        return True
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return False
-    cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
-    return DAEMON_BINARY in cmdline or "reachy_mini" in cmdline
+    return procsup.has_argv_basename(pid, _IDENTITY_BASENAMES)
 
 
 def health_ok(base_url: str, timeout: float) -> bool:

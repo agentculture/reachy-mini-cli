@@ -88,7 +88,7 @@ def emit(publish: PublishFn, event_type: str, payload: dict) -> None:
     """Publish an event, isolating a broken ``publish`` callback (never raises)."""
     try:
         publish(event_type, payload)
-    except Exception as err:  # noqa: BLE001 - a broken publish callback must not crash us
+    except Exception as err:  # a broken publish callback must not crash us
         logger.warning("forge publish callback raised for %s: %s", event_type, err)
 
 

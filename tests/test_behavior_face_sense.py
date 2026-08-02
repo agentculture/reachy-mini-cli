@@ -28,8 +28,10 @@ seam so the missing-extra path is exercised deterministically either way.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import logging
+import textwrap
 import threading
 
 import numpy as np
@@ -109,7 +111,7 @@ class _FakeStore:
         self._match = match
         self._raises = raises
 
-    def match(self, embedding):  # noqa: ARG002
+    def match(self, embedding):
         if self._raises is not None:
             raise self._raises
         return self._match
@@ -568,7 +570,12 @@ def test_a_raising_engine_or_store_degrades_to_no_match() -> None:
 def test_add_frame_sink_receives_every_usable_frame() -> None:
     """A registered sink is pushed each usable frame, in order, once per tick."""
     frames = [_frame(width=4), _frame(width=6), _frame(width=8)]
-    driver = FaceSenseDriver(media=_FakeMedia(list(frames)), engine=None, store=None)
+    # The read CADENCE is a separate property (see the frame-interval tests
+    # below); this one is about what a sink receives per read, so it reads
+    # every tick.
+    driver = FaceSenseDriver(
+        media=_FakeMedia(list(frames)), engine=None, store=None, frame_interval_s=0.0
+    )
     received: list = []
     driver.add_frame_sink(received.append)
     try:
@@ -757,3 +764,280 @@ def test_driver_never_constructs_its_own_media_client() -> None:
         stripped = line.strip()
         if stripped.startswith(("import ", "from ")):
             assert "media_client" not in stripped, f"face_sense must not import it: {line}"
+
+
+# --------------------------------------------------------------------------- #
+# The frame-read interval (#137 / #145)                                        #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_frame_read_is_gated_by_the_interval_not_the_tick() -> None:
+    """The read runs at its own cadence, not once per 50 Hz tick.
+
+    Reading every tick sustained the whole 20 ms budget ~5% over for as long as
+    frames flowed, measured on the deployed box
+    (``docs/evidence/2026-08-02-t8-tick-overrun-attribution.md``). No consumer
+    needs faster than 8 fps.
+    """
+    media = _FakeMedia([_frame() for _ in range(20)])
+    driver = FaceSenseDriver(media=media, start_worker=False, frame_interval_s=0.1)
+    try:
+        # 10 ticks of a 50 Hz loop = 0.2 s of wall time -> 3 reads at 10 Hz
+        # (t=0.00, 0.10, 0.20), never 10.
+        for index in range(11):
+            driver(_Ctx(index * 0.02))
+    finally:
+        driver.close()
+    assert media.calls == 3, f"read {media.calls} times in 0.2 s; expected 3 at 10 Hz"
+
+
+def test_frame_available_is_held_across_the_gap_between_reads() -> None:
+    """A skipped read holds the condition on its TTL rather than dropping it.
+
+    The interval (0.1 s) is an order of magnitude inside the TTL (1.0 s), so a
+    tick that declines to read can never make the condition flap.
+    """
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame() for _ in range(5)]),
+        start_worker=False,
+        frame_interval_s=0.1,
+        frame_ttl_s=1.0,
+    )
+    try:
+        driver(_Ctx(0.0))
+        assert driver.peek_frame_available() is True
+        for index in range(1, 5):  # every one of these is inside the interval
+            driver(_Ctx(index * 0.02))
+            assert driver.peek_frame_available() is True, "the TTL hold broke at a skipped read"
+    finally:
+        driver.close()
+
+
+def test_a_clockless_tick_still_reads() -> None:
+    """Without ``ctx.now`` there is no interval to measure, so the read happens.
+
+    Declining instead would silence the sense entirely on a clock-less engine.
+    """
+    media = _FakeMedia([_frame() for _ in range(3)])
+    driver = FaceSenseDriver(media=media, start_worker=False, frame_interval_s=0.1)
+    try:
+        for _ in range(3):
+            driver(_Ctx(None))
+    finally:
+        driver.close()
+    assert media.calls == 3
+
+
+def test_a_disconnected_tick_does_not_consume_the_interval() -> None:
+    """A client that comes back reads at once instead of waiting an interval out."""
+
+    class _Client:
+        def __init__(self) -> None:
+            self.connected = False
+            self.calls = 0
+
+        def frame(self):
+            self.calls += 1
+            return _frame()
+
+    media = _Client()
+    driver = FaceSenseDriver(media=media, start_worker=False, frame_interval_s=0.1)
+    try:
+        driver(_Ctx(0.0))
+        assert media.calls == 0
+        media.connected = True
+        driver(_Ctx(0.02))  # well inside the interval, but nothing was read yet
+        assert media.calls == 1
+        assert driver.peek_frame_available() is True
+    finally:
+        driver.close()
+
+
+# --------------------------------------------------------------------------- #
+# Camera-stream-ended staleness (issue #138) — DETECT ONLY                    #
+# --------------------------------------------------------------------------- #
+#
+# Live evidence, 2026-08-02: the daemon's pipeline EOS'd and no camera frame
+# arrived again for 1h45m while the runtime stayed healthy. ``connected``
+# stays true across a dead pipeline (see ``_FakeMedia``, which has no
+# ``connected`` attribute at all — the driver's own docstring says a missing
+# probe is ASSUMED live, exactly what a real ``HeldMediaClient`` reports here),
+# so the only honest signal is how long ago the last USABLE frame arrived.
+
+
+def _drop_messages(caplog, reason: str) -> list:
+    """Every senselog line naming *reason* as its drop reason."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if f"dropped reason={reason}" in record.getMessage()
+    ]
+
+
+def test_stream_ended_drop_fires_once_after_frames_stop_while_connected(caplog) -> None:
+    """The acceptance criterion's positive case: one latched drop within the window."""
+    media = _FakeMedia([_frame(), None])
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        driver(_Ctx(0.0))  # a real frame anchors `_last_frame_at`
+        for now in (0.5, 1.0, 1.5, 3.0, 10.0):  # well past the 1.0s staleness window
+            driver(_Ctx(now))
+
+    drops = _drop_messages(caplog, FS.REASON_STREAM_ENDED)
+    assert len(drops) == 1, drops
+    assert "stage=vision source=face" in drops[0]
+
+
+def test_a_camera_that_never_existed_produces_no_stream_ended_drop(caplog) -> None:
+    """The acceptance criterion's negative case: no frame ever arrived, so no drop."""
+    media = _FakeMedia([None])
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        for now in (0.0, 1.0, 5.0, 50.0):  # far past the staleness window, forever
+            driver(_Ctx(now))
+
+    assert _drop_messages(caplog, FS.REASON_STREAM_ENDED) == []
+
+
+def test_no_stream_ended_drop_when_camera_reports_unavailable(caplog) -> None:
+    """A camera-absent robot (#120's case) is a structural absence, not #138's staleness."""
+    media = _FakeMedia([_frame()], camera_available=False)
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        for now in (0.0, 5.0, 50.0):
+            driver(_Ctx(now))
+
+    assert _drop_messages(caplog, FS.REASON_STREAM_ENDED) == []
+
+
+def test_stream_ended_drop_does_not_fire_inside_the_staleness_window() -> None:
+    """A camera slower than 1 fps, but not dead, must not be misdiagnosed."""
+    media = _FakeMedia([_frame(), None, None, None])
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    driver(_Ctx(0.0))
+    for now in (0.2, 0.5, 0.9):  # inside the 1.0s window the whole time
+        driver(_Ctx(now))
+    assert driver._stream_ended_logged is False
+
+
+def test_stream_ended_latch_resets_after_frames_resume_and_can_fire_again(caplog) -> None:
+    """A LATER silent episode is reported again — the latch is per-episode, not process-wide."""
+    media = _FakeMedia([_frame(), None, _frame(), None])
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        driver(_Ctx(0.0))  # frame: anchors `_last_frame_at`
+        driver(_Ctx(2.0))  # None, 2.0s later: past the window -> drop #1
+        driver(_Ctx(2.02))  # frame resumes: clears the latch
+        driver(_Ctx(4.1))  # None, 2.08s later: past the window again -> drop #2
+
+    assert len(_drop_messages(caplog, FS.REASON_STREAM_ENDED)) == 2
+
+
+def test_staleness_detection_never_constructs_rebuilds_or_restarts_anything() -> None:
+    """Grep proof (#138 acceptance): DETECT ONLY — no reconnect, rebuild, warm-up, restart.
+
+    Checked against the method's CODE only — its own docstring explains, in
+    prose, exactly what it must NOT do, which would trip a plain substring
+    grep against the raw source.
+    """
+    source = textwrap.dedent(inspect.getsource(FaceSenseDriver._check_stream_staleness))
+    (func,) = ast.parse(source).body
+    body = func.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]  # drop the docstring node — prose is not code
+    code = "\n".join(ast.get_source_segment(source, node) or "" for node in body)
+
+    forbidden = (
+        "warm_up",
+        "ReachyMini",
+        "HeldMediaClient",
+        "reconnect",
+        "rebuild",
+        "restart",
+        "connect(",
+        "_ensure_",
+    )
+    for token in forbidden:
+        assert token not in code, f"{token!r} must not appear in the staleness check's CODE: {code}"
+
+
+def test_stream_ended_fires_when_the_camera_goes_unavailable_after_streaming(caplog) -> None:
+    """The failure mode #138 actually produces, measured on the deployed box.
+
+    The daemon reports ``camera_available`` FALSE once its GStreamer pipeline
+    EOSes — not the believed-present-but-silent shape the first detector
+    watched, which is why that detector stayed silent through three real camera
+    deaths in one afternoon. A camera that streamed and then vanished is a
+    stream that ENDED.
+    """
+    media = _FakeMedia([_frame()])
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        driver(_Ctx(0.0))  # a real frame anchors `_last_frame_at`
+        assert driver.peek_frame_available() is True
+        media.camera_available = False  # the pipeline dies
+        driver(_Ctx(0.5))
+        assert not _drop_messages(caplog, FS.REASON_STREAM_ENDED), "fired inside the window"
+        for now in (2.0, 5.0, 20.0):
+            driver(_Ctx(now))
+
+    drops = _drop_messages(caplog, FS.REASON_STREAM_ENDED)
+    assert len(drops) == 1, f"a died pipeline was not named exactly once: {drops}"
+
+
+def test_a_camera_that_never_streamed_and_is_unavailable_produces_no_drop(caplog) -> None:
+    """The never-existed exemption survives the fix: no frame ever, no stream."""
+    media = _FakeMedia([_frame()], camera_available=False)
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        for tick in range(4):
+            driver(_Ctx(tick * 30.0))
+    assert not _drop_messages(caplog, FS.REASON_STREAM_ENDED)
+
+
+def test_a_disconnected_client_is_never_reported_as_a_dead_stream(caplog) -> None:
+    """A dropped or unwarmed client is not a camera whose stream ended.
+
+    ``HeldMediaClient.connected`` is false whenever no live client is HELD —
+    not warmed yet, dropped, mid-backoff. Sharing the ``camera-stream-ended``
+    name with that state would report a dead camera on every reconnect window,
+    which is the misleading-diagnosis class #138 exists to remove.
+    """
+
+    class _Dropping:
+        def __init__(self) -> None:
+            self.connected = True
+            self.camera_available = True
+
+        def frame(self):
+            return _frame()
+
+    media = _Dropping()
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        driver(_Ctx(0.0))  # a real frame anchors `_last_frame_at`
+        assert driver.peek_frame_available() is True
+        media.connected = False  # the client drops — NOT a dead pipeline
+        for now in (2.0, 10.0, 60.0):  # far past the staleness window
+            driver(_Ctx(now))
+        assert driver.peek_frame_available() is False
+
+    assert not _drop_messages(
+        caplog, FS.REASON_STREAM_ENDED
+    ), "a merely disconnected client was mislabelled as a dead camera stream"

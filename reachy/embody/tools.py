@@ -1,8 +1,11 @@
 """The embodiment layer's direct-operation action set — and its blast radius.
 
 The layer is cognition with an ungated ear: it hears everyone in the room, so
-containment cannot depend on *who* is speaking. It depends on what the layer
-can reach at all. That is this module. There are exactly five tools, covering
+containment cannot depend on *who* is speaking. (Since issue #148 the layer
+does choose whose speech is worth a TURN — :mod:`reachy.embody.attention` — but
+that is a two-state machine anyone in the room can open by saying "reachy" out
+loud, so it bounds cost and manners, never blast radius.) Containment depends
+on what the layer can reach at all. That is this module. There are exactly five tools, covering
 the four action classes the spec names, and **every one of them wraps a surface
 that already exists and already validates**:
 
@@ -933,7 +936,7 @@ class EmbodyToolRegistry:
             content = tool.handler(arguments)
         except Refusal as err:
             return self._refuse(tool_call_id, event_id, name, err.reason, err.message)
-        except Exception as err:  # noqa: BLE001 - a bad tool call must never kill the turn
+        except Exception as err:  # a bad tool call must never kill the turn
             logger.warning("[embody] handler for %r raised: %s", name, err)
             return self._refuse(
                 tool_call_id, event_id, name, REFUSAL_TOOL_ERROR, f"{name!r} failed: {err}"

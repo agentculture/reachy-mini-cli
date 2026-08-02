@@ -33,7 +33,7 @@ class _FakePopen:
 
     returncode = None
 
-    def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001 - test shim
+    def __init__(self, cmd, **kwargs) -> None:  # test shim
         self.cmd = list(cmd)
         self.kwargs = kwargs
         self.pid = 4242
@@ -49,7 +49,7 @@ class _DeadPopen(_FakePopen):
 
 
 def _popen_factory(box, cls=_FakePopen):
-    def _popen(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _popen(cmd, **kwargs):  # test shim
         proc = cls(cmd, **kwargs)
         box.append(proc)
         return proc
@@ -98,7 +98,7 @@ def test_start_idempotent_when_tracked_alive(monkeypatch, tmp_path, capsys) -> N
     monkeypatch.setattr("reachy.daemon.is_alive", lambda pid: True)
     monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: True)
 
-    def _no_spawn(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _no_spawn(cmd, **kwargs):  # test shim
         raise AssertionError("must not spawn when a daemon already runs")
 
     monkeypatch.setattr("subprocess.Popen", _no_spawn)
@@ -113,7 +113,7 @@ def test_start_idempotent_when_tracked_alive(monkeypatch, tmp_path, capsys) -> N
 def test_start_detects_foreign_daemon(monkeypatch, capsys) -> None:
     monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: True)
 
-    def _no_spawn(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _no_spawn(cmd, **kwargs):  # test shim
         raise AssertionError("must not spawn when a foreign daemon answers")
 
     monkeypatch.setattr("subprocess.Popen", _no_spawn)
@@ -172,7 +172,7 @@ def test_start_idempotent_path_honours_wait(monkeypatch, tmp_path, capsys) -> No
 
     monkeypatch.setattr("reachy.daemon.health_ok", _health)
 
-    def _no_spawn(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _no_spawn(cmd, **kwargs):  # test shim
         raise AssertionError("must not spawn for an already-tracked daemon")
 
     monkeypatch.setattr("subprocess.Popen", _no_spawn)
@@ -188,7 +188,7 @@ def test_start_wraps_popen_oserror(monkeypatch, capsys) -> None:
     monkeypatch.setenv("REACHY_DAEMON_CMD", "fake-daemon")
     monkeypatch.setattr("reachy.daemon.health_ok", lambda *a, **k: False)
 
-    def _boom(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _boom(cmd, **kwargs):  # test shim
         raise OSError("Exec format error")
 
     monkeypatch.setattr("subprocess.Popen", _boom)
@@ -383,7 +383,7 @@ def test_health_ok_true_on_2xx(monkeypatch) -> None:
 
 
 def test_health_ok_false_on_error(monkeypatch) -> None:
-    def _boom(req, timeout=None):  # noqa: ANN001 - test shim
+    def _boom(req, timeout=None):  # test shim
         raise urllib.error.URLError("refused")
 
     monkeypatch.setattr("urllib.request.urlopen", _boom)

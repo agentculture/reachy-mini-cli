@@ -220,13 +220,13 @@ class PetReaction:
                 raise ValueError("non-finite behavior-local time")
             t = max(self._last_t, max(0.0, t))
             self._last_t = t
-        except Exception:  # noqa: BLE001 - malformed clock becomes a safe finish
+        except Exception:  # malformed clock becomes a safe finish
             t = self._last_t
             self._begin_finish(t, "fault")
 
         try:
             self._observe(t, sense)
-        except Exception:  # noqa: BLE001 - perception must never kill the engine
+        except Exception:  # perception must never kill the engine
             self._begin_finish(t, "fault")
 
         if self._done:

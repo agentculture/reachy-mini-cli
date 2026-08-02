@@ -213,7 +213,7 @@ class HttpSttBackend:
     @property
     def _endpoint(self) -> str:
         """Full transcription endpoint URL (owned by the shared :class:`Transcriber`)."""
-        return self._transcriber._endpoint  # noqa: SLF001
+        return self._transcriber._endpoint
 
     # ------------------------------------------------------------------
     # Public API
@@ -287,7 +287,7 @@ class OpenWakeWordBackend:
             result = engine.detect(audio) if hasattr(engine, "detect") else False
             return bool(result)
         # An engine crash must not kill the loop.
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[wakeword] openwakeword error: %s; ignoring this tick", exc)
             return False
 
@@ -322,7 +322,7 @@ class OpenWakeWordBackend:
         except ImportError:
             logger.debug("[wakeword] openwakeword not installed; Tier-2 wake-word disabled")
             return None
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[wakeword] openwakeword failed to load (%s); disabled", exc)
             return None
 

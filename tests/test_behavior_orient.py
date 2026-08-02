@@ -771,7 +771,7 @@ def test_the_latch_is_logged_on_entry_and_release_and_never_per_tick(caplog) -> 
 def test_the_shipped_gate_is_the_guard_wrapping_the_corroborated_gate() -> None:
     """The guard must actually SHIP — a defence wired into nothing is a note."""
     fn = make_orient_to_sound()
-    gate = fn._gate  # noqa: SLF001 - pinning the composed default is the point
+    gate = fn._gate  # pinning the composed default is the point
     assert isinstance(gate, LatchedDoaGuard)
     assert isinstance(gate.inner, CorroboratedGate)
 

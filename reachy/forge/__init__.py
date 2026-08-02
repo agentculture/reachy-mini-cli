@@ -1,6 +1,6 @@
 """The forge package — runtime self-extension for Reachy Mini.
 
-Dispatch a natural-language goal to a coder model (``qwen3`` on the lobes gateway by
+Dispatch a natural-language goal to a coder model (the lobes gateway's ``cortex`` role by
 default), parse the two fenced files it returns (``SKILL.md`` + ``executor.py``), stage
 them under the state dir, and run them through an AST-only, fail-closed validator before
 they are ever eligible for activation. Every lifecycle transition is announced as a

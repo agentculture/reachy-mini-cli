@@ -13,7 +13,7 @@ Cue-triggered, not polled
 :class:`~reachy.speech.agent_turn.AgentTurnEngine` is the closest relative and
 several seams are cited from it verbatim (the bounded rolling history, the
 ``run(max_turns=, stop=, before_turn=)`` loop shape, the export-before-dispatch
-ordering, the ``max_tool_rounds`` bound). Two things are deliberately NOT
+ordering, the ``max_tool_rounds`` bound). One thing is deliberately NOT
 inherited:
 
 * **No permanent failure latch.** That engine mutes its audio sink for the
@@ -21,9 +21,66 @@ inherited:
   that is meant to stay switched on: every failure is a named, counted drop and
   the very next turn tries again. A layer that goes permanently quiet because
   the gateway blipped is indistinguishable from a layer that crashed.
-* **No snapshot-only buffer.** A turn here is TRIGGERED by an arriving cue or
-  utterance (:meth:`submit_cue` / :meth:`submit_utterance`), which is what makes
-  "the robot's own rule fired, so it says something about it" possible at all.
+
+Three input classes, not one queue (issue #143)
+-----------------------------------------------
+A turn is TRIGGERED — that is what makes "the robot's own rule fired, so it
+says something about it" possible at all — but not by everything that arrives.
+Measured live on 2026-08-02 with the bus bridged into the feed: **187 cues in
+~40 s produced 23 turns and 19 queue-full drops**, and not one of those turns
+was prompted by something the robot DECIDED. The mix was 145 "speech from the
+left/ahead/right" plus 44 "loud sound", zero rule fires. The layer already has
+its own ears (a ``/v1/realtime`` duplex session with server-side VAD), so
+those cues told it nothing it did not already hear — they simply arrived at
+tick rate instead of utterance rate. So intake splits three ways:
+
+============  ==========================================  =================
+class         events                                      effect
+============  ==========================================  =================
+heard         an utterance from the duplex session        runs a turn, if
+                                                          ATTENTION admits it
+**alert**     a rule FIRE                                 runs a turn
+**context**   ``sense`` / ``intent`` / ``motion``, and a   parked, drained
+              rule SUPPRESSION                            by the next turn
+============  ==========================================  =================
+
+The "if attention admits it" qualifier is issue #148, and it is the one clause
+of this policy that is about WHO rather than about WHAT. The ear stays ungated
+— the duplex session surfaces every voice in the room — but a turn is woken
+only by an utterance that named the robot, or by one arriving while a
+conversation the name opened is still live. The whole rule lives in
+:mod:`reachy.embody.attention`; what matters here is that it gates the HEARD
+class alone. An alert is the robot's own reflex firing: attention gates the
+ear, never the robot's reactions, so a rule fire runs a turn from cold.
+
+The context half is where :class:`~reachy.speech.agent_turn.AgentTurnEngine`'s
+snapshot-only buffer is CITED rather than imported: cues that arrive during a
+turn accumulate for the next one and cause none of their own. What is added on
+top is COALESCING — 145 near-identical lines must reach a turn as one fact
+carrying a count, not as 145 strings — keyed on the rendered cue text, which
+is exactly the identity the closed cue vocabulary already expresses (see
+:mod:`reachy.runtime_cues`: a fixed phrase per perception, so equal text means
+the same fact happened again).
+
+Alert containment, because the flood has a front door too
+----------------------------------------------------------
+``reachy/behavior/rules.py`` permits ``cooldown_s = 0`` and several rules can
+fire in one tick, so "only alerts trigger" alone would let the same flood back
+in wearing the one class that is allowed through. Two bounds close it, and
+both are about turns rather than about cues:
+
+* alerts arriving while a turn is pending or running COALESCE into the ONE
+  turn that drains them next — the trigger buffer is drained whole, so ten
+  fires inside one turn window cost a second turn, never ten;
+* :data:`DEFAULT_MIN_ALERT_INTERVAL_S` bounds how often an alert may TRIGGER.
+  Inside the interval an alert is DEFERRED, never dropped: it stays pending
+  and rides the next turn that runs. An utterance is exempt — a person talking
+  outranks a rate limit — and the first alert after quiet is never delayed,
+  because the interval is measured from the last alert-triggered turn.
+
+Both bounds are observable by construction: every turn's senselog line and its
+exported ``thinking`` block carry ``triggers=T context=N coalesced-from=M``. A
+silent coalescer is indistinguishable from a dropper.
 
 Every LLM call streams (spec claim c6), and the reason is measured
 ------------------------------------------------------------------
@@ -72,8 +129,10 @@ Per turn the engine emits, through the shared
   expression can come from; it is a plain codepoint scan
   (:func:`first_emoji`), NOT a resurrection of the retired ``*emoji*`` marker
   grammar — the text is neither consumed nor rewritten.
-* ``thinking`` — exactly one per turn, last, carrying the cues that triggered it
-  and the raw turn text: the model's streamed ``reasoning`` (see
+* ``thinking`` — exactly one per turn, last, carrying every perception line the
+  turn read (its triggers first, then the drained context) and the raw turn
+  text, which OPENS with this turn's ``[triggers=… context=… coalesced-from=…]``
+  drain counts and continues with the model's streamed ``reasoning`` (see
   :data:`reachy.speech.llm.REASONING_DELTA_KEYS` — the gateway sends
   ``reasoning``, not the documented ``reasoning_content``), its content, every
   tool call, every tool RESULT including refusals, and any named drop. That last
@@ -103,6 +162,8 @@ from typing import Protocol
 
 from reachy import senselog
 from reachy.cli._errors import CliError
+from reachy.embody.attention import DEFAULT_ATTENTION_WINDOW_S, LABEL_COLD, AttentionGate
+from reachy.embody.cues import ClassifiedCue, CueClass
 from reachy.embody.tools import HARMONICS, SPEAK
 from reachy.export.events import EmotionEvent, MessageEvent, ThinkingEvent
 from reachy.export.exporter import ExportHook
@@ -149,12 +210,20 @@ REASON_ENDPOINT_UNREACHABLE = "llm-endpoint-unreachable"
 REASON_STREAM_FAILED = "stream-failed"
 #: The model kept calling tools past :data:`DEFAULT_MAX_TOOL_ROUNDS`.
 REASON_TOOL_ROUNDS_EXHAUSTED = "tool-rounds-exhausted"
-#: The pending-input buffer was full; the newest input was refused.
+#: The pending-TRIGGER buffer was full; the newest trigger was refused.
 REASON_INPUT_QUEUE_FULL = "input-queue-full"
+#: The context park already holds :data:`DEFAULT_MAX_CONTEXT` DISTINCT facts and
+#: a new one arrived. A repeat of a parked fact can never reach this: it
+#: coalesces, so a flood of one perception cannot fill the park.
+REASON_CONTEXT_PARK_FULL = "context-park-full"
 #: A blank cue/utterance was submitted.
 REASON_EMPTY_INPUT = "empty-input"
 #: A turn produced no text, no reasoning and no tool call.
 REASON_SILENT_TURN = "silent-turn"
+#: An utterance arrived while attention was COLD and named nobody (issue #148).
+#: Imported from :mod:`reachy.embody.attention` rather than retyped: the gate's
+#: label IS the drop reason, exactly as the runtime's engagement labels are.
+REASON_NOT_ADDRESSED_COLD = LABEL_COLD
 
 #: Every reason this module can emit, in one place so the journal, the export
 #: feed, the operator docs and the tests share ONE vocabulary.
@@ -164,8 +233,10 @@ DROP_REASONS: tuple[str, ...] = (
     REASON_STREAM_FAILED,
     REASON_TOOL_ROUNDS_EXHAUSTED,
     REASON_INPUT_QUEUE_FULL,
+    REASON_CONTEXT_PARK_FULL,
     REASON_EMPTY_INPUT,
     REASON_SILENT_TURN,
+    REASON_NOT_ADDRESSED_COLD,
 )
 
 # --------------------------------------------------------------------------- #
@@ -186,9 +257,21 @@ DEFAULT_MAX_TOOL_ROUNDS = 6
 #: Prior (perception, reply) pairs kept for context — the same 6-entry
 #: discipline the engagement classifier and the agent engine use.
 DEFAULT_HISTORY_MAXLEN = 6
-#: Pending cues/utterances held between turns. Bounded: a runtime feed that
-#: outruns cognition must drop the NEWEST by name, never grow without bound.
+#: Pending TRIGGERS (utterances + alerts) held between turns. Bounded: a
+#: runtime feed that outruns cognition must drop the NEWEST by name, never grow
+#: without bound.
 DEFAULT_MAX_PENDING = 32
+#: DISTINCT facts the context park holds. Small on purpose: the cue vocabulary
+#: is closed and the measured 40 s flood was six facts arriving 187 times, so a
+#: park that needs more than this is describing a robot in a genuinely novel
+#: situation, not a busy one.
+DEFAULT_MAX_CONTEXT = 24
+#: Seconds between ALERT-triggered turns. The first alert after quiet is never
+#: delayed; this only bites on a burst, where the fires it holds back are
+#: deferred into the next turn rather than dropped. Sized against the measured
+#: defect: 23 turns in 40 s (~34/min) becomes at most 12/min from alerts, while
+#: a single reflex the robot should react to still gets an immediate turn.
+DEFAULT_MIN_ALERT_INTERVAL_S = 5.0
 #: Recent already-spoken replies carried into the next turn's context.
 DEFAULT_SPOKEN_MAXLEN = 4
 #: Minimum gap between turns in :meth:`EmbodyTurnEngine.run`.
@@ -218,15 +301,20 @@ DEFAULT_EMBODY_SYSTEM_PROMPT = (
 # Input kinds                                                                 #
 # --------------------------------------------------------------------------- #
 
-#: A runtime perception (a rule fired, a pat, a face) — see :mod:`reachy.embody.cues`.
-KIND_CUE = "cue"
-#: Something a person said, ungated (spec claim c4 — the layer hears everyone).
+#: A runtime perception the robot's own reflexes DECIDED — a rule fire. The one
+#: cue class that triggers, because it is the one the layer cannot learn any
+#: other way (see :class:`reachy.embody.cues.CueClass`).
+KIND_ALERT = "alert"
+#: Something a person said. The layer HEARS everyone (spec claim c4, pinned in
+#: the wire); whether what it heard wakes the mind is
+#: :mod:`reachy.embody.attention`'s decision, taken in
+#: :meth:`EmbodyTurnEngine.submit_utterance`.
 KIND_UTTERANCE = "utterance"
 
 
 @dataclass(frozen=True)
 class Input:
-    """One pending trigger: what kind it was, and the text a turn will read."""
+    """One pending TRIGGER: what kind it was, and the text a turn will read."""
 
     kind: str
     text: str
@@ -236,6 +324,28 @@ class Input:
         if self.kind == KIND_UTTERANCE:
             return f'heard: "{self.text}"'
         return self.text
+
+
+@dataclass
+class Parked:
+    """One CONTEXT fact in the park, and how many times it has been perceived.
+
+    Mutable, unlike :class:`Input`, because coalescing IS a mutation of the
+    entry already there: the whole point is that the 145th "speech from the
+    left" costs one increment rather than a 145th list slot. Every mutation
+    happens under the engine's intake lock and is O(1).
+    """
+
+    text: str
+    count: int = 1
+
+    def render(self) -> str:
+        """``"speech from the left (x145)"`` — or the bare fact when seen once.
+
+        A single sighting reads as a fact, not a tally: ``(x1)`` on every quiet
+        line would be noise in the one place the model is meant to skim.
+        """
+        return self.text if self.count == 1 else f"{self.text} (x{self.count})"
 
 
 # --------------------------------------------------------------------------- #
@@ -285,6 +395,103 @@ class EmbodyModels:
         if role == ROLE_SENSES:
             return self.senses
         raise ValueError(f"unknown model role {role!r}; the layer has exactly {ROLES}")
+
+
+# --------------------------------------------------------------------------- #
+# Bounds, grouped into one frozen home (issue #141, python:S107)              #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Limits:
+    """:class:`EmbodyTurnEngine`'s numeric bounds, out of the constructor's kwargs.
+
+    Every field here was a bare keyword parameter on
+    :class:`EmbodyTurnEngine` before this task; the constructor's OTHER
+    parameters are injected SEAMS (a collaborator, a callable tap, a clock)
+    and none of those moved — grouping seams in here too would just relocate
+    the S107 complaint rather than fix its actual defect. This class does not
+    re-explain each bound: the measured reasoning behind every default lives
+    with its ``DEFAULT_*`` constant above (the one documented home this module
+    already keeps), and every field here simply carries that same constant
+    forward unchanged, so the refactor cannot silently change a number while
+    moving it.
+    """
+
+    #: The inter-chunk idle budget passed to every streamed call.
+    idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S
+    #: Rounds one turn may take before the tool loop is force-stopped.
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS
+    #: Prior (perception, reply) pairs kept in the rolling history.
+    history_maxlen: int = DEFAULT_HISTORY_MAXLEN
+    #: Pending TRIGGERS (utterances + alerts) held between turns.
+    max_pending: int = DEFAULT_MAX_PENDING
+    #: DISTINCT facts the context park holds.
+    max_context: int = DEFAULT_MAX_CONTEXT
+    #: Seconds between ALERT-triggered turns; ``0`` disables the bound.
+    min_alert_interval_s: float = DEFAULT_MIN_ALERT_INTERVAL_S
+    #: Recent already-spoken replies carried into the next turn's context.
+    spoken_maxlen: int = DEFAULT_SPOKEN_MAXLEN
+    #: Minimum gap between turns in :meth:`EmbodyTurnEngine.run`.
+    turn_interval: float = DEFAULT_TURN_INTERVAL
+    #: How long attention stays open after the last utterance heard or answer
+    #: spoken (issue #148); ``0`` means name-only forever. It lives here rather
+    #: than as a constructor parameter for the reason this class exists at all:
+    #: a loose bound would put the count back over ``python:S107``'s threshold.
+    #: The measured argument for the default is on
+    #: :data:`reachy.embody.attention.DEFAULT_ATTENTION_WINDOW_S`.
+    attention_window_s: float = DEFAULT_ATTENTION_WINDOW_S
+
+
+@dataclass(frozen=True)
+class RequestConfig:
+    """The per-call LLM request template, grouped for the SAME reason as :class:`Limits`.
+
+    :class:`Limits` alone — the resource/time bounds issue #141 names by
+    example (``max_tool_rounds``, the several timeouts, …) — still leaves this
+    engine's constructor at 17 parameters. This project's configured
+    ``python:S107`` threshold is **13 authorized parameters** (verified
+    against SonarCloud, not assumed), so bounds alone do not clear the rule
+    here — measured, not guessed, and the reason this second dataclass exists
+    at all. Its six fields are neither seams (none is a callable) nor
+    resource/time bounds; they are the plain, per-call shape of every
+    streamed request: which system message opens the turn, which endpoint and
+    key to call, and how the model samples. Every field keeps the exact
+    default it had as a bare parameter.
+    """
+
+    #: The system message on every turn.
+    system_prompt: str = DEFAULT_EMBODY_SYSTEM_PROMPT
+    #: Forwarded to *turn_fn* per call. ``None`` lets
+    #: :class:`reachy.speech.llm.LlmConfig` resolve them from the
+    #: ``REACHY_OPENAI_*`` environment as usual.
+    base_url: str | None = None
+    api_key: str | None = None
+    #: Sampling controls, forwarded per call.
+    temperature: float = DEFAULT_TEMPERATURE
+    max_tokens: int | None = None
+    #: Ask the server for streamed reasoning. Off by default, and the default
+    #: is a PRODUCT decision about a robot that answers out loud — measured
+    #: live against the deployed gateway on 2026-08-02
+    #: (``docs/evidence/2026-08-02-probe-thinking-vs-reasoning-deltas.md``)::
+    #:
+    #:     model    enable_thinking   delta keys        first *content*
+    #:     worker   False (shipped)   content, role     0.22 s
+    #:     worker   True              + reasoning       9.72 s
+    #:     cortex   False (shipped)   content, role     0.27 s
+    #:     cortex   True              + reasoning       17.96 s
+    #:
+    #: So turning this on costs 9-18 SECONDS before the robot says or does
+    #: anything. For a layer whose whole point is realtime conversation that
+    #: is not a trade worth making, and no amount of tuning elsewhere
+    #: recovers it. The consequence is worth stating plainly rather than
+    #: discovering: with the shipped default the gateway sends **no
+    #: reasoning key at all**, so :attr:`TurnResult.reasoning` is empty and
+    #: the exported ``thinking`` block carries cues, reply text, tool calls
+    #: and results — but no model reasoning. The reasoning seam is correct
+    #: and dormant, NOT broken. Flip this to ``True`` and it fills
+    #: immediately.
+    enable_thinking: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -353,45 +560,31 @@ class EmbodyTurnEngine:
         export: the shared :class:`~reachy.export.exporter.ExportHook`. ``None``
             means no export path is entered at all.
         models: :class:`EmbodyModels`; default :meth:`EmbodyModels.resolve`.
-        system_prompt: the system message on every turn.
-        base_url / api_key: forwarded to *turn_fn* per call. ``None`` lets
-            :class:`reachy.speech.llm.LlmConfig` resolve them from the
-            ``REACHY_OPENAI_*`` environment as usual.
-        temperature / max_tokens: sampling controls, forwarded per call.
-        idle_timeout_s: the INTER-CHUNK idle budget (see the module docstring).
-        enable_thinking: ask the server for streamed reasoning. Off by default,
-            and the default is a PRODUCT decision about a robot that answers out
-            loud — measured live against the deployed gateway on 2026-08-02
-            (``docs/evidence/2026-08-02-probe-thinking-vs-reasoning-deltas.md``):
-
-            ==========  ===============  =====================  ================
-            model       enable_thinking  delta keys             first *content*
-            ==========  ===============  =====================  ================
-            worker      False (shipped)  content, role          0.22 s
-            worker      True             + reasoning            9.72 s
-            cortex      False (shipped)  content, role          0.27 s
-            cortex      True             + reasoning            17.96 s
-            ==========  ===============  =====================  ================
-
-            So turning this on costs 9-18 SECONDS before the robot says or does
-            anything. For a layer whose whole point is realtime conversation
-            that is not a trade worth making, and no amount of tuning elsewhere
-            recovers it.
-
-            The consequence is worth stating plainly rather than discovering:
-            with the shipped default the gateway sends **no reasoning key at
-            all**, so :attr:`TurnResult.reasoning` is empty and the exported
-            ``thinking`` block carries cues, reply text, tool calls and results
-            — but no model reasoning. The reasoning seam is correct and dormant,
-            NOT broken. Flip this to ``True`` and it fills immediately.
-        max_tool_rounds / history_maxlen / max_pending / spoken_maxlen: bounds.
+        request: the per-call LLM request template — the system prompt, the
+            endpoint + key, and the sampling controls (``temperature`` /
+            ``max_tokens`` / ``enable_thinking``) — grouped into one frozen
+            :class:`RequestConfig`. Grouped for the same S107 reason as
+            ``limits`` below (see :class:`RequestConfig`'s docstring for why
+            bounds alone do not clear the rule here); every field keeps the
+            exact default it had as a bare parameter.
+        limits: the engine's numeric bounds — the inter-chunk idle timeout, the
+            tool-round cap, the rolling-history / pending-trigger / context-park
+            / already-spoken sizes, the alert-containment interval (issue
+            #143) and the inter-turn pacing — grouped into one frozen
+            :class:`Limits` (issue #141/``python:S107``). Every field keeps
+            the exact default it had as a bare parameter; see :class:`Limits`
+            for what each one bounds.
         voice_tools: tool names exported as ``message`` blocks.
         on_content / on_reasoning: optional taps fired per delta, on the calling
             thread, as the stream arrives.
         cancel: zero-arg predicate; truthy aborts an in-flight stream after the
             current chunk. A composition root passes the same predicate it gives
             :meth:`run`'s ``stop``.
-        sleep / turn_interval: inter-turn pacing for :meth:`run`.
+        now_fn: the monotonic clock the alert interval is measured on
+            (default :func:`time.monotonic`). Injected so the containment
+            bounds are testable without sleeping.
+        sleep: the callable :meth:`run` sleeps with between turns (default
+            :func:`time.sleep`), paced by ``limits.turn_interval``.
     """
 
     def __init__(
@@ -401,50 +594,65 @@ class EmbodyTurnEngine:
         turn_fn: _TurnFn | None = None,
         export: ExportHook | None = None,
         models: EmbodyModels | None = None,
-        system_prompt: str = DEFAULT_EMBODY_SYSTEM_PROMPT,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        temperature: float = DEFAULT_TEMPERATURE,
-        max_tokens: int | None = None,
-        idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S,
-        enable_thinking: bool = False,
-        max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
-        history_maxlen: int = DEFAULT_HISTORY_MAXLEN,
-        max_pending: int = DEFAULT_MAX_PENDING,
-        spoken_maxlen: int = DEFAULT_SPOKEN_MAXLEN,
+        request: RequestConfig | None = None,
+        limits: Limits | None = None,
         voice_tools: frozenset[str] | None = None,
         on_content: Callable[[str], None] | None = None,
         on_reasoning: Callable[[str], None] | None = None,
         cancel: Callable[[], bool] | None = None,
+        now_fn: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
-        turn_interval: float = DEFAULT_TURN_INTERVAL,
     ) -> None:
         self._registry = registry
         self._turn_fn = turn_fn if turn_fn is not None else _llm.stream_turn
         self._export = export
         self._models = models if models is not None else EmbodyModels.resolve()
-        self._system_prompt = system_prompt
-        self._base_url = base_url
-        self._api_key = api_key
-        self._temperature = float(temperature)
-        self._max_tokens = max_tokens
-        self._idle_timeout_s = max(0.1, float(idle_timeout_s))
-        self._enable_thinking = bool(enable_thinking)
-        self._max_tool_rounds = max(1, int(max_tool_rounds))
+        self._request = request if request is not None else RequestConfig()
+        self._system_prompt = self._request.system_prompt
+        self._base_url = self._request.base_url
+        self._api_key = self._request.api_key
+        self._temperature = float(self._request.temperature)
+        self._max_tokens = self._request.max_tokens
+        self._limits = limits if limits is not None else Limits()
+        self._idle_timeout_s = max(0.1, float(self._limits.idle_timeout_s))
+        self._enable_thinking = bool(self._request.enable_thinking)
+        self._max_tool_rounds = max(1, int(self._limits.max_tool_rounds))
         self._voice_tools = voice_tools if voice_tools is not None else DEFAULT_VOICE_TOOLS
         self._on_content = on_content
         self._on_reasoning = on_reasoning
         self._cancel = cancel if cancel is not None else _never
+        self._now = now_fn if now_fn is not None else time.monotonic
         self._sleep = sleep if sleep is not None else time.sleep
-        self._turn_interval = float(turn_interval)
+        self._turn_interval = float(self._limits.turn_interval)
 
-        self._pending: deque[Input] = deque(maxlen=None)
-        self._max_pending = max(1, int(max_pending))
-        self._spoken: deque[str] = deque(maxlen=max(0, int(spoken_maxlen)))
-        self._history: deque[tuple[str, str]] = deque(maxlen=max(0, int(history_maxlen)))
+        self._triggers: deque[Input] = deque(maxlen=None)
+        self._max_pending = max(1, int(self._limits.max_pending))
+        # Insertion-ordered by construction (``dict``), so the park reads back
+        # in the order the robot first noticed each fact — stable across a
+        # flood, where a recency ordering would churn every line every tick.
+        self._context: dict[str, Parked] = {}
+        self._max_context = max(1, int(self._limits.max_context))
+        self._min_alert_interval_s = max(0.0, float(self._limits.min_alert_interval_s))
+        # ONE clock for the layer: the gate is a time-based state machine and a
+        # second clock would make "the window elapsed" untestable and, under an
+        # injected clock, wrong.
+        self._attention = AttentionGate(window_s=self._limits.attention_window_s, clock=self._now)
+        # -inf, never 0.0: an injected clock may start anywhere, and the FIRST
+        # alert after quiet must never be the one the interval delays.
+        self._last_alert_turn = float("-inf")
+        self._deferral_logged = False
+        self._spoken: deque[str] = deque(maxlen=max(0, int(self._limits.spoken_maxlen)))
+        self._history: deque[tuple[str, str]] = deque(
+            maxlen=max(0, int(self._limits.history_maxlen))
+        )
         self._last_text = ""
         # One turn at a time; ``ask`` is deliberately outside it.
         self._turn_lock = threading.Lock()
+        # Guards the two intake structures ONLY, and is never held across a
+        # turn, an LLM call or a log write: two threads submit (the cue reader
+        # and the duplex utterance tap) while a third drains under
+        # ``_turn_lock``, and both bounds are check-then-act.
+        self._intake_lock = threading.Lock()
 
         self.turns = 0
         self.rounds = 0
@@ -453,22 +661,76 @@ class EmbodyTurnEngine:
         self.stream_timeouts = 0
         self.stream_failures = 0
         self.dropped_inputs = 0
+        # Counted apart from ``dropped_inputs``, which means "a bound was hit":
+        # an unaddressed utterance is not a resource failure, it is the gate
+        # working, and folding the two would make a busy room look like a sick
+        # layer on the summary line.
+        self.unaddressed_utterances = 0
 
     # ------------------------------------------------------------------ #
     # Intake — O(1), safe from any thread, never raises                  #
     # ------------------------------------------------------------------ #
 
-    def submit_cue(self, text: str) -> bool:
-        """Offer one runtime perception cue. Returns whether it was accepted."""
-        return self._offer(KIND_CUE, text)
+    def submit_cue(self, text: str, *, cue_class: CueClass = CueClass.CONTEXT) -> bool:
+        """Offer one runtime perception cue. Returns whether it was accepted.
 
-    def submit_cues(self, texts: Iterable[str]) -> int:
-        """Offer several cues (what :func:`reachy.embody.cues.cues_for_line` returns)."""
-        return sum(1 for text in texts if self.submit_cue(text))
+        The class defaults to :attr:`~reachy.embody.cues.CueClass.CONTEXT`
+        because that is the fail-safe direction of the #143 policy: a caller
+        that has not thought about which lane a cue belongs to must not be able
+        to wake the mind up by accident. An ALERT is always named explicitly.
+        """
+        if cue_class is CueClass.ALERT:
+            return self._offer_trigger(KIND_ALERT, text)
+        return self._offer_context(text)
+
+    def submit_cues(self, cues: Iterable[str | ClassifiedCue]) -> int:
+        """Offer several cues, routing each by its class. Returns how many landed.
+
+        Accepts what :func:`reachy.embody.cues.classified_cues_for_line`
+        returns — the composition root's intake — and, for a caller that has no
+        classification to give, bare strings, which park.
+        """
+        accepted = 0
+        for cue in cues:
+            if isinstance(cue, ClassifiedCue):
+                accepted += self.submit_cue(cue.text, cue_class=cue.cue_class)
+            else:
+                accepted += self.submit_cue(cue)
+        return accepted
 
     def submit_utterance(self, text: str) -> bool:
-        """Offer one heard utterance. **Ungated** — the layer hears everyone (c4)."""
-        return self._offer(KIND_UTTERANCE, text)
+        """Offer one heard utterance, subject to ATTENTION (issue #148).
+
+        The layer's ear stays ungated — the duplex session surfaces every voice
+        in the room and its own boundary tests pin that — but hearing is not
+        the same as being addressed. While attention is cold only an utterance
+        that NAMES the robot wakes a turn; while it is warm anything does, and
+        every admission extends the window. A refusal is a NAMED drop carrying
+        the text it ignored, never a silent no-op: "why is it ignoring me?" has
+        to be answerable from the journal.
+
+        The gate deliberately runs BEFORE the pending-trigger bound, and the
+        admission stands even if that bound then refuses the utterance: the
+        robot was addressed, which is a fact about the room, not about how full
+        a queue happened to be.
+        """
+        cleaned = (text or "").strip()
+        if not cleaned:
+            self._drop(REASON_EMPTY_INPUT, KIND_UTTERANCE)
+            return False
+        verdict = self._attention.decide(cleaned)
+        if not verdict.admitted:
+            self.unaddressed_utterances += 1
+            self._drop(verdict.label, f'"{cleaned[:60]}"')
+            return False
+        if verdict.opened:
+            senselog.stage(
+                STAGE,
+                SOURCE,
+                uuid.uuid4().hex[:8],
+                f"attention open ({verdict.label}) for {self._attention.window_s:g}s",
+            )
+        return self._offer_trigger(KIND_UTTERANCE, cleaned)
 
     def note_spoken(self, text: str) -> None:
         """Record something the layer's MOUTH already said. Does NOT trigger a turn.
@@ -477,35 +739,94 @@ class EmbodyTurnEngine:
         the thinking mind would have no idea it had already replied and would
         cheerfully call ``speak`` to say it again. It is context, not a trigger —
         a robot that treats its own voice as a perception talks to itself.
+
+        It also EXTENDS attention, so a long answer cannot time the human out
+        mid-exchange — but only while attention is already warm. That
+        asymmetry is load-bearing: the session is armed once and the server
+        replies to every committed utterance, including the ambient ones the
+        gate has just refused, so a voice that could OPEN attention would be a
+        robot waking itself up (see :mod:`reachy.embody.attention`).
         """
         cleaned = (text or "").strip()
         if not cleaned:
             return
         self._spoken.append(cleaned)
+        self._attention.note_spoken()
         if self._export is not None:
             self._export.emit(MessageEvent(text=cleaned, ts=self._export.time_fn()))
 
     @property
+    def attention(self) -> AttentionGate:
+        """The two-state attention gate (issue #148).
+
+        Exposed rather than injected: it is state the engine owns and shares a
+        clock with, and a composition root configures it through
+        :attr:`Limits.attention_window_s` like every other bound. A caller that
+        knows the robot was addressed some other way opens the window with
+        :meth:`~reachy.embody.attention.AttentionGate.note_addressed`.
+        """
+        return self._attention
+
+    @property
     def pending(self) -> int:
-        """How many triggers are waiting for the next turn."""
-        return len(self._pending)
+        """How many TRIGGERS are waiting for the next turn.
+
+        Parked context is deliberately not counted: a composition root uses
+        this to decide whether the layer still has thinking to do (see
+        ``_EmbodyLayer.should_stop``), and context that can never cause a turn
+        would keep a finished run spinning forever.
+        """
+        return len(self._triggers)
+
+    @property
+    def parked(self) -> int:
+        """How many DISTINCT context facts the park is holding."""
+        return len(self._context)
 
     @property
     def last_text(self) -> str:
         """The final assistant text of the last turn that ran (``""`` if it failed)."""
         return self._last_text
 
-    def _offer(self, kind: str, text: str) -> bool:
+    def _offer_trigger(self, kind: str, text: str) -> bool:
+        """Park-free intake for the two classes that RUN a turn. O(1)."""
         cleaned = (text or "").strip()
         if not cleaned:
             self._drop(REASON_EMPTY_INPUT, kind)
             return False
-        if len(self._pending) >= self._max_pending:
-            self.dropped_inputs += 1
-            self._drop(REASON_INPUT_QUEUE_FULL, f"{kind} dropped, {len(self._pending)} pending")
+        with self._intake_lock:
+            depth = len(self._triggers)
+            if depth < self._max_pending:
+                self._triggers.append(Input(kind=kind, text=cleaned))
+                return True
+        self.dropped_inputs += 1
+        self._drop(REASON_INPUT_QUEUE_FULL, f"{kind} dropped, {depth} pending")
+        return False
+
+    def _offer_context(self, text: str) -> bool:
+        """Coalescing intake for everything that never runs a turn. O(1).
+
+        Keyed on the cue TEXT: the vocabulary is closed (one fixed phrase per
+        perception, :mod:`reachy.runtime_cues`), so equal text means the same
+        fact happened again, and the count is the only thing worth keeping
+        about the repeat.
+        """
+        cleaned = (text or "").strip()
+        if not cleaned:
+            self._drop(REASON_EMPTY_INPUT, "context")
             return False
-        self._pending.append(Input(kind=kind, text=cleaned))
-        return True
+        with self._intake_lock:
+            entry = self._context.get(cleaned)
+            if entry is not None:
+                entry.count += 1
+                return True
+            distinct = len(self._context)
+            if distinct < self._max_context:
+                self._context[cleaned] = Parked(text=cleaned)
+                return True
+        self.dropped_inputs += 1
+        self._drop(REASON_CONTEXT_PARK_FULL, f"{distinct} distinct facts parked")
+        return False
 
     # ------------------------------------------------------------------ #
     # One turn                                                           #
@@ -514,10 +835,17 @@ class EmbodyTurnEngine:
     def run_turn(self) -> bool:
         """Run one turn over everything pending. ``False`` when there was nothing.
 
-        The pending inputs are DRAINED into the turn, so a failure consumes them
-        rather than retrying forever against a sick gateway — but the failure is
-        always named, on the journal and on the export feed, and the perception
-        still enters the rolling history so the next turn knows it happened.
+        A turn runs only when a TRIGGER is waiting — an utterance or an alert.
+        Parked context alone is never a reason to think (issue #143); it is
+        drained into whatever turn a trigger causes next, and if none ever
+        comes it is simply never read, which is the correct outcome for
+        ambient background.
+
+        The pending triggers are DRAINED into the turn, so a failure consumes
+        them rather than retrying forever against a sick gateway — but the
+        failure is always named, on the journal and on the export feed, and the
+        perception still enters the rolling history so the next turn knows it
+        happened.
 
         Exactly ONE turn runs at a time (cited from
         :meth:`reachy.speech.agent_turn.AgentTurnEngine.run_turn`): a second
@@ -526,21 +854,66 @@ class EmbodyTurnEngine:
         perception question must not have to wait out a long turn.
         """
         with self._turn_lock:
-            inputs = self._drain()
-            if not inputs:
+            if not self._triggers or self._alert_deferred():
                 return False
-            self._run_turn(inputs)
+            triggers = self._drain_triggers()
+            if not triggers:
+                return False
+            self._run_turn(triggers, self._drain_context())
             return True
 
-    def _run_turn(self, inputs: list[Input]) -> None:
+    def _alert_deferred(self) -> bool:
+        """Whether the pending triggers are alerts that must wait out the interval.
+
+        The bound is on alert-triggered TURNS, not on alert cues: an alert held
+        back here stays pending and rides the next turn that runs, so a burst
+        costs latency, never a lost reflex. An utterance among the triggers
+        lifts the bound outright — a person talking is not rate-limited — and
+        the alerts waiting with it ride that turn too.
+        """
+        if self._min_alert_interval_s <= 0.0:
+            return False
+        with self._intake_lock:
+            heard = any(item.kind == KIND_UTTERANCE for item in self._triggers)
+            waiting = len(self._triggers)
+        if heard:
+            return False
+        waited = self._now() - self._last_alert_turn
+        if waited >= self._min_alert_interval_s:
+            return False
+        if not self._deferral_logged:
+            # Once per deferral window: ``run`` re-asks every ``turn_interval``,
+            # and a line per ask would bury the turn it is about to describe.
+            self._deferral_logged = True
+            senselog.stage(
+                STAGE,
+                SOURCE,
+                uuid.uuid4().hex[:8],
+                f"alert deferred waiting={waiting} for "
+                f"{self._min_alert_interval_s - waited:.1f}s",
+            )
+        return True
+
+    def _run_turn(self, triggers: list[Input], context: list[Parked]) -> None:
         event = uuid.uuid4().hex[:8]
-        senselog.stage(STAGE, SOURCE, event, f"turn inputs={len(inputs)}")
+        counts = (
+            f"triggers={len(triggers)} context={len(context)} "
+            f"coalesced-from={sum(entry.count for entry in context)}"
+        )
+        senselog.stage(STAGE, SOURCE, event, f"turn {counts}")
         self.turns += 1
+        if any(item.kind == KIND_ALERT for item in triggers):
+            self._last_alert_turn = self._now()
+        self._deferral_logged = False
         before_refusals, before_rounds = self.refusals, self.rounds
-        cues = [item.render() for item in inputs]
-        user_content = self._build_user_content(cues, self._drain_spoken())
+        trigger_lines = [item.render() for item in triggers]
+        context_lines = [entry.render() for entry in context]
+        cues = trigger_lines + context_lines
+        user_content = self._build_user_content(trigger_lines, context_lines, self._drain_spoken())
         conversation = self._build_messages(user_content)
-        raw: list[str] = []
+        # Seeded, not appended: the drain counts open the block so a feed reader
+        # can see what a turn was built from before reading what it thought.
+        raw: list[str] = [f"[{counts}]"]
 
         result = self._tool_loop(conversation, raw, event)
         self._last_text = (result.content if result is not None else "") or ""
@@ -591,7 +964,9 @@ class EmbodyTurnEngine:
     # The perception question (the senses lane)                          #
     # ------------------------------------------------------------------ #
 
-    def ask(self, prompt: str, *, role: str = ROLE_SENSES, system: str | None = None) -> str:
+    def ask(
+        self, prompt: str | list[dict], *, role: str = ROLE_SENSES, system: str | None = None
+    ) -> str:
         """Ask one tool-less streaming question and return the answer text.
 
         This is the ``senses`` lane: a cheap perception question (describe this
@@ -600,6 +975,20 @@ class EmbodyTurnEngine:
         why lobes-cli#161 (a tool call on a no-tools request returns
         ``content: null``) can cost at most an empty answer here and never a
         lost action. It emits no export block: the feed is about turns.
+
+        *prompt* is forwarded verbatim as the user message's ``content`` —
+        plain text, or an OpenAI-style multimodal content LIST (one ``text``
+        part plus one ``video_url`` data-URI part; see
+        :func:`reachy.cli._commands.agent.build_clip_question`, which builds
+        that shape and stays OUTSIDE this module on purpose — this engine
+        reads no file, per its own model-config claim machine-checked in
+        ``tests/test_embody_engine.py``). No branching lives here: the OpenAI
+        wire contract already accepts an arbitrary ``content`` list, and
+        ``docs/evidence/2026-08-01-probe-video-wire-format.md`` (task t2)
+        confirmed the deployed gateway decodes it correctly, streamed — so
+        carrying a clip needed no change to this method beyond the type hint.
+        The first real caller is the layer's clip poller (issue #139's h9:
+        :class:`reachy.cli._commands.agent._ClipAsker`).
         """
         messages = [{"role": "system", "content": system}] if system else []
         messages.append({"role": "user", "content": prompt})
@@ -657,7 +1046,7 @@ class EmbodyTurnEngine:
         except OSError as err:
             self.stream_failures += 1
             return self._fail(REASON_STREAM_FAILED, f"{type(err).__name__}: {err}", raw)
-        except Exception as err:  # noqa: BLE001 - a bad turn must never kill the layer
+        except Exception as err:  # a bad turn must never kill the layer
             self.stream_failures += 1
             logger.warning("[embody] %s turn raised", role, exc_info=True)
             return self._fail(REASON_STREAM_FAILED, f"{type(err).__name__}: {err}", raw)
@@ -672,9 +1061,21 @@ class EmbodyTurnEngine:
     # Messages                                                           #
     # ------------------------------------------------------------------ #
 
-    def _build_user_content(self, cues: list[str], spoken: list[str]) -> str:
+    def _build_user_content(
+        self, triggers: list[str], context: list[str], spoken: list[str]
+    ) -> str:
+        """The turn's perception, with the background kept visibly separate.
+
+        Two sections rather than one list: what made the robot think, then what
+        has merely been going on around it. Folded together, a coalesced
+        ``"speech from the left (x145)"`` reads to the model exactly like the
+        rule fire that actually woke it up.
+        """
         lines = ["I just perceived:"]
-        lines.extend(f"- {cue}" for cue in cues)
+        lines.extend(f"- {line}" for line in triggers)
+        if context:
+            lines.append("Meanwhile, in the background:")
+            lines.extend(f"- {line}" for line in context)
         if spoken:
             lines.append("I have already said out loud:")
             lines.extend(f'- "{said}"' for said in spoken)
@@ -690,11 +1091,29 @@ class EmbodyTurnEngine:
         messages.append({"role": "user", "content": user_content})
         return messages
 
-    def _drain(self) -> list[Input]:
-        items: list[Input] = []
-        while self._pending:
-            items.append(self._pending.popleft())
+    def _drain_triggers(self) -> list[Input]:
+        """Take every pending trigger at once.
+
+        Draining WHOLE is the alert coalescer: ten rule fires waiting together
+        become one turn's perception list, never ten turns.
+        """
+        with self._intake_lock:
+            items = list(self._triggers)
+            self._triggers.clear()
         return items
+
+    def _drain_context(self) -> list[Parked]:
+        """Take the parked facts this turn will show, emptying the park.
+
+        Drained rather than snapshotted-and-kept: the park describes what has
+        happened SINCE the last turn, so carrying an entry forward would make
+        every later turn re-read the same background — the failure
+        :meth:`_drain_spoken` avoids one buffer over.
+        """
+        with self._intake_lock:
+            taken = list(self._context.values())
+            self._context.clear()
+        return taken
 
     def _drain_spoken(self) -> list[str]:
         """Take the already-spoken lines this turn will carry, emptying the buffer.

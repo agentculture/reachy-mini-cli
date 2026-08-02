@@ -10,8 +10,9 @@ either end:
 * the duplex session's ears reach the turn engine as an UTTERANCE, and its
   mouth reaches the same engine as ALREADY-SAID context — never as a trigger
   (the one wiring t10 flagged as the thing t11 could miss);
-* the runtime feed's lines reach the engine as CUES through
-  :func:`reachy.embody.cues.cues_for_line`;
+* the runtime feed's lines reach the engine as CLASSIFIED cues through
+  :func:`reachy.embody.cues.classified_cues_for_line`, so a rule FIRE
+  triggers a turn and every other cue parks (issue #143);
 * the media profile's source and sink are the SAME two objects the session
   reads and speaks through, and the same sink the voice tools render into.
 
@@ -36,6 +37,7 @@ duplex session is a double, and the turn engine is the REAL
 from __future__ import annotations
 
 import ast
+import base64
 import collections
 import io
 import json
@@ -43,6 +45,7 @@ import logging
 import subprocess  # nosec B404 — fixed argv, sys.executable, never shell=True
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -404,17 +407,49 @@ def _run_probe(script: str, tmp_path: Path) -> str:
 
 
 def test_a_heard_utterance_reaches_the_turn_engine_as_a_trigger():
-    """duplex ``on_utterance`` -> ``engine.submit_utterance`` (t9 -> t10 join)."""
+    """duplex ``on_utterance`` -> ``engine.submit_utterance`` (t9 -> t10 join).
+
+    The utterance names the robot because the shipped engine gates the heard
+    class on ATTENTION (issue #148), so this join is only observable on an
+    admitted utterance. Its refusing half is the test below.
+    """
     factory = _SessionFactory()
     turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     layer, _args, _sink = _compose(
         media=_media(), session_factory=factory, lines=iter(()), turn_fn=turn
     )
     try:
-        factory.last.hear("is anyone there")
+        factory.last.hear("reachy, is anyone there")
         assert layer.engine.pending == 1
         assert layer.engine.run_turn() is True
-        assert 'heard: "is anyone there"' in turn.last_user_content()
+        assert 'heard: "reachy, is anyone there"' in turn.last_user_content()
+    finally:
+        layer.close()
+
+
+def test_an_ambient_utterance_never_wakes_the_mind_while_attention_is_cold():
+    """The other half of that join (issue #148), through the real composition.
+
+    The SESSION still hears it — that is pinned in ``tests/test_realtime_
+    duplex.py`` and is not what changed — but a conversation the robot was
+    never invited into no longer costs a streaming turn per sentence. Saying
+    the name admits the very next utterance too, so what the gate holds is a
+    STATE, not a filter on wording.
+    """
+    factory = _SessionFactory()
+    turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), turn_fn=turn
+    )
+    try:
+        factory.last.hear("could you pass me the salt please")
+        assert layer.engine.pending == 0
+        assert layer.engine.run_turn() is False
+        assert len(turn.calls) == 0
+
+        factory.last.hear("reachy, are you listening")
+        factory.last.hear("and what can you see")
+        assert layer.engine.pending == 2, "the name opened the window for the next one"
     finally:
         layer.close()
 
@@ -426,6 +461,11 @@ def test_a_spoken_reply_is_recorded_as_already_said_never_as_a_trigger():
     know its own mouth had already spoken and would call ``speak`` to repeat
     it. It is CONTEXT, not a trigger: a robot that treats its own voice as a
     perception talks to itself.
+
+    The follow-up utterance names the robot for the same reason as the test
+    above — and deliberately so here: a reply spoken while attention is COLD
+    must not open the window on its own (issue #148), or the server's own
+    answers to ambient chatter would keep the ear open forever.
     """
     factory = _SessionFactory()
     turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
@@ -438,7 +478,7 @@ def test_a_spoken_reply_is_recorded_as_already_said_never_as_a_trigger():
         assert layer.engine.pending == 0, "a reply must not trigger a turn"
         assert "I am right here." in sink.texts("message")
 
-        layer.engine.submit_cue("felt a gentle scratch on the head")
+        layer.engine.submit_utterance("reachy, are you still there?")
         assert layer.engine.run_turn() is True
         assert "I have already said out loud" in turn.last_user_content()
         assert "I am right here." in turn.last_user_content()
@@ -468,7 +508,12 @@ def test_an_interrupted_reply_is_never_recorded_as_spoken():
 
 
 def test_runtime_feed_lines_become_cues_on_the_turn_engine(tmp_path):
-    """feed line -> ``cues_for_line`` -> ``engine.submit_cues`` (t8 -> t10 join)."""
+    """feed line -> ``classified_cues_for_line`` -> ``engine.submit_cues``.
+
+    The t8 -> t10 join, and since #143 it also carries the class: the rule
+    FIRE is what makes the turn run, and the sense line rides along as the
+    context that turn drains.
+    """
     feed = tmp_path / "runtime.feed"
     feed.write_text(
         json.dumps(
@@ -903,7 +948,7 @@ def test_a_cue_source_that_dies_mid_stream_is_a_named_drop_not_a_crash():
     try:
         layer.start()
         _wait_for(lambda: layer.reader.done)
-        assert layer.engine.pending == 1, "the cue read before the fault still landed"
+        assert layer.engine.parked == 1, "the cue read before the fault still landed"
         assert any(agent_mod.REASON_CUE_SOURCE_FAILED in text for text in sink.texts("thinking"))
     finally:
         layer.close()
@@ -989,7 +1034,8 @@ def test_max_events_bounds_the_cue_reader(tmp_path):
         layer.start()  # idempotent: one reader thread, not two
         _wait_for(lambda: layer.reader.done)
         assert layer.reader.events == 2
-        assert layer.engine.pending == 2
+        assert layer.reader.cues == 2, "both cues were accepted"
+        assert layer.engine.parked == 1, "and, being the same fact twice, coalesced"
     finally:
         layer.close()
 
@@ -1022,7 +1068,7 @@ def test_an_explicit_stop_ends_the_run_even_with_a_live_feed():
         media=_media(), session_factory=_SessionFactory(), lines=iter(())
     )
     try:
-        layer.engine.submit_cue("felt a gentle scratch on the head")
+        layer.engine.submit_utterance("are you still there?")
         layer.reader.done = False
         assert layer.should_stop() is False
         layer.request_stop()
@@ -1086,8 +1132,11 @@ def test_killing_the_export_consumer_mid_run_leaves_the_layer_alive(tmp_path, ca
     feed = tmp_path / "runtime.feed"
     feed.write_text(
         "\n".join(
-            json.dumps({"t": "sense", "ts": float(i), "pat": ["scratch", "level1"]})
-            for i in range(4)
+            [json.dumps({"t": "rule", "ts": 0.0, "rule": "pat-acknowledge", "action": "fire"})]
+            + [
+                json.dumps({"t": "sense", "ts": float(i), "pat": ["scratch", "level1"]})
+                for i in range(1, 4)
+            ]
         )
         + "\n",
         encoding="utf-8",
@@ -1117,7 +1166,465 @@ def test_killing_the_export_consumer_mid_run_leaves_the_layer_alive(tmp_path, ca
 
 
 # =========================================================================== #
-# 5. The verb itself: end to end, errors, overview, catalog                   #
+# 5. The clip -> ask() perception lane (task t11, issue #139's h9 blocker)    #
+# =========================================================================== #
+#
+# EmbodyTurnEngine.ask() (the tool-less senses lane) was designed and never
+# wired anywhere in reachy/ — exactly what blocked #139's h9 acceptance ("ask
+# the worker model where it is"). _ClipAsker is its first real caller: it
+# reads state.json's 'clip' key (reachy/behavior/clip_rider.py's path
+# reference), and when it names a fresh clip, calls ask() and parks the
+# answer as CONTEXT for the next TRIGGERED turn (t7/#143's policy) — never a
+# trigger of its own. Every negative path (missing/unavailable, stale,
+# unreadable, ask() raising, ask() answering empty) resolves to exactly one
+# named, non-blocking drop.
+
+
+class _FakeAskEngine:
+    """A minimal engine double exposing only what _ClipAsker calls.
+
+    Deliberately NOT the real EmbodyTurnEngine for the per-scenario drop
+    tests below — a bare double keeps each test a single-purpose unit test of
+    _ClipAsker's OWN policy (never blocks, never raises, names every negative
+    path) with no gateway, no tool registry and no turn machinery involved.
+    The full loop — the answer actually reaching a REAL triggered turn's
+    prompt — is proven separately below with the real EmbodyTurnEngine.
+    """
+
+    def __init__(self, ask_fn=None) -> None:
+        self._ask_fn = ask_fn if ask_fn is not None else (lambda prompt, **kw: "")
+        self.ask_calls: list[object] = []
+        self.submitted: list[tuple[str, object]] = []
+
+    def ask(self, prompt, **kwargs):
+        self.ask_calls.append(prompt)
+        return self._ask_fn(prompt, **kwargs)
+
+    def submit_cue(self, text: str, *, cue_class=None) -> bool:
+        self.submitted.append((text, cue_class))
+        return True
+
+
+def _clip_file(tmp_path: Path, name: str = "clip.mp4") -> Path:
+    path = tmp_path / name
+    path.write_bytes(b"not a real mp4, just some bytes")
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# build_clip_question — the pure content-shaping helper _ClipAsker calls      #
+# --------------------------------------------------------------------------- #
+#
+# Lives (and is tested) here, not in reachy.embody.engine: that module's own
+# "the engine reads no file" claim is machine-checked by an AST scan over the
+# WHOLE module (tests/test_embody_engine.py), so the one genuine file read
+# this feature needs belongs on the composition-root side of that boundary.
+
+
+def test_build_clip_question_produces_the_probed_wire_shape(tmp_path):
+    """The exact shape docs/evidence/2026-08-01-probe-video-wire-format.md proved works."""
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"not really an mp4, just some bytes")
+
+    content = agent_mod.build_clip_question(clip, "describe what you see")
+
+    encoded = base64.b64encode(b"not really an mp4, just some bytes").decode("ascii")
+    assert content == [
+        {"type": "text", "text": "describe what you see"},
+        {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{encoded}"}},
+    ]
+
+
+def test_build_clip_question_defaults_to_the_shipped_prompt(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    content = agent_mod.build_clip_question(clip)
+    assert content[0] == {"type": "text", "text": agent_mod.DEFAULT_CLIP_PROMPT}
+
+
+def test_build_clip_question_raises_on_an_unreadable_path(tmp_path):
+    """A pure, RAISING helper by design — the caller (_ClipAsker) names the drop."""
+    with pytest.raises(OSError):
+        agent_mod.build_clip_question(tmp_path / "does-not-exist.mp4")
+
+
+def test_a_missing_clip_block_is_a_named_drop_never_a_call_to_ask():
+    engine = _FakeAskEngine()
+    sink = _Sink()
+    asker = agent_mod._ClipAsker(engine, read_clip=lambda: None, export=sink.hook())
+
+    asker.poll_once()
+
+    assert engine.ask_calls == [], "no clip reference means nothing to ask about"
+    assert engine.submitted == []
+    assert any(agent_mod.REASON_CLIP_UNAVAILABLE in t for t in sink.texts("thinking"))
+
+
+def test_an_unavailable_clip_block_names_the_blocks_own_reason():
+    engine = _FakeAskEngine()
+    sink = _Sink()
+    asker = agent_mod._ClipAsker(
+        engine,
+        read_clip=lambda: {"available": False, "reason": "vision-extra-absent"},
+        export=sink.hook(),
+    )
+
+    asker.poll_once()
+
+    assert engine.ask_calls == []
+    assert any(
+        agent_mod.REASON_CLIP_UNAVAILABLE in t and "vision-extra-absent" in t
+        for t in sink.texts("thinking")
+    )
+
+
+def test_a_clip_reader_that_raises_is_a_named_drop_never_a_crash():
+    """An unreadable/corrupt state.json must not take the poller down with it."""
+    engine = _FakeAskEngine()
+    sink = _Sink()
+
+    def _boom():
+        raise OSError("state.json vanished mid-read")
+
+    asker = agent_mod._ClipAsker(engine, read_clip=_boom, export=sink.hook())
+
+    asker.poll_once()  # must not raise
+
+    assert engine.ask_calls == []
+    assert any(agent_mod.REASON_CLIP_UNAVAILABLE in t for t in sink.texts("thinking"))
+
+
+def test_a_stale_clip_is_a_named_drop_never_asked_about(tmp_path):
+    clip = _clip_file(tmp_path)
+    engine = _FakeAskEngine()
+    sink = _Sink()
+    old_ts = 1_000.0
+    asker = agent_mod._ClipAsker(
+        engine,
+        read_clip=lambda: {"available": True, "ts": old_ts, "path": str(clip)},
+        export=sink.hook(),
+        clock=lambda: old_ts + agent_mod.DEFAULT_CLIP_STALE_AFTER_S + 1.0,
+    )
+
+    asker.poll_once()
+
+    assert engine.ask_calls == [], "a stale clip must never be asked about"
+    assert any(agent_mod.REASON_CLIP_STALE in t for t in sink.texts("thinking"))
+
+
+def test_an_unreadable_clip_path_is_a_named_drop_never_asked_about():
+    engine = _FakeAskEngine()
+    sink = _Sink()
+    asker = agent_mod._ClipAsker(
+        engine,
+        read_clip=lambda: {
+            "available": True,
+            "ts": time.monotonic(),
+            "path": "/nonexistent/clip.mp4",
+        },
+        export=sink.hook(),
+    )
+
+    asker.poll_once()
+
+    assert engine.ask_calls == [], "an unreadable path must never reach ask()"
+    assert any(agent_mod.REASON_CLIP_UNREADABLE in t for t in sink.texts("thinking"))
+
+
+def test_ask_raising_is_a_named_drop_never_a_raised_exception(tmp_path):
+    clip = _clip_file(tmp_path)
+
+    def _boom(prompt, **kw):
+        raise RuntimeError("the senses gateway exploded")
+
+    engine = _FakeAskEngine(ask_fn=_boom)
+    sink = _Sink()
+    asker = agent_mod._ClipAsker(
+        engine,
+        read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)},
+        export=sink.hook(),
+    )
+
+    asker.poll_once()  # must not raise
+
+    assert engine.submitted == [], "a failed ask must never reach context"
+    assert any(agent_mod.REASON_CLIP_ASK_FAILED in t for t in sink.texts("thinking"))
+
+
+def test_an_empty_answer_is_a_named_drop_never_context(tmp_path):
+    clip = _clip_file(tmp_path)
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "   ")
+    sink = _Sink()
+    asker = agent_mod._ClipAsker(
+        engine,
+        read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)},
+        export=sink.hook(),
+    )
+
+    asker.poll_once()
+
+    assert engine.submitted == []
+    assert any(agent_mod.REASON_CLIP_ASK_EMPTY in t for t in sink.texts("thinking"))
+
+
+def test_a_fresh_clip_reaches_ask_and_the_answer_lands_as_context(tmp_path):
+    clip = _clip_file(tmp_path)
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen, someone is cooking")
+    asker = agent_mod._ClipAsker(
+        engine, read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)}
+    )
+
+    asker.poll_once()
+
+    assert len(engine.ask_calls) == 1
+    assert asker.asks == 1
+    assert engine.submitted, "the answer never reached the engine as context"
+    text, cue_class = engine.submitted[0]
+    assert "a kitchen" in text
+
+    from reachy.embody.cues import CueClass
+
+    assert cue_class is CueClass.CONTEXT, "the answer must land as CONTEXT, never a trigger"
+
+
+def test_ask_is_called_with_the_probed_multimodal_wire_shape(tmp_path):
+    """The content _ClipAsker builds is exactly build_clip_question's shape."""
+    clip = _clip_file(tmp_path)
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen")
+    asker = agent_mod._ClipAsker(
+        engine, read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)}
+    )
+
+    asker.poll_once()
+
+    assert engine.ask_calls[0] == agent_mod.build_clip_question(clip, agent_mod.DEFAULT_CLIP_PROMPT)
+
+
+def test_a_custom_prompt_reaches_build_clip_question(tmp_path):
+    clip = _clip_file(tmp_path)
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen")
+    asker = agent_mod._ClipAsker(
+        engine,
+        read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)},
+        prompt="where are you right now?",
+    )
+
+    asker.poll_once()
+
+    assert engine.ask_calls[0] == agent_mod.build_clip_question(clip, "where are you right now?")
+
+
+def test_the_same_clip_reference_is_never_asked_about_twice(tmp_path):
+    clip = _clip_file(tmp_path)
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen")
+    ts = time.monotonic()
+    asker = agent_mod._ClipAsker(
+        engine, read_clip=lambda: {"available": True, "ts": ts, "path": str(clip)}
+    )
+
+    asker.poll_once()
+    asker.poll_once()
+    asker.poll_once()
+
+    assert len(engine.ask_calls) == 1, "an unchanged clip reference must not be re-asked"
+
+
+def test_a_fresh_clip_reference_after_a_stale_one_is_still_asked_about(tmp_path):
+    """A stale ts is dropped and not asked about; a LATER fresh ts still reaches ask()."""
+    clip = _clip_file(tmp_path)
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen")
+    state = {"ts": 1.0}
+    now = 1.0 + agent_mod.DEFAULT_CLIP_STALE_AFTER_S + 1.0
+
+    def _read():
+        return {"available": True, "ts": state["ts"], "path": str(clip)}
+
+    asker = agent_mod._ClipAsker(engine, read_clip=_read, clock=lambda: now)
+    asker.poll_once()  # stale relative to `now` -> dropped, never asked
+    assert engine.ask_calls == []
+
+    state["ts"] = now - 1.0  # a NEW clip lands, fresh relative to `now`
+    asker.poll_once()
+    assert len(engine.ask_calls) == 1
+
+
+def test_a_permanently_unavailable_clip_logs_only_once():
+    """Dedup, mirroring ClipRider._report — a bare box must not flood the journal."""
+    engine = _FakeAskEngine()
+    sink = _Sink()
+    asker = agent_mod._ClipAsker(engine, read_clip=lambda: None, export=sink.hook())
+
+    asker.poll_once()
+    asker.poll_once()
+    asker.poll_once()
+
+    assert len(sink.texts("thinking")) == 1, "the same failure must not spam the feed"
+
+
+def test_recovery_after_a_failure_reports_a_fresh_drop_on_the_next_one(tmp_path):
+    """The dedup latch resets on success, so a LATER distinct failure still reports."""
+    clip = _clip_file(tmp_path)
+    state = {"ts": 1.0, "available": True}
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen")
+    sink = _Sink()
+
+    def _read():
+        if not state["available"]:
+            return None
+        return {"available": True, "ts": state["ts"], "path": str(clip)}
+
+    asker = agent_mod._ClipAsker(
+        engine, read_clip=_read, export=sink.hook(), clock=lambda: state["ts"]
+    )
+    asker.poll_once()  # succeeds, resets the dedup latch
+    assert len(sink.texts("thinking")) == 0
+
+    # A later poll finds the SAME clip missing entirely (block gone) -> a fresh drop
+    state["available"] = False
+    asker.poll_once()
+    assert len(sink.texts("thinking")) == 1
+
+
+def test_a_slow_ask_never_delays_or_blocks_a_pending_turn(tmp_path):
+    """The core constraint: a stuck senses-lane call must never touch a turn.
+
+    ask() is deliberately outside EmbodyTurnEngine's _turn_lock, and
+    _ClipAsker runs on its own thread rather than being wired into run()'s
+    before_turn hook — so a poll stuck inside ask() must never delay a
+    concurrent run_turn() on the very same engine.
+    """
+    from reachy.embody.engine import EmbodyModels, EmbodyTurnEngine
+
+    clip = _clip_file(tmp_path)
+    release = threading.Event()
+    entered_ask = threading.Event()
+
+    def _turn_fn(messages, **kwargs):
+        if kwargs.get("model") == "senses":
+            entered_ask.set()
+            release.wait(WAIT_BUDGET_S)
+            return TurnResult(content="a kitchen", finish_reason="stop")
+        return TurnResult(content="ok", finish_reason="stop")
+
+    class _MiniRegistry:
+        def tools(self) -> list[dict]:
+            return []
+
+        def dispatch(self, name, arguments_json=None, tool_call_id=None) -> dict:
+            return {"role": "tool", "tool_call_id": tool_call_id, "content": "{}"}
+
+    engine = EmbodyTurnEngine(
+        registry=_MiniRegistry(),
+        turn_fn=_turn_fn,
+        models=EmbodyModels(worker="worker", senses="senses"),
+    )
+    asker = agent_mod._ClipAsker(
+        engine, read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)}
+    )
+
+    poll_thread = threading.Thread(target=asker.poll_once, daemon=True)
+    poll_thread.start()
+    try:
+        assert entered_ask.wait(WAIT_BUDGET_S), "the poll never reached ask()"
+
+        # Attention (#148) is cold by default and this test is about ask()
+        # blocking, not about who the robot answers to.
+        engine.attention.note_addressed()
+        engine.submit_utterance("where are you?")
+        started = time.monotonic()
+        assert engine.run_turn() is True
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0, f"run_turn() waited on the stuck ask() call ({elapsed:.2f}s)"
+    finally:
+        release.set()
+        poll_thread.join(WAIT_BUDGET_S)
+
+
+def test_the_answer_becomes_context_for_the_next_triggered_turn(tmp_path):
+    """The full loop with the REAL engine: clip -> ask() -> CONTEXT -> next turn's prompt."""
+    from reachy.embody.engine import EmbodyModels, EmbodyTurnEngine
+
+    clip = _clip_file(tmp_path)
+    calls: list[dict] = []
+
+    def _turn_fn(messages, **kwargs):
+        calls.append({"messages": messages, "kwargs": kwargs})
+        if kwargs.get("model") == "senses":
+            return TurnResult(content="a kitchen, someone is cooking", finish_reason="stop")
+        return TurnResult(content="ok", finish_reason="stop")
+
+    class _MiniRegistry:
+        def tools(self) -> list[dict]:
+            return []
+
+        def dispatch(self, name, arguments_json=None, tool_call_id=None) -> dict:
+            return {"role": "tool", "tool_call_id": tool_call_id, "content": "{}"}
+
+    engine = EmbodyTurnEngine(
+        registry=_MiniRegistry(),
+        turn_fn=_turn_fn,
+        models=EmbodyModels(worker="worker", senses="senses"),
+    )
+    asker = agent_mod._ClipAsker(
+        engine, read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)}
+    )
+
+    asker.poll_once()
+    assert engine.pending == 0, "the clip answer must never trigger a turn on its own"
+    assert engine.parked == 1
+
+    # Attention (#148) is cold by default; this test is about where the clip
+    # answer lands, not about the wake word.
+    engine.attention.note_addressed()
+    engine.submit_utterance("where are you?")
+    assert engine.run_turn() is True
+
+    worker_call = next(c for c in calls if c["kwargs"].get("model") == "worker")
+    user_content = next(m["content"] for m in worker_call["messages"] if m.get("role") == "user")
+    assert "a kitchen" in user_content
+    assert 'heard: "where are you?"' in user_content
+
+
+def test_the_composition_root_starts_and_stops_the_clip_asker_with_the_layer(tmp_path):
+    """h22-style wiring proof: _compose_embody_seam builds and lifecycles a real asker."""
+    seen: dict = {"available": True, "ts": time.monotonic(), "path": str(_clip_file(tmp_path))}
+    turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    layer, _args, _sink = _compose(
+        media=_media(),
+        session_factory=_SessionFactory(),
+        lines=iter(()),
+        turn_fn=turn,
+        clip_reader=lambda: seen,
+        clip_poll_interval=0.01,
+    )
+    try:
+        assert layer.clip_asker is not None
+        layer.start()
+        _wait_for(lambda: layer.clip_asker.asks >= 1)
+        assert layer.engine.parked == 1
+    finally:
+        layer.close()
+    assert layer.clip_asker.thread is not None
+    _wait_for(lambda: not layer.clip_asker.thread.is_alive())
+
+
+def test_a_missing_clip_reader_seam_falls_back_to_the_real_state_json(tmp_path):
+    """No injected clip_reader -> the production seam reads state.json under REACHY_STATE_DIR."""
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=_SessionFactory(), lines=iter(())
+    )
+    try:
+        assert layer.clip_asker is not None
+        # No ClipRider ever ran in this tmp state dir, so the read resolves to
+        # "no clip block published yet" rather than raising.
+        layer.clip_asker.poll_once()
+        assert layer.clip_asker.asks == 0
+    finally:
+        layer.close()
+
+
+# =========================================================================== #
+# 6. The verb itself: end to end, errors, overview, catalog                   #
 # =========================================================================== #
 
 
@@ -1167,7 +1674,9 @@ def test_embody_runs_turns_over_a_feed_and_publishes_its_own_cognition_feed(tmp_
 
 def test_embody_summary_goes_to_stdout_as_json_when_not_exporting(tmp_path, capsys):
     feed = tmp_path / "runtime.feed"
-    feed.write_text(json.dumps({"t": "sense", "ts": 1.0, "pat": ["scratch", "level1"]}) + "\n")
+    feed.write_text(
+        json.dumps({"t": "rule", "ts": 1.0, "rule": "pat-acknowledge", "action": "fire"}) + "\n"
+    )
     turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
 
     code = agent_mod.cmd_agent_embody(
@@ -1187,6 +1696,9 @@ def test_embody_summary_goes_to_stdout_as_json_when_not_exporting(tmp_path, caps
     assert payload["turns"] >= 1
     assert payload["events"] == 1
     assert payload["profile"] == "bench"
+    # "it heard N and ignored M" is what an operator asks about a quiet robot,
+    # and since #148 attention is the answer more often than a fault is.
+    assert payload["unaddressed"] == 0
 
 
 def test_an_unreadable_feed_is_a_clean_environment_error():
@@ -1228,3 +1740,52 @@ def test_the_explain_catalog_resolves_the_embody_verb():
     body = ENTRIES[("agent", "embody")]
     assert "embody" in body
     assert "reachy-mini-cli agent embody" in body
+
+
+# --------------------------------------------------------------------------- #
+# Operand order — issue #147                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_embody_operating_flags_survive_being_written_before_the_subcommand() -> None:
+    """``embody --feed X start`` must reach the child, not be reset to a default.
+
+    These flags are declared on the parent verb AND on ``start``/``restart``,
+    because the bare verb is itself the foreground loop. Argparse applies a
+    sub-parser's defaults over values the parent already parsed, so before this
+    was fixed the spawned layer got ``--feed -``, read ``/dev/null`` as a
+    detached process, and exited having connected the tee and armed a realtime
+    session — every log line reading as success.
+    """
+    from reachy.cli import _build_parser
+
+    parser = _build_parser()
+    for verb in ("start", "restart"):
+        before = parser.parse_args(
+            ["agent", "embody", "--feed", "/tmp/f.fifo", "--media-profile", "robot", verb]
+        )
+        after = parser.parse_args(
+            ["agent", "embody", verb, "--feed", "/tmp/f.fifo", "--media-profile", "robot"]
+        )
+        assert before.feed == after.feed == "/tmp/f.fifo", f"{verb}: --feed did not survive"
+        assert before.media_profile == after.media_profile == "robot"
+
+
+def test_embody_subcommand_flags_still_win_over_the_parents() -> None:
+    """Inheriting the parent's value must not make the sub-parser's flag inert."""
+    from reachy.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        ["agent", "embody", "--feed", "/tmp/parent", "start", "--feed", "/tmp/child"]
+    )
+    assert args.feed == "/tmp/child"
+
+
+def test_embody_operating_defaults_still_apply_when_nothing_is_given() -> None:
+    """SUPPRESS on the sub-parser must not leave the dest missing entirely."""
+    from reachy.cli import _build_parser
+
+    args = _build_parser().parse_args(["agent", "embody", "start"])
+    assert args.feed == "-"
+    assert args.media_profile is None
+    assert args.mute_during_playback is False

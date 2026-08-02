@@ -52,14 +52,28 @@ This module intentionally imports neither :mod:`reachy.speech.llm` nor
 :mod:`reachy.speech.events` — it is a peer of :mod:`reachy.speech.voice`, not of
 the retired ``reachy.speech.cognition``.  The tool *definitions* are produced here; the
 *decision* to call them (the LLM tool loop) lives in the cognition/agent engine.
-The pose seam is injected as a plain callable, so this module does not even
-import :mod:`reachy.motion`.  :mod:`reachy.speech.expressions` (the catalog
-loader) IS imported — it is a peer data module (TOML in, dataclasses out, no
-LLM/event/motion dependency of its own), used only to read the emoji key set
-that ``apply_pose`` advertises to the model. :mod:`reachy.senselog` IS also
-imported — a stdlib-only logging helper (no LLM/event/motion dependency of its
-own) used to emit a ``[SENSE stage=action]`` line per :meth:`ToolRegistry.dispatch`
-call, and a ``drop(..., reason="tool-error")`` line for an error tool-result.
+The pose seam is injected as a plain callable, so ``apply_pose`` needs no
+:mod:`reachy.motion` import of its own.  :mod:`reachy.speech.expressions` (the
+catalog loader) IS imported — it is a peer data module (TOML in, dataclasses
+out, no LLM/event/motion dependency of its own), used only to read the emoji
+key set that ``apply_pose`` advertises to the model. :mod:`reachy.senselog` IS
+also imported — a stdlib-only logging helper (no LLM/event/motion dependency
+of its own) used to emit a ``[SENSE stage=action]`` line per
+:meth:`ToolRegistry.dispatch` call, and a ``drop(..., reason="tool-error")``
+line for an error tool-result.
+
+:func:`_require_text` imports :data:`reachy.behavior.rules.MAX_SAY_CHARS` —
+the ONE bound ``speak``/``harmonics`` share with a rule's own ``say`` field and
+with :class:`reachy.behavior.speech_act.SpeechActuator` (issue #133) — but does
+so INSIDE the function, not at module scope. ``reachy.behavior.rules`` itself
+imports ``reachy.behavior.library`` (to validate a rule's own
+``run``/``disable`` names), which transitively imports ``reachy.motion.pat``; a
+module-scope import here would reach :mod:`reachy.motion` the moment this
+module is merely imported, which is exactly the reach the paragraph above
+disclaims. The local import pays that transitive cost only when ``speak`` or
+``harmonics`` actually validates text, never on import alone —
+``test_importing_tools_does_not_pull_motion_vision_llm_events_or_forge_into_sys_modules``
+is what pins this.
 """
 
 from __future__ import annotations
@@ -160,6 +174,17 @@ def _require_text(arguments: dict) -> str:
     text = arguments.get("text")
     if not isinstance(text, str) or not text.strip():
         raise ValueError("a non-empty 'text' string is required")
+    # Local import — see the module docstring's Import boundary note: importing
+    # MAX_SAY_CHARS at module scope would reach reachy.motion the moment this
+    # module is merely imported, via reachy.behavior.rules -> ...library ->
+    # reachy.motion.pat.
+    from reachy.behavior.rules import MAX_SAY_CHARS
+
+    if len(text) > MAX_SAY_CHARS:
+        raise ValueError(
+            f"'text' is {len(text)} characters, over the {MAX_SAY_CHARS}-character "
+            "limit — the same bound a rule's say field carries"
+        )
     return text
 
 
@@ -246,7 +271,7 @@ def _make_describe_scene_handler(describe: DescribeSceneSeam) -> Handler:
     raising seam (a :class:`~reachy.vision.scene.SceneError` from an unreachable VLM)
     surfaces as an error tool-result via :meth:`ToolRegistry.dispatch`."""
 
-    def handler(arguments: dict) -> str:  # noqa: ARG001 — no parameters
+    def handler(arguments: dict) -> str:  # no parameters
         text = describe()
         if not isinstance(text, str) or not text.strip():
             raise ValueError("the scene description was empty")
@@ -526,7 +551,7 @@ class ToolRegistry:
 
         try:
             content = tool.handler(arguments)
-        except Exception as exc:  # noqa: BLE001 — a bad tool call must never kill the loop
+        except Exception as exc:  # a bad tool call must never kill the loop
             log.warning("[tools] handler for %r raised: %s", name, exc)
             senselog.drop("action", name, event_id, "tool-error")
             return self._error(tool_call_id, f"{name!r} failed: {exc}")

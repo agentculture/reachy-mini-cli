@@ -139,7 +139,7 @@ class SelfMotionDriver:
         """One tick: delta the commanded pose, latch or release. Never raises."""
         try:
             self._process(ctx)
-        except Exception:  # noqa: BLE001 — a sense tap must never crash the loop
+        except Exception:  # a sense tap must never crash the loop
             logger.warning("SelfMotionDriver tick raised; motion latch unchanged", exc_info=True)
 
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
