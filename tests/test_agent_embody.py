@@ -1240,3 +1240,52 @@ def test_the_explain_catalog_resolves_the_embody_verb():
     body = ENTRIES[("agent", "embody")]
     assert "embody" in body
     assert "reachy-mini-cli agent embody" in body
+
+
+# --------------------------------------------------------------------------- #
+# Operand order — issue #147                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_embody_operating_flags_survive_being_written_before_the_subcommand() -> None:
+    """``embody --feed X start`` must reach the child, not be reset to a default.
+
+    These flags are declared on the parent verb AND on ``start``/``restart``,
+    because the bare verb is itself the foreground loop. Argparse applies a
+    sub-parser's defaults over values the parent already parsed, so before this
+    was fixed the spawned layer got ``--feed -``, read ``/dev/null`` as a
+    detached process, and exited having connected the tee and armed a realtime
+    session — every log line reading as success.
+    """
+    from reachy.cli import _build_parser
+
+    parser = _build_parser()
+    for verb in ("start", "restart"):
+        before = parser.parse_args(
+            ["agent", "embody", "--feed", "/tmp/f.fifo", "--media-profile", "robot", verb]
+        )
+        after = parser.parse_args(
+            ["agent", "embody", verb, "--feed", "/tmp/f.fifo", "--media-profile", "robot"]
+        )
+        assert before.feed == after.feed == "/tmp/f.fifo", f"{verb}: --feed did not survive"
+        assert before.media_profile == after.media_profile == "robot"
+
+
+def test_embody_subcommand_flags_still_win_over_the_parents() -> None:
+    """Inheriting the parent's value must not make the sub-parser's flag inert."""
+    from reachy.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        ["agent", "embody", "--feed", "/tmp/parent", "start", "--feed", "/tmp/child"]
+    )
+    assert args.feed == "/tmp/child"
+
+
+def test_embody_operating_defaults_still_apply_when_nothing_is_given() -> None:
+    """SUPPRESS on the sub-parser must not leave the dest missing entirely."""
+    from reachy.cli import _build_parser
+
+    args = _build_parser().parse_args(["agent", "embody", "start"])
+    assert args.feed == "-"
+    assert args.media_profile is None
+    assert args.mute_during_playback is False

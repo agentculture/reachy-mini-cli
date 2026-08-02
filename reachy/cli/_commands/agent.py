@@ -1375,16 +1375,29 @@ def _no_verb(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _add_embody_operating_args(parser: argparse.ArgumentParser) -> None:
+def _add_embody_operating_args(parser: argparse.ArgumentParser, *, inherit: bool = False) -> None:
     """The layer's own operating flags — shared by ``embody`` (the foreground
     verb) and the ``start``/``restart`` supervisor verbs (task t12), so a
     background layer is configured identically to a foreground run. Mirrors
     ``behavior.py``'s ``_add_engine_tuning`` sharing the same shape between
     ``engine run`` and ``engine start``.
+
+    *inherit* is for the SUB-parser copies, and it is load-bearing (issue #147).
+    Because these flags are declared on the parent AND the sub-parser, argparse
+    applies the sub-parser's defaults over a value the parent already parsed —
+    so ``embody --feed <fifo> start`` spawned a layer with ``--feed -``, read
+    ``/dev/null``, and exited having armed a realtime session and logged nothing
+    but success. ``SUPPRESS`` means an unspecified sub-parser flag contributes
+    NOTHING to the namespace, so the parent's value survives and either operand
+    order works.
     """
+
+    def _default(value):
+        return argparse.SUPPRESS if inherit else value
+
     parser.add_argument(
         "--feed",
-        default="-",
+        default=_default("-"),
         metavar="PATH",
         help="Runtime-event JSONL source: a path (stream/FIFO/file) or '-' for stdin "
         "(default). The layer never spawns the runtime; it reads what the runtime "
@@ -1393,7 +1406,7 @@ def _add_embody_operating_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--media-profile",
-        default=None,
+        default=_default(None),
         dest="media_profile",
         metavar="PROFILE",
         help="Audio profile: 'robot' (the runtime's tee socket in, the daemon HTTP "
@@ -1402,7 +1415,7 @@ def _add_embody_operating_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--spool-dir",
-        default=None,
+        default=_default(None),
         dest="spool_dir",
         metavar="DIR",
         help="Override the intents-spool root (default: the shared state dir, so the "
@@ -1411,7 +1424,7 @@ def _add_embody_operating_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--await-timeout",
         type=float,
-        default=1.0,
+        default=_default(1.0),
         dest="await_timeout",
         help="Seconds an action waits for the engine to confirm a spool command "
         "before returning 'submitted, unconfirmed' (default: 1.0).",
@@ -1419,7 +1432,7 @@ def _add_embody_operating_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--turn-interval",
         type=float,
-        default=DEFAULT_TURN_INTERVAL,
+        default=_default(DEFAULT_TURN_INTERVAL),
         dest="turn_interval",
         help=f"Seconds to wait between turns when nothing is pending "
         f"(default: {DEFAULT_TURN_INTERVAL}).",
@@ -1427,6 +1440,7 @@ def _add_embody_operating_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--mute-during-playback",
         action="store_true",
+        default=_default(False),
         dest="mute_during_playback",
         help="Withhold microphone audio while the layer is speaking. OFF by default: "
         "Reachy has hardware AEC against its own speakers, so the layer keeps "
@@ -1536,7 +1550,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     embody_start = embody_sub.add_parser(
         "start", help="Start the embodiment layer in the background (idempotent)."
     )
-    _add_embody_operating_args(embody_start)
+    _add_embody_operating_args(embody_start, inherit=True)
     embody_start.add_argument("--json", action="store_true", help=_JSON_HELP)
     embody_start.set_defaults(func=cmd_agent_embody_start)
 
@@ -1554,7 +1568,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     embody_restart = embody_sub.add_parser(
         "restart", help="Restart the background layer (re-reads code/flags)."
     )
-    _add_embody_operating_args(embody_restart)
+    _add_embody_operating_args(embody_restart, inherit=True)
     embody_restart.add_argument("--json", action="store_true", help=_JSON_HELP)
     embody_restart.set_defaults(func=cmd_agent_embody_restart)
 
