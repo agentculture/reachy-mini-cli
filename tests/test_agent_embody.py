@@ -26,12 +26,23 @@ Plus the three acceptance criteria the plan names:
 * **h22** — every named failure mode reaches the journal AND the export feed,
   and killing the export consumer mid-run leaves the layer alive.
 
-Nothing here opens a socket, a gateway, a broker, a robot or an audio device:
-the media profile is the real :class:`~reachy.embody.media.EmbodySource` /
+Nothing here opens a gateway, a broker, a robot or an audio device: the media
+profile is the real :class:`~reachy.embody.media.EmbodySource` /
 :class:`~reachy.embody.media.EmbodySink` wrappers over recording backends, the
 duplex session is a double, and the turn engine is the REAL
 :class:`~reachy.embody.engine.EmbodyTurnEngine` driven by a scripted
 ``turn_fn``.
+
+**One deliberate exception**, added by the foreground-Gemma arc's task t8
+(issue #149): the per-utterance arming section at the end drives the REAL
+:class:`~reachy.speech.realtime_duplex.RealtimeDuplexSession` over a loopback
+socket against :class:`tests.fake_realtime_server.FakeRealtimeServer`. That
+join spans three pieces — the attention gate's verdict, the composition root's
+policy, and the wire's arming mechanism — and it is exactly the shape of join
+this module's own preamble warns about: with a session double on one side and a
+fake server on the other, both halves can pass while nothing asks the gateway
+for a reply. The socket is loopback, ephemeral-port, and torn down by the
+harness's context manager.
 """
 
 from __future__ import annotations
@@ -59,8 +70,14 @@ from reachy.embody.tools import SPEAK
 from reachy.explain.catalog import ENTRIES
 from reachy.export.exporter import ExportHook
 from reachy.speech.llm import ToolCall, TurnResult
-from reachy.speech.realtime_duplex import Response, Utterance
+from reachy.speech.realtime_duplex import Limits as DuplexLimits
+from reachy.speech.realtime_duplex import (
+    RealtimeDuplexSession,
+    Response,
+    Utterance,
+)
 from tests.conftest import WAIT_BUDGET_S
+from tests.fake_realtime_server import FakeRealtimeServer, Scenario
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PKG_ROOT = _REPO_ROOT / "reachy"
@@ -124,12 +141,22 @@ class _FakeSession:
     a test can fire them the way the session worker thread would.
     """
 
-    def __init__(self, *, start_error: BaseException | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        *,
+        start_error: BaseException | None = None,
+        arm_error: BaseException | None = None,
+        **kwargs,
+    ) -> None:
         self.kwargs = kwargs
         self.started = 0
         self.closed = 0
         self.utterances = 0
+        #: Per-utterance arming (issue #149): how many times the composition
+        #: root asked the gateway for ONE spoken reply.
+        self.arms = 0
         self._start_error = start_error
+        self._arm_error = arm_error
 
     def start(self) -> None:
         if self._start_error is not None:
@@ -138,6 +165,12 @@ class _FakeSession:
 
     def close(self) -> None:
         self.closed += 1
+
+    def arm_once(self) -> bool:
+        if self._arm_error is not None:
+            raise self._arm_error
+        self.arms += 1
+        return True
 
     # -- the two taps, fired the way the session worker would ---------------- #
 
@@ -1910,3 +1943,173 @@ def test_the_command_modules_local_attention_window_constants_match_the_real_one
 
     assert agent_mod.DEFAULT_ATTENTION_WINDOW_S == REAL_DEFAULT
     assert agent_mod.ENV_ATTENTION_WINDOW_S == REAL_ENV
+
+
+# =========================================================================== #
+# 9. Attention gates the VOICE, not only the mind (issue #149, task t8)       #
+#                                                                            #
+# The gate stopped an ambient utterance from running a TURN (#148) and the    #
+# robot answered it out loud anyway, because arming was a decision taken once #
+# at ``session.created``. The fix is a policy — arm per ADMITTED utterance —   #
+# and the policy lives HERE, at the composition layer, reading the gate. The  #
+# wire only gained a mechanism (``arm_once``) and a capability probe; its     #
+# three structural gate-free pins are unchanged in                            #
+# ``tests/test_realtime_duplex.py``.                                          #
+# =========================================================================== #
+
+
+def test_the_composition_asks_the_session_for_per_utterance_arming() -> None:
+    """The layer opts IN: the wire's default is still arm-once for everyone else."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["arm_per_utterance"] is True
+    finally:
+        layer.close()
+
+
+def test_an_admitted_utterance_asks_the_gateway_for_exactly_one_spoken_reply() -> None:
+    """The join: ``AttentionGate`` admits -> the composition arms -> one reply."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.hear("reachy, are you listening")
+        assert factory.last.arms == 1
+    finally:
+        layer.close()
+
+
+def test_an_ambient_utterance_asks_for_no_reply_at_all_ignore_means_silently() -> None:
+    """Issue #149 stated as an assertion: a refused utterance arms NOTHING.
+
+    The robot heard it — the wire is ungated and stays so — and it neither
+    thinks about it nor answers it. Then the name opens the window and the very
+    next nameless sentence is both thought about AND answered, so what changed
+    is a STATE, not a filter on wording.
+    """
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.hear("could you pass me the salt please")
+        assert factory.last.arms == 0
+        assert layer.engine.pending == 0
+
+        factory.last.hear("reachy, are you listening")
+        factory.last.hear("and what can you see")
+        assert factory.last.arms == 3 - 1, "the name warmed the window for the next one"
+    finally:
+        layer.close()
+
+
+def test_an_addressed_utterance_is_answered_even_when_the_mind_is_saturated() -> None:
+    """The arming decision follows ATTENTION, not the trigger queue's depth.
+
+    ``submit_utterance`` returns ``False`` for two very different reasons: the
+    robot was not addressed, and the robot was addressed but the turn engine
+    already has more than it can think about. Only the first is a reason to
+    stay silent — the engine's own docstring says the admission stands either
+    way, "a fact about the room, not about how full a queue happened to be" —
+    and the voice belongs to the realtime floor rather than to this queue, so a
+    saturated mind must not mute the robot mid-conversation.
+    """
+    import dataclasses as _dc
+
+    from reachy.embody.engine import EmbodyTurnEngine
+
+    def _one_deep(**kwargs):
+        kwargs["limits"] = _dc.replace(kwargs["limits"], max_pending=1)
+        return EmbodyTurnEngine(**kwargs)
+
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), engine_factory=_one_deep
+    )
+    try:
+        factory.last.hear("reachy, first question")
+        assert layer.engine.pending == 1
+        factory.last.hear("and a second one right away")
+        assert layer.engine.pending == 1, "the trigger queue refused the second"
+        assert factory.last.arms == 2, "but the room still gets an answer"
+    finally:
+        layer.close()
+
+
+def test_an_empty_utterance_arms_nothing() -> None:
+    """A blank transcript is not an utterance; asking for a reply to it is noise."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.hear("   ")
+        assert factory.last.arms == 0
+    finally:
+        layer.close()
+
+
+def test_a_session_that_refuses_to_arm_is_a_named_drop_not_a_crash(caplog) -> None:
+    """The tap runs on the session's own worker thread: it may never raise."""
+    factory = _SessionFactory(arm_error=RuntimeError("socket gone"))
+    sink = _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), sink=sink
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="reachy"):
+            factory.last.hear("reachy, are you listening")
+        assert agent_mod.REASON_ARM_FAILED in "\n".join(r.getMessage() for r in caplog.records)
+        assert any(agent_mod.REASON_ARM_FAILED in text for text in sink.texts("thinking"))
+    finally:
+        layer.close()
+
+
+def _duplex_factory(server: FakeRealtimeServer):
+    """Build the REAL duplex session against *server* — the end-to-end seam.
+
+    An explicit ``url=`` wins over the suite-wide unreachable-gateway guard
+    (``tests/conftest.py``'s ``_no_live_realtime_gateway``), which is exactly
+    how ``tests/test_realtime_client.py`` points a real client at a fake.
+    """
+
+    def _build(**kwargs):
+        return RealtimeDuplexSession(
+            **kwargs,
+            url=server.url,
+            limits=DuplexLimits(backoff_initial_s=5.0, backoff_max_s=5.0),
+        )
+
+    return _build
+
+
+def test_c4_end_to_end_the_room_hears_no_reply_to_an_utterance_attention_refused() -> None:
+    """Criterion 1, all three pieces at once, over a real socket.
+
+    ``AttentionGate`` -> the composition root -> ``arm_once`` -> the wire ->
+    a gateway that answers only what it was asked to. The session double and
+    the fake server each prove their own half; only this proves the halves are
+    joined, and a join is what this arc keeps paying for getting wrong quietly.
+    """
+    with FakeRealtimeServer(
+        Scenario.ONE_SHOT_ARMING,
+        announce_one_shot_arming=True,
+        transcripts=["could you pass me the salt please", "reachy, are you listening"],
+        arm_grace_s=0.2,
+    ) as server:
+        layer, _args, _sink = _compose(
+            media=_media(),
+            session_factory=_duplex_factory(server),
+            lines=iter(()),
+            clip_reader=lambda: None,
+        )
+        try:
+            layer.start()
+            _wait_for(lambda: server.answered_transcripts >= 1)
+            _wait_for(lambda: int(getattr(layer.session, "utterances", 0)) >= 2)
+        finally:
+            layer.close()
+
+    assert server.response_create_count == 1, "more than one reply was asked for"
+    # WHICH one, not how many: with only counts this assertion is equally happy
+    # with a layer that answered the ambient sentence and ignored the addressed
+    # one — which is what an unwired ``arm_once`` actually produces.
+    assert server.answered_texts == ["reachy, are you listening"]
+    assert server.unanswered_texts == ["could you pass me the salt please"]
+    assert layer.engine.unaddressed_utterances == 1

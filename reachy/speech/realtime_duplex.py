@@ -156,7 +156,7 @@ be blind to half of what actually leaves. A third sender added later under any
 name, in either file, fails the suite immediately.
 
 --------------------------------------------------------------------------
-Arming: once per session, on ``session.created``
+Arming: once per session, or once per ADMITTED utterance (issue #149)
 --------------------------------------------------------------------------
 The server starts DISARMED and answers nothing until it sees one
 ``response.create`` (lobes-cli's ``lobes/realtime/_conversation.py``); arming
@@ -168,6 +168,54 @@ verified — and re-arms on every new session. :meth:`RealtimeDuplexSession.arm`
 lets a caller request another one; it costs nothing if the session is already
 armed. ``arm_on_connect=False`` degrades this client to the runtime's own
 ears-only shape.
+
+**Arm-once is exactly the defect issue #149 names.** The layer's attention gate
+can decide an utterance is not worth waking a mind for, and then the room hears
+a spoken reply to it anyway — because the decision the gateway acts on was
+taken at ``session.created``, long before anyone heard the sentence. A robot
+that butts into a conversation it was explicitly told to ignore is worse than
+one that answers everything. So this client offers a second arming MODE:
+
+``arm_per_utterance=True`` + a gateway that announces one-shot arming
+    Nothing is armed at connect. Each :meth:`RealtimeDuplexSession.arm_once`
+    call buys exactly ONE reply — the caller's way of saying "this particular
+    utterance deserves an answer" — and it reaches the already-transcribed turn
+    through upstream's existing
+    ``response.create``-after-transcript flow (``ConversationBridge.arm()``
+    answers a pending transcript on the spot).
+
+``arm_per_utterance=True`` + a gateway that announces nothing
+    Today's behaviour, unchanged, plus one named
+    :data:`REASON_ONE_SHOT_ARMING_UNSUPPORTED` drop: the session arms itself at
+    connect and the server answers everything. This is the h9 never-half-deploy
+    rule and the direction of the degrade is deliberate — a client that went
+    silent against an old gateway would take the robot's voice away to fix a
+    politeness bug.
+
+**The capability check is a provisional contract, and it fails closed.**
+Upstream has NOT shipped one-shot arming: ``ConversationBridge.arm()`` latches
+``armed = True`` and nothing clears it (``_floor.py``'s ``_disarm`` is
+stage-timeout bookkeeping). The ask is agentculture/lobes-cli#170 item 1, and
+:func:`announces_one_shot_arming` reads the ONE shape this repo guessed for it
+(``session.created``'s ``config.arming == "one_shot"``). Any other shape, any
+other value, or no announcement at all reads as "no one-shot arming" — so
+guessing wrong costs the degraded path, never a robot that stops answering. If
+upstream ships a different name, that predicate is the one line that changes.
+
+That ask carries a second note, also filed upstream, which is a property of the
+SERVER and stated here because it explains why this client asks for one reply
+per utterance rather than trying to disarm one itself: ``armed`` must clear at
+a reply's **completion**, never when the ``response.create`` frame is consumed.
+Every floor call sits behind ``if self.armed``, so an arm that cleared early
+would answer the turn and then be unable to honour the human who speaks over
+it — mid-synthesis barge-in would die silently, which is the interruption
+:meth:`cancel_playback` and the whole of task t6 exist to make work.
+
+**The policy that drives this lives one level up, and must stay there.** This
+module contains no gate and reaches none (see the UNGATED section above); it
+knows only that *someone* asked for a reply. ``reachy/cli/_commands/agent.py``
+is where :class:`reachy.embody.attention.AttentionGate`'s verdict turns into an
+:meth:`arm_once` call.
 
 --------------------------------------------------------------------------
 The mute seam: present, and OFF by default (the AEC decision)
@@ -309,6 +357,8 @@ from reachy.speech.realtime import (
 #: of a string. Declaring them here is also what says "these imports are a
 #: re-export, not a leftover".
 __all__ = [
+    "ARMING_CONFIG_KEY",
+    "ARMING_MODE_ONE_SHOT",
     "DEFAULT_OUTPUT_SAMPLE_RATE",
     "DEFAULT_PLAYBACK_CHUNK_BYTES",
     "DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES",
@@ -319,6 +369,7 @@ __all__ = [
     "RealtimeDuplexSession",
     "Response",
     "Utterance",
+    "announces_one_shot_arming",
     "build",
     "connect_url",
     "resolve_realtime_api_key",
@@ -336,6 +387,7 @@ __all__ = [
     "REASON_MALFORMED_AUDIO_DELTA",
     "REASON_MALFORMED_EVENT",
     "REASON_NO_PLAYBACK_SINK",
+    "REASON_ONE_SHOT_ARMING_UNSUPPORTED",
     "REASON_PLAYBACK_CANCELLED",
     "REASON_PLAYBACK_FAILED",
     "REASON_PLAYBACK_QUEUE_FULL",
@@ -403,6 +455,13 @@ REASON_PLAYBACK_QUEUE_FULL = "playback-queue-full"
 REASON_PLAYBACK_FAILED = "playback-failed"
 #: ``read_audio`` raised. Latched: a broken source costs one line, not one per read.
 REASON_SOURCE_FAILED = "audio-source-failed"
+#: ``arm_per_utterance`` was asked for and the gateway announced no one-shot
+#: arming, so this session armed ONCE at connect and the server will answer
+#: every committed utterance (issue #149's defect, degraded to on purpose — see
+#: the module docstring's arming section and honesty condition h9). Latched per
+#: session, and the latch clears the moment a session DOES announce support, so
+#: a gateway upgraded (or downgraded) under a long-lived client still says so.
+REASON_ONE_SHOT_ARMING_UNSUPPORTED = "one-shot-arming-unsupported"
 #: ``mute_during_playback`` is on and the mouth is busy — the AEC fallback.
 REASON_SELF_MUTE = "self-mute"
 
@@ -453,6 +512,18 @@ DEFAULT_PLAYBACK_MAXSIZE = 64
 DEFAULT_STALE_DRAIN_MAX_CHUNKS = 64
 #: Chunks sent per pump iteration, so the send side cannot starve the read side.
 _MAX_CHUNKS_PER_PUMP = 8
+
+#: The ``session.created`` ``config`` key a gateway announces its arming MODE
+#: in, and the one value that means "one ``response.create`` buys exactly one
+#: reply, and ``armed`` clears at that reply's completion".
+#:
+#: PROVISIONAL, and the module docstring says why at length: lobes has not
+#: shipped one-shot arming (agentculture/lobes-cli#170 item 1), so this pair is
+#: this repo's guess at a contract that does not exist yet. It is safe because
+#: :func:`announces_one_shot_arming` fails closed — a gateway that says nothing,
+#: or says something else, gets today's arm-once behaviour and a named drop.
+ARMING_CONFIG_KEY = "arming"
+ARMING_MODE_ONE_SHOT = "one_shot"
 
 DEFAULT_CONNECT_TIMEOUT_S = 5.0
 DEFAULT_FRAME_TIMEOUT_S = 5.0
@@ -520,6 +591,33 @@ class Limits:
 def _even(value: object) -> int:
     """At least one PCM16 sample, and a whole number of them."""
     return max(2, int(value) & ~1)
+
+
+def announces_one_shot_arming(event: dict | None) -> bool:
+    """Does this ``session.created`` event announce ONE-SHOT arming?
+
+    The whole capability check, as one pure predicate over one event, so the
+    single provisional guess this arc makes about an unshipped upstream feature
+    has exactly one home (see :data:`ARMING_CONFIG_KEY`). It answers ``True``
+    only for an explicit affirmative — ``config.arming == "one_shot"`` — and
+    ``False`` for everything else including a missing config, a non-mapping
+    config, a different value and a right value in the wrong place.
+
+    Failing closed is the point, not caution for its own sake: ``False`` means
+    the session arms once at connect and the server answers every utterance,
+    which is precisely what it does today. A wrong guess therefore costs the
+    politeness fix, never the robot's voice.
+    """
+    if not isinstance(event, dict):
+        return False
+    config = event.get("config")
+    if not isinstance(config, dict):
+        return False
+    # The isinstance is not redundant with the comparison: a gateway sending a
+    # bare `arming: true` means "some arming mode I have not named", which is
+    # not an announcement of THIS one.
+    announced = config.get(ARMING_CONFIG_KEY)
+    return isinstance(announced, str) and announced == ARMING_MODE_ONE_SHOT
 
 
 class PlaySink(Protocol):
@@ -686,6 +784,15 @@ class RealtimeDuplexSession(_SessionObservables):
         url / api_key: explicit endpoint + bearer, else the shared
             ``REACHY_REALTIME_*`` / ``REACHY_OPENAI_*`` precedence.
         arm_on_connect: send ``response.create`` on ``session.created``.
+        arm_per_utterance: opt into per-ADMITTED-utterance arming (issue
+            #149). ``False`` — the default — is the historical shape and every
+            existing caller's behaviour, byte for byte. ``True`` says "I will
+            call :meth:`arm_once` for the utterances that deserve an answer",
+            and this session then arms nothing at connect **if the gateway
+            announced one-shot arming**; against a gateway that did not, it
+            degrades to arming once and names it. It is opt-in rather than the
+            class default because the class ships a MECHANISM: the layer's
+            composition root owns the policy and is the one that asks for it.
         limits: the session's numeric bounds — the three queue depths, the
             reply-audio cap, the connect-time stale-drain bound, the socket
             timeouts and the reconnect/backoff policy — grouped into one
@@ -712,6 +819,7 @@ class RealtimeDuplexSession(_SessionObservables):
         url: str | None = None,
         api_key: str | None = None,
         arm_on_connect: bool = True,
+        arm_per_utterance: bool = False,
         limits: Limits | None = None,
         on_utterance: Callable[[Utterance], None] | None = None,
         on_response: Callable[[Response], None] | None = None,
@@ -725,6 +833,7 @@ class RealtimeDuplexSession(_SessionObservables):
         self._output_sample_rate = max(1, int(output_sample_rate))
         self._mute_during_playback = bool(mute_during_playback)
         self._arm_on_connect = bool(arm_on_connect)
+        self._arm_per_utterance = bool(arm_per_utterance)
         self._limits = limits if limits is not None else Limits()
         self._max_response_bytes = max(0, int(self._limits.max_response_bytes))
         # Chunk sizes are forced EVEN: a chunk boundary inside a PCM16 sample
@@ -796,6 +905,11 @@ class RealtimeDuplexSession(_SessionObservables):
 
         # --- cross-thread flags (single writer each; plain reads are atomic) - #
         self._arm_pending = False
+        #: What the LIVE session announced (issue #149). Learned on every
+        #: ``session.created`` and cleared on every connect, so a capability can
+        #: never be inherited from a session that is already gone.
+        self._one_shot_arming = False
+        self._one_shot_unsupported_logged = False
         self._speaking = False
         self._muted_logged = False
         self._no_sink_logged = False
@@ -809,6 +923,11 @@ class RealtimeDuplexSession(_SessionObservables):
         self.responses = 0
         self.response_audio_bytes = 0
         self.arms_sent = 0
+        #: :meth:`arm_once` calls the gateway could not honour — the degraded
+        #: path is counted as well as named, because "how often did the layer
+        #: ask for something this gateway cannot do" is the question an
+        #: operator asks once the drop line has scrolled away.
+        self.arms_declined = 0
         self.ignored_events = 0
         self.muted_chunks = 0
         self.stale_chunks_discarded = 0
@@ -882,10 +1001,36 @@ class RealtimeDuplexSession(_SessionObservables):
 
         Arming is idempotent server-side, so this is always safe; the worker
         sends it on its next pump. Sessions arm themselves on
-        ``session.created`` unless ``arm_on_connect=False``.
+        ``session.created`` unless ``arm_on_connect=False`` or per-utterance
+        arming is live (see :meth:`arm_once`).
         """
         self._arm_pending = True
         self._state.wake()
+
+    def arm_once(self) -> bool:
+        """Ask for ONE spoken reply — the per-utterance arming mechanism (#149).
+
+        Called by whoever decided this particular utterance deserves an answer;
+        this module has no opinion about that and deliberately cannot form one
+        (see the UNGATED section of the module docstring). O(1), safe from any
+        thread, never raises — like :meth:`arm`, it only sets a flag the worker
+        acts on at its next pump, which is what keeps the decision off the
+        socket thread's critical path.
+
+        Returns whether a ``response.create`` was actually requested. ``False``
+        means the gateway announced no one-shot arming, so this session already
+        armed itself at connect and the server answers on its own: the h9
+        degrade, named once by :data:`REASON_ONE_SHOT_ARMING_UNSUPPORTED` and
+        counted in :attr:`arms_declined`. Sending the frame anyway would be
+        worse than useless — upstream's ``arm()`` answers any pending transcript
+        on the spot, so a redundant arm against a latched session risks a
+        duplicate reply to a turn that was already being answered.
+        """
+        if not self._one_shot_arming:
+            self.arms_declined += 1
+            return False
+        self.arm()
+        return True
 
     def take_utterance(self) -> Utterance | None:
         """Pop the oldest heard utterance, or ``None``. **Ungated** — see c4."""
@@ -965,6 +1110,18 @@ class RealtimeDuplexSession(_SessionObservables):
         return self._lane_unavailable
 
     @property
+    def supports_one_shot_arming(self) -> bool:
+        """Whether the LIVE session announced one-shot arming (issue #149).
+
+        ``False`` before the first ``session.created``, after a disconnect, and
+        against every gateway shipping today — which is exactly the degraded
+        state :meth:`arm_once` reports on. A caller uses it to explain itself
+        ("the robot answers everything because this gateway cannot do
+        otherwise"), never to decide whether to ask: asking is always safe.
+        """
+        return self._one_shot_arming
+
+    @property
     def speaking(self) -> bool:
         """Whether the mouth is busy right now (what the mute seam keys on)."""
         return self._speaking
@@ -1036,6 +1193,10 @@ class RealtimeDuplexSession(_SessionObservables):
         self._reader = handshake.reader
         self._connected_at = self._clock()
         self._lane_unavailable = False
+        # A capability belongs to the session that announced it: the next
+        # `session.created` re-establishes it, and until then this client knows
+        # nothing about the gateway it just reached.
+        self._one_shot_arming = False
         self._pending.clear()
         # A reply whose session died mid-sentence is dead with it: speaking its
         # queued tail seconds later, into a new session, is the outbound twin of
@@ -1179,8 +1340,30 @@ class RealtimeDuplexSession(_SessionObservables):
             logger.debug("duplex: unhandled event type %r", kind)
 
     def _on_session_created(self, event: dict) -> None:
+        """Adopt the new session, and decide how this one arms (issue #149).
+
+        The capability is re-read on EVERY session rather than once per
+        process: a reconnect can land on a restarted (upgraded, or rolled back)
+        gateway, and a client that cached the answer would either keep waiting
+        for one-shot arming it no longer has — a permanently mute robot — or
+        keep arming per utterance against a gateway that latches.
+        """
         self._session_id = _as_str(event.get("session_id"))
         self._state.note(_session_created_line(event))
+        self._one_shot_arming = announces_one_shot_arming(event)
+        if self._arm_per_utterance and self._one_shot_arming:
+            # Nobody has asked for a reply yet, so nothing is armed. Every
+            # `arm_once` from here on buys exactly one.
+            self._one_shot_unsupported_logged = False
+            self._state.note("arming per admitted utterance (gateway announced one-shot)")
+            return
+        if self._arm_per_utterance and not self._one_shot_unsupported_logged:
+            self._one_shot_unsupported_logged = True
+            self._state.drop(
+                REASON_ONE_SHOT_ARMING_UNSUPPORTED,
+                "the gateway announced no one-shot arming, so this session arms "
+                "once and it will answer every utterance (lobes-cli#170 item 1)",
+            )
         if self._arm_on_connect:
             self._arm_pending = True
 
