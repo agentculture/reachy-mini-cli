@@ -71,6 +71,26 @@ number of dimensions or channels, and anything numpy cannot convert are all
 skipped silently. A degenerate frame is a non-reading, never an exception.
 
 --------------------------------------------------------------------------
+Frame fan-out — a PUSH seam for a second in-process consumer
+--------------------------------------------------------------------------
+This driver is the ONLY thing in the runtime allowed to call
+:meth:`HeldMediaClient.frame`: any other piece that wants to see camera frames
+(the clip rider, a future consumer) must never open a second read against the
+one held media client — that is exactly the single-SDK-owner contention this
+module's docstring already warns about for the SDK's media session generally.
+:meth:`add_frame_sink` registers a zero-arg-return callable that
+:meth:`_update_frame` PUSHES every USABLE frame to, the moment it is read — the
+same shape :class:`reachy.cli._commands.behavior._AudioTap`'s ``add_sink`` uses
+for the audio leg. Push rather than a second peek is what makes "no second
+camera read" structural rather than a call-site convention: a sink cannot be
+wired to anything but this one read. A sink is called with the frame the tick
+already validated (never ``None`` or a degenerate array — :func:`usable_frame`
+gates it first), runs UNCONDITIONALLY of whether a face recognizer is
+composed (a cv2-less-but-still-camera'd box can still feed a sink that has its
+own reason to want frames), and its faults are swallowed here: a misbehaving
+sink degrades to a debug log line, never a tick fault.
+
+--------------------------------------------------------------------------
 Degradation
 --------------------------------------------------------------------------
 Face recognition needs the ``[vision]`` extra (opencv). :func:`build_face_recognition`
@@ -370,6 +390,9 @@ class FaceSenseDriver:
         self._input = _Slot()
         #: Worker -> tick thread: the latest matched, named face.
         self._output = _Slot()
+        #: PUSH consumers of every usable frame (see the module docstring's
+        #: "Frame fan-out" section) — the clip rider registers here.
+        self._frame_sinks: list[Callable[[object], None]] = []
         #: Worker-thread-only: clock reading of the last detection (cadence gate).
         self._last_detect: float | None = None
         #: Tick-thread-only: name -> ``ctx.now`` of its last latch (cooldown).
@@ -435,6 +458,7 @@ class FaceSenseDriver:
         if usable_frame(frame):
             self._last_frame_at = now
             self._frame_available = True
+            self._fan_out_frame(frame)
             if self._recognizer_ready:
                 self._input.publish(frame)
             return
@@ -500,6 +524,29 @@ class FaceSenseDriver:
         except Exception:  # noqa: BLE001 — a read fault degrades, never propagates
             logger.debug("FaceSenseDriver frame read raised; no frame this tick", exc_info=True)
             return None
+
+    def add_frame_sink(self, sink: Callable[[object], None]) -> None:
+        """Register a PUSH consumer of every usable frame (module docstring).
+
+        Called once at composition, e.g. ``face_driver.add_frame_sink(
+        clip_rider.offer)``. Never called on the tick thread itself.
+        """
+        self._frame_sinks.append(sink)
+
+    def _fan_out_frame(self, frame: object) -> None:
+        """Push *frame* to every registered sink — O(1), never raises into the tick.
+
+        Mirrors :meth:`reachy.cli._commands.behavior._AudioTap.pull`'s sink
+        fan-out: a sink is called with the frame the moment it is read, so a
+        consumer can never be wired to anything but THIS read — no second
+        ``media.frame()`` call, no second camera contention. A misbehaving sink
+        degrades to a debug log line, never a tick fault.
+        """
+        for sink in self._frame_sinks:
+            try:
+                sink(frame)
+            except Exception as err:  # noqa: BLE001 — a fan-out consumer must never break the tick
+                logger.debug("FaceSenseDriver: frame sink raised (%s); frame not delivered", err)
 
     # -- match leg ------------------------------------------------------ #
 

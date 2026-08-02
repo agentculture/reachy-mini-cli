@@ -53,6 +53,7 @@ from reachy.behavior import rules as rules_mod
 from reachy.behavior import supervisor
 from reachy.behavior.audio_pump import AudioPump
 from reachy.behavior.audio_tee import AudioTee
+from reachy.behavior.clip_rider import ClipRider, build_clip_encoder, clip_seconds_from_env
 from reachy.behavior.engine import EngineConfig
 from reachy.behavior.engine import run as engine_run
 from reachy.behavior.excited_motion_probe import CUES as PROBE_CUES
@@ -1537,6 +1538,28 @@ def _make_audio_tee(samplerate_provider: Callable[[], object]) -> AudioTee:
     return AudioTee(samplerate_provider=samplerate_provider)
 
 
+def _make_clip_rider(main_control) -> ClipRider:
+    """Build the rolling-clip rider — a test-injection seam.
+
+    The sibling of :func:`_make_audio_tee`, composed with the same discipline:
+    every knob (X, the encoder) resolves inside :mod:`reachy.behavior.
+    clip_rider` from the environment or a probe, so this stays a thin
+    constructor call. Composed UNCONDITIONALLY, like every other sense piece —
+    a cv2-less box (no ``[vision]`` extra) gets a permanently-quiet rider
+    reporting a named reason, never a disabled composition step.
+
+    *main_control* is the SAME spool :func:`_compose_run_seam`'s other state
+    riders (``SenseAvailabilityDriver``, ``IntentDriver``) receive, so the
+    ``clip`` key rides the identical ``state_writer``-wrapped write those use —
+    no second publish path.
+    """
+    return ClipRider(
+        encoder=build_clip_encoder(),
+        clip_seconds=clip_seconds_from_env(),
+        main_control=main_control,
+    )
+
+
 def _warm_holder(holder, *, label: str) -> bool:
     """Construct *holder*'s client NOW, on the caller's (setup) thread.
 
@@ -1733,9 +1756,10 @@ class _RuntimeResources:
     """Everything :func:`_compose_run_seam` opened that the caller MUST release.
 
     ``cmd_engine_run`` used to close a single held pose reader; the runtime now
-    owns two held SDK clients, two driver-owned worker threads and the speech
-    actuator's worker, so the teardown travels as one object rather than a
-    growing tuple. ``close()`` is idempotent, releases in reverse dependency
+    owns two held SDK clients, three driver-owned worker threads (transcript,
+    face, clip) and the speech actuator's worker, so the teardown travels as
+    one object rather than a growing tuple. ``close()`` is idempotent, releases
+    in reverse dependency
     order (keeper, then the voice, then drivers that READ the holders, then the
     holders themselves), and never raises — a failing teardown step must not
     stop the remaining ones, because an unclosed client hangs the process at
@@ -2110,7 +2134,7 @@ def _compose_run_seam(
     Act-in seams (the ONE TickBus, in driver order)
     -----------------------------------------------
     ``[rules_driver, intent_driver, pat_driver, transcript_driver, face_driver,
-    self_motion, holder, goto_lane, availability]`` (with a
+    self_motion, holder, goto_lane, availability, clip_rider]`` (with a
     :class:`SenseSnapshotDriver` appended when exporting):
 
     * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
@@ -2150,9 +2174,18 @@ def _compose_run_seam(
       engine publishes its own snapshot BEFORE the seam runs, so a rider that
       augments the file wants to be the tick's final word. It reads nothing off
       ``ctx``, so this is ordering hygiene rather than a correctness constraint.
+    * ``clip_rider`` — the rolling-clip reference (spec claim c18), the same
+      kind of WRITER as ``availability`` and ordered beside it for the same
+      reason. It reads nothing off ``ctx`` either — its OWN frame feed arrives
+      by PUSH from ``face_driver.add_frame_sink(clip_rider.offer)``, wired
+      right after ``face_driver`` is constructed above, never through this
+      tick seam. All the encoding work happens on its own background worker
+      (:mod:`reachy.behavior.clip_rider`'s module docstring); this driver
+      entry only republishes ``state.json``'s ``clip`` key on change.
 
     Both state RIDERS — ``availability`` (``senses``) and ``intent_driver``
-    (``intents``) — take *main_control* as their state spool. When
+    (``intents``) — take *main_control* as their state spool, and so does
+    ``clip_rider`` (``clip``). When
     ``cmd_engine_run`` passes the engine's own ``CommandSpool``, and that spool's
     ``write_state`` is later wrapped with the nervous-system ``state_writer``,
     the riders' merged writes reach the retained bus tree as well as disk (t14,
@@ -2182,7 +2215,7 @@ def _compose_run_seam(
     # that `Restart=on-failure` never restarts. So the whole construction is
     # guarded and releases what it opened before re-raising.
     reader = media = transcript_driver = face_driver = keeper = speech = pump = None
-    realtime = publisher = tee = None
+    realtime = publisher = tee = clip_rider = None
     try:
         # The voice, first: built and STARTED here on the setup thread so no tick
         # ever pays for thread creation, and so a malformed REACHY_VOICE_ENGINE /
@@ -2237,6 +2270,13 @@ def _compose_run_seam(
             engine=recognition[0] if recognition is not None else None,
             store=recognition[1] if recognition is not None else None,
         )
+        # The rolling clip rider (spec claim c18): fed by PUSH off the SAME
+        # frame `face_driver` already reads — never a second `media.frame()`
+        # call (the single-SDK-owner model). Composed unconditionally; a
+        # cv2-less box gets a permanently-quiet rider reporting a named reason
+        # in state.json rather than a disabled composition step.
+        clip_rider = _make_clip_rider(main_control)
+        face_driver.add_frame_sink(clip_rider.offer)
 
         # Warm BOTH held clients here, on the setup thread, before anything ticks.
         # Sequential and in this order on purpose: the ``no_media`` pose handle is
@@ -2399,6 +2439,7 @@ def _compose_run_seam(
                 holder,
                 goto_lane,
                 availability,
+                clip_rider,
             )
             if d is not None
         ]
@@ -2422,7 +2463,7 @@ def _compose_run_seam(
         resources = _RuntimeResources(
             pose_reader=reader,
             media=media,
-            drivers=(transcript_driver, face_driver),
+            drivers=(transcript_driver, face_driver, clip_rider),
             keeper=keeper,
             speech=speech,
             pump=pump,
@@ -2435,7 +2476,7 @@ def _compose_run_seam(
         _RuntimeResources(
             pose_reader=reader,
             media=media,
-            drivers=(transcript_driver, face_driver),
+            drivers=(transcript_driver, face_driver, clip_rider),
             keeper=keeper,
             speech=speech,
             pump=pump,
