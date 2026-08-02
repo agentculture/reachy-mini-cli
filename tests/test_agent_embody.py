@@ -823,7 +823,8 @@ def test_the_layers_failure_vocabulary_is_declared_named_and_unique():
     assert agent_mod.EMBODY_REASONS, "the layer declares no named failure modes"
     assert len(set(agent_mod.EMBODY_REASONS)) == len(agent_mod.EMBODY_REASONS)
     for reason in agent_mod.EMBODY_REASONS:
-        assert reason == reason.strip() and " " not in reason, reason
+        assert reason == reason.strip(), reason
+        assert " " not in reason, reason
 
 
 @pytest.mark.parametrize("reason", sorted(agent_mod.EMBODY_REASONS))
@@ -1158,7 +1159,8 @@ def test_embody_runs_turns_over_a_feed_and_publishes_its_own_cognition_feed(tmp_
     blocks = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
     kinds = {block["t"] for block in blocks}
     assert kinds <= {"thinking", "message", "emotion"}, "a runtime block leaked onto c27's feed"
-    assert "message" in kinds and "thinking" in kinds
+    assert "message" in kinds
+    assert "thinking" in kinds
     assert any(block.get("text") == "that tickles" for block in blocks if block["t"] == "message")
     assert layer_box[0].session.closed == 1, "the session was not closed at shutdown"
 
@@ -1189,8 +1191,9 @@ def test_embody_summary_goes_to_stdout_as_json_when_not_exporting(tmp_path, caps
 
 def test_an_unreadable_feed_is_a_clean_environment_error():
     """A typo'd feed path fails like ``attach``'s does — never a traceback."""
+    args = _parse("--feed=/nonexistent/runtime.feed")
     with pytest.raises(CliError) as excinfo:
-        agent_mod.cmd_agent_embody(_parse("--feed=/nonexistent/runtime.feed"))
+        agent_mod.cmd_agent_embody(args)
     assert excinfo.value.code == EXIT_ENV_ERROR
     assert "behavior engine run --export -" in excinfo.value.remediation
 
@@ -1198,10 +1201,9 @@ def test_an_unreadable_feed_is_a_clean_environment_error():
 def test_an_unknown_media_profile_is_a_clean_user_error():
     from reachy.cli._errors import EXIT_USER_ERROR
 
+    args = _parse("--media-profile=submarine")
     with pytest.raises(CliError) as excinfo:
-        agent_mod._compose_embody_seam(
-            _parse("--media-profile=submarine"), export=None, lines=iter(())
-        )
+        agent_mod._compose_embody_seam(args, export=None, lines=iter(()))
     assert excinfo.value.code == EXIT_USER_ERROR
 
 

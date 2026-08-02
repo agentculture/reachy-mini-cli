@@ -75,15 +75,21 @@ perception cue reusing the same vocabulary :mod:`reachy.speech.events` defines:
   own — or a peer's — declared goal taking effect).
 * ``motion`` → ``"started moving: <behavior>"`` / ``"stopped moving: …"`` (a
   low-level ``goto`` is not surfaced, to keep turns focused).
+
+The mapping itself (the per-type functions above, plus the DoA band / loudness
+floor / pat-phrasing constants they use) lives in :mod:`reachy.runtime_cues`,
+shared with the embodiment layer's own cue reader
+(:mod:`reachy.embody.cues`) — SonarCloud flagged the two as duplicated
+blocks on PR #140. See that module's docstring for exactly what is shared and
+what deliberately stays local to each caller (this module's dispatch never
+logs a drop for an unrecognised event; ``reachy.embody.cues`` does).
 """
 
 from __future__ import annotations
 
 import argparse
 import functools
-import json
 import logging
-import math
 import os
 import sys
 import threading
@@ -93,7 +99,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
-from reachy import senselog
+from reachy import runtime_cues, senselog
 from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
@@ -125,18 +131,6 @@ logger = logging.getLogger(__name__)
 
 _JSON_HELP = "Emit structured JSON."
 
-# Sound-direction band + loudness threshold — mirror reachy.speech.events'
-# DoA convention (0 = left, pi/2 = front, pi = right; ~15° "ahead" band) and its
-# loud-sound floor, so the agent's perception vocabulary matches the folded
-# retired listen --live cognition path exactly.
-_AHEAD_BAND_RAD: float = 0.26
-_LOUD_RMS_THRESHOLD: float = 0.02
-
-# Touch phrasing — keys match the strings reachy.motion.pat.PatDetector emits and
-# reachy.speech.events uses for the folded pat cue.
-_PAT_KIND_PHRASE: dict[str, str] = {"scratch": "scratch", "side_pat": "sideways nudge"}
-_PAT_LEVEL_INTENSITY: dict[str, str] = {"level1": "gentle", "level2": "firm"}
-
 # Inert voice sample rates for the publish-only speak/harmonics tools (a no-op
 # playback ignores them — they only satisfy the VoiceEngine shape).
 _TTS_RATE = 24000
@@ -146,103 +140,23 @@ _HARMONIC_RATE = 16000
 # ---------------------------------------------------------------------------
 # Runtime-event → perception-cue mapping
 # ---------------------------------------------------------------------------
-
-
-def _direction_word(doa: object) -> str | None:
-    """Map a DoA angle (radians) to ``"left"`` / ``"ahead"`` / ``"right"``, or ``None``.
-
-    Convention (``reachy.behavior.sense`` / ``reachy.speech.events``): ``0`` = left,
-    ``pi/2`` = front, ``pi`` = right. A ``None``/unparseable angle yields ``None``.
-    """
-    if doa is None:
-        return None
-    try:
-        angle = float(doa)
-    except (TypeError, ValueError):
-        return None
-    front = math.pi / 2.0
-    if angle < front - _AHEAD_BAND_RAD:
-        return "left"
-    if angle > front + _AHEAD_BAND_RAD:
-        return "right"
-    return "ahead"
-
-
-def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _sense_cues(event: dict) -> list[str]:
-    """Cues for a ``sense`` runtime event (perception snapshot)."""
-    cues: list[str] = []
-    direction = _direction_word(event.get("doa"))
-    rms = event.get("rms")
-    if event.get("speech"):
-        cues.append(f"speech from the {direction}" if direction else "speech nearby")
-    elif _is_number(rms) and rms >= _LOUD_RMS_THRESHOLD:
-        cues.append(f"loud sound {direction}" if direction else "loud sound nearby")
-
-    pat = event.get("pat")
-    if isinstance(pat, (list, tuple)) and len(pat) == 2:
-        phrase = _PAT_KIND_PHRASE.get(pat[0])
-        intensity = _PAT_LEVEL_INTENSITY.get(pat[1])
-        if phrase and intensity:
-            cues.append(f"felt a {intensity} {phrase} on the head")
-
-    face = event.get("face")
-    if isinstance(face, str) and face.strip():
-        cues.append(f"saw {face.strip()}")
-    return cues
-
-
-def _rule_cues(event: dict) -> list[str]:
-    """Cues for a ``rule`` runtime event (a rule fire/suppress decision)."""
-    rule = str(event.get("rule") or "a rule")
-    action = event.get("action")
-    if action == "fire":
-        behavior = event.get("behavior")
-        disable = event.get("disable") or []
-        if behavior:
-            return [f"a behavior rule fired ({rule}): now doing {behavior}"]
-        if disable:
-            joined = ", ".join(str(d) for d in disable)
-            return [f"a behavior rule fired ({rule}): stopping {joined}"]
-        return [f"a behavior rule fired ({rule})"]
-    if action == "suppress":
-        return [f"a behavior rule held off ({rule})"]
-    return []
-
-
-def _intent_cues(event: dict) -> list[str]:
-    """Cues for an ``intent`` runtime event (a standing goal declared/updated/cleared)."""
-    action = event.get("action")
-    name = str(event.get("name") or "").strip()
-    if action == "clear":
-        return ["a standing intent was cleared"]
-    if action in ("declare", "update"):
-        verb = "set" if action == "declare" else "updated"
-        return [
-            f"a standing intent was {verb}: {name}" if name else f"a standing intent was {verb}"
-        ]
-    return []
-
-
-def _motion_cues(event: dict) -> list[str]:
-    """Cues for a ``motion`` runtime event (a behavior admission/eviction)."""
-    action = event.get("action")
-    label = str(event.get("behavior") or "a body behavior")
-    if action == "admit":
-        return [f"started moving: {label}"]
-    if action == "evict":
-        return [f"stopped moving: {label}"]
-    return []  # a low-level goto keyframe is not surfaced as a cognition cue
+#
+# The per-type mapper functions, the DoA band / loudness floor / pat-phrasing
+# constants they use, and the JSONL line parser all live in
+# :mod:`reachy.runtime_cues` — the shared owner cited by both this module's
+# ``_CUE_MAPPERS`` and :mod:`reachy.embody.cues`'s ``CUE_MAPPERS`` (SonarCloud
+# PR #140: the two were duplicated blocks before this extraction). See that
+# module's docstring for exactly what is shared and what is not — in
+# particular, this dispatch stays silent on an unrecognised/malformed event
+# where ``reachy.embody.cues`` logs a named drop; that difference is
+# deliberate and is NOT flattened by sharing the per-type mappers.
 
 
 _CUE_MAPPERS: dict[str, Callable[[dict], list[str]]] = {
-    "sense": _sense_cues,
-    "rule": _rule_cues,
-    "intent": _intent_cues,
-    "motion": _motion_cues,
+    "sense": runtime_cues.sense_cues,
+    "rule": runtime_cues.rule_cues,
+    "intent": runtime_cues.intent_cues,
+    "motion": runtime_cues.motion_cues,
 }
 
 
@@ -261,15 +175,12 @@ def _cues_for_runtime_event(event: object) -> list[str]:
 
 
 def _parse_runtime_line(line: str) -> dict | None:
-    """Parse one JSONL feed line into an event dict, or ``None`` for junk/blank."""
-    stripped = line.strip()
-    if not stripped:
-        return None
-    try:
-        obj = json.loads(stripped)
-    except (TypeError, ValueError):
-        return None
-    return obj if isinstance(obj, dict) else None
+    """Parse one JSONL feed line into an event dict, or ``None`` for junk/blank.
+
+    Delegates to the shared :func:`reachy.runtime_cues.parse_runtime_line` —
+    identical logic to :func:`reachy.embody.cues.parse_runtime_line`.
+    """
+    return runtime_cues.parse_runtime_line(line)
 
 
 def _event_ts(event: dict) -> float:

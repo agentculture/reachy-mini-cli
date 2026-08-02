@@ -12,6 +12,18 @@ to its own reflexes (the spec's before/after story: "a scratch draws a spoken
 response") — so :func:`cues_for_runtime_event`'s ``rule`` mapper never returns
 an empty cue for a fire, and is exercised first in this module's test table.
 
+The per-type mapping functions themselves (``rule``/``sense``/``intent``/
+``motion``), plus the DoA band / loudness floor / pat-phrasing vocabulary they
+share with ``agent attach``'s ``_CUE_MAPPERS``, now live in
+:mod:`reachy.runtime_cues` — SonarCloud flagged the two modules' copies as
+duplicated blocks on PR #140. This module still defines its OWN ``_sense_cues``
+(layering a ``frame_available`` cue the shared core does not carry) and its
+own ``cues_for_runtime_event``/``CUE_MAPPERS`` dispatch (which names a
+:mod:`reachy.senselog` drop for an unrecognised/malformed event — see "Named
+drops" below — where ``agent attach``'s dispatch stays silent); see
+:mod:`reachy.runtime_cues`'s own docstring for the full account of what moved
+and what deliberately did not.
+
 Two intake routes feed the SAME mapping (:func:`cues_for_line` /
 :func:`cues_for_runtime_event`), so nothing downstream cares which one
 produced a line — the wire shape is identical either way
@@ -69,8 +81,6 @@ vocabulary declared below (mirrors ``reachy/export/mqtt.py``'s discipline).
 
 from __future__ import annotations
 
-import json
-import math
 import queue
 import sys
 import uuid
@@ -78,7 +88,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Protocol, TextIO
 
-from reachy import senselog
+from reachy import runtime_cues, senselog
 
 # --------------------------------------------------------------------------- #
 # Senselog identity                                                           #
@@ -118,88 +128,39 @@ def _drop(source: str, reason: str, extra: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sound-direction band + loudness threshold + pat phrasing — cited from
-# reachy.cli._commands.agent's _CUE_MAPPERS (cite-don't-import: that module is
-# a CLI command module this package must never be imported BY, so the
-# vocabulary is restated here rather than shared by import), which itself
-# mirrors reachy.speech.events' DoA convention (0 = left, pi/2 = front, pi =
-# right; ~15 degree "ahead" band) and its loud-sound floor.
-# ---------------------------------------------------------------------------
-
-_AHEAD_BAND_RAD: float = 0.26
-_LOUD_RMS_THRESHOLD: float = 0.02
-
-_PAT_KIND_PHRASE: dict[str, str] = {"scratch": "scratch", "side_pat": "sideways nudge"}
-_PAT_LEVEL_INTENSITY: dict[str, str] = {"level1": "gentle", "level2": "firm"}
-
-
-def _direction_word(doa: object) -> str | None:
-    """Map a DoA angle (radians) to ``"left"`` / ``"ahead"`` / ``"right"``, or ``None``."""
-    if doa is None:
-        return None
-    try:
-        angle = float(doa)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-    front = math.pi / 2.0
-    if angle < front - _AHEAD_BAND_RAD:
-        return "left"
-    if angle > front + _AHEAD_BAND_RAD:
-        return "right"
-    return "ahead"
-
-
-def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-# ---------------------------------------------------------------------------
 # Runtime-event -> perception-cue mapping (one function per line type)
 # ---------------------------------------------------------------------------
-
-
-def _rule_cues(event: dict) -> list[str]:
-    """Cues for a ``rule`` runtime event — the headline react-in-voice input.
-
-    A ``fire`` NEVER maps to an empty cue: the robot's own react/inhibit
-    decision is always worth narrating, whether or not it names a behavior.
-    """
-    rule = str(event.get("rule") or "a rule")
-    action = event.get("action")
-    if action == "fire":
-        behavior = event.get("behavior")
-        disable = event.get("disable") or []
-        if behavior:
-            return [f"a behavior rule fired ({rule}): now doing {behavior}"]
-        if disable:
-            joined = ", ".join(str(d) for d in disable)
-            return [f"a behavior rule fired ({rule}): stopping {joined}"]
-        return [f"a behavior rule fired ({rule})"]
-    if action == "suppress":
-        return [f"a behavior rule held off ({rule})"]
-    return []
+#
+# The DoA band / loudness floor / pat-phrasing constants, ``direction_word``,
+# ``rule_cues``, the ``sense_cues`` core, ``intent_cues`` and ``motion_cues``
+# all live in :mod:`reachy.runtime_cues` now — SonarCloud flagged this
+# module's copies as duplicated against ``reachy.cli._commands.agent``'s
+# ``_CUE_MAPPERS`` on PR #140. Previously the vocabulary was RESTATED here
+# rather than imported, because the only place it lived was
+# ``reachy.cli._commands.agent`` — a CLI command module this package must
+# never be imported BY. That constraint still holds; what changed is that the
+# vocabulary now lives in a THIRD, neutral module neither side already
+# forbade importing (see ``reachy.runtime_cues``'s own docstring for exactly
+# why it sits outside ``reachy.cli``/``reachy.embody``/``reachy.speech``), so
+# both callers cite one owner instead of each carrying its own copy.
+#
+# ``_sense_cues`` below is the one function this module still defines itself:
+# it layers a ``frame_available`` cue on top of the shared
+# :func:`reachy.runtime_cues.sense_cues` core, which ``agent attach`` does
+# NOT do — see ``reachy.runtime_cues``'s docstring for why that is reported as
+# likely accidental drift on the ``agent attach`` side rather than folded away
+# here.
 
 
 def _sense_cues(event: dict) -> list[str]:
-    """Cues for a ``sense`` runtime event (pat, face, rms, speech, doa, frame_available)."""
-    cues: list[str] = []
-    direction = _direction_word(event.get("doa"))
-    rms = event.get("rms")
-    if event.get("speech"):
-        cues.append(f"speech from the {direction}" if direction else "speech nearby")
-    elif _is_number(rms) and rms >= _LOUD_RMS_THRESHOLD:
-        cues.append(f"loud sound {direction}" if direction else "loud sound nearby")
+    """Cues for a ``sense`` runtime event (pat, face, rms, speech, doa, frame_available).
 
-    pat = event.get("pat")
-    if isinstance(pat, (list, tuple)) and len(pat) == 2:
-        phrase = _PAT_KIND_PHRASE.get(pat[0])
-        intensity = _PAT_LEVEL_INTENSITY.get(pat[1])
-        if phrase and intensity:
-            cues.append(f"felt a {intensity} {phrase} on the head")
-
-    face = event.get("face")
-    if isinstance(face, str) and face.strip():
-        cues.append(f"saw {face.strip()}")
+    Delegates the speech/loud-sound, pat and face core to
+    :func:`reachy.runtime_cues.sense_cues` (identical to ``agent attach``'s
+    mapper) and layers ``frame_available`` on top — the one extension this
+    layer's cue vocabulary has that ``agent attach``'s does not.
+    """
+    cues = list(runtime_cues.sense_cues(event))
 
     # Positive-only, mirroring every other sub-field above: a camera view
     # being unavailable is the common (no [vision] extra, or the daemon not
@@ -212,48 +173,18 @@ def _sense_cues(event: dict) -> list[str]:
     return cues
 
 
-def _intent_cues(event: dict) -> list[str]:
-    """Cues for an ``intent`` runtime event (declare / update / clear).
-
-    ``applied`` / ``blocked`` are the IntentDriver's own status emissions —
-    recognised, but deliberately silent here (the declare/update/clear the
-    status describes already produced its own cue moments earlier).
-    """
-    action = event.get("action")
-    name = str(event.get("name") or "").strip()
-    if action == "clear":
-        return ["a standing intent was cleared"]
-    if action in ("declare", "update"):
-        verb = "set" if action == "declare" else "updated"
-        return [
-            f"a standing intent was {verb}: {name}" if name else f"a standing intent was {verb}"
-        ]
-    return []
-
-
-def _motion_cues(event: dict) -> list[str]:
-    """Cues for a ``motion`` runtime event (admit / evict).
-
-    A low-level ``goto`` is not surfaced — same reasoning as ``agent attach``:
-    it would flood turns with keyframe-level noise instead of the higher-level
-    behavior admissions that actually matter to a conversation.
-    """
-    action = event.get("action")
-    label = str(event.get("behavior") or "a body behavior")
-    if action == "admit":
-        return [f"started moving: {label}"]
-    if action == "evict":
-        return [f"stopped moving: {label}"]
-    return []
-
-
 #: Every runtime line type this module recognises, mapped to its cue function.
-#: This IS the table :mod:`tests.test_embody_cues`' table test pins.
+#: This IS the table :mod:`tests.test_embody_cues`' table test pins. ``rule``
+#: is listed first — not load-bearing for dict lookup, but it keeps the
+#: "headline react-in-voice input" framing from the module docstring visible
+#: at the point of use: a ``fire`` NEVER maps to an empty cue (see
+#: :func:`reachy.runtime_cues.rule_cues`), so the robot's own react/inhibit
+#: decision is always worth narrating, whether or not it names a behavior.
 CUE_MAPPERS: dict[str, Callable[[dict], list[str]]] = {
-    "rule": _rule_cues,
+    "rule": runtime_cues.rule_cues,
     "sense": _sense_cues,
-    "intent": _intent_cues,
-    "motion": _motion_cues,
+    "intent": runtime_cues.intent_cues,
+    "motion": runtime_cues.motion_cues,
 }
 
 
@@ -283,15 +214,12 @@ def cues_for_runtime_event(event: object) -> list[str]:
 
 
 def parse_runtime_line(line: str) -> dict | None:
-    """Parse one JSONL runtime-feed line into an event dict, or ``None`` for junk/blank."""
-    stripped = line.strip()
-    if not stripped:
-        return None
-    try:
-        obj = json.loads(stripped)
-    except (TypeError, ValueError):
-        return None
-    return obj if isinstance(obj, dict) else None
+    """Parse one JSONL runtime-feed line into an event dict, or ``None`` for junk/blank.
+
+    Delegates to the shared :func:`reachy.runtime_cues.parse_runtime_line` —
+    identical logic to ``agent attach``'s ``_parse_runtime_line``.
+    """
+    return runtime_cues.parse_runtime_line(line)
 
 
 def cues_for_line(line: str) -> list[str]:
