@@ -16,7 +16,9 @@ robot agent is now real and extensive: the CLI drives the daemon (`daemon`,
 `device`, `app`, `move`), idle presence (`demo-mode`), the **symbolic runtime**
 that composes every sense onto one 50 Hz tick (`behavior engine run`), the
 standalone single-sense verbs (`vision`, `pat`, `sleep`), speech (`say`), boot
-persistence (`service`), the external agent client (`agent attach`) and the
+persistence (`service`), the external agent client (`agent attach`), the
+detachable **embodiment layer** that gives the robot ears, a voice and a
+conversational mind beside the runtime (`agent embody`), and the
 runtime's two JSONL feeds (`behavior engine run --export` and `agent attach
 --export`). When you build a new robot feature you are extending a
 working agent — follow the existing nouns as the model, summarized in the
@@ -122,11 +124,17 @@ you touch the CLI.
   forge validator's joined rejection reasons, …) — never a silent no-op.
   `_logging.install_logging` attaches exactly ONE `stderr` `StreamHandler` to
   the `"reachy"` logger (the common ancestor every `reachy.*` module logger
-  propagates to) at `behavior engine run` / `sleep run` entry — the only two
-  call sites — level from `--log-level` (`add_log_level_arg`) or
-  `REACHY_LOG_LEVEL` (default `INFO`); a repeated call reuses the same handler
-  (no duplicate lines). Stderr-only by construction, so `--export -`'s stdout
-  stays pure JSONL.
+  propagates to) at `behavior engine run` / `sleep run` / `agent embody`
+  entry — the only three call sites — level from `--log-level`
+  (`add_log_level_arg`) or `REACHY_LOG_LEVEL` (default `INFO`); a repeated call
+  reuses the same handler (no duplicate lines). Stderr-only by construction, so
+  `--export -`'s stdout stays pure JSONL. `agent embody` is the third on
+  purpose: every named failure the layer must surface (a dead session, a dead
+  LLM, a refused action) is a `[SENSE …]` line at INFO, and with no handler on
+  the `reachy` logger `logging.lastResort` drops everything below WARNING — a
+  layer whose drops are invisible is indistinguishable from a layer that
+  silently no-ops. It is still the only cognition root that does this: `agent
+  attach` runs without it.
 - **`explain` catalog** (`reachy/explain/`): markdown keyed by command-path
   tuples in `catalog.py`'s `ENTRIES`. `test_every_catalog_path_resolves`
   verifies each catalog entry resolves — but nothing fails if you add a verb
@@ -218,7 +226,8 @@ transport. Deep notes for the non-trivial nouns follow in
 | `pat` | `_commands/pat.py` | `reachy/motion/{pat,pat_reaction,pat_signal}.py` | `sdk` only |
 | `sleep` | `_commands/sleep.py` | `reachy/sleep/{state,stimulus,wake,patwake,wakeword,supervisor}.py`, `reachy/motion/{sleep,sleep_signal}.py` | `sdk` default |
 | `service` | `_commands/service.py` | `reachy/service/{units,manager}.py` (`ServiceManager`, systemd `--user`) | none (systemd) |
-| `agent` | `_commands/agent.py` | `reachy/speech/{agent_turn,tools,intent_tools,events}.py` + `reachy/forge/*`, over `--feed` + the intents spool | none (feeds + spool) |
+| `agent attach` | `_commands/agent.py` | `reachy/speech/{agent_turn,tools,intent_tools,events}.py` + `reachy/forge/*`, over `--feed` + the intents spool | none (feeds + spool) |
+| `agent embody` (+ `start`/`stop`/`restart`/`status`) | `_commands/agent.py` (`_compose_embody_seam`, `cmd_agent_embody*`) | `reachy/embody/{media,tools,cues,engine,supervisor}.py` + `reachy/speech/realtime_duplex.py`, consuming the runtime's `behavior/{audio_tee,clip_rider}.py` legs | none (tee socket, feed/bus, spools, daemon `http`) |
 
 ## Noun internals
 
@@ -240,10 +249,27 @@ daemon restart (fixes issue #21).
 
 `reachy/cli/_commands/behavior.py::_compose_run_seam` composes every runtime
 sense/act piece onto the engine's ONE `TickBus`: `[rules_driver,
-intent_driver, pat_driver, transcript_driver, face_driver, holder, goto_lane]`
-(plus a `SenseSnapshotDriver` when exporting). Every piece below is import-safe
+intent_driver, pat_driver, transcript_driver, face_driver, self_motion,
+holder, goto_lane, availability, clip_rider]` (plus a `SenseSnapshotDriver`
+when exporting). Every piece below is import-safe
 without `reachy_mini` and composed UNCONDITIONALLY — a bare box (no `[sdk]` /
 `[vision]` extra) runs unchanged except for permanently-quiet sense fields.
+
+**Two ADDITIVE export legs feed the embodiment layer, and cost the tick
+nothing.** `AudioTee` (`reachy/behavior/audio_tee.py`) is a THIRD consumer of
+the ONE per-tick chunk `_AudioTap` takes — never a second `take()` — fanning
+mono float32 out over a unix socket under the state dir behind a
+self-describing JSON header; `ClipRider` (`reachy/behavior/clip_rider.py`)
+keeps a rolling `REACHY_CLIP_SECONDS` (6.0 s) frame ring fed by PUSH from
+`face_driver.add_frame_sink`, encodes on its own worker, and republishes only
+a PATH REFERENCE on `state.json`'s `clip` key. Both `offer()` calls are O(1) on
+the tick thread (a timestamp + a bounded append; no socket I/O, no encoding,
+no filesystem access) and both drop-don't-block by name. Measured on the
+deployed robot over matched 100 s windows
+(`docs/evidence/2026-08-02-t15-on-box-verification.md`):
+**0 overrun ticks** with no tee consumer, with an active
+one draining 64 kB/s, and with a WEDGED one. See [the embodiment
+layer](#agent-embody--the-embodiment-layer) for the consumer side.
 
 **The two held clients, and the warm-up pair.** The runtime process owns
 exactly TWO SDK clients (the single-SDK-owner model): `HeldStateReader`
@@ -425,15 +451,29 @@ a stale value makes the linter lie in one direction or the other.
   t27/t28 removed, and it must not come back. Three defaults are product
   decisions, not conveniences: the voice is `harmonic` (in-process, offline —
   deliberately NOT `speech/voice.py`'s own `tts` default, so a box with
-  nothing reachable still speaks); playback defaults to the daemon's `http`
-  route — not because the SDK path is broken (issue #94 is CLOSED: measured
-  2026-07-23, `HeldMediaClient` warms in 1032 ms and delivers 9/10 camera
-  frames plus live mic audio on every boot) but because the daemon and the
-  runtime hold `/dev/snd/pcmC2D0p` **simultaneously**, through the
-  `reachymini_audio_sink` ALSA plugin device (`~/.asoundrc`) — the
-  single-SDK-owner model constrains the *media session*, not the *ALSA sink*,
-  so the daemon route was never in contention with the runtime's held client
-  (`REACHY_SPEECH_TRANSPORT=sdk` flips it back with no code change); and a
+  nothing reachable still speaks); playback is
+  `RUNTIME_DEFAULT_TRANSPORT = "sdk"`, resolved by presence
+  (`REACHY_SPEECH_TRANSPORT` > `REACHY_TRANSPORT` > `sdk`) — and `sdk` here
+  does NOT mean "open the SDK": it pushes PCM through the media session the
+  runtime ALREADY holds, reached via the injected `media_session_provider`
+  (`robot/media_client.py`'s `HeldMediaClient`), so speech is a fan-OUT leg of
+  the ONE client exactly as `rms`/transcript are fan-IN legs. Without that
+  provider the same path would call `playback._open_sdk_media()` and
+  construct a SECOND `ReachyMini` — the forbidden move — which is why the
+  provider, not the word `sdk`, is what makes the default legal. Two
+  measurements put it there: issue #94 is CLOSED (2026-07-23,
+  `HeldMediaClient` warms in 1032 ms and delivers 9/10 camera frames plus live
+  mic audio on every boot), which retired the old `http` default's premise;
+  and the push tolerates the speech worker thread (2026-07-24 live probe: 198
+  clean concurrent `client.audio()` reads, zero errors, `push_audio_sample`
+  returns in ~8 ms for a 5.76 s clip). `http` stays FIRST-CLASS — one variable
+  away (`REACHY_SPEECH_TRANSPORT=http`) and the automatic fallback whenever
+  the provider yields no session (a cold holder, or no `[sdk]` extra);
+  falling back there rather than to `_open_sdk_media()` is deliberate, and it
+  costs nothing because the daemon and the runtime hold `/dev/snd/pcmC2D0p`
+  **simultaneously** through the `reachymini_audio_sink` ALSA plugin device
+  (`~/.asoundrc`) — the single-SDK-owner model constrains the *media session*,
+  not the *ALSA sink*. And a
   persistently dead sink latches off for 30 s and RETRIES
   (time-bounded, unlike `AgentTurnEngine`'s permanent latch, because a
   boot-persistent robot must survive a daemon restart un-muted).
@@ -677,6 +717,18 @@ requires the `reachy/motion/listen_*.py` glob to stay EMPTY, and
 `test_cognition_survives_only_behind_the_agent_noun` requires the LLM client to
 stay reachable from `agent attach` — the bans constrain the runtime, not the repo.
 
+**A SECOND cognition root is legal, and `agent embody` is it.** The pins above
+constrain *where* cognition may live, not *how many* roots there are:
+`test_cognition_survives_only_behind_the_agent_noun` asserts existence, not
+exclusivity, and the parser pin only demands function-local cognition imports
+in command modules. The embodiment layer satisfies exactly those conditions —
+every `reachy.embody` import in `_commands/agent.py` is inside a function, the
+runtime's import closure gains no edge to it, and nothing lands in
+`reachy/behavior/` or `reachy/motion/` except the two model-free export legs
+(`audio_tee.py`, `clip_rider.py`). The suite is unchanged by its arrival, which
+is the point: if a change to the layer starts requiring a pin to be loosened,
+the change is wrong, not the pin.
+
 ### `reachy/speech/` cognition stack — no longer its own noun
 
 **The `think` noun is gone (t20), and so is `listen run --live`'s folded
@@ -790,6 +842,143 @@ runtime's `SpeechActuator`:
   `docs/export-schema.md` for the full wire-format contract. The complementary
   RUNTIME feed (`sense`/`rule`/`intent`/`motion`) is `behavior engine run
   --export -`, built by the same module's `build_runtime_export_consumer`.
+
+### `agent embody` — the embodiment layer
+
+The second cognition root, and the one with a body. `agent attach` is
+turn-based, cue-driven and publish-only; `agent embody` hears and speaks for
+real. It runs **beside** the runtime as a separate process — a peripheral, not
+a rewrite. Operator-facing walkthrough: [the operating
+guide](docs/operating-reachy.md#the-embodiment-layer--agent-embody). Spec and
+plan: `docs/specs/2026-08-01-embodiment-layer.md`,
+`docs/plans/2026-08-01-embodiment-layer.md`.
+
+**The peripheral property is measured, not asserted.** The whole arc's footprint
+inside `reachy/behavior/` is **3 files, 6 hunks, 1486 insertions, 0 deletions**
+— every hunk an additive tee or clip leg
+(`docs/evidence/2026-08-02-runtime-equivalence.md`). If a future change to the
+layer needs a line *deleted* from the decision loop, that is the signal the
+change belongs somewhere else.
+
+**Import boundary — AST-asserted in `tests/test_embody_redteam.py`, not merely
+intended.** No module under `reachy/embody/` imports `reachy_mini` (the
+single-SDK-owner model gives the media session to the runtime; audio arrives over the
+tee socket or a bench device, never a second client), none imports
+`reachy.daemon` (a layer that can stop the daemon has a blast radius wider than
+its action set — the state dir is resolved on its behalf by the spool and the
+tee module), and none contains `subprocess` / `os.system` / `eval` / `exec`.
+The dependency runs ONE way: nothing under `reachy/behavior/` or
+`reachy/motion/` imports this package, and every `reachy.embody` import in
+`_commands/agent.py` is FUNCTION-LOCAL so `_build_parser()` stays
+cognition-free.
+
+**`reachy/embody/tools.py` — five tools, and the layer validates NOTHING
+itself.** `goto` (the shipped goto handler: per-axis bounds, 10 s cap),
+`run_behavior` (library + param checks, the unbounded-lifetime refusal), both
+via the intents spool; `speak` / `harmonics` (the injected synth + playback
+seams, bounded by the ONE imported `rules.MAX_SAY_CHARS`); `create_rule` (a
+candidate overlay handed to `load_rules`, `os.replace`d only if it returns).
+A second copy of a bound is a second number to drift, and a bound living only
+in the layer is one an operator using the CLI does not get. Two consequences
+worth keeping: motion/behavior actions run the shipped kind handler against
+inert sinks as a **synchronous pre-flight** before the spool write — an LLM
+handed `{"ok": null, "submitted": …}` concludes it succeeded, so *a refusal the
+model cannot see is not a refusal* — and every refusal returns as a tool result
+AND lands on the export feed. The one policy this module owns is the `embody-`
+rule-id namespace: layer-authored rules **PERSIST** after the layer stops (spec
+c26, a confirmed product decision — the robot keeps what it was taught), so
+there is deliberately **no** deletion-on-exit hook anywhere; the prefix is what
+makes them enumerable and removable as a set.
+
+**`reachy/embody/media.py` — two profiles, ONE code path.** `EmbodySource` /
+`EmbodySink` are literally the same classes for `robot` and `bench`; a profile
+only picks which small duck-typed backend gets injected, and there is no
+`isinstance` fork anywhere. The robot sink names `transport="http"` as a
+literal keyword on every `play_audio` call, so an operator's
+`REACHY_TRANSPORT=sdk` can never steer the layer onto `_open_sdk_media()` — a
+second `ReachyMini`. **Every wire fact is CITED from
+`reachy/behavior/audio_tee.py` by import**, socket path included
+(`socket_path()`, so one `REACHY_AUDIO_TEE_SOCKET` moves both ends and neither
+can half-move). That is scar tissue: the two ends were first built against two
+different descriptions of the same pipe (writer: JSON header + float32; reader:
+headerless int16 — and separately, two different socket paths), which does not
+fail loudly, it makes the layer appear to *hear noise*. Both ends are now
+connected in a real end-to-end test (`tests/test_embody_tee_integration.py`)
+rather than each being fed a payload it framed itself. The bench devices bind
+through a lazily-imported `sounddevice` from the new **`[bench]` extra**;
+absent, one named `bench-audio-extra-absent` drop and a permanently quiet
+profile.
+
+**`reachy/embody/engine.py` — cue-triggered, streaming, and it never gives up.**
+Several seams are cited verbatim from `AgentTurnEngine` (bounded history, the
+`run(max_turns=, stop=, before_turn=)` shape, export-before-dispatch,
+`max_tool_rounds`). Two are deliberately NOT inherited: there is **no permanent
+failure latch** (that engine mutes itself for the process lifetime after a
+failure streak; a layer that goes permanently quiet because the gateway blipped
+is indistinguishable from one that crashed, so every failure here is a named,
+counted drop and the next turn retries), and **no snapshot-only buffer** — a
+turn is TRIGGERED by an arriving cue or utterance, which is what makes "the
+robot's own rule fired, so it says something about it" possible at all.
+`note_spoken` feeds the layer's own speech back as CONTEXT, never as a trigger:
+a robot that treats its own voice as a perception talks to itself. Both lanes
+stream, and the stall detector is armed on **inter-chunk idle, never total
+elapsed** — measured, the gateway takes 9-18 s to first content with thinking
+on while the largest gap BETWEEN deltas anywhere is 0.275 s
+(`docs/evidence/2026-08-02-probe-thinking-vs-reasoning-deltas.md`), a factor of
+65, so a total deadline long enough to survive a real think cannot catch a real
+stall. That same probe is why `enable_thinking` stays **False**: 9-18 s before
+the robot says or does anything is disqualifying for a realtime harness, so the
+exported `thinking` block carries cues, reply text, tool calls and tool results
+but **no model reasoning** — the `delta.reasoning` seam (the gateway sends
+`reasoning`, not the documented `reasoning_content`) is dormant, not broken.
+Models are resolved per REQUEST from `REACHY_EMBODY_WORKER_MODEL` /
+`REACHY_EMBODY_SENSES_MODEL` in the process env only — an `environment.d`
+drop-in would silently re-point the RUNTIME's engagement classifier too.
+
+**`reachy/speech/realtime_duplex.py` — the duplex peer of `realtime.py`.** Same
+wire, same server-side VAD, same never-raise discipline, plus the half the
+runtime refuses: it ARMS with one `response.create` and plays the response
+audio out. **One session per process, and it must remain the only ARMED session
+on the box** — the t1 probe
+(`docs/evidence/2026-08-01-probe-concurrent-realtime-sessions.md`) is why it may
+coexist with the runtime's hearing session at all (~85 s, zero cross-talk), but
+it deliberately did NOT test two armed sessions and upstream
+`TTS_VOICE_CONCURRENCY` defaults to 1. It is **UNGATED by construction** — no
+engagement/name-match module is reachable in its import closure, asserted three
+ways — and `play` runs on a DEDICATED thread, never the socket pump, because
+the robot sink's daemon-HTTP route is a seconds-long upload-then-play round
+trip: charging that to the pump stops the ears, starves the keepalive and gets
+the session dropped. Exactly three frame kinds may leave the socket (session
+config, `input_audio_buffer.append`, `response.create`), pinned by test.
+
+**`reachy/embody/cues.py` + `supervisor.py`.** Cues map the runtime's own
+`sense`/`rule`/`intent`/`motion` lines to first-person text — a **rule fire is
+the headline input**, not an afterthought. Two intake routes share ONE mapping;
+the MQTT bus is primary in design, but the installed `events-cli>=0.9` ships no
+`subscribe` surface at all, so `resolve_bus_subscriber` degrades to the
+feed-tail fallback with one named drop, and
+`test_the_installed_events_cli_client_has_no_subscribe_capability` is the live
+canary that starts failing the day upstream ships one. The supervisor is the
+per-noun pid+log pattern (`embody.pid` / `embody.log` under the state dir);
+`stop` signals ONLY the pid it tracked — a stale or reused pid is detected and
+left untouched. **No systemd unit ships for the layer**: `service`'s
+`_PRESENCE` stays the closed `demo`/`runtime` pair, and a layer unit there
+would disable the very runtime the layer needs.
+
+**Live status — do not round it up.** On the deployed robot
+(`docs/evidence/2026-08-02-t14-live-acceptance.md`,
+`…-t15-on-box-verification.md`) the layer came up against the live runtime,
+heard, thought and spoke aloud (2.8 s of audio), turned a `pat-acknowledge` rule
+fire into a six-round turn, and **moved the robot** — `run_behavior` and `goto`
+admitted and applied by the live engine's own journal. It did **not** hold a
+sustained two-way conversation with the browser harness: the box has one audio
+output and the browser's PipeWire stream on it could not be evicted, so the room
+could never be seeded while the browser was connected. `harmonics`,
+`create_rule` and the clip→worker-model leg were not exercised live. A finding
+worth carrying forward: Reachy's hardware AEC is scoped to **the daemon's own
+playback**, not to the speaker as a device (2.06x for its own voice vs 4.72x
+peak for PipeWire playback, at its own mic) — which is why a probe listening on
+the tee can never prove the robot's own voice was audible.
 
 ### `pat` noun — bench-only proprioceptive touch + snuggle (SDK-first)
 
@@ -1042,10 +1231,12 @@ disables only the tool; cognition keeps running.
 
 ## Hard constraints
 
-- **Base runtime dependencies — SDK-first, but installable.** Two packages are
-  **base** runtime dependencies (`pyproject.toml`): `numpy` (the RMS loudness
+- **Base runtime dependencies — SDK-first, but installable.** There are exactly
+  **three** (`pyproject.toml`, pinned by
+  `tests/test_dep_freeze.py`); two of them are `numpy` (the RMS loudness
   detector) and `harmonics-cli>=0.8` (the harmonic voice backend, import
-  package `harmonics` — see the `say` noun internals above).
+  package `harmonics` — see the `say` noun internals above). The third is
+  `events-cli` — see its own decision record in the next bullet.
   Both are pure wheels that install everywhere; `harmonics-cli` additionally
   has **zero transitive runtime deps** and is org-owned (AgentCulture), which
   is why it earns a base-dep exception — that exception does NOT extend to any
@@ -1076,7 +1267,18 @@ disables only the tool; cognition keeps running.
   JPEG-encode leg): lazy-imported, absent by default, and a missing extra leaves
   `behavior/face_sense.py` permanently quiet (one logged warning, `face` /
   `frame_available` never populated) instead of crashing the loop —
-  `pip install 'reachy-mini-cli[vision]'` to enable it.
+  `pip install 'reachy-mini-cli[vision]'` to enable it. `[vision]` also carries
+  the embodiment layer's rolling clip (`behavior/clip_rider.py`), on the same
+  terms.
+  The `[bench]` extra (`sounddevice>=0.4,<0.6`) is the newest and the narrowest:
+  it serves ONLY the embodiment layer's `bench` media profile (dev-box mic +
+  speakers, so the layer is testable on a box with no robot). It stays an extra
+  for the usual reason — `sounddevice` binds PortAudio, a system library absent
+  on a bare box and in CI — and, more importantly, because the **deployed path
+  needs none of it**: the shipped `robot` profile hears through the runtime's
+  tee socket and speaks through the daemon's `http` route, both stdlib. Absent,
+  `reachy/embody/media.py` logs one process-wide warning and the bench profile
+  degrades to a named `bench-audio-extra-absent` drop.
   The pixel-only `vision` noun (motion/light orienting) needs no extra —
   numpy-only, unaffected. The `behavior` engine's pat-sense pose reader
   (`reachy/robot/state_reader.py` `HeldStateReader`) adds no new dependency

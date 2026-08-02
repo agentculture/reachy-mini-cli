@@ -38,6 +38,11 @@ a **noun** you run from the shell or an agent loop:
 - **Feel a head pat and lean into it** — proprioceptive touch, no touch sensor.
   Live, this is a runtime sense; `pat` is the standalone bench check.
 - **Park itself when left alone and wake when addressed** (`sleep`).
+- **Switch on a conversational mind** — the optional
+  [embodiment layer](#the-embodiment-layer--agent-embody) (`agent embody`):
+  ears, a voice and a cue-triggered mind running *beside* the runtime, so the
+  robot answers out loud and reacts in voice when its own rules fire. Stop it
+  and the robot is exactly the symbolic presence above.
 
 See the [noun map in the README](../README.md#noun-map) for the one-line table,
 and `reachy-mini-cli explain <noun>` for the full reference of any noun.
@@ -179,6 +184,22 @@ The installed command is **`reachy-mini-cli`** (short alias: `reachy`). Running
 the `sdk` transport without the extra exits `2` with a hint to install `[sdk]` —
 never a traceback. `reachy-cli` remains a transitional alias dist that just
 pulls in `reachy-mini-cli`.
+
+Four optional extras sit on top of those two profiles. Every one is
+**lazy-imported**: absent, the feature it powers goes quiet after one named
+warning rather than crashing anything.
+
+| Extra | Pulls | Needed for | Absent means |
+|---|---|---|---|
+| `[daemon]` / `[sdk]` | `reachy-mini` (same 1.9.x wheel) | the daemon binary; the in-process SDK client | the `sdk` transport exits `2` with a hint |
+| `[vision]` | `opencv-python-headless` | face recognition, scene description, the rolling video clip | the face sense and clip rider stay permanently quiet |
+| `[cpu]` | (empty today) | on-box `openwakeword` for `sleep --wake-word` | the HTTP wake-word backend is used instead; Tier 1 wake is unaffected |
+| `[bench]` | `sounddevice` | **only** the embodiment layer's `bench` media profile (dev-box mic + speakers) | the bench profile degrades to a named `bench-audio-extra-absent` drop |
+
+`[bench]` is a development convenience, not part of the deployed path: the
+layer's shipped `robot` profile hears through a unix socket and speaks through
+`urllib`, both stdlib. (`[gpu]` exists as a generic compute-class pin for
+future GPU features; it bundles no model.)
 
 ---
 
@@ -375,11 +396,17 @@ at card 0 drives the robot's hearing exactly as a nearby human voice would.
 > robot's OWN playback, precisely because AEC cancels it — that is the whole
 > point of the channel selection above. A 2026-07-23 loopback measurement
 > found `rms_ratio 0.92`: the mic went *quieter* during the robot's own
-> playback, while the sound was plainly audible in the room to a human ear.
-> Verify the robot's own voice with the daemon's ALSA playback log line
-> (`Using ALSA device reachymini_audio_sink for playback`, see [the
-> ALSA-sharing fact](#speech--the-say-field-gives-a-rule-a-voice)) plus a
-> human ear — never with mic RMS.
+> playback, while the sound was plainly audible in the room to a human ear. A
+> 2026-08-02 measurement put a number on the asymmetry: **2.06×** baseline for
+> the robot's own voice (cancelled) against **4.72× peak** for anything else
+> played into the same speaker (not cancelled) — Reachy's AEC is scoped to the
+> daemon's own playback, not to the speaker as a device. So verify the robot's
+> own voice with a **human ear** plus the runtime's own
+> `[SENSE stage=speech source=say …] spoke` line — never with mic RMS. (On the
+> `http` playback route the daemon additionally logs `Using ALSA device
+> reachymini_audio_sink for playback`; the shipped `sdk` route pushes through
+> the runtime's held client instead and produces no daemon line — see
+> [Speech](#speech--the-say-field-gives-a-rule-a-voice).)
 
 ---
 
@@ -442,7 +469,7 @@ vars override the built-in default.
 | `REACHY_TTS_ROUTE` | `chatterbox` | Which TTS wire protocol to speak: `chatterbox` (`{REACHY_TTS_URL}/v1/audio/synthesize`) or `openai` (`{REACHY_OPENAI_URL_BASE}/v1/audio/speech`). The generated `runtime` unit bakes `openai` in as an `Environment=` directive | `speech/tts.py`, `service/units.py` |
 | `REACHY_TTS_MODEL` | `ResembleAI/chatterbox` | Model id sent on the `openai` TTS route | `speech/tts.py` |
 | `REACHY_VOICE_ENGINE` | `tts` for `say`; **`harmonic`** for the behavior runtime | Speech backend: `tts` or `harmonic`. The symbolic runtime defaults the other way on purpose — its voice must work with nothing reachable | `speech/voice.py`, `behavior/speech_act.py` |
-| `REACHY_SPEECH_TRANSPORT` | `http` | How the behavior runtime's voice reaches the speaker: `http` (upload + play via the daemon) or `sdk` (push PCM in-process). Falls back to `REACHY_TRANSPORT`; `http` is the default because the daemon and the runtime share `/dev/snd/pcmC2D0p` through the `reachymini_audio_sink` ALSA plugin device — not because the SDK path is broken (issue #94 is closed) | `behavior/speech_act.py` |
+| `REACHY_SPEECH_TRANSPORT` | `sdk` | How the behavior runtime's voice reaches the speaker: `sdk` (push PCM through the media session the runtime **already holds**) or `http` (upload + play via the daemon). Precedence is by presence: this variable, then `REACHY_TRANSPORT`, then `sdk`. The `sdk` default is safe precisely because it never opens a second `ReachyMini` — it fans out of the one held client — and `http` stays one variable away, and is the automatic fallback when no held session exists yet | `behavior/speech_act.py` |
 | `REACHY_HARMONIC_IDENTITY` | `reachy` | Harmonic voice identity signature (root pitch + instrument) | `speech/harmonic.py` |
 | `REACHY_HARMONIC_ARTICULATION` | `smooth` | Harmonic rendering style: `discrete` / `speechy` / `smooth` / `alien` | `speech/harmonic.py` |
 | `REACHY_OPENAI_URL_BASE` | `http://localhost:8000` | OpenAI-compatible LLM base URL for `agent attach`'s cognition and the engagement classifier (legacy: `REACHY_LLM_BASE_URL`). **Also the runtime's HEARING endpoint fallback** since the realtime arc (issue #115): an `http(s)` value here is mapped to `ws(s)://…/v1/realtime` whenever `REACHY_REALTIME_URL` is unset. Pointing this at a chat-only gateway with no `/v1/realtime` route gets a refused handshake and a deaf robot — see [Hearing over the lobes realtime session](#hearing-over-the-lobes-realtime-session) | `speech/llm.py`, `speech/realtime.py` |
@@ -461,6 +488,18 @@ vars override the built-in default.
 | `FORGE_BASE_URL` | `http://localhost:8001/v1` | Coder-model endpoint the `forge` tool dispatches to (the lobes gateway's cortex route) | `forge/client.py` |
 | `FORGE_MODEL` | `qwen3` | Coder-model id sent in the forge dispatch request | `forge/client.py` |
 | `FORGE_API_KEY` | (unset) | Bearer key for the forge endpoint, sent only when present | `forge/client.py` |
+| `REACHY_AUDIO_TEE` | (unset → **on**) | Kill switch for the runtime's audio tee (the additive leg the embodiment layer hears through). Falsey disables it; absent means enabled, because the deployed unit's `ExecStart` carries no flags | `behavior/audio_tee.py` |
+| `REACHY_AUDIO_TEE_SOCKET` | `<state-dir>/audio_tee.sock` | Explicit tee socket path. Read by **both** ends, so one variable moves the pipe and neither half can move alone | `behavior/audio_tee.py`, `embody/media.py` |
+| `REACHY_CLIP_SECONDS` | `6.0` | X — how many seconds of camera frames the rolling clip ring keeps before each re-encode | `behavior/clip_rider.py` |
+| `REACHY_EMBODY_MEDIA_PROFILE` | `robot` | Embodiment-layer media profile: `robot` (tee socket in, daemon HTTP route out) or `bench` (dev-box mic + speakers). `--media-profile` wins | `embody/media.py` |
+| `REACHY_EMBODY_WORKER_MODEL` | `worker` (the lobes ROLE name) | Model id for the layer's tool-bearing turns. Process env only — an `environment.d` drop-in would re-point the runtime's engagement classifier too | `embody/engine.py` |
+| `REACHY_EMBODY_SENSES_MODEL` | `senses` (the lobes ROLE name) | Model id for the layer's tool-less perception questions | `embody/engine.py` |
+| `REACHY_EMBODY_TARGET_SAMPLE_RATE` | `16000` | The one rate every layer audio read is normalised to — the runtime's measured mic rate, so the `robot` profile resamples nothing and only `bench` converts | `embody/media.py` |
+| `REACHY_EMBODY_BENCH_INPUT_DEVICE` | (system default) | Bench capture device. Point it at the `module-echo-cancel` **source** for AEC | `embody/media.py` |
+| `REACHY_EMBODY_BENCH_OUTPUT_DEVICE` | (system default) | Bench playback device. Point it at the paired echo-cancel **sink** — using only one half of the pair gets no cancellation | `embody/media.py` |
+| `REACHY_EMBODY_BENCH_SAMPLE_RATE` | (device rate, else `48000`) | Native bench capture rate, when the device cannot be asked | `embody/media.py` |
+| `REACHY_EMBODY_ROBOT_SAMPLE_RATE` | `16000` | Fallback native rate for the tee reader, used **only** when the tee header announces `samplerate: null` (a cold media holder). The header is authoritative whenever it carries a rate | `embody/media.py` |
+| `REACHY_EMBODY_TEE_SOCKET` | (unset — uses `REACHY_AUDIO_TEE_SOCKET`) | Reader-side-only override, for deliberately pointing the layer at a different socket than the runtime writes | `embody/media.py` |
 
 Legacy `REACHY_LLM_BASE_URL` / `REACHY_LLM_MODEL` / `REACHY_LLM_API_KEY` are
 still honoured as a fallback for the three `REACHY_OPENAI_*` names above.
@@ -1861,25 +1900,48 @@ has a voice. Set `REACHY_VOICE_ENGINE=tts` to use the external Chatterbox
 endpoint instead (see [the harmonic voice](#the-harmonic-voice) for the
 identity and articulation knobs, which apply here unchanged).
 
-**Playback goes through the daemon by default.** Audio is uploaded to the
-daemon and played there (`REACHY_SPEECH_TRANSPORT=http`, the default) rather
-than through an in-process SDK media session. That default is NOT because the
-SDK path is broken — issue #94 (a media-profile SDK client failing to
-construct) is **closed**: measured 2026-07-23, `HeldMediaClient` warms up in
-1032 ms and delivers 9/10 camera frames plus live mic audio, and the runtime
-does this unprompted on every boot. The real reason is **ALSA sharing**: the
-daemon and the runtime hold `/dev/snd/pcmC2D0p` *simultaneously* through the
-`reachymini_audio_sink` plugin device defined in `~/.asoundrc`. The
-single-SDK-owner model (see [above](#the-single-sdk-owner-model)) constrains
-the *media session* — the single-consumer SDK client — not the *ALSA sink*,
-so playback via the daemon's HTTP route was never in contention with the
-runtime's held client. Verified 2026-07-23: with the runtime live and holding
-media, `POST /api/media/sounds/upload` → 200 and `POST /api/media/play_sound`
-→ 200, the daemon logged `Using ALSA device reachymini_audio_sink for
-playback`, and a human in the room confirmed the clip was audible. The
-daemon route needs no `[sdk]` extra, which is why it stays the default; set
-`REACHY_SPEECH_TRANSPORT=sdk` to push PCM through the SDK instead — one
-variable, no code change.
+**Playback goes through the media session the runtime already holds.** The
+shipped default is `REACHY_SPEECH_TRANSPORT=sdk`, and resolution is by
+presence: `REACHY_SPEECH_TRANSPORT`, then `REACHY_TRANSPORT`, then `sdk`.
+
+Read that default carefully, because "sdk" here does **not** mean "open the
+SDK". The runtime's voice pushes PCM into `HeldMediaClient` — the *one* media
+session the loop already owns for its ears and eyes — handed to
+`SpeechActuator` as an injected `media_session_provider`. Speech is a fan-**out**
+leg of that single client exactly as loudness and hearing are fan-**in** legs
+of it. Without the provider the same `sdk` path would call
+`playback._open_sdk_media()` and construct a **second** `ReachyMini`, which is
+the one move [the single-SDK-owner model](#the-single-sdk-owner-model) forbids;
+the provider is what makes the default legal, not the word `sdk`.
+
+Two measurements put it there, and neither is the retired issue #94 premise.
+Issue #94 (a media-profile SDK client failing to construct) is **closed** — measured
+2026-07-23, `HeldMediaClient` warms in 1032 ms and delivers 9/10 camera frames
+plus live mic audio, unprompted, on every boot — so the older `http` default
+lost its justification. And the push tolerates the speech worker thread (live
+probe 2026-07-24): a clip pushed from the worker while a reader thread drained
+`client.audio()` gave 198 clean reads, zero read errors and no reader stall;
+`push_audio_sample` buffers and returns in ~8 ms for a 5.76 s clip. Using the
+held client also removes the voice's dependence on **daemon media state**
+entirely, which is the durable fix beneath #122's quick `http` re-enable.
+
+**`http` is still first-class — one variable away, and the automatic
+fallback.** `REACHY_SPEECH_TRANSPORT=http` uploads to the daemon and plays
+there, and the runtime falls back to that route *by itself* whenever the
+provider yields no session: a holder that has not warmed yet, or a box with no
+`[sdk]` extra at all. Falling back to `http` rather than to
+`_open_sdk_media()` is the deliberate part — opening a second client is the
+defect being avoided, and the daemon route reaches the same physical speaker
+anyway. It was never in contention with the held client: the daemon and the
+runtime hold `/dev/snd/pcmC2D0p` *simultaneously* through the
+`reachymini_audio_sink` plugin device defined in `~/.asoundrc`, because the
+single-SDK-owner model constrains the *media session*, not the *ALSA sink*.
+Verified 2026-07-23 with the runtime live and holding media: `POST
+/api/media/sounds/upload` → 200, `POST /api/media/play_sound` → 200, the daemon
+logged `Using ALSA device reachymini_audio_sink for playback`, and a human in
+the room confirmed the clip was audible. The route is pure `urllib` and needs
+no extra, which is why a bare `pip install reachy-mini-cli` box still has a
+voice.
 
 **Nothing slow happens on the engine tick.** Synthesis and playback both run
 on a background worker; the tick thread only hands over the text. A wedged or
@@ -2301,6 +2363,369 @@ the runtime feed the rules-only proof above just checked.
 
 ---
 
+## The embodiment layer — `agent embody`
+
+Everything above describes a robot whose presence is **symbolic and mute in
+conversation**. `reachy-mini-cli agent embody` is the optional other half: a
+detachable realtime harness that gives Reachy ears, a voice and a
+cue-triggered mind — running *beside* the runtime, never inside it.
+
+**Before.** A conversational mind existed only behind `agent attach`, and
+`attach` is turn-based, text-cue-driven, and **publish-only**: its
+`speak`/`harmonics`/`apply_pose` tools emit feed blocks and touch nothing, and
+it has no transcript cue at all — no external surface carries the words the
+robot heard (issue #93, still open). So the robot could react to a rule firing
+in *motion*, and could publish what an agent *proposed* saying, but nothing in
+that process ever made a sound and nothing outside the runtime ever heard a
+word.
+
+**After.** With the layer running, Reachy holds an out-loud conversation over
+one duplex realtime session, reacts **in voice** when its own rules fire (a
+scratch can draw a spoken response), and takes direct-operation commands —
+move the head/antennas/body, make a sound, run a set of movements, author a
+new rule-triggered reaction. With the layer stopped, the robot is exactly the
+symbolic presence the rest of this guide describes.
+
+**It really is a peripheral.** That is the arc's central promise, and it was
+checked rather than asserted ([the equivalence proof](evidence/2026-08-02-runtime-equivalence.md)):
+the entire footprint inside `reachy/behavior/` is **3 files, 6 diff hunks,
+1486 inserted lines and 0 deleted lines**, and every hunk classifies as one of
+the two additive export legs below. Nothing in the decision loop was rewired,
+nothing was removed, and the layer is a separate process you start and stop.
+Swapping the mind is configuration too, not code: the models are chosen
+**per request** from `REACHY_EMBODY_WORKER_MODEL` / `REACHY_EMBODY_SENSES_MODEL`
+(process env only — an `environment.d` drop-in would silently re-point the
+runtime's own engagement classifier as well).
+
+`agent embody --help` and `reachy-mini-cli explain agent embody` are the flag
+reference; this section is the operator's picture.
+
+### The four channels
+
+```mermaid
+graph LR
+    subgraph RUNTIME["behavior engine run (unchanged)"]
+        TICK["50 Hz tick<br/>rules + arbitration"]
+        TEE["audio tee<br/>(additive leg)"]
+        CLIP["clip rider<br/>(additive leg)"]
+        FEED["runtime feed / bus<br/>sense · rule · intent · motion"]
+    end
+
+    subgraph LAYER["agent embody (a separate process)"]
+        DUPLEX["ONE lobes /v1/realtime session<br/>server VAD in · response audio out"]
+        MIND["streaming /v1/chat/completions<br/>worker · senses"]
+        TOOLS["five tools<br/>goto · run_behavior · speak · harmonics · create_rule"]
+    end
+
+    TEE -->|"unix socket, mono f32"| DUPLEX
+    FEED -->|"cues"| MIND
+    CLIP -->|"path reference"| MIND
+    DUPLEX -->|"utterances"| MIND
+    MIND --> TOOLS
+    DUPLEX -->|"spoken reply"| SPK["speaker<br/>daemon http route"]
+    TOOLS -->|"intents spool / rules overlay"| TICK
+```
+
+- **EARS + MOUTH — one duplex session.** The layer holds exactly **one** lobes
+  `/v1/realtime` WebSocket. The server's own VAD decides where a sentence
+  ended; the session is armed with a single `response.create`, and the spoken
+  reply comes back as audio deltas that get played out. Only three frame kinds
+  ever leave the socket (session config, audio append, `response.create`) — no
+  tool call rides it, because lobes parks socket tool-calling upstream.
+  **Hearing here is UNGATED**: unlike the runtime's transcript sense it runs no
+  engagement gate and no name match, so it hears every voice in the room,
+  including utterances the runtime would drop as ambient. That is structural,
+  not a setting — nothing in the module's import closure reaches either gate.
+- **PERCEPTION — the runtime's own events, as cues.** The layer reads the same
+  `sense`/`rule`/`intent`/`motion` lines `agent attach` reads and maps them to
+  short first-person cues. **A rule firing is the headline input**, not an
+  afterthought: it is what lets the robot answer out loud about its own
+  reflexes. The MQTT bus is the intended primary route; `events-cli` is
+  publish-only today (it ships no `subscribe` surface at all), so intake
+  degrades — with one named drop, never silently — to tailing the NDJSON feed
+  from `--feed <path|->`.
+- **COGNITION — every call streams.** Turns go over
+  `/v1/chat/completions` with `stream=true`, model per request. Streaming is
+  not a style choice: with thinking enabled the deployed gateway took **9–18 s**
+  to the first content delta while the largest gap *between* deltas anywhere
+  was **0.275 s**
+  ([the thinking-deltas probe](evidence/2026-08-02-probe-thinking-vs-reasoning-deltas.md)).
+  So the stall detector is armed on **inter-chunk idle**, never on
+  total elapsed — a deadline long enough to survive a real think is useless for
+  catching a real stall. For the same reason `enable_thinking` stays **off**:
+  9–18 s before the robot says or does anything is disqualifying for a
+  conversational harness. The consequence is honest and visible — the exported
+  `thinking` block carries cues, reply text, tool calls and tool results, but
+  **no model reasoning**. The seam is dormant, not broken; one flag fills it.
+- **ACTION — a closed five-tool set.** `goto`, `run_behavior`, `speak`,
+  `harmonics`, `create_rule`. There is no shell, no filesystem tool, no network
+  tool, and no way to register a sixth.
+
+### Containment — an ungated ear does not widen actuation
+
+The layer hears everyone, so containment cannot depend on *who* is speaking. It
+depends on what the layer can reach at all, and every tool wraps a surface that
+**already validates fail-closed**, with no second copy of any bound:
+
+| Tool | The existing gate it goes through |
+|---|---|
+| `goto` | the shipped goto handler — per-axis bounds, the 10 s duration cap; refuses, never clamps |
+| `run_behavior` | the intent driver's library-name/param checks and the unbounded-lifetime refusal |
+| `speak` / `harmonics` | the one shared 500-character `say` cap (`MAX_SAY_CHARS`), imported rather than restated |
+| `create_rule` | the real rules validator: a candidate overlay is handed to the loader and only `os.replace`d into place if it passes |
+
+Motion and behavior actions run the shipped validator **synchronously as a
+pre-flight** before the spool write, for a specific reason: a model that gets
+back "submitted" concludes it succeeded, and *a refusal the model cannot see is
+not a refusal*. Every refusal comes back into the conversation as a tool result
+and lands on the export feed.
+
+### Media profiles — configuration, not a code fork
+
+| Profile | Ears | Mouth | For |
+|---|---|---|---|
+| `robot` (default) | the runtime's **audio tee** socket | the daemon's **HTTP media route**, `transport="http"` named explicitly on every call | the deployed box |
+| `bench` | the dev-box microphone | the dev-box speakers | a machine with no robot attached |
+
+Both run through literally the same two classes — there is no subclass per
+profile and no `isinstance` fork anywhere; a profile only decides which small
+backend object gets injected. Select with `--media-profile` or
+`REACHY_EMBODY_MEDIA_PROFILE`.
+
+The robot sink hard-codes `transport="http"` rather than letting it resolve,
+and that is the one place in this repo where hard-coding is the *safe*
+choice: `play_audio`'s own default is `sdk`, and the layer has no held media
+session to push into, so resolving would open a **second `ReachyMini`** — the
+move [the single-SDK-owner model](#the-single-sdk-owner-model) forbids. An
+operator's `REACHY_TRANSPORT=sdk` therefore cannot steer the layer onto the
+SDK path. (Contrast the *runtime's* voice, which defaults to `sdk` precisely
+because it *does* hold a session — see
+[Speech](#speech--the-say-field-gives-a-rule-a-voice).)
+
+The bench profile needs the **`[bench]` extra** (`pip install
+'reachy-mini-cli[bench]'`, which pulls `sounddevice`). The deployed path needs
+none of it: the robot profile hears through a unix socket and speaks through
+`urllib`, both stdlib. Bench AEC is an OS-level module you load once, outside
+the process, and **both** ends must point at the pair it creates:
+
+```bash
+pactl load-module module-echo-cancel aec_method=webrtc \
+    source_name=embody_echo_cancel_source sink_name=embody_echo_cancel_sink
+export REACHY_EMBODY_BENCH_INPUT_DEVICE=embody_echo_cancel_source
+export REACHY_EMBODY_BENCH_OUTPUT_DEVICE=embody_echo_cancel_sink
+```
+
+Pointing only one end at it gets you a mic with no cancellation. A module that
+was never loaded degrades to "the bench mic has no AEC", never a crash.
+
+### The two additive legs inside the runtime
+
+The layer never opens a media session, so the runtime has to hand it raw media.
+It does that through two legs that are **on by default** and that a stopped
+layer costs nothing:
+
+- **The audio tee** (`<state-dir>/audio_tee.sock`) is a **third consumer of the
+  one per-tick mic chunk** the runtime already takes — never a second `take()`,
+  which is the documented defect that hands each consumer half the audio. It
+  writes one self-describing JSON header line, then contiguous mono float32.
+  A slow or dead consumer **drops** through a bounded queue and is named
+  (`dropped reason=consumer-slow`); it never backpressures the 20 ms tick.
+  `REACHY_AUDIO_TEE=0` is the kill switch; absent means on.
+- **The clip rider** keeps a rolling ring of the last `REACHY_CLIP_SECONDS`
+  (default 6.0 s) of camera frames and encodes them, on a background worker,
+  into **one overwrite-in-place** `clip.mp4` under `<state-dir>/behavior/`.
+  Only a **path reference** is published — on `state.json`'s `clip` key, and so
+  onto the retained bus tree — never the bytes. Encoding never touches the tick
+  thread; the tick-side call is a timestamp and a bounded append. Without the
+  `[vision]` extra the rider is permanently quiet after one logged warning.
+
+**Measured cost to the runtime: none.** Over matched 100-second windows
+([the on-box verification](evidence/2026-08-02-t15-on-box-verification.md)), counting the overrun
+ticks the runtime itself reports:
+
+| Tee consumer | Overrun ticks |
+|---|---|
+| none | **0** |
+| active — 6,721,627 B read in 105 s (= 64 kB/s = 16 kHz × float32) | **0** |
+| wedged — connected, never reads | **0** |
+
+The wedged case is the important one, and it behaved as designed: the runtime
+*named* the condition and the consumer lost only its own audio.
+
+> **One overrun that exists anyway is NOT this arc's.** With the camera alive
+> the runtime does sit in a continuous ~5 % overrun streak (`mean_ms=21.06`).
+> The same streak is in the journal from **Jul 30**, days before this arc's
+> first commit, at `mean_ms=21.03`. It correlates with camera frame processing
+> and is filed separately as issue #137.
+
+If the clip reference stays `{"available": false, "reason": "no-clip-yet"}`
+while the journal repeats `[SENSE stage=vision source=clip event=clip] dropped
+reason=encode-refused`, the encoder is refusing the file — the shipped bug of
+this class was `cv2.VideoWriter` choosing its container from the filename
+*suffix*, so a temp name ending `.tmp` matched no format and silently opened
+nothing. That is fixed (the marker now goes **before** the extension), and the
+reason it took ten minutes rather than an afternoon to find is that the leg
+failed loudly, by name, every 5 s.
+
+### Lifecycle — one command each way, and what deliberately survives
+
+```bash
+reachy-mini-cli behavior engine run --export - > /tmp/runtime.feed &   # the runtime
+reachy-mini-cli agent embody --feed /tmp/runtime.feed --export -       # foreground
+
+reachy-mini-cli agent embody start --feed /tmp/runtime.feed            # or: background
+reachy-mini-cli agent embody status
+reachy-mini-cli agent embody stop
+```
+
+`start` is idempotent (a second one reports `already-running` instead of
+spawning a twin) and tracks a pid + log under the state dir
+(`embody.pid` / `embody.log`) — the same shape `sleep`, `vision` and `behavior
+engine` already use. `stop` sends SIGTERM then SIGKILL, and signals **only the
+pid this CLI tracked**: a stale or reused pid is detected and left untouched,
+so a sibling runtime or daemon process is never at risk.
+
+**No systemd unit ships for the layer.** `service`'s presence pair stays
+exactly the closed `demo`/`runtime` pair it is — a layer unit added there would
+disable the very runtime the layer needs.
+
+**The persist-on-disable rule contract.** Stopping the layer removes the
+process — and with it its connection to the runtime's tee socket, which the
+runtime owns and keeps — and **nothing on disk**. Specifically, any rule
+the layer authored through `create_rule` **PERSISTS** in the rules overlay and
+keeps running inside the runtime after the layer is gone. That is a deliberate
+product decision, not an oversight: *the robot keeps what it was taught.* The
+`embody-` id prefix is enforced on every write, which is what makes the set
+enumerable and removable as a set — and layer writes are temp+rename and merge
+per rule id, so an operator-authored rule is never clobbered:
+
+```bash
+RULES=$(reachy-mini-cli behavior rules --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])')
+grep -n 'id = "embody-' "$RULES"      # exactly what the layer taught the robot
+```
+
+Delete those blocks and `reachy-mini-cli behavior reload` to forget them.
+
+### Observability — every failure is named twice
+
+`--export -` publishes the same `thinking`/`message`/`emotion` NDJSON feed
+`agent attach` does ([`docs/export-schema.md`](export-schema.md)), and **every**
+named failure — a dead session, a dead LLM, a dead speaker, a refused action, a
+feed that went away — appears both as a `[SENSE stage=embody …]` line on stderr
+and as a block on that feed. A consumer that disconnects mid-conversation never
+kills the layer.
+
+One difference from `agent attach` matters to anyone rendering the feed: the
+layer's voice tools are **real**, not publish-only. A `message` block from
+`agent embody` is either an utterance it is dispatching to a live speaker or one
+the duplex session has already spoken aloud — where the same block from `agent
+attach` is an intention no speaker in that process reproduces.
+
+The layer has no systemd unit, so its lines are **not** in the journal: in the
+foreground they are on stderr, and under `agent embody start` they are in
+`embody.log` under the state dir.
+
+```bash
+# foreground — everything the layer did, live (stderr only; --export - keeps stdout pure)
+reachy-mini-cli agent embody --feed /tmp/runtime.feed 2>&1 >/dev/null \
+  | grep -E 'stage=(embody|duplex|turn|cue)'
+
+# background — the same lines, and just the failures
+STATE="${REACHY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/reachy}"
+tail -f "$STATE/embody.log" | grep 'dropped reason='
+```
+
+### Two things worth knowing before you set a room up
+
+**Reachy's echo cancellation is scoped to the daemon's own playback, not to the
+speaker as a device.** Measured at the robot's own microphone, through the tee
+([the live-acceptance run](evidence/2026-08-02-t14-live-acceptance.md)):
+
+| Audio path | Played by | What Reachy's mic hears |
+|---|---|---|
+| the daemon route (`/api/media/*`) | Reachy's own voice | **2.06×** baseline — cancelled |
+| PipeWire (`paplay`) | anything else in the room | **4.72× peak, 5.84× p95** — not cancelled |
+
+Two consequences. A second party can share the robot's one physical speaker and
+still be heard, which is what makes a single-speaker bench viable at all. And
+an instrument listening on the tee **cannot** prove the robot's own voice was
+audible — that channel is engineered specifically to remove it, so "audible in
+the room" needs a human, not a probe.
+
+**`--mute-during-playback` is off by default, on purpose.** The hardware AEC
+above is why the layer keeps hearing while it talks (which is also what makes
+barge-in possible at all). It is the one-flip fallback if AEC proves
+insufficient on a given box. Note also that the runtime's own `say` voice and
+the layer's voice are both live at once, deliberately: double-voice is
+accept-and-observe for now, and coordination becomes a follow-up only if real
+collisions show up.
+
+### What is proven live — and what is not
+
+Run 2026-08-02 on the deployed robot with `reachy-daemon` and `reachy-runtime`
+live throughout ([live acceptance](evidence/2026-08-02-t14-live-acceptance.md) and
+[on-box verification](evidence/2026-08-02-t15-on-box-verification.md)). Read this before
+telling anyone the layer "works". The session ran in the **robot** profile
+rather than bench — a recorded deviation — because with a single audio output
+on the box, bench would have put both conversational parties on the same
+devices; robot profile also exercises the deployed path.
+
+**Demonstrated on real hardware:**
+
+- The layer came up against the live runtime: the tee wire negotiated
+  (`format=f32le rate=16000 Hz`, measured 16016 Hz against 16000 declared —
+  0.1 %) and the duplex session came up armed with server-side VAD.
+- **Hear → think → speak, out loud.** One turn produced 134,400 bytes of
+  24 kHz PCM16 ≈ **2.8 seconds of speech** through Reachy's speaker, and the
+  export feed carried all three block types for it.
+- **A rule fire produced a reaction.** A `pat-acknowledge` fire reached the
+  layer as a cue and drove a six-round turn — the capability the whole arc was
+  requested for.
+- **The robot physically moved on the layer's instruction**, confirmed from the
+  *runtime's* own journal rather than the layer's: `run_behavior` (nod ×4) and
+  `goto` (×2, antennas + head) were admitted and applied by the live engine.
+- The runtime's transcription session and the layer's duplex session ran
+  **concurrently for five minutes** against the same gateway, one session
+  throughout (`sessions=1`, `connect_failures=0`), with zero hearing drops on
+  the runtime side and its tick time unchanged.
+- The layer's own sink played through the daemon route while the engine held
+  media, with **no ~1 Hz throttle**: all eight sense providers stayed
+  available, heartbeat age 0.0 s, tick unchanged.
+
+**Not achieved, and why:**
+
+- **A sustained two-way conversation between the browser harness and the layer
+  did not happen.** Both sides were individually live — Reachy spoke aloud, the
+  browser held an armed session with a working mic — but the dev box has
+  **one** audio output, and the browser's PipeWire playback stream on it could
+  not be evicted (`pactl kill-sink-input` left it in place; `paplay` then
+  failed with `Stream error: Timeout`). So the room could never be seeded with
+  a spoken prompt while the browser was connected. **The fix is a second audio
+  output** — HDMI from an awake monitor, or any second USB speaker.
+- The three coherent out-loud turns the acceptance condition asks for therefore
+  did **not** happen: there was one spoken turn and one cue-driven turn.
+- **`harmonics` and `create_rule` were not exercised live.** `speak`,
+  `run_behavior` and `goto` were.
+- **No clip was handed to the worker model live.** The wire format itself is
+  separately probe-verified (a real MP4 as an OpenAI-style `video_url` part
+  returns an accurate streamed description), and the rider now produces real
+  files — but the two ends have not been joined on the robot.
+- The echo half is only half-shown: Reachy never answered its own voice, but
+  the exchange was never long enough to prove a loop cannot form.
+- One behavioural note that is not a contract failure but is worth tuning: given
+  a *single* nod cue the model emitted four `run_behavior` nods and two gotos in
+  one six-round turn. Every call was validated and bounded; the prompt simply
+  lets it loop on one stimulus.
+- Also expect to hold the feed open: with no bus subscribe route yet, an
+  exhausted `--feed` reader ends the run, so bench sessions want a FIFO (or a
+  real `behavior engine run --export -` writer) rather than a finite file.
+
+Finally, a webcam gotcha that cost time: the C270 exposes **only** a
+`pro-audio` profile, which the browser would not open — capture worked only
+after switching the default source to a different device.
+
+---
+
 ## Troubleshooting
 
 The CLI never leaks a Python traceback — every failure is a structured
@@ -2323,7 +2748,10 @@ The CLI never leaks a Python traceback — every failure is a structured
 | The runtime / `sleep` runs but the robot never reacts to sound | `No Reachy Mini Audio Source card found` — mic not exposed as an ALSA source | The [`~/.asoundrc` gotcha](#the-asoundrc-mic-array-gotcha): pin `reachymini_audio_src`, restart the daemon |
 | `error: 'pat run' refused: a behavior engine is already driving the head` (exit 1) | The single-head invariant: a foreground sense verb refuses to join a live engine | Stop the engine first (`systemctl --user stop reachy-runtime.service`, `behavior engine stop`, or Ctrl-C the foreground run) — or just use the runtime's own pat sense instead of `pat run` |
 | A second sense noun is sluggish or feels dead | Two `sdk`-sense processes contending for the single-consumer SDK client (throttled ~1 Hz) | Run **one** `sdk` sense owner — the `behavior` runtime is the way to have several senses at once — or put the second on `--transport http`. See [the conflict matrix](#what-this-means-the-conflict-matrix) |
-| The robot answers a sentence spoken up close but never one from across the room | The capture gate never opened, so no utterance exists (`stage=capture` is silent) | Known limitation — speak closer. The fix is server-side VAD, not lowering the capture threshold |
+| The robot answers a sentence spoken up close but never one from across the room | No utterance reached the rules. Since #115 the endpointing is the **server's**, so the local threshold that used to cause this is gone — check the session instead (`stage=realtime` for a down/reconnecting session, `stage=capture` for a named drop such as `self-mute` or `no-session`) | Verify the hearing session is up before blaming distance — see [Hearing — server-side VAD replaces local endpointing](#hearing--server-side-vad-replaces-local-endpointing) for what is and is not evidenced live |
+| `agent embody` starts, then exits almost immediately | The `--feed` reader ran out of lines (a finite file), which ends the run | Point `--feed` at a live writer (`behavior engine run --export -`) or a FIFO you hold open; a finite file is only useful for a replay |
+| The layer runs but never hears anything (`stage=embody` shows no tee connection) | No runtime is writing the tee, or the two ends resolved different socket paths | Start `behavior engine run`; if you set `REACHY_AUDIO_TEE_SOCKET`, set it for **both** processes — one variable moves both ends by design |
+| The layer speaks but the robot never moves | The action was refused, not lost — every refusal is a tool result *and* a feed block | Grep the layer's output for `dropped reason=` and the `thinking` block's tool results; the shipped validators refuse out-of-range axes, unbounded lifetimes and over-long `say` fail-closed |
 | `service status` reports `mode=retired` | A retired unit (`reachy-live.service` / `reachy-listen.service`) is still enabled on this box | Back up `~/.config/systemd/user/reachy-*.service*`, then run `service enable runtime` — the purge is part of every `service` verb |
 | `--no-audio-wake` / `--wake pat` exits `2` on `http` | Pat-wake needs the head-pose read-back, which is `sdk`-only | Use the `sdk` transport for pat-based wake |
 | `device state` / `head_pose`-based ops fail on `http` | The `http` transport cannot read the head pose back | Use the `sdk` transport for pose read-back |
@@ -2504,16 +2932,19 @@ running loop uses without reading unit files.
 See [Boot persistence — one presence per reboot](#boot-persistence--one-presence-per-reboot)
 for the operator workflow.
 
-### Symbolic runtime (agent attach)
+### External agents (agent attach, agent embody)
 
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
-| `agent` | attach an external AI agent over the runtime's event feed; acts through the four intent tools (`run_behavior`/`declare_goal`/`set_mode`/`set_inhibition`) via the intents spool; publishes its own cognition feed | the `behavior engine run --export -` feed (`--feed`) | intent-spool commands, not the robot directly | none (feeds + intent spool, not the robot) |
+| `agent attach` | attach an external AI agent over the runtime's event feed; acts through the four intent tools (`run_behavior`/`declare_goal`/`set_mode`/`set_inhibition`) via the intents spool; publishes its own cognition feed. Its voice and pose tools are **publish-only** | the `behavior engine run --export -` feed (`--feed`) | intent-spool commands, not the robot directly | none (feeds + intent spool, not the robot) |
+| `agent embody` (+ `start`/`stop`/`restart`/`status`) | the [embodiment layer](#the-embodiment-layer--agent-embody): ears + a mouth on one lobes `/v1/realtime` duplex session, a streaming cognition loop, and a closed five-tool action set (`goto`, `run_behavior`, `speak`, `harmonics`, `create_rule`). Its voice is **real**. Runs beside the runtime; enabling or disabling it changes nothing about how the robot behaves alone | the runtime feed **or** the MQTT bus, plus mic audio off the runtime's audio tee | the intents spool + the `embody-`prefixed rules overlay; audio out through the daemon HTTP media route | none (tee socket, feeds, spools, daemon HTTP) |
 
 `behavior` (above, under [Idle presence](#idle-presence)) is the deterministic
 50 Hz engine `agent` attaches to. See [The symbolic
 runtime](#the-symbolic-runtime) for the rules.toml schema, the three
-end-to-end client walkthroughs, and the zero-token rationale.
+end-to-end client walkthroughs, and the zero-token rationale, and [The
+embodiment layer](#the-embodiment-layer--agent-embody) for the optional
+conversational half.
 
 ### Agent-first introspection (no robot needed)
 
@@ -2539,15 +2970,19 @@ with `--export-blocks` (e.g. `--export-blocks message,emotion`). The exporter
 is a passive, broken-pipe-safe tap on the cognition loop: a disconnecting
 consumer never blocks or kills the loop.
 
-> **A `message` block is an intent to speak, not proof of sound.** `agent
-> attach` composes its `speak` / `harmonics` / `apply_pose` tools
-> **publish-only**, so a `message` is what the agent *proposed* saying and an
-> `emotion` is what it *proposed* expressing — neither touches the robot. The
-> speech you actually hear comes from a rule's `say` in the runtime, through
-> `SpeechActuator`, and carries **no block of its own** on either feed (the
-> runtime logs it as `[SENSE stage=speech source=say …]` instead). A renderer
-> that captions a `message` as "the robot said this" is captioning an
-> intention.
+> **Whether a `message` block is proof of sound depends on which process
+> produced it.** `agent attach` composes its `speak` / `harmonics` /
+> `apply_pose` tools **publish-only**, so a `message` is what the agent
+> *proposed* saying and an `emotion` is what it *proposed* expressing — neither
+> touches the robot; a renderer that captions those as "the robot said this" is
+> captioning an intention. `agent embody` is the opposite case: its voice tools
+> are **real**, so a `message` there is an utterance dispatched to a live
+> speaker (or one the duplex session has already spoken). Its `emotion` blocks
+> stay observational — the layer has no pose tool, so the block reports an
+> emoji found in the model's own reply, not a head that moved. Speech from the
+> runtime itself (a rule's `say`, through `SpeechActuator`) carries **no block
+> of its own** on either feed; the runtime logs it as `[SENSE stage=speech
+> source=say …]` instead.
 
 The full wire-format contract is in [`docs/export-schema.md`](export-schema.md).
 
@@ -2605,6 +3040,20 @@ What is honestly **not** delivered, so you do not go looking for it:
   Both engines are in the tree; nothing wires them today — see [Vision, faces
   and scene](#vision-faces-and-scene-become-events).
 - **The behavior stash is Python-API only** — no CLI verb, no agent tool.
+- **The embodiment layer has not held a sustained two-way conversation.** It
+  demonstrably heard, thought, spoke aloud and moved the robot on real
+  hardware — but the back-and-forth acceptance run was blocked by having one
+  audio output on the box, and `harmonics`, `create_rule` and the
+  clip→worker-model leg were not exercised live. The precise boundary is in
+  [What is proven live — and what is
+  not](#what-is-proven-live--and-what-is-not); do not round it up.
+- **The layer's `thinking` block carries no model reasoning.**
+  `enable_thinking` is off by design (it costs 9–18 s to first output), so the
+  block carries cues, reply text, tool calls and results only. The seam is
+  dormant, not broken.
+- **`events-cli` cannot subscribe yet**, so the layer's bus intake always falls
+  back to tailing the runtime's NDJSON feed. That is a reported gap with a
+  named drop, not a patched-around one.
 
 Pointers:
 
@@ -2613,6 +3062,8 @@ Pointers:
   model-free presence (`behavior` + `rules.toml` + `agent attach`) and [the
   zero-token rationale](#the-zero-token-rationale), including the one LLM edge
   that survives and how to remove it
+- [The embodiment layer](#the-embodiment-layer--agent-embody) — the optional
+  conversational mind (`agent embody`) that switches on and off beside it
 - Per-noun flag reference: `reachy-mini-cli explain <noun>`
 - Export wire format: [`docs/export-schema.md`](export-schema.md)
 - SDK-transport rationale: [`docs/adr-0001-sdk-transport-extra.md`](adr-0001-sdk-transport-extra.md)
