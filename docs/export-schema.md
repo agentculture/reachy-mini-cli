@@ -6,9 +6,14 @@ or any downstream tool). You need only this document — no Python import from
 the package is required to implement a compatible reader.
 
 There are **two, separate** feeds. This first half of the document covers the
-**cognition feed** (`thinking` / `message` / `emotion`) — whose one and only
-producer is `agent attach --export -`, the attached tool-use agent publishing
-what it perceived, said, and expressed. The **runtime feed**
+**cognition feed** (`thinking` / `message` / `emotion`) — an external mind
+publishing what it perceived, said, and expressed. It has **two** producers,
+which emit the same block types with the same fields: `agent attach --export -`
+(the turn-based tool-use agent, whose voice and pose seams are publish-only)
+and `agent embody --export -` (the embodiment layer, whose voice is real — see
+the per-block notes below, and
+[the operating guide](operating-reachy.md#the-embodiment-layer--agent-embody)).
+The **runtime feed**
 (`sense` / `rule` / `intent` / `motion`, produced by `behavior engine run
 --export -`) has its own section below —
 [Runtime Event Feed (`behavior engine run --export -`)](#runtime-event-feed-behavior-engine-run---export--).
@@ -53,15 +58,27 @@ Example line:
 
 Emitted when the agent calls a speech tool (`speak` or `harmonics`), at the
 moment that call is dispatched — **before**, and independently of, any synthesis
-or playback.
+or playback. `agent embody` emits one for a second trigger too: speech its
+duplex session already produced and played (see below).
 
-**A `message` block is an intent to speak, not proof of sound.** `agent attach`
-composes its built-in speech tools **publish-only**: the attached agent is an
-external client, the running runtime owns the robot, and so the client's
-`synthesize` and `play` seams are inert by design. The block records what the
-agent chose to say; making the robot audible is the runtime's job (a react
-rule's `say` field). A consumer rendering "what the robot said" is rendering the
-agent's utterance, which no speaker in this process reproduces.
+**Whether the block is proof of sound depends on the producer, so a renderer
+that captions it must know which one it is reading.**
+
+- **`agent attach` — an intent to speak, not proof of sound.** It composes its
+  built-in speech tools **publish-only**: the attached agent is an external
+  client, the running runtime owns the robot, and so the client's `synthesize`
+  and `play` seams are inert by design. The block records what the agent chose
+  to say; making the robot audible is the runtime's job (a react rule's `say`
+  field). A consumer rendering "what the robot said" is rendering an utterance
+  no speaker in that process reproduces.
+- **`agent embody` — a real utterance.** The layer's `speak` / `harmonics`
+  tools drive a live sink, so the block is either an utterance being dispatched
+  to the speaker (emitted at dispatch, so a synthesis or playback failure still
+  follows it as a named refusal on the same feed) or one the layer's duplex
+  session has **already spoken aloud**.
+
+Either way, speech produced by the *runtime itself* (a rule's `say`) carries no
+block on any feed — it is logged as `[SENSE stage=speech source=say …]`.
 
 | Key    | Type        | Description                       |
 |--------|-------------|-----------------------------------|
@@ -81,6 +98,12 @@ Emitted when the agent calls the `apply_pose` tool to adopt an emotional pose,
 at the same dispatch-time point and with the same "intent, not proof" semantics
 as a `"message"` block: `agent attach`'s `express` seam is publish-only too, so
 the block names the expression the agent chose, not a head that moved.
+
+`agent embody` emits the same block from a different origin: its action set has
+**no** `apply_pose` tool, so the block reports an emoji found in the model's own
+reply text, resolved against the shipped expressions catalog. It is an
+observation about the reply, never a pose that was applied — and the reply text
+is neither consumed nor rewritten by the scan.
 
 | Key    | Type              | Description                                                   |
 |--------|-------------------|---------------------------------------------------------------|
@@ -150,10 +173,11 @@ sustained intents, and motion admissions — produced by the 50 Hz
 `reachy.behavior.engine` loop and its rule evaluator
 (`reachy.behavior.rule_engine`), independent of any LLM.
 
-**Decision c27** (the `symbolic-runtime-70` design): when an external agent
-attaches to the running engine (`reachy-mini-cli agent attach` — see
+**Decision c27** (the `symbolic-runtime-70` design): when an external mind
+consumes the running engine's events (`reachy-mini-cli agent attach` — see
 [`docs/operating-reachy.md`'s symbolic-runtime
-chapter](operating-reachy.md#the-symbolic-runtime)), it publishes its OWN
+chapter](operating-reachy.md#the-symbolic-runtime) — or `agent embody`, which
+reads the same lines off this feed or off the MQTT bus), it publishes its OWN
 cognition feed through the family documented above (`thinking` / `message` /
 `emotion`) — it does **not** write into this feed, and this feed never carries
 a cognition block. The two feeds are how a human, a script, and an attached AI

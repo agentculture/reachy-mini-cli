@@ -1,5 +1,9 @@
 """Shared logging setup for the long-running loops (``behavior engine run`` /
-``sleep run``).
+``sleep run`` / ``agent embody``).
+
+Three call sites, and the third is deliberate: the embodiment layer surfaces
+every named failure as a ``[SENSE …]`` line at INFO, which the "last resort"
+handler below would drop entirely.
 
 Every module in this codebase logs via ``logging.getLogger(__name__)``, but
 nothing ever attached a handler or called ``logging.basicConfig`` — so
