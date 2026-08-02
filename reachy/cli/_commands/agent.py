@@ -1619,7 +1619,11 @@ def _compose_embody_seam(
     from reachy.embody.engine import EmbodyTurnEngine, Limits, resolve_attention_window_s
     from reachy.embody.media import build_media
     from reachy.embody.tools import EmbodyToolRegistry
-    from reachy.speech.realtime_duplex import RealtimeDuplexSession
+    from reachy.speech.realtime_duplex import (
+        DEFAULT_VOICE_PROMPT,
+        RealtimeDuplexSession,
+        resolve_voice_prompt,
+    )
 
     resolved_media = (
         media if media is not None else build_media(getattr(args, "media_profile", None))
@@ -1667,6 +1671,20 @@ def _compose_embody_seam(
         sample_rate=resolved_media.source.sample_rate,
         play=resolved_media.sink.play,
         mute_during_playback=bool(getattr(args, "mute_during_playback", False)),
+        # Connect-time voice conventions (issue #151/#153, spec c10, honesty
+        # h8, task t9): no CLI flag yet, so this is env-var-then-default —
+        # REACHY_EMBODY_VOICE_PROMPT if set (and valid), else this module's
+        # own chunk-friendly, longer-answer-permitting text. Passing `default=`
+        # HERE, at the one production construction site, is the fix for the
+        # capability having shipped with no caller: resolve_voice_prompt's own
+        # bare-call contract stays "nothing configured -> None" (an absent
+        # override is not a fault for a pure resolver), but on the deployed
+        # robot "nothing configured" must not mean "silently inherit the
+        # gateway's bare default" -- that is the whole point of this arc. A
+        # REJECTED attempt (blank or over-long) still resolves to None here,
+        # never to DEFAULT_VOICE_PROMPT -- see resolve_voice_prompt's
+        # docstring for why a rejected override is never silently repaired.
+        system_prompt=resolve_voice_prompt(default=DEFAULT_VOICE_PROMPT),
         # Opt in to per-ADMITTED-utterance arming. The wire's own default is
         # still arm-once, and against a gateway that cannot do one-shot arming
         # this degrades back to exactly that, with one named drop (h9).

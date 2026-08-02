@@ -219,7 +219,8 @@ The send surface is CLOSED (honesty condition h13)
 Exactly three things ever leave this client:
 
 1. **session config** — which rides the connect URL's query params
-   (``?input_sample_rate=``), not a frame at all;
+   (``?input_sample_rate=``, and — since task t9 — optionally
+   ``&system_prompt=``), not a frame at all;
 2. ``input_audio_buffer.append`` — one JSON TEXT frame per mic chunk;
 3. ``response.create`` — the arming frame, once per session.
 
@@ -231,7 +232,130 @@ new arc. Both halves are pinned by AST scan over this file **and over**
 :mod:`reachy.speech.realtime` — the PONG and CLOSE frames are emitted by the
 shared session mechanics that live there, so a scan of this file alone would
 be blind to half of what actually leaves. A third sender added later under any
-name, in either file, fails the suite immediately.
+name, in either file, fails the suite immediately. Task t9's
+``system_prompt`` addition is a QUERY PARAMETER on send surface item 1, not a
+new item — it widens nothing this pin counts, which is exactly what
+``test_h13_the_three_frame_pin_is_unaffected_by_a_configured_system_prompt``
+in the offline suite exists to prove in this task, alongside the pre-existing
+static h13 AST pins below (unmodified by this task).
+
+--------------------------------------------------------------------------
+Connect-time voice conventions: the ``system_prompt`` override (spec c10, h8)
+--------------------------------------------------------------------------
+**The finding.** Before this task, this client sent the realtime session no
+instructions at all, so what a listener heard was entirely the gateway's own
+default voice behaviour — this client had no way to shape its own persona,
+its reply length, or its spoken style (issue #151 item 2, issue #153).
+
+**The channel already existed; this task only adopts it.** lobes-cli's
+``lobes/realtime/_session.py``:465-540 ``parse_session_config`` accepts a
+per-session ``system_prompt`` override riding the connect config (the SAME
+query-string channel ``input_sample_rate`` already uses — see
+:func:`reachy.speech.realtime.connect_url`), and a client's own value ALWAYS
+wins over the gateway's env-level ``default_system_prompt``. So adopting it
+adds no new frame kind, only a second query parameter — see the send-surface
+section above.
+
+**Why sending a BLANK override would be actively harmful, not merely
+useless.** Chatterbox reads the reply aloud verbatim. lobes-cli's own
+``_settings.py`` ``default_system_prompt`` field comment makes the point
+explicitly, and the mechanics back it up:
+``Session.system_prompt = config.system_prompt if config.system_prompt is not
+None else DEFAULT_SYSTEM_PROMPT`` — an explicit ``""`` IS NOT ``None``, so a
+blank override is used VERBATIM instead of falling through to the gateway's
+own default, and a reply generated with no formatting guidance at all reverts
+to the model's normal WRITTEN register (markdown, bullet lists, code fences)
+— "asterisk asterisk", literal list markers, read aloud as spoken nonsense.
+This is why :func:`resolve_voice_prompt` never lets a blank string reach the
+wire: a rejected override degrades to **omitting the key entirely** (``None``
+on :func:`~reachy.speech.realtime.connect_url`'s ``system_prompt=``
+parameter), which is what lets the GATEWAY's own configured default take
+over — never a blank or broken string.
+
+**Resolution, and WHO ships :data:`DEFAULT_VOICE_PROMPT`.**
+:func:`resolve_voice_prompt` resolves an explicit argument, then
+:data:`ENV_VOICE_PROMPT` (``REACHY_EMBODY_VOICE_PROMPT``) from the PROCESS
+environment ONLY — mirroring
+:func:`reachy.embody.engine.resolve_attention_window_s`'s scoping and its
+reasoning verbatim: an operator who wants a different voice sets the env var
+in the LAYER PROCESS's own environment, never an ``environment.d`` drop-in,
+which would silently re-point :class:`~reachy.speech.realtime.RealtimeTranscriber`
+(the runtime's ears-only session, sharing this env var's owning module) too —
+except that transcriber never arms a reply and so never reads this env var or
+passes ``system_prompt`` to :func:`~reachy.speech.realtime.connect_url` at
+all.
+
+The function itself stays conservative when called bare — *default* is an
+opt-in keyword-only argument, ``None`` unless a caller asks otherwise, so a
+direct call (a test, a future script) keeps meaning exactly what it always
+did: nothing configured resolves to ``None``, an absent override is not a
+fault the way an unparseable numeric bound would be. But **the PRODUCTION
+composition root asks for a default, and that is the deliberate decision this
+task ships**: ``reachy/cli/_commands/agent.py``'s ``_compose_embody_seam``
+calls ``resolve_voice_prompt(default=DEFAULT_VOICE_PROMPT)`` and passes the
+result straight into this class's ``system_prompt=`` — so on the deployed
+robot, "nothing configured" resolves to :data:`DEFAULT_VOICE_PROMPT`, not to
+silence. A built-but-unreachable capability is indistinguishable from a
+missing one (this exact shape bit task t6's ``cancel_playback`` earlier in
+this arc), so the fix belongs at the ONE production call site, not merely in
+this module's own vocabulary.
+
+*default* only ever fills in for a **genuine absence** — *explicit* is
+``None`` AND the env key is not present at all. A REJECTED attempt (blank
+after stripping, or over :data:`MAX_VOICE_PROMPT_CHARS`) is never silently
+repaired into *default*: it resolves to ``None`` regardless, because an
+operator who tried something and got it wrong deserves the named
+:data:`REASON_VOICE_PROMPT_INVALID` drop and an honestly empty override, not
+a quiet substitution of an opinion they never asked for. This is also,
+consequently, the one way to reach ``None`` (the bare gateway default) on the
+shipped path deliberately: set :data:`ENV_VOICE_PROMPT` to a blank string
+(present, but empty) rather than leaving it unset — a present-but-blank key
+is structurally distinguishable from an absent one (``Mapping.get`` returns
+``""`` for the former, ``None`` for the latter), so it reads as an EXPLICIT
+"I want nothing here", not as "nobody configured this". It costs one named
+drop, which is the honest price of overriding the layer's own recommendation
+with silence.
+
+**What the shipped default asks for, and why.** :data:`DEFAULT_VOICE_PROMPT`
+keeps the spoken-register guidance lobes' own default already has (no
+markdown, no lists, no code, no emoji — dropping it would reopen exactly the
+harm described above), but deliberately does NOT keep upstream's own length
+cap ("answer in one or two short spoken sentences"): issue #151's own
+complaint is that replies are too terse, and that brevity comes from the
+GATEWAY's default prompt, not from any cap this client enforces. So this
+text asks for complete, natural, SENTENCE-SHAPED spoken thoughts instead of a
+sentence-count limit — a longer answer is welcome, composed as several such
+thoughts, because since task t6 a reply is played as several chunks with a
+brief pause between them (issue #151's explicitly accepted "minor gap")
+rather than one unbroken clip. Chunk-friendly phrasing and permitting length
+are therefore the SAME request, not two: short complete sentences are what
+both a natural spoken cadence and a clean chunk boundary want.
+
+**Validation is REFUSED, never truncated** (the same fail-closed idiom
+:data:`reachy.behavior.rules.MAX_SAY_CHARS` uses): blank (after stripping) or
+longer than :data:`MAX_VOICE_PROMPT_CHARS` degrades to the "omit, gateway
+default" outcome above, and :class:`RealtimeDuplexSession` — never the pure
+:func:`resolve_voice_prompt` — turns a REJECTED explicit-or-env attempt (as
+opposed to nothing configured at all, which is not a failure) into one named,
+counted :data:`REASON_VOICE_PROMPT_INVALID` drop at construction time, the
+same discipline every other named failure in this module follows.
+
+**No CLI flag yet, by choice, not oversight.** ``agent embody`` gains no new
+``--voice-prompt`` argument in this task — the env var alone is the
+operator-facing knob, matching every earlier revision of this module's own
+"operator-configurable" claim. A dedicated flag is a natural extension (the
+same shape :data:`~reachy.embody.engine.DEFAULT_ATTENTION_WINDOW_S`'s
+``--attention-window`` already has), left for whichever composition task
+next touches this seam's flag set, rather than folded in here as a
+drive-by addition.
+
+**What this task does NOT claim.** Nothing here has been checked against a
+live gateway: whether the override actually changes spoken persona/length
+behaviour end to end (query param → ``parse_session_config`` → the floor's
+generate call) is honesty condition h8's LIVE half, and it belongs to task
+t15's live acceptance — this task claims only what the offline suite proves,
+that the value composition resolves is exactly the value that reaches the
+connect URL, with no new frame kind.
 
 --------------------------------------------------------------------------
 Arming: once per session, or once per ADMITTED utterance (issue #149)
@@ -353,11 +477,13 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import queue
 import socket
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -440,6 +566,8 @@ __all__ = [
     "DEFAULT_OUTPUT_SAMPLE_RATE",
     "DEFAULT_PLAYBACK_CHUNK_BYTES",
     "DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES",
+    "DEFAULT_VOICE_PROMPT",
+    "MAX_VOICE_PROMPT_CHARS",
     "Limits",
     "PlaybackProgress",
     "PlaySink",
@@ -454,12 +582,15 @@ __all__ = [
     "estimate_spoken_prefix",
     "resolve_realtime_api_key",
     "resolve_realtime_base_url",
+    "resolve_voice_prompt",
     "split_spoken",
     # configuration env names (owned by reachy.speech.realtime)
     "OPENAI_API_KEY_ENV",
     "OPENAI_URL_BASE_ENV",
     "REALTIME_API_KEY_ENV",
     "REALTIME_URL_ENV",
+    # configuration env names — this module's own
+    "ENV_VOICE_PROMPT",
     # named drop reasons — this module's own, and the shared ones
     "REASON_CONNECT_FAILED",
     "REASON_EMPTY_TRANSCRIPT",
@@ -483,6 +614,7 @@ __all__ = [
     "REASON_STT_FORWARD_FAILED",
     "REASON_UTTERANCE_QUEUE_FULL",
     "REASON_VAD_UNAVAILABLE",
+    "REASON_VOICE_PROMPT_INVALID",
 ]
 
 logger = logging.getLogger(__name__)
@@ -496,6 +628,110 @@ SOURCE = "embody"
 #: Thread names, exported so a test (and a stack dump) can name them.
 WORKER_THREAD_NAME = "realtime-duplex-session"
 PLAYBACK_THREAD_NAME = "realtime-duplex-mouth"
+
+# --------------------------------------------------------------------------- #
+# Connect-time voice conventions (issue #151/#153, spec c10, honesty h8) —     #
+# see the module docstring's own section for the full reasoning.              #
+# --------------------------------------------------------------------------- #
+
+#: Process-scoped override for the connect-time ``system_prompt``
+#: (persona/reply-length) instructions. Same scoping as
+#: :data:`reachy.embody.engine.ENV_WORKER_MODEL` and neighbours, and the same
+#: reason: see :func:`resolve_voice_prompt`.
+ENV_VOICE_PROMPT = "REACHY_EMBODY_VOICE_PROMPT"
+
+#: Refused, never truncated, past this length — the same fail-closed idiom
+#: :data:`reachy.behavior.rules.MAX_SAY_CHARS` and
+#: :data:`reachy.embody.engine.DEFAULT_SUMMARY_MAX_CHARS` use, and the same
+#: number as the latter: a persona/style prompt is the same order of
+#: magnitude as a rolling conversation summary, not a single spoken utterance.
+MAX_VOICE_PROMPT_CHARS = 2000
+
+#: This module's own recommended connect-time ``system_prompt`` — see the
+#: module docstring's "Connect-time voice conventions" section for what it
+#: asks for and why, and :func:`resolve_voice_prompt`'s docstring for why
+#: this constant is NOT applied automatically by that function.
+DEFAULT_VOICE_PROMPT = (
+    "You are Reachy Mini, a small expressive desk robot, speaking your "
+    "replies aloud through a text-to-speech voice — never write markdown, "
+    "bullet points, code fences or emoji; say only the words you would "
+    "actually speak aloud. Answer at whatever length the question deserves: "
+    "a longer answer is welcome, composed as a sequence of short, complete, "
+    "sentence-shaped thoughts a listener can follow one at a time, since it "
+    "may reach the room as a few spoken chunks with a brief pause between "
+    "them rather than one unbroken run-on sentence."
+)
+
+
+def resolve_voice_prompt(
+    explicit: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    default: str | None = None,
+) -> str | None:
+    """Resolve the connect-time ``system_prompt`` override (issue #151/#153, spec c10).
+
+    Precedence: *explicit* argument, then :data:`ENV_VOICE_PROMPT`, then
+    *default* — but *default* fills in ONLY for a genuine absence (see
+    below), never for a rejected attempt. *env* defaults to ``os.environ`` —
+    the PROCESS environment, read once per call and never written, and never
+    a file — mirroring
+    :func:`reachy.embody.engine.resolve_attention_window_s`'s scoping and its
+    reasoning: an operator who wants a different voice sets
+    :data:`ENV_VOICE_PROMPT` in the LAYER PROCESS's own environment, never an
+    ``environment.d`` drop-in.
+
+    **``default`` is opt-in, and its absence is what keeps this function's
+    own contract unchanged.** Called bare (*default* omitted, ``None``), this
+    function's "nothing configured" case does not substitute a value of its
+    own — the same conservative shape it has always had: an absent override
+    is not a fault, and there is no "wrong" fallback for a pure resolver to
+    protect against. **The PRODUCTION composition root asks for one anyway**
+    — ``reachy/cli/_commands/agent.py``'s ``_compose_embody_seam`` calls this
+    function with ``default=``:data:`DEFAULT_VOICE_PROMPT`, which is the
+    deliberate decision this task ships: on the deployed robot, "nothing
+    configured" resolves to this module's own chunk-friendly text, not to
+    silence — see the module docstring's "Connect-time voice conventions"
+    section for the reasoning and the reachability argument (a capability
+    built and never wired is indistinguishable from a missing one).
+
+    A resolved override that is BLANK (after stripping) or longer than
+    :data:`MAX_VOICE_PROMPT_CHARS` is a malformed configuration and resolves
+    to ``None`` regardless of *default* — a rejected attempt is never
+    silently repaired into someone else's opinion of what should have been
+    sent. Chatterbox reads the reply aloud verbatim, so a blank
+    ``system_prompt`` is not merely useless but ACTIVELY HARMFUL: lobes-cli's
+    own ``_settings.py`` ``default_system_prompt`` field comment makes
+    exactly this point, and the mechanics prove it — ``Session.system_prompt``
+    treats an explicit ``""`` as ``is not None``, so it would be used
+    VERBATIM instead of falling through to the gateway's default (see the
+    module docstring for the full citation). Refused, never truncated, the
+    same fail-closed idiom :data:`reachy.behavior.rules.MAX_SAY_CHARS` uses.
+    This is also, consequently, how an operator reaches the bare gateway
+    default DELIBERATELY even once composition asks for a *default*: set
+    :data:`ENV_VOICE_PROMPT` to a blank string (present, but empty) — an
+    explicit, if blunt, "I want nothing here", distinguishable from an
+    unset key by the very check this function makes (``raw is None`` only
+    when the key is genuinely absent).
+
+    This function is PURE and reports nothing on its own — it never touches
+    :mod:`reachy.senselog`, so it is safe to call from a test with no logging
+    side effect. :class:`RealtimeDuplexSession` is what turns a REJECTED
+    attempt (a non-``None`` input that resolves to ``None``) into a named,
+    counted :data:`REASON_VOICE_PROMPT_INVALID` drop at construction time —
+    the same discipline every other named failure in this module follows.
+    The ordinary unconfigured case (nothing given at all) is not a failure
+    and is never logged, whether or not a *default* filled in for it.
+    """
+    source = env if env is not None else os.environ
+    raw = explicit if explicit is not None else source.get(ENV_VOICE_PROMPT)
+    if raw is None:
+        return default
+    text = raw.strip()
+    if not text or len(text) > MAX_VOICE_PROMPT_CHARS:
+        return None
+    return text
+
 
 # --------------------------------------------------------------------------- #
 # The response.* half of the wire (the runtime session ignores all of these)   #
@@ -545,6 +781,12 @@ REASON_SOURCE_FAILED = "audio-source-failed"
 REASON_ONE_SHOT_ARMING_UNSUPPORTED = "one-shot-arming-unsupported"
 #: ``mute_during_playback`` is on and the mouth is busy — the AEC fallback.
 REASON_SELF_MUTE = "self-mute"
+#: An explicit or ``REACHY_EMBODY_VOICE_PROMPT`` ``system_prompt`` override was
+#: blank (after stripping) or over :data:`MAX_VOICE_PROMPT_CHARS`, so it was
+#: never placed on the connect URL — see the module docstring's "Connect-time
+#: voice conventions" section. NEVER logged for the ordinary unconfigured
+#: case (nothing attempted is not a failure); only a REJECTED attempt.
+REASON_VOICE_PROMPT_INVALID = "voice-prompt-invalid"
 
 # --------------------------------------------------------------------------- #
 # Defaults                                                                    #
@@ -996,6 +1238,23 @@ class RealtimeDuplexSession(_SessionObservables):
             module docstring; flipping it is configuration, not code.
         url / api_key: explicit endpoint + bearer, else the shared
             ``REACHY_REALTIME_*`` / ``REACHY_OPENAI_*`` precedence.
+        system_prompt: the connect-time persona/reply-length override (issue
+            #151/#153, spec c10). This constructor does its OWN resolution
+            when given a bare string or ``None`` — via
+            :func:`resolve_voice_prompt` with no *default* (explicit
+            argument, then :data:`ENV_VOICE_PROMPT` from the process env,
+            then ``None``) — so a value already invalid re-validates the same
+            way regardless of who computed it. ``None`` in means "nothing
+            configured or a rejected attempt", and omits ``system_prompt``
+            from the connect URL entirely, plus one named
+            :data:`REASON_VOICE_PROMPT_INVALID` drop for a REJECTED (as
+            opposed to absent) attempt. The PRODUCTION composition root
+            (``_compose_embody_seam``) does not rely on this class's own
+            "nothing configured" fallback — it resolves
+            :data:`DEFAULT_VOICE_PROMPT` itself first and passes the result
+            in, which is what makes the deployed robot ship the layer's own
+            chunk-friendly voice by default rather than silence. See the
+            module docstring's "Connect-time voice conventions" section.
         arm_on_connect: send ``response.create`` on ``session.created``.
         arm_per_utterance: opt into per-ADMITTED-utterance arming (issue
             #149). ``False`` — the default — is the historical shape and every
@@ -1038,6 +1297,7 @@ class RealtimeDuplexSession(_SessionObservables):
         mute_during_playback: bool = False,
         url: str | None = None,
         api_key: str | None = None,
+        system_prompt: str | None = None,
         arm_on_connect: bool = True,
         arm_per_utterance: bool = False,
         limits: Limits | None = None,
@@ -1048,6 +1308,14 @@ class RealtimeDuplexSession(_SessionObservables):
     ) -> None:
         self.url = resolve_realtime_base_url(url)
         self._api_key = resolve_realtime_api_key(api_key)
+        # An attempt that resolves to a REJECTED (None) prompt is a named
+        # drop; nothing configured at all is not — see resolve_voice_prompt's
+        # docstring. `_state` does not exist yet, so the drop (if any) is
+        # logged just below, once `_state` is constructed.
+        _voice_prompt_attempted = (
+            system_prompt if system_prompt is not None else os.environ.get(ENV_VOICE_PROMPT)
+        )
+        self._system_prompt = resolve_voice_prompt(system_prompt)
         self._read_audio = read_audio
         self._play = play
         self._sample_rate = max(1, int(sample_rate))
@@ -1096,6 +1364,12 @@ class RealtimeDuplexSession(_SessionObservables):
             backoff_initial_s=self._limits.backoff_initial_s,
             backoff_max_s=self._limits.backoff_max_s,
         )
+        if _voice_prompt_attempted is not None and self._system_prompt is None:
+            self._state.drop(
+                REASON_VOICE_PROMPT_INVALID,
+                f"{len(_voice_prompt_attempted)} chars, blank or over the "
+                f"{MAX_VOICE_PROMPT_CHARS}-char cap — connecting with no system_prompt override",
+            )
 
         # --- worker-thread state ------------------------------------------- #
         self._sock: socket.socket | None = None
@@ -1358,8 +1632,14 @@ class RealtimeDuplexSession(_SessionObservables):
 
     @property
     def connect_url(self) -> str:
-        """The full ws(s) URL this client connects to, sample rate included."""
-        return connect_url(self.url, self._sample_rate)
+        """The full ws(s) URL this client connects to.
+
+        Sample rate always rides it; ``system_prompt`` rides it too whenever
+        :func:`resolve_voice_prompt` resolved one at construction (see the
+        module docstring's "Connect-time voice conventions" section) — never
+        a second frame, never a follow-up message.
+        """
+        return connect_url(self.url, self._sample_rate, system_prompt=self._system_prompt)
 
     @property
     def lane_unavailable(self) -> bool:
