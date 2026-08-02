@@ -119,6 +119,47 @@ provider (mirroring :class:`reachy.behavior.pat_sense.PatSenseDriver` and
 ``camera_available``, a raising detector or store, a closed driver — each is "no
 reading" for that tick.
 
+--------------------------------------------------------------------------
+Camera-stream-ended staleness (issue #138) — DETECT ONLY
+--------------------------------------------------------------------------
+Live evidence, 2026-08-02: the daemon's GStreamer pipeline EOS'd and no camera
+frame arrived again for **1h45m**, while the runtime kept ticking, rules kept
+firing, and ``state.json`` stayed fresh — nothing distinguished "the room is
+quiet" from "the camera is dead" until an operator noticed by eye and
+restarted the service by hand.
+
+The connection-level signal cannot see this: ``HeldMediaClient.connected``
+stays ``True`` across a dead pipeline (only the daemon's own supervisor
+would notice the process exited, and it did not exit), so a supervisor
+polling ``connected`` to decide whether to re-warm never fires. The only
+honest signal left is **how long ago the last USABLE frame arrived**, so
+:meth:`FaceSenseDriver._check_stream_staleness` watches
+:attr:`_last_frame_at` directly, on every read attempt where the client still
+claims to be connected AND camera-available (see :meth:`_update_frame`).
+:data:`DEFAULT_STREAM_STALE_S` is ten times :data:`DEFAULT_FRAME_TTL_S` and a
+hundred times :data:`DEFAULT_FRAME_INTERVAL_S` — comfortably past either
+magnitude, so ordinary TTL flicker or single-SDK-owner contention (which
+still throttles to ~1 fps, never to zero) can never trip it, while it still
+names a dead stream in well under a minute rather than the 1h45m an operator
+went unwarned.
+
+A camera that **legitimately never existed** — no camera at all, or one that
+has simply never produced a single usable frame yet — must never trip this:
+:attr:`_last_frame_at` starts ``None`` and only a real frame ever sets it, so
+"stale since the beginning of time" is structurally impossible to reach. The
+drop is emitted through :mod:`reachy.senselog` exactly once per silent
+episode (a fresh usable frame clears the latch, so a LATER episode is
+reported again, mirroring :class:`reachy.speech.realtime._SessionState`'s
+``session-down``/recovered discipline) — never once per tick, which at 50 Hz
+would flood the journal for as long as the pipeline stays dead.
+
+This is **detection only**, a deliberate boundary (spec claim c21): nobody
+has probed whether a GStreamer EOS is recoverable in-process at all, so
+:meth:`_check_stream_staleness` does nothing but read state and call
+:func:`reachy.senselog.drop` — it never touches :meth:`HeldMediaClient.warm_up`,
+never constructs a client, and never signals the composition root to rebuild
+or restart anything.
+
 Stdlib plus numpy (already a base dependency, used only for the frame-shape
 guard). No cv2 at import time, no ``reachy_mini``, no transport: the engine and
 store are injected, and :func:`build_face_recognition` imports the real ones
@@ -135,7 +176,15 @@ from typing import Any, Callable
 
 import numpy as np
 
+from reachy import senselog
+
 logger = logging.getLogger(__name__)
+
+#: Senselog ``stage`` every line from this module carries — shared with
+#: ``clip_rider``'s modality on purpose (``grep 'stage=vision'`` shows both).
+STAGE = "vision"
+#: Senselog ``source`` every line from this module carries.
+SOURCE = "face"
 
 #: Minimum wall-clock gap (seconds) between two detections on the worker thread.
 #: YuNet+SFace is heavy; ~2 Hz is ample for catching a face entering the frame,
@@ -162,6 +211,23 @@ DEFAULT_FRAME_INTERVAL_S: float = 0.1
 #: pulsed — 1 s is many camera periods but still collapses promptly when the
 #: camera genuinely stops.
 DEFAULT_FRAME_TTL_S: float = 1.0
+
+#: How long the last USABLE frame may go unrefreshed — while the injected
+#: client still reports itself connected and camera-available — before the
+#: pipeline is presumed to have died silently (issue #138). Ten times
+#: :data:`DEFAULT_FRAME_TTL_S` and a hundred times
+#: :data:`DEFAULT_FRAME_INTERVAL_S`: comfortably past either magnitude, so
+#: ordinary TTL flicker or single-SDK-owner contention (still ~1 fps, never
+#: zero) can never trip it, while it still names a dead stream in well under a
+#: minute against the 1h45m an operator went unwarned live on 2026-08-02. See
+#: the module docstring's "Camera-stream-ended staleness" section.
+DEFAULT_STREAM_STALE_S: float = 10.0
+
+#: NAMED reason for the latched drop :meth:`FaceSenseDriver._check_stream_staleness`
+#: emits: frames were flowing and then stopped while the client still claims to
+#: be there. DETECT ONLY — see the module docstring; nothing on this path
+#: constructs, rebuilds or restarts a media client or pipeline.
+REASON_STREAM_ENDED = "camera-stream-ended"
 
 #: How long the worker parks between iterations when idle. Bounded so
 #: :meth:`FaceSenseDriver.close` joins promptly.
@@ -365,6 +431,13 @@ class FaceSenseDriver:
     frame_ttl_s:
         How long a read frame holds ``frame_available`` true. Default
         :data:`DEFAULT_FRAME_TTL_S`.
+    stream_stale_s:
+        How long the last usable frame may go unrefreshed, while the client
+        still claims to be connected and camera-available, before a latched
+        :data:`REASON_STREAM_ENDED` drop is emitted (issue #138; see the
+        module docstring's "Camera-stream-ended staleness" section). Default
+        :data:`DEFAULT_STREAM_STALE_S`. DETECT ONLY — never triggers a
+        reconnect or rebuild.
     clock:
         The worker's cadence clock (default :func:`time.monotonic`). The tick
         thread uses ``ctx.now`` instead, so the driver inherits the engine's
@@ -385,6 +458,7 @@ class FaceSenseDriver:
         reannounce_cooldown: float = DEFAULT_REANNOUNCE_COOLDOWN,
         frame_ttl_s: float = DEFAULT_FRAME_TTL_S,
         frame_interval_s: float = DEFAULT_FRAME_INTERVAL_S,
+        stream_stale_s: float = DEFAULT_STREAM_STALE_S,
         clock: Callable[[], float] = time.monotonic,
         start_worker: bool = True,
     ) -> None:
@@ -395,6 +469,7 @@ class FaceSenseDriver:
         self._reannounce_cooldown = max(0.0, float(reannounce_cooldown))
         self._frame_ttl_s = max(0.0, float(frame_ttl_s))
         self._frame_interval_s = max(0.0, float(frame_interval_s))
+        self._stream_stale_s = max(0.0, float(stream_stale_s))
         self._last_read_at: float | None = None
         self._clock = clock
 
@@ -414,6 +489,10 @@ class FaceSenseDriver:
         #: The TTL-held ``frame_available`` condition and its freshness anchor.
         self._frame_available = False
         self._last_frame_at: float | None = None
+        #: One-episode latch for the #138 ``camera-stream-ended`` drop — cleared
+        #: the moment a fresh usable frame arrives, so a LATER silent episode is
+        #: reported again rather than only the first one for the process's life.
+        self._stream_ended_logged = False
         #: Count of face cues latched this run (diagnostics / tests).
         self.events = 0
 
@@ -480,6 +559,9 @@ class FaceSenseDriver:
         if usable_frame(frame):
             self._last_frame_at = now
             self._frame_available = True
+            # A real frame ends any silent episode — the NEXT one gets its own
+            # report rather than being swallowed by an old latch (#138).
+            self._stream_ended_logged = False
             self._fan_out_frame(frame)
             if self._recognizer_ready:
                 self._input.publish(frame)
@@ -488,6 +570,7 @@ class FaceSenseDriver:
         # A None or degenerate frame is a NON-READING, never a fault (#73): the
         # condition simply rides its TTL until frames genuinely stop.
         self._frame_available = self._within_ttl(now)
+        self._check_stream_staleness(now)
 
     def _read_due(self, now: float | None) -> bool:
         """Whether enough time has passed since the last ``frame()`` read.
@@ -518,6 +601,33 @@ class FaceSenseDriver:
             return False
         elapsed = now - last
         return 0.0 <= elapsed <= self._frame_ttl_s
+
+    def _check_stream_staleness(self, now: float | None) -> None:
+        """Latch :data:`REASON_STREAM_ENDED` once frames stop for :data:`DEFAULT_STREAM_STALE_S`.
+
+        DETECT ONLY (issue #138): reads :attr:`_last_frame_at` and calls
+        :func:`reachy.senselog.drop` — nothing more. It never touches
+        ``warm_up``, never constructs a client, never reconnects, rebuilds or
+        restarts a pipeline; see the module docstring's "Camera-stream-ended
+        staleness" section for why that boundary is deliberate here.
+
+        Only reached from the branch of :meth:`_update_frame` where the client
+        still claims to be connected and camera-available but the read produced
+        no usable frame — the camera is BELIEVED present, which is what makes a
+        long silence meaningful rather than an ordinary camera-less reading.
+        ``_last_frame_at is None`` (no frame has EVER arrived — a camera that
+        never existed, never streamed, or is still warming up) is exempt by
+        construction: there is no "stream" to have ended.
+        """
+        if self._stream_ended_logged or now is None:
+            return
+        last = self._last_frame_at
+        if last is None:
+            return
+        if now - last < self._stream_stale_s:
+            return
+        self._stream_ended_logged = True
+        senselog.drop(STAGE, SOURCE, "stream", REASON_STREAM_ENDED)
 
     def _connected(self) -> bool:
         """The one FREE liveness check — and the reason it is checked FIRST.
@@ -749,6 +859,8 @@ __all__ = [
     "DEFAULT_FRAME_INTERVAL_S",
     "DEFAULT_FRAME_TTL_S",
     "DEFAULT_REANNOUNCE_COOLDOWN",
+    "DEFAULT_STREAM_STALE_S",
+    "REASON_STREAM_ENDED",
     "VISION_EXTRA_ABSENT",
     "VISION_STACK_UNAVAILABLE",
 ]
