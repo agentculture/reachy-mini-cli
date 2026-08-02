@@ -475,9 +475,13 @@ def test_h9_no_new_media_audio_or_get_frame_caller_appears() -> None:
 #: ``reachy/behavior/audio_tee.py`` (t4) BINDS a ``AF_UNIX`` sink under the state
 #: dir (spec claim c19) — an IPC endpoint on a filesystem path, not a service —
 #: and ``reachy/embody/media.py`` (t6) merely CONNECTS to it to read audio.
+#: ``reachy/speech/realtime_duplex.py`` (t9) is the layer's own WebSocket
+#: session client: it dials the lobes gateway exactly as
+#: ``reachy/speech/realtime.py`` has since #115 and, like it, never binds.
 #: See :data:`_LOCAL_IPC_LISTENERS` for the price of the one bind exemption.
 _SOCKET_IMPORTERS = {
     "reachy/speech/realtime.py",
+    "reachy/speech/realtime_duplex.py",
     "reachy/behavior/audio_tee.py",
     "reachy/embody/media.py",
 }

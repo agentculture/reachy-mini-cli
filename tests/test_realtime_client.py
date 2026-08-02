@@ -825,15 +825,34 @@ def test_the_openai_transcript_field_name_is_honoured_as_well_as_lobes_text() ->
 
 
 def test_audio_queued_long_before_a_session_is_discarded_as_stale() -> None:
-    """A reconnect must not replay old sound into a server-side VAD."""
-    with FakeRealtimeServer(Scenario.HAPPY_PATH) as server:
-        client = _client(server, stale_after_s=0.0, backoff_initial_s=5.0, backoff_max_s=5.0)
-        try:
-            assert client.submit_audio(_pcm16()) is True
+    """A reconnect must not replay old sound into a server-side VAD.
+
+    The chunk is queued while NOTHING is listening, and the server is brought
+    up on that same (pinned) port afterwards, so it is unambiguously standing
+    backlog by the time a session exists. Pointing the client at a LIVE server
+    and submitting looked simpler but left the ordering to chance:
+    ``submit_audio`` calls ``start()`` BEFORE its own ``put_nowait``, so under
+    a loaded ``pytest -n auto`` the worker could connect and run
+    ``_discard_stale_audio`` against a still-empty queue, after which the chunk
+    was sent as ordinary live audio and this assertion failed. Observed in the
+    wild (~1 run in 8) once the box was busy enough; the client was never at
+    fault.
+    """
+    port = _dead_port()
+    client = _client(
+        url=f"ws://127.0.0.1:{port}/v1/realtime",
+        stale_after_s=0.0,
+        backoff_initial_s=0.01,
+        backoff_max_s=0.02,
+    )
+    try:
+        assert client.submit_audio(_pcm16()) is True
+        assert _wait_until(lambda: client.connect_failures >= 1)
+        with _PinnedPortServer(Scenario.HAPPY_PATH, port=port) as server:
             assert _take(client) is not None  # the session ran to completion
-        finally:
-            client.close()
-    assert server.append_payloads == []
+            assert server.append_payloads == []
+    finally:
+        client.close()
 
 
 def test_the_utterance_record_is_frozen() -> None:
