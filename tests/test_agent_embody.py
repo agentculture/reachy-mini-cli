@@ -2142,6 +2142,24 @@ def test_the_command_modules_local_attention_window_constants_match_the_real_one
     assert agent_mod.ENV_ATTENTION_WINDOW_S == REAL_ENV
 
 
+def test_the_clip_and_perception_staleness_bounds_stay_equal() -> None:
+    """The second by-VALUE mirror, pinned for the same reason as the first.
+
+    ``_ClipAsker`` refuses to ASK about a clip older than
+    ``DEFAULT_CLIP_STALE_AFTER_S``; the engine evicts a parked snapshot older
+    than ``DEFAULT_PERCEPTION_STALE_AFTER_S``. Both are measured against the
+    SAME quantity — the age of the frame the snapshot describes — so they are
+    one decision expressed twice, and task t13's docstrings justify the second
+    by pointing at the first. Nothing enforced that, which is what a drift
+    canary is for: raising the ask bound alone would let the asker spend a
+    ~2 400-token clip question (measured, task t1) on a frame the engine then
+    evicts on the very next read.
+    """
+    from reachy.embody.engine import DEFAULT_PERCEPTION_STALE_AFTER_S
+
+    assert agent_mod.DEFAULT_CLIP_STALE_AFTER_S == DEFAULT_PERCEPTION_STALE_AFTER_S
+
+
 # =========================================================================== #
 # Connect-time voice conventions reach production composition                 #
 # (issue #151/#153, spec claim c10, honesty h8, task t9)                       #
