@@ -260,6 +260,73 @@ def test_one_turn_invokes_both_speak_and_harmonics_each_at_own_rate() -> None:
 
 
 # ---------------------------------------------------------------------------
+# MAX_SAY_CHARS enforcement (issue #133) — speak/harmonics share the ONE cap
+# reachy.behavior.rules already enforces for a rule's own `say` field.
+# ---------------------------------------------------------------------------
+
+
+def test_speak_at_max_say_chars_still_synthesizes() -> None:
+    from reachy.behavior.rules import MAX_SAY_CHARS
+
+    synths: list[str] = []
+    play = _PlayRecorder()
+    reg = ToolRegistry(speak_engine=_fake_engine("tts", TTS_SAMPLE_RATE, synths), play=play)
+    text = "a" * MAX_SAY_CHARS
+    result = reg.dispatch("speak", json.dumps({"text": text}), tool_call_id="s")
+    assert synths == [text]
+    assert play.calls
+    assert "error" not in json.loads(result["content"])
+
+
+def test_speak_over_max_say_chars_is_refused_naming_the_cap_and_never_synthesizes() -> None:
+    from reachy.behavior.rules import MAX_SAY_CHARS
+
+    synths: list[str] = []
+    play = _PlayRecorder()
+    reg = ToolRegistry(speak_engine=_fake_engine("tts", TTS_SAMPLE_RATE, synths), play=play)
+    text = "a" * (MAX_SAY_CHARS + 1)
+    result = reg.dispatch("speak", json.dumps({"text": text}), tool_call_id="s")
+    content = json.loads(result["content"])
+    assert "error" in content
+    assert str(MAX_SAY_CHARS) in content["error"]
+    assert synths == []
+    assert play.calls == []
+
+
+def test_harmonics_over_max_say_chars_is_refused_naming_the_cap_and_never_synthesizes() -> None:
+    from reachy.behavior.rules import MAX_SAY_CHARS
+
+    synths: list[str] = []
+    play = _PlayRecorder()
+    reg = ToolRegistry(
+        harmonic_engine=_fake_engine("harmonic", HARMONIC_SAMPLE_RATE, synths), play=play
+    )
+    text = "a" * (MAX_SAY_CHARS + 1)
+    result = reg.dispatch("harmonics", json.dumps({"text": text}), tool_call_id="h")
+    content = json.loads(result["content"])
+    assert "error" in content
+    assert str(MAX_SAY_CHARS) in content["error"]
+    assert synths == []
+    assert play.calls == []
+
+
+def test_speak_over_max_say_chars_never_truncates_and_synthesizes_a_shortened_clip() -> None:
+    """A truncating implementation would still leave ``synths`` non-empty (just
+    shorter) — assert no synth call happened at all, at several sizes over the
+    cap, so a future "helpfully" truncating change is caught."""
+    from reachy.behavior.rules import MAX_SAY_CHARS
+
+    for over in (1, 10, 4500):
+        synths: list[str] = []
+        play = _PlayRecorder()
+        reg = ToolRegistry(speak_engine=_fake_engine("tts", TTS_SAMPLE_RATE, synths), play=play)
+        text = "a" * (MAX_SAY_CHARS + over)
+        reg.dispatch("speak", json.dumps({"text": text}), tool_call_id="s")
+        assert synths == [], f"synthesized despite being {over} chars over the cap"
+        assert play.calls == []
+
+
+# ---------------------------------------------------------------------------
 # AC-2: apply_pose enqueues the IDENTICAL action the *emoji* marker path does
 # ---------------------------------------------------------------------------
 
@@ -692,6 +759,33 @@ def test_importing_tools_does_not_pull_forge_into_sys_modules() -> None:
     code = (
         "import sys, reachy.speech.tools;"
         "assert 'reachy.forge' not in sys.modules, 'forge leaked';"
+        "print('ok')"
+    )
+    proc = subprocess.run(  # nosec B603 — fixed args, sys.executable, no shell
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "ok"
+
+
+def test_importing_tools_does_not_pull_motion_vision_llm_events_or_forge_into_sys_modules() -> None:
+    """A fresh interpreter importing reachy.speech.tools must not transitively import
+    reachy.motion, reachy.vision, reachy.speech.llm, reachy.speech.events, or reachy.forge
+    (issue #133).  MAX_SAY_CHARS is now sourced from reachy.behavior.rules — but that
+    import lives INSIDE ``_require_text``, not at module scope, precisely because
+    reachy.behavior.rules imports reachy.behavior.library (to validate a rule's own
+    ``run``/``disable`` names), which transitively imports reachy.motion.pat. A
+    module-scope import would drag reachy.motion into this module's footprint merely by
+    being imported — this test is what catches that regression."""
+    code = (
+        "import sys, reachy.speech.tools;"
+        "leaked = [m for m in sys.modules if m.startswith(('reachy.motion', 'reachy.vision'))"
+        " or m in ('reachy.speech.llm', 'reachy.speech.events')"
+        " or m == 'reachy.forge' or m.startswith('reachy.forge.')];"
+        "assert not leaked, f'leaked: {leaked}';"
         "print('ok')"
     )
     proc = subprocess.run(  # nosec B603 — fixed args, sys.executable, no shell
