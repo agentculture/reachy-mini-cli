@@ -108,7 +108,7 @@ Decisions no deviation record covers:
 | `t1` (`d1`) | the brief's premise was false: `rules.py` reaches `reachy.motion` transitively, so the instructed module-scope import would have broken a documented boundary and the task's own acceptance test | acceptable |
 | `t14` (`d2`) | #147 (embody `start` discarding its flags) blocked t14's acceptance path; fixing it was a precondition | acceptable |
 | `t7` (`d3`) | wake-word attention added as new scope at the operator's mid-run request; composes with the three-class policy rather than reworking it | acceptable |
-| `t9` | the detector shipped against a false premise from #138 and did not fire on the real failure; repaired in-arc with regression tests, but it means the criterion "ONE latched drop appears" was satisfied by tests and **not** by the live failure until the repair | needs-follow-up |
+| `t9` | the detector shipped against a false premise from #138 and did not fire on the real failure; repaired in-arc with regression tests, and the repair was then **confirmed live** (19:39:07). The criterion was satisfied by tests and not by reality until the repair — which is the finding worth keeping | acceptable |
 | `t13` | four line-wrap collapses by `black` mean the diff is "comment text + whitespace-only reformatting", not literally comment-text-only; AST-identity verified | acceptable |
 | `t15` | issue closing deferred to PR merge — closing issues whose fixes are not yet on `main` would be false | needs-follow-up |
 
@@ -145,7 +145,7 @@ Decisions no deviation record covers:
 | The layer hears, thinks and speaks aloud on the deployed robot | high | live journal: `utterance chars=68` → `turn done` → `response done … audio=255360B` (≈5.3 s) |
 | The wake-word gate refuses ambient speech and opens on the name | high | live journal: `dropped reason=not-addressed-cold ("Yeah.")` and `attention open (name) for 45s` |
 | The full stack survives a stop/start cycle un-attended | high | all four units returned `active`; layer re-armed; `Linger=yes` |
-| The camera-stream-ended detector fires on the real failure | medium | tests pass; **not yet observed firing live** — a watcher is running against the next camera death |
+| The camera-stream-ended detector fires on the real failure | high | observed live 19:39:07 on the deployed robot — `[SENSE stage=vision source=face event=stream] dropped reason=camera-stream-ended`, the first time a camera death has been named in the journal instead of being silent |
 | The clip→`ask()` lane makes the robot able to describe its room | unverified | plumbing tested, but the **voice** is the realtime lane, which receives no context — see #149; and the camera dies within minutes (#138) |
 | SonarCloud `python:S7632` count is 0 | unverified | requires the PR scan — not yet run |
 | A true reboot (power cycle) brings the stack back | unverified | only a `systemctl` stop/start cycle was exercised |
@@ -154,8 +154,8 @@ Decisions no deviation record covers:
 
 - `t15` — close #132 #133 #134 #135 #136 #137 #141 #142 #143 #145 #147 #148
   **after the PR merges**, each linking its evidence. Deferred deliberately.
-- `t9` follow-up — watch for the detector's first **live** fire; the claim is
-  `medium` until then. A watcher is running.
+- `t9` follow-up — **done**: the detector fired live at 19:39:07, naming a real
+  camera death for the first time. No remaining work on the detect half.
 - **#138 (camera)** — consolidated as the single camera issue. Root cause open:
   lifetime collapsed from 610 min to 4.5 min across one day. Recovery still
   unprobed. This is the highest-value open item — at 4–18 min per process the
