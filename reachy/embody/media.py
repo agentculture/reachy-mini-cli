@@ -980,6 +980,63 @@ def _default_tee_socket_path() -> Path:
     return tee_socket_path()
 
 
+def _robot_backends(
+    *,
+    tee_socket: Path | str | None,
+    robot_sample_rate: int | None,
+    base_url: str | None,
+    http_timeout: float,
+) -> tuple[Any, Any]:
+    """The ROBOT profile's (source, sink) backends: tee socket in, daemon http out.
+
+    Split out of :func:`build_media` so each profile's override resolution reads
+    on its own. The dispatch in ``build_media`` stays a single ``if`` on the
+    resolved profile name — still no ``isinstance`` fork anywhere (pinned by an
+    AST scan in ``tests/test_embody_media.py``).
+    """
+    socket_path = Path(tee_socket) if tee_socket is not None else None
+    if socket_path is None:
+        env_socket = os.environ.get(ENV_TEE_SOCKET)
+        socket_path = Path(env_socket) if env_socket else _default_tee_socket_path()
+    native_rate = robot_sample_rate or _env_int(ENV_ROBOT_SAMPLE_RATE) or DEFAULT_ROBOT_SAMPLE_RATE
+    resolved_base_url = base_url or os.environ.get(ENV_BASE_URL, DEFAULT_BASE_URL)
+    return (
+        _RobotTeeSourceBackend(socket_path, native_sample_rate=native_rate),
+        _RobotHttpSinkBackend(base_url=resolved_base_url, timeout=http_timeout),
+    )
+
+
+def _bench_backends(
+    *,
+    bench_input_device: Any,
+    bench_output_device: Any,
+    bench_sample_rate: int | None,
+    bench_blocksize: int,
+) -> tuple[Any, Any]:
+    """The BENCH profile's (source, sink) backends: dev-box mic in, speakers out.
+
+    ``_UNSET`` (not ``None``) marks "no explicit device", because ``None`` is
+    itself meaningful to sounddevice — it selects the system default.
+    """
+    in_device = (
+        bench_input_device
+        if bench_input_device is not _UNSET
+        else _resolve_device(os.environ.get(ENV_BENCH_INPUT_DEVICE))
+    )
+    out_device = (
+        bench_output_device
+        if bench_output_device is not _UNSET
+        else _resolve_device(os.environ.get(ENV_BENCH_OUTPUT_DEVICE))
+    )
+    native_bench_rate = bench_sample_rate or _env_int(ENV_BENCH_SAMPLE_RATE)
+    return (
+        _BenchMicSourceBackend(
+            device=in_device, samplerate=native_bench_rate, blocksize=bench_blocksize
+        ),
+        _BenchSpeakerSinkBackend(device=out_device),
+    )
+
+
 def build_media(
     profile: str | None = None,
     *,
@@ -1007,32 +1064,19 @@ def build_media(
     )
 
     if resolved_profile == PROFILE_ROBOT:
-        socket_path = Path(tee_socket) if tee_socket is not None else None
-        if socket_path is None:
-            env_socket = os.environ.get(ENV_TEE_SOCKET)
-            socket_path = Path(env_socket) if env_socket else _default_tee_socket_path()
-        native_rate = (
-            robot_sample_rate or _env_int(ENV_ROBOT_SAMPLE_RATE) or DEFAULT_ROBOT_SAMPLE_RATE
+        source_backend, sink_backend = _robot_backends(
+            tee_socket=tee_socket,
+            robot_sample_rate=robot_sample_rate,
+            base_url=base_url,
+            http_timeout=http_timeout,
         )
-        source_backend: Any = _RobotTeeSourceBackend(socket_path, native_sample_rate=native_rate)
-        resolved_base_url = base_url or os.environ.get(ENV_BASE_URL, DEFAULT_BASE_URL)
-        sink_backend: Any = _RobotHttpSinkBackend(base_url=resolved_base_url, timeout=http_timeout)
     else:  # PROFILE_BENCH — the only other member of _PROFILES
-        in_device = (
-            bench_input_device
-            if bench_input_device is not _UNSET
-            else _resolve_device(os.environ.get(ENV_BENCH_INPUT_DEVICE))
+        source_backend, sink_backend = _bench_backends(
+            bench_input_device=bench_input_device,
+            bench_output_device=bench_output_device,
+            bench_sample_rate=bench_sample_rate,
+            bench_blocksize=bench_blocksize,
         )
-        out_device = (
-            bench_output_device
-            if bench_output_device is not _UNSET
-            else _resolve_device(os.environ.get(ENV_BENCH_OUTPUT_DEVICE))
-        )
-        native_bench_rate = bench_sample_rate or _env_int(ENV_BENCH_SAMPLE_RATE)
-        source_backend = _BenchMicSourceBackend(
-            device=in_device, samplerate=native_bench_rate, blocksize=bench_blocksize
-        )
-        sink_backend = _BenchSpeakerSinkBackend(device=out_device)
 
     source = EmbodySource(source_backend, target_sample_rate=resolved_target)
     sink = EmbodySink(sink_backend)
