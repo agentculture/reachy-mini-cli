@@ -59,6 +59,7 @@ import textwrap
 import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -70,6 +71,10 @@ from reachy.embody.tools import SPEAK
 from reachy.explain.catalog import ENTRIES
 from reachy.export.exporter import ExportHook
 from reachy.speech.llm import ToolCall, TurnResult
+from reachy.speech.realtime_duplex import (
+    DEFAULT_VOICE_PROMPT,
+    ENV_VOICE_PROMPT,
+)
 from reachy.speech.realtime_duplex import Limits as DuplexLimits
 from reachy.speech.realtime_duplex import (
     RealtimeDuplexSession,
@@ -2041,6 +2046,100 @@ def test_the_command_modules_local_attention_window_constants_match_the_real_one
 
     assert agent_mod.DEFAULT_ATTENTION_WINDOW_S == REAL_DEFAULT
     assert agent_mod.ENV_ATTENTION_WINDOW_S == REAL_ENV
+
+
+# =========================================================================== #
+# Connect-time voice conventions reach production composition                 #
+# (issue #151/#153, spec claim c10, honesty h8, task t9)                       #
+#                                                                              #
+# resolve_voice_prompt/DEFAULT_VOICE_PROMPT existed after this task's first    #
+# pass but had NO production caller: _compose_embody_seam's build_session      #
+# call never passed system_prompt=, so the shipped robot still inherited the   #
+# gateway's bare default -- a capability built and never wired is             #
+# indistinguishable from a missing one (the exact shape task t6's own          #
+# cancel_playback hit earlier in this arc, per issue #151's own retrospective).#
+# These tests pin the ONE production construction site so this cannot         #
+# silently regress to unwired again.                                          #
+# =========================================================================== #
+
+
+def test_compose_ships_the_default_voice_prompt_when_nothing_is_configured() -> None:
+    """The point of the task: "nothing configured" ships DEFAULT_VOICE_PROMPT,
+    not silence -- composition asks resolve_voice_prompt for a `default=`,
+    which the bare function never substitutes on its own."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["system_prompt"] == DEFAULT_VOICE_PROMPT
+    finally:
+        layer.close()
+
+
+def test_compose_resolves_the_voice_prompt_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv(ENV_VOICE_PROMPT, "Speak like a lighthouse keeper.")
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["system_prompt"] == "Speak like a lighthouse keeper."
+    finally:
+        layer.close()
+
+
+def test_compose_a_present_but_blank_env_override_opts_out_to_no_override(
+    monkeypatch,
+) -> None:
+    """A PRESENT but BLANK REACHY_EMBODY_VOICE_PROMPT is how an operator reaches
+    the bare gateway default even once composition asks for DEFAULT_VOICE_PROMPT
+    -- distinguishable from an unset key, and never silently repaired into the
+    layer's own recommendation (resolve_voice_prompt's own docstring)."""
+    monkeypatch.setenv(ENV_VOICE_PROMPT, "   ")
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["system_prompt"] is None
+    finally:
+        layer.close()
+
+
+def test_compose_an_over_long_env_override_opts_out_to_no_override(monkeypatch) -> None:
+    from reachy.speech.realtime_duplex import MAX_VOICE_PROMPT_CHARS
+
+    monkeypatch.setenv(ENV_VOICE_PROMPT, "x" * (MAX_VOICE_PROMPT_CHARS + 1))
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["system_prompt"] is None
+    finally:
+        layer.close()
+
+
+def test_the_shipped_default_actually_reaches_the_connect_url() -> None:
+    """The end-to-end proof the coordinator asked for: through composition,
+    into the REAL session class, onto the connect URL -- not merely a kwarg
+    captured by a double. Never starts the session (no socket, no thread);
+    ``connect_url`` is a pure property."""
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=RealtimeDuplexSession, lines=iter(())
+    )
+    try:
+        query = parse_qs(urlsplit(layer.session.connect_url).query)
+        assert query.get("system_prompt") == [DEFAULT_VOICE_PROMPT]
+    finally:
+        layer.close()
+
+
+def test_a_custom_env_configured_voice_prompt_reaches_the_real_connect_url(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_VOICE_PROMPT, "Speak like a lighthouse keeper.")
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=RealtimeDuplexSession, lines=iter(())
+    )
+    try:
+        query = parse_qs(urlsplit(layer.session.connect_url).query)
+        assert query.get("system_prompt") == ["Speak like a lighthouse keeper."]
+    finally:
+        layer.close()
 
 
 # =========================================================================== #

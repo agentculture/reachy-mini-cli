@@ -272,7 +272,7 @@ on :func:`~reachy.speech.realtime.connect_url`'s ``system_prompt=``
 parameter), which is what lets the GATEWAY's own configured default take
 over — never a blank or broken string.
 
-**Resolution and the two things "gateway default" can mean.**
+**Resolution, and WHO ships :data:`DEFAULT_VOICE_PROMPT`.**
 :func:`resolve_voice_prompt` resolves an explicit argument, then
 :data:`ENV_VOICE_PROMPT` (``REACHY_EMBODY_VOICE_PROMPT``) from the PROCESS
 environment ONLY — mirroring
@@ -283,19 +283,38 @@ which would silently re-point :class:`~reachy.speech.realtime.RealtimeTranscribe
 (the runtime's ears-only session, sharing this env var's owning module) too —
 except that transcriber never arms a reply and so never reads this env var or
 passes ``system_prompt`` to :func:`~reachy.speech.realtime.connect_url` at
-all. When NEITHER is given, the result is ``None`` — the connect URL omits
-``system_prompt`` and the GATEWAY's own operator-configured default
-(``lobes/realtime/_settings.py``'s ``default_system_prompt``, itself falling
-back to ``_session.DEFAULT_SYSTEM_PROMPT``) applies, exactly as it did before
-this task. :data:`DEFAULT_VOICE_PROMPT` is a SEPARATE thing: this module's
-own recommended text, exported for a composition root (the embodiment layer,
-task t11) to pass as the *explicit* argument — e.g. a CLI flag's default —
-which is how an operator gets this layer's chunk-friendly, longer-answer
-voice out of the box without this module silently overriding an operator who
-deliberately wants the bare gateway default. :func:`resolve_voice_prompt`
-itself never reaches for :data:`DEFAULT_VOICE_PROMPT` — that decision belongs
-one level up, same as every other policy this module refuses to make for its
-caller (see the UNGATED and arming-policy sections).
+all.
+
+The function itself stays conservative when called bare — *default* is an
+opt-in keyword-only argument, ``None`` unless a caller asks otherwise, so a
+direct call (a test, a future script) keeps meaning exactly what it always
+did: nothing configured resolves to ``None``, an absent override is not a
+fault the way an unparseable numeric bound would be. But **the PRODUCTION
+composition root asks for a default, and that is the deliberate decision this
+task ships**: ``reachy/cli/_commands/agent.py``'s ``_compose_embody_seam``
+calls ``resolve_voice_prompt(default=DEFAULT_VOICE_PROMPT)`` and passes the
+result straight into this class's ``system_prompt=`` — so on the deployed
+robot, "nothing configured" resolves to :data:`DEFAULT_VOICE_PROMPT`, not to
+silence. A built-but-unreachable capability is indistinguishable from a
+missing one (this exact shape bit task t6's ``cancel_playback`` earlier in
+this arc), so the fix belongs at the ONE production call site, not merely in
+this module's own vocabulary.
+
+*default* only ever fills in for a **genuine absence** — *explicit* is
+``None`` AND the env key is not present at all. A REJECTED attempt (blank
+after stripping, or over :data:`MAX_VOICE_PROMPT_CHARS`) is never silently
+repaired into *default*: it resolves to ``None`` regardless, because an
+operator who tried something and got it wrong deserves the named
+:data:`REASON_VOICE_PROMPT_INVALID` drop and an honestly empty override, not
+a quiet substitution of an opinion they never asked for. This is also,
+consequently, the one way to reach ``None`` (the bare gateway default) on the
+shipped path deliberately: set :data:`ENV_VOICE_PROMPT` to a blank string
+(present, but empty) rather than leaving it unset — a present-but-blank key
+is structurally distinguishable from an absent one (``Mapping.get`` returns
+``""`` for the former, ``None`` for the latter), so it reads as an EXPLICIT
+"I want nothing here", not as "nobody configured this". It costs one named
+drop, which is the honest price of overriding the layer's own recommendation
+with silence.
 
 **What the shipped default asks for, and why.** :data:`DEFAULT_VOICE_PROMPT`
 keeps the spoken-register guidance lobes' own default already has (no
@@ -321,12 +340,21 @@ opposed to nothing configured at all, which is not a failure) into one named,
 counted :data:`REASON_VOICE_PROMPT_INVALID` drop at construction time, the
 same discipline every other named failure in this module follows.
 
+**No CLI flag yet, by choice, not oversight.** ``agent embody`` gains no new
+``--voice-prompt`` argument in this task — the env var alone is the
+operator-facing knob, matching every earlier revision of this module's own
+"operator-configurable" claim. A dedicated flag is a natural extension (the
+same shape :data:`~reachy.embody.engine.DEFAULT_ATTENTION_WINDOW_S`'s
+``--attention-window`` already has), left for whichever composition task
+next touches this seam's flag set, rather than folded in here as a
+drive-by addition.
+
 **What this task does NOT claim.** Nothing here has been checked against a
 live gateway: whether the override actually changes spoken persona/length
 behaviour end to end (query param → ``parse_session_config`` → the floor's
 generate call) is honesty condition h8's LIVE half, and it belongs to task
 t15's live acceptance — this task claims only what the offline suite proves,
-that the value this client resolves is exactly the value that reaches the
+that the value composition resolves is exactly the value that reaches the
 connect URL, with no new frame kind.
 
 --------------------------------------------------------------------------
@@ -636,48 +664,55 @@ DEFAULT_VOICE_PROMPT = (
 
 
 def resolve_voice_prompt(
-    explicit: str | None = None, *, env: Mapping[str, str] | None = None
+    explicit: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    default: str | None = None,
 ) -> str | None:
     """Resolve the connect-time ``system_prompt`` override (issue #151/#153, spec c10).
 
-    Precedence: *explicit* argument, then :data:`ENV_VOICE_PROMPT`. *env*
-    defaults to ``os.environ`` — the PROCESS environment, read once per call
-    and never written, and never a file — mirroring
+    Precedence: *explicit* argument, then :data:`ENV_VOICE_PROMPT`, then
+    *default* — but *default* fills in ONLY for a genuine absence (see
+    below), never for a rejected attempt. *env* defaults to ``os.environ`` —
+    the PROCESS environment, read once per call and never written, and never
+    a file — mirroring
     :func:`reachy.embody.engine.resolve_attention_window_s`'s scoping and its
     reasoning: an operator who wants a different voice sets
     :data:`ENV_VOICE_PROMPT` in the LAYER PROCESS's own environment, never an
     ``environment.d`` drop-in.
 
-    **Unlike** :func:`~reachy.embody.engine.resolve_attention_window_s`, this
+    **``default`` is opt-in, and its absence is what keeps this function's
+    own contract unchanged.** Called bare (*default* omitted, ``None``), this
     function's "nothing configured" case does not substitute a value of its
-    own: when neither *explicit* nor the env var is present, it returns
-    ``None``, which means "send no ``system_prompt`` at all" — the connect
-    URL omits the key entirely (see
-    :func:`reachy.speech.realtime.connect_url`), so the GATEWAY's own
-    operator-configured default takes over. That is a deliberate difference
-    in shape, not an oversight: an absent override is not a fault here, the
-    way an unparseable numeric bound would be — the gateway already has a
-    sensible default of its own, so there is no "wrong" fallback to protect
-    against by substituting one. :data:`DEFAULT_VOICE_PROMPT` is this
-    module's OWN recommended text, and this function does NOT reach for it
-    automatically — it is exported for a composition root (the embodiment
-    layer, task t11) to pass as *explicit* (e.g. a CLI flag's default),
-    which is how an operator actually gets this layer's chunk-friendly,
-    longer-answer-permitting voice out of the box without this module
-    silently overriding an operator who deliberately wants the bare gateway
-    default.
+    own — the same conservative shape it has always had: an absent override
+    is not a fault, and there is no "wrong" fallback for a pure resolver to
+    protect against. **The PRODUCTION composition root asks for one anyway**
+    — ``reachy/cli/_commands/agent.py``'s ``_compose_embody_seam`` calls this
+    function with ``default=``:data:`DEFAULT_VOICE_PROMPT`, which is the
+    deliberate decision this task ships: on the deployed robot, "nothing
+    configured" resolves to this module's own chunk-friendly text, not to
+    silence — see the module docstring's "Connect-time voice conventions"
+    section for the reasoning and the reachability argument (a capability
+    built and never wired is indistinguishable from a missing one).
 
     A resolved override that is BLANK (after stripping) or longer than
-    :data:`MAX_VOICE_PROMPT_CHARS` is a malformed configuration and is
-    likewise resolved to ``None`` — never sent. Chatterbox reads the reply
-    aloud verbatim, so a blank ``system_prompt`` is not merely useless but
-    ACTIVELY HARMFUL: lobes-cli's own ``_settings.py``
-    ``default_system_prompt`` field comment makes exactly this point, and the
-    mechanics prove it — ``Session.system_prompt`` treats an explicit ``""``
-    as ``is not None``, so it would be used VERBATIM instead of falling
-    through to the gateway's default (see the module docstring for the full
-    citation). Refused, never truncated, the same fail-closed idiom
-    :data:`reachy.behavior.rules.MAX_SAY_CHARS` uses.
+    :data:`MAX_VOICE_PROMPT_CHARS` is a malformed configuration and resolves
+    to ``None`` regardless of *default* — a rejected attempt is never
+    silently repaired into someone else's opinion of what should have been
+    sent. Chatterbox reads the reply aloud verbatim, so a blank
+    ``system_prompt`` is not merely useless but ACTIVELY HARMFUL: lobes-cli's
+    own ``_settings.py`` ``default_system_prompt`` field comment makes
+    exactly this point, and the mechanics prove it — ``Session.system_prompt``
+    treats an explicit ``""`` as ``is not None``, so it would be used
+    VERBATIM instead of falling through to the gateway's default (see the
+    module docstring for the full citation). Refused, never truncated, the
+    same fail-closed idiom :data:`reachy.behavior.rules.MAX_SAY_CHARS` uses.
+    This is also, consequently, how an operator reaches the bare gateway
+    default DELIBERATELY even once composition asks for a *default*: set
+    :data:`ENV_VOICE_PROMPT` to a blank string (present, but empty) — an
+    explicit, if blunt, "I want nothing here", distinguishable from an
+    unset key by the very check this function makes (``raw is None`` only
+    when the key is genuinely absent).
 
     This function is PURE and reports nothing on its own — it never touches
     :mod:`reachy.senselog`, so it is safe to call from a test with no logging
@@ -686,12 +721,12 @@ def resolve_voice_prompt(
     counted :data:`REASON_VOICE_PROMPT_INVALID` drop at construction time —
     the same discipline every other named failure in this module follows.
     The ordinary unconfigured case (nothing given at all) is not a failure
-    and is never logged.
+    and is never logged, whether or not a *default* filled in for it.
     """
     source = env if env is not None else os.environ
     raw = explicit if explicit is not None else source.get(ENV_VOICE_PROMPT)
     if raw is None:
-        return None
+        return default
     text = raw.strip()
     if not text or len(text) > MAX_VOICE_PROMPT_CHARS:
         return None
@@ -1204,14 +1239,22 @@ class RealtimeDuplexSession(_SessionObservables):
         url / api_key: explicit endpoint + bearer, else the shared
             ``REACHY_REALTIME_*`` / ``REACHY_OPENAI_*`` precedence.
         system_prompt: the connect-time persona/reply-length override (issue
-            #151/#153, spec c10), resolved via :func:`resolve_voice_prompt`
-            (explicit argument, then :data:`ENV_VOICE_PROMPT` from the
-            process env). ``None`` — the default when nothing is configured
-            either way — omits ``system_prompt`` from the connect URL
-            entirely, so the gateway's own default applies; a blank or
-            over-long resolved value degrades the same way, plus one named
-            :data:`REASON_VOICE_PROMPT_INVALID` drop. See the module
-            docstring's "Connect-time voice conventions" section.
+            #151/#153, spec c10). This constructor does its OWN resolution
+            when given a bare string or ``None`` — via
+            :func:`resolve_voice_prompt` with no *default* (explicit
+            argument, then :data:`ENV_VOICE_PROMPT` from the process env,
+            then ``None``) — so a value already invalid re-validates the same
+            way regardless of who computed it. ``None`` in means "nothing
+            configured or a rejected attempt", and omits ``system_prompt``
+            from the connect URL entirely, plus one named
+            :data:`REASON_VOICE_PROMPT_INVALID` drop for a REJECTED (as
+            opposed to absent) attempt. The PRODUCTION composition root
+            (``_compose_embody_seam``) does not rely on this class's own
+            "nothing configured" fallback — it resolves
+            :data:`DEFAULT_VOICE_PROMPT` itself first and passes the result
+            in, which is what makes the deployed robot ship the layer's own
+            chunk-friendly voice by default rather than silence. See the
+            module docstring's "Connect-time voice conventions" section.
         arm_on_connect: send ``response.create`` on ``session.created``.
         arm_per_utterance: opt into per-ADMITTED-utterance arming (issue
             #149). ``False`` — the default — is the historical shape and every
