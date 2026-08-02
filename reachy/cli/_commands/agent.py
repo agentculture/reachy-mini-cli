@@ -97,7 +97,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -636,8 +636,15 @@ def cmd_agent_attach(
 # connected the two ends. So the wirings here are stated, not implied:
 #
 #   media.source.read   -> duplex read_audio      (the layer's EARS)
-#   media.sink.play     -> duplex play            (the layer's MOUTH)
-#   media.sink.play     -> the speak/harmonics tools' render leg
+#   media.sink.play     -> duplex play            (the layer's ONLY MOUTH: the
+#                          FOREGROUND voice's own reply — c2. The speak /
+#                          harmonics tools used to render here too and no
+#                          longer do; see "The interjection route" below)
+#   speak / harmonics   -> InterjectionPolicy.admit -> engine.note_interjection
+#                          (a PROPOSAL: refused by name, or parked as a
+#                          speakable cognition scope. Never audio — c2/h1)
+#   interjection line   -> InterjectionPolicy.admit_event -> the same, with
+#                          alert=True (an EXTERNAL proposal may wake the mind)
 #   duplex on_utterance -> engine.submit_utterance   (a TRIGGER, if attention
 #                          admits it: the name opens the window — #148)
 #                       -> session.arm_once          (ONE spoken reply, and
@@ -653,8 +660,10 @@ def cmd_agent_attach(
 #                          response.done the floor can no longer interrupt
 #                          anything, and our queue is still draining — c34/c35;
 #                          attention deliberately does NOT gate it)
-#   runtime feed line   -> classified_cues_for_line -> engine.submit_cues
+#   runtime feed line   -> classified_cues_for_runtime_event -> submit_cues
 #                          (a rule FIRE triggers; every other cue parks — #143)
+#   the shared history  -> SummaryProducer -> engine.update_summary (ONE
+#                          summary, Qwen's, on its own thread — c30)
 #   engine + every layer failure -> the shared --export cognition feed
 #
 # IMPORT BOUNDARY (h15). Every import of the layer, the realtime client and the
@@ -676,19 +685,12 @@ def cmd_agent_attach(
 #: ``duplex`` and the tools' ``action`` so one journal can be split by layer.
 EMBODY_STAGE = "embody"
 
-EMBODY_SOURCE_VOICE = "voice"
 EMBODY_SOURCE_SESSION = "session"
 EMBODY_SOURCE_CUES = "cue-reader"
 EMBODY_SOURCE_SHUTDOWN = "shutdown"
 #: The clip -> ``ask()`` perception lane (task t11, issue #139's h9 blocker).
 EMBODY_SOURCE_CLIP = "clip"
 
-#: A voice engine would not resolve at composition, so that tool refuses for the
-#: life of the process rather than the tool set changing shape per box.
-REASON_VOICE_UNAVAILABLE = "voice-unavailable"
-#: Synthesis or playback raised — a wedged TTS, a dead speaker, a refused
-#: daemon route. The model is told (a named refusal) and the feed shows it.
-REASON_SPEAK_FAILED = "speak-failed"
 #: The duplex session refused to start; the layer is deaf and mute but alive.
 REASON_SESSION_START_FAILED = "session-start-failed"
 #: The runtime line source raised mid-stream (the feed went away, the bus died).
@@ -735,8 +737,6 @@ REASON_CLIP_ASK_EMPTY = "clip-ask-empty"
 #: each keep for their own layer.
 EMBODY_REASONS: frozenset[str] = frozenset(
     {
-        REASON_VOICE_UNAVAILABLE,
-        REASON_SPEAK_FAILED,
         REASON_SESSION_START_FAILED,
         REASON_CUE_SOURCE_FAILED,
         REASON_ARM_FAILED,
@@ -750,9 +750,6 @@ EMBODY_REASONS: frozenset[str] = frozenset(
         REASON_CLIP_ASK_EMPTY,
     }
 )
-
-#: The two voices the layer composes, by :mod:`reachy.speech.voice` engine name.
-_EMBODY_VOICES = ("tts", "harmonic")
 
 EMBODY_READER_THREAD_NAME = "embody-cue-reader"
 EMBODY_CLIP_THREAD_NAME = "embody-clip-asker"
@@ -845,89 +842,73 @@ def _embody_drop(export: object, source: str, reason: str, detail: str = "") -> 
 
 
 # ---------------------------------------------------------------------------
-# The voice seams — the layer's mouth for its own DELIBERATE utterances
+# The interjection route — where a PROPOSED utterance goes (issue #155, c2)
 # ---------------------------------------------------------------------------
 #
-# Distinct from the duplex session's mouth: that one plays the SERVER's spoken
-# reply, this one renders a ``speak`` / ``harmonics`` tool call. Both end at the
-# same :class:`~reachy.embody.media.EmbodySink`, which is what keeps the
-# profile decision (daemon-http on the robot, monitor speakers on the bench) in
-# exactly one place.
+# There is no voice seam here any more, and its absence is the feature. Until
+# task t12 this section built a ``synthesize`` + ``play_audio`` pair and handed
+# it to the tool registry, so the WORKER model's text reached the speaker
+# directly. The two-tempo architecture forbids exactly that: Gemma, rendered by
+# the realtime floor, is the only voice the room hears (spec claim c2), and
+# Qwen influences the conversation only through explicit typed events.
+#
+# So the layer's one remaining mouth is the duplex session's own playback leg
+# (``resolved_media.sink.play``, passed to ``RealtimeDuplexSession``), and a
+# ``speak``/``harmonics`` tool call becomes an INTERJECTION: governed by
+# ``reachy.embody.interjection.InterjectionPolicy`` (default OFF, per-source
+# default-deny, rate-bounded) and, if admitted, parked as a ``speakable``
+# cognition scope the foreground voice may use or decline.
 
 
-def _voice_seam(
-    name: str,
-    synthesize: Callable[[str], bytes],
-    samplerate: int,
-    sink: object,
-    *,
-    export: object,
-) -> Callable[[str], str]:
-    """Build ``seam(text) -> str``: synthesize, play through *sink*, or name it.
+class _LateAttention:
+    """The attention gate, reachable before the engine that owns it exists.
 
-    A failure is named with the layer's own precise reason AND re-raised as the
-    tool layer's :class:`~reachy.embody.tools.Refusal`, so the model is told in
-    the same turn that its mouth did not work. A failure the model cannot see is
-    not a failure — it is a robot that believes it spoke.
+    The interjection policy needs the gate; the gate belongs to the engine; the
+    engine is built from the registry the policy configures. Rather than break
+    that circle by giving the policy a second gate — two state machines
+    answering "is a conversation live?" is exactly how the two would come to
+    disagree — this forwards to the ONE gate through the same one-slot box
+    :func:`_compose_embody_seam` already uses for the session.
+
+    Fail-closed while the slot is empty: no engine yet reads as COLD, so an
+    interjection arriving before composition finishes is refused rather than
+    admitted on a technicality.
     """
 
-    def _speak(text: str) -> str:
-        from reachy.embody.tools import REFUSAL_TOOL_ERROR, Refusal
+    def __init__(self, engine_of: Callable[[], object | None]) -> None:
+        self._engine_of = engine_of
 
-        try:
-            pcm = synthesize(text)
-            sink.play(pcm, samplerate=samplerate)
-        except Exception as err:  # every voice fault is NAMED, never raw
-            _embody_drop(
-                export,
-                EMBODY_SOURCE_VOICE,
-                REASON_SPEAK_FAILED,
-                f"{name}: {type(err).__name__}: {err}",
-            )
-            raise Refusal(REFUSAL_TOOL_ERROR, f"the {name} voice failed: {err}") from err
-        return f"{len(pcm)} bytes at {samplerate} Hz"
+    def _gate(self) -> object | None:
+        engine = self._engine_of()
+        return getattr(engine, "attention", None) if engine is not None else None
 
-    return _speak
+    def is_warm(self, now: float | None = None) -> bool:
+        gate = self._gate()
+        return bool(gate.is_warm()) if gate is not None else False
+
+    def note_spoken(self, now: float | None = None) -> bool:
+        gate = self._gate()
+        return bool(gate.note_spoken()) if gate is not None else False
 
 
-def _build_voice_seams(
-    sink: object,
-    *,
-    export: object,
-    synthesize: Mapping[str, Callable[[str], bytes]] | None = None,
-) -> tuple[Callable[[str], str] | None, Callable[[str], str] | None]:
-    """The ``(speak, harmonics)`` pair for :class:`EmbodyToolRegistry`.
+def _interjection_publisher(
+    engine_of: Callable[[], object | None], *, alert: bool
+) -> Callable[[object], None]:
+    """``publish(interjection)`` -> the engine's own record of it.
 
-    Both legs reuse :func:`reachy.speech.voice.resolve_voice_engine` — the same
-    registry ``say`` and the runtime's ``SpeechActuator`` resolve through — so
-    the layer inherits their synthesis and their sample rates rather than
-    inventing a third pair. ``synthesize`` overrides the callable per engine
-    name (tests only); the rate always comes from the resolved engine.
-
-    A voice that will not resolve yields ``None``, which leaves the tool
-    ADVERTISED but refusing by name — the layer's action set must not change
-    shape with the box's audio configuration, or the model learns a different
-    robot on every start (``reachy/embody/tools.py``'s own reasoning).
+    *alert* is the one thing that differs between the two admission routes, and
+    it is decided HERE, at composition, because only the composition knows
+    which door an interjection came through: an external proposal off the wire
+    is worth waking the mind for, the worker's own tool call is not (see
+    :meth:`~reachy.embody.engine.EmbodyTurnEngine.note_interjection`).
     """
-    from reachy.speech.voice import resolve_voice_engine
 
-    overrides = dict(synthesize or {})
-    seams: dict[str, Callable[[str], str] | None] = {}
-    for name in _EMBODY_VOICES:
-        try:
-            engine = resolve_voice_engine(name)
-        except Exception as err:  # a missing voice is not a dead layer
-            _embody_drop(export, EMBODY_SOURCE_VOICE, REASON_VOICE_UNAVAILABLE, f"{name}: {err}")
-            seams[name] = None
-            continue
-        seams[name] = _voice_seam(
-            name,
-            overrides.get(name, engine.synthesize),
-            engine.samplerate,
-            sink,
-            export=export,
-        )
-    return seams["tts"], seams["harmonic"]
+    def _publish(interjection: object) -> None:
+        engine = engine_of()
+        if engine is not None:
+            engine.note_interjection(interjection, alert=alert)
+
+    return _publish
 
 
 # ---------------------------------------------------------------------------
@@ -952,6 +933,17 @@ class _CueReader:
     everything else parks. Erasing the class here is precisely the defect that
     turned 187 cues into 23 turns — the mapper always knew which was which.
 
+    **Interjection lines are routed BEFORE the mapper (issue #155).**
+    :mod:`reachy.embody.cues` recognises the layer's own ``interjection``
+    family and REFUSES it by name, deliberately: a pure mapper holds no policy
+    state, so it cannot decide whether an external source may put words in the
+    robot's mouth, and falling through to "unrecognised" would hide the family
+    behind a generic drop. The policy lives here, at the composition root, and
+    this is the one place it is consulted for the wire route —
+    ``policy.admit_event`` first, the mapper only for everything else. Without
+    an injected policy the line still reaches the mapper and is still refused
+    by name, so forgetting to wire this is loud rather than permissive.
+
     Everything it touches is O(1) and non-raising:
     :meth:`~reachy.embody.engine.EmbodyTurnEngine.submit_cues` routes into a
     bounded deque or a bounded coalescing park, and names its own overflow.
@@ -964,11 +956,13 @@ class _CueReader:
         *,
         export: object = None,
         max_events: int | None = None,
+        interjections: object = None,
     ) -> None:
         self._lines = lines
         self._engine = engine
         self._export = export
         self._max_events = max_events
+        self._interjections = interjections
         self._stop = threading.Event()
         self.thread: threading.Thread | None = None
         self.events = 0
@@ -993,14 +987,16 @@ class _CueReader:
         self._stop.set()
 
     def _run(self) -> None:
-        from reachy.embody.cues import classified_cues_for_line
+        from reachy.embody.cues import classified_cues_for_runtime_event, parse_runtime_line
 
         try:
             for line in self._lines:
                 if self._stop.is_set():
                     break
                 self.events += 1
-                self.cues += self._engine.submit_cues(classified_cues_for_line(line))
+                event = parse_runtime_line(line)
+                if event is not None and not self._routed_interjection(event):
+                    self.cues += self._engine.submit_cues(classified_cues_for_runtime_event(event))
                 if self._max_events is not None and self.events >= self._max_events:
                     break
         except Exception as err:  # a dead feed must not kill the conversation
@@ -1012,6 +1008,24 @@ class _CueReader:
             )
         finally:
             self.done = True
+
+    def _routed_interjection(self, event: dict) -> bool:
+        """Hand an ``interjection`` line to the policy. ``True`` if it was handled.
+
+        ``False`` for every other line type AND for an interjection when no
+        policy was injected — in which case the mapper's own named refusal
+        (``interjection-requires-policy``) is exactly the right outcome. The
+        policy names its own drop for a refusal, so a rejected proposal is
+        never silent on either path.
+        """
+        from reachy import runtime_cues
+
+        if self._interjections is None or event.get("t") != runtime_cues.LINE_INTERJECTION:
+            return False
+        verdict = self._interjections.admit_event(event)
+        if verdict.admitted and verdict.interjection is not None:
+            self._engine.note_interjection(verdict.interjection, alert=True)
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1251,7 @@ class _EmbodyLayer:
         engine: object,
         reader: _CueReader,
         clip_asker: _ClipAsker | None = None,
+        summary: object = None,
         export: object = None,
     ) -> None:
         self.profile = profile
@@ -1246,6 +1261,11 @@ class _EmbodyLayer:
         self.engine = engine
         self.reader = reader
         self.clip_asker = clip_asker
+        #: Qwen's rolling-summary maintenance pass
+        #: (:class:`reachy.embody.summary.SummaryProducer`), on its own thread
+        #: for the same reason the clip asker is: a whole gateway round trip
+        #: charged to the turn loop would pause the robot mid-conversation.
+        self.summary = summary
         self._export = export
         self._stop = threading.Event()
         self._closed = False
@@ -1270,6 +1290,8 @@ class _EmbodyLayer:
         self.reader.start()
         if self.clip_asker is not None:
             self.clip_asker.start()
+        if self.summary is not None:
+            self.summary.start()
 
     def request_stop(self) -> None:
         """Ask the run loop to finish after the current turn. Safe from any thread."""
@@ -1299,6 +1321,8 @@ class _EmbodyLayer:
         self.reader.stop()
         if self.clip_asker is not None:
             self.clip_asker.stop()
+        if self.summary is not None:
+            self.summary.stop()
         for label, closer in (("session", self.session.close), ("media", self.media.close)):
             try:
                 closer()
@@ -1597,11 +1621,12 @@ def _compose_embody_seam(
     registry_factory: Callable[..., object] | None = None,
     engine_factory: Callable[..., object] | None = None,
     turn_fn: object | None = None,
-    synthesize: Mapping[str, Callable[[str], bytes]] | None = None,
+    interjection_limits: object | None = None,
     lines: Iterable[str] | None = None,
     stdin: TextIO | None = None,
     clip_reader: Callable[[], dict | None] | None = None,
     clip_poll_interval: float | None = None,
+    summary_producer: object | None = None,
 ) -> _EmbodyLayer:
     """Build the whole layer — the ONE place the wave-1/2/3 seams meet.
 
@@ -1610,14 +1635,17 @@ def _compose_embody_seam(
     defaults are the real thing.
 
     Order matters in one place only: the media profile is built FIRST, because
-    its sink is shared by three consumers (the duplex mouth, and both voice
-    tools) and its source is the duplex ears. Building it twice would give the
-    layer two mouths and, on the robot profile, two readers contending for one
-    tee socket.
+    its sink is the duplex mouth and its source the duplex ears. Building it
+    twice would give the layer two mouths and, on the robot profile, two
+    readers contending for one tee socket. Since task t12 the sink has exactly
+    ONE consumer — the realtime floor's own reply — because the worker's voice
+    tools are proposals rather than playback (spec claim c2).
     """
     from reachy.embody.cues import open_runtime_lines
     from reachy.embody.engine import EmbodyTurnEngine, Limits, resolve_attention_window_s
+    from reachy.embody.interjection import InterjectionPolicy
     from reachy.embody.media import build_media
+    from reachy.embody.summary import SummaryProducer
     from reachy.embody.tools import EmbodyToolRegistry
     from reachy.speech.realtime_duplex import (
         DEFAULT_VOICE_PROMPT,
@@ -1629,15 +1657,27 @@ def _compose_embody_seam(
         media if media is not None else build_media(getattr(args, "media_profile", None))
     )
 
-    speak_seam, harmonic_seam = _build_voice_seams(
-        resolved_media.sink, export=export, synthesize=synthesize
+    # The engine is built FROM the registry, and the policy the registry needs
+    # wants the engine's attention gate — one slot closes that circle, exactly
+    # as ``session_slot`` closes the session's, and for the same reason: the
+    # slot is filled long before any thread that can read it exists.
+    # Only the LIMITS are injectable, never the whole policy: the attention
+    # wiring is this function's job and must not be something a caller can
+    # forget, or an interjection would be judged against a gate nobody warms.
+    engine_slot: list[object] = []
+    policy = InterjectionPolicy(
+        limits=interjection_limits,
+        attention=_LateAttention(lambda: engine_slot[0] if engine_slot else None),
     )
 
     spool_root = _resolve_spool_dir(args)
     build_registry = registry_factory if registry_factory is not None else EmbodyToolRegistry
     registry = build_registry(
-        speak=speak_seam,
-        harmonics=harmonic_seam,
+        interjection=policy,
+        # alert=False: the worker's own proposal must not wake the worker.
+        on_interjection=_interjection_publisher(
+            lambda: engine_slot[0] if engine_slot else None, alert=False
+        ),
         spool_root=spool_root,
         await_timeout=float(getattr(args, "await_timeout", 1.0)),
     )
@@ -1658,6 +1698,7 @@ def _compose_embody_seam(
     if turn_fn is not None:
         engine_kwargs["turn_fn"] = turn_fn
     engine = build_engine(**engine_kwargs)
+    engine_slot.append(engine)
 
     build_session = session_factory if session_factory is not None else RealtimeDuplexSession
     # The utterance tap has to reach the session that is being built WITH it
@@ -1713,7 +1754,13 @@ def _compose_embody_seam(
         else open_runtime_lines(feed=getattr(args, "feed", "-"), stdin=stdin)
     )
     reader = _CueReader(
-        feed_lines, engine, export=export, max_events=getattr(args, "max_events", None)
+        feed_lines,
+        engine,
+        export=export,
+        max_events=getattr(args, "max_events", None),
+        # The wire route reaches the SAME policy the tool route does: one
+        # decision point, one place to get default-deny right.
+        interjections=policy,
     )
 
     clip_asker_kwargs: dict[str, object] = {
@@ -1724,6 +1771,10 @@ def _compose_embody_seam(
         clip_asker_kwargs["poll_interval"] = clip_poll_interval
     clip_asker = _ClipAsker(engine, **clip_asker_kwargs)
 
+    # ONE summary, Qwen's, never regenerated per lane (issue #154 decision
+    # c30): this is the repo's only production caller of ``update_summary``.
+    summary = summary_producer if summary_producer is not None else SummaryProducer(engine)
+
     return _EmbodyLayer(
         profile=getattr(resolved_media, "profile", "unknown"),
         media=resolved_media,
@@ -1732,6 +1783,7 @@ def _compose_embody_seam(
         engine=engine,
         reader=reader,
         clip_asker=clip_asker,
+        summary=summary,
         export=export,
     )
 

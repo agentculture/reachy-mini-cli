@@ -655,8 +655,7 @@ def test_embody_star_rules_persist_after_stop_and_stay_enumerable_by_prefix(
     )
 
     registry = EmbodyToolRegistry(
-        speak=lambda text: "ok",
-        harmonics=lambda text: "ok",
+        on_interjection=lambda interjection: "proposed",
         spool_root=tmp_path,
         await_timeout=0.0,
         reload_seam=lambda timeout: None,

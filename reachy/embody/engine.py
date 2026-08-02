@@ -169,8 +169,11 @@ number.
 
 Everything older than Gemma's ``m``-turn window is covered by ONE
 Qwen-maintained summary (:meth:`update_summary`), never regenerated per lane
-and never computed by this module — Qwen owns WRITING it (task t12's job);
-this module owns only the plumbing: storing it, bounding it
+and never computed by this module — Qwen owns WRITING it
+(:class:`reachy.embody.summary.SummaryProducer`, the one production caller of
+:meth:`update_summary` and :meth:`mark_summary_stale`, reading the turns
+:meth:`backlog` reports); this module owns only the plumbing: storing it,
+bounding it
 (:attr:`Limits.summary_max_chars`, refused rather than truncated when
 over-length, the same fail-closed idiom :data:`reachy.behavior.rules.
 MAX_SAY_CHARS` uses — "a compaction that can grow without limit is a slow leak
@@ -182,6 +185,34 @@ counted drop (:data:`REASON_SUMMARY_STALE`) — never a silent narrowing of
 Gemma's memory down to just the last ``m`` turns (spec claim c45, honesty
 h30). The marker clears on the next :meth:`update_summary` call that
 succeeds.
+
+Cognition scopes: what the background mind may put in front of the voice
+--------------------------------------------------------------------------
+Qwen influences the conversation only through explicit, inspectable typed
+events (spec claim c2), and :mod:`reachy.embody.scope` is the type: a compact,
+attributed, expiring :class:`~reachy.embody.scope.CognitionScope` — a goal, the
+facts that matter, a suggested next step, a priority, an expiry in turns and a
+speakable flag. **Never raw model reasoning** (claim c8). :meth:`submit_scope`
+parks one, latest-wins on ``(kind, goal)``; :meth:`ask` — the FOREGROUND lane —
+renders the live ones into one system message beside Qwen's summary, and Gemma
+keeps the wording and the decision to speak.
+
+Two properties are structural rather than conventional, and both mirror
+guarantees this module already carries elsewhere. A scope is **context, never a
+trigger**: :meth:`submit_scope` has no class parameter, exactly as
+:meth:`submit_perception` has none, so the robot cannot wake itself up to act
+on its own background thought. And a scope **expires in TURNS**, filtered on
+read like :attr:`wanted_to_say`, so a stale scope cannot shape a later turn —
+the turn counter is the only clock this record has.
+
+:meth:`note_interjection` is where the sibling family meets this one: an
+ADMITTED :class:`reachy.embody.interjection.Interjection` becomes a
+``speakable`` scope (:func:`reachy.embody.scope.scope_from_interjection`).
+Its ``alert`` flag is the ONE difference between the two admission routes — an
+interjection that arrived over the wire is worth waking the mind for (t5's
+``ADMITTED_CUE_CLASS``), while the worker's own tool call is not: a mind woken
+by its own proposal is a mind talking to itself, the same defect
+:meth:`note_spoken` avoids one buffer over.
 
 Said, unsaid, and the sentence the room never got (issue #151, spec c34)
 -------------------------------------------------------------------------
@@ -209,7 +240,12 @@ Per turn the engine emits, through the shared
 * ``message`` — one per voice tool call (``speak`` / ``harmonics``), emitted
   BEFORE dispatch, and one per :meth:`note_spoken`. As the schema says of
   ``agent attach``'s publish-only seams, the block names the utterance the mind
-  CHOSE, not a speaker that moved.
+  CHOSE, not a speaker that moved. Since task t12 that distinction carries more
+  weight, not less: a voice tool call is now a PROPOSAL the interjection policy
+  may refuse, so the block records what the background mind wanted said and the
+  same turn's ``thinking`` block carries the verdict verbatim. Emitting it
+  before dispatch is what keeps "what it wanted" and "what it was allowed"
+  visible as two facts rather than one.
 * ``emotion`` — when the model's own reply text carries an emoji, resolved to a
   pose through the hook's ``pose_resolver`` (the shipped expressions catalog).
   The layer's action set has no ``apply_pose`` tool, so this is the one place an
@@ -251,7 +287,8 @@ from reachy import senselog
 from reachy.cli._errors import CliError
 from reachy.embody.attention import DEFAULT_ATTENTION_WINDOW_S, LABEL_COLD, AttentionGate
 from reachy.embody.cues import ClassifiedCue, CueClass
-from reachy.embody.interjection import WantedToSay, make_wanted_to_say
+from reachy.embody.interjection import ADMITTED_CUE_CLASS, WantedToSay, make_wanted_to_say
+from reachy.embody.scope import CognitionScope, scope_from_interjection
 from reachy.embody.tools import HARMONICS, SPEAK
 from reachy.export.events import EmotionEvent, MessageEvent, ThinkingEvent
 from reachy.export.exporter import ExportHook
@@ -318,6 +355,12 @@ REASON_CONTEXT_PARK_FULL = "context-park-full"
 #: source — however many DIFFERENT descriptions — can never fill this bound;
 #: only a genuinely new source can.
 REASON_PERCEPTION_SOURCES_FULL = "perception-sources-full"
+#: :meth:`EmbodyTurnEngine.submit_scope`'s own bound: the scope park already
+#: holds :data:`DEFAULT_MAX_SCOPES` distinct ``(kind, goal)`` concerns and a new
+#: goal arrived. A restatement of an already-parked GOAL can never reach this —
+#: it replaces the slot in place — so only a genuinely new concern can, and an
+#: EXPIRED slot is freed first (see :meth:`~EmbodyTurnEngine.submit_scope`).
+REASON_SCOPE_PARK_FULL = "scope-park-full"
 #: A blank cue/utterance was submitted.
 REASON_EMPTY_INPUT = "empty-input"
 #: A turn produced no text, no reasoning and no tool call.
@@ -349,6 +392,7 @@ DROP_REASONS: tuple[str, ...] = (
     REASON_INPUT_QUEUE_FULL,
     REASON_CONTEXT_PARK_FULL,
     REASON_PERCEPTION_SOURCES_FULL,
+    REASON_SCOPE_PARK_FULL,
     REASON_EMPTY_INPUT,
     REASON_SILENT_TURN,
     REASON_NOT_ADDRESSED_COLD,
@@ -423,6 +467,14 @@ DEFAULT_PERCEPTION_SOURCE = "vision"
 #: is one source, so this only ever bites a caller that names a new source on
 #: every call, which is a bug, not a busy robot.
 DEFAULT_MAX_PERCEPTION_SOURCES = 4
+#: DISTINCT ``(kind, goal)`` concerns the cognition-scope park holds at once
+#: (:meth:`EmbodyTurnEngine.submit_scope`). Small on purpose, and for the same
+#: reason the artifact expires in turns: a foreground voice steered by five
+#: simultaneous background concerns is not being helped, and the whole point of
+#: a scope is that it is COMPACT. A restatement of a parked goal replaces it
+#: rather than adding beside it, so this only bites on genuinely distinct
+#: concerns.
+DEFAULT_MAX_SCOPES = 3
 #: Seconds between ALERT-triggered turns. The first alert after quiet is never
 #: delayed; this only bites on a burst, where the fires it holds back are
 #: deferred into the next turn rather than dropped. Sized against the measured
@@ -454,9 +506,11 @@ DEFAULT_EMBODY_SYSTEM_PROMPT = (
     "is already handled: you do not need to reply in words to everything you hear. "
     "What you decide here is what to DO. You act only through your tools: goto "
     "(move your head, antennas or body), run_behavior (run one of your movement "
-    "sets), speak and harmonics (say something out loud, or chirp), and "
-    "create_rule (teach yourself a new standing reaction that keeps firing on its "
-    "own afterwards). When nothing is worth doing, do nothing and call no tools. "
+    "sets), speak and harmonics (PROPOSE something to say out loud, or a chirp — "
+    "the voice that actually talks to the room decides the wording and whether to "
+    "say it, and may refuse), and create_rule (teach yourself a new standing "
+    "reaction that keeps firing on its own afterwards). When nothing is worth "
+    "doing, do nothing and call no tools. "
     "Keep any speech to one or two short, natural first-person sentences. Never "
     "narrate raw sensor readings. If you want to show an expression, put a single "
     "emoji in your reply text."
@@ -472,6 +526,17 @@ DEFAULT_EMBODY_SYSTEM_PROMPT = (
 STALE_SUMMARY_MARKER = (
     "[The summary of the conversation before this window could not be "
     "refreshed and may be out of date.]"
+)
+
+#: Heads the system message :meth:`EmbodyTurnEngine._scope_message` builds from
+#: the live :class:`reachy.embody.scope.CognitionScope`\\ s (spec claim c8).
+#: Every word of it is load-bearing for claim c2: the background mind is
+#: introduced as a colleague with suggestions, never as an instruction, and the
+#: last clause says outright where the decision lives — because a prompt that
+#: reads like an order is how a background mind quietly becomes the speaker.
+SCOPE_PREAMBLE = (
+    "Your background mind is working on the following. Use any of it that helps "
+    "you answer well; the wording, and whether to say anything at all, are yours."
 )
 
 # --------------------------------------------------------------------------- #
@@ -696,6 +761,12 @@ class Limits:
     #: is exactly the crowding-out defect (issue #154) this pair of bounds
     #: exists to close.
     max_perception_sources: int = DEFAULT_MAX_PERCEPTION_SOURCES
+    #: DISTINCT ``(kind, goal)`` concerns the cognition-scope park holds (see
+    #: :meth:`EmbodyTurnEngine.submit_scope`) — a THIRD bound of its own, for
+    #: the same reason the perception park has one: what the background mind is
+    #: working on must never compete with what the robot perceived for the same
+    #: budget.
+    max_scopes: int = DEFAULT_MAX_SCOPES
     #: Seconds between ALERT-triggered turns; ``0`` disables the bound.
     min_alert_interval_s: float = DEFAULT_MIN_ALERT_INTERVAL_S
     #: Recent already-spoken replies carried into the next turn's context.
@@ -944,6 +1015,12 @@ class EmbodyTurnEngine:
         # vocabulary for the same distinct-fact budget.
         self._perception: dict[str, PerceptionSlot] = {}
         self._max_perception_sources = max(1, int(self._limits.max_perception_sources))
+        # A THIRD park, keyed on ``(kind, goal)`` and read by the FOREGROUND
+        # lane rather than drained by a turn (spec claim c8): see
+        # ``submit_scope``. Insertion-ordered, so the prompt reads back in the
+        # order the background mind raised each concern.
+        self._scopes: dict[tuple[str, str], CognitionScope] = {}
+        self._max_scopes = max(1, int(self._limits.max_scopes))
         self._min_alert_interval_s = max(0.0, float(self._limits.min_alert_interval_s))
         # ONE clock for the layer: the gate is a time-based state machine and a
         # second clock would make "the window elapsed" untestable and, under an
@@ -1096,6 +1173,111 @@ class EmbodyTurnEngine:
         self.dropped_inputs += 1
         self._drop(REASON_PERCEPTION_SOURCES_FULL, f"{distinct} perception sources parked")
         return False
+
+    def submit_scope(self, scope: CognitionScope | None) -> bool:
+        """Park one background-mind cognition scope for the FOREGROUND lane.
+
+        The channel spec claim c2 gives Qwen: it influences the conversation
+        through explicit, inspectable typed events and never through the mouth.
+        A live scope reaches Gemma as one system message in :meth:`ask`
+        (:meth:`_scope_message`), and Gemma keeps the wording and the decision
+        to speak.
+
+        Latest-wins on :meth:`~reachy.embody.scope.CognitionScope.key` —
+        ``(kind, goal)``, never any of the artifact's free text (issue #154's
+        lesson, restated in :mod:`reachy.embody.scope`). Two scopes pursuing
+        one goal are the same standing concern restated, so the later replaces
+        the earlier and the park cannot fill with re-wordings; only a genuinely
+        distinct goal consumes a slot, and an EXPIRED slot is freed before the
+        bound is tested, so a long conversation never wedges the park closed.
+
+        **Context, never a trigger — and there is no parameter to make it one**,
+        exactly as :meth:`submit_perception` has none. The robot does not wake
+        itself up to act on its own background thought.
+
+        O(1), safe from any thread, never raises. A ``None`` scope (what
+        :func:`reachy.embody.scope.make_scope` returns on a refusal it has
+        already named) is a quiet ``False`` rather than a second drop line for
+        one event.
+        """
+        if scope is None:
+            return False
+        key = scope.key()
+        with self._intake_lock:
+            live = {
+                parked_key: parked
+                for parked_key, parked in self._scopes.items()
+                if not parked.is_expired(self.turns)
+            }
+            self._scopes = live
+            if key in live or len(live) < self._max_scopes:
+                self._scopes[key] = scope
+                return True
+            distinct = len(live)
+        self.dropped_inputs += 1
+        self._drop(REASON_SCOPE_PARK_FULL, f"{distinct} scopes live")
+        return False
+
+    def note_interjection(
+        self, interjection: object, *, alert: bool = False
+    ) -> CognitionScope | None:
+        """Record an ADMITTED interjection as the speakable face of a scope.
+
+        *interjection* is duck-typed
+        (:class:`reachy.embody.interjection.Interjection` in production), and it
+        is ALREADY admitted: the policy owns default-deny, the per-source
+        allow-list, the say cap and the rate bound, and this method is what
+        happens afterwards. The proposal reaches Gemma as a ``speakable`` scope
+        attributed to whoever made it — a suggestion Gemma may re-word or
+        decline (spec claim c2).
+
+        *alert* is the ONE difference between the two admission routes, and it
+        belongs to the caller because only the caller knows which one it is.
+        An interjection that arrived over the wire is somebody ELSE's proposal
+        and is worth waking the mind for (t5's
+        :data:`reachy.embody.interjection.ADMITTED_CUE_CLASS`); the worker's own
+        ``speak`` tool call is not, because a mind woken by its own proposal is
+        a mind talking to itself — the failure :meth:`note_spoken` avoids one
+        buffer over.
+
+        Returns the parked scope, or ``None`` when the proposal was refused as
+        a scope (blank, or over a scope bound) — always after one named drop
+        from :mod:`reachy.embody.scope`, never a raise: this runs on a tool
+        handler's thread and on the cue reader's.
+        """
+        scope = scope_from_interjection(interjection, turn=self.turns)
+        if scope is not None:
+            self.submit_scope(scope)
+        if alert:
+            text = getattr(interjection, "render", lambda: "")()
+            if text:
+                self.submit_cues([ClassifiedCue(text=text, cue_class=ADMITTED_CUE_CLASS)])
+        senselog.stage(
+            STAGE,
+            SOURCE,
+            uuid.uuid4().hex[:8],
+            f"interjection noted source={getattr(interjection, 'source', '?')!r} "
+            f"alert={alert} scoped={scope is not None}",
+        )
+        return scope
+
+    @property
+    def scopes(self) -> tuple[CognitionScope, ...]:
+        """The live cognition scopes, oldest concern first (spec claim c8).
+
+        Expired scopes are filtered out on READ rather than swept on a timer —
+        expiry is counted in TURNS, and the turn counter is the only clock this
+        park has, exactly as :attr:`wanted_to_say` reasons. A caller therefore
+        never sees a stale scope, and the park stays bounded regardless.
+        """
+        with self._intake_lock:
+            live = {
+                key: scope
+                for key, scope in self._scopes.items()
+                if not scope.is_expired(self.turns)
+            }
+            self._scopes = live
+            return tuple(live.values())
 
     def submit_utterance(self, text: str) -> bool:
         """Offer one heard utterance, subject to ATTENTION (issue #148).
@@ -1488,7 +1670,12 @@ class EmbodyTurnEngine:
     # ------------------------------------------------------------------ #
 
     def ask(
-        self, prompt: str | list[dict], *, role: str = ROLE_SENSES, system: str | None = None
+        self,
+        prompt: str | list[dict],
+        *,
+        role: str = ROLE_SENSES,
+        system: str | None = None,
+        context: bool = True,
     ) -> str:
         """Ask one tool-less streaming question and return the answer text.
 
@@ -1516,23 +1703,53 @@ class EmbodyTurnEngine:
         Ahead of *prompt*, this is where Gemma's nested window lands (issue
         #154 decision c30 — see the module docstring's "Nested windows"
         section): the optional *system* message, then Qwen's summary (or its
-        staleness marker, :meth:`_summary_message`), then the last ``m``
-        turns of the ONE shared history (:meth:`_senses_window`) replayed
-        exactly as :meth:`_build_messages` replays the worker's own turns.
-        None of that touches *prompt* itself — it is still appended last,
-        unmodified, which is what keeps this method's "reads no file, builds
-        no clip payload, forwards content verbatim" contract true.
+        staleness marker, :meth:`_summary_message`), then what the background
+        mind is working on (:meth:`_scope_message`, spec claim c8), then the
+        last ``m`` turns of the ONE shared history (:meth:`_senses_window`)
+        replayed exactly as :meth:`_build_messages` replays the worker's own
+        turns. None of that touches *prompt* itself — it is still appended
+        last, unmodified, which is what keeps this method's "reads no file,
+        builds no clip payload, forwards content verbatim" contract true.
+
+        *context* is how the ONE caller that must NOT see any of that asks for
+        a clean sheet: the background mind's own summary maintenance pass
+        (:class:`reachy.embody.summary.SummaryProducer`). Handed the layer's
+        usual context it would be shown :data:`STALE_SUMMARY_MARKER` — the
+        sentence saying the summary could not be refreshed — and would fold
+        that sentence into the summary it was asked to write. With ``context =
+        False`` the call is exactly ``[system?, user]``.
         """
         messages: list[dict] = []
         if system:
             messages.append({"role": "system", "content": system})
-        summary_message = self._summary_message()
-        if summary_message is not None:
-            messages.append(summary_message)
-        messages.extend(self._history_messages(self._senses_window()))
+        if context:
+            for extra in (self._summary_message(), self._scope_message()):
+                if extra is not None:
+                    messages.append(extra)
+            messages.extend(self._history_messages(self._senses_window()))
         messages.append({"role": "user", "content": prompt})
         result = self._stream(messages, role=role, tools=None, raw=None)
         return (result.content if result is not None else "") or ""
+
+    def _scope_message(self) -> dict | None:
+        """The system-role message carrying the live cognition scopes, or ``None``.
+
+        ``None`` when nothing is parked — an empty "the background mind is
+        working on:" heading is noise in the one place the foreground is meant
+        to skim. Every rendered scope is attributed and phrased as a suggestion
+        (:meth:`reachy.embody.scope.CognitionScope.render`), which is what
+        keeps spec claim c2 true at the level of the prompt itself: the
+        background mind proposes, and the wording is still Gemma's.
+
+        What can never appear here is the model's own private draft. The
+        artifact carries no field for it, and ``tests/test_embody_scope.py``
+        walks this method by AST to prove it does not so much as name one.
+        """
+        live = self.scopes
+        if not live:
+            return None
+        body = "\n".join(scope.render() for scope in live)
+        return {"role": "system", "content": f"{SCOPE_PREAMBLE}\n{body}"}
 
     # ------------------------------------------------------------------ #
     # Qwen's rolling summary of everything older than Gemma's window     #
@@ -1600,6 +1817,56 @@ class EmbodyTurnEngine:
         """Whether the last summary-maintenance attempt failed and has not yet been fixed."""
         with self._summary_lock:
             return self._summary_stale
+
+    @property
+    def summary(self) -> str:
+        """The last summary text :meth:`update_summary` accepted (``""`` if none).
+
+        The producer's own read-back: a ROLLING summary has to start from what
+        it already said, or every pass rewrites the distant past from scratch
+        and the compaction drifts.
+        """
+        with self._summary_lock:
+            return self._summary
+
+    @property
+    def summary_max_chars(self) -> int:
+        """The bound :meth:`update_summary` enforces, exposed for its producer.
+
+        A producer that cannot read this bound has to restate it, and a
+        restated bound is a second number to drift — the same reasoning that
+        makes :mod:`reachy.embody.tools` import
+        :data:`reachy.behavior.rules.MAX_SAY_CHARS` rather than repeat it.
+        """
+        return self._summary_max_chars
+
+    def history(self) -> list[tuple[str, str]]:
+        """A snapshot of the ONE shared conversation deque, oldest turn first.
+
+        The whole ``n``-turn window both lanes read
+        (:meth:`_build_messages` replays it in full, :meth:`_senses_window`
+        takes its tail) — copied under the history lock so a caller iterating
+        it can never race the turn thread's append.
+        """
+        with self._history_lock:
+            return list(self._history)
+
+    def backlog(self) -> list[tuple[str, str]]:
+        """The turns OLDER than Gemma's ``m``-turn window — the summary's territory.
+
+        The complement of :meth:`_senses_window` over the same deque
+        (issue #154 decision c30): what Gemma no longer replays verbatim is
+        exactly what Qwen's rolling summary has to carry, so
+        :class:`reachy.embody.summary.SummaryProducer` reads this and nothing
+        else. Deriving it here rather than in the producer keeps ONE definition
+        of "older than the window" — two would eventually disagree about which
+        turns are covered, and the ones they disagreed about would be the ones
+        silently lost when the deque drops them at ``n``.
+        """
+        pairs = self.history()
+        if self._senses_history_maxlen <= 0:
+            return pairs
+        return pairs[: max(0, len(pairs) - self._senses_history_maxlen)]
 
     def _summary_message(self) -> dict | None:
         """The system-role message carrying Qwen's summary, or its staleness marker.
