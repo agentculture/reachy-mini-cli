@@ -88,11 +88,13 @@ logs a drop for an unrecognised event; ``reachy.embody.cues`` does).
 from __future__ import annotations
 
 import argparse
+import base64
 import functools
 import logging
 import os
 import sys
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -665,6 +667,8 @@ EMBODY_SOURCE_VOICE = "voice"
 EMBODY_SOURCE_SESSION = "session"
 EMBODY_SOURCE_CUES = "cue-reader"
 EMBODY_SOURCE_SHUTDOWN = "shutdown"
+#: The clip -> ``ask()`` perception lane (task t11, issue #139's h9 blocker).
+EMBODY_SOURCE_CLIP = "clip"
 
 #: A voice engine would not resolve at composition, so that tool refuses for the
 #: life of the process rather than the tool set changing shape per box.
@@ -679,6 +683,23 @@ REASON_CUE_SOURCE_FAILED = "cue-source-failed"
 #: Closing a held resource raised. Named, never propagated — a fault in teardown
 #: must not mask the reason the layer was stopping.
 REASON_SHUTDOWN_FAILED = "shutdown-failed"
+#: ``state.json``'s ``clip`` key is missing, unreadable, or names
+#: ``available: false`` (no ``[vision]`` extra, no clip encoded yet, ...) — see
+#: the block's own ``reason`` field, carried as the drop's detail.
+REASON_CLIP_UNAVAILABLE = "clip-unavailable"
+#: The clip block IS available but its ``ts`` (a MONOTONIC value from the
+#: runtime process — see ``reachy/behavior/clip_rider.py``) is older than
+#: :data:`DEFAULT_CLIP_STALE_AFTER_S`: asking about it would tell the mind
+#: about a view the robot no longer has.
+REASON_CLIP_STALE = "clip-stale"
+#: The clip's ``path`` could not be turned into a question — missing, unreadable,
+#: or the read otherwise raised.
+REASON_CLIP_UNREADABLE = "clip-unreadable"
+#: ``ask()`` itself raised (a dead senses-lane gateway, a timeout, ...).
+REASON_CLIP_ASK_FAILED = "clip-ask-failed"
+#: ``ask()`` returned no usable answer (an empty/blank stream) — nothing worth
+#: parking as context.
+REASON_CLIP_ASK_EMPTY = "clip-ask-empty"
 
 #: Every failure this composition root can name, in one place so the journal,
 #: the export feed, the operator docs and the tests share ONE vocabulary — the
@@ -691,6 +712,11 @@ EMBODY_REASONS: frozenset[str] = frozenset(
         REASON_SESSION_START_FAILED,
         REASON_CUE_SOURCE_FAILED,
         REASON_SHUTDOWN_FAILED,
+        REASON_CLIP_UNAVAILABLE,
+        REASON_CLIP_STALE,
+        REASON_CLIP_UNREADABLE,
+        REASON_CLIP_ASK_FAILED,
+        REASON_CLIP_ASK_EMPTY,
     }
 )
 
@@ -698,9 +724,31 @@ EMBODY_REASONS: frozenset[str] = frozenset(
 _EMBODY_VOICES = ("tts", "harmonic")
 
 EMBODY_READER_THREAD_NAME = "embody-cue-reader"
+EMBODY_CLIP_THREAD_NAME = "embody-clip-asker"
 
 #: Default gap between turns when nothing is pending (seconds).
 DEFAULT_TURN_INTERVAL = 0.5
+
+#: How often :class:`_ClipAsker` checks ``state.json``'s ``clip`` key. Bounded
+#: well above the clip rider's own ``DEFAULT_ENCODE_INTERVAL_S`` (5 s,
+#: ``reachy/behavior/clip_rider.py``) — an active runtime republishes a new
+#: clip roughly every 5 s, but "ask a model to watch a video" is a genuine
+#: senses-lane gateway call, and the #143 flood (23 streaming calls in 40 s
+#: from cues ALONE) is exactly the failure mode a second, unbounded lane must
+#: not reproduce. Combined with the change-detection in
+#: :meth:`_ClipAsker.poll_once` (a clip whose ``ts`` has not moved since the
+#: last check is a silent no-op, never a re-ask), this caps the senses lane at
+#: one call per this many seconds even while the robot watches continuously.
+DEFAULT_CLIP_POLL_INTERVAL_S = 20.0
+#: How old a clip's ``ts`` may be (measured on THIS process's own monotonic
+#: clock — the value itself came from the runtime process's monotonic clock,
+#: which is the same system-wide counter on one host, never wall time; see
+#: ``clip_rider.py``'s module docstring) before :class:`_ClipAsker` refuses to
+#: ask about it. ~6x the rider's own encode cadence: loose enough to absorb
+#: ordinary jitter between two independent processes, tight enough that a
+#: runtime that has stopped publishing for half a minute reads as "no longer
+#: the robot's current view" rather than as one.
+DEFAULT_CLIP_STALE_AFTER_S = 30.0
 
 #: Seconds ``agent embody stop`` waits after SIGTERM before escalating to
 #: SIGKILL (task t12). Mirrors :data:`reachy.embody.supervisor.
@@ -922,6 +970,211 @@ class _CueReader:
 
 
 # ---------------------------------------------------------------------------
+# The clip -> ask() perception lane (task t11, issue #139's h9 blocker)
+# ---------------------------------------------------------------------------
+
+#: The question :func:`build_clip_question` asks the ``senses`` lane about the
+#: runtime's own rolling clip (issue #139's h9: "ask the worker model where it
+#: is"). Framed as a single perception question, matching
+#: :meth:`~reachy.embody.engine.EmbodyTurnEngine.ask`'s own contract — the
+#: answer becomes a CONTEXT cue for the next TRIGGERED turn, never a reply
+#: spoken on its own.
+DEFAULT_CLIP_PROMPT = (
+    "You are shown a short recent clip from your own camera. In one or two "
+    "plain sentences, describe where you appear to be and what is happening "
+    "in view right now."
+)
+
+
+def build_clip_question(path: str | Path, prompt: str = DEFAULT_CLIP_PROMPT) -> list[dict]:
+    """The OpenAI-style multimodal content for :meth:`~reachy.embody.engine.
+    EmbodyTurnEngine.ask` about one clip.
+
+    One ``text`` part plus one ``video_url`` data-URI part, in that exact
+    order and shape — ``docs/evidence/2026-08-01-probe-video-wire-format.md``
+    (task t2) proved the deployed gateway decodes this correctly, streamed,
+    with a recognizably correct description (and that the direction flips
+    correctly between a forward and a reversed control clip, ruling out a
+    lucky prior). ``ask()`` forwards whatever it is given as the user
+    message's ``content`` verbatim, so no change to ``ask`` itself was needed
+    to carry a clip beyond widening its type hint — only this content-shaping
+    helper.
+
+    Lives HERE rather than in :mod:`reachy.embody.engine` on purpose: that
+    module's own model-config claim ("the engine reads no file and writes no
+    environment variable") is machine-checked by an AST scan over the WHOLE
+    module (``tests/test_embody_engine.py``), so a file read belongs on the
+    composition-root side of that boundary — exactly where the clip's PATH is
+    already resolved (:func:`_default_clip_reader`).
+
+    A pure, RAISING helper on purpose: whatever reading *path* raises
+    (typically :class:`OSError` — missing file, permission, a race with the
+    clip rider's own overwrite-in-place rename) propagates unchanged, so this
+    function stays trivially unit-testable against a real temp file. The
+    caller (:class:`_ClipAsker`) is what turns a raise here into a named,
+    non-blocking drop.
+    """
+    data = Path(path).read_bytes()
+    encoded = base64.b64encode(data).decode("ascii")
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{encoded}"}},
+    ]
+
+
+class _ClipAsker:
+    """Poll the runtime's clip reference and turn it into perception CONTEXT.
+
+    ``EmbodyTurnEngine.ask()`` (the tool-less ``senses`` lane) was built for
+    exactly this — "a cheap perception question (describe this clip, is that a
+    face) whose answer becomes a cue, not an action" — and had ZERO callers
+    anywhere in :mod:`reachy` (issue #139's h9 blocker: "ask the worker model
+    where it is"). This class is its first real caller: it reads
+    ``state.json``'s ``clip`` key (:mod:`reachy.behavior.clip_rider`'s path
+    reference), and when it names a fresh clip, asks about it and parks the
+    answer as CONTEXT the next TRIGGERED turn drains (issue #143's policy) —
+    never a trigger of its own.
+
+    A background THREAD, for the same reason :class:`_CueReader` is one — but
+    the constraint here is sharper than "must not block on I/O": ``ask()`` is
+    a synchronous senses-lane network call, so running it from
+    :meth:`~reachy.embody.engine.EmbodyTurnEngine.run`'s ``before_turn`` hook
+    (the turn loop's OWN thread) would delay every pending trigger behind it —
+    exactly the coupling h6/#139 forbid ("must never delay or block a turn").
+    Polling on this thread means a stalled senses lane costs this thread
+    alone; ``ask()`` is already deliberately outside the engine's
+    ``_turn_lock`` (see that method's own docstring), so a concurrent
+    ``run_turn()`` proceeds at full speed regardless of how long a poll is
+    stuck inside ``ask()``.
+
+    Cadence AND change-detection, never either alone: polling only on a bound
+    interval (:data:`DEFAULT_CLIP_POLL_INTERVAL_S`) caps how often the senses
+    lane is hit even while the runtime republishes a clip every
+    ``DEFAULT_ENCODE_INTERVAL_S`` (5 s, ``reachy/behavior/clip_rider.py``);
+    re-asking about the SAME clip on top of that (an unchanged ``ts``) would
+    ask an identical question for no new information, so
+    :meth:`poll_once` treats that as a silent no-op — nothing has gone wrong,
+    there is simply nothing new to report.
+
+    Every negative path resolves to exactly ONE named drop — never a raise,
+    never a blocked or delayed turn: a missing/unavailable clip block
+    (:data:`REASON_CLIP_UNAVAILABLE`, naming the block's own ``reason`` when it
+    has one), one whose ``ts`` has not advanced within
+    :data:`DEFAULT_CLIP_STALE_AFTER_S` (:data:`REASON_CLIP_STALE`), a path this
+    process could not turn into a question (:data:`REASON_CLIP_UNREADABLE`),
+    and ``ask()`` raising or answering empty (:data:`REASON_CLIP_ASK_FAILED` /
+    :data:`REASON_CLIP_ASK_EMPTY`). Each is deduped against the last-reported
+    state (mirroring :meth:`~reachy.behavior.clip_rider.ClipRider._report`) so
+    a box with no clip ever published (no ``[vision]`` extra, the http-remote
+    profile, a fresh boot) logs ONE line, not one every poll cycle forever.
+    """
+
+    def __init__(
+        self,
+        engine: object,
+        *,
+        read_clip: Callable[[], dict | None],
+        export: object = None,
+        prompt: str | None = None,
+        poll_interval: float = DEFAULT_CLIP_POLL_INTERVAL_S,
+        stale_after_s: float = DEFAULT_CLIP_STALE_AFTER_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._engine = engine
+        self._read_clip = read_clip
+        self._export = export
+        self._prompt = prompt
+        self._poll_interval = max(0.1, float(poll_interval))
+        self._stale_after_s = max(0.0, float(stale_after_s))
+        self._clock = clock
+        self._stop = threading.Event()
+        self.thread: threading.Thread | None = None
+        self._last_ts: float | None = None
+        self._last_report: tuple[str, str] | None = None
+        self.asks = 0
+        self.drops = 0
+
+    def start(self) -> None:
+        """Start the poll thread. Idempotent."""
+        if self.thread is not None:
+            return
+        self.thread = threading.Thread(target=self._run, name=EMBODY_CLIP_THREAD_NAME, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        """Ask the poller to stop after its current check. Never blocks."""
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.poll_once()
+            self._stop.wait(self._poll_interval)
+
+    def poll_once(self) -> None:
+        """Check the clip reference once. NEVER raises; NEVER blocks a turn.
+
+        Called by the poll loop (:meth:`_run`) and directly by tests — no
+        thread is needed to exercise the policy.
+        """
+        try:
+            block = self._read_clip()
+        except Exception as err:  # noqa: BLE001 — a broken read is a named drop, not a raise
+            self._report(REASON_CLIP_UNAVAILABLE, f"read raised {type(err).__name__}: {err}")
+            return
+        if not isinstance(block, dict) or not block.get("available"):
+            reason = block.get("reason") if isinstance(block, dict) else None
+            self._report(REASON_CLIP_UNAVAILABLE, reason or "no clip block published yet")
+            return
+        ts = block.get("ts")
+        path = block.get("path")
+        if not isinstance(ts, (int, float)) or not path:
+            self._report(REASON_CLIP_UNAVAILABLE, "clip block carries no ts/path")
+            return
+        if ts == self._last_ts:
+            return  # unchanged since the last ask — a quiet no-op, not a drop
+        age = self._clock() - float(ts)
+        if age > self._stale_after_s:
+            self._last_ts = ts  # never retry the SAME stale clip
+            self._report(REASON_CLIP_STALE, f"age={age:.1f}s > {self._stale_after_s:g}s")
+            return
+        self._last_ts = ts
+        self._ask_about(str(path))
+
+    def _ask_about(self, path: str) -> None:
+        """Turn *path* into a question, ask it, and park the answer as CONTEXT."""
+        from reachy.embody.cues import CueClass
+
+        try:
+            content = build_clip_question(path, self._prompt or DEFAULT_CLIP_PROMPT)
+        except Exception as err:  # noqa: BLE001 — an unreadable clip is a named drop
+            self._report(REASON_CLIP_UNREADABLE, f"{path}: {type(err).__name__}: {err}")
+            return
+        try:
+            answer = self._engine.ask(content)
+        except Exception as err:  # noqa: BLE001 — ask() must never wedge this thread
+            self._report(REASON_CLIP_ASK_FAILED, f"{type(err).__name__}: {err}")
+            return
+        answer = (answer or "").strip()
+        if not answer:
+            self._report(REASON_CLIP_ASK_EMPTY, "")
+            return
+        self._last_report = None  # the lane recovered; the next failure reports fresh
+        self.asks += 1
+        # CONTEXT, explicitly — never a trigger (t7/#143's policy): a clip
+        # answer is a perception the NEXT triggered turn reads, exactly like
+        # any other sense cue, never a reason to run one by itself.
+        self._engine.submit_cue(f"camera view: {answer}", cue_class=CueClass.CONTEXT)
+
+    def _report(self, reason: str, detail: str) -> None:
+        key = (reason, detail)
+        if key == self._last_report:
+            return
+        self._last_report = key
+        self.drops += 1
+        _embody_drop(self._export, EMBODY_SOURCE_CLIP, reason, detail)
+
+
+# ---------------------------------------------------------------------------
 # The composed layer
 # ---------------------------------------------------------------------------
 
@@ -938,6 +1191,7 @@ class _EmbodyLayer:
         registry: object,
         engine: object,
         reader: _CueReader,
+        clip_asker: _ClipAsker | None = None,
         export: object = None,
     ) -> None:
         self.profile = profile
@@ -946,6 +1200,7 @@ class _EmbodyLayer:
         self.registry = registry
         self.engine = engine
         self.reader = reader
+        self.clip_asker = clip_asker
         self._export = export
         self._stop = threading.Event()
         self._closed = False
@@ -968,6 +1223,8 @@ class _EmbodyLayer:
                 f"{type(err).__name__}: {err}",
             )
         self.reader.start()
+        if self.clip_asker is not None:
+            self.clip_asker.start()
 
     def request_stop(self) -> None:
         """Ask the run loop to finish after the current turn. Safe from any thread."""
@@ -995,6 +1252,8 @@ class _EmbodyLayer:
         self._closed = True
         self._stop.set()
         self.reader.stop()
+        if self.clip_asker is not None:
+            self.clip_asker.stop()
         for label, closer in (("session", self.session.close), ("media", self.media.close)):
             try:
                 closer()
@@ -1062,6 +1321,30 @@ def _require_readable_feed(feed: str) -> None:
     )
 
 
+def _default_clip_reader(root: Path | None) -> Callable[[], dict | None]:
+    """The production ``read_clip`` seam: ``state.json``'s ``clip`` key.
+
+    Same containment as every other spool consumer this composition root
+    builds (:func:`_resolve_spool_dir` -> :class:`~reachy.embody.tools.
+    EmbodyToolRegistry`'s ``spool_root``): :mod:`reachy.behavior.control`
+    resolves the state dir on the layer's behalf, reaching
+    :func:`~reachy.daemon.state_dir` only transitively — never its process
+    surface — so this module still never imports :mod:`reachy.daemon` itself.
+    *root* is the SAME override :meth:`_resolve_spool_dir` returns, so a test
+    (or an operator's ``--spool-dir``) that redirects the tool registry's
+    spool redirects this reader too — the clip lives under the ONE
+    ``behavior/`` tree the runtime and the layer already share.
+    """
+    from reachy.behavior import control as control_mod
+
+    def _read() -> dict | None:
+        state = control_mod.read_state(root=root)
+        block = state.get("clip") if isinstance(state, dict) else None
+        return block if isinstance(block, dict) else None
+
+    return _read
+
+
 def _compose_embody_seam(
     args: argparse.Namespace,
     *,
@@ -1074,6 +1357,8 @@ def _compose_embody_seam(
     synthesize: Mapping[str, Callable[[str], bytes]] | None = None,
     lines: Iterable[str] | None = None,
     stdin: TextIO | None = None,
+    clip_reader: Callable[[], dict | None] | None = None,
+    clip_poll_interval: float | None = None,
 ) -> _EmbodyLayer:
     """Build the whole layer — the ONE place the wave-1/2/3 seams meet.
 
@@ -1101,11 +1386,12 @@ def _compose_embody_seam(
         resolved_media.sink, export=export, synthesize=synthesize
     )
 
+    spool_root = _resolve_spool_dir(args)
     build_registry = registry_factory if registry_factory is not None else EmbodyToolRegistry
     registry = build_registry(
         speak=speak_seam,
         harmonics=harmonic_seam,
-        spool_root=_resolve_spool_dir(args),
+        spool_root=spool_root,
         await_timeout=float(getattr(args, "await_timeout", 1.0)),
     )
 
@@ -1143,6 +1429,14 @@ def _compose_embody_seam(
         feed_lines, engine, export=export, max_events=getattr(args, "max_events", None)
     )
 
+    clip_asker_kwargs: dict[str, object] = {
+        "read_clip": clip_reader if clip_reader is not None else _default_clip_reader(spool_root),
+        "export": export,
+    }
+    if clip_poll_interval is not None:
+        clip_asker_kwargs["poll_interval"] = clip_poll_interval
+    clip_asker = _ClipAsker(engine, **clip_asker_kwargs)
+
     return _EmbodyLayer(
         profile=getattr(resolved_media, "profile", "unknown"),
         media=resolved_media,
@@ -1150,6 +1444,7 @@ def _compose_embody_seam(
         registry=registry,
         engine=engine,
         reader=reader,
+        clip_asker=clip_asker,
         export=export,
     )
 
@@ -1203,6 +1498,7 @@ def cmd_agent_embody(
         "events": layer.reader.events,
         "cues": layer.reader.cues,
         "utterances": int(getattr(layer.session, "utterances", 0) or 0),
+        "clip_asks": layer.clip_asker.asks if layer.clip_asker is not None else 0,
     }
     if json_mode and export_hook is None:
         emit_result({"status": "ok", **stats}, json_mode=True)

@@ -951,3 +951,34 @@ def test_a_field_passed_through_request_config_reaches_the_engine() -> None:
     engine.submit_utterance("tick")
     engine.run_turn()
     assert turn.calls[0]["kwargs"]["max_tokens"] == 99
+
+
+# =========================================================================== #
+# issue #139/h9 — ask() carries a multimodal clip question with no branching  #
+# =========================================================================== #
+#
+# The wiring itself (clip -> ask() -> CONTEXT, never a trigger) is task t11's
+# job and lives entirely in tests/test_agent_embody.py, alongside
+# reachy.cli._commands.agent.build_clip_question (the content-shaping helper
+# that reads the clip file — deliberately NOT in this module, since this
+# module's own model-config claim, "the engine reads no file", is machine-
+# checked by an AST scan a few tests up). What belongs HERE is ask()'s own
+# contract: it forwards whatever content it is given verbatim, string or an
+# OpenAI-style multimodal list, with no branching of its own.
+
+
+def test_ask_forwards_multimodal_content_verbatim_no_branching() -> None:
+    """ask() must not care whether prompt is a string or a content list."""
+    script = Script(chunks=[content_chunk("a red square"), finish()])
+    with FakeChatServer(script=script) as server:
+        engine = _build(base_url=server.base_url)
+        content = [
+            {"type": "text", "text": "describe this clip"},
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,QUJD"}},
+        ]
+        answer = engine.ask(content)
+
+    assert answer == "a red square"
+    sent_messages = server.requests[0]["messages"]
+    user_message = next(m for m in sent_messages if m["role"] == "user")
+    assert user_message["content"] == content
