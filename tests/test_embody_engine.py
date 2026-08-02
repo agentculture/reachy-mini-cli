@@ -43,6 +43,7 @@ from reachy.embody import engine as engine_mod
 from reachy.embody.cues import CueClass
 from reachy.embody.engine import (
     DROP_REASONS,
+    ENV_ATTENTION_WINDOW_S,
     ENV_SENSES_MODEL,
     ENV_WORKER_MODEL,
     REASON_EMPTY_INPUT,
@@ -55,6 +56,7 @@ from reachy.embody.engine import (
     EmbodyModels,
     EmbodyTurnEngine,
     first_emoji,
+    resolve_attention_window_s,
 )
 from reachy.embody.tools import CREATE_RULE, REFUSAL_RULE_NAMESPACE, SPEAK, EmbodyToolRegistry
 from reachy.export.exporter import ExportHook
@@ -408,6 +410,64 @@ def test_resolving_and_running_never_mutate_the_environment(monkeypatch) -> None
 
     assert dict(os.environ) == before
     assert turn.models == ["qwen-on-thor", ROLE_SENSES]
+
+
+# =========================================================================== #
+# issue #150 — the attention window is an operator knob, resolved the same   #
+# way the model names are: explicit argument, then process env, then default #
+# =========================================================================== #
+
+
+def test_attention_window_default_matches_the_documented_constant() -> None:
+    assert resolve_attention_window_s(env={}) == engine_mod.DEFAULT_ATTENTION_WINDOW_S
+
+
+def test_attention_window_resolves_from_process_env_only() -> None:
+    resolved = resolve_attention_window_s(env={ENV_ATTENTION_WINDOW_S: "10"})
+    assert resolved == 10.0
+
+
+def test_an_explicit_attention_window_wins_over_the_environment() -> None:
+    resolved = resolve_attention_window_s(5.0, env={ENV_ATTENTION_WINDOW_S: "10"})
+    assert resolved == 5.0
+
+
+def test_an_explicit_zero_attention_window_is_not_treated_as_unset() -> None:
+    """The falsy-zero hazard: an ``or`` chain would read 0.0 as "not given".
+
+    Unlike :meth:`EmbodyModels.resolve`'s string fields (where an empty
+    string and "unset" are the same thing), ``0`` is a legitimate,
+    meaningfully different value here — name-only-forever, the same
+    convention ``Limits.min_alert_interval_s`` already uses for ``0``. This
+    pins that :func:`resolve_attention_window_s` checks *explicit* by
+    identity against ``None``, not by truthiness.
+    """
+    resolved = resolve_attention_window_s(0.0, env={ENV_ATTENTION_WINDOW_S: "10"})
+    assert resolved == 0.0
+
+
+def test_attention_window_env_value_of_zero_is_also_honoured() -> None:
+    resolved = resolve_attention_window_s(env={ENV_ATTENTION_WINDOW_S: "0"})
+    assert resolved == 0.0
+
+
+def test_a_non_numeric_attention_window_env_value_degrades_to_the_default(caplog) -> None:
+    """Mirrors ``reachy.embody.media._env_int``: never raise, log and fall back."""
+    with caplog.at_level("WARNING"):
+        resolved = resolve_attention_window_s(env={ENV_ATTENTION_WINDOW_S: "not-a-number"})
+    assert resolved == engine_mod.DEFAULT_ATTENTION_WINDOW_S
+    assert "not-a-number" in caplog.text
+
+
+def test_resolving_the_attention_window_never_mutates_the_environment(monkeypatch) -> None:
+    """Same guarantee as the model resolution: no global mutation, no file I/O."""
+    monkeypatch.setenv(ENV_ATTENTION_WINDOW_S, "12")
+    before = dict(os.environ)
+
+    resolved = resolve_attention_window_s()
+
+    assert dict(os.environ) == before
+    assert resolved == 12.0
 
 
 def test_the_engine_reads_no_file_and_writes_no_environment_variable() -> None:
@@ -888,6 +948,7 @@ def test_limits_defaults_match_the_documented_module_constants() -> None:
     assert limits.min_alert_interval_s == engine_mod.DEFAULT_MIN_ALERT_INTERVAL_S
     assert limits.spoken_maxlen == engine_mod.DEFAULT_SPOKEN_MAXLEN
     assert limits.turn_interval == engine_mod.DEFAULT_TURN_INTERVAL
+    assert limits.attention_window_s == engine_mod.DEFAULT_ATTENTION_WINDOW_S
 
 
 def test_limits_is_frozen() -> None:

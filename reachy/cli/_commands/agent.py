@@ -763,6 +763,20 @@ DEFAULT_CLIP_STALE_AFTER_S = 30.0
 #: defined three times over (sleep/vision/behavior).
 EMBODY_DEFAULT_STOP_TIMEOUT = 10.0
 
+#: Mirrors :data:`reachy.embody.attention.DEFAULT_ATTENTION_WINDOW_S` and
+#: :data:`reachy.embody.engine.ENV_ATTENTION_WINDOW_S` by VALUE, not by import
+#: — for the SAME reason ``DEFAULT_TURN_INTERVAL``/``EMBODY_DEFAULT_STOP_
+#: TIMEOUT`` above are independently defined here rather than imported: a
+#: command module registering this noun's CLI flags must not import
+#: :mod:`reachy.embody` at module scope (it pulls in ``reachy.speech.llm``,
+#: forbidden in ``_build_parser()``'s import closure by
+#: ``tests/test_zero_llm_boundary.py``). Used only to spell out the default in
+#: the flag's own help text; resolution against the real default happens in
+#: :func:`reachy.embody.engine.resolve_attention_window_s`, imported
+#: function-locally where composition actually needs it.
+DEFAULT_ATTENTION_WINDOW_S = 45.0
+ENV_ATTENTION_WINDOW_S = "REACHY_EMBODY_ATTENTION_WINDOW"
+
 
 def _embody_drop(export: object, source: str, reason: str, detail: str = "") -> None:
     """Name one layer failure on the journal AND on the export feed (h22).
@@ -1388,7 +1402,7 @@ def _compose_embody_seam(
     tee socket.
     """
     from reachy.embody.cues import open_runtime_lines
-    from reachy.embody.engine import EmbodyTurnEngine, Limits
+    from reachy.embody.engine import EmbodyTurnEngine, Limits, resolve_attention_window_s
     from reachy.embody.media import build_media
     from reachy.embody.tools import EmbodyToolRegistry
     from reachy.speech.realtime_duplex import RealtimeDuplexSession
@@ -1415,10 +1429,12 @@ def _compose_embody_seam(
         "registry": registry,
         "export": export,
         # issue #141/S107: the engine's bounds live in one frozen Limits now;
-        # this composition root only ever overrides turn_interval, so every
-        # other field takes the engine's own documented default.
+        # this composition root overrides turn_interval and attention_window_s
+        # (issue #150, resolved explicit-flag > env > default), so every other
+        # field takes the engine's own documented default.
         "limits": Limits(
-            turn_interval=float(getattr(args, "turn_interval", DEFAULT_TURN_INTERVAL))
+            turn_interval=float(getattr(args, "turn_interval", DEFAULT_TURN_INTERVAL)),
+            attention_window_s=resolve_attention_window_s(getattr(args, "attention_window", None)),
         ),
     }
     if turn_fn is not None:
@@ -1562,6 +1578,7 @@ def cmd_agent_embody_start(args: argparse.Namespace) -> int:
         await_timeout=args.await_timeout,
         turn_interval=args.turn_interval,
         mute_during_playback=args.mute_during_playback,
+        attention_window=args.attention_window,
     )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
@@ -1593,6 +1610,7 @@ def cmd_agent_embody_restart(args: argparse.Namespace) -> int:
         await_timeout=args.await_timeout,
         turn_interval=args.turn_interval,
         mute_during_playback=args.mute_during_playback,
+        attention_window=args.attention_window,
     )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
@@ -1769,6 +1787,20 @@ def _add_embody_operating_args(parser: argparse.ArgumentParser, *, inherit: bool
         "Reachy has hardware AEC against its own speakers, so the layer keeps "
         "hearing while it talks (which is what makes barge-in possible). This is "
         "the one-flip fallback if live AEC proves insufficient.",
+    )
+    parser.add_argument(
+        "--attention-window",
+        type=float,
+        default=_default(None),
+        dest="attention_window",
+        metavar="SECONDS",
+        help="Seconds attention stays open after the last utterance heard or answer "
+        "spoken; 0 means name-only forever (issue #150). Precedence: this flag, "
+        f"then {ENV_ATTENTION_WINDOW_S} in the process environment, then the "
+        f"layer's own default ({DEFAULT_ATTENTION_WINDOW_S:g}s). Like every other "
+        f"flag in this group, unspecified here falls through to "
+        f"{ENV_ATTENTION_WINDOW_S} at composition time, in THIS process (the "
+        "foreground layer) or the spawned child (start/restart) alike.",
     )
 
 
