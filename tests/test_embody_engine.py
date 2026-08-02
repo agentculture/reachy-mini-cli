@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
+import inspect
 import json
 import os
 from pathlib import Path
@@ -142,6 +144,16 @@ def _speak_call(text: str, call_id: str = "call_1") -> ToolCall:
     return ToolCall(id=call_id, name=SPEAK, arguments={"text": text}, arguments_json=payload)
 
 
+#: Every :class:`~reachy.embody.engine.Limits` / :class:`~reachy.embody.engine.
+#: RequestConfig` field name (issue #141/S107) — used to translate the flat,
+#: per-field kwargs most tests already pass (e.g. ``max_pending=2``,
+#: ``base_url=...``) into the ``limits=`` / ``request=`` keywords the
+#: constructor takes now, so the individual test bodies below did not have to
+#: change.
+_LIMIT_FIELDS = {field.name for field in dataclasses.fields(engine_mod.Limits)}
+_REQUEST_FIELDS = {field.name for field in dataclasses.fields(engine_mod.RequestConfig)}
+
+
 def _build(**kwargs) -> EmbodyTurnEngine:
     """An engine with every collaborator faked unless the test says otherwise.
 
@@ -152,6 +164,12 @@ def _build(**kwargs) -> EmbodyTurnEngine:
     if "base_url" not in kwargs:
         kwargs.setdefault("turn_fn", ScriptedTurn(TurnResult(content="ok", finish_reason="stop")))
     kwargs.setdefault("models", EmbodyModels(worker="worker", senses="senses"))
+    limit_kwargs = {name: kwargs.pop(name) for name in list(kwargs) if name in _LIMIT_FIELDS}
+    if limit_kwargs:
+        kwargs.setdefault("limits", engine_mod.Limits(**limit_kwargs))
+    request_kwargs = {name: kwargs.pop(name) for name in list(kwargs) if name in _REQUEST_FIELDS}
+    if request_kwargs:
+        kwargs.setdefault("request", engine_mod.RequestConfig(**request_kwargs))
     return EmbodyTurnEngine(**kwargs)
 
 
@@ -827,3 +845,109 @@ def test_the_goto_tool_name_is_imported_not_retyped() -> None:
     """A drift canary: the engine's voice-tool set names the shipped constants."""
     assert GOTO not in engine_mod.DEFAULT_VOICE_TOOLS
     assert SPEAK in engine_mod.DEFAULT_VOICE_TOOLS
+
+
+# =========================================================================== #
+# issue #141/S107 — bounds/request config live in frozen dataclasses,         #
+# seams stay explicit                                                        #
+# =========================================================================== #
+#
+# Sonar's CONFIGURED threshold for this project (queried live against
+# SonarCloud, not assumed from the rule's language-wide default of 7) is
+# 13 authorized parameters ("Method __init__ has 21 parameters, which is
+# greater than the 13 authorized"). Moving only the 8 fields the issue names
+# by example (max_tool_rounds, history_maxlen, max_pending, spoken_maxlen and
+# the several timeouts) into Limits leaves this constructor at 17 — still
+# over. :class:`~reachy.embody.engine.RequestConfig` is the second grouping
+# that closes the remaining gap: not a seam (no field is callable) and not a
+# resource/time bound either, but equally not an injected collaborator, so it
+# belongs on the "grouped" side of the seam/non-seam line the issue draws.
+
+
+def test_limits_defaults_match_the_documented_module_constants() -> None:
+    """The refactor must not change a single default — only where it lives."""
+    limits = engine_mod.Limits()
+    assert limits.idle_timeout_s == engine_mod.DEFAULT_IDLE_TIMEOUT_S
+    assert limits.max_tool_rounds == engine_mod.DEFAULT_MAX_TOOL_ROUNDS
+    assert limits.history_maxlen == engine_mod.DEFAULT_HISTORY_MAXLEN
+    assert limits.max_pending == engine_mod.DEFAULT_MAX_PENDING
+    assert limits.max_context == engine_mod.DEFAULT_MAX_CONTEXT
+    assert limits.min_alert_interval_s == engine_mod.DEFAULT_MIN_ALERT_INTERVAL_S
+    assert limits.spoken_maxlen == engine_mod.DEFAULT_SPOKEN_MAXLEN
+    assert limits.turn_interval == engine_mod.DEFAULT_TURN_INTERVAL
+
+
+def test_limits_is_frozen() -> None:
+    limits = engine_mod.Limits()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        limits.max_pending = 1  # type: ignore[misc]
+
+
+def test_request_config_defaults_match_the_documented_module_constants() -> None:
+    """Same guarantee as Limits: grouping must not change a single default."""
+    request = engine_mod.RequestConfig()
+    assert request.system_prompt == engine_mod.DEFAULT_EMBODY_SYSTEM_PROMPT
+    assert request.base_url is None
+    assert request.api_key is None
+    assert request.temperature == engine_mod.DEFAULT_TEMPERATURE
+    assert request.max_tokens is None
+    assert request.enable_thinking is False
+
+
+def test_request_config_is_frozen() -> None:
+    request = engine_mod.RequestConfig()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        request.temperature = 1.0  # type: ignore[misc]
+
+
+def test_the_constructor_keeps_seams_explicit_and_moves_bounds_and_request_config_out() -> None:
+    """S107's fix: bounds and request config each collapse to one keyword."""
+    params = inspect.signature(EmbodyTurnEngine.__init__).parameters
+    names = set(params) - {"self"}
+
+    assert names.isdisjoint(_LIMIT_FIELDS), "a bound is still a bare parameter"
+    assert names.isdisjoint(_REQUEST_FIELDS), "a request field is still a bare parameter"
+    assert {"limits", "request"} <= names
+
+    seams = {
+        "registry",
+        "turn_fn",
+        "export",
+        "models",
+        "on_content",
+        "on_reasoning",
+        "cancel",
+        "now_fn",
+        "sleep",
+    }
+    assert seams <= names, "an injectable seam must stay an explicit parameter"
+    assert all(params[name].kind is inspect.Parameter.KEYWORD_ONLY for name in names)
+
+
+def test_the_constructor_clears_this_projects_configured_s107_threshold() -> None:
+    """The hard acceptance criterion: not "fewer parameters", but under the gate.
+
+    13 is this project's CONFIGURED ``python:S107`` threshold, queried live
+    against SonarCloud rather than assumed — the language-wide default (7)
+    would be the wrong number to pin here.
+    """
+    params = inspect.signature(EmbodyTurnEngine.__init__).parameters
+    count = len(params) - 1  # exclude self
+    assert count <= 13, f"{count} parameters still exceeds the 13 authorized"
+
+
+def test_a_bound_passed_through_limits_reaches_the_engine() -> None:
+    """Behavioural proof, not just a signature check: the value actually takes."""
+    engine = _build(limits=engine_mod.Limits(max_pending=1))
+    assert engine.submit_utterance("first") is True
+    assert engine.submit_utterance("second") is False
+    assert engine.dropped_inputs == 1
+
+
+def test_a_field_passed_through_request_config_reaches_the_engine() -> None:
+    """Behavioural proof for the second grouping, mirroring the Limits one."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, request=engine_mod.RequestConfig(max_tokens=99))
+    engine.submit_utterance("tick")
+    engine.run_turn()
+    assert turn.calls[0]["kwargs"]["max_tokens"] == 99

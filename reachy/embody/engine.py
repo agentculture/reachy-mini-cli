@@ -379,6 +379,96 @@ class EmbodyModels:
 
 
 # --------------------------------------------------------------------------- #
+# Bounds, grouped into one frozen home (issue #141, python:S107)              #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Limits:
+    """:class:`EmbodyTurnEngine`'s numeric bounds, out of the constructor's kwargs.
+
+    Every field here was a bare keyword parameter on
+    :class:`EmbodyTurnEngine` before this task; the constructor's OTHER
+    parameters are injected SEAMS (a collaborator, a callable tap, a clock)
+    and none of those moved — grouping seams in here too would just relocate
+    the S107 complaint rather than fix its actual defect. This class does not
+    re-explain each bound: the measured reasoning behind every default lives
+    with its ``DEFAULT_*`` constant above (the one documented home this module
+    already keeps), and every field here simply carries that same constant
+    forward unchanged, so the refactor cannot silently change a number while
+    moving it.
+    """
+
+    #: The inter-chunk idle budget passed to every streamed call.
+    idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S
+    #: Rounds one turn may take before the tool loop is force-stopped.
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS
+    #: Prior (perception, reply) pairs kept in the rolling history.
+    history_maxlen: int = DEFAULT_HISTORY_MAXLEN
+    #: Pending TRIGGERS (utterances + alerts) held between turns.
+    max_pending: int = DEFAULT_MAX_PENDING
+    #: DISTINCT facts the context park holds.
+    max_context: int = DEFAULT_MAX_CONTEXT
+    #: Seconds between ALERT-triggered turns; ``0`` disables the bound.
+    min_alert_interval_s: float = DEFAULT_MIN_ALERT_INTERVAL_S
+    #: Recent already-spoken replies carried into the next turn's context.
+    spoken_maxlen: int = DEFAULT_SPOKEN_MAXLEN
+    #: Minimum gap between turns in :meth:`EmbodyTurnEngine.run`.
+    turn_interval: float = DEFAULT_TURN_INTERVAL
+
+
+@dataclass(frozen=True)
+class RequestConfig:
+    """The per-call LLM request template, grouped for the SAME reason as :class:`Limits`.
+
+    :class:`Limits` alone — the resource/time bounds issue #141 names by
+    example (``max_tool_rounds``, the several timeouts, …) — still leaves this
+    engine's constructor at 17 parameters. This project's configured
+    ``python:S107`` threshold is **13 authorized parameters** (verified
+    against SonarCloud, not assumed), so bounds alone do not clear the rule
+    here — measured, not guessed, and the reason this second dataclass exists
+    at all. Its six fields are neither seams (none is a callable) nor
+    resource/time bounds; they are the plain, per-call shape of every
+    streamed request: which system message opens the turn, which endpoint and
+    key to call, and how the model samples. Every field keeps the exact
+    default it had as a bare parameter.
+    """
+
+    #: The system message on every turn.
+    system_prompt: str = DEFAULT_EMBODY_SYSTEM_PROMPT
+    #: Forwarded to *turn_fn* per call. ``None`` lets
+    #: :class:`reachy.speech.llm.LlmConfig` resolve them from the
+    #: ``REACHY_OPENAI_*`` environment as usual.
+    base_url: str | None = None
+    api_key: str | None = None
+    #: Sampling controls, forwarded per call.
+    temperature: float = DEFAULT_TEMPERATURE
+    max_tokens: int | None = None
+    #: Ask the server for streamed reasoning. Off by default, and the default
+    #: is a PRODUCT decision about a robot that answers out loud — measured
+    #: live against the deployed gateway on 2026-08-02
+    #: (``docs/evidence/2026-08-02-probe-thinking-vs-reasoning-deltas.md``)::
+    #:
+    #:     model    enable_thinking   delta keys        first *content*
+    #:     worker   False (shipped)   content, role     0.22 s
+    #:     worker   True              + reasoning       9.72 s
+    #:     cortex   False (shipped)   content, role     0.27 s
+    #:     cortex   True              + reasoning       17.96 s
+    #:
+    #: So turning this on costs 9-18 SECONDS before the robot says or does
+    #: anything. For a layer whose whole point is realtime conversation that
+    #: is not a trade worth making, and no amount of tuning elsewhere
+    #: recovers it. The consequence is worth stating plainly rather than
+    #: discovering: with the shipped default the gateway sends **no
+    #: reasoning key at all**, so :attr:`TurnResult.reasoning` is empty and
+    #: the exported ``thinking`` block carries cues, reply text, tool calls
+    #: and results — but no model reasoning. The reasoning seam is correct
+    #: and dormant, NOT broken. Flip this to ``True`` and it fills
+    #: immediately.
+    enable_thinking: bool = False
+
+
+# --------------------------------------------------------------------------- #
 # Collaborator protocols (documentation; any matching object is accepted)     #
 # --------------------------------------------------------------------------- #
 
@@ -444,42 +534,20 @@ class EmbodyTurnEngine:
         export: the shared :class:`~reachy.export.exporter.ExportHook`. ``None``
             means no export path is entered at all.
         models: :class:`EmbodyModels`; default :meth:`EmbodyModels.resolve`.
-        system_prompt: the system message on every turn.
-        base_url / api_key: forwarded to *turn_fn* per call. ``None`` lets
-            :class:`reachy.speech.llm.LlmConfig` resolve them from the
-            ``REACHY_OPENAI_*`` environment as usual.
-        temperature / max_tokens: sampling controls, forwarded per call.
-        idle_timeout_s: the INTER-CHUNK idle budget (see the module docstring).
-        enable_thinking: ask the server for streamed reasoning. Off by default,
-            and the default is a PRODUCT decision about a robot that answers out
-            loud — measured live against the deployed gateway on 2026-08-02
-            (``docs/evidence/2026-08-02-probe-thinking-vs-reasoning-deltas.md``):
-
-            ==========  ===============  =====================  ================
-            model       enable_thinking  delta keys             first *content*
-            ==========  ===============  =====================  ================
-            worker      False (shipped)  content, role          0.22 s
-            worker      True             + reasoning            9.72 s
-            cortex      False (shipped)  content, role          0.27 s
-            cortex      True             + reasoning            17.96 s
-            ==========  ===============  =====================  ================
-
-            So turning this on costs 9-18 SECONDS before the robot says or does
-            anything. For a layer whose whole point is realtime conversation
-            that is not a trade worth making, and no amount of tuning elsewhere
-            recovers it.
-
-            The consequence is worth stating plainly rather than discovering:
-            with the shipped default the gateway sends **no reasoning key at
-            all**, so :attr:`TurnResult.reasoning` is empty and the exported
-            ``thinking`` block carries cues, reply text, tool calls and results
-            — but no model reasoning. The reasoning seam is correct and dormant,
-            NOT broken. Flip this to ``True`` and it fills immediately.
-        max_tool_rounds / history_maxlen / max_pending / max_context /
-            spoken_maxlen: bounds. ``max_pending`` bounds the TRIGGER buffer;
-            ``max_context`` bounds the park's DISTINCT facts.
-        min_alert_interval_s: seconds between alert-triggered turns (issue
-            #143's alert containment). ``0`` disables the bound.
+        request: the per-call LLM request template — the system prompt, the
+            endpoint + key, and the sampling controls (``temperature`` /
+            ``max_tokens`` / ``enable_thinking``) — grouped into one frozen
+            :class:`RequestConfig`. Grouped for the same S107 reason as
+            ``limits`` below (see :class:`RequestConfig`'s docstring for why
+            bounds alone do not clear the rule here); every field keeps the
+            exact default it had as a bare parameter.
+        limits: the engine's numeric bounds — the inter-chunk idle timeout, the
+            tool-round cap, the rolling-history / pending-trigger / context-park
+            / already-spoken sizes, the alert-containment interval (issue
+            #143) and the inter-turn pacing — grouped into one frozen
+            :class:`Limits` (issue #141/``python:S107``). Every field keeps
+            the exact default it had as a bare parameter; see :class:`Limits`
+            for what each one bounds.
         voice_tools: tool names exported as ``message`` blocks.
         on_content / on_reasoning: optional taps fired per delta, on the calling
             thread, as the stream arrives.
@@ -489,7 +557,8 @@ class EmbodyTurnEngine:
         now_fn: the monotonic clock the alert interval is measured on
             (default :func:`time.monotonic`). Injected so the containment
             bounds are testable without sleeping.
-        sleep / turn_interval: inter-turn pacing for :meth:`run`.
+        sleep: the callable :meth:`run` sleeps with between turns (default
+            :func:`time.sleep`), paced by ``limits.turn_interval``.
     """
 
     def __init__(
@@ -499,61 +568,53 @@ class EmbodyTurnEngine:
         turn_fn: _TurnFn | None = None,
         export: ExportHook | None = None,
         models: EmbodyModels | None = None,
-        system_prompt: str = DEFAULT_EMBODY_SYSTEM_PROMPT,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        temperature: float = DEFAULT_TEMPERATURE,
-        max_tokens: int | None = None,
-        idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S,
-        enable_thinking: bool = False,
-        max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
-        history_maxlen: int = DEFAULT_HISTORY_MAXLEN,
-        max_pending: int = DEFAULT_MAX_PENDING,
-        max_context: int = DEFAULT_MAX_CONTEXT,
-        min_alert_interval_s: float = DEFAULT_MIN_ALERT_INTERVAL_S,
-        spoken_maxlen: int = DEFAULT_SPOKEN_MAXLEN,
+        request: RequestConfig | None = None,
+        limits: Limits | None = None,
         voice_tools: frozenset[str] | None = None,
         on_content: Callable[[str], None] | None = None,
         on_reasoning: Callable[[str], None] | None = None,
         cancel: Callable[[], bool] | None = None,
         now_fn: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
-        turn_interval: float = DEFAULT_TURN_INTERVAL,
     ) -> None:
         self._registry = registry
         self._turn_fn = turn_fn if turn_fn is not None else _llm.stream_turn
         self._export = export
         self._models = models if models is not None else EmbodyModels.resolve()
-        self._system_prompt = system_prompt
-        self._base_url = base_url
-        self._api_key = api_key
-        self._temperature = float(temperature)
-        self._max_tokens = max_tokens
-        self._idle_timeout_s = max(0.1, float(idle_timeout_s))
-        self._enable_thinking = bool(enable_thinking)
-        self._max_tool_rounds = max(1, int(max_tool_rounds))
+        self._request = request if request is not None else RequestConfig()
+        self._system_prompt = self._request.system_prompt
+        self._base_url = self._request.base_url
+        self._api_key = self._request.api_key
+        self._temperature = float(self._request.temperature)
+        self._max_tokens = self._request.max_tokens
+        self._limits = limits if limits is not None else Limits()
+        self._idle_timeout_s = max(0.1, float(self._limits.idle_timeout_s))
+        self._enable_thinking = bool(self._request.enable_thinking)
+        self._max_tool_rounds = max(1, int(self._limits.max_tool_rounds))
         self._voice_tools = voice_tools if voice_tools is not None else DEFAULT_VOICE_TOOLS
         self._on_content = on_content
         self._on_reasoning = on_reasoning
         self._cancel = cancel if cancel is not None else _never
         self._now = now_fn if now_fn is not None else time.monotonic
         self._sleep = sleep if sleep is not None else time.sleep
-        self._turn_interval = float(turn_interval)
+        self._turn_interval = float(self._limits.turn_interval)
 
         self._triggers: deque[Input] = deque(maxlen=None)
-        self._max_pending = max(1, int(max_pending))
+        self._max_pending = max(1, int(self._limits.max_pending))
         # Insertion-ordered by construction (``dict``), so the park reads back
         # in the order the robot first noticed each fact — stable across a
         # flood, where a recency ordering would churn every line every tick.
         self._context: dict[str, Parked] = {}
-        self._max_context = max(1, int(max_context))
-        self._min_alert_interval_s = max(0.0, float(min_alert_interval_s))
+        self._max_context = max(1, int(self._limits.max_context))
+        self._min_alert_interval_s = max(0.0, float(self._limits.min_alert_interval_s))
         # -inf, never 0.0: an injected clock may start anywhere, and the FIRST
         # alert after quiet must never be the one the interval delays.
         self._last_alert_turn = float("-inf")
         self._deferral_logged = False
-        self._spoken: deque[str] = deque(maxlen=max(0, int(spoken_maxlen)))
-        self._history: deque[tuple[str, str]] = deque(maxlen=max(0, int(history_maxlen)))
+        self._spoken: deque[str] = deque(maxlen=max(0, int(self._limits.spoken_maxlen)))
+        self._history: deque[tuple[str, str]] = deque(
+            maxlen=max(0, int(self._limits.history_maxlen))
+        )
         self._last_text = ""
         # One turn at a time; ``ask`` is deliberately outside it.
         self._turn_lock = threading.Lock()
