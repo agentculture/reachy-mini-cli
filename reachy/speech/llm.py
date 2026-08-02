@@ -52,6 +52,24 @@ _SENTENCE_RE_LOOSE = re.compile(
 # Switch to the loose regex when the buffer exceeds this many characters.
 _MAX_BUFFER_BEFORE_LOOSE = 200
 
+#: Streaming reasoning-delta keys, in precedence order.
+#:
+#: vLLM DOCUMENTS ``delta.reasoning_content``. Our gateway sends
+#: ``delta.reasoning`` — reproduced against ``localhost:8001``
+#: (``model=cortex``, ``stream=true``, 73 chunks, delta keys observed
+#: ``['content', 'reasoning', 'role']``) and independently by a sibling
+#: project; the record is
+#: ``docs/evidence/2026-08-01-cited-findings-from-embodiment-sibling.md``.
+#:
+#: A consumer written against the documented name alone sees zero reasoning
+#: forever and concludes the model does not stream its thinking, which is the
+#: opposite of the truth — a silent, invisible failure with nothing in the
+#: record to flag it. So the OBSERVED name leads and the documented one is
+#: kept as a fallback for a server that conforms to the docs; the two never
+#: appear together on one delta. ``tests/test_speech_llm_reasoning.py`` pins
+#: both the order and a live-shaped stream through each name.
+REASONING_DELTA_KEYS: tuple[str, ...] = ("reasoning", "reasoning_content")
+
 _MARKDOWN_CHARS = frozenset("*_~`#")
 
 
@@ -150,11 +168,19 @@ class TurnResult:
     :class:`ToolCall`s in the order they were emitted. ``finish_reason`` is the
     terminal reason the server reported (e.g. ``"stop"`` or ``"tool_calls"``), or
     ``None`` if the stream ended without one.
+
+    ``reasoning`` is the model's streamed thinking, concatenated the same way
+    ``content`` is (see :data:`REASONING_DELTA_KEYS` for which wire field that
+    reads). It is a DEFAULTED field appended last, so every pre-existing call
+    site — positional or keyword — constructs and compares exactly as before,
+    and a caller that never asks for reasoning always sees ``""`` rather than
+    ``None``.
     """
 
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
+    reasoning: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -290,14 +316,18 @@ def _build_request(
     stream: bool = True,
     tools: list[dict] | None = None,
     tool_choice: str | dict | None = None,
+    enable_thinking: bool = False,
 ) -> urllib.request.Request:
     url = cfg.base_url.rstrip("/") + "/v1/chat/completions"
+    # ``enable_thinking`` defaults to False, which is the payload that shipped
+    # before the reasoning seam existed — so a caller that does not opt in sends
+    # byte-identical JSON (asserted in tests/test_speech_llm_reasoning.py).
     payload: dict = {
         "model": cfg.model,
         "messages": messages,
         "stream": stream,
         "temperature": temperature,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": bool(enable_thinking)},
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
@@ -473,6 +503,7 @@ def complete_turn(
     timeout: float = _DEFAULT_COMPLETE_TIMEOUT,
     tools: list[dict] | None = None,
     tool_choice: str | dict | None = None,
+    enable_thinking: bool = False,
 ) -> TurnResult:
     """Issue a single non-streaming completion and return the full turn.
 
@@ -497,6 +528,7 @@ def complete_turn(
         stream=False,
         tools=tools,
         tool_choice=tool_choice,
+        enable_thinking=enable_thinking,
     )
 
     resp_cm = _open_checked(cfg, req, timeout)
@@ -511,6 +543,9 @@ def complete_turn(
         content=message.get("content") or "",
         tool_calls=_parse_message_tool_calls(message),
         finish_reason=choice.get("finish_reason"),
+        # Same field, same precedence, read off the whole message instead of a
+        # delta — so the streaming and non-streaming legs cannot drift apart.
+        reasoning=_reasoning_delta(message) or "",
     )
 
 
@@ -526,6 +561,8 @@ def stream_turn(
     tools: list[dict] | None = None,
     tool_choice: str | dict | None = None,
     on_content: Callable[[str], None] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
+    enable_thinking: bool = False,
     cancel=None,
 ) -> TurnResult:
     """Stream a completion, assembling content **and** tool calls into a turn.
@@ -538,12 +575,31 @@ def stream_turn(
     ``arguments`` string arrives split across later chunks) and finalized with
     parsed JSON arguments when the stream ends (on ``finish_reason`` or ``[DONE]``).
 
+    ``on_reasoning`` is the same seam one field over: the model's streamed
+    thinking (:data:`REASONING_DELTA_KEYS`) is handed to it as it arrives and
+    concatenated into ``TurnResult.reasoning``. Both the callback and the field
+    are additive and opt-in — a caller that passes neither gets exactly the
+    behaviour that shipped before. ``enable_thinking`` asks the server to
+    produce that thinking at all; it defaults to ``False``, the payload that
+    shipped.
+
     ``cancel`` is an optional zero-arg predicate (or an object with ``is_set``);
     when it signals truthy, streaming stops after the current chunk and the turn
     assembled so far is returned.
 
-    Transport / HTTP failures raise a :class:`CliError` (exit code 2) with a
-    remediation hint — never a Python traceback.
+    **The read deadline is per-read, not total.** ``timeout`` becomes the socket
+    timeout, so a streaming caller is bounding the gap BETWEEN chunks, not the
+    whole request. That is the property the embodiment layer's stall detection
+    is armed on (a measured 43.2 s to the first content delta versus a 0.124 s
+    largest inter-chunk gap —
+    ``docs/evidence/2026-08-01-cited-findings-from-embodiment-sibling.md``). A
+    gap that exceeds it surfaces as a ``TimeoutError`` from the iteration, which
+    the caller names; it is deliberately NOT converted to a
+    :class:`CliError` here, because that would change what every existing caller
+    sees.
+
+    Transport / HTTP failures at connect time raise a :class:`CliError` (exit
+    code 2) with a remediation hint — never a Python traceback.
     """
     cfg = LlmConfig.resolve(base_url=base_url, model=model, api_key=api_key)
     req = _build_request(
@@ -554,13 +610,11 @@ def stream_turn(
         stream=True,
         tools=tools,
         tool_choice=tool_choice,
+        enable_thinking=enable_thinking,
     )
     is_cancelled = _coerce_cancel(cancel)
 
-    content_parts: list[str] = []
-    accumulators: dict[int, _ToolCallAccumulator] = {}
-    order: list[int] = []
-    finish_reason: str | None = None
+    state = _TurnState(on_content=on_content, on_reasoning=on_reasoning)
 
     resp_cm = _open_checked(cfg, req, timeout)
     with resp_cm as resp:
@@ -568,41 +622,71 @@ def stream_turn(
         for chunk in _iter_sse_chunks(resp):
             if is_cancelled():
                 break
-            reason = _fold_turn_chunk(chunk, content_parts, accumulators, order, on_content)
-            if reason:
-                finish_reason = reason
+            _fold_turn_chunk(chunk, state)
 
-    return TurnResult(
-        content="".join(content_parts),
-        tool_calls=[accumulators[i].finalize() for i in order],
-        finish_reason=finish_reason,
-    )
+    return state.finalize()
 
 
-def _fold_turn_chunk(
-    chunk: dict,
-    content_parts: list[str],
-    accumulators: dict[int, "_ToolCallAccumulator"],
-    order: list[int],
-    on_content: Callable[[str], None] | None,
-) -> str | None:
-    """Fold one parsed SSE chunk into the turn state; return its ``finish_reason``.
+@dataclass
+class _TurnState:
+    """The mutable accumulation of one streamed turn.
 
-    Content deltas are appended to ``content_parts`` (and handed to ``on_content``
-    when set); ``tool_calls`` deltas are folded into their per-``index``
-    accumulator, first-seen order preserved in ``order``. A chunk with no usable
-    ``choices`` entry is a silent no-op (returns ``None``).
+    Bundled into one object (rather than four parallel arguments) so the
+    reasoning seam could be added without growing ``_fold_turn_chunk``'s
+    parameter list a fifth and sixth time.
+    """
+
+    on_content: Callable[[str], None] | None = None
+    on_reasoning: Callable[[str], None] | None = None
+    content_parts: list[str] = field(default_factory=list)
+    reasoning_parts: list[str] = field(default_factory=list)
+    accumulators: dict[int, "_ToolCallAccumulator"] = field(default_factory=dict)
+    order: list[int] = field(default_factory=list)
+    finish_reason: str | None = None
+
+    def finalize(self) -> TurnResult:
+        return TurnResult(
+            content="".join(self.content_parts),
+            tool_calls=[self.accumulators[i].finalize() for i in self.order],
+            finish_reason=self.finish_reason,
+            reasoning="".join(self.reasoning_parts),
+        )
+
+
+def _reasoning_delta(delta: dict) -> str | None:
+    """The reasoning fragment on one delta, under whichever key the server uses."""
+    for key in REASONING_DELTA_KEYS:
+        value = delta.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _fold_turn_chunk(chunk: dict, state: _TurnState) -> None:
+    """Fold one parsed SSE chunk into *state*.
+
+    Content deltas are appended to ``state.content_parts`` (and handed to
+    ``on_content`` when set); reasoning deltas likewise; ``tool_calls`` deltas
+    are folded into their per-``index`` accumulator, first-seen order preserved
+    in ``state.order``. A chunk with no usable ``choices`` entry is a silent
+    no-op.
     """
     try:
         choice = chunk["choices"][0]
     except (KeyError, IndexError, TypeError):
-        return None
+        return
     delta = choice.get("delta") or {}
     content = delta.get("content")
     if content:
-        content_parts.append(content)
-        if on_content is not None:
-            on_content(content)
+        state.content_parts.append(content)
+        if state.on_content is not None:
+            state.on_content(content)
+    reasoning = _reasoning_delta(delta)
+    if reasoning:
+        state.reasoning_parts.append(reasoning)
+        if state.on_reasoning is not None:
+            state.on_reasoning(reasoning)
+    accumulators, order = state.accumulators, state.order
     for tc in delta.get("tool_calls") or []:
         index = tc.get("index", 0)
         acc = accumulators.get(index)
@@ -610,7 +694,9 @@ def _fold_turn_chunk(
             acc = accumulators[index] = _ToolCallAccumulator()
             order.append(index)
         acc.add(tc)
-    return choice.get("finish_reason")
+    reason = choice.get("finish_reason")
+    if reason:
+        state.finish_reason = reason
 
 
 class _ToolCallAccumulator:
