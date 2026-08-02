@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from reachy.speech import realtime
 from reachy.speech import realtime_duplex as duplex
 from reachy.speech import realtime_wire as wire
 from reachy.speech.realtime_duplex import (
@@ -76,6 +77,14 @@ _RATE = 16000
 _MODULE_PATH = Path(duplex.__file__)
 _REPO_ROOT = _MODULE_PATH.resolve().parent.parent.parent
 _MODULE_DOTTED = "reachy.speech.realtime_duplex"
+
+#: Every file this session's SEND path spans. Since the duplication cleanup the
+#: wire mechanics (handshake, frame pump, PONG, CLOSE) have ONE owner —
+#: ``reachy/speech/realtime.py``'s "Shared session mechanics" section — and this
+#: module composes them, so an h13 scan of this file alone would be blind to
+#: half the frames that actually leave. Anything reachable on the send path is
+#: in this tuple, or the pins below are lying.
+_SEND_PATH_MODULES = (_MODULE_PATH, Path(realtime.__file__))
 
 _ENV_VARS = (
     duplex.REALTIME_URL_ENV,
@@ -280,7 +289,8 @@ def test_one_socket_carries_appends_in_and_both_utterances_and_audio_out() -> No
     assert server.connections_accepted == 1
 
     utterance = client.take_utterance()
-    assert utterance is not None and utterance.text == DEFAULT_TRANSCRIPT
+    assert utterance is not None
+    assert utterance.text == DEFAULT_TRANSCRIPT
 
     response = client.take_response()
     assert response is not None
@@ -413,7 +423,7 @@ def _callee(node: ast.Call) -> str | None:
 
 
 def test_h13_the_modules_outbound_event_family_is_exactly_the_two_legal_kinds() -> None:
-    """AST half (h13): every outbound EVENT this module can construct.
+    """AST half (h13): every outbound EVENT this session can construct.
 
     Stronger than calling the two known senders: it walks the source for every
     way an event can come into being — a call to one of the wire's ``build_*``
@@ -423,71 +433,97 @@ def test_h13_the_modules_outbound_event_family_is_exactly_the_two_legal_kinds() 
     immediately; an unrecognised ``build_*_event`` callee fails it too, rather
     than being silently ignored. Session config is not in the set on purpose:
     it rides the connect URL's query params, never a frame.
+
+    It scans BOTH source files, because this session's send path spans both:
+    the shared wire mechanics live in ``reachy/speech/realtime.py`` (its
+    "Shared session mechanics" section) and this module composes them. Scanning
+    only this file would have left the shared owner free to grow a third
+    sender unseen. The sibling pin — that the shared owner can build NOTHING
+    but ``append``, so the ears-only client cannot arm — lives in
+    ``tests/test_realtime_client.py``.
     """
-    tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
     builders = {
         "build_append_event": wire.APPEND_EVENT_TYPE,
         "build_response_create_event": wire.RESPONSE_CREATE_EVENT_TYPE,
     }
     found: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            name = _callee(node)
-            if name in builders:
-                found.add(builders[name])
-            elif name is not None and name.startswith("build_") and name.endswith("_event"):
-                pytest.fail(f"unrecognised outbound event builder: {name}")
-        elif isinstance(node, ast.Dict):
-            for key, value in zip(node.keys, node.values):
-                if isinstance(key, ast.Constant) and key.value == "type":
-                    resolved = _resolve_constant(value)
-                    if resolved is not None:
-                        found.add(resolved)
+    for path in _SEND_PATH_MODULES:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call):
+                name = _callee(node)
+                if name in builders:
+                    found.add(builders[name])
+                elif name is not None and name.startswith("build_") and name.endswith("_event"):
+                    pytest.fail(f"unrecognised outbound event builder in {path.name}: {name}")
+            elif isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if isinstance(key, ast.Constant) and key.value == "type":
+                        resolved = _resolve_constant(value)
+                        if resolved is not None:
+                            found.add(resolved)
     assert found == {wire.APPEND_EVENT_TYPE, wire.RESPONSE_CREATE_EVENT_TYPE}
 
 
 def test_h13_the_module_serialises_no_event_of_its_own() -> None:
     """The AST pin above can only see what it can resolve, so close the hole:
-    this module never imports ``json``, so it cannot hand-roll an event payload
-    past that scan — every outbound payload comes from the wire module."""
-    tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module)
-    assert "json" not in imported
+    neither this module nor the shared owner imports ``json``, so neither can
+    hand-roll an event payload past that scan — every outbound payload comes
+    from the wire module."""
+    for path in _SEND_PATH_MODULES:
+        imported: set[str] = set()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        assert "json" not in imported, f"{path.name} can serialise an event of its own"
+
+
+#: Every function that puts an opcode on the wire, and WHICH positional
+#: argument carries it. ``_send`` is each client's funnel, ``_ws_send`` is the
+#: shared one it forwards to, and ``build_frame`` is the wire's own encoder.
+_SEND_OPCODE_ARG = {"_send": 0, "_ws_send": 1, "build_frame": 0}
 
 
 def test_h13_every_frame_the_module_can_send_is_text_pong_or_close() -> None:
     """No BINARY frame exists anywhere in the send path (audio is base64 TEXT).
 
-    Scans the opcode argument of every send call site — ``_send`` and the
-    wire's own ``build_frame`` — rather than every ``OPCODE_*`` the module
-    merely *mentions* (it compares against ``OPCODE_PING`` when handling an
-    inbound keepalive, which is a read, not a write). Every such argument must
-    be a literal ``wire.OPCODE_*``; the ONE permitted indirection is ``_send``
-    forwarding its own ``opcode`` parameter to ``build_frame``, which is what
-    makes it the single funnel every other call site has to pass through.
+    Scans the opcode argument of every send call site (see
+    :data:`_SEND_OPCODE_ARG`) rather than every ``OPCODE_*`` the source merely
+    *mentions* — the pump compares against ``OPCODE_PING`` when handling an
+    inbound keepalive, which is a read, not a write. Every such argument must
+    be a literal ``wire.OPCODE_*``; the ONE permitted indirection is a funnel
+    (``_send`` / ``_ws_send``) forwarding its own ``opcode`` parameter, which is
+    what makes them the funnels every other call site has to pass through.
+
+    Both files are scanned, for the reason the event-family pin above states:
+    since the duplication cleanup, the PONG and CLOSE frames this session sends
+    are emitted by the shared mechanics in ``reachy/speech/realtime.py``. The
+    union must still be exactly the three legal kinds.
     """
-    tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
-    senders = {"_send", "build_frame"}
     opcodes: set[int] = set()
-    for func in ast.walk(tree):
-        if not isinstance(func, ast.FunctionDef):
-            continue
-        for node in ast.walk(func):
-            if not isinstance(node, ast.Call) or _callee(node) not in senders:
+    for path in _SEND_PATH_MODULES:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for func in ast.walk(tree):
+            if not isinstance(func, ast.FunctionDef):
                 continue
-            assert node.args, "a send call must name its opcode positionally"
-            first = node.args[0]
-            if func.name == "_send" and isinstance(first, ast.Name) and first.id == "opcode":
-                continue  # the funnel forwarding its own parameter
-            assert isinstance(first, ast.Attribute), f"opaque opcode argument: {ast.dump(first)}"
-            value = getattr(wire, first.attr, None)
-            assert isinstance(value, int), f"unknown opcode constant: {first.attr}"
-            opcodes.add(value)
+            for node in ast.walk(func):
+                index = (
+                    _SEND_OPCODE_ARG.get(_callee(node) or "")
+                    if isinstance(node, ast.Call)
+                    else None
+                )
+                if index is None:
+                    continue
+                assert len(node.args) > index, "a send call must name its opcode positionally"
+                arg = node.args[index]
+                if func.name in _SEND_OPCODE_ARG and isinstance(arg, ast.Name):
+                    assert arg.id == "opcode", f"opaque opcode forwarded by {func.name}: {arg.id}"
+                    continue  # a funnel forwarding its own parameter
+                assert isinstance(arg, ast.Attribute), f"opaque opcode argument: {ast.dump(arg)}"
+                value = getattr(wire, arg.attr, None)
+                assert isinstance(value, int), f"unknown opcode constant: {arg.attr}"
+                opcodes.add(value)
     assert opcodes == {wire.OPCODE_TEXT, wire.OPCODE_PONG, wire.OPCODE_CLOSE}
 
 
@@ -592,7 +628,8 @@ def test_c4_an_utterance_the_runtime_gate_would_drop_still_reaches_the_caller() 
         finally:
             client.close()
     utterance = client.take_utterance()
-    assert utterance is not None and utterance.text == ambient
+    assert utterance is not None
+    assert utterance.text == ambient
 
 
 def test_the_module_never_imports_reachy_mini() -> None:
@@ -742,7 +779,8 @@ def test_an_interrupted_response_is_named_and_never_spoken_over_the_speaker(
     assert _count_reason(sense_log, REASON_RESPONSE_INTERRUPTED) == 1
     assert sink.calls == []
     response = client.take_response()
-    assert response is not None and response.interrupted is True
+    assert response is not None
+    assert response.interrupted is True
     assert response.text == DEFAULT_RESPONSE_TEXT
 
 
@@ -801,7 +839,8 @@ def test_no_playback_sink_at_all_is_a_named_drop_not_a_crash(
     finally:
         client.close()
     response = client.take_response()
-    assert response is not None and response.audio == b"\x01\x02"
+    assert response is not None
+    assert response.audio == b"\x01\x02"
 
 
 def test_session_down_logs_once_however_many_attempts_fail(
@@ -1035,7 +1074,8 @@ def test_start_is_idempotent_and_close_joins_every_thread() -> None:
         assert _established(client)
         client.close()
         client.close()  # idempotent
-        assert client.worker is not None and client.worker.is_alive() is False
+        assert client.worker is not None
+        assert client.worker.is_alive() is False
     assert _wait_until(lambda: threading.active_count() <= before, timeout=2.0)
 
 
@@ -1051,7 +1091,8 @@ def test_the_context_manager_starts_and_closes_the_session() -> None:
     with FakeRealtimeServer(Scenario.HAPPY_PATH) as server:
         with _session(server) as client:
             assert _established(client)
-        assert client.worker is not None and client.worker.is_alive() is False
+        assert client.worker is not None
+        assert client.worker.is_alive() is False
     assert _wait_until(lambda: threading.active_count() <= before, timeout=2.0)
 
 
