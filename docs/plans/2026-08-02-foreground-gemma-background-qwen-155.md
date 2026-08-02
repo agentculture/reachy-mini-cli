@@ -135,10 +135,21 @@ slug: `foreground-gemma-background-qwen-155` · status: `exported` · from frame
   - operating guide + CLAUDE.md + export-schema document the two-tempo architecture, the interjection policy, the phase-1 limitation, and the non-goals; markdownlint green
   - version bumped with uv lock refreshed (the PR #33 gotcha) and a CHANGELOG entry
 
+### t16 — Client-side tail cut: an interjection stops the robot inside the post-response.done window
+
+- instruction: Deviation d1 created this task — read 'devague deviate --list' first. Files: reachy/cli/`_commands`/agent.py (the policy, beside t8's `_utterance_tap` arming) and a minimal seam in `realtime_duplex.py` if needed (it must stay gate-free; t8 added `arm_once` as the model to copy). The gap is ONLY the tail window: upstream paces delivery to the playhead (lobes `_conversation.py` `delivery_pause_ms`, `DELIVERY_LEAD_MS`=400) so the server covers the bulk of a reply — do NOT rebuild what response.interrupted already does, and make sure the two paths cannot double-record one reply (t7's `_correct_spoken` narrows an already-recorded reply; reuse it). Chunk size and daemon latency set the window's width; t1's audio measurement is still deferred, so do not hard-code an assumption about it.
+- depends on: t7
+- covers: c34, h22
+- acceptance:
+  - VAD-verified `speech_started` while the playback queue is non-empty cuts playback within one chunk; a cut with nothing playing is a no-op, pinned by test
+  - the cut records the measured said/unsaid split via `spoken_split`() + `note_interrupted_reply`(), so the remainder becomes a wanted-to-say artifact exactly as a server-driven interrupt does
+  - the trigger keys on VAD-verified speech only (never raw loudness, per c35) and the policy lives at the composition layer; `realtime_duplex.py` stays gate-free with its structural pins untouched
+  - the server-driven response.interrupted path still works and the two paths never double-record one reply, pinned by test
+
 ### t15 — Live acceptance: the eight #155 scenarios on the deployed robot (PR gate)
 
 - instruction: Live on the deployed robot: stop-to-test discipline (note which presence unit runs), operator in the room for the spoken scenarios. Evidence file per the docs/evidence/ convention with per-scenario pass/fail. Scenarios blocked on upstream (items live half, one-shot barge-in) are recorded BLOCKED-ON-UPSTREAM, not rounded up. Close #149/#150/#151/#153/#154 with evidence links; #155 stays open if anything is blocked.
-- depends on: t14, t1
+- depends on: t14, t1, t16
 - covers: c1, h14, c23, h15, c24, h16, c25, h17, c26, h18, c14, h19, c16, h21, c4, h3, c6, h5
 - acceptance:
   - all eight scenarios executed live and recorded in docs/evidence/ with per-scenario pass/fail, judged from the room (speaker/mic), failures reported faithfully
