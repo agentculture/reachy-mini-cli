@@ -1789,3 +1789,124 @@ def test_embody_operating_defaults_still_apply_when_nothing_is_given() -> None:
     assert args.feed == "-"
     assert args.media_profile is None
     assert args.mute_during_playback is False
+    assert args.attention_window is None
+
+
+# --------------------------------------------------------------------------- #
+# --attention-window / REACHY_EMBODY_ATTENTION_WINDOW — issue #150            #
+# --------------------------------------------------------------------------- #
+
+
+def test_attention_window_flag_survives_operand_order_the_147_defect_class() -> None:
+    """``--attention-window`` reaches start/restart from EITHER side of the verb.
+
+    Exactly the shape ``test_embody_operating_flags_survive_being_written_
+    before_the_subcommand`` pins for ``--feed``/``--media-profile`` above: the
+    #147 defect was a flag that parsed fine on its own but was silently reset
+    to the sub-parser's own default once a subcommand followed it.
+    """
+    from reachy.cli import _build_parser
+
+    parser = _build_parser()
+    for verb in ("start", "restart"):
+        before = parser.parse_args(["agent", "embody", "--attention-window", "12", verb])
+        after = parser.parse_args(["agent", "embody", verb, "--attention-window", "12"])
+        assert (
+            before.attention_window == after.attention_window == 12.0
+        ), f"{verb}: --attention-window did not survive"
+
+
+def test_attention_window_subcommand_flag_wins_over_the_parent() -> None:
+    from reachy.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        ["agent", "embody", "--attention-window", "12", "start", "--attention-window", "7"]
+    )
+    assert args.attention_window == 7.0
+
+
+def test_attention_window_flag_accepts_zero_without_being_swallowed_as_falsy() -> None:
+    """0 must parse and survive on the CLI (AC 3, issue #150) — see also
+    ``reachy.embody.engine``'s ``resolve_attention_window_s`` unit tests for
+    the falsy-zero hazard this guards against downstream.
+    """
+    from reachy.cli import _build_parser
+
+    args = _build_parser().parse_args(["agent", "embody", "start", "--attention-window", "0"])
+    assert args.attention_window == 0.0
+
+
+def test_compose_resolves_the_attention_window_from_the_explicit_flag() -> None:
+    layer, _args, _sink = _compose(
+        ["--attention-window", "12"],
+        media=_media(),
+        session_factory=_SessionFactory(),
+        lines=iter(()),
+    )
+    try:
+        assert layer.engine.attention.window_s == 12.0
+    finally:
+        layer.close()
+
+
+def test_compose_resolves_the_attention_window_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("REACHY_EMBODY_ATTENTION_WINDOW", "9")
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=_SessionFactory(), lines=iter(())
+    )
+    try:
+        assert layer.engine.attention.window_s == 9.0
+    finally:
+        layer.close()
+
+
+def test_compose_explicit_attention_window_wins_over_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("REACHY_EMBODY_ATTENTION_WINDOW", "9")
+    layer, _args, _sink = _compose(
+        ["--attention-window", "12"],
+        media=_media(),
+        session_factory=_SessionFactory(),
+        lines=iter(()),
+    )
+    try:
+        assert layer.engine.attention.window_s == 12.0
+    finally:
+        layer.close()
+
+
+def test_compose_defaults_the_attention_window_when_nothing_is_given() -> None:
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=_SessionFactory(), lines=iter(())
+    )
+    try:
+        assert layer.engine.attention.window_s == agent_mod.DEFAULT_ATTENTION_WINDOW_S
+    finally:
+        layer.close()
+
+
+def test_compose_a_zero_attention_window_reaches_the_engine_as_name_only_forever() -> None:
+    """The clamp AttentionGate already has for ``0`` (AC 3) survives composition."""
+    layer, _args, _sink = _compose(
+        ["--attention-window", "0"],
+        media=_media(),
+        session_factory=_SessionFactory(),
+        lines=iter(()),
+    )
+    try:
+        assert layer.engine.attention.window_s == 0.0
+    finally:
+        layer.close()
+
+
+def test_the_command_modules_local_attention_window_constants_match_the_real_ones() -> None:
+    """A drift canary for the by-VALUE duplication ``DEFAULT_ATTENTION_WINDOW_S``/
+    ``ENV_ATTENTION_WINDOW_S`` need in this module (h15: no module-scope
+    ``reachy.embody`` import) — mirrors ``test_the_layer_answers_to_the_same_
+    names_the_runtime_gate_does``'s tuple-equality pin in
+    ``tests/test_embody_attention.py`` for the same reason.
+    """
+    from reachy.embody.attention import DEFAULT_ATTENTION_WINDOW_S as REAL_DEFAULT
+    from reachy.embody.engine import ENV_ATTENTION_WINDOW_S as REAL_ENV
+
+    assert agent_mod.DEFAULT_ATTENTION_WINDOW_S == REAL_DEFAULT
+    assert agent_mod.ENV_ATTENTION_WINDOW_S == REAL_ENV

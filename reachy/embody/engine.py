@@ -222,6 +222,10 @@ ROLES: tuple[str, ...] = (ROLE_WORKER, ROLE_SENSES)
 #: the layer's worker model would change the reflex robot's behaviour.
 ENV_WORKER_MODEL = "REACHY_EMBODY_WORKER_MODEL"
 ENV_SENSES_MODEL = "REACHY_EMBODY_SENSES_MODEL"
+#: Process-scoped override for :attr:`Limits.attention_window_s` (issue #150).
+#: Same scoping as :data:`ENV_WORKER_MODEL`/:data:`ENV_SENSES_MODEL`, and the
+#: same reason: see :func:`resolve_attention_window_s`.
+ENV_ATTENTION_WINDOW_S = "REACHY_EMBODY_ATTENTION_WINDOW"
 
 # --------------------------------------------------------------------------- #
 # Named drop reasons — every failure names one, never a silent no-op          #
@@ -473,6 +477,48 @@ class EmbodyModels:
         raise ValueError(f"unknown model role {role!r}; the layer has exactly {ROLES}")
 
 
+def resolve_attention_window_s(
+    explicit: float | None = None, *, env: Mapping[str, str] | None = None
+) -> float:
+    """Resolve :attr:`Limits.attention_window_s` (issue #150).
+
+    Precedence: *explicit* argument, then :data:`ENV_ATTENTION_WINDOW_S`, then
+    :data:`~reachy.embody.attention.DEFAULT_ATTENTION_WINDOW_S`. Mirrors
+    :meth:`EmbodyModels.resolve` on purpose, including its reasoning: *env*
+    defaults to ``os.environ`` — the PROCESS environment, read once per call
+    and never written, and never a file. An operator who wants a different
+    window sets :data:`ENV_ATTENTION_WINDOW_S` in the LAYER PROCESS's own
+    environment, never in an ``environment.d`` drop-in — that mechanism is
+    login-session-wide (applied identically to every unit under the session,
+    the runtime's included) rather than scoped to this one process, and the
+    layer ships no systemd unit of its own for a drop-in to target anyway
+    (:mod:`reachy.embody.supervisor`'s module docstring).
+
+    Unlike :meth:`EmbodyModels.resolve`'s string fields — where ``""`` and
+    "not given" are the same thing, so a plain ``or`` chain is safe — ``0`` is
+    a legitimate, meaningfully DIFFERENT value here: it means name-only-
+    forever, the same convention :attr:`Limits.min_alert_interval_s` already
+    uses for ``0``. So *explicit* is checked by identity against ``None``
+    rather than by truthiness; a bare ``or`` chain would silently read an
+    explicit ``0.0`` as unset and fall through to the environment or the
+    default. :class:`~reachy.embody.attention.AttentionGate` itself clamps a
+    negative value to ``0.0``; this function does not re-clamp, so a caller
+    sees exactly what was configured. An unparseable environment value
+    degrades to the default with a logged warning (mirrors
+    :func:`reachy.embody.media._env_int`) — never a raise.
+    """
+    if explicit is not None:
+        return float(explicit)
+    source = env if env is not None else os.environ
+    raw = source.get(ENV_ATTENTION_WINDOW_S)
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning("embody: ignoring non-numeric %s=%r", ENV_ATTENTION_WINDOW_S, raw)
+    return DEFAULT_ATTENTION_WINDOW_S
+
+
 # --------------------------------------------------------------------------- #
 # Bounds, grouped into one frozen home (issue #141, python:S107)              #
 # --------------------------------------------------------------------------- #
@@ -522,7 +568,10 @@ class Limits:
     #: than as a constructor parameter for the reason this class exists at all:
     #: a loose bound would put the count back over ``python:S107``'s threshold.
     #: The measured argument for the default is on
-    #: :data:`reachy.embody.attention.DEFAULT_ATTENTION_WINDOW_S`.
+    #: :data:`reachy.embody.attention.DEFAULT_ATTENTION_WINDOW_S`. An operator
+    #: knob reaches this field via :func:`resolve_attention_window_s` (issue
+    #: #150) — the composition root resolves the value BEFORE it lands here;
+    #: this field itself takes whatever it is handed, unresolved.
     attention_window_s: float = DEFAULT_ATTENTION_WINDOW_S
 
 

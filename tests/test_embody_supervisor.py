@@ -112,6 +112,26 @@ def test_build_run_command_mute_during_playback_absent_by_default() -> None:
     assert "--mute-during-playback" not in cmd
 
 
+def test_build_run_command_optional_attention_window_forwarded() -> None:
+    """Issue #150 — the #147 defect class: the value must reach the argv, not
+    just the supervisor function's own parameter."""
+    cmd = supervisor.build_run_command(attention_window=12.0)
+    assert "--attention-window" in cmd
+    assert cmd[cmd.index("--attention-window") + 1] == "12.0"
+
+
+def test_build_run_command_attention_window_absent_by_default() -> None:
+    cmd = supervisor.build_run_command()
+    assert "--attention-window" not in cmd
+
+
+def test_build_run_command_attention_window_zero_is_still_forwarded() -> None:
+    """0.0 must not be treated as "not given" — the falsy-zero hazard again."""
+    cmd = supervisor.build_run_command(attention_window=0.0)
+    assert "--attention-window" in cmd
+    assert cmd[cmd.index("--attention-window") + 1] == "0.0"
+
+
 def test_build_run_command_never_forwards_bounded_run_flags() -> None:
     """A background layer must never get --max-turns/--max-events/--export/--log-level.
 
@@ -173,6 +193,15 @@ def test_start_spawns_agent_embody(monkeypatch, tmp_path) -> None:
     cmd = procs[0].cmd
     assert cmd[1:5] == ["-m", "reachy", "agent", "embody"]
     assert procs[0].kwargs.get("start_new_session") is True
+
+
+def test_start_forwards_attention_window(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    procs: list = []
+    monkeypatch.setattr("subprocess.Popen", _popen_factory(procs))
+    supervisor.start(attention_window=30.0)
+    cmd = procs[0].cmd
+    assert cmd[cmd.index("--attention-window") + 1] == "30.0"
 
 
 def test_start_idempotent_when_already_running(monkeypatch, tmp_path) -> None:
@@ -316,6 +345,15 @@ def test_restart_forwards_media_profile(monkeypatch, tmp_path) -> None:
     supervisor.restart(media_profile="bench")
     assert "--media-profile" in procs[0].cmd
     assert procs[0].cmd[procs[0].cmd.index("--media-profile") + 1] == "bench"
+
+
+def test_restart_forwards_attention_window(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    procs: list = []
+    monkeypatch.setattr("subprocess.Popen", _popen_factory(procs))
+    supervisor.restart(attention_window=7.5)
+    assert "--attention-window" in procs[0].cmd
+    assert procs[0].cmd[procs[0].cmd.index("--attention-window") + 1] == "7.5"
 
 
 # ---------------------------------------------------------------------------
