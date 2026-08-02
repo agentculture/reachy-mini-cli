@@ -37,6 +37,7 @@ the chain could pass while the chain still floods.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import threading
@@ -45,6 +46,7 @@ import time
 import pytest
 
 import reachy.cli._commands.agent as agent_mod
+from reachy.embody import engine as engine_mod
 from reachy.embody.cues import ClassifiedCue, CueClass
 from reachy.embody.engine import (
     DEFAULT_MIN_ALERT_INTERVAL_S,
@@ -184,10 +186,19 @@ class _Clock:
         self.now += float(seconds)
 
 
+#: :class:`~reachy.embody.engine.Limits` field names (issue #141/S107) — lets
+#: this module's tests keep passing flat bounds (``max_context=2``) while the
+#: constructor itself now takes only ``limits=``.
+_LIMIT_FIELDS = {field.name for field in dataclasses.fields(engine_mod.Limits)}
+
+
 def _build(**kwargs) -> EmbodyTurnEngine:
     kwargs.setdefault("registry", _Registry())
     kwargs.setdefault("turn_fn", _ScriptedTurn())
     kwargs.setdefault("models", EmbodyModels(worker="worker", senses="senses"))
+    limit_kwargs = {name: kwargs.pop(name) for name in list(kwargs) if name in _LIMIT_FIELDS}
+    if limit_kwargs:
+        kwargs.setdefault("limits", engine_mod.Limits(**limit_kwargs))
     return EmbodyTurnEngine(**kwargs)
 
 

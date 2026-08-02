@@ -1088,7 +1088,7 @@ def _compose_embody_seam(
     tee socket.
     """
     from reachy.embody.cues import open_runtime_lines
-    from reachy.embody.engine import EmbodyTurnEngine
+    from reachy.embody.engine import EmbodyTurnEngine, Limits
     from reachy.embody.media import build_media
     from reachy.embody.tools import EmbodyToolRegistry
     from reachy.speech.realtime_duplex import RealtimeDuplexSession
@@ -1113,7 +1113,12 @@ def _compose_embody_seam(
     engine_kwargs: dict[str, object] = {
         "registry": registry,
         "export": export,
-        "turn_interval": float(getattr(args, "turn_interval", DEFAULT_TURN_INTERVAL)),
+        # issue #141/S107: the engine's bounds live in one frozen Limits now;
+        # this composition root only ever overrides turn_interval, so every
+        # other field takes the engine's own documented default.
+        "limits": Limits(
+            turn_interval=float(getattr(args, "turn_interval", DEFAULT_TURN_INTERVAL))
+        ),
     }
     if turn_fn is not None:
         engine_kwargs["turn_fn"] = turn_fn
