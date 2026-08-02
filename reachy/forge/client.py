@@ -45,8 +45,11 @@ logger = logging.getLogger(__name__)
 
 #: Default coder endpoint: the local lobes gateway (its cortex/coder route on :8001).
 DEFAULT_FORGE_BASE_URL = "http://localhost:8001/v1"
-#: Default model name sent in the chat-completions request (matches nova).
-DEFAULT_FORGE_MODEL = "qwen3"
+#: Default model: the lobes gateway's cortex ROLE (issue #132) — never a served
+#: id. A role name survives a model promotion; the served id nova's default
+#: named (``qwen3``) does not — live-probed 2026-08-02, it now 404s
+#: (``model_not_found``) while ``cortex`` and ``senses`` both resolve.
+DEFAULT_FORGE_MODEL = "cortex"
 DEFAULT_TIMEOUT = 120.0
 
 PROMPT_TEMPLATE = (
