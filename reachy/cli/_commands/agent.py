@@ -638,7 +638,8 @@ def cmd_agent_attach(
 #   media.sink.play     -> the speak/harmonics tools' render leg
 #   duplex on_utterance -> engine.submit_utterance   (a TRIGGER)
 #   duplex on_response  -> engine.note_spoken        (CONTEXT, never a trigger)
-#   runtime feed line   -> cues_for_line -> engine.submit_cues
+#   runtime feed line   -> classified_cues_for_line -> engine.submit_cues
+#                          (a rule FIRE triggers; every other cue parks — #143)
 #   engine + every layer failure -> the shared --export cognition feed
 #
 # IMPORT BOUNDARY (h15). Every import of the layer, the realtime client and the
@@ -851,9 +852,16 @@ class _CueReader:
     runtime a deaf layer. Daemon, so a blocked read can never hold up
     interpreter exit.
 
+    The line is mapped through
+    :func:`~reachy.embody.cues.classified_cues_for_line`, not the bare
+    ``cues_for_line``, so each cue reaches the engine carrying the #143 class
+    its runtime event decided: a rule FIRE is an ALERT and triggers a turn,
+    everything else parks. Erasing the class here is precisely the defect that
+    turned 187 cues into 23 turns — the mapper always knew which was which.
+
     Everything it touches is O(1) and non-raising:
-    :meth:`~reachy.embody.engine.EmbodyTurnEngine.submit_cues` appends to a
-    bounded deque and names its own overflow.
+    :meth:`~reachy.embody.engine.EmbodyTurnEngine.submit_cues` routes into a
+    bounded deque or a bounded coalescing park, and names its own overflow.
     """
 
     def __init__(
@@ -892,14 +900,14 @@ class _CueReader:
         self._stop.set()
 
     def _run(self) -> None:
-        from reachy.embody.cues import cues_for_line
+        from reachy.embody.cues import classified_cues_for_line
 
         try:
             for line in self._lines:
                 if self._stop.is_set():
                     break
                 self.events += 1
-                self.cues += self._engine.submit_cues(cues_for_line(line))
+                self.cues += self._engine.submit_cues(classified_cues_for_line(line))
                 if self._max_events is not None and self.events >= self._max_events:
                     break
         except Exception as err:  # noqa: BLE001 — a dead feed must not kill the conversation

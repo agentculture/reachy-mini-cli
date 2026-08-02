@@ -45,7 +45,7 @@ block that turn produced.
 |--------|-----------------|--------------------------------------------------------|
 | `t`    | `"thinking"`    | Block-type discriminator                               |
 | `ts`   | float           | Unix timestamp                                         |
-| `cues` | array of string | Sense cues that triggered this turn (see the note below) |
+| `cues` | array of string | The perception lines this turn read (see the notes below) |
 | `text` | string          | The turn's raw text — per LLM round, that round's assistant content plus a `name(arguments_json)` rendering of each tool call it made (space-joined); rounds are joined by newlines |
 
 Example line:
@@ -53,6 +53,12 @@ Example line:
 ```json
 {"t":"thinking","ts":1718362800.1,"cues":["speech from the left"],"text":"apply_pose({\"emoji\": \"🤔\"}) speak({\"text\": \"I heard something.\"})"}
 ```
+
+**The block shape is unchanged by `agent embody`'s input policy** (issue #143):
+no key was added or removed. What changed is what two existing fields carry,
+and only for that producer — see "the two producers differ in what `cues`
+means" and "`agent embody` opens `thinking.text` with its drain counts" in the
+notes below.
 
 ### `"message"` — speech segment
 
@@ -152,6 +158,16 @@ for raw_line in sys.stdin:
   the shipped producer emits carries the cues that triggered it. The field is
   still declared as a possibly-empty array — a reader should tolerate `[]`
   rather than assume `cues[0]` exists.
+- **The two producers differ in what `cues` means.** For `agent attach` every
+  entry is a cue that triggered the turn. For `agent embody` (issue #143) only
+  the leading entries are: an utterance (rendered `heard: "…"`) or an **alert**
+  cue — a rule fire. Everything after them is drained **context** — sense
+  snapshots, intent changes, motion admissions, rule suppressions — which
+  accumulated in a coalescing park and never caused a turn of its own. Repeats
+  of one context fact arrive coalesced with a count, e.g. `speech from the left
+  (x145)`; a fact seen once carries no count. A consumer that renders `cues` as
+  "why the robot thought" should show the leading trigger lines, not the
+  background.
 - Consumers should treat unknown `t` values as forward-compatible extensions
   and skip them gracefully.
 - **Block ordering within a turn is stable.** A turn emits its `"message"` and
@@ -164,6 +180,16 @@ for raw_line in sys.stdin:
   as `speak({"text": …})`, the text of every `"message"` block in a turn also
   appears inside that turn's `thinking.text`. Do not assume `thinking.text` and
   the set of `"message"` blocks for the same turn are disjoint.
+- **`agent embody` opens `thinking.text` with its drain counts.** The first
+  line of that producer's `text` is a bracketed, non-model annotation naming
+  what the turn was built from — `[triggers=1 context=6 coalesced-from=187]` —
+  in the same idiom as the `[drop reason=…]` markers the field already carries.
+  It is what makes the coalescer auditable: `coalesced-from` is how many raw
+  cues the `context` lines stand for, so a reader can tell a park that folded a
+  flood from one that quietly threw it away. The same counts appear on the
+  journal as `[SENSE stage=turn source=embody …] turn triggers=… context=…
+  coalesced-from=…`. A consumer that treats `text` as pure model output should
+  skip lines matching `^\[.*\]$`.
 
 ## Runtime Event Feed (`behavior engine run --export -`)
 

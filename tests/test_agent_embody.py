@@ -10,8 +10,9 @@ either end:
 * the duplex session's ears reach the turn engine as an UTTERANCE, and its
   mouth reaches the same engine as ALREADY-SAID context — never as a trigger
   (the one wiring t10 flagged as the thing t11 could miss);
-* the runtime feed's lines reach the engine as CUES through
-  :func:`reachy.embody.cues.cues_for_line`;
+* the runtime feed's lines reach the engine as CLASSIFIED cues through
+  :func:`reachy.embody.cues.classified_cues_for_line`, so a rule FIRE
+  triggers a turn and every other cue parks (issue #143);
 * the media profile's source and sink are the SAME two objects the session
   reads and speaks through, and the same sink the voice tools render into.
 
@@ -438,7 +439,7 @@ def test_a_spoken_reply_is_recorded_as_already_said_never_as_a_trigger():
         assert layer.engine.pending == 0, "a reply must not trigger a turn"
         assert "I am right here." in sink.texts("message")
 
-        layer.engine.submit_cue("felt a gentle scratch on the head")
+        layer.engine.submit_utterance("are you still there?")
         assert layer.engine.run_turn() is True
         assert "I have already said out loud" in turn.last_user_content()
         assert "I am right here." in turn.last_user_content()
@@ -468,7 +469,12 @@ def test_an_interrupted_reply_is_never_recorded_as_spoken():
 
 
 def test_runtime_feed_lines_become_cues_on_the_turn_engine(tmp_path):
-    """feed line -> ``cues_for_line`` -> ``engine.submit_cues`` (t8 -> t10 join)."""
+    """feed line -> ``classified_cues_for_line`` -> ``engine.submit_cues``.
+
+    The t8 -> t10 join, and since #143 it also carries the class: the rule
+    FIRE is what makes the turn run, and the sense line rides along as the
+    context that turn drains.
+    """
     feed = tmp_path / "runtime.feed"
     feed.write_text(
         json.dumps(
@@ -903,7 +909,7 @@ def test_a_cue_source_that_dies_mid_stream_is_a_named_drop_not_a_crash():
     try:
         layer.start()
         _wait_for(lambda: layer.reader.done)
-        assert layer.engine.pending == 1, "the cue read before the fault still landed"
+        assert layer.engine.parked == 1, "the cue read before the fault still landed"
         assert any(agent_mod.REASON_CUE_SOURCE_FAILED in text for text in sink.texts("thinking"))
     finally:
         layer.close()
@@ -989,7 +995,8 @@ def test_max_events_bounds_the_cue_reader(tmp_path):
         layer.start()  # idempotent: one reader thread, not two
         _wait_for(lambda: layer.reader.done)
         assert layer.reader.events == 2
-        assert layer.engine.pending == 2
+        assert layer.reader.cues == 2, "both cues were accepted"
+        assert layer.engine.parked == 1, "and, being the same fact twice, coalesced"
     finally:
         layer.close()
 
@@ -1022,7 +1029,7 @@ def test_an_explicit_stop_ends_the_run_even_with_a_live_feed():
         media=_media(), session_factory=_SessionFactory(), lines=iter(())
     )
     try:
-        layer.engine.submit_cue("felt a gentle scratch on the head")
+        layer.engine.submit_utterance("are you still there?")
         layer.reader.done = False
         assert layer.should_stop() is False
         layer.request_stop()
@@ -1086,8 +1093,11 @@ def test_killing_the_export_consumer_mid_run_leaves_the_layer_alive(tmp_path, ca
     feed = tmp_path / "runtime.feed"
     feed.write_text(
         "\n".join(
-            json.dumps({"t": "sense", "ts": float(i), "pat": ["scratch", "level1"]})
-            for i in range(4)
+            [json.dumps({"t": "rule", "ts": 0.0, "rule": "pat-acknowledge", "action": "fire"})]
+            + [
+                json.dumps({"t": "sense", "ts": float(i), "pat": ["scratch", "level1"]})
+                for i in range(1, 4)
+            ]
         )
         + "\n",
         encoding="utf-8",
@@ -1167,7 +1177,9 @@ def test_embody_runs_turns_over_a_feed_and_publishes_its_own_cognition_feed(tmp_
 
 def test_embody_summary_goes_to_stdout_as_json_when_not_exporting(tmp_path, capsys):
     feed = tmp_path / "runtime.feed"
-    feed.write_text(json.dumps({"t": "sense", "ts": 1.0, "pat": ["scratch", "level1"]}) + "\n")
+    feed.write_text(
+        json.dumps({"t": "rule", "ts": 1.0, "rule": "pat-acknowledge", "action": "fire"}) + "\n"
+    )
     turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
 
     code = agent_mod.cmd_agent_embody(
