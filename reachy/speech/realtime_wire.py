@@ -56,11 +56,22 @@ Wire contract (agentculture/reachy-mini-cli#115)
   opt-in trigger for the ``response.*`` family — the donor server
   (``lobes-cli``'s ``lobes/realtime/_conversation.py`` ``ConversationBridge``)
   starts DISARMED, so a session that never sends it gets exactly the #115
-  ears-only sequence above and nothing else. This is the third and LAST
-  outbound frame kind this wire ever builds, alongside session config (query
-  params, not a frame at all) and :func:`build_append_event` — see
-  :func:`build_response_create_event`'s own docstring for the h13 boundary
-  this pins.
+  ears-only sequence above and nothing else.
+- **Pushing context into the floor's generate call** (foreground-Gemma plan,
+  task t10, decision **c28**): :func:`build_conversation_item_create_event`'s
+  ``conversation.item.create`` is the FOURTH and last outbound frame kind, and
+  it is a DELIBERATE widening of a pinned surface rather than an
+  implementation detail — the layer curates the canonical conversation history
+  (decision c27) and needs a per-turn channel for cognition scopes, perception
+  snapshots and rolling summary updates. It is also **PROVISIONAL**: upstream
+  parked conversation-item parity explicitly, and the ask is
+  agentculture/lobes-cli#170 item 2. See that function's docstring for the
+  schema and what happens if upstream answers differently.
+
+So the complete outbound family is session config (query params, not a frame
+at all), :func:`build_append_event`, :func:`build_response_create_event` and
+:func:`build_conversation_item_create_event` — four kinds, pinned by AST scan
+in ``tests/test_realtime_wire.py`` (h13/h20).
 
 Stdlib only: ``base64``, ``hashlib``, ``json``, ``os``, ``struct``,
 ``urllib.parse`` — the dependency lists in ``pyproject.toml`` are untouched by
@@ -100,6 +111,41 @@ APPEND_EVENT_TYPE = "input_audio_buffer.append"
 #: The one arming frame this wire sends to opt a session into the duplex
 #: half (embodiment-layer plan, task t3) — see :func:`build_response_create_event`.
 RESPONSE_CREATE_EVENT_TYPE = "response.create"
+
+#: The one CONTEXT frame this wire sends (foreground-Gemma plan, task t10,
+#: decision c28) — see :func:`build_conversation_item_create_event`. Its
+#: schema below is PROVISIONAL: upstream has parked conversation-item parity
+#: (``lobes/realtime/_conversation.py``'s own note: ``response.create`` was
+#: adopted "for its SHAPE only — full parity (session.update semantics, the
+#: conversation-item schema, tool calls over the session) is an explicitly
+#: parked follow-up"), and our ask is agentculture/lobes-cli#170 item 2.
+CONVERSATION_ITEM_CREATE_EVENT_TYPE = "conversation.item.create"
+
+#: The item OBJECT's own type, and the content-part type inside it. Both are
+#: OpenAI-Realtime's names, adopted for their shape — they are types of an
+#: object *inside* one event, never event kinds of their own, which is the
+#: distinction the outbound-family AST pin makes explicitly.
+ITEM_TYPE_MESSAGE = "message"
+ITEM_CONTENT_INPUT_TEXT = "input_text"
+
+#: The roles an injected item may carry, mirroring the two roles the floor
+#: itself appends (``lobes/realtime/_conversation.py``:489/523 user,
+#: :647/:680 assistant) plus ``system`` for out-of-band context.
+ITEM_ROLE_SYSTEM = "system"
+ITEM_ROLE_USER = "user"
+ITEM_ROLE_ASSISTANT = "assistant"
+ITEM_ROLES = (ITEM_ROLE_SYSTEM, ITEM_ROLE_USER, ITEM_ROLE_ASSISTANT)
+
+#: The one key in this schema that is OURS rather than OpenAI's, and the whole
+#: reason the schema is worth filing upstream: an item is either **ephemeral
+#: CONTEXT** (participates in the next generate call, never lands in the
+#: session's history) or a **HISTORY turn** (the client's curated record,
+#: re-seeded after a reconnect). Without that distinction, items injected
+#: beside the floor's own auto-appends duplicate and drift — the two-histories
+#: failure the whole arc exists to avoid, one level down.
+ITEM_DISPOSITION_CONTEXT = "context"
+ITEM_DISPOSITION_HISTORY = "history"
+ITEM_DISPOSITIONS = (ITEM_DISPOSITION_CONTEXT, ITEM_DISPOSITION_HISTORY)
 
 
 class FrameReadError(Exception):
@@ -283,11 +329,12 @@ def build_response_create_event() -> str:
     """Wrap the ``response.create`` arming frame as JSON TEXT ready to send.
 
     Alongside session config (query params — see :func:`derive_realtime_ws_url`,
-    never a frame) and :func:`build_append_event`, this is the only other
-    outbound frame kind this wire ever builds: the h13 boundary
+    never a frame), :func:`build_append_event` and
+    :func:`build_conversation_item_create_event`, this is one of the four
+    outbound frame kinds this wire ever builds: the h13/h20 boundary
     (``tests/test_realtime_wire.py``'s
-    ``test_the_wire_modules_outbound_frame_type_family_is_exactly_two_members``)
-    pins that no third kind is ever added here. Tool calls never travel over
+    ``test_the_wire_modules_outbound_frame_type_family_is_exactly_three_members``)
+    pins that no FIFTH kind is ever added here. Tool calls never travel over
     this socket — see the embodiment-layer spec's scope/boundaries.
 
     Carries no body: the donor server's own opt-in check (``lobes-cli``'s
@@ -297,6 +344,68 @@ def build_response_create_event() -> str:
     has no state to make idempotent.
     """
     return json.dumps({"type": RESPONSE_CREATE_EVENT_TYPE})
+
+
+def build_conversation_item_create_event(text: str, *, role: str, disposition: str) -> str:
+    """Wrap ONE conversation item as a ``conversation.item.create`` JSON TEXT event.
+
+    The FOURTH outbound frame kind, and the one the layer's mouth-knows-the-mind
+    arc leans on (decision **c28**, issue #153): the embodiment layer curates
+    the canonical conversation history (decision c27) and pushes per-turn
+    context into the floor's generate call through this channel — cognition
+    scopes, perception snapshots, rolling summary updates, and the m-window
+    re-seed a reconnect needs (claim c40).
+
+    **Schema, and how much of it is ours.** The envelope is OpenAI-Realtime's
+    own::
+
+        {"type": "conversation.item.create",
+         "item": {"type": "message", "role": "system",
+                  "disposition": "context",
+                  "content": [{"type": "input_text", "text": "..."}]}}
+
+    ``item.type`` / ``item.role`` / ``item.content[]`` of ``input_text`` parts
+    are adopted for their SHAPE, exactly as upstream adopted
+    ``response.create``'s. ``disposition`` is OURS: it distinguishes an
+    ephemeral CONTEXT item (participates in the next generate call, never lands
+    in the session's own history) from a HISTORY turn (the client-curated
+    record). That key exists because the floor already auto-appends both roles
+    (``lobes/realtime/_conversation.py``:489/523 user, :647/:680 assistant), so
+    items injected beside those auto-appends would duplicate and drift — and it
+    is filed as the constraint on agentculture/lobes-cli#170 item 2.
+
+    **PROVISIONAL, and it fails closed one level up.** Upstream has not shipped
+    conversation-item parity; nothing has answered #170 item 2 yet, so this is
+    the shape this repo committed to rather than a shape anyone agreed on. It
+    is safe because no frame is ever sent to a gateway that did not announce
+    support: :func:`reachy.speech.realtime_duplex.announces_conversation_items`
+    is the one predicate that decides, and it answers ``True`` only for an
+    explicit affirmative. If upstream answers with a different schema, this
+    function and that predicate are the two places that change.
+
+    Raises :class:`ValueError` for an unknown *role* or *disposition* — refused,
+    never coerced, because guessing a disposition is exactly the duplicate-and-
+    drift failure the key exists to prevent. *text* is carried VERBATIM and
+    bounded by nothing here: whoever produced it already owns its bound
+    (``reachy.embody.scope.ScopeLimits`` for a scope,
+    ``reachy.embody.engine.Limits.summary_max_chars`` for a summary), and a
+    second copy of a bound is a second number to drift.
+    """
+    if role not in ITEM_ROLES:
+        raise ValueError(f"role must be one of {ITEM_ROLES}, got {role!r}")
+    if disposition not in ITEM_DISPOSITIONS:
+        raise ValueError(f"disposition must be one of {ITEM_DISPOSITIONS}, got {disposition!r}")
+    return json.dumps(
+        {
+            "type": CONVERSATION_ITEM_CREATE_EVENT_TYPE,
+            "item": {
+                "type": ITEM_TYPE_MESSAGE,
+                "role": role,
+                "disposition": disposition,
+                "content": [{"type": ITEM_CONTENT_INPUT_TEXT, "text": text}],
+            },
+        }
+    )
 
 
 def decode_event(payload: bytes | str) -> dict | None:

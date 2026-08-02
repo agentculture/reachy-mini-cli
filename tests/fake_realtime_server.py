@@ -38,8 +38,10 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   SPECIFIC token is required and only a mismatching/missing one 401s.
 - ``CLOSE_MID_STREAM`` — emits ``session.created``, waits (bounded by
   ``wait_timeout``) until it has received at least ``close_after_frames``
-  frames from the client, then drops the TCP connection with **no** WebSocket
-  CLOSE frame — an abrupt disconnect, not a clean shutdown.
+  frames from the client **on this connection**, then drops the TCP connection
+  with **no** WebSocket CLOSE frame — an abrupt disconnect, not a clean
+  shutdown. The count is per-connection so a reconnecting client meets the same
+  target again rather than being dropped the instant it reopens.
 - ``PING_EXPECT_PONG`` — emits ``session.created``, sends one PING frame,
   waits (bounded by ``pong_wait_s``) for a PONG to come back (recorded via
   :attr:`FakeRealtimeServer.pong_count` / :meth:`wait_for_pong`), then
@@ -162,6 +164,21 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   (``transcription.completed`` at t=30.228, ``response.created`` 10 ms later
   on the same session). It exists because neither half alone can show that
   words IN and audio OUT share one socket.
+- ``DROP_AFTER_ARM`` (foreground-Gemma plan, task t10) — emits
+  ``session.created``, waits (bounded by ``wait_timeout``) until the client has
+  armed **on this connection**, then drops the TCP connection abruptly with no
+  CLOSE frame. The client reconnects and the whole cycle repeats, so a test
+  gets as many complete connect-and-drop cycles as it waits for.
+
+  Deliberately keyed on the ARM rather than on a raw frame count, which is what
+  makes it deterministic: ``response.create`` is the LAST thing a session sends
+  while coming up, so everything the client sends BEFORE arming — its whole
+  re-seed (spec claim c40) — has provably arrived by the time the trigger
+  fires. ``CLOSE_MID_STREAM`` with a frame target expresses "drop mid-session",
+  but a target the client reaches only by sending N frames couples the drop to
+  a count a test then has to keep in step with the client's startup sequence,
+  and a client starved by a loaded box can miss it entirely and pay a whole
+  ``wait_timeout`` before the drop.
 - ``ROLE_INFEASIBLE`` (embodiment-layer plan, task t9) — refuses the
   handshake with **404**, the gateway's answer when its ``stt`` lane is
   declared infeasible (``lobes-cli``'s ``site/src/scripts/
@@ -171,6 +188,48 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   404 here is a CONFIGURATION verdict an operator must act on, not the
   transient outage a generic refusal implies, and a client is expected to
   name it separately while still reconnecting.
+
+Conversation items — the fourth frame kind (foreground-Gemma plan, task t10)
+-----------------------------------------------------------------------------
+``conversation.item.create`` is accepted by EVERY scenario rather than being a
+scenario of its own, because it is a channel a client uses *while* something
+else is going on (a re-seed at ``session.created``, a scope pushed mid-turn),
+not a script the server plays. Two constructor flags select the gateway's
+posture, and the default is the gateway shipping TODAY:
+
+* ``announce_conversation_items=False`` (default) — ``session.created`` says
+  nothing about items, which is what a real lobes gateway does: conversation-
+  item parity is explicitly PARKED upstream (``lobes/realtime/_conversation.py``
+  adopted ``response.create`` "for its SHAPE only"), and the ask is
+  agentculture/lobes-cli#170 item 2. A client is expected to send NO item at
+  all here and to degrade to the connect-time ``system_prompt`` context.
+* ``announce_conversation_items=True`` — ``session.created``'s ``config``
+  carries ``items: "context_and_history"`` and the server sorts arriving items
+  by their ``disposition``: :attr:`FakeRealtimeServer.context_items`
+  (ephemeral — they would participate in the next generate call and never
+  enter history) and :attr:`FakeRealtimeServer.history_items` (the client's
+  curated record). That split is the whole point of the ask: the floor already
+  auto-appends both roles (``_conversation.py``:489/523 user, :647/:680
+  assistant), so items landing beside those auto-appends would duplicate and
+  drift.
+* ``reject_items=True`` — the server ANSWERS each item with a named ``error``
+  event (``code="item_rejected"``) rather than accepting it, which is how a
+  version-skewed or stricter gateway would refuse one. A client must survive
+  that as a named drop and keep its session; the scenario it rides on is what
+  keeps the socket open long enough for "the session outlived the refusal" to
+  be observable.
+
+An item is RECORDED whatever this server announced, and that is deliberate:
+"no item reached a gateway that never announced one" is only provable if the
+harness would have recorded one that did. A server that quietly ignored
+unannounced items would make the client's own degrade test vacuous — it would
+pass for a client that sends items to everybody.
+
+Like ``arming: "one_shot"``, the ``items`` announcement and the item schema are
+ONE provisional guess at a contract upstream has not shipped, and both ends of
+it — this file and
+``reachy/speech/realtime_wire.build_conversation_item_create_event`` — change
+together if #170 item 2 lands differently.
 
 Two failure modes are deliberately NOT separate ``Scenario`` members, because
 they are properties of the REQUEST, not a server mood the harness picks:
@@ -285,6 +344,15 @@ Observability (thread-safe reads, populated by the reader thread)
   well-formed ``response.create`` frames arrived, and a blocking wait for the
   next one (embodiment-layer plan, task t3) — the arm-and-wait scenarios above
   poll this the same way ``CLOSE_MID_STREAM`` polls ``received_frames``.
+- ``received_event_types`` — every well-formed inbound EVENT type, in arrival
+  order and across reconnects. The ordering view: it is what proves a re-seed
+  landed BEFORE the ``response.create`` that follows it (spec claim c40),
+  which no per-kind counter can express.
+- ``items_received`` / ``context_items`` / ``history_items`` /
+  ``rejected_items`` — every ``conversation.item.create`` item object the
+  client sent, then the same items split by ``disposition`` as
+  ``(role, text)`` pairs (or collected as refusals under ``reject_items``).
+  ``wait_for_item(timeout)`` blocks for the next one.
 - ``is_armed`` / ``arms_consumed`` / ``answered_texts`` / ``unanswered_texts``
   (and their ``answered_transcripts`` / ``unanswered_transcripts`` counts) —
   the ``ONE_SHOT_ARMING`` script's bookkeeping: whether the server would answer
@@ -349,6 +417,18 @@ _MAX_HEAD_BYTES = 64 * 1024
 ARMING_CONFIG_KEY = "arming"
 ARMING_MODE_ONE_SHOT = "one_shot"
 
+#: ``session.created``'s ``config`` key that announces conversation-item
+#: support, and the one value that means "``conversation.item.create`` is
+#: accepted AND ephemeral context items are distinguished from history turns".
+#: The second provisional contract in this file (lobes-cli#170 item 2, decision
+#: c28), paired with
+#: :func:`reachy.speech.realtime_duplex.announces_conversation_items`.
+ITEMS_CONFIG_KEY = "items"
+ITEMS_MODE_CONTEXT_AND_HISTORY = "context_and_history"
+
+#: The ``error`` code this harness refuses an item with under ``reject_items``.
+ITEM_REJECTED_CODE = "item_rejected"
+
 
 class Scenario(str, Enum):
     """Selects one connection's entire scripted behaviour. See the module docstring."""
@@ -367,6 +447,7 @@ class Scenario(str, Enum):
     RESPONSE_AUDIO_DELTA_MALFORMED = "response_audio_delta_malformed"
     DUPLEX_HAPPY_PATH = "duplex_happy_path"
     ONE_SHOT_ARMING = "one_shot_arming"
+    DROP_AFTER_ARM = "drop_after_arm"
     ROLE_INFEASIBLE = "role_infeasible"
 
 
@@ -495,6 +576,8 @@ class FakeRealtimeServer:
         arm_grace_s: float = _DEFAULT_ARM_GRACE_S,
         hold_response: bool = False,
         interrupt_response: bool = False,
+        announce_conversation_items: bool = False,
+        reject_items: bool = False,
     ) -> None:
         self._scenario = Scenario(scenario)
         self._host = host
@@ -515,11 +598,14 @@ class FakeRealtimeServer:
         self._arm_grace_s = max(0.0, float(arm_grace_s))
         self._hold_response = bool(hold_response)
         self._interrupt_response = bool(interrupt_response)
+        self._announce_conversation_items = bool(announce_conversation_items)
+        self._reject_items = bool(reject_items)
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._pong_event = threading.Event()
         self._response_create_event = threading.Event()
+        self._item_event = threading.Event()
         self._release_done_event = threading.Event()
         #: ``RESPONSE_TAIL_INTERJECTION``'s own gate. Deliberately NOT the
         #: ``_release_done_event`` above: that one releases a reply the server
@@ -535,7 +621,14 @@ class FakeRealtimeServer:
         self._live_sockets: list[socket.socket] = []
 
         self._received_frames: list[tuple[int, bytes]] = []
+        self._received_event_types: list[str] = []
         self._append_payloads: list[bytes] = []
+        #: Conversation items (the fourth frame kind), whole and then split by
+        #: ``disposition`` — see the module docstring's own section.
+        self._items_received: list[dict] = []
+        self._context_items: list[tuple[str, str]] = []
+        self._history_items: list[tuple[str, str]] = []
+        self._rejected_items: list[dict] = []
         self._malformed_append_count = 0
         self._pong_count = 0
         self._ping_sent_count = 0
@@ -635,9 +728,47 @@ class FakeRealtimeServer:
             return [opcode for opcode, _payload in self._received_frames]
 
     @property
+    def received_event_types(self) -> list[str]:
+        """Every inbound EVENT type, in arrival order and ACROSS reconnects.
+
+        The one view that can express an ORDERING claim: "the re-seed items
+        preceded the arm" (spec claim c40) is a statement about the sequence,
+        and a per-kind counter cannot make it however many counters there are.
+        Spanning reconnects is deliberate — the claim is about what happens
+        after a session DROPS, so the interesting sequence starts on the second
+        connection.
+        """
+        with self._lock:
+            return list(self._received_event_types)
+
+    @property
     def append_payloads(self) -> list[bytes]:
         with self._lock:
             return list(self._append_payloads)
+
+    @property
+    def items_received(self) -> list[dict]:
+        """Every ``conversation.item.create`` item object the client sent, in order."""
+        with self._lock:
+            return list(self._items_received)
+
+    @property
+    def context_items(self) -> list[tuple[str, str]]:
+        """``(role, text)`` for every EPHEMERAL context item accepted."""
+        with self._lock:
+            return list(self._context_items)
+
+    @property
+    def history_items(self) -> list[tuple[str, str]]:
+        """``(role, text)`` for every curated HISTORY turn accepted."""
+        with self._lock:
+            return list(self._history_items)
+
+    @property
+    def rejected_items(self) -> list[dict]:
+        """Items this server refused (``reject_items=True``), rather than accepted."""
+        with self._lock:
+            return list(self._rejected_items)
 
     @property
     def malformed_append_count(self) -> int:
@@ -765,6 +896,10 @@ class FakeRealtimeServer:
         same event internally rather than polling.
         """
         return self._response_create_event.wait(timeout=timeout)
+
+    def wait_for_item(self, timeout: float | None = None) -> bool:
+        """Block until a well-formed ``conversation.item.create`` has arrived."""
+        return self._item_event.wait(timeout=timeout)
 
     def release_response_done(self) -> None:
         """Let ``RESPONSE_HOLD_BEFORE_DONE`` finish the reply it is holding open.
@@ -1002,7 +1137,7 @@ class FakeRealtimeServer:
                 with self._lock:
                     self._received_frames.append((opcode, payload))
                 if opcode == wire.OPCODE_TEXT:
-                    self._record_text_frame(payload)
+                    self._record_text_frame(payload, conn, send_lock)
                 elif opcode == wire.OPCODE_PING:
                     self._send_frame(conn, send_lock, wire.OPCODE_PONG, payload)
                 elif opcode == wire.OPCODE_PONG:
@@ -1016,17 +1151,69 @@ class FakeRealtimeServer:
         finally:
             done.set()
 
-    def _record_text_frame(self, payload: bytes) -> None:
+    def _record_text_frame(
+        self, payload: bytes, conn: socket.socket, send_lock: threading.Lock
+    ) -> None:
         event = wire.decode_event(payload)
         if event is None:
             return
         event_type = event.get("type")
+        with self._lock:
+            if isinstance(event_type, str):
+                self._received_event_types.append(event_type)
         if event_type == wire.APPEND_EVENT_TYPE:
             self._record_append_event(event)
         elif event_type == wire.RESPONSE_CREATE_EVENT_TYPE:
             with self._lock:
                 self._response_create_count += 1
             self._response_create_event.set()
+        elif event_type == wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE:
+            self._record_conversation_item(event, conn, send_lock)
+
+    def _record_conversation_item(
+        self, event: dict, conn: socket.socket, send_lock: threading.Lock
+    ) -> None:
+        """Accept (and SORT) one item, or refuse it under ``reject_items``.
+
+        The sort is the whole ask (lobes-cli#170 item 2): an item's
+        ``disposition`` says whether it is ephemeral CONTEXT for the next
+        generate call or a curated HISTORY turn, and a harness that lumped them
+        together could not tell a client that got the distinction right from one
+        that never made it.
+        """
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return
+        role = item.get("role")
+        content = item.get("content")
+        text = ""
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            text = str(content[0].get("text", ""))
+        with self._lock:
+            self._items_received.append(item)
+        self._item_event.set()
+
+        if self._reject_items:
+            with self._lock:
+                self._rejected_items.append(item)
+                session_id = self._last_session_id or ""
+            self._send_event(
+                conn,
+                send_lock,
+                self._event_error(
+                    session_id,
+                    ITEM_REJECTED_CODE,
+                    "this gateway does not accept conversation items",
+                ),
+            )
+            return
+
+        pair = (str(role), text)
+        with self._lock:
+            if item.get("disposition") == wire.ITEM_DISPOSITION_HISTORY:
+                self._history_items.append(pair)
+            else:
+                self._context_items.append(pair)
 
     def _record_append_event(self, event: dict) -> None:
         audio_field = event.get("audio")
@@ -1108,10 +1295,15 @@ class FakeRealtimeServer:
             "system_prompt": None,
         }
         if self._announce_one_shot_arming:
-            # The ONE provisional key in this file — see the module docstring.
-            # A gateway that does not announce it says NOTHING here, which is
-            # what makes the client's check fail closed.
+            # One of the TWO provisional keys in this file — see the module
+            # docstring. A gateway that does not announce it says NOTHING here,
+            # which is what makes the client's check fail closed.
             config[ARMING_CONFIG_KEY] = ARMING_MODE_ONE_SHOT
+        if self._announce_conversation_items:
+            # The other one (lobes-cli#170 item 2, decision c28). Same
+            # discipline: silence is the honest default, because silence is
+            # what every gateway shipping today says about items.
+            config[ITEMS_CONFIG_KEY] = ITEMS_MODE_CONTEXT_AND_HISTORY
         return {
             "type": "session.created",
             "session_id": session_id,
@@ -1293,7 +1485,15 @@ class FakeRealtimeServer:
 
         if scenario is Scenario.CLOSE_MID_STREAM:
             deadline = time.monotonic() + self._wait_timeout
-            target = self._close_after_frames
+            # PER-CONNECTION, not cumulative: a client that reconnects must meet
+            # the same frame target again, or the second connection would die
+            # the instant it opened (the first one's frames already satisfy a
+            # global count) and every reconnect test would be racing a socket
+            # closing under it. The "target it can never reach" idiom is
+            # unaffected, and a test that offers a frame per poll — which every
+            # reconnect test here does — reaches a small target on each
+            # connection exactly as it did before.
+            target = len(self.received_frames) + self._close_after_frames
             while time.monotonic() < deadline:
                 # ``_stop_event`` is checked so a test may hold a session open
                 # with a LONG ``wait_timeout`` (the "frame target it can never
@@ -1303,6 +1503,16 @@ class FakeRealtimeServer:
                 if len(self.received_frames) >= target or self._stop_event.is_set():
                     break
                 time.sleep(0.02)
+            self._abrupt_close(conn)
+            return
+
+        if scenario is Scenario.DROP_AFTER_ARM:
+            deadline = time.monotonic() + self._wait_timeout
+            armed_before = self.response_create_count
+            while time.monotonic() < deadline:
+                if self.response_create_count > armed_before or self._stop_event.is_set():
+                    break
+                time.sleep(0.01)
             self._abrupt_close(conn)
             return
 

@@ -422,26 +422,29 @@ def test_build_response_create_event_is_valid_json_text_ready_for_a_text_frame()
     assert decoded["type"] == wire.RESPONSE_CREATE_EVENT_TYPE
 
 
-def test_the_wire_modules_outbound_frame_type_family_is_exactly_two_members() -> None:
-    """h13 (embodiment-layer spec): the client-side SEND surface is session
-    config (query params — never a frame, see :func:`derive_realtime_ws_url`),
-    ``input_audio_buffer.append`` and ``response.create`` — no other frame
-    type may ever be built here, so tool calls can never travel over this
-    socket.
+def _envelope_types(tree: ast.AST, module_globals: dict) -> set[str]:
+    """Every EVENT type an outbound envelope in *tree* can carry.
 
-    An AST scan is a stronger pin than calling the two known ``build_*``
-    functions and checking their output: it finds every dict literal in the
-    module with a ``"type"`` key (resolving a ``Name`` value like
-    ``APPEND_EVENT_TYPE`` through the module's own globals) and asserts the
-    resulting set is exactly the two allowed constants — so a THIRD outbound
-    builder added anywhere in this file, under any name, fails this test
-    immediately rather than waiting for someone to remember to update it.
+    An outbound event is a TOP-LEVEL dict literal — one that is not itself a
+    value inside another dict literal. That distinction arrived with the fourth
+    frame kind (decision c28): ``conversation.item.create``'s body nests an
+    ``item`` object (``"type": "message"``) which itself nests content parts
+    (``"type": "input_text"``), and those are OBJECT types inside one event, not
+    three new event kinds. Counting every ``"type"`` key at any depth would
+    conflate the two and make the pin unreadable exactly where it matters most.
     """
-    tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
-    module_globals = vars(wire)
-    found: set[str] = set()
+    nested: set[int] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Dict):
+            continue
+        for value in node.values:
+            for inner in ast.walk(value):
+                if isinstance(inner, ast.Dict):
+                    nested.add(id(inner))
+
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict) or id(node) in nested:
             continue
         for key, value in zip(node.keys, node.values):
             if not (isinstance(key, ast.Constant) and key.value == "type"):
@@ -450,7 +453,130 @@ def test_the_wire_modules_outbound_frame_type_family_is_exactly_two_members() ->
                 found.add(module_globals[value.id])
             elif isinstance(value, ast.Constant) and isinstance(value.value, str):
                 found.add(value.value)
-    assert found == {wire.APPEND_EVENT_TYPE, wire.RESPONSE_CREATE_EVENT_TYPE}
+    return found
+
+
+def test_the_wire_modules_outbound_frame_type_family_is_exactly_three_members() -> None:
+    """h13/h20: the client-side SEND surface is session config (query params —
+    never a frame, see :func:`derive_realtime_ws_url`),
+    ``input_audio_buffer.append``, ``response.create`` and — since decision
+    **c28** — ``conversation.item.create``. No other frame type may ever be
+    built here, so tool calls can never travel over this socket.
+
+    **This pin widened from two members to three in the SAME change that landed
+    the item builder** (honesty condition h20), which is the whole reason the
+    widening is legible at all: decision c28 chose ``conversation.item.create``
+    as the layer's per-turn context channel and accepted, explicitly and on
+    both repos, that the client's pinned send surface grows from three frame
+    kinds to four. A widening that arrived quietly, in a change about something
+    else, would be indistinguishable from the surface simply drifting.
+
+    An AST scan is a stronger pin than calling the known ``build_*`` functions
+    and checking their output: it finds every outbound ENVELOPE in the module
+    (see :func:`_envelope_types`) and asserts the resulting set is exactly the
+    three allowed constants — so a FOURTH outbound builder added anywhere in
+    this file, under any name, fails this test immediately rather than waiting
+    for someone to remember to update it.
+    """
+    tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
+    assert _envelope_types(tree, vars(wire)) == {
+        wire.APPEND_EVENT_TYPE,
+        wire.RESPONSE_CREATE_EVENT_TYPE,
+        wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE,
+    }
+
+
+# --- conversation.item.create: the fourth frame kind (decision c28) --------------
+
+
+def test_build_conversation_item_create_event_renders_the_provisional_item_schema() -> None:
+    """The exact payload this repo committed to, in one assertion.
+
+    Provenance, stated plainly because it is PROVISIONAL: the envelope is
+    OpenAI-Realtime's own ``conversation.item.create`` shape (``item.type`` /
+    ``item.role`` / ``item.content[]`` of ``input_text`` parts), adopted for its
+    SHAPE exactly as upstream adopted ``response.create``'s; the one key that is
+    OURS is ``disposition``, which carries the ephemeral-CONTEXT vs HISTORY-turn
+    distinction filed as a constraint on agentculture/lobes-cli#170 item 2. If
+    upstream answers with a different schema, this literal is what changes.
+    """
+    text = wire.build_conversation_item_create_event(
+        "the room has two people in it",
+        role=wire.ITEM_ROLE_SYSTEM,
+        disposition=wire.ITEM_DISPOSITION_CONTEXT,
+    )
+    assert json.loads(text) == {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "system",
+            "disposition": "context",
+            "content": [{"type": "input_text", "text": "the room has two people in it"}],
+        },
+    }
+
+
+def test_build_conversation_item_create_event_carries_a_history_turn_verbatim() -> None:
+    """The other disposition, and the roles a re-seeded history turn uses."""
+    text = wire.build_conversation_item_create_event(
+        "what can you see?",
+        role=wire.ITEM_ROLE_USER,
+        disposition=wire.ITEM_DISPOSITION_HISTORY,
+    )
+    item = json.loads(text)["item"]
+    assert item["role"] == "user"
+    assert item["disposition"] == "history"
+    assert item["content"] == [{"type": wire.ITEM_CONTENT_INPUT_TEXT, "text": "what can you see?"}]
+
+
+@pytest.mark.parametrize("role", ["", "robot", "System", None, 3])
+def test_build_conversation_item_create_event_refuses_an_unknown_role(role) -> None:
+    """Fail closed, never coerce: an unknown role is a ValueError here, and the
+    session client turns that into a named drop rather than a frame."""
+    with pytest.raises(ValueError):
+        wire.build_conversation_item_create_event(
+            "hello", role=role, disposition=wire.ITEM_DISPOSITION_CONTEXT
+        )
+
+
+@pytest.mark.parametrize("disposition", ["", "ephemeral", "Context", None, True])
+def test_build_conversation_item_create_event_refuses_an_unknown_disposition(disposition) -> None:
+    """The context/history distinction is the ONE thing this schema exists to
+    carry (lobes#170 item 2), so an unrecognised value can never be guessed at:
+    injecting a context item as a history turn is precisely the duplicate-and-
+    drift failure the distinction prevents."""
+    with pytest.raises(ValueError):
+        wire.build_conversation_item_create_event(
+            "hello", role=wire.ITEM_ROLE_SYSTEM, disposition=disposition
+        )
+
+
+def test_build_conversation_item_create_event_is_valid_json_text_for_a_text_frame() -> None:
+    """Build, frame, read, decode — the same round trip the other two builders
+    take, so the fourth frame kind is a TEXT frame like its siblings."""
+    text = wire.build_conversation_item_create_event(
+        "a summary of everything older", role="system", disposition="history"
+    )
+    frame = wire.build_frame(wire.OPCODE_TEXT, text.encode("utf-8"), mask=True)
+    fin, opcode, payload = wire.read_frame(_reader_from(frame))
+    assert fin is True
+    assert opcode == wire.OPCODE_TEXT
+    decoded = wire.decode_event(payload)
+    assert decoded is not None
+    assert decoded["type"] == wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE
+
+
+def test_the_item_text_is_carried_verbatim_with_no_length_bound_of_its_own() -> None:
+    """This wire restates NO bound. An item's text is bounded by whoever
+    produced it — ``reachy.embody.scope.ScopeLimits`` for a cognition scope,
+    ``Limits.summary_max_chars`` for a rolling summary — and a second copy of a
+    bound here would be a second number to drift.
+    """
+    long_text = "x" * 10_000
+    rendered = json.loads(
+        wire.build_conversation_item_create_event(long_text, role="system", disposition="context")
+    )
+    assert rendered["item"]["content"][0]["text"] == long_text
 
 
 # --- decode_event: never raises on malformed input ------------------------------
