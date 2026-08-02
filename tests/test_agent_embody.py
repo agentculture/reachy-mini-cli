@@ -179,6 +179,8 @@ class _FakeSession:
         split_error: BaseException | None = None,
         cancel_error: BaseException | None = None,
         playback_pending: bool = False,
+        items_supported: bool = False,
+        item_error: BaseException | None = None,
         **kwargs,
     ) -> None:
         self.kwargs = kwargs
@@ -206,6 +208,15 @@ class _FakeSession:
         self.playback_pending = bool(playback_pending)
         self.cancels = 0
         self._cancel_error = cancel_error
+        #: Conversation items the composition root pushed (task t11, decision
+        #: c27). The default is a gateway that announced NO item support,
+        #: because that is the gateway shipping today — parity is parked
+        #: upstream on lobes-cli#170 item 2 — so a test that wants the channel
+        #: has to ask for it, exactly as production has to feature-detect it.
+        self.items_supported = bool(items_supported)
+        self.items: list[object] = []
+        self.items_declined = 0
+        self._item_error = item_error
 
     def start(self) -> None:
         if self._start_error is not None:
@@ -227,6 +238,26 @@ class _FakeSession:
         self.cancels += 1
         self.playback_pending = False
         return _progress_of(self.split)
+
+    def send_item(self, item: object) -> bool:
+        """Mirrors the real ``send_item``: accepted, or a counted decline.
+
+        The real method never raises and answers ``False`` for a gateway that
+        announced nothing — naming the degrade itself, once per session. So the
+        composition root reads the RETURN for "did the floor learn this", never
+        an exception, and this double models both halves.
+        """
+        if self._item_error is not None:
+            raise self._item_error
+        if not self.items_supported:
+            self.items_declined += 1
+            return False
+        self.items.append(item)
+        return True
+
+    @property
+    def supports_conversation_items(self) -> bool:
+        return self.items_supported
 
     # -- the three taps, fired the way the session worker would -------------- #
 
@@ -2790,3 +2821,234 @@ def test_t16_end_to_end_a_tail_interjection_cuts_the_real_session_and_records_on
     assert [a.text for a in layer.engine.wanted_to_say] == ["three four five six"]
     assert layer.session.chunks_cancelled == 3, "the queued tail was never withheld"
     assert sink.texts("message") == [_CUT_TEXT], "the whole reply was recorded at response.done"
+
+
+# =========================================================================== #
+# 11. The layer curates ONE canonical history and PUSHES it (decision c27)    #
+#                                                                             #
+# Task t10 built the whole ``conversation.item.create`` mechanism and         #
+# deliberately left it unreached, because the re-seed CONTENT belongs to the  #
+# layer. This section is the wiring half — and it is the half this arc has    #
+# now got wrong twice (t6's ``cancel_playback`` needed a whole extra task to  #
+# acquire a caller; t9 shipped a voice prompt no production path passed). A   #
+# capability with no caller does not ship, so the pins below fail the moment  #
+# ``_compose_embody_seam`` stops handing the session a ``reseed=`` or stops   #
+# pushing a correction after a cut.                                           #
+#                                                                             #
+# The PROJECTION itself — what the re-seed contains, and that it comes off    #
+# the same deque both lanes read — lives in                                   #
+# ``tests/test_embody_canonical_history.py``.                                 #
+# =========================================================================== #
+
+
+def _call_keywords(function: str, callee: str) -> set[str]:
+    """Keyword names passed to *callee* inside *function*, read from the source.
+
+    A behavioural assertion proves the seam works for the session double a
+    test happened to build; this proves the production construction site names
+    it at all, which is what "wired" means when nobody is looking.
+    """
+    tree = ast.parse(Path(agent_mod.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != function:
+            continue
+        for call in ast.walk(node):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == callee
+            ):
+                return {keyword.arg for keyword in call.keywords if keyword.arg}
+    raise AssertionError(f"{function} no longer calls {callee}")
+
+
+def test_t11_the_composition_hands_the_session_a_real_reseed_seam():
+    """The headline pin: ``reseed=`` is NAMED at the one production call site."""
+    assert "reseed" in _call_keywords("_compose_embody_seam", "build_session")
+
+
+def test_t11_the_item_channel_keeps_a_production_caller():
+    """``send_item`` is reached by production code, not only by its own tests.
+
+    Task t10's own report said it plainly: "the mechanism is fully reachable
+    but not yet reached by production code; t11 must wire it or the channel
+    ships built-and-unreachable". This is the assertion that keeps that true.
+    """
+    tree = ast.parse(Path(agent_mod.__file__).read_text(encoding="utf-8"))
+    callers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "send_item"
+    ]
+    assert callers, "no production path pushes a conversation item"
+
+
+def test_t11_the_composed_reseed_seam_projects_the_engines_canonical_history():
+    """The seam is not merely present: calling it returns the engine's own record."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        layer.engine.update_summary("earlier: the operator asked about the weather")
+        items = factory.last.kwargs["reseed"]()
+        assert [item.disposition for item in items] == ["context"]
+        assert "asked about the weather" in items[0].text
+    finally:
+        layer.close()
+
+
+def test_t11_the_composed_reseed_returns_items_the_real_wire_accepts():
+    """A projection the codec would refuse is a re-seed that silently never lands."""
+    from reachy.speech.realtime_duplex import ConversationItem
+
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        layer.engine.update_summary("earlier: something happened")
+        for item in factory.last.kwargs["reseed"]():
+            assert isinstance(item, ConversationItem)
+            assert item.valid
+    finally:
+        layer.close()
+
+
+def test_t11_a_reseed_from_an_engine_with_nothing_to_say_is_an_empty_list():
+    """A fresh conversation seeds nothing, and that is not a failure."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["reseed"]() == []
+    finally:
+        layer.close()
+
+
+def test_t11_a_cut_reply_pushes_the_measured_correction_to_the_floor():
+    """c39's phase-1 limitation closing: the floor is told what the room HEARD.
+
+    The server recorded the whole reply (a client-local cut is invisible to
+    it), so without this the two records disagree and only ours is right.
+    """
+    factory = _SessionFactory(items_supported=True)
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.reply(_CUT_TEXT, interrupted=True, split=_measured_split())
+        assert layer.engine.replies_cut == 1
+        assert len(factory.last.items) == 1
+        item = factory.last.items[0]
+        assert item.disposition == "history"
+        assert "one two" in item.text
+        assert "four five six" not in item.text
+    finally:
+        layer.close()
+
+
+def test_t11_the_tail_cut_path_pushes_the_correction_too():
+    """Both cut paths correct the floor — one record, and one place it is pushed."""
+    factory = _SessionFactory(items_supported=True, playback_pending=True)
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.split = _measured_split()
+        factory.last.speech_started()
+        assert layer.engine.replies_cut == 1
+        assert [item.disposition for item in factory.last.items] == ["history"]
+    finally:
+        layer.close()
+
+
+def test_t11_a_reply_the_room_heard_whole_pushes_nothing():
+    """Nothing was withheld, so the floor's own record is already true."""
+    factory = _SessionFactory(items_supported=True)
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.reply(_CUT_TEXT)
+        assert factory.last.items == []
+    finally:
+        layer.close()
+
+
+def test_t11_a_cut_that_withheld_nothing_pushes_no_correction():
+    """The floor's record is already true, so a "correction" would be pure noise.
+
+    A cancel can land on the last chunk, which the speaker is already committed
+    to: the reply was cut and the room still heard all of it. Recorded as a cut
+    (``replies_cut`` moves), corrected nowhere.
+    """
+    factory = _SessionFactory(items_supported=True)
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.reply(
+            _CUT_TEXT, interrupted=True, split=_measured_split(said_bytes=48, cut=True)
+        )
+        assert layer.engine.replies_cut == 1
+        assert factory.last.items == []
+        assert factory.last.items_declined == 0, "nothing was even offered"
+    finally:
+        layer.close()
+
+
+def test_t11_without_item_support_the_overstatement_stands_and_is_not_dressed_up():
+    """The c44/h29 degrade, at the correction: declined, counted, and NOT pretended.
+
+    The layer's OWN record still narrows to the measured prefix — that is the
+    half the client is authoritative for — while the floor keeps the full reply
+    it wrote. Nothing here claims the two agree.
+    """
+    factory = _SessionFactory()  # a gateway that announced no item support
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.reply(_CUT_TEXT, interrupted=True, split=_measured_split())
+        assert factory.last.items == []
+        assert factory.last.items_declined == 1
+        assert layer.engine.replies_cut == 1
+        assert [a.text for a in layer.engine.wanted_to_say] == ["three four five six"]
+    finally:
+        layer.close()
+
+
+def test_t11_a_raising_send_item_is_a_named_drop_and_the_cut_is_still_recorded(caplog):
+    """The push runs on the session's worker thread, where a raise is invisible."""
+    factory = _SessionFactory(items_supported=True, item_error=RuntimeError("socket gone"))
+    layer, _args, sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        with caplog.at_level(logging.INFO, logger="reachy"):
+            factory.last.reply(_CUT_TEXT, interrupted=True, split=_measured_split())
+        journal = "\n".join(record.getMessage() for record in caplog.records)
+        assert agent_mod.REASON_FLOOR_PUSH_FAILED in journal
+        assert any(agent_mod.REASON_FLOOR_PUSH_FAILED in text for text in sink.texts("thinking"))
+        assert layer.engine.replies_cut == 1
+    finally:
+        layer.close()
+
+
+def test_t11_end_to_end_the_composed_layer_reseeds_a_real_gateway_before_arming():
+    """Composition -> the REAL session -> a gateway implementing the items schema.
+
+    The strongest form of the wiring claim, and the one a session double cannot
+    make: the layer's own canonical history reaches a socket, sorted by
+    ``disposition``, and every item precedes the arm (spec claim c40).
+    """
+    with FakeRealtimeServer(
+        Scenario.HAPPY_PATH,
+        announce_conversation_items=True,
+        wait_timeout=WAIT_BUDGET_S,
+    ) as server:
+        layer, _args, _sink = _compose(
+            media=_media(),
+            session_factory=_duplex_factory(server),
+            lines=iter(()),
+            clip_reader=lambda: None,
+        )
+        try:
+            layer.engine.update_summary("earlier: the operator asked about the weather")
+            layer.start()
+            _wait_for(lambda: len(server.context_items) >= 1)
+        finally:
+            layer.close()
+
+    assert [role for role, _text in server.context_items] == ["system"]
+    assert "asked about the weather" in server.context_items[0][1]
+    item_type = "conversation.item.create"
+    arm_type = "response.create"
+    sent = [kind for kind in server.received_event_types if kind in (item_type, arm_type)]
+    assert sent[0] == item_type, "the arm preceded the re-seed"

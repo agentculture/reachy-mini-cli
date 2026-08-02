@@ -157,8 +157,17 @@ POLICY about the canonical history, and the canonical history belongs to the
 layer one level up (decision c27, task t11). Nothing on the cut path sends an
 item, and a test pins that. What is true, and all that is claimed, is that the
 LAYER's own record is measured at the sink and the client is the authority for
-it. The divergence is knowing, bounded, and closes when the layer chooses to
-push a correction through the channel below.
+it.
+
+**Since task t11 the layer DOES push a correction, and the divergence is
+narrower — not gone.** ``reachy/cli/_commands/agent.py``'s ``_record_cut``
+builds one through :meth:`reachy.embody.engine.EmbodyTurnEngine.
+floor_correction` and sends it here as a ``history`` item, so a gateway that
+announced the schema is TOLD what the room actually heard. It is an APPEND: the
+overstated turn the floor already wrote is still in its history, because the
+schema has no operation for editing one. And against every gateway shipping
+today — parity is parked upstream — the push is declined by :meth:`send_item`,
+named once, and the phase-1 overstatement stands exactly as described above.
 
 --------------------------------------------------------------------------
 Conversation items: the CONTEXT channel (decision c28, issue #153)

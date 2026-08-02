@@ -656,11 +656,18 @@ def cmd_agent_attach(
 #                       -> engine.note_interrupted_reply  (for a CUT reply: the
 #                          measured said half as spoken, the remainder kept as
 #                          a wanted-to-say artifact the next turn reads — c34)
+#                       -> engine.floor_correction -> session.send_item  (and
+#                          the floor is TOLD what the room actually heard, as a
+#                          history item — c39's phase-1 overstatement closing)
 #   duplex on_speech_started -> session.cancel_playback + the same
 #                          note_interrupted_reply  (the TAIL cut: after
 #                          response.done the floor can no longer interrupt
 #                          anything, and our queue is still draining — c34/c35;
 #                          attention deliberately does NOT gate it)
+#   duplex reseed       -> engine.floor_reseed       (on EVERY session.created,
+#                          BEFORE the arm: the layer curates the canonical
+#                          history and pushes a projection of it, so the floor's
+#                          own history is what the layer put there — c27/c40)
 #   runtime feed line   -> classified_cues_for_runtime_event -> submit_cues
 #                          (a rule FIRE triggers; every other cue parks — #143)
 #   the shared history  -> SummaryProducer -> engine.update_summary (ONE
@@ -711,6 +718,14 @@ REASON_TAIL_CUT_FAILED = "tail-cut-failed"
 #: never left with NO record of its own voice; the drop says the record is the
 #: coarse one.
 REASON_SPLIT_UNAVAILABLE = "cut-split-unavailable"
+#: Pushing the layer's canonical record to the floor RAISED (task t11, decision
+#: c27). ``send_item`` never raises and answers ``False`` for a gateway that
+#: announced no item support — naming that degrade itself, once per session — so
+#: this is the socket dying under a correction, not the ordinary no-items
+#: gateway. Named because the tap runs on the session's own worker thread, and
+#: because a floor left holding an overstated reply is a fact about the
+#: conversation the operator should be able to see.
+REASON_FLOOR_PUSH_FAILED = "floor-push-failed"
 #: Closing a held resource raised. Named, never propagated — a fault in teardown
 #: must not mask the reason the layer was stopping.
 REASON_SHUTDOWN_FAILED = "shutdown-failed"
@@ -751,6 +766,7 @@ EMBODY_REASONS: frozenset[str] = frozenset(
         REASON_ARM_FAILED,
         REASON_TAIL_CUT_FAILED,
         REASON_SPLIT_UNAVAILABLE,
+        REASON_FLOOR_PUSH_FAILED,
         REASON_SHUTDOWN_FAILED,
         REASON_CLIP_UNAVAILABLE,
         REASON_CLIP_STALE,
@@ -1564,9 +1580,10 @@ def _response_tap(
     """
 
     def _spoke(response: object) -> None:
-        split = _measured_split(session_of(), response, export=export)
+        session = session_of()
+        split = _measured_split(session, response, export=export)
         if split is not None and getattr(split, "cut", False):
-            engine.note_interrupted_reply(split)
+            _record_cut(engine, session, split, export=export)
             return
         if getattr(response, "interrupted", False):
             return
@@ -1652,9 +1669,111 @@ def _tail_cut_tap(
             return
         split = _measured_split(session, progress, export=export)
         if split is not None and getattr(split, "cut", False):
-            engine.note_interrupted_reply(split)
+            _record_cut(engine, session, split, export=export)
 
     return _started
+
+
+def _record_cut(
+    engine: object, session: object | None, split: object, *, export: object = None
+) -> None:
+    """ONE cut, recorded in both places it belongs: our record, and the floor's.
+
+    The two cut paths (:func:`_response_tap`'s server-driven interrupt and
+    :func:`_tail_cut_tap`'s client-side tail cut) share this so they cannot
+    drift into telling the conversation two different stories — the same reason
+    :func:`_measured_split` is one accessor for both.
+
+    * The LAYER's record narrows here: :meth:`~reachy.embody.engine.
+      EmbodyTurnEngine.note_interrupted_reply` records the measured said half as
+      spoken and keeps the remainder as a wanted-to-say artifact (spec c34).
+    * The FLOOR's record is CORRECTED here: the server saw a reply delivered at
+      wire speed and appended it whole, so its history overstates what the room
+      heard after every client-local cut (spec claim c39). The correction goes
+      out as a ``history`` conversation item — ephemeral context would let the
+      overstatement return on the next generate call.
+
+    Where the gateway announced no item support the push is declined by
+    ``send_item`` itself, which names the degrade once per session (c44/h29):
+    the layer's own record is still right, the floor's is still overstated, and
+    neither is dressed up as the other.
+    """
+    engine.note_interrupted_reply(split)
+    _push_floor_item(session, engine.floor_correction(split), export=export)
+
+
+def _push_floor_item(session: object | None, item: object | None, *, export: object = None) -> bool:
+    """Send ONE projection of the canonical history to the floor. Never raises.
+
+    Returns whether the floor took it. ``False`` is the ordinary answer today —
+    conversation-item parity is parked upstream (agentculture/lobes-cli#170 item
+    2), so ``send_item`` declines and names that degrade itself, once per
+    session. Only a RAISE is named here: ``send_item`` promises not to, this
+    runs on the session's own worker thread where an escaping exception is an
+    anonymous warning at best, and a floor left holding an overstated reply is
+    something the operator should be able to see.
+    """
+    if item is None:
+        # Nothing to correct: the room heard the whole reply, so the floor's own
+        # record is already true and a "correction" would only add noise.
+        return False
+    if session is None:  # pragma: no cover - composition fills the slot first
+        return False
+    try:
+        return bool(session.send_item(_as_conversation_item(item)))
+    except Exception as err:
+        _embody_drop(
+            export,
+            EMBODY_SOURCE_SESSION,
+            REASON_FLOOR_PUSH_FAILED,
+            f"{type(err).__name__}: {err}",
+        )
+        return False
+
+
+def _as_conversation_item(item: object) -> object:
+    """Join the engine's :class:`~reachy.embody.engine.FloorItem` to the wire's own type.
+
+    The two are structurally identical and deliberately distinct classes: the
+    dependency runs ONE way (the engine must not import the WebSocket client, as
+    its ``_SpokenSplitLike`` docstring records for the value travelling the
+    other way), so joining them is this composition root's job. A mechanical
+    1:1 field copy, and the wire re-validates every value on the way out, so a
+    drift in either vocabulary fails closed at the frame instead of quietly
+    mislabelling an item's disposition.
+    """
+    from reachy.speech.realtime_duplex import ConversationItem
+
+    return ConversationItem(
+        role=item.role,
+        text=item.text,
+        disposition=item.disposition,
+    )
+
+
+def _reseed_tap(engine: object) -> Callable[[], list[object]]:
+    """duplex ``reseed`` -> the canonical history, projected onto a NEW session.
+
+    Decision **c27**: the layer curates the conversation record and pushes
+    projections to the floor, so lobes' server-side history is what the layer
+    put there. This is the seam that does the pushing, and the ORDERING it
+    depends on is the wire's: the client consults it inside ``session.created``
+    handling, before it arms, because a session close wipes the floor's
+    ephemeral history and a reconnect that armed first would answer out of an
+    empty one — Gemma silently reset to amnesia (spec claim c40).
+
+    WHAT to send is :meth:`~reachy.embody.engine.EmbodyTurnEngine.floor_reseed`
+    — Gemma's ``m``-window as curated history turns plus Qwen's rolling summary
+    as one ephemeral context item, both bounded where those bounds already live.
+    This function adds no policy of its own; it is the type join, and it exists
+    as a named function rather than a lambda so a test can pin that composition
+    hands the session a real one.
+    """
+
+    def _seed() -> list[object]:
+        return [_as_conversation_item(item) for item in engine.floor_reseed()]
+
+    return _seed
 
 
 def _measured_split(session: object | None, response: object, *, export: object = None) -> object:
@@ -1868,6 +1987,13 @@ def _compose_embody_seam(
         on_speech_started=_tail_cut_tap(
             engine, lambda: session_slot[0] if session_slot else None, export=export
         ),
+        # The canonical history's projection onto every NEW session (task t11,
+        # decision c27). Task t10 built the whole items mechanism and left the
+        # CONTENT to the layer, which is here: without this keyword the channel
+        # ships built and unreachable, the exact shape t6's ``cancel_playback``
+        # and t9's voice prompt each hit earlier in this arc. No late-bound slot
+        # is needed — the seam reads the ENGINE, which already exists.
+        reseed=_reseed_tap(engine),
     )
     session_slot.append(session)
 
