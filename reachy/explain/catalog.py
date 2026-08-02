@@ -1096,6 +1096,36 @@ that feed. A consumer that disconnects mid-conversation never kills the layer.
 (the AEC fallback; off by default), `--max-turns N`, `--max-events N`,
 `--export -` / `--export-blocks`, `--log-level LEVEL`, `--json`.
 
+## Process supervision — start / stop / restart / status
+
+`agent embody` (bare) runs the layer in the FOREGROUND. `agent embody start`
+runs it DETACHED in the background instead, tracked with a pid + log file
+under the state dir (`embody.pid` / `embody.log`) — the same shape
+`sleep`/`vision`/`behavior engine` already use. One command each way for the
+operator:
+
+- `agent embody start` — spawn the layer detached (idempotent: a second
+  `start` while one is already running reports `already-running` rather than
+  spawning a duplicate). Accepts the same operating flags as the foreground
+  verb (`--feed`, `--media-profile`, `--spool-dir`, `--await-timeout`,
+  `--turn-interval`, `--mute-during-playback`) — never `--max-turns` /
+  `--max-events` / `--export` / `--log-level`, which are foreground-only.
+- `agent embody stop` — SIGTERM, then SIGKILL if it lingers (`--timeout`,
+  default 10s). Signals ONLY the pid this CLI tracked — a stale or reused pid
+  is detected and left untouched, never blindly signalled — so a sibling
+  runtime/daemon process is never at risk. Touches nothing on disk: any
+  `embody-*` rule the layer authored via `create_rule` PERSISTS in the rules
+  overlay after stop (the robot keeps what it was taught) and stays
+  enumerable by its `embody-` prefix.
+- `agent embody restart` — stop the tracked layer (if any), then start a fresh
+  one — picks up new code/flags with one command.
+- `agent embody status` — report the process state (`running` / `stale` /
+  `stopped`) plus the pid and log path.
+
+No systemd unit ships for the layer in this version — it is a plain process,
+never wired into `reachy.service`'s presence pair (`demo` / `runtime`), which
+stays exactly that closed pair either way.
+
 ## Usage
 
     reachy-mini-cli behavior engine run --export - > /tmp/runtime.feed &
@@ -1104,11 +1134,17 @@ that feed. A consumer that disconnects mid-conversation never kills the layer.
     # on a dev box with no robot:
     reachy-mini-cli agent embody --media-profile bench --feed -
 
+    # as a background process instead:
+    reachy-mini-cli agent embody start --feed /tmp/runtime.feed
+    reachy-mini-cli agent embody status
+    reachy-mini-cli agent embody stop
+
 ## Exit codes
 
 - `0` success
 - `1` user-input error (an unknown media profile)
-- `2` environment error (unreadable feed)
+- `2` environment error (unreadable feed; failed to launch/stop the background
+  process)
 """
 
 
@@ -1212,4 +1248,8 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("agent", "overview"): _AGENT,
     ("agent", "attach"): _AGENT,
     ("agent", "embody"): _AGENT_EMBODY,
+    ("agent", "embody", "start"): _AGENT_EMBODY,
+    ("agent", "embody", "stop"): _AGENT_EMBODY,
+    ("agent", "embody", "restart"): _AGENT_EMBODY,
+    ("agent", "embody", "status"): _AGENT_EMBODY,
 }
