@@ -2606,6 +2606,100 @@ grep -n 'id = "embody-' "$RULES"      # exactly what the layer taught the robot
 
 Delete those blocks and `reachy-mini-cli behavior reload` to forget them.
 
+### The bus bridge — `scripts/embody_bus_feed.py`
+
+[The four channels](#the-four-channels) above names the MQTT bus as the
+layer's PRIMARY intake — but `events-cli>=0.9` ships no `subscribe` surface
+at all (verified live), so `reachy/embody/cues.py`'s own
+`resolve_bus_subscriber` always resolves to `None` and the layer falls back
+to tailing a feed file. `scripts/embody_bus_feed.py` is what makes the bus
+route real today: it speaks `paho-mqtt` directly — already in the resolved
+dependency tree as `events-cli`'s own base dependency, so nothing new gets
+installed — and writes matching runtime events onto the same FIFO the
+layer's `--feed` fallback already knows how to tail. It lives in `scripts/`,
+outside the `reachy` package, specifically so it *can* import an MQTT
+library at all without moving the zero-MQTT-library line this repo has
+drawn for its own code (`test_h10_no_mqtt_library_became_a_direct_dependency`
+/ `test_h10_no_module_in_this_repo_imports_an_mqtt_library` are scoped to
+`reachy/`, not `scripts/`).
+
+```bash
+reachy-mini-cli behavior engine run &                              # the runtime (no --export needed)
+python3 scripts/embody_bus_feed.py ~/.local/state/reachy/embody-feed.fifo &
+reachy-mini-cli agent embody --feed ~/.local/state/reachy/embody-feed.fifo --export -
+```
+
+**The last-writer-EOF lifecycle — why the FIFO is opened `O_RDWR`, not
+`O_WRONLY`.** This bit the layer once already, live: the bridge exited
+during testing, the FIFO lost its last writer, the layer's `--feed` reader
+hit EOF on its very next read, and `should_stop` ended the run — the layer
+died alongside a process it does not even know exists. `open_feed_fifo`
+opens `O_RDWR | O_NONBLOCK`, and both halves of that choice are
+load-bearing:
+
+- **`O_NONBLOCK` makes the open itself never block or fail, regardless of
+  which process starts first.** A plain `O_WRONLY` open blocks until a
+  reader shows up — or, with `O_NONBLOCK` added, fails outright with
+  `ENXIO` if no reader is there yet — so a writer-only bridge would have to
+  poll and retry depending on whether it started before or after the layer.
+  `O_RDWR` is a Linux-specific FIFO exception: the open always succeeds
+  immediately, whether or not anyone else has the FIFO open yet.
+- **`O_RDWR` makes the bridge's OWN descriptor count as a reader of the
+  FIFO for as long as the bridge lives**, which is what keeps the pipe from
+  going writer-less — and any *other* reader from seeing EOF — purely
+  because the layer's own `--feed` attachment restarts or is briefly
+  detached. The bridge never reads from this descriptor itself; holding the
+  read end open is pure bookkeeping, not a second consumer competing for
+  bytes.
+
+That second property has a hard edge worth stating plainly: it protects the
+FIFO from the *layer's* churn, not from the *bridge's own exit*. The
+bridge's descriptor is itself the FIFO's writer while the bridge runs — the
+moment the bridge process itself exits (crash, `Ctrl-C`, a supervisor
+stopping it), that descriptor closes, the FIFO reaches zero writers, and the
+layer's blocked read returns `b""` — EOF — which is exactly the failure
+that motivated this section. No FIFO can survive its last writer
+disappearing; the fix is operational, not a code change to the FIFO itself
+— run the bridge under something that restarts it (a `systemctl --user`
+unit you define locally; the repo ships none, matching [the layer's own
+no-unit-in-repo rule](#lifecycle--one-command-each-way-and-what-deliberately-survives)).
+`tests/test_embody_bus_feed.py` pins both bullets directly against a real
+FIFO — no mock, no thread: a second reader gets `BlockingIOError` (no data
+yet), never EOF, while the bridge's descriptor stays open, and gets a
+genuine `b""` the instant it closes.
+
+**The default source filter — `rule,intent,motion`, `REACHY_BUS_FEED_SOURCES`
+to override.** The bridge subscribes `reachy/events/<source>/#` per source
+in the filter (or the single `reachy/events/#` when the filter contains
+`*`). `sense` is excluded by default because forwarding it unfiltered
+flooded the layer, measured: 187 cues and 23 turns in roughly 40 seconds,
+19 `input-queue-full` drops, and not one rule fire in the mix — the flood
+was entirely sense. **State this precisely: the filter is an interim
+mitigation, not the fix.** A bridge process is the wrong layer to own the
+runtime's trigger policy, and filtering here does nothing for an operator
+who feeds the layer from the runtime's own `--export -` instead of this
+bridge. Issue #143 moves that policy into `EmbodyTurnEngine` itself, where
+it belongs.
+
+**The events-only topic filter.** Every filter the bridge can produce is
+scoped under `reachy/events/` — it subscribes `reachy/events/<source>/#`
+(or `reachy/events/#`) and never `reachy/state/#`, the runtime's RETAINED
+state tree. That is a safety property, not an oversight: a bridge that also
+subscribed the retained tree would replay the robot's last-known pose/state
+into a cue the instant it reconnects, as if that state had *just* changed.
+`tests/test_embody_bus_feed.py` asserts this structurally over every filter
+the topic-selection function can produce, not just the default case.
+
+**Byte-identical passthrough.** `on_message` never parses or re-serializes
+a payload — it writes `msg.payload + b"\n"` verbatim, because the runtime
+already publishes `reachy/events/<source>/<type>` payloads shaped exactly
+like a feed line ([`docs/export-schema.md`](export-schema.md)). The bridge
+is a pipe, not a translator; `cues_for_line` on the layer side is what
+actually interprets the bytes, identically whether they arrived over the
+bus or the feed-tail fallback. A full FIFO (nobody draining) is a named,
+counted drop — `BlockingIOError` is caught, never allowed to stall the bus
+client's own thread.
+
 ### Observability — every failure is named twice
 
 `--export -` publishes the same `thinking`/`message`/`emotion` NDJSON feed
@@ -3051,9 +3145,13 @@ What is honestly **not** delivered, so you do not go looking for it:
   `enable_thinking` is off by design (it costs 9–18 s to first output), so the
   block carries cues, reply text, tool calls and results only. The seam is
   dormant, not broken.
-- **`events-cli` cannot subscribe yet**, so the layer's bus intake always falls
-  back to tailing the runtime's NDJSON feed. That is a reported gap with a
-  named drop, not a patched-around one.
+- **`events-cli` cannot subscribe yet**, so `reachy/embody/cues.py`'s own bus
+  intake always falls back to tailing the runtime's NDJSON feed with no
+  injected subscriber. That remains a reported gap with a named drop, not a
+  patched-around one — [the bus bridge](#the-bus-bridge--scriptsembody_bus_feedpy)
+  (`scripts/embody_bus_feed.py`) works around it from OUTSIDE the package by
+  speaking `paho-mqtt` directly, so an operator gets the bus route today, but
+  the package-level gap itself is unchanged.
 
 Pointers:
 
@@ -3064,6 +3162,9 @@ Pointers:
   that survives and how to remove it
 - [The embodiment layer](#the-embodiment-layer--agent-embody) — the optional
   conversational mind (`agent embody`) that switches on and off beside it
+- [The bus bridge](#the-bus-bridge--scriptsembody_bus_feedpy) —
+  `scripts/embody_bus_feed.py`, the MQTT-to-FIFO bridge that makes the
+  layer's primary intake usable today
 - Per-noun flag reference: `reachy-mini-cli explain <noun>`
 - Export wire format: [`docs/export-schema.md`](export-schema.md)
 - SDK-transport rationale: [`docs/adr-0001-sdk-transport-extra.md`](adr-0001-sdk-transport-extra.md)
