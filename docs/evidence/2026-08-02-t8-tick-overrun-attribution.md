@@ -38,7 +38,7 @@ processes:
 
 So the sustained condition is ~5 % over a 20 ms budget (≈47.5 Hz achieved rather
 than 50 Hz), present whenever frames flow and absent when they do not — matching
-#137's own camera-alive/camera-dead table exactly, now with the transition
+the camera-alive/camera-dead table in #137 exactly, now with the transition
 captured *within a single process* rather than across restarts.
 
 ### A methodological note worth keeping
