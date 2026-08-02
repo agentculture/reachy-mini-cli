@@ -2432,10 +2432,14 @@ graph LR
   reply comes back as audio deltas that get played out. Only three frame kinds
   ever leave the socket (session config, audio append, `response.create`) — no
   tool call rides it, because lobes parks socket tool-calling upstream.
-  **Hearing here is UNGATED**: unlike the runtime's transcript sense it runs no
-  engagement gate and no name match, so it hears every voice in the room,
-  including utterances the runtime would drop as ambient. That is structural,
-  not a setting — nothing in the module's import closure reaches either gate.
+  **Hearing here is UNGATED**: unlike the runtime's transcript sense the
+  session runs no engagement gate and no name match, so it hears every voice in
+  the room, including utterances the runtime would drop as ambient. That is
+  structural, not a setting — nothing in the module's import closure reaches
+  either gate. What the layer *does* with what it heard is a separate decision
+  taken one level up: since issue #148, only an utterance naming the robot
+  wakes a turn from cold — see [saying its
+  name](#saying-its-name--the-attention-window).
 - **PERCEPTION — the runtime's own events, as cues.** The layer reads the same
   `sense`/`rule`/`intent`/`motion` lines `agent attach` reads and maps them to
   short first-person cues. **A rule firing is the headline input**, not an
@@ -2525,11 +2529,75 @@ threw it away. Watch it with:
 journalctl --user -f | grep 'stage=turn source=embody'
 ```
 
+### Saying its name — the attention window
+
+The heard class has one more condition on it, and it is the one an operator
+notices first: **the robot ignores you until you say its name.** Measured on a
+real conversation on 2026-08-02, six operator utterances produced 49 turns —
+the three-class policy above fixed the runtime-cue half of that, and this fixes
+the other half. Nothing distinguished *someone addressed the robot* from
+*someone spoke near the robot*, so every sentence in the room cost a streaming
+LLM call and, through the duplex session, a spoken reply.
+
+| state | what wakes a turn | how it ends |
+|---|---|---|
+| **cold** | only an utterance that names the robot — "reachy" (or "robot") | — |
+| **warm** | any utterance | nothing heard **and** nothing spoken for **45 s** |
+
+Three things follow from that table, and each is worth knowing before you
+decide the robot is broken:
+
+- **The window is refreshed by both sides.** Every admitted utterance *and*
+  every answer the layer speaks pushes the deadline out, so a real
+  back-and-forth never drops out mid-exchange — including while the robot is
+  taking a long turn of its own. The name is only needed to *start*.
+- **Only a name opens it.** Ambient chatter cannot warm the robot up by being
+  refused often enough, and neither can the robot's own voice: the duplex
+  session is armed once and the server answers every committed utterance, so a
+  reply spoken while cold — to a conversation the layer is not part of —
+  extends nothing. A robot that could wake itself with its own voice would
+  never go quiet again. This is the same failure the runtime's engagement gate
+  measured the hard way (199 correct drops, 39 accepts, *all wrong*, from a
+  history that could only accumulate reasons to say yes).
+- **A rule fire still wakes it from cold.** Attention gates the *ear*, never
+  the robot's own reactions — patting its head still produces a turn, and it
+  may still speak about what it just did.
+
+The name matcher is the runtime's, so the mishearings it already forgives
+("richie", "reachie", "richy") work here too, and the everyday `r`-words its
+phonetic guard closed ("really", "reality", "route", …) still do not wake
+anything.
+
+Every outcome is named on the journal:
+
+```text
+[SENSE stage=turn source=embody event=8f0c21ab] attention open (name) for 45s
+[SENSE stage=turn source=embody event=1d4e77b0] dropped reason=not-addressed-cold ("could you pass me the salt")
+```
+
+`not-addressed-cold` is deliberately the same label the runtime's transcript
+sense uses for the same situation, so one grep answers "why did it ignore me?"
+on both hearing paths:
+
+```bash
+tail -f "$STATE/embody.log" | grep -E 'attention open|not-addressed-cold'
+```
+
+The window length is `Limits.attention_window_s` in
+`reachy/embody/engine.py` (45 s; `0` means name-only forever). It is longer
+than the runtime's 20 s transcript window on purpose — a *spoken* exchange
+spends most of its time on things a transcript stream never pays for: the
+robot's own multi-round turn, seconds of synthesized speech, and the human
+listening to it before replying. There is no CLI flag for it yet.
+
 ### Containment — an ungated ear does not widen actuation
 
-The layer hears everyone, so containment cannot depend on *who* is speaking. It
-depends on what the layer can reach at all, and every tool wraps a surface that
-**already validates fail-closed**, with no second copy of any bound:
+The layer hears everyone, so containment cannot depend on *who* is speaking.
+(Attention decides whose speech is worth a *turn*; it is a state anyone in the
+room can open by saying one word out loud, so it bounds cost and manners, never
+blast radius.) Containment depends on what the layer can reach at all, and
+every tool wraps a surface that **already validates fail-closed**, with no
+second copy of any bound:
 
 | Tool | The existing gate it goes through |
 |---|---|
@@ -2911,6 +2979,7 @@ The CLI never leaks a Python traceback — every failure is a structured
 | The layer runs but never hears anything (`stage=embody` shows no tee connection) | No runtime is writing the tee, or the two ends resolved different socket paths | Start `behavior engine run`; if you set `REACHY_AUDIO_TEE_SOCKET`, set it for **both** processes — one variable moves both ends by design |
 | The layer speaks but the robot never moves | The action was refused, not lost — every refusal is a tool result *and* a feed block | Grep the layer's output for `dropped reason=` and the `thinking` block's tool results; the shipped validators refuse out-of-range axes, unbounded lifetimes and over-long `say` fail-closed |
 | The layer runs a lot of turns but takes none of them | It is thinking about ambient sense cues rather than about anything the robot decided. This is the pre-#143 shape; a current build cannot do it | Confirm the build: `[SENSE stage=turn source=embody …] turn triggers=… context=…` on every turn is the current one. See [what is worth a turn](#what-is-worth-a-turn--the-three-input-classes) |
+| The layer hears you (`stage=duplex` shows the utterance) but never answers, and the log says `not-addressed-cold` | Attention is cold: since #148 only an utterance naming the robot starts a conversation | Say "reachy" — the next 45 s of talk needs no name, and every answer it speaks extends that. See [saying its name](#saying-its-name--the-attention-window) |
 | The layer runs **no** turns while the runtime is clearly busy | Since #143 only a heard utterance or a **rule fire** starts a turn; `sense`/`intent`/`motion` lines park as context and never trigger. A busy runtime firing no rules is silence by design | Check the feed for `"t":"rule","action":"fire"` lines. No fires and nobody talking = no turns, correctly. `context=N coalesced-from=M` on the next turn proves the background was still being collected |
 | `service status` reports `mode=retired` | A retired unit (`reachy-live.service` / `reachy-listen.service`) is still enabled on this box | Back up `~/.config/systemd/user/reachy-*.service*`, then run `service enable runtime` — the purge is part of every `service` verb |
 | `--no-audio-wake` / `--wake pat` exits `2` on `http` | Pat-wake needs the head-pose read-back, which is `sdk`-only | Use the `sdk` transport for pat-based wake |

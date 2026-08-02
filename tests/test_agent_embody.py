@@ -407,17 +407,49 @@ def _run_probe(script: str, tmp_path: Path) -> str:
 
 
 def test_a_heard_utterance_reaches_the_turn_engine_as_a_trigger():
-    """duplex ``on_utterance`` -> ``engine.submit_utterance`` (t9 -> t10 join)."""
+    """duplex ``on_utterance`` -> ``engine.submit_utterance`` (t9 -> t10 join).
+
+    The utterance names the robot because the shipped engine gates the heard
+    class on ATTENTION (issue #148), so this join is only observable on an
+    admitted utterance. Its refusing half is the test below.
+    """
     factory = _SessionFactory()
     turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
     layer, _args, _sink = _compose(
         media=_media(), session_factory=factory, lines=iter(()), turn_fn=turn
     )
     try:
-        factory.last.hear("is anyone there")
+        factory.last.hear("reachy, is anyone there")
         assert layer.engine.pending == 1
         assert layer.engine.run_turn() is True
-        assert 'heard: "is anyone there"' in turn.last_user_content()
+        assert 'heard: "reachy, is anyone there"' in turn.last_user_content()
+    finally:
+        layer.close()
+
+
+def test_an_ambient_utterance_never_wakes_the_mind_while_attention_is_cold():
+    """The other half of that join (issue #148), through the real composition.
+
+    The SESSION still hears it — that is pinned in ``tests/test_realtime_
+    duplex.py`` and is not what changed — but a conversation the robot was
+    never invited into no longer costs a streaming turn per sentence. Saying
+    the name admits the very next utterance too, so what the gate holds is a
+    STATE, not a filter on wording.
+    """
+    factory = _SessionFactory()
+    turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), turn_fn=turn
+    )
+    try:
+        factory.last.hear("could you pass me the salt please")
+        assert layer.engine.pending == 0
+        assert layer.engine.run_turn() is False
+        assert len(turn.calls) == 0
+
+        factory.last.hear("reachy, are you listening")
+        factory.last.hear("and what can you see")
+        assert layer.engine.pending == 2, "the name opened the window for the next one"
     finally:
         layer.close()
 
@@ -429,6 +461,11 @@ def test_a_spoken_reply_is_recorded_as_already_said_never_as_a_trigger():
     know its own mouth had already spoken and would call ``speak`` to repeat
     it. It is CONTEXT, not a trigger: a robot that treats its own voice as a
     perception talks to itself.
+
+    The follow-up utterance names the robot for the same reason as the test
+    above — and deliberately so here: a reply spoken while attention is COLD
+    must not open the window on its own (issue #148), or the server's own
+    answers to ambient chatter would keep the ear open forever.
     """
     factory = _SessionFactory()
     turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
@@ -441,7 +478,7 @@ def test_a_spoken_reply_is_recorded_as_already_said_never_as_a_trigger():
         assert layer.engine.pending == 0, "a reply must not trigger a turn"
         assert "I am right here." in sink.texts("message")
 
-        layer.engine.submit_utterance("are you still there?")
+        layer.engine.submit_utterance("reachy, are you still there?")
         assert layer.engine.run_turn() is True
         assert "I have already said out loud" in turn.last_user_content()
         assert "I am right here." in turn.last_user_content()
@@ -1653,6 +1690,9 @@ def test_embody_summary_goes_to_stdout_as_json_when_not_exporting(tmp_path, caps
     assert payload["turns"] >= 1
     assert payload["events"] == 1
     assert payload["profile"] == "bench"
+    # "it heard N and ignored M" is what an operator asks about a quiet robot,
+    # and since #148 attention is the answer more often than a fault is.
+    assert payload["unaddressed"] == 0
 
 
 def test_an_unreadable_feed_is_a_clean_environment_error():

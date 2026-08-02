@@ -1,8 +1,11 @@
 """The embodiment layer's direct-operation action set — and its blast radius.
 
 The layer is cognition with an ungated ear: it hears everyone in the room, so
-containment cannot depend on *who* is speaking. It depends on what the layer
-can reach at all. That is this module. There are exactly five tools, covering
+containment cannot depend on *who* is speaking. (Since issue #148 the layer
+does choose whose speech is worth a TURN — :mod:`reachy.embody.attention` — but
+that is a two-state machine anyone in the room can open by saying "reachy" out
+loud, so it bounds cost and manners, never blast radius.) Containment depends
+on what the layer can reach at all. That is this module. There are exactly five tools, covering
 the four action classes the spec names, and **every one of them wraps a surface
 that already exists and already validates**:
 

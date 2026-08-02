@@ -193,13 +193,24 @@ _LIMIT_FIELDS = {field.name for field in dataclasses.fields(engine_mod.Limits)}
 
 
 def _build(**kwargs) -> EmbodyTurnEngine:
+    """An engine on fakes, with its ATTENTION WINDOW already open (issue #148).
+
+    The shipped gate starts cold and only the robot's name opens it, which is
+    a question about WHO spoke; this module is about WHICH CLASS of perception
+    is worth a turn, and its utterances stand in for "a person is talking to
+    the robot". ``tests/test_embody_attention.py`` owns the other question —
+    including the one place the two meet, that an ALERT still triggers a turn
+    while attention is cold.
+    """
     kwargs.setdefault("registry", _Registry())
     kwargs.setdefault("turn_fn", _ScriptedTurn())
     kwargs.setdefault("models", EmbodyModels(worker="worker", senses="senses"))
     limit_kwargs = {name: kwargs.pop(name) for name in list(kwargs) if name in _LIMIT_FIELDS}
     if limit_kwargs:
         kwargs.setdefault("limits", engine_mod.Limits(**limit_kwargs))
-    return EmbodyTurnEngine(**kwargs)
+    engine = EmbodyTurnEngine(**kwargs)
+    engine.attention.note_addressed()
+    return engine
 
 
 def _drain_lines(engine: EmbodyTurnEngine, lines: list[str]) -> agent_mod._CueReader:
