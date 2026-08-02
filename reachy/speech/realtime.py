@@ -223,6 +223,11 @@ REASON_SERVER_ERROR = "server-error"
 REASON_EMPTY_TRANSCRIPT = "empty-transcript"
 
 #: Server ``error.code`` -> this module's kebab-case drop reason.
+# SHARED with reachy/speech/realtime_duplex.py (the embodiment layer's duplex
+# session), which imports this private name rather than keeping a second copy —
+# one owner for the wire, the lesson the t4/t6 audio-tee mismatch taught. Change
+# its BEHAVIOUR and you change the layer's too; a rename breaks that module's
+# import loudly, which is the intended failure mode.
 _ERROR_REASONS = {
     "vad_unavailable": REASON_VAD_UNAVAILABLE,
     "stt_forward_failed": REASON_STT_FORWARD_FAILED,
@@ -392,6 +397,11 @@ class _SessionLost(Exception):
         self.intentional = intentional
 
 
+# SHARED with reachy/speech/realtime_duplex.py (the embodiment layer's duplex
+# session), which imports this private name rather than keeping a second copy —
+# one owner for the wire, the lesson the t4/t6 audio-tee mismatch taught. Change
+# its BEHAVIOUR and you change the layer's too; a rename breaks that module's
+# import loudly, which is the intended failure mode.
 class _FrameReader:
     """A byte-buffered reader over one connected socket.
 
@@ -456,6 +466,11 @@ class _FrameReader:
         return data
 
 
+# SHARED with reachy/speech/realtime_duplex.py (the embodiment layer's duplex
+# session), which imports this private name rather than keeping a second copy —
+# one owner for the wire, the lesson the t4/t6 audio-tee mismatch taught. Change
+# its BEHAVIOUR and you change the layer's too; a rename breaks that module's
+# import loudly, which is the intended failure mode.
 def _to_pcm16(audio: Any) -> bytes:
     """Coerce one mic chunk to little-endian PCM16 mono bytes; ``b""`` if unusable.
 
@@ -1079,6 +1094,11 @@ class RealtimeTranscriber:
         )
 
 
+# SHARED with reachy/speech/realtime_duplex.py (the embodiment layer's duplex
+# session), which imports this private name rather than keeping a second copy —
+# one owner for the wire, the lesson the t4/t6 audio-tee mismatch taught. Change
+# its BEHAVIOUR and you change the layer's too; a rename breaks that module's
+# import loudly, which is the intended failure mode.
 def _as_str(value: Any) -> str | None:
     """Return *value* when it is a non-empty string, else ``None``."""
     return value if isinstance(value, str) and value else None
