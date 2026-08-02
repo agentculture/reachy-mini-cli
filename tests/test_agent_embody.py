@@ -1527,6 +1527,9 @@ def test_a_slow_ask_never_delays_or_blocks_a_pending_turn(tmp_path):
     try:
         assert entered_ask.wait(WAIT_BUDGET_S), "the poll never reached ask()"
 
+        # Attention (#148) is cold by default and this test is about ask()
+        # blocking, not about who the robot answers to.
+        engine.attention.note_addressed()
         engine.submit_utterance("where are you?")
         started = time.monotonic()
         assert engine.run_turn() is True
@@ -1570,6 +1573,9 @@ def test_the_answer_becomes_context_for_the_next_triggered_turn(tmp_path):
     assert engine.pending == 0, "the clip answer must never trigger a turn on its own"
     assert engine.parked == 1
 
+    # Attention (#148) is cold by default; this test is about where the clip
+    # answer lands, not about the wake word.
+    engine.attention.note_addressed()
     engine.submit_utterance("where are you?")
     assert engine.run_turn() is True
 
