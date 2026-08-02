@@ -483,3 +483,90 @@ def test_malformed_tool_arguments_are_a_named_refusal(registry) -> None:
     body = json.loads(registry.dispatch(GOTO, "{not json")["content"])
     assert body["ok"] is False
     assert body["refusal"] == embody_tools.REFUSAL_BAD_ARGUMENTS
+
+
+# --------------------------------------------------------------------------- #
+# The catalog is an ENFORCED boundary, not an advertised hint                  #
+# --------------------------------------------------------------------------- #
+
+
+def _restricted_registry(**kwargs):
+    """A registry whose catalog is a strict subset of the real library."""
+    from reachy.behavior import library
+    from reachy.embody.tools import EmbodyToolRegistry
+
+    return EmbodyToolRegistry(catalog={"nod": library.LIBRARY["nod"]}, **kwargs)
+
+
+def test_run_behavior_refuses_a_name_the_catalog_excludes(tmp_path) -> None:
+    """A restricted catalog must RESTRICT, not merely advertise.
+
+    ``IntentDriver`` validates against the global LIBRARY and has never heard of
+    this registry's catalog, so before this was enforced here a registry built
+    with ``{'nod'}`` still ran ``shake`` — the schema ``enum`` said one thing and
+    the handler did another. An ``enum`` is a hint to a well-behaved model; a
+    direct ``dispatch`` or a malformed client never sees it.
+    """
+    from reachy.embody.tools import REFUSAL_BEHAVIOR
+
+    registry = _restricted_registry(spool_root=tmp_path)
+    result = registry.dispatch("run_behavior", json.dumps({"name": "shake"}), "c1")
+    payload = json.loads(result["content"])
+
+    assert payload["ok"] is False
+    assert payload["refusal"] == REFUSAL_BEHAVIOR
+    assert "shake" in payload["error"]
+    assert "nod" in payload["error"], "the refusal must name the valid set"
+
+
+def test_create_rule_refuses_a_run_the_catalog_excludes(tmp_path) -> None:
+    """Same boundary on the rule path, where it matters MORE.
+
+    A rule outlives the layer (spec c26), so an out-of-catalog behavior authored
+    here would keep firing long after the process that wrote it is gone.
+    """
+    from reachy.embody.tools import REFUSAL_RULE
+
+    rules = tmp_path / "rules.toml"
+    registry = _restricted_registry(rules_path=rules, reload_seam=lambda _t: {"ok": True})
+    result = registry.dispatch(
+        "create_rule",
+        json.dumps({"id": "embody-x", "when": {"field": "pat", "op": "is_true"}, "run": "shake"}),
+        "c1",
+    )
+    payload = json.loads(result["content"])
+
+    assert payload["ok"] is False
+    assert payload["refusal"] == REFUSAL_RULE
+    assert not rules.exists(), "a refused rule must never reach the overlay"
+
+
+def test_the_catalog_boundary_is_not_a_wall(tmp_path) -> None:
+    """The guard must still admit what the catalog DOES contain, on both paths."""
+    rules = tmp_path / "rules.toml"
+    registry = _restricted_registry(
+        spool_root=tmp_path, rules_path=rules, reload_seam=lambda _t: {"ok": True}
+    )
+
+    behavior = json.loads(
+        registry.dispatch("run_behavior", json.dumps({"name": "nod", "duration": 2}), "c1")[
+            "content"
+        ]
+    )
+    assert "refusal" not in behavior
+
+    rule = json.loads(
+        registry.dispatch(
+            "create_rule",
+            json.dumps(
+                {
+                    "id": "embody-ok",
+                    "when": {"field": "pat", "op": "is_true"},
+                    "run": "nod",
+                    "duration_s": 2.0,
+                }
+            ),
+            "c1",
+        )["content"]
+    )
+    assert rule["ok"] is True

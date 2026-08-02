@@ -51,11 +51,29 @@ in the layer is a bound an operator using the CLI does not get. So this module
   :class:`reachy.behavior.speech_act.SpeechActuator` does, "because a rule is
   not its only caller".
 
-The one policy this module *does* own is the ``embody-`` rule-id namespace
-(spec c26): layer-authored rules PERSIST after the layer stops (a confirmed
-product decision — the robot keeps what it was taught), so the prefix is what
-makes them enumerable and removable as a set. There is deliberately no
-deletion-on-exit hook anywhere here.
+The two policies this module *does* own
+--------------------------------------
+Both are bounds no downstream validator has ever heard of, so delegation is not
+available — there is no other owner.
+
+1. **The ``embody-`` rule-id namespace** (spec c26): layer-authored rules
+   PERSIST after the layer stops (a confirmed product decision — the robot
+   keeps what it was taught), so the prefix is what makes them enumerable and
+   removable as a set. There is deliberately no deletion-on-exit hook here.
+2. **The ``catalog``** — the behavior name set this registry was built with.
+   ``IntentDriver`` and ``load_rules`` both validate names against the GLOBAL
+   :data:`reachy.behavior.library.LIBRARY`; neither knows a registry may have
+   been constructed with a narrower one. So a restricted catalog was
+   **advisory** until it was enforced here: the tool schema advertised the short
+   ``enum`` while the handler admitted anything the full library knew. Measured
+   with ``catalog={'nod'}``, before the fix — the advertised enum was
+   ``['nod']``, and ``run_behavior{'name': 'shake'}`` returned ``ok: true`` and
+   ran, while ``create_rule{'run': 'shake'}`` wrote the rule. A schema ``enum``
+   is a hint to a model, never an enforcement boundary: a direct ``dispatch``
+   call or a malformed tool-call client never sees it.
+   :func:`_require_catalog_name` closes both paths, mirroring
+   :func:`reachy.speech.intent_tools._require_known_name`, which the sibling
+   cognition root has always applied.
 
 Import boundary
 ---------------
@@ -542,8 +560,43 @@ def _make_goto_handler(spool_root: Path | None, timeout: float) -> Callable[[dic
     return handler
 
 
-def _make_run_behavior_handler(spool_root: Path | None, timeout: float) -> Callable[[dict], str]:
+def _require_catalog_name(name: object, *, catalog: Mapping, refusal: str, what: str) -> str:
+    """Refuse a behavior name outside *catalog*, naming the valid set.
+
+    This is the ONE bound the layer must own, and it does not contradict the
+    module docstring's "why the layer validates nothing itself" — it completes
+    it. Every other bound belongs to a shipped validator, so restating it here
+    would create a second number to drift. The **catalog** is different: it is a
+    layer-owned restriction, and no downstream validator has ever heard of it.
+    ``IntentDriver`` checks names against the global
+    :data:`reachy.behavior.library.LIBRARY`, so a registry built with a
+    RESTRICTED catalog was advisory only — the tool schema advertised the short
+    ``enum`` while the handler happily admitted anything the full library knew.
+
+    Measured before the fix, with ``catalog={'nod'}``: the advertised enum was
+    ``['nod']`` and ``run_behavior{'name': 'shake'}`` returned ``ok: true`` and
+    ran; ``create_rule{'run': 'shake'}`` wrote the rule. A schema ``enum`` is a
+    hint to a model, not an enforcement boundary — a malformed client, or a
+    direct ``dispatch`` call, never sees it.
+
+    Mirrors :func:`reachy.speech.intent_tools._require_known_name`, which the
+    sibling cognition root already applies for exactly this reason; the embody
+    port dropped it. Raises :class:`Refusal` rather than ``ValueError`` so the
+    outcome reaches the model as one of this module's NAMED refusals.
+    """
+    if not isinstance(name, str) or name not in catalog:
+        valid = ", ".join(sorted(catalog)) or "(the catalog is empty)"
+        raise Refusal(refusal, f"unknown {what} {name!r}; valid: {valid}")
+    return name
+
+
+def _make_run_behavior_handler(
+    spool_root: Path | None, timeout: float, catalog: Mapping
+) -> Callable[[dict], str]:
     def handler(arguments: dict) -> str:
+        _require_catalog_name(
+            arguments.get("name"), catalog=catalog, refusal=REFUSAL_BEHAVIOR, what="behavior"
+        )
         duration = arguments.get("duration")
         if duration is not None and (
             isinstance(duration, bool) or not isinstance(duration, (int, float))
@@ -574,11 +627,18 @@ def _make_voice_handler(seam: SoundSeam | None, name: str) -> Callable[[dict], s
 
 
 def _make_create_rule_handler(
-    rules_path: Path | None, reload_seam: ReloadSeam, timeout: float
+    rules_path: Path | None, reload_seam: ReloadSeam, timeout: float, catalog: Mapping
 ) -> Callable[[dict], str]:
     def handler(arguments: dict) -> str:
         entry = dict(arguments)
         entry["id"] = _checked_rule_id(entry.get("id"))
+        # The rule's `run` crosses the same catalog boundary as run_behavior's
+        # `name`, and matters MORE: a rule outlives the layer (spec c26), so an
+        # out-of-catalog behavior authored here keeps firing long after the
+        # process that wrote it is gone.
+        _require_catalog_name(
+            entry.get("run"), catalog=catalog, refusal=REFUSAL_RULE, what="behavior"
+        )
         target = rules_path if rules_path is not None else rules_mod.overlay_rules_path()
 
         text = target.read_text(encoding="utf-8") if target.is_file() else ""
@@ -672,7 +732,7 @@ def _run_behavior_tool(spool_root: Path | None, timeout: float, catalog: Mapping
             },
             "required": ["name"],
         },
-        handler=_make_run_behavior_handler(spool_root, timeout),
+        handler=_make_run_behavior_handler(spool_root, timeout, catalog),
     )
 
 
@@ -744,7 +804,7 @@ def _create_rule_tool(
             },
             "required": ["id", "when", "run"],
         },
-        handler=_make_create_rule_handler(rules_path, reload_seam, timeout),
+        handler=_make_create_rule_handler(rules_path, reload_seam, timeout, catalog),
     )
 
 
