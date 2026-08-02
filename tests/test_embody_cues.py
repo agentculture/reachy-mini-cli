@@ -236,6 +236,141 @@ def test_rule_fires_are_the_headline_react_in_voice_input():
 
 
 # --------------------------------------------------------------------------- #
+# Cue classification — alert vs context (issue #143a)                        #
+# --------------------------------------------------------------------------- #
+
+_CLASS_TABLE = [
+    pytest.param(_RULE_FIRE_WITH_BEHAVIOR, cues.CueClass.ALERT, id="rule-fire-behavior"),
+    pytest.param(_RULE_FIRE_WITH_DISABLE, cues.CueClass.ALERT, id="rule-fire-disable"),
+    pytest.param(_RULE_FIRE_BARE, cues.CueClass.ALERT, id="rule-fire-bare"),
+    pytest.param(_RULE_SUPPRESS, cues.CueClass.CONTEXT, id="rule-suppress"),
+    pytest.param(_RULE_UNKNOWN_ACTION, cues.CueClass.CONTEXT, id="rule-unknown-action"),
+    pytest.param(_SENSE_SPEECH_AHEAD, cues.CueClass.CONTEXT, id="sense-speech"),
+    pytest.param(_SENSE_EVERYTHING, cues.CueClass.CONTEXT, id="sense-everything"),
+    pytest.param(_INTENT_DECLARE_NAMED, cues.CueClass.CONTEXT, id="intent-declare"),
+    pytest.param(_INTENT_CLEAR, cues.CueClass.CONTEXT, id="intent-clear"),
+    pytest.param(_MOTION_ADMIT, cues.CueClass.CONTEXT, id="motion-admit"),
+    pytest.param(_MOTION_EVICT, cues.CueClass.CONTEXT, id="motion-evict"),
+]
+
+
+@pytest.mark.parametrize(("event", "expected_class"), _CLASS_TABLE)
+def test_classify_runtime_event_matches_the_143_table(event, expected_class):
+    """Rule fires are ALERT; sense/intent/motion and rule suppressions are CONTEXT."""
+    assert cues.classify_runtime_event(event) is expected_class
+
+
+def test_classified_cues_pair_every_cue_text_with_the_events_class():
+    assert cues.classified_cues_for_runtime_event(_RULE_FIRE_WITH_BEHAVIOR) == [
+        cues.ClassifiedCue(
+            text="a behavior rule fired (hear): now doing nod", cue_class=cues.CueClass.ALERT
+        )
+    ]
+
+
+def test_classified_cues_for_a_multi_cue_sense_event_are_all_context():
+    classified = cues.classified_cues_for_runtime_event(_SENSE_EVERYTHING)
+    assert len(classified) > 1
+    assert all(c.cue_class is cues.CueClass.CONTEXT for c in classified)
+    assert [c.text for c in classified] == cues.cues_for_runtime_event(_SENSE_EVERYTHING)
+
+
+def test_rule_suppress_classifies_as_context_not_alert():
+    [classified] = cues.classified_cues_for_runtime_event(_RULE_SUPPRESS)
+    assert classified.cue_class is cues.CueClass.CONTEXT
+    assert classified.text == "a behavior rule held off (hear)"
+
+
+@pytest.mark.parametrize("bad", [None, "a string", 42, {"t": "cognition"}, {"ts": 1.0}])
+def test_classified_cues_for_runtime_event_is_empty_for_unrecognised_or_malformed(bad):
+    assert cues.classified_cues_for_runtime_event(bad) == []
+
+
+def test_classified_cues_for_line_composes_parse_and_classify():
+    line = '{"t":"rule","action":"fire","rule":"hear","behavior":"nod","disable":[]}\n'
+    assert cues.classified_cues_for_line(line) == [
+        cues.ClassifiedCue(
+            text="a behavior rule fired (hear): now doing nod", cue_class=cues.CueClass.ALERT
+        )
+    ]
+
+
+def test_classified_cues_for_line_is_empty_for_a_blank_line():
+    assert cues.classified_cues_for_line("\n") == []
+
+
+def test_cue_classifiers_cover_the_same_line_types_as_cue_mappers():
+    """The classifier table must never drift from the mapper table it rides beside."""
+    assert set(cues.CUE_CLASSIFIERS) == set(cues.CUE_MAPPERS)
+
+
+def test_classification_never_depends_on_cue_text(monkeypatch):
+    """classify_runtime_event decides from the event alone — it never even sees rendered text.
+
+    Proven by swapping the TEXT-producing mapper out from under it: the class
+    for a rule fire must stay ALERT even when the text a mapper would render
+    is replaced with something unrelated, because classification never reads
+    that text in the first place.
+    """
+    fire_event = {"t": "rule", "action": "fire", "rule": "x", "behavior": None, "disable": []}
+    assert cues.classify_runtime_event(fire_event) is cues.CueClass.ALERT
+
+    monkeypatch.setitem(cues.CUE_MAPPERS, "rule", lambda _event: ["totally unrelated text"])
+    classified = cues.classified_cues_for_runtime_event(fire_event)
+    assert classified == [
+        cues.ClassifiedCue(text="totally unrelated text", cue_class=cues.CueClass.ALERT)
+    ]
+
+
+def test_two_rule_fires_with_different_wording_both_classify_alert():
+    """Same action, different rendered text -> same class: wording never enters the decision."""
+    assert (
+        cues.classify_runtime_event(_RULE_FIRE_WITH_BEHAVIOR)
+        is cues.classify_runtime_event(_RULE_FIRE_BARE)
+        is cues.CueClass.ALERT
+    )
+    assert cues.cues_for_runtime_event(_RULE_FIRE_WITH_BEHAVIOR) != cues.cues_for_runtime_event(
+        _RULE_FIRE_BARE
+    )
+
+
+def test_classify_runtime_event_has_no_senselog_side_effect(caplog):
+    """Pure lookup — cues_for_runtime_event already owns the drop/stage logging."""
+    with caplog.at_level("INFO"):
+        cues.classify_runtime_event(_RULE_SUPPRESS)
+    assert caplog.text == ""
+
+
+def test_both_intake_routes_classify_an_identical_event_identically():
+    """The acceptance contract: the bus bridge and the feed-tail path must agree.
+
+    Same event content, delivered once through each of ``open_runtime_lines``'
+    two routes; :func:`cues.classified_cues_for_line` is applied to whatever
+    line each route yields, and the results must match exactly.
+    """
+    payload = '{"t":"rule","action":"fire","rule":"hear","behavior":"nod","disable":[]}'
+
+    feed_lines = list(cues.open_runtime_lines(stdin=io.StringIO(payload + "\n")))
+    feed_classified = [cues.classified_cues_for_line(line) for line in feed_lines]
+
+    fake = FakeBusSubscriber(autoconnect=True)
+    bus_lines = cues.open_runtime_lines(subscriber_factory=lambda: fake)
+    fake.push("reachy/events/rule/fire", payload)
+    bus_classified = [
+        cues.classified_cues_for_line(line) for line in itertools.islice(bus_lines, 1)
+    ]
+
+    expected = [
+        cues.ClassifiedCue(
+            text="a behavior rule fired (hear): now doing nod", cue_class=cues.CueClass.ALERT
+        )
+    ]
+    assert feed_classified == [expected]
+    assert bus_classified == [expected]
+    assert feed_classified == bus_classified
+
+
+# --------------------------------------------------------------------------- #
 # Unknown / malformed lines are skipped with a NAMED drop, never silently     #
 # --------------------------------------------------------------------------- #
 

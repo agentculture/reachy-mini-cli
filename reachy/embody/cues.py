@@ -36,6 +36,30 @@ output, verbatim... one serializer, two transports"):
 * **fallback — tailing the NDJSON feed** (``behavior engine run --export
   -``), the exact shape ``agent attach --feed`` already reads.
 
+Because both routes hand their lines to the same :func:`cues_for_line` /
+:func:`classified_cues_for_line`, a bus-delivered event and a feed-tailed
+event of identical content classify identically by construction — neither
+function knows or cares which transport produced the line it is looking at.
+
+Cue classification — alert vs context (issue #143)
+-----------------------------------------------------
+:func:`cues_for_runtime_event` / :func:`cues_for_line` stay exactly as they
+were: bare ``list[str]``, because :mod:`reachy.runtime_cues`'s shared shape
+and ``agent attach``'s own caller must stay untouched (boundary claim c20).
+This module additionally exposes a classified counterpart —
+:func:`classified_cues_for_runtime_event` / :func:`classified_cues_for_line`,
+returning :class:`ClassifiedCue` — for a caller that needs to know WHICH of
+#143's two admission lanes a cue belongs to. A rule FIRE is the one
+``CueClass.ALERT``; every other recognised event (a sense snapshot, an intent
+change, a motion admit/evict) and a rule SUPPRESSION are
+``CueClass.CONTEXT``. The class is decided from the event's TYPE (and, for
+``rule``, its fire/suppress ``action``) at the same dispatch point
+:data:`CUE_MAPPERS` already uses — never re-derived from a mapper's rendered
+cue TEXT, which by the time it exists has already lost the distinction that
+mattered. This module only decides and carries the class; giving ALERT and
+CONTEXT different admission behaviour in the turn engine is issue #143b, a
+later task, not this one.
+
 Nothing here changes what the runtime publishes. This module is a pure
 CONSUMER of two already-shipped, already-tested wire contracts (the bus topic
 map in ``reachy/export/mqtt.py`` and the NDJSON feed in
@@ -81,10 +105,12 @@ vocabulary declared below (mirrors ``reachy/export/mqtt.py``'s discipline).
 
 from __future__ import annotations
 
+import enum
 import queue
 import sys
 import uuid
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -233,6 +259,133 @@ def cues_for_line(line: str) -> list[str]:
     if event is None:
         return []
     return cues_for_runtime_event(event)
+
+
+# ---------------------------------------------------------------------------
+# Cue classification — alert vs context (issue #143)
+# ---------------------------------------------------------------------------
+#
+# The layer's own duplex ears already hear everything a person says, so an
+# utterance always triggers a turn — that decision lives in engine.py, not
+# here. What a runtime cue adds on top is different in kind: most of it (a
+# sense snapshot, a standing-intent change, a motion admit/evict, a rule the
+# engine held off) is safe to let accumulate and be picked up on the NEXT
+# turn rather than interrupt one. Exactly one kind is not: a rule FIRE, the
+# one thing this layer cannot learn any other way (the robot's own reflex
+# just did something, in voice or in motion) — the same "headline input"
+# :func:`reachy.runtime_cues.rule_cues` already never returns an empty cue
+# for. Task #143b (a later task, not this module) is what gives ALERT and
+# CONTEXT different admission policies in the turn engine; this module's job
+# ends at deciding, and carrying, which class each cue belongs to.
+#
+# The class is decided from the EVENT's type (and, for ``rule``, its
+# fire/suppress ``action``) — never re-derived from a mapper's rendered cue
+# TEXT. By the time a mapper has produced a string, the fact that mattered
+# (what kind of runtime decision this was) is already what produced that
+# string, so classifying straight from the event is both cheaper and stays
+# correct even if the wording changes later.
+
+
+class CueClass(enum.Enum):
+    """Which of #143's two admission lanes a cue belongs to (t7 implements both).
+
+    * ``ALERT`` — a rule fire. The one class worth interrupting a turn for.
+    * ``CONTEXT`` — everything else this module recognises: a sense snapshot,
+      an intent change, a motion admit/evict, and a rule SUPPRESSION. Safe to
+      accumulate and be read on the next turn; never a trigger on its own.
+    """
+
+    ALERT = "alert"
+    CONTEXT = "context"
+
+
+@dataclass(frozen=True)
+class ClassifiedCue:
+    """One perception-cue string plus the :class:`CueClass` its source event carries.
+
+    :func:`cues_for_runtime_event` / :func:`cues_for_line` still return bare
+    ``list[str]`` — unchanged, because :mod:`reachy.runtime_cues`'s shared
+    shape and ``agent attach``'s caller must stay untouched (boundary claim
+    c20). This is the ADDITIVE, classified counterpart a caller that needs
+    the class (the turn engine's composition) reaches for instead.
+    """
+
+    text: str
+    cue_class: CueClass
+
+
+def _rule_cue_class(event: dict) -> CueClass:
+    """A rule ``fire`` is ALERT; a ``suppress`` (or any other action) is CONTEXT."""
+    return CueClass.ALERT if event.get("action") == "fire" else CueClass.CONTEXT
+
+
+def _context_cue_class(_event: dict) -> CueClass:
+    """``sense`` / ``intent`` / ``motion`` are always CONTEXT."""
+    return CueClass.CONTEXT
+
+
+#: One classifier per recognised line type, keyed exactly like
+#: :data:`CUE_MAPPERS` — that dispatch table already knows each event's type,
+#: so classification happens right where the mapper is chosen, not re-derived
+#: later from whatever text the mapper happened to produce.
+CUE_CLASSIFIERS: dict[str, Callable[[dict], CueClass]] = {
+    "rule": _rule_cue_class,
+    "sense": _context_cue_class,
+    "intent": _context_cue_class,
+    "motion": _context_cue_class,
+}
+
+
+def classify_runtime_event(event: dict) -> CueClass:
+    """The :class:`CueClass` for one recognised runtime event.
+
+    Looks up :data:`CUE_CLASSIFIERS` by the event's ``t``. A pure lookup —
+    no I/O, no :mod:`reachy.senselog` side effect — because
+    :func:`cues_for_runtime_event` already owns the recognition/drop
+    observability; this function only ever runs on an event that mapper
+    already accepted (see :func:`classified_cues_for_runtime_event`). An
+    event whose type :data:`CUE_MAPPERS` does not recognise defaults to
+    CONTEXT here rather than raising, matching that function's own
+    fail-quiet posture for a mapper miss.
+    """
+    classifier = CUE_CLASSIFIERS.get(event.get("t"), _context_cue_class)
+    return classifier(event)
+
+
+def classified_cues_for_runtime_event(event: object) -> list[ClassifiedCue]:
+    """Like :func:`cues_for_runtime_event`, but each cue carries its :class:`CueClass`.
+
+    Delegates entirely to :func:`cues_for_runtime_event` for recognition,
+    text and the senselog drop/stage side effects — this function adds
+    nothing but the classification and produces no cue text of its own. All
+    cues from one event share one class, because the class is a property of
+    the runtime DECISION the event describes, not of the individual wording a
+    mapper happened to produce for it.
+    """
+    if not isinstance(event, dict):
+        return []
+    texts = cues_for_runtime_event(event)
+    if not texts:
+        return []
+    cue_class = classify_runtime_event(event)
+    return [ClassifiedCue(text=text, cue_class=cue_class) for text in texts]
+
+
+def classified_cues_for_line(line: str) -> list[ClassifiedCue]:
+    """Parse one runtime-feed line into classified cues (blank lines yield none).
+
+    The classified counterpart to :func:`cues_for_line`, sharing the same
+    :func:`parse_runtime_line` parse step. Both intake routes
+    (:func:`open_runtime_lines`'s bus branch and its feed-tail fallback) hand
+    their lines to this SAME function, so a bus-delivered event and a
+    feed-tailed event of identical content classify identically — the class
+    depends only on the parsed event, never on which transport carried the
+    line.
+    """
+    event = parse_runtime_line(line)
+    if event is None:
+        return []
+    return classified_cues_for_runtime_event(event)
 
 
 # ---------------------------------------------------------------------------
