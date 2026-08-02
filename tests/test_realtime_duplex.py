@@ -49,6 +49,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 import pytest
@@ -71,6 +72,7 @@ from reachy.speech.realtime_duplex import (
     REASON_STREAM_CLOSED,
     REASON_STT_FORWARD_FAILED,
     REASON_VAD_UNAVAILABLE,
+    REASON_VOICE_PROMPT_INVALID,
     RealtimeDuplexSession,
     Response,
 )
@@ -101,6 +103,7 @@ _ENV_VARS = (
     duplex.REALTIME_API_KEY_ENV,
     duplex.OPENAI_URL_BASE_ENV,
     duplex.OPENAI_API_KEY_ENV,
+    duplex.ENV_VOICE_PROMPT,
 )
 
 
@@ -1440,6 +1443,187 @@ def test_the_sample_rate_rides_the_connect_url_and_is_not_hardcoded() -> None:
             client.close()
     assert server.last_input_sample_rate == 24000
     assert server.request_path == "/v1/realtime?input_sample_rate=24000"
+
+
+# --------------------------------------------------------------------------- #
+# t9 — connect-time voice conventions (spec claim c10, honesty h8)             #
+# --------------------------------------------------------------------------- #
+
+
+def _query(url: str) -> dict[str, list[str]]:
+    return parse_qs(urlsplit(url).query)
+
+
+def test_the_default_construction_sends_no_system_prompt_query_param() -> None:
+    """Nothing configured -> the connect URL omits the key entirely, so the
+    GATEWAY's own operator-configured default applies (issue #151/#153, spec
+    c10) -- never a blank override. Re-proves, from the property side, the
+    exact query pinned behaviourally by
+    test_the_sample_rate_rides_the_connect_url_and_is_not_hardcoded."""
+    client = _session(url="ws://box/v1/realtime")
+    assert "system_prompt" not in _query(client.connect_url)
+
+
+def test_an_explicit_system_prompt_rides_the_connect_url() -> None:
+    client = _session(url="ws://box/v1/realtime", system_prompt="Be warm and brief.")
+    assert _query(client.connect_url)["system_prompt"] == ["Be warm and brief."]
+
+
+def test_the_env_var_configures_the_voice_prompt_when_nothing_explicit_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(duplex.ENV_VOICE_PROMPT, "Speak like a lighthouse keeper.")
+    client = _session(url="ws://box/v1/realtime")
+    assert _query(client.connect_url)["system_prompt"] == ["Speak like a lighthouse keeper."]
+
+
+def test_an_explicit_system_prompt_overrides_the_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(duplex.ENV_VOICE_PROMPT, "from the environment")
+    client = _session(url="ws://box/v1/realtime", system_prompt="from the caller")
+    assert _query(client.connect_url)["system_prompt"] == ["from the caller"]
+
+
+def test_a_configured_system_prompt_reaches_the_real_wire() -> None:
+    """The property is not enough on its own -- prove it against a live handshake."""
+    with FakeRealtimeServer(Scenario.HAPPY_PATH) as server:
+        client = _session(
+            server, system_prompt="Be brief.", backoff_initial_s=5.0, backoff_max_s=5.0
+        )
+        client.start()
+        try:
+            assert _established(client)
+        finally:
+            client.close()
+    query = _query(server.request_path or "")
+    assert query.get("system_prompt") == ["Be brief."]
+    assert query.get("input_sample_rate") == [str(_RATE)]
+
+
+def test_a_blank_system_prompt_is_a_named_drop_and_never_sent(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    client = _session(url="ws://box/v1/realtime", system_prompt="   ")
+    assert "system_prompt" not in _query(client.connect_url)
+    assert _count_reason(sense_log, REASON_VOICE_PROMPT_INVALID) == 1
+
+
+def test_an_over_long_system_prompt_is_a_named_drop_and_never_sent(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    client = _session(
+        url="ws://box/v1/realtime", system_prompt="x" * (duplex.MAX_VOICE_PROMPT_CHARS + 1)
+    )
+    assert "system_prompt" not in _query(client.connect_url)
+    assert _count_reason(sense_log, REASON_VOICE_PROMPT_INVALID) == 1
+
+
+def test_nothing_configured_never_logs_a_voice_prompt_drop(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """The common, unconfigured case is not a failure -- no line at all."""
+    _session(url="ws://box/v1/realtime")
+    assert _count_reason(sense_log, REASON_VOICE_PROMPT_INVALID) == 0
+
+
+def test_h13_the_three_frame_pin_is_unaffected_by_a_configured_system_prompt() -> None:
+    """Criterion 1 (spec c10): the send surface stays exactly the two legal
+    frame KINDS even with a system prompt configured -- the in-task assertion
+    the c10/h8 acceptance criteria require. Session config, prompt included,
+    rides the connect URL, never a frame; the static h13 pins right below this
+    section are unmodified by this task and keep covering the rest."""
+    source = _Source()
+    source.offer(_chunk())
+    with FakeRealtimeServer(Scenario.DUPLEX_HAPPY_PATH, wait_timeout=_TIMEOUT) as server:
+        client = _session(
+            server,
+            read_audio=source,
+            system_prompt="Be brief.",
+            stale_drain_max_chunks=0,
+            backoff_initial_s=5.0,
+            backoff_max_s=5.0,
+        )
+        client.start()
+        try:
+            assert _wait_until(lambda: len(server.append_payloads) >= 1)
+            assert _wait_until(lambda: client.responses >= 1)
+        finally:
+            client.close()
+    types = set(_sent_event_types(server))
+    assert types == {wire.APPEND_EVENT_TYPE, wire.RESPONSE_CREATE_EVENT_TYPE}
+    assert wire.OPCODE_BINARY not in server.received_opcodes
+    assert _query(server.request_path or "").get("system_prompt") == ["Be brief."]
+
+
+# --------------------------------------------------------------------------- #
+# resolve_voice_prompt — pure, no socket (spec c10, honesty h8)                #
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_voice_prompt_returns_none_when_nothing_is_configured() -> None:
+    assert duplex.resolve_voice_prompt(env={}) is None
+
+
+def test_resolve_voice_prompt_precedence_explicit_over_env() -> None:
+    env = {duplex.ENV_VOICE_PROMPT: "from env"}
+    assert duplex.resolve_voice_prompt("from explicit", env=env) == "from explicit"
+
+
+def test_resolve_voice_prompt_reads_the_env_var_when_nothing_explicit() -> None:
+    env = {duplex.ENV_VOICE_PROMPT: "from env"}
+    assert duplex.resolve_voice_prompt(env=env) == "from env"
+
+
+def test_resolve_voice_prompt_strips_surrounding_whitespace() -> None:
+    assert duplex.resolve_voice_prompt("  Be brief.  ", env={}) == "Be brief."
+
+
+def test_resolve_voice_prompt_rejects_a_blank_explicit_override() -> None:
+    assert duplex.resolve_voice_prompt("   ", env={}) is None
+
+
+def test_resolve_voice_prompt_rejects_a_blank_env_override() -> None:
+    env = {duplex.ENV_VOICE_PROMPT: ""}
+    assert duplex.resolve_voice_prompt(env=env) is None
+
+
+def test_resolve_voice_prompt_rejects_an_over_long_override() -> None:
+    text = "x" * (duplex.MAX_VOICE_PROMPT_CHARS + 1)
+    assert duplex.resolve_voice_prompt(text, env={}) is None
+
+
+def test_resolve_voice_prompt_accepts_exactly_the_cap() -> None:
+    text = "x" * duplex.MAX_VOICE_PROMPT_CHARS
+    assert duplex.resolve_voice_prompt(text, env={}) == text
+
+
+def test_resolve_voice_prompt_is_pure_and_logs_nothing(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """The resolver itself never touches senselog -- the SESSION is what turns
+    a rejected override into a named, counted drop (see the tests above)."""
+    duplex.resolve_voice_prompt("   ", env={})
+    duplex.resolve_voice_prompt("x" * (duplex.MAX_VOICE_PROMPT_CHARS + 1), env={})
+    duplex.resolve_voice_prompt(env={})
+    assert _count_reason(sense_log, REASON_VOICE_PROMPT_INVALID) == 0
+
+
+def test_default_voice_prompt_is_chunk_friendly_and_stays_in_the_spoken_register() -> None:
+    """Loosely pins DEFAULT_VOICE_PROMPT's content against the design intent
+    (issue #151): no markdown/lists/code/emoji, and it asks for natural,
+    complete, sentence-shaped spoken thoughts rather than a hard cap on how
+    many sentences a reply may contain."""
+    text = duplex.DEFAULT_VOICE_PROMPT.lower()
+    assert "markdown" in text
+    assert "sentence" in text
+    assert "one or two" not in text  # not upstream's own terse cap, deliberately
+    assert 0 < len(duplex.DEFAULT_VOICE_PROMPT) <= duplex.MAX_VOICE_PROMPT_CHARS
+
+
+def test_default_voice_prompt_round_trips_through_resolve() -> None:
+    """A sanity/regression pin: this module's own shipped default must always
+    itself be a VALID override (never blank, never over the cap)."""
+    resolved = duplex.resolve_voice_prompt(duplex.DEFAULT_VOICE_PROMPT, env={})
+    assert resolved == duplex.DEFAULT_VOICE_PROMPT
 
 
 # --------------------------------------------------------------------------- #

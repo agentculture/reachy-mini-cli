@@ -363,20 +363,36 @@ def resolve_realtime_api_key(api_key: str | None = None) -> str | None:
     return None
 
 
-def connect_url(base_url: str, sample_rate: int) -> str:
-    """Add (or replace) ``input_sample_rate`` on *base_url*.
+def connect_url(base_url: str, sample_rate: int, *, system_prompt: str | None = None) -> str:
+    """Add (or replace) ``input_sample_rate`` — and, optionally, ``system_prompt`` — on *base_url*.
 
     Session config rides the connect URL on this wire — there is no follow-up
     ``session.update`` message — so the rate the microphone actually reports is
     carried here, never hard-coded and never resampled client-side.
+
+    *system_prompt* is the embodiment layer's connect-time persona/reply-length
+    override (issue #151/#153, spec claim c10; see
+    :func:`reachy.speech.realtime_duplex.resolve_voice_prompt` for the
+    resolution + validation policy — this function does none of that, it only
+    places an already-decided value on the wire). ``None`` — the default, and
+    every call :class:`RealtimeTranscriber` makes — omits the key entirely
+    rather than sending a blank one, so the gateway's own
+    ``parse_session_config`` falls through to its operator-configured
+    default; a present value REPLACES whatever *base_url* already carried,
+    never duplicates it, matching ``input_sample_rate``'s own idiom. The
+    ears-only transcriber never arms a reply and has no use for a persona
+    prompt, so it never passes this argument — only
+    :class:`~reachy.speech.realtime_duplex.RealtimeDuplexSession` does.
     """
     parts = urlsplit(base_url)
     params = [
         (name, value)
         for name, value in parse_qsl(parts.query, keep_blank_values=True)
-        if name != "input_sample_rate"
+        if name not in ("input_sample_rate", "system_prompt")
     ]
     params.append(("input_sample_rate", str(int(sample_rate))))
+    if system_prompt is not None:
+        params.append(("system_prompt", system_prompt))
     path = parts.path or wire.REALTIME_PATH
     return urlunsplit((parts.scheme, parts.netloc, path, urlencode(params), ""))
 
