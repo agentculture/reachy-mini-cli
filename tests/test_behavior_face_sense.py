@@ -568,7 +568,12 @@ def test_a_raising_engine_or_store_degrades_to_no_match() -> None:
 def test_add_frame_sink_receives_every_usable_frame() -> None:
     """A registered sink is pushed each usable frame, in order, once per tick."""
     frames = [_frame(width=4), _frame(width=6), _frame(width=8)]
-    driver = FaceSenseDriver(media=_FakeMedia(list(frames)), engine=None, store=None)
+    # The read CADENCE is a separate property (see the frame-interval tests
+    # below); this one is about what a sink receives per read, so it reads
+    # every tick.
+    driver = FaceSenseDriver(
+        media=_FakeMedia(list(frames)), engine=None, store=None, frame_interval_s=0.0
+    )
     received: list = []
     driver.add_frame_sink(received.append)
     try:
@@ -757,3 +762,90 @@ def test_driver_never_constructs_its_own_media_client() -> None:
         stripped = line.strip()
         if stripped.startswith(("import ", "from ")):
             assert "media_client" not in stripped, f"face_sense must not import it: {line}"
+
+
+# --------------------------------------------------------------------------- #
+# The frame-read interval (#137 / #145)                                        #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_frame_read_is_gated_by_the_interval_not_the_tick() -> None:
+    """The read runs at its own cadence, not once per 50 Hz tick.
+
+    Reading every tick sustained the whole 20 ms budget ~5% over for as long as
+    frames flowed, measured on the deployed box
+    (``docs/evidence/2026-08-02-t8-tick-overrun-attribution.md``). No consumer
+    needs faster than 8 fps.
+    """
+    media = _FakeMedia([_frame() for _ in range(20)])
+    driver = FaceSenseDriver(media=media, start_worker=False, frame_interval_s=0.1)
+    try:
+        # 10 ticks of a 50 Hz loop = 0.2 s of wall time -> 3 reads at 10 Hz
+        # (t=0.00, 0.10, 0.20), never 10.
+        for index in range(11):
+            driver(_Ctx(index * 0.02))
+    finally:
+        driver.close()
+    assert media.calls == 3, f"read {media.calls} times in 0.2 s; expected 3 at 10 Hz"
+
+
+def test_frame_available_is_held_across_the_gap_between_reads() -> None:
+    """A skipped read holds the condition on its TTL rather than dropping it.
+
+    The interval (0.1 s) is an order of magnitude inside the TTL (1.0 s), so a
+    tick that declines to read can never make the condition flap.
+    """
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame() for _ in range(5)]),
+        start_worker=False,
+        frame_interval_s=0.1,
+        frame_ttl_s=1.0,
+    )
+    try:
+        driver(_Ctx(0.0))
+        assert driver.peek_frame_available() is True
+        for index in range(1, 5):  # every one of these is inside the interval
+            driver(_Ctx(index * 0.02))
+            assert driver.peek_frame_available() is True, "the TTL hold broke at a skipped read"
+    finally:
+        driver.close()
+
+
+def test_a_clockless_tick_still_reads() -> None:
+    """Without ``ctx.now`` there is no interval to measure, so the read happens.
+
+    Declining instead would silence the sense entirely on a clock-less engine.
+    """
+    media = _FakeMedia([_frame() for _ in range(3)])
+    driver = FaceSenseDriver(media=media, start_worker=False, frame_interval_s=0.1)
+    try:
+        for _ in range(3):
+            driver(_Ctx(None))
+    finally:
+        driver.close()
+    assert media.calls == 3
+
+
+def test_a_disconnected_tick_does_not_consume_the_interval() -> None:
+    """A client that comes back reads at once instead of waiting an interval out."""
+
+    class _Client:
+        def __init__(self) -> None:
+            self.connected = False
+            self.calls = 0
+
+        def frame(self):
+            self.calls += 1
+            return _frame()
+
+    media = _Client()
+    driver = FaceSenseDriver(media=media, start_worker=False, frame_interval_s=0.1)
+    try:
+        driver(_Ctx(0.0))
+        assert media.calls == 0
+        media.connected = True
+        driver(_Ctx(0.02))  # well inside the interval, but nothing was read yet
+        assert media.calls == 1
+        assert driver.peek_frame_available() is True
+    finally:
+        driver.close()

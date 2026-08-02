@@ -147,6 +147,15 @@ DEFAULT_DETECT_INTERVAL: float = 0.5
 #: would re-fire its rule every detection cycle.
 DEFAULT_REANNOUNCE_COOLDOWN: float = 30.0
 
+#: Minimum seconds between ``media.frame()`` reads on the tick thread.
+#: 10 Hz: above the fastest real consumer (the rolling clip's
+#: :data:`~reachy.behavior.clip_rider.DEFAULT_ENCODE_FPS`, 8 fps) and an order of
+#: magnitude inside :data:`DEFAULT_FRAME_TTL_S`, so a held ``frame_available``
+#: can never go stale between reads. Reading once per tick instead cost a
+#: sustained ~5% tick-budget overrun for as long as frames flowed — see issue
+#: #145 and ``docs/evidence/2026-08-02-t8-tick-overrun-attribution.md``.
+DEFAULT_FRAME_INTERVAL_S: float = 0.1
+
 #: How long a successfully read frame keeps ``frame_available`` true (seconds).
 #: The camera is slower than the 50 Hz tick and a steady-state read returns
 #: ``None`` whenever nothing is ready, so the condition is held rather than
@@ -375,6 +384,7 @@ class FaceSenseDriver:
         detect_interval: float = DEFAULT_DETECT_INTERVAL,
         reannounce_cooldown: float = DEFAULT_REANNOUNCE_COOLDOWN,
         frame_ttl_s: float = DEFAULT_FRAME_TTL_S,
+        frame_interval_s: float = DEFAULT_FRAME_INTERVAL_S,
         clock: Callable[[], float] = time.monotonic,
         start_worker: bool = True,
     ) -> None:
@@ -384,6 +394,8 @@ class FaceSenseDriver:
         self._detect_interval = max(0.0, float(detect_interval))
         self._reannounce_cooldown = max(0.0, float(reannounce_cooldown))
         self._frame_ttl_s = max(0.0, float(frame_ttl_s))
+        self._frame_interval_s = max(0.0, float(frame_interval_s))
+        self._last_read_at: float | None = None
         self._clock = clock
 
         #: Tick thread -> worker: the latest validated frame to detect on.
@@ -447,6 +459,12 @@ class FaceSenseDriver:
 
     def _update_frame(self, now: float | None) -> None:
         """Peek one frame, gate it (#73), publish it, and refresh the condition."""
+        if not self._read_due(now):
+            # Not due: hold the condition on its TTL rather than re-reading. The
+            # interval is many times shorter than the TTL, so a held condition is
+            # never stale — see :meth:`_read_due`.
+            self._frame_available = self._within_ttl(now)
+            return
         if not self._connected() or not self._camera_available():
             # A camera-less robot: the condition collapses at once — no TTL hold,
             # nothing to be stale about.
@@ -454,6 +472,10 @@ class FaceSenseDriver:
             self._last_frame_at = None
             return
 
+        # Stamped only where a read is actually attempted: a disconnected or
+        # camera-less tick must not consume the interval, or a client that comes
+        # back would wait one out before its first frame.
+        self._last_read_at = now
         frame = self._read_frame()
         if usable_frame(frame):
             self._last_frame_at = now
@@ -466,6 +488,26 @@ class FaceSenseDriver:
         # A None or degenerate frame is a NON-READING, never a fault (#73): the
         # condition simply rides its TTL until frames genuinely stop.
         self._frame_available = self._within_ttl(now)
+
+    def _read_due(self, now: float | None) -> bool:
+        """Whether enough time has passed since the last ``frame()`` read.
+
+        The read is the one leg of this driver that runs ON the tick thread, and
+        it used to run every tick — 50 Hz against consumers that need at most 8
+        (issue #145). Measured on the deployed box, that sustained the whole 20 ms
+        budget about 5% over for as long as frames flowed
+        (``docs/evidence/2026-08-02-t8-tick-overrun-attribution.md``).
+
+        A clock-less tick reads every time: without ``ctx.now`` there is no
+        interval to measure, and declining to read would silence the sense.
+        """
+        if now is None or self._frame_interval_s <= 0.0:
+            return True
+        last = self._last_read_at
+        if last is None:
+            return True
+        # A clock that jumped backwards reads now rather than waiting it out.
+        return not (0.0 <= now - last < self._frame_interval_s)
 
     def _within_ttl(self, now: float | None) -> bool:
         """Whether the last good frame is still recent enough to hold the condition."""
@@ -704,6 +746,7 @@ __all__ = [
     "usable_frame",
     "vision_unavailable_reason",
     "DEFAULT_DETECT_INTERVAL",
+    "DEFAULT_FRAME_INTERVAL_S",
     "DEFAULT_FRAME_TTL_S",
     "DEFAULT_REANNOUNCE_COOLDOWN",
     "VISION_EXTRA_ABSENT",
