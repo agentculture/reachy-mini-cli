@@ -6,8 +6,8 @@ Two transport paths mirror the ``listen`` noun's sdk/http split:
   chunks via ``push_audio_sample()``.  ``reachy_mini`` is imported lazily so
   the slim base install stays installable without system audio libs.
 * **http** — synthesizes a full WAV in memory, uploads it to the daemon
-  (``POST /media/sounds/upload``, multipart), then triggers playback
-  (``POST /media/play_sound`` with ``{"file": "<path>"}``).  Pure stdlib
+  (``POST /api/media/sounds/upload``, multipart), then triggers playback
+  (``POST /api/media/play_sound`` with ``{"file": "<path>"}``). Pure stdlib
   (``urllib``), no third-party runtime dep.
 
 Transport selection:
@@ -273,9 +273,9 @@ def _play_http(
 ) -> None:
     """Upload a WAV to the daemon and trigger playback over HTTP.
 
-    Step 1: ``POST {base_url}/media/sounds/upload`` (multipart) — daemon saves
+    Step 1: ``POST {base_url}/api/media/sounds/upload`` (multipart) — daemon saves
             the file and returns ``{"path": "<name>"}`` (or similar).
-    Step 2: ``POST {base_url}/media/play_sound`` with ``{"file": "<path>"}``.
+    Step 2: ``POST {base_url}/api/media/play_sound`` with ``{"file": "<path>"}``.
     """
     base = base_url.rstrip("/")
     wav = _make_wav_bytes(pcm, samplerate)
