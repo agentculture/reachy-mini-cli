@@ -82,10 +82,53 @@ slot's own ``count`` keeps incrementing on every update, so it still adds its
 share to the turn's ``coalesced-from`` total, and its rendering marks an
 update differently from a repeat (``"... (updated x180)"`` against a cue's
 ``"... (x145)"``) so a reader of the journal or export feed can tell which
-happened. What this module does NOT build: freshness/staleness on the slot,
-or a structured schema for its content — both are task t13's job, over the
-seam this one leaves in place (one slot, replaced on every
-:meth:`submit_perception` call).
+happened.
+
+A state PERSISTS, and a structured artifact has a shape (issue #155 c7, task
+t13)
+------------------------------------------------------------------------------
+Two things t3 deliberately left open, both closed here. First, the shape:
+:meth:`submit_perception` now takes a :class:`PerceptionSnapshot` — the
+observation summary, salient entities, a confidence, a capture time and a
+frame reference issue #155 names — rather than bare text; the producer
+(:class:`~reachy.cli._commands.agent._ClipAsker`) builds one from the senses
+model's answer and degrades to a summary-only snapshot, never a crash, when
+that answer does not parse as the requested structure. A bare string is still
+accepted (wrapped into a summary-only snapshot at intake) so every existing
+caller keeps working unchanged.
+
+Second, the lifetime: "one slot, replaced on every call" is the coalescing
+key, not the whole story, and t3's own :meth:`_drain_context` DRAINED that
+slot exactly like every cue — read once, gone. A :class:`PerceptionSlot`
+describes a STATE, and a state does not stop being true the instant one turn
+looks at it: a person asking "what can you see?" between two 20 s clip polls
+used to get nothing, because the last answer had already been read and
+thrown away by whatever turn happened to run first. :meth:`_live_perception`
+is the fix — a slot now PERSISTS across turns until SUPERSEDED (a later
+:meth:`submit_perception` call for the same source) or STALE (its
+snapshot's ``captured_at`` is older than
+:attr:`Limits.perception_stale_after_s`, checked on every read against
+:attr:`_now` — the SAME clock the alert interval and the attention gate
+already share, never a second one). This is why perception is a SEPARATE
+park from the closed cue vocabulary in the first place: changing ONE park's
+lifetime semantics without touching the other would not be possible if they
+shared a dict, and the closed-vocabulary park's drain-every-turn behaviour is
+exactly as load-bearing as it always was (see the section above) — a cue
+describes something that HAPPENED, and a happening does not stay true.
+
+Freshness reuses the clip discipline instead of inventing a second one. The
+production ``captured_at`` is the runtime clip's own monotonic ``ts``
+(``reachy/behavior/clip_rider.py``), carried straight through by
+``_ClipAsker`` rather than re-stamped at submission time — so a snapshot that
+sat unread is judged by the true age of the FRAME it describes, not by how
+recently the layer happened to hear about it. :data:`DEFAULT_PERCEPTION_
+STALE_AFTER_S` mirrors :data:`reachy.cli._commands.agent.DEFAULT_CLIP_
+STALE_AFTER_S` (30.0) BY VALUE, not by import — the same reason
+:data:`DEFAULT_ATTENTION_WINDOW_S` is independently defined on each side of
+the composition-root boundary — because the two really are the SAME rule
+evaluated at two different moments (once at ask time, in ``_ClipAsker.
+poll_once``; again at read time, here), and a caller that widened one without
+the other would have quietly invented a second staleness policy.
 
 Alert containment, because the flood has a front door too
 ----------------------------------------------------------
@@ -280,7 +323,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from reachy import senselog
@@ -355,6 +398,13 @@ REASON_CONTEXT_PARK_FULL = "context-park-full"
 #: source — however many DIFFERENT descriptions — can never fill this bound;
 #: only a genuinely new source can.
 REASON_PERCEPTION_SOURCES_FULL = "perception-sources-full"
+#: :meth:`EmbodyTurnEngine._live_perception` evicted a slot on READ: its
+#: snapshot's ``captured_at`` is older than :attr:`Limits.
+#: perception_stale_after_s` (task t13, spec c7). Never counted against
+#: :attr:`EmbodyTurnEngine.dropped_inputs` — this is a slot going stale, not a
+#: capacity refusal, the same distinction :data:`REASON_SUMMARY_STALE` draws
+#: against the input-queue reasons above it.
+REASON_PERCEPTION_STALE = "perception-stale"
 #: :meth:`EmbodyTurnEngine.submit_scope`'s own bound: the scope park already
 #: holds :data:`DEFAULT_MAX_SCOPES` distinct ``(kind, goal)`` concerns and a new
 #: goal arrived. A restatement of an already-parked GOAL can never reach this —
@@ -392,6 +442,7 @@ DROP_REASONS: tuple[str, ...] = (
     REASON_INPUT_QUEUE_FULL,
     REASON_CONTEXT_PARK_FULL,
     REASON_PERCEPTION_SOURCES_FULL,
+    REASON_PERCEPTION_STALE,
     REASON_SCOPE_PARK_FULL,
     REASON_EMPTY_INPUT,
     REASON_SILENT_TURN,
@@ -467,6 +518,20 @@ DEFAULT_PERCEPTION_SOURCE = "vision"
 #: is one source, so this only ever bites a caller that names a new source on
 #: every call, which is a bug, not a busy robot.
 DEFAULT_MAX_PERCEPTION_SOURCES = 4
+#: How long a persisted :class:`PerceptionSnapshot` stays LIVE before
+#: :meth:`EmbodyTurnEngine._live_perception` evicts it as stale (task t13,
+#: issue #153/#155 spec claim c7). Mirrors :data:`reachy.cli._commands.agent.
+#: DEFAULT_CLIP_STALE_AFTER_S` (30.0) BY VALUE, not by import — the same
+#: reason :data:`DEFAULT_ATTENTION_WINDOW_S` is independently defined on each
+#: side of the composition-root boundary. The number is deliberately the
+#: SAME one, not a fresh guess: a snapshot's ``captured_at`` carries the
+#: clip's own monotonic ``ts``, which ``_ClipAsker.poll_once`` already
+#: refuses to ask about once it is this old, so re-checking it here — later,
+#: against the SAME clock family (``time.monotonic``, a host-wide counter
+#: comparable across processes on one host, never wall time) — is the
+#: identical staleness rule evaluated a second time, not a new one invented
+#: for persistence.
+DEFAULT_PERCEPTION_STALE_AFTER_S = 30.0
 #: DISTINCT ``(kind, goal)`` concerns the cognition-scope park holds at once
 #: (:meth:`EmbodyTurnEngine.submit_scope`). Small on purpose, and for the same
 #: reason the artifact expires in turns: a foreground voice steered by five
@@ -590,9 +655,63 @@ class Parked:
         return self.text if self.count == 1 else f"{self.text} (x{self.count})"
 
 
+@dataclass(frozen=True)
+class PerceptionSnapshot:
+    """One structured perception observation (issue #155, spec claim c7).
+
+    What the clip-asking senses lane
+    (:class:`~reachy.cli._commands.agent._ClipAsker`) produces INSTEAD of free
+    prose, closing issues #153/#154: a compact, typed artifact rather than
+    uncontrolled prompt text — the five fields issue #155 names for it.
+
+    ``summary`` is the one field every caller can always fill, even when the
+    senses model ignores the requested JSON shape (see
+    :func:`reachy.cli._commands.agent.parse_perception_answer`'s degrade
+    path, which falls back to the model's raw answer text) — the rest are a
+    best-effort extra, never a requirement for the observation to reach the
+    robot's context at all.
+
+    ``captured_at`` is a MONOTONIC timestamp (``time.monotonic()``, never
+    wall time — see the module docstring's freshness note) naming WHEN THE
+    FRAME WAS CAPTURED, not when this snapshot was built or submitted: the
+    production caller carries the runtime clip's own ``ts``
+    (``reachy/behavior/clip_rider.py``) straight through, so a snapshot that
+    sits unread in the park is judged by the true age of what it describes,
+    never by how recently the layer happened to hear about it. ``None`` means
+    "the caller did not know" — :meth:`EmbodyTurnEngine.submit_perception`
+    stamps its own clock at intake in that case, exactly as it already does
+    for a bare string.
+
+    ``frame_ref`` is the clip path the observation was drawn from — kept for
+    attribution/inspection (the journal, the export feed, a future consumer
+    that wants the actual frame), never rendered into the compact prose a
+    turn's context carries (see :meth:`render`).
+    """
+
+    summary: str
+    entities: tuple[str, ...] = ()
+    confidence: float | None = None
+    captured_at: float | None = None
+    frame_ref: str | None = None
+
+    def render(self) -> str:
+        """The compact one-line prose a turn's context shows for this snapshot.
+
+        ``frame_ref`` is deliberately absent: a file path narrated into the
+        model's prompt would cost tokens for no benefit the model can act on,
+        so it stays a structured field for attribution instead of prose.
+        """
+        parts = [self.summary]
+        if self.entities:
+            parts.append("entities: " + ", ".join(self.entities))
+        if self.confidence is not None:
+            parts.append(f"confidence={self.confidence:.2f}")
+        return "; ".join(parts)
+
+
 @dataclass
 class PerceptionSlot(Parked):
-    """One latest-wins CONTEXT slot for free-form perception text (issue #154).
+    """One latest-wins CONTEXT slot for structured perception (issue #154/#155).
 
     A subclass of :class:`Parked`, not a second copy: it reuses ``text`` /
     ``count`` and the same list :meth:`EmbodyTurnEngine._drain_context` reads,
@@ -600,6 +719,11 @@ class PerceptionSlot(Parked):
     entry it is holding. What differs is the KEY it lives under and how a
     later update behaves — both live in
     :meth:`EmbodyTurnEngine.submit_perception`, not here — and how it renders.
+    Since task t13 the slot also carries the full structured
+    :attr:`snapshot` (:class:`PerceptionSnapshot`); ``text`` is kept in sync
+    with ``snapshot.summary`` on every update so the generic :class:`Parked`
+    accounting (``coalesced-from``, the plain-string legacy path) needs no
+    branch of its own.
 
     Unlike :class:`Parked`'s exact-text coalescing (the SAME fact reported
     again), a slot coalesces on the IDENTITY OF ITS SOURCE, never on text: a
@@ -612,11 +736,40 @@ class PerceptionSlot(Parked):
     ``"... (updated x180)"`` here, never a bare ``"... (x180)"``, so a reader
     can tell "the 180th version of this fact" apart from "this exact fact
     recurred 180 times."
+
+    Also unlike :class:`Parked`, a slot does not live only until the next
+    turn drains it: :meth:`EmbodyTurnEngine._live_perception` keeps it PARKED
+    across turns until it is superseded (a later
+    :meth:`~EmbodyTurnEngine.submit_perception` for the same source) or STALE
+    (:meth:`is_stale`) — see the module docstring's "A state PERSISTS"
+    section for why that lifetime differs from the closed cue vocabulary's.
     """
 
+    snapshot: PerceptionSnapshot | None = None
+
     def render(self) -> str:
-        """``"<latest text> (updated x180)"`` — or the bare text on the first sighting."""
-        return self.text if self.count == 1 else f"{self.text} (updated x{self.count})"
+        """``"<latest snapshot> (updated x180)"`` — or the bare rendering on the first sighting."""
+        body = self.snapshot.render() if self.snapshot is not None else self.text
+        return body if self.count == 1 else f"{body} (updated x{self.count})"
+
+    def is_stale(self, now: float, *, stale_after_s: float) -> bool:
+        """Whether this slot's snapshot has gone stale (task t13, spec c7).
+
+        ``stale_after_s <= 0`` disables the bound entirely — the same
+        zero-disables convention :attr:`Limits.min_alert_interval_s` /
+        :attr:`Limits.attention_window_s` already use, so a park meant to
+        never expire (an operator choice, or a test with no clock to worry
+        about) is never tripped by a default nobody asked for. A slot with no
+        snapshot, or a snapshot with no known capture time, never expires
+        either: there is nothing to judge its age against, and that should
+        not happen once :meth:`~EmbodyTurnEngine.submit_perception` always
+        builds one — this stays defensive rather than assumed.
+        """
+        if self.snapshot is None or self.snapshot.captured_at is None:
+            return False
+        if stale_after_s <= 0.0:
+            return False
+        return (now - self.snapshot.captured_at) > stale_after_s
 
 
 # --------------------------------------------------------------------------- #
@@ -761,6 +914,12 @@ class Limits:
     #: is exactly the crowding-out defect (issue #154) this pair of bounds
     #: exists to close.
     max_perception_sources: int = DEFAULT_MAX_PERCEPTION_SOURCES
+    #: How long a persisted perception snapshot stays live before
+    #: :meth:`EmbodyTurnEngine._live_perception` evicts it as stale (task
+    #: t13, spec claim c7); ``<= 0`` disables the bound. See
+    #: :data:`DEFAULT_PERCEPTION_STALE_AFTER_S` for why this mirrors the clip
+    #: asker's own staleness bound by value rather than widening it.
+    perception_stale_after_s: float = DEFAULT_PERCEPTION_STALE_AFTER_S
     #: DISTINCT ``(kind, goal)`` concerns the cognition-scope park holds (see
     #: :meth:`EmbodyTurnEngine.submit_scope`) — a THIRD bound of its own, for
     #: the same reason the perception park has one: what the background mind is
@@ -1015,6 +1174,10 @@ class EmbodyTurnEngine:
         # vocabulary for the same distinct-fact budget.
         self._perception: dict[str, PerceptionSlot] = {}
         self._max_perception_sources = max(1, int(self._limits.max_perception_sources))
+        # Task t13: a persisted slot's own staleness bound, checked against
+        # THIS engine's ``_now`` — the one clock the layer already shares
+        # (see the ``self._attention`` comment just below).
+        self._perception_stale_after_s = max(0.0, float(self._limits.perception_stale_after_s))
         # A THIRD park, keyed on ``(kind, goal)`` and read by the FOREGROUND
         # lane rather than drained by a turn (spec claim c8): see
         # ``submit_scope``. Insertion-ordered, so the prompt reads back in the
@@ -1127,11 +1290,16 @@ class EmbodyTurnEngine:
                 accepted += self.submit_cue(cue)
         return accepted
 
-    def submit_perception(self, text: str, *, source: str = DEFAULT_PERCEPTION_SOURCE) -> bool:
-        """Offer one free-text perception update as CONTEXT. Latest-wins per *source*.
+    def submit_perception(
+        self,
+        snapshot: PerceptionSnapshot | str,
+        *,
+        source: str = DEFAULT_PERCEPTION_SOURCE,
+    ) -> bool:
+        """Offer one structured perception update as CONTEXT. Latest-wins per *source*.
 
         This is the escape hatch from :meth:`submit_cue`'s text-identity
-        coalescing, for a caller whose text has no fixed phrase to key on —
+        coalescing, for a caller whose content has no fixed phrase to key on —
         today, the senses lane's :meth:`ask` answering a clip question,
         polled by ``_ClipAsker`` roughly every 20 s (issue #139's h9). Two
         renderings of one room never share a key
@@ -1146,29 +1314,57 @@ class EmbodyTurnEngine:
         distinct text, so any number of updates from ONE source — however
         many different descriptions — occupies exactly one slot.
 
+        Accepts a full :class:`PerceptionSnapshot` (task t13, issue #155
+        c7 — the shape :class:`~reachy.cli._commands.agent._ClipAsker` now
+        produces) or a plain string, wrapped into a summary-only snapshot
+        stamped with THIS call's own clock reading — kept for every existing
+        caller that has no structure to give. A snapshot whose own
+        ``captured_at`` is ``None`` is stamped the same way; one that already
+        names a capture time (the clip's own monotonic ``ts``) keeps it,
+        because that is what lets :meth:`_live_perception` judge staleness
+        against when the FRAME was captured rather than when this call
+        happened to run.
+
         Always CONTEXT, never a TRIGGER, and there is no parameter to make it
         one: perception must never wake the mind on its own (mirrors
         :meth:`submit_cue`'s CONTEXT-by-default rationale, made structural
         rather than merely defaulted here). Like :meth:`_offer_context`, this
-        is O(1), safe from any thread, and never raises; an empty *text* is a
+        is O(1), safe from any thread, and never raises; a blank summary is a
         named, counted drop exactly as an empty cue is.
+
+        Unlike :meth:`_offer_context`, the returned slot is NOT drained by the
+        next turn that shows it — see :meth:`_live_perception` and the module
+        docstring's "A state PERSISTS" section for the lifetime this method's
+        park now has.
         """
-        cleaned = (text or "").strip()
-        if not cleaned:
-            self._drop(REASON_EMPTY_INPUT, "perception")
-            return False
+        if isinstance(snapshot, str):
+            cleaned = (snapshot or "").strip()
+            if not cleaned:
+                self._drop(REASON_EMPTY_INPUT, "perception")
+                return False
+            snapshot = PerceptionSnapshot(summary=cleaned, captured_at=self._now())
+        else:
+            cleaned = (snapshot.summary or "").strip()
+            if not cleaned:
+                self._drop(REASON_EMPTY_INPUT, "perception")
+                return False
+            captured_at = snapshot.captured_at if snapshot.captured_at is not None else self._now()
+            if cleaned != snapshot.summary or captured_at != snapshot.captured_at:
+                snapshot = replace(snapshot, summary=cleaned, captured_at=captured_at)
         with self._intake_lock:
             slot = self._perception.get(source)
             if slot is not None:
-                # Latest-wins: replace the text IN PLACE, but keep counting —
-                # the 180th update is still visible in ``coalesced-from``, it
-                # just never grows the dict (see ``PerceptionSlot.render``).
-                slot.text = cleaned
+                # Latest-wins: replace the snapshot IN PLACE, but keep
+                # counting — the 180th update is still visible in
+                # ``coalesced-from``, it just never grows the dict (see
+                # ``PerceptionSlot.render``).
+                slot.snapshot = snapshot
+                slot.text = snapshot.summary
                 slot.count += 1
                 return True
             distinct = len(self._perception)
             if distinct < self._max_perception_sources:
-                self._perception[source] = PerceptionSlot(text=cleaned)
+                self._perception[source] = PerceptionSlot(text=snapshot.summary, snapshot=snapshot)
                 return True
         self.dropped_inputs += 1
         self._drop(REASON_PERCEPTION_SOURCES_FULL, f"{distinct} perception sources parked")
@@ -1474,15 +1670,19 @@ class EmbodyTurnEngine:
 
     @property
     def parked(self) -> int:
-        """How many DISTINCT context facts the park is holding.
+        """How many DISTINCT, LIVE context facts the park is holding.
 
         Sums both coalescing keys: exact-text cue facts and latest-wins
         perception slots (:meth:`submit_perception`) are two separately
-        bounded dicts, but both are CONTEXT the next turn drains, so one count
-        describes the whole park to a caller that only cares "is there
-        anything parked".
+        bounded dicts, but both are CONTEXT, so one count describes the whole
+        park to a caller that only cares "is there anything parked". Since
+        task t13 the perception half is filtered through
+        :meth:`_live_perception`, exactly like :attr:`scopes`/
+        :attr:`wanted_to_say` filter their own park on read — a caller asking
+        "how much is parked" should never be told about a slot that has
+        already gone stale.
         """
-        return len(self._context) + len(self._perception)
+        return len(self._context) + len(self._live_perception())
 
     @property
     def last_text(self) -> str:
@@ -2033,26 +2233,70 @@ class EmbodyTurnEngine:
         return items
 
     def _drain_context(self) -> list[Parked]:
-        """Take the parked facts this turn will show, emptying BOTH parks.
+        """Take the parked facts this turn will show: DRAIN the cues, PEEK the perception.
 
-        Drained rather than snapshotted-and-kept: the park describes what has
-        happened SINCE the last turn, so carrying an entry forward would make
-        every later turn re-read the same background — the failure
-        :meth:`_drain_spoken` avoids one buffer over. This applies uniformly
-        to the two coalescing keys: exact-text cue facts (:attr:`_context`)
-        and latest-wins :class:`PerceptionSlot`\\ s (:attr:`_perception`) drain
-        together into one list, in that order, and both dicts empty. A slot
-        surviving un-drained until its NEXT update — so a turn between two
-        clip polls still sees the room — is deliberately not built here: this
-        module's contract is only that a flood of updates costs one slot, not
-        that the slot is FRESH between updates; that discipline is task t13's,
-        over the seam this method already leaves in place.
+        The two coalescing keys have different LIFETIMES since task t13, and
+        this method is where that split is made concrete. Exact-text cue
+        facts (:attr:`_context`) describe something that HAPPENED — a rule
+        fire, a face appearing — and a happening does not stay true, so they
+        are drained rather than snapshotted-and-kept: carrying one forward
+        would make every later turn re-read the same background, the failure
+        :meth:`_drain_spoken` avoids one buffer over. Latest-wins
+        :class:`PerceptionSlot`\\ s (:attr:`_perception`) describe a STATE —
+        "what the camera currently shows" — and a state stays true until it
+        is superseded or stale, so they are only PEEKED here
+        (:meth:`_live_perception`, which does the staleness eviction) and
+        never cleared by the act of being read: a turn between two 20 s clip
+        polls now sees the room exactly as the last poll described it,
+        closing issue #153's "asked what it can see, the robot says it
+        cannot" — instead of the old behaviour, where only the ONE turn that
+        happened to run right after a poll ever saw it.
         """
         with self._intake_lock:
-            taken = list(self._context.values()) + list(self._perception.values())
+            taken = list(self._context.values())
             self._context.clear()
-            self._perception.clear()
-        return taken
+        return taken + self._live_perception()
+
+    def _live_perception(self) -> list[PerceptionSlot]:
+        """The perception park's LIVE slots, evicting any that have gone stale.
+
+        Mirrors :attr:`scopes`/:attr:`wanted_to_say`: expiry is filtered on
+        READ rather than swept on a timer, so a caller never sees a stale
+        slot and the park stays bounded regardless. The clock and the bound
+        are :attr:`_now` and :attr:`_perception_stale_after_s` — the SAME
+        clock the alert interval and the attention gate already share, and
+        the SAME staleness rule :class:`~reachy.cli._commands.agent.
+        _ClipAsker` already applies once at ask time (see
+        :data:`DEFAULT_PERCEPTION_STALE_AFTER_S`), just re-checked here at
+        read time. Unlike a scope's turn-counted expiry, this is a genuine
+        elapsed-seconds check: a camera snapshot's staleness is about how
+        long ago the frame was captured, not how many turns have run since.
+
+        An evicted slot is a NAMED drop (:data:`REASON_PERCEPTION_STALE`) —
+        the removal from the dict IS the dedup: a source that goes stale
+        reports exactly once, because it cannot be found (and re-evicted)
+        again until a fresh :meth:`~EmbodyTurnEngine.submit_perception` call
+        re-populates it.
+        """
+        now = self._now()
+        evicted: list[tuple[str, float]] = []
+        with self._intake_lock:
+            fresh: dict[str, PerceptionSlot] = {}
+            for source, slot in self._perception.items():
+                if slot.is_stale(now, stale_after_s=self._perception_stale_after_s):
+                    captured_at = slot.snapshot.captured_at if slot.snapshot is not None else now
+                    evicted.append((source, now - captured_at))
+                    continue
+                fresh[source] = slot
+            if evicted:
+                self._perception = fresh
+            result = list(fresh.values())
+        for source, age in evicted:
+            self._drop(
+                REASON_PERCEPTION_STALE,
+                f"source={source} age={age:.1f}s > {self._perception_stale_after_s:g}s",
+            )
+        return result
 
     def _drain_spoken(self) -> list[str]:
         """Take the already-spoken lines this turn will carry, emptying the buffer.

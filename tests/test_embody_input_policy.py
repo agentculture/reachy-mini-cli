@@ -50,11 +50,14 @@ from reachy.embody import engine as engine_mod
 from reachy.embody.cues import ClassifiedCue, CueClass
 from reachy.embody.engine import (
     DEFAULT_MIN_ALERT_INTERVAL_S,
+    DEFAULT_PERCEPTION_STALE_AFTER_S,
     REASON_CONTEXT_PARK_FULL,
     REASON_INPUT_QUEUE_FULL,
     REASON_PERCEPTION_SOURCES_FULL,
+    REASON_PERCEPTION_STALE,
     EmbodyModels,
     EmbodyTurnEngine,
+    PerceptionSnapshot,
 )
 from reachy.export.exporter import ExportHook
 from reachy.speech.llm import TurnResult
@@ -659,6 +662,177 @@ def test_a_perception_replacement_is_visible_in_the_coalesced_accounting(caplog)
     assert (
         "kitchen, state 2 (updated x3)" in content
     ), "the model's own prompt shows the update mark"
+
+
+# =========================================================================== #
+# Structured snapshots, fresh and latest-wins (issue #155 c7/h6, task t13)    #
+# =========================================================================== #
+#
+# t3 built the latest-wins park and the ``PerceptionSlot`` coalescing key;
+# t13 closes the two seams t3 deliberately left open: the park entry is now a
+# structured ``PerceptionSnapshot`` (summary/entities/confidence/capture
+# time/frame ref) rather than bare text, and the slot PERSISTS across turns
+# until it is superseded or goes stale, instead of being drained by the one
+# turn that happened to run right after a poll. The closed-vocabulary cue
+# park above is untouched by any of this — every test in this section only
+# ever calls ``submit_perception``.
+
+
+def _snapshot(summary: str, *, clock: _Clock, **kwargs) -> PerceptionSnapshot:
+    """A convenience builder stamping ``captured_at`` from the test's own clock."""
+    kwargs.setdefault("captured_at", clock.now)
+    return PerceptionSnapshot(summary=summary, **kwargs)
+
+
+def test_a_structured_snapshot_carries_its_fields_into_the_turn() -> None:
+    """AC1: summary, entities and confidence all reach the model's context."""
+    clock = _Clock()
+    turn = _ScriptedTurn()
+    engine = _build(turn_fn=turn, now_fn=clock)
+    snapshot = _snapshot(
+        "a kitchen, someone at the counter",
+        clock=clock,
+        entities=("person", "counter"),
+        confidence=0.82,
+        frame_ref="/state/clip.mp4",
+    )
+
+    assert engine.submit_perception(snapshot) is True
+    engine.submit_utterance("what do you see?")
+    assert engine.run_turn() is True
+
+    content = turn.last_user_content
+    assert "a kitchen, someone at the counter" in content
+    assert "entities: person, counter" in content
+    assert "confidence=0.82" in content
+    assert "/state/clip.mp4" not in content, "the frame path is attribution, never narrated prose"
+
+
+def test_a_perception_snapshot_persists_across_multiple_turns_until_superseded() -> None:
+    """AC2's core: a turn between two clip polls still sees the room (closes #153)."""
+    clock = _Clock()
+    turn = _ScriptedTurn()
+    engine = _build(turn_fn=turn, now_fn=clock)
+    engine.submit_perception(_snapshot("a kitchen, empty", clock=clock))
+
+    engine.submit_utterance("first question")
+    assert engine.run_turn() is True
+    assert "a kitchen, empty" in turn.last_user_content, "the FIRST turn sees the snapshot"
+
+    # No new clip arrived — the OLD cue-park behaviour would have drained the
+    # slot on the first turn and left the second with nothing at all.
+    clock.advance(5.0)
+    engine.submit_utterance("second question")
+    assert engine.run_turn() is True
+    assert "a kitchen, empty" in turn.last_user_content, "the SECOND turn still sees it"
+
+    # A later poll supersedes it — the OLD text must never linger beside the new.
+    clock.advance(1.0)
+    engine.submit_perception(_snapshot("a kitchen, someone arrived", clock=clock))
+    engine.submit_utterance("third question")
+    assert engine.run_turn() is True
+    content = turn.last_user_content
+    assert "a kitchen, someone arrived" in content
+    assert "a kitchen, empty" not in content, "the superseded snapshot never lingers"
+
+
+def test_a_stale_perception_snapshot_expires_and_is_absent_from_the_next_turn(caplog) -> None:
+    """AC2's other half: a stale snapshot expires rather than lingers."""
+    clock = _Clock()
+    turn = _ScriptedTurn()
+    engine = _build(turn_fn=turn, now_fn=clock)
+    engine.submit_perception(_snapshot("a kitchen, empty", clock=clock))
+    assert engine.parked == 1
+
+    clock.advance(DEFAULT_PERCEPTION_STALE_AFTER_S + 1.0)
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        assert engine.parked == 0, "the stale slot is evicted on read, not merely hidden"
+    assert REASON_PERCEPTION_STALE in caplog.text
+
+    engine.submit_utterance("what do you see?")
+    assert engine.run_turn() is True
+    assert "a kitchen, empty" not in turn.last_user_content
+
+
+def test_a_perception_snapshot_within_the_freshness_window_survives_a_gap() -> None:
+    """The boundary case: a gap that has NOT yet crossed the staleness bound."""
+    clock = _Clock()
+    turn = _ScriptedTurn()
+    engine = _build(turn_fn=turn, now_fn=clock)
+    engine.submit_perception(_snapshot("a kitchen, empty", clock=clock))
+
+    clock.advance(DEFAULT_PERCEPTION_STALE_AFTER_S - 1.0)
+    engine.submit_utterance("what do you see?")
+    assert engine.run_turn() is True
+    assert "a kitchen, empty" in turn.last_user_content, "still fresh, one second inside the bound"
+
+
+def test_zero_disables_the_perception_staleness_bound() -> None:
+    """Mirrors ``min_alert_interval_s``/``attention_window_s``'s own zero-disables convention."""
+    clock = _Clock()
+    turn = _ScriptedTurn()
+    engine = _build(turn_fn=turn, now_fn=clock, perception_stale_after_s=0.0)
+    engine.submit_perception(_snapshot("a kitchen, empty", clock=clock))
+
+    clock.advance(DEFAULT_PERCEPTION_STALE_AFTER_S * 100)
+    engine.attention.note_addressed()  # re-open attention; this test is about PERCEPTION staleness
+    engine.submit_utterance("what do you see?")
+    assert engine.run_turn() is True
+    assert "a kitchen, empty" in turn.last_user_content
+
+
+def test_a_bare_string_is_still_accepted_and_never_expires() -> None:
+    """Backward compatibility: a caller with no structure to give still works.
+
+    A bare string is wrapped into a summary-only snapshot stamped with the
+    engine's OWN clock at intake, so it behaves exactly like every other
+    persisted snapshot — it is not a second, timeless code path.
+    """
+    clock = _Clock()
+    turn = _ScriptedTurn()
+    engine = _build(turn_fn=turn, now_fn=clock)
+    assert engine.submit_perception("a kitchen, empty") is True
+
+    engine.submit_utterance("first")
+    assert engine.run_turn() is True
+    assert "a kitchen, empty" in turn.last_user_content
+
+    clock.advance(5.0)
+    engine.submit_utterance("second")
+    assert engine.run_turn() is True
+    assert "a kitchen, empty" in turn.last_user_content, "a bare string persists too"
+
+
+def test_the_offline_what_can_you_see_flow_reads_the_latest_valid_snapshot() -> None:
+    """AC2, end to end: the mechanical shape of closing issue #153 offline.
+
+    Mirrors the exact defect t1 reproduced (asked what it can see with no
+    media/context attached, the senses model claimed blindness): here, the
+    WORKER lane's context is what a person's question reads, and it must
+    carry the room description from the latest snapshot the clip asker
+    parked — never nothing, and never a snapshot that has gone stale.
+    """
+    clock = _Clock()
+    turn = _ScriptedTurn()
+    engine = _build(turn_fn=turn, now_fn=clock)
+
+    # Two changed clip polls, exactly as ``_ClipAsker`` would submit them.
+    engine.submit_perception(_snapshot("a kitchen, someone is cooking", clock=clock))
+    clock.advance(20.0)
+    engine.submit_perception(_snapshot("a kitchen, someone is at the counter", clock=clock))
+
+    engine.submit_utterance("what can you see?")
+    assert engine.run_turn() is True
+    content = turn.last_user_content
+    assert "a kitchen, someone is at the counter" in content, "answers from the LATEST snapshot"
+    assert "a kitchen, someone is cooking" not in content, "the superseded one never lingers"
+
+    # The clip asker stops publishing (camera unplugged, process died, ...):
+    # the last snapshot must eventually stop being offered as current.
+    clock.advance(DEFAULT_PERCEPTION_STALE_AFTER_S + 1.0)
+    engine.submit_utterance("what can you see now?")
+    assert engine.run_turn() is True
+    assert "a kitchen" not in turn.last_user_content, "a stale snapshot expires, never lingers"
 
 
 # =========================================================================== #

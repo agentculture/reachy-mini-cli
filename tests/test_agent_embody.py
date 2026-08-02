@@ -1335,14 +1335,14 @@ class _FakeAskEngine:
     def __init__(self, ask_fn=None) -> None:
         self._ask_fn = ask_fn if ask_fn is not None else (lambda prompt, **kw: "")
         self.ask_calls: list[object] = []
-        self.submitted: list[tuple[str, object]] = []
+        self.perceptions: list[tuple[object, str]] = []
 
     def ask(self, prompt, **kwargs):
         self.ask_calls.append(prompt)
         return self._ask_fn(prompt, **kwargs)
 
-    def submit_cue(self, text: str, *, cue_class=None) -> bool:
-        self.submitted.append((text, cue_class))
+    def submit_perception(self, snapshot, *, source: str = "vision") -> bool:
+        self.perceptions.append((snapshot, source))
         return True
 
 
@@ -1397,7 +1397,7 @@ def test_a_missing_clip_block_is_a_named_drop_never_a_call_to_ask():
     asker.poll_once()
 
     assert engine.ask_calls == [], "no clip reference means nothing to ask about"
-    assert engine.submitted == []
+    assert engine.perceptions == []
     assert any(agent_mod.REASON_CLIP_UNAVAILABLE in t for t in sink.texts("thinking"))
 
 
@@ -1488,7 +1488,7 @@ def test_ask_raising_is_a_named_drop_never_a_raised_exception(tmp_path):
 
     asker.poll_once()  # must not raise
 
-    assert engine.submitted == [], "a failed ask must never reach context"
+    assert engine.perceptions == [], "a failed ask must never reach context"
     assert any(agent_mod.REASON_CLIP_ASK_FAILED in t for t in sink.texts("thinking"))
 
 
@@ -1504,28 +1504,117 @@ def test_an_empty_answer_is_a_named_drop_never_context(tmp_path):
 
     asker.poll_once()
 
-    assert engine.submitted == []
+    assert engine.perceptions == []
     assert any(agent_mod.REASON_CLIP_ASK_EMPTY in t for t in sink.texts("thinking"))
 
 
-def test_a_fresh_clip_reaches_ask_and_the_answer_lands_as_context(tmp_path):
+def test_a_fresh_clip_reaches_ask_and_the_unstructured_answer_degrades_to_a_summary(tmp_path):
+    """Task t13: a cheap model's free-text reply still lands as a snapshot, degraded and named."""
     clip = _clip_file(tmp_path)
     engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen, someone is cooking")
+    sink = _Sink()
     asker = agent_mod._ClipAsker(
-        engine, read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)}
+        engine,
+        read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)},
+        export=sink.hook(),
     )
 
     asker.poll_once()
 
     assert len(engine.ask_calls) == 1
     assert asker.asks == 1
-    assert engine.submitted, "the answer never reached the engine as context"
-    text, cue_class = engine.submitted[0]
-    assert "a kitchen" in text
+    assert engine.perceptions, "the answer never reached the engine as a snapshot"
+    snapshot, source = engine.perceptions[0]
+    assert snapshot.summary == "a kitchen, someone is cooking"
+    assert snapshot.entities == ()
+    assert snapshot.confidence is None
+    assert source == "vision"
+    assert any(agent_mod.REASON_CLIP_ANSWER_UNSTRUCTURED in t for t in sink.texts("thinking"))
 
-    from reachy.embody.cues import CueClass
 
-    assert cue_class is CueClass.CONTEXT, "the answer must land as CONTEXT, never a trigger"
+def test_a_fresh_clip_with_a_structured_json_answer_produces_a_full_snapshot(tmp_path):
+    """Task t13: when the senses lane follows the requested shape, every field lands."""
+    clip = _clip_file(tmp_path)
+    raw = (
+        '{"summary": "a kitchen, someone is cooking", '
+        '"entities": ["person", "stove"], "confidence": 0.87}'
+    )
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: raw)
+    ts = time.monotonic()
+    asker = agent_mod._ClipAsker(
+        engine, read_clip=lambda: {"available": True, "ts": ts, "path": str(clip)}
+    )
+
+    asker.poll_once()
+
+    assert engine.perceptions, "the answer never reached the engine as a snapshot"
+    snapshot, source = engine.perceptions[0]
+    assert snapshot.summary == "a kitchen, someone is cooking"
+    assert snapshot.entities == ("person", "stove")
+    assert snapshot.confidence == 0.87
+    assert snapshot.captured_at == ts, "the clip's OWN monotonic ts, never a re-stamp"
+    assert snapshot.frame_ref == str(clip)
+    assert source == "vision"
+
+
+# --------------------------------------------------------------------------- #
+# parse_perception_answer — the tolerant JSON extractor (task t13, spec c7)   #
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_perception_answer_extracts_a_well_formed_object():
+    parsed = agent_mod.parse_perception_answer(
+        '{"summary": "a kitchen", "entities": ["stove"], "confidence": 0.5}'
+    )
+    assert parsed == ("a kitchen", ("stove",), 0.5)
+
+
+def test_parse_perception_answer_is_tolerant_of_surrounding_prose():
+    """The senses lane is a cheap model — it will sometimes wrap the JSON in text."""
+    parsed = agent_mod.parse_perception_answer(
+        'Sure, here it is:\n```json\n{"summary": "a kitchen"}\n```\nHope that helps!'
+    )
+    assert parsed == ("a kitchen", (), None)
+
+
+def test_parse_perception_answer_returns_none_for_free_prose():
+    assert agent_mod.parse_perception_answer("I am in a kitchen, someone is cooking.") is None
+
+
+def test_parse_perception_answer_returns_none_for_a_blank_summary():
+    assert agent_mod.parse_perception_answer('{"summary": "   "}') is None
+
+
+def test_parse_perception_answer_returns_none_when_summary_is_missing():
+    assert agent_mod.parse_perception_answer('{"entities": ["a"], "confidence": 0.4}') is None
+
+
+def test_parse_perception_answer_drops_non_string_entities_without_failing():
+    parsed = agent_mod.parse_perception_answer(
+        '{"summary": "a kitchen", "entities": ["stove", null, 3, {"a": 1}, "  "]}'
+    )
+    assert parsed == ("a kitchen", ("stove", "3"), None)
+
+
+def test_parse_perception_answer_ignores_a_non_list_entities_value():
+    parsed = agent_mod.parse_perception_answer('{"summary": "a kitchen", "entities": "stove"}')
+    assert parsed == ("a kitchen", (), None)
+
+
+def test_parse_perception_answer_clamps_confidence_to_the_unit_interval():
+    assert agent_mod.parse_perception_answer('{"summary": "a", "confidence": 4.2}')[2] == 1.0
+    assert agent_mod.parse_perception_answer('{"summary": "a", "confidence": -1.0}')[2] == 0.0
+
+
+def test_parse_perception_answer_rejects_a_boolean_confidence():
+    """``json`` parses ``true``/``false`` as a ``bool``, an ``int`` subtype — never read as 0/1."""
+    parsed = agent_mod.parse_perception_answer('{"summary": "a", "confidence": true}')
+    assert parsed == ("a", (), None)
+
+
+def test_parse_perception_answer_ignores_a_non_numeric_confidence():
+    parsed = agent_mod.parse_perception_answer('{"summary": "a", "confidence": "very sure"}')
+    assert parsed == ("a", (), None)
 
 
 def test_ask_is_called_with_the_probed_multimodal_wire_shape(tmp_path):
@@ -1606,7 +1695,9 @@ def test_recovery_after_a_failure_reports_a_fresh_drop_on_the_next_one(tmp_path)
     """The dedup latch resets on success, so a LATER distinct failure still reports."""
     clip = _clip_file(tmp_path)
     state = {"ts": 1.0, "available": True}
-    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen")
+    # Well-formed JSON, so this poll degrades nothing — the recovery this
+    # test pins is about the FAILURE-mode dedup latch, not the parser.
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: '{"summary": "a kitchen"}')
     sink = _Sink()
 
     def _read():
