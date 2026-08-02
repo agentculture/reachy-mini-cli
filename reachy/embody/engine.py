@@ -879,7 +879,9 @@ class EmbodyTurnEngine:
     # The perception question (the senses lane)                          #
     # ------------------------------------------------------------------ #
 
-    def ask(self, prompt: str, *, role: str = ROLE_SENSES, system: str | None = None) -> str:
+    def ask(
+        self, prompt: str | list[dict], *, role: str = ROLE_SENSES, system: str | None = None
+    ) -> str:
         """Ask one tool-less streaming question and return the answer text.
 
         This is the ``senses`` lane: a cheap perception question (describe this
@@ -888,6 +890,20 @@ class EmbodyTurnEngine:
         why lobes-cli#161 (a tool call on a no-tools request returns
         ``content: null``) can cost at most an empty answer here and never a
         lost action. It emits no export block: the feed is about turns.
+
+        *prompt* is forwarded verbatim as the user message's ``content`` —
+        plain text, or an OpenAI-style multimodal content LIST (one ``text``
+        part plus one ``video_url`` data-URI part; see
+        :func:`reachy.cli._commands.agent.build_clip_question`, which builds
+        that shape and stays OUTSIDE this module on purpose — this engine
+        reads no file, per its own model-config claim machine-checked in
+        ``tests/test_embody_engine.py``). No branching lives here: the OpenAI
+        wire contract already accepts an arbitrary ``content`` list, and
+        ``docs/evidence/2026-08-01-probe-video-wire-format.md`` (task t2)
+        confirmed the deployed gateway decodes it correctly, streamed — so
+        carrying a clip needed no change to this method beyond the type hint.
+        The first real caller is the layer's clip poller (issue #139's h9:
+        :class:`reachy.cli._commands.agent._ClipAsker`).
         """
         messages = [{"role": "system", "content": system}] if system else []
         messages.append({"role": "user", "content": prompt})
