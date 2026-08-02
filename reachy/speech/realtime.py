@@ -888,21 +888,46 @@ def _ws_pump_frames(
             _fin, opcode, payload = wire.read_frame(reader.recv_exact)
         except wire.FrameReadError as err:
             raise _SessionLost(REASON_STREAM_CLOSED, str(err)) from err
-        if opcode == wire.OPCODE_TEXT:
-            event = wire.decode_event(payload)
-            if event is None:
-                state.drop(REASON_MALFORMED_EVENT, f"{len(payload)} bytes")
-            else:
-                on_event(event)
-        elif opcode == wire.OPCODE_PING:
-            _ws_send(socket_of(), wire.OPCODE_PONG, payload)
-            state.note_pong()
-        elif opcode == wire.OPCODE_PONG:
-            logger.debug("%s: pong received", state.stage)
-        elif opcode == wire.OPCODE_CLOSE:
-            raise _SessionLost(REASON_STREAM_CLOSED, "server closed the session")
+        _ws_dispatch_frame(
+            opcode=opcode,
+            payload=payload,
+            socket_of=socket_of,
+            on_event=on_event,
+            state=state,
+        )
+
+
+def _ws_dispatch_frame(
+    *,
+    opcode: int,
+    payload: bytes,
+    socket_of: Callable[[], "socket.socket | None"],
+    on_event: Callable[[dict], None],
+    state: _SessionState,
+) -> None:
+    """Act on ONE decoded frame. Split from the read loop above for readability.
+
+    Kept a free function rather than a closure so the opcode policy is testable
+    on its own and so the loop reads as "read a frame, act on it" — the two
+    concerns Sonar's complexity warning was really pointing at.
+    """
+    if opcode == wire.OPCODE_TEXT:
+        event = wire.decode_event(payload)
+        if event is None:
+            state.drop(REASON_MALFORMED_EVENT, f"{len(payload)} bytes")
         else:
-            logger.debug("%s: ignoring unexpected opcode 0x%x", state.stage, opcode)
+            on_event(event)
+    elif opcode == wire.OPCODE_PING:
+        # uvicorn pings roughly every 20 s and disconnects a client that stays
+        # quiet, so the PONG is keepalive, not politeness.
+        _ws_send(socket_of(), wire.OPCODE_PONG, payload)
+        state.note_pong()
+    elif opcode == wire.OPCODE_PONG:
+        logger.debug("%s: pong received", state.stage)
+    elif opcode == wire.OPCODE_CLOSE:
+        raise _SessionLost(REASON_STREAM_CLOSED, "server closed the session")
+    else:
+        logger.debug("%s: ignoring unexpected opcode 0x%x", state.stage, opcode)
 
 
 def _ws_attempt_connect(

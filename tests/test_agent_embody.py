@@ -1202,8 +1202,12 @@ def test_an_unknown_media_profile_is_a_clean_user_error():
     from reachy.cli._errors import EXIT_USER_ERROR
 
     args = _parse("--media-profile=submarine")
+    # `iter(())` is hoisted out of the block so the ONLY call inside it is the
+    # one under test — otherwise the assertion could be satisfied by the wrong
+    # invocation raising (Sonar S5778).
+    empty_lines = iter(())
     with pytest.raises(CliError) as excinfo:
-        agent_mod._compose_embody_seam(args, export=None, lines=iter(()))
+        agent_mod._compose_embody_seam(args, export=None, lines=empty_lines)
     assert excinfo.value.code == EXIT_USER_ERROR
 
 
