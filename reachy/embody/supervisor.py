@@ -26,42 +26,52 @@ sibling supervisor's shape almost suggests them:
   any) then starts a fresh one, so an operator picks up new code/flags with
   one command.
 
-Own process-management mechanics (PID-file write/read, detached spawn,
-signal-based stop, PID-reuse guard) are kept self-contained here, exactly as
-every sibling supervisor keeps its own — a change to one noun's supervisor can
-never reach another's.
+Process-management mechanics (PID-file write/read, detached spawn,
+signal-based stop, PID-reuse guard) are NOT re-implemented here: they live once
+in :mod:`reachy.procsup`, which every sibling supervisor also cites. What stays
+in this module is only what is genuinely the layer's — its PID/log filenames,
+its spawn argv, its wording, and the two structural choices called out above.
+(This module was where the exact-argv-token PID guard was first written; issue
+#136 was the other three supervisors still carrying the substring form, which
+is what moving it into :mod:`reachy.procsup` fixes for good.)
 
-Pure standard library (``subprocess`` / ``signal`` / ``os``). This is the one
-module under :mod:`reachy.embody` that is EXEMPT from the layer's own
-"no shell reachable" claim (``tests/test_embody_redteam.py``): it is the
-OPERATOR's own control plane for the layer PROCESS (what a human runs from a
-terminal), never part of the tool-dispatch action surface an utterance can
-reach — nothing in :mod:`reachy.embody.tools` / ``.engine`` / ``.cues`` /
-``.media`` imports this module, and the redteam suite pins that unreachability
-by name. Reusing :func:`reachy.daemon.state_dir` / :func:`reachy.daemon.is_alive`
-(exactly as every sibling supervisor does) also means this module names
+Pure standard library (``subprocess`` / ``signal`` / ``os``, the latter two via
+:mod:`reachy.procsup`). This is the one module under :mod:`reachy.embody` that
+is EXEMPT from the layer's own "no shell reachable" claim
+(``tests/test_embody_redteam.py``): it is the OPERATOR's own control plane for
+the layer PROCESS (what a human runs from a terminal), never part of the
+tool-dispatch action surface an utterance can reach — nothing in
+:mod:`reachy.embody.tools` / ``.engine`` / ``.cues`` / ``.media`` imports this
+module, and the redteam suite pins that unreachability by name. Reusing
+:func:`reachy.daemon.state_dir` / :func:`reachy.daemon.is_alive` (exactly as
+every sibling supervisor does) also means this module names
 :mod:`reachy.daemon` directly, the other half of that same exemption.
 """
 
 from __future__ import annotations
 
-import os
-import signal
-import subprocess  # nosec B404 - only ever re-spawns this trusted CLI (sys.executable -m reachy)
 import sys
-import time
 from pathlib import Path
 
-from reachy.cli._errors import EXIT_ENV_ERROR, CliError
+from reachy import procsup
 from reachy.daemon import is_alive, state_dir
 
-# Grace window after spawning before we trust the layer came up (vs crashed).
-_START_GRACE = 0.4
-# Seconds to wait after SIGTERM before escalating to SIGKILL.
+# Seconds to wait after SIGTERM before escalating to SIGKILL. Owned per
+# supervisor (and mirrored by VALUE in reachy.cli._commands.agent) rather than
+# shared: it is an operator-facing default, not a mechanic.
 DEFAULT_STOP_TIMEOUT = 10.0
-# How finely _wait_gone polls for the process to exit.
-_SLEEP_SLICE = 0.25
-_STATUS_NOT_RUNNING = "not running"
+
+# The exact argv tokens the spawn line below carries — see
+# reachy.procsup.has_argv_tokens for why this is a token set and not a substring.
+_IDENTITY_TOKENS = ("reachy", "embody")
+
+_LABELS = procsup.ProcessLabels(
+    tracked="embody",
+    launch="the embodiment layer",
+    exited="embody",
+    reused="an embody layer",
+    signalled="embody",
+)
 
 # Mirrors reachy.cli._commands.agent.DEFAULT_TURN_INTERVAL by VALUE, not by
 # import: a library module under reachy/embody/ must never import a CLI
@@ -83,61 +93,24 @@ def log_file() -> Path:
 
 def read_pid() -> int | None:
     """Return the tracked PID, or ``None`` if the file is absent or unparseable."""
-    try:
-        text = pid_file().read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
-
-
-def _clear_pid() -> None:
-    try:
-        pid_file().unlink()
-    except FileNotFoundError:
-        pass
+    return procsup.read_pid(pid_file())
 
 
 def _wait_gone(pid: int, timeout: float) -> bool:
     """Poll until ``pid`` is gone or ``timeout`` elapses."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not is_alive(pid):
-            return True
-        time.sleep(_SLEEP_SLICE)
-    return not is_alive(pid)
+    return procsup.poll_until_gone(pid, timeout, is_alive=is_alive)
 
 
 def _is_our_process(pid: int) -> bool:
     """Best-effort guard against PID reuse: is ``pid`` actually an embody layer?
 
-    Reads ``/proc/<pid>/cmdline`` on Linux (the spawn line is ``<python> -m
-    reachy agent embody ...``, so ``reachy`` and ``embody`` each appear as
-    their OWN argv element). If ``/proc`` is unavailable we cannot verify, so
-    we trust the pid file. If ``/proc`` exists but the process is gone or
-    clearly isn't ours, return False so :func:`stop` never signals an
-    unrelated pid — this is the ONE guard that makes "kill ONLY the layer"
-    true under PID reuse.
-
-    Matched as EXACT argv tokens, not a substring scan over the raw joined
-    cmdline (what the sibling sleep/vision/behavior supervisors do): the
-    interpreter path itself (argv[0]) commonly contains substrings like
-    ``reachy`` or ``embody`` merely because of where the checkout/venv lives —
-    this very worktree is ``.../embody-t12/.venv/bin/python3`` — which a
-    substring scan would misread as "this is an embody layer" for ANY process
-    that interpreter runs, not only a real one. Exact-token matching only
-    a real ``... agent embody ...`` spawn line.
+    The spawn line is ``<python> -m reachy agent embody ...``, so ``reachy`` and
+    ``embody`` each appear as their OWN argv element — see
+    :data:`_IDENTITY_TOKENS` and :func:`reachy.procsup.has_argv_tokens` for the
+    exact-token rule and why a substring scan (issue #136) could never do this
+    job.
     """
-    if not Path("/proc").is_dir():
-        return True
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return False
-    tokens = {tok.decode("utf-8", "replace") for tok in raw.split(b"\x00") if tok}
-    return "reachy" in tokens and "embody" in tokens
+    return procsup.has_argv_tokens(pid, _IDENTITY_TOKENS)
 
 
 def build_run_command(
@@ -207,11 +180,7 @@ def start(
     """
     existing = read_pid()
     if existing is not None and is_alive(existing):
-        return {
-            "status": "already-running",
-            "pid": existing,
-            "log": str(log_file()),
-        }
+        return procsup.already_running(existing, log_path=log_file())
 
     cmd = build_run_command(
         feed=feed,
@@ -221,39 +190,16 @@ def start(
         turn_interval=turn_interval,
         mute_during_playback=mute_during_playback,
     )
-    log_path = log_file()
-    try:
-        with open(log_path, "ab") as logf:
-            proc = subprocess.Popen(  # nosec B603 - trusted argv (this CLI), no shell
-                cmd,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-    except OSError as err:
-        raise CliError(
-            code=EXIT_ENV_ERROR,
-            message=f"failed to launch the embodiment layer ({cmd[0]}): {err}",
-            remediation="check the Python interpreter is usable and the state dir is writable",
-        ) from err
-    pid_file().write_text(str(proc.pid), encoding="utf-8")
-
-    time.sleep(_START_GRACE)
-    result: dict[str, object] = {
-        "status": "started",
-        "pid": proc.pid,
-        "log": str(log_path),
-    }
-    if proc.poll() is not None:
-        # Exited within the grace window — startup failed (e.g. a bad flag, an
-        # unreadable --feed path). Clear the pid file we just wrote so
-        # status/stop don't report a stale pid.
-        _clear_pid()
-        result["status"] = "exited"
-        result["exit_code"] = proc.returncode
-        result["note"] = f"embody exited during startup; see {log_path}"
-    return result
+    # clear_pid_on_exit: a layer that dies in the grace window (a bad flag, an
+    # unreadable --feed path) must not leave a pid file behind for status/stop
+    # to report as stale.
+    return procsup.spawn_tracked(
+        cmd=cmd,
+        pid_path=pid_file(),
+        log_path=log_file(),
+        labels=_LABELS,
+        clear_pid_on_exit=True,
+    )
 
 
 def stop(*, timeout: float = DEFAULT_STOP_TIMEOUT) -> dict[str, object]:
@@ -265,48 +211,14 @@ def stop(*, timeout: float = DEFAULT_STOP_TIMEOUT) -> dict[str, object]:
     runtime/daemon process (or anything else on the box) is untouched by
     construction, not merely by convention.
     """
-    pid = read_pid()
-    if pid is None:
-        return {"status": _STATUS_NOT_RUNNING, "note": "no tracked embody pid"}
-    if not is_alive(pid):
-        _clear_pid()
-        return {"status": _STATUS_NOT_RUNNING, "pid": pid, "note": "stale pid cleared"}
-    if not _is_our_process(pid):
-        _clear_pid()
-        return {
-            "status": _STATUS_NOT_RUNNING,
-            "pid": pid,
-            "note": "tracked pid is no longer an embody layer (reused); left untouched",
-        }
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        _clear_pid()
-        return {"status": _STATUS_NOT_RUNNING, "pid": pid, "note": "process already gone"}
-    except PermissionError as err:
-        raise CliError(
-            code=EXIT_ENV_ERROR,
-            message=f"not permitted to stop embody pid {pid}",
-            remediation="stop it as the owning user",
-        ) from err
-    signaled = "SIGTERM"
-    gone = _wait_gone(pid, timeout)
-    if not gone:
-        try:
-            os.kill(pid, signal.SIGKILL)
-            signaled = "SIGKILL"
-        except ProcessLookupError:
-            gone = True
-        if not gone:
-            gone = _wait_gone(pid, 2.0)
-    if not gone:
-        raise CliError(
-            code=EXIT_ENV_ERROR,
-            message=f"failed to stop embody pid {pid}: still alive after SIGKILL",
-            remediation="inspect and terminate the process manually",
-        )
-    _clear_pid()
-    return {"status": "stopped", "pid": pid, "signal": signaled}
+    return procsup.stop_tracked(
+        pid_path=pid_file(),
+        labels=_LABELS,
+        timeout=timeout,
+        is_alive=is_alive,
+        is_ours=_is_our_process,
+        wait_gone=_wait_gone,
+    )
 
 
 def restart(**start_kwargs) -> dict[str, object]:
@@ -320,14 +232,8 @@ def restart(**start_kwargs) -> dict[str, object]:
 def status() -> dict[str, object]:
     """Report the embody layer's process state (PID + liveness)."""
     pid = read_pid()
-    if pid is None:
-        process = "stopped"
-    elif is_alive(pid):
-        process = "running"
-    else:
-        process = "stale"  # pid file points at a dead process
     return {
-        "process": process,
+        "process": procsup.process_state(pid, is_alive=is_alive),
         "pid": pid,
         "log": str(log_file()),
     }

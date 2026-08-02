@@ -90,7 +90,23 @@ _DYNAMIC_EXECUTION = frozenset({"eval", "exec", "compile", "__import__"})
 #: half of this exemption: a machine-checked proof that nothing on the
 #: tool-dispatch path (``tools.py`` / ``engine.py`` / ``cues.py`` / ``media.py``)
 #: ever imports it.
-_ALLOWED_PROCESS_SPAWNERS = frozenset({"reachy.daemon", "reachy.embody.supervisor"})
+#:
+#: ``reachy.procsup`` is the third entry and is the SAME exemption one level
+#: down: it is the single owner of the tracked-background-process mechanics
+#: every supervisor cites (issue #136 — the PID-identity guard used to be
+#: duplicated four ways and was therefore fixed in only one), so it owns
+#: ``subprocess`` on the supervisors' behalf. It enters the layer's closure
+#: through exactly ONE edge — ``reachy.embody.supervisor``, already exempt above
+#: — and ``test_the_supervisor_is_not_reachable_from_any_tool_surface`` proves
+#: it too is unreachable from any tool surface.
+_ALLOWED_PROCESS_SPAWNERS = frozenset(
+    {"reachy.daemon", "reachy.embody.supervisor", "reachy.procsup"}
+)
+
+#: The process-spawning modules whose exemption rests on being the OPERATOR's
+#: control plane rather than tool-dispatch surface — the names the reachability
+#: test below proves no tool-surface module can import.
+_UNREACHABLE_FROM_TOOLS = ("reachy.embody.supervisor", "reachy.procsup")
 
 #: The one layer module that is the OPERATOR CONTROL PLANE rather than part of
 #: the tool-dispatch action surface an utterance can reach — see
@@ -232,16 +248,21 @@ def test_the_supervisor_is_not_reachable_from_any_tool_surface() -> None:
     machine-checked fact rather than an unenforced comment: nothing on the
     tool-dispatch surface (``tools.py`` / ``engine.py`` / ``cues.py`` /
     ``media.py`` / ``__init__.py``) may import it.
+
+    ``reachy.procsup`` — the shared owner of the process mechanics the
+    supervisor delegates to — is held to the same bar, so the allow-list entry
+    it needs is a proven claim rather than a widening.
     """
     modules = _repo_modules()
     offenders = sorted(
-        dotted
+        (dotted, name)
         for dotted, path in _tool_surface_modules().items()
-        if "reachy.embody.supervisor" in _imported_names(modules[dotted], dotted)
+        for name in _UNREACHABLE_FROM_TOOLS
+        if name in _imported_names(modules[dotted], dotted)
     )
     assert not offenders, (
-        f"the tool-dispatch surface can reach the supervisor: {offenders} — "
-        "the control plane must stay unreachable from any tool call"
+        f"the tool-dispatch surface can reach the control plane: {offenders} — "
+        "it must stay unreachable from any tool call"
     )
 
 
