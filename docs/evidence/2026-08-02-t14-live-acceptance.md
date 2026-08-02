@@ -96,7 +96,50 @@ admitted and applied them** — from the runtime's own journal, not the layer's:
 
 Direct-operation action classes verified end to end on hardware: **`speak`**
 (2.8 s of audio out), **`run_behavior`** (nod ×4, admitted), **`goto`**
-(×2, antennas + head). Not exercised this session: `harmonics`, `create_rule`.
+(×2, antennas + head).
+
+### `create_rule` — the layer taught the robot a standing reaction ✅
+
+Verified separately, later the same day, by dispatching the tool against the
+**live** runtime (mechanics, not model choice — the model's *decision* to reach
+for it is a prompt-quality question and is not what this proves):
+
+```json
+{"ok": true, "id": "embody-pat-thanks",
+ "path": "…/behavior/rules.toml", "rules": ["embody-pat-thanks"],
+ "reload": {"ok": true, "react": 3, "inhibit": 0}}
+```
+
+The runtime's own journal confirms it took the rule live:
+
+```text
+[SENSE stage=rule source=rules] reload applied path=…/rules.toml react=3 inhibit=0
+```
+
+...and the file now carries it inside the managed block, namespaced:
+
+```toml
+# >>> embody-managed rules (embody-*) - written by the embodiment layer >>>
+[[react]]
+id = "embody-pat-thanks"
+when = { field = "pat", op = "is_true" }
+run = "nod"
+duration_s = 2.0
+say = "thank you for the pat"
+```
+
+The containment held on the way in: the first attempt used `pat_event`, which is
+a *cue* name and not a sense field, and was **refused fail-closed** —
+`rule-refused … use one of: doa, face, frame_available, pat, rms, rms_ratio,
+self_moving, speech, transcript`. A malformed rule never reached the file.
+
+This is the h26 contract made concrete: the rule is on disk and reloaded, so it
+keeps firing with the layer switched off. **The rule was deliberately left in
+place** on this box as a live demonstration — patting Reachy's head should now
+produce a nod and "thank you for the pat". Remove it by deleting the managed
+block if it is not wanted.
+
+Still not exercised live: **`harmonics`**.
 
 ### The browser harness side ✅ (partially)
 
@@ -119,13 +162,24 @@ Microphone permission was granted and capture confirmed at the OS level
 Both sides were individually live — Reachy spoke aloud; the browser held an
 armed session with a working mic — but they never entered a loop.
 
-The blocking mechanism is concrete: with **one** audio output device, the
-browser holds a PipeWire playback stream on Reachy's speaker for the whole
-session, and that stream could not be evicted (`pactl kill-sink-input` left it
-in place, `paplay` then failed with `Stream error: Timeout`). So the room could
-not be seeded with a spoken prompt while the browser was connected, and the one
-utterance Reachy did transcribe (5 characters) was ambient noise, not the
-browser.
+The blocking mechanism is concrete, and it is deeper than the browser. There is
+**one** audio output on this box and the runtime owns it: `/dev/snd/pcmC2D0p` is
+held by `reachy-mini-daemon` and the runtime process together (they share it
+through the `reachymini_audio_sink` ALSA plugin). A third client — PipeWire —
+cannot start the device while they hold it, so its sink sits `SUSPENDED` and
+`paplay` fails with `Stream error: Timeout`. The browser hits the same wall from
+the other side: it holds a PipeWire playback stream that cannot be evicted
+(`pactl kill-sink-input` leaves it in place).
+
+An earlier `paplay` in this session *did* work — that was a window after a
+runtime restart, before the device was re-held, which is what made the AEC
+measurement above possible at all. So the room cannot be reliably seeded with a
+spoken prompt while the runtime is up, and the one utterance Reachy transcribed
+(5 characters) was ambient noise, not the browser.
+
+This is not a software defect and has no code fix: two conversational parties
+need two output devices. Tracked with setup instructions and pass/fail criteria
+in issue #139.
 
 The C270 webcam also exposes **only** a `pro-audio` profile, which the browser
 did not open; capture only worked after switching the default source to the
