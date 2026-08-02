@@ -33,12 +33,14 @@ import copy
 import dataclasses
 import inspect
 import json
+import logging
 import os
 from pathlib import Path
 
 import pytest
 
 from reachy.behavior.goto_intent import GOTO
+from reachy.behavior.rules import MAX_SAY_CHARS
 from reachy.embody import engine as engine_mod
 from reachy.embody.cues import CueClass
 from reachy.embody.engine import (
@@ -60,6 +62,10 @@ from reachy.embody.engine import (
     EmbodyTurnEngine,
     first_emoji,
     resolve_attention_window_s,
+)
+from reachy.embody.interjection import (
+    DEFAULT_WANTED_TO_SAY_EXPIRY_TURNS,
+    REFUSAL_WANTED_TO_SAY_TOO_LONG,
 )
 from reachy.embody.tools import CREATE_RULE, REFUSAL_RULE_NAMESPACE, SPEAK, EmbodyToolRegistry
 from reachy.export.exporter import ExportHook
@@ -1212,3 +1218,230 @@ def test_an_empty_summary_update_is_a_named_drop_not_a_silent_clear(caplog) -> N
 def test_summary_reasons_are_in_the_shared_drop_vocabulary() -> None:
     assert REASON_SUMMARY_STALE in DROP_REASONS
     assert REASON_SUMMARY_TOO_LONG in DROP_REASONS
+
+
+# =========================================================================== #
+# t7 — the said/unsaid record and the wanted-to-say artifact                   #
+# (spec claims c34/c39/c41, honesty h22/h24/h26)                              #
+# =========================================================================== #
+
+_CUT_TEXT = "one two three four five six"
+_CUT_SAID = "one two"
+_CUT_UNSAID = "three four five six"
+
+
+@dataclasses.dataclass(frozen=True)
+class _StubSplit:
+    """The four fields the engine reads — the duck type, without the wire.
+
+    The engine takes the split as a structural type on purpose (it must not
+    import the WebSocket client to record what its own mouth did), so most of
+    these tests hand it this stub; the one test about the JOIN hands it the
+    real :class:`~reachy.speech.realtime_duplex.SpokenSplit`.
+    """
+
+    response_id: str
+    text: str
+    said: str
+    unsaid: str
+
+
+def _split(
+    said: str = _CUT_SAID,
+    unsaid: str = _CUT_UNSAID,
+    *,
+    text: str = _CUT_TEXT,
+    response_id: str = "resp_cut",
+) -> _StubSplit:
+    return _StubSplit(response_id=response_id, text=text, said=said, unsaid=unsaid)
+
+
+def _last_user(turn: ScriptedTurn) -> str:
+    return turn.last_messages()[-1]["content"]
+
+
+def test_t7_a_cut_reply_records_only_the_measured_said_portion_as_spoken() -> None:
+    """c34: the mind learns exactly what the room got, never the whole reply."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    engine.note_interrupted_reply(_split())
+    engine.submit_utterance("sorry, go on")
+    engine.run_turn()
+
+    said_section = _last_user(turn)
+    assert f'"{_CUT_SAID}"' in said_section
+    assert f'"{_CUT_TEXT}"' not in said_section, "the unspoken remainder was recorded as said"
+
+
+def test_t7_the_unsaid_remainder_is_readable_by_the_next_turn() -> None:
+    """h22: the remainder is kept so the mind can decide whether it still matters."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    artifact = engine.note_interrupted_reply(_split())
+    assert artifact is not None
+    engine.submit_utterance("what were you saying?")
+    engine.run_turn()
+
+    assert artifact.render() in _last_user(turn)
+    assert _CUT_UNSAID in _last_user(turn)
+
+
+def test_t7_the_remainder_is_attributed_to_the_interrupted_response() -> None:
+    engine = _build()
+    artifact = engine.note_interrupted_reply(_split())
+
+    assert artifact is not None
+    assert artifact.response_id == "resp_cut"
+    assert artifact.text == _CUT_UNSAID
+    assert engine.wanted_to_say == (artifact,)
+
+
+def test_t7_the_remainder_never_triggers_a_turn() -> None:
+    """The robot never wakes itself up to finish an old sentence (c43)."""
+    engine = _build()
+    engine.note_interrupted_reply(_split())
+
+    assert engine.pending == 0
+    assert engine.parked == 1
+    assert engine.run_turn() is False
+
+
+def test_t7_a_cut_after_the_reply_was_recorded_whole_corrects_the_record() -> None:
+    """The ordering phase 1 actually produces: ``response.done`` first, cut second.
+
+    The wire delivers a reply seconds ahead of the speaker, so the human who
+    interjects over the tail does it long after ``on_response`` fired. The
+    record must end up describing the room, not the wire.
+    """
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    engine.note_spoken(_CUT_TEXT)
+    engine.note_interrupted_reply(_split())
+    engine.submit_utterance("sorry, carry on")
+    engine.run_turn()
+
+    content = _last_user(turn)
+    assert f'"{_CUT_SAID}"' in content
+    assert f'"{_CUT_TEXT}"' not in content
+    assert content.count("I have already said out loud") == 1
+
+
+def test_t7_a_reply_cut_before_a_word_was_heard_is_never_recorded_as_spoken() -> None:
+    """Nothing measured means nothing said — the donor's own load-bearing guard."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    artifact = engine.note_interrupted_reply(_split(said="", unsaid=_CUT_TEXT))
+    engine.submit_utterance("hello?")
+    engine.run_turn()
+
+    assert artifact is not None and artifact.text == _CUT_TEXT
+    assert "I have already said out loud" not in _last_user(turn)
+    assert artifact.render() in _last_user(turn)
+
+
+def test_t7_an_over_long_remainder_is_a_named_drop_and_the_said_half_still_stands(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Refused, never truncated (t5's rule) — and never silently."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        artifact = engine.note_interrupted_reply(
+            _split(said="here we go", unsaid="a" * (MAX_SAY_CHARS + 1))
+        )
+
+    assert artifact is None
+    assert REFUSAL_WANTED_TO_SAY_TOO_LONG in caplog.text
+    engine.submit_utterance("go on")
+    engine.run_turn()
+    assert '"here we go"' in _last_user(turn)
+
+
+def test_t7_the_canonical_record_of_remainders_is_bounded_and_expires() -> None:
+    """c43: bounded and expiring, so a stale sentence cannot shape a later turn."""
+    engine = _build(wanted_to_say_maxlen=2)
+    for index in range(4):
+        engine.note_interrupted_reply(_split(unsaid=f"remainder {index}"))
+
+    assert len(engine.wanted_to_say) == 2
+    assert [artifact.text for artifact in engine.wanted_to_say] == ["remainder 2", "remainder 3"]
+
+    for _ in range(DEFAULT_WANTED_TO_SAY_EXPIRY_TURNS + 1):
+        engine.submit_utterance("keep talking")
+        engine.run_turn()
+    assert engine.wanted_to_say == ()
+
+
+def test_t7_the_layers_record_makes_no_claim_the_server_matches() -> None:
+    """h24: the divergence is knowing and bounded, and the docstring says so."""
+    doc = EmbodyTurnEngine.note_interrupted_reply.__doc__ or ""
+
+    assert "server" in doc.lower()
+    assert "overstate" in doc.lower()
+    engine = _build()
+    engine.note_interrupted_reply(_split())
+    # Nothing in the canonical record asserts anything about the floor: the
+    # said half is the measured prefix and the unsaid half is an artifact.
+    assert [artifact.text for artifact in engine.wanted_to_say] == [_CUT_UNSAID]
+    assert engine.replies_cut == 1
+
+
+def test_t7_the_engine_consumes_the_real_duplex_split_type() -> None:
+    """The join, unmocked: the wire's own dataclass satisfies the engine's seam."""
+    from reachy.speech.realtime_duplex import PlaybackProgress, split_spoken
+
+    engine = _build()
+    split = split_spoken(
+        _CUT_TEXT,
+        PlaybackProgress(
+            response_id="resp_cut",
+            queued_bytes=48,
+            played_bytes=16,
+            in_flight_bytes=0,
+            skipped_bytes=32,
+            cancelled=True,
+            total_bytes=48,
+        ),
+    )
+
+    assert (split.said, split.unsaid) == (_CUT_SAID, _CUT_UNSAID)
+    artifact = engine.note_interrupted_reply(split)
+    assert artifact is not None and artifact.response_id == "resp_cut"
+
+
+def test_t7_a_reply_that_played_whole_is_recorded_exactly_as_before() -> None:
+    """No cut, no artifact: the ordinary path is untouched."""
+    engine = _build()
+    artifact = engine.note_interrupted_reply(_split(said=_CUT_TEXT, unsaid=""))
+
+    assert artifact is None
+    assert engine.wanted_to_say == ()
+    assert engine.parked == 0
+
+
+def test_t7_a_cut_that_heard_nothing_removes_the_record_it_had_already_made() -> None:
+    """The correction's other half: cut before a word landed, after ``response.done``."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    engine.note_spoken(_CUT_TEXT)
+    artifact = engine.note_interrupted_reply(_split(said="", unsaid=_CUT_TEXT))
+    engine.submit_utterance("hello?")
+    engine.run_turn()
+
+    assert artifact is not None and artifact.text == _CUT_TEXT
+    assert "I have already said out loud" not in _last_user(turn)
+    assert artifact.render() in _last_user(turn)
+
+
+def test_t7_a_cut_reply_with_no_text_at_all_is_counted_and_keeps_nothing() -> None:
+    """A reply whose text never arrived: named and counted, never invented."""
+    engine = _build()
+
+    assert engine.note_interrupted_reply(_split(said="", unsaid="", text="")) is None
+    assert (engine.replies_cut, engine.parked, engine.wanted_to_say) == (1, 0, ())

@@ -106,13 +106,57 @@ counted as skipped, never as played — the room heard nothing.
 
 The reply RECORD is unchanged by any of this: :class:`Response` still carries
 every byte the server sent, because what the server said and what the room
-heard are two different facts and conflating them is the defect t7 exists to
-prevent. One consequence to carry forward: a reply is published on
-``response.done``, which since t6 is no longer the same instant as "the last
-chunk left the speaker". So ``on_response`` means *the server finished this
-reply*, not *the room heard all of it* — the second question is
-:meth:`~RealtimeDuplexSession.playback_progress`'s, and reconciling the two
-into a said/unsaid record is task t7's, not this module's.
+heard are two different facts and conflating them is the defect the said/unsaid
+split below exists to prevent. One consequence to carry forward: a reply is
+published on ``response.done``, which since t6 is no longer the same instant as
+"the last chunk left the speaker". So ``on_response`` means *the server
+finished this reply*, not *the room heard all of it* — the second question is
+:meth:`~RealtimeDuplexSession.playback_progress`'s.
+
+--------------------------------------------------------------------------
+Said and unsaid: the measured cut (issue #151, spec c34/c39/c41)
+--------------------------------------------------------------------------
+A human — meaning any external interlocutor, a peer robot or an automated
+system included — who talks over an audibly speaking robot cuts it
+mid-sentence. The mind on the other side of this client must then know
+**exactly what was actually said aloud**, because recording the whole reply as
+if it had been heard would leave it believing it answered when the room got
+half a sentence, and it would go on to reason from words nobody received.
+
+:func:`estimate_spoken_prefix` + :func:`split_spoken` produce that split, and
+:meth:`RealtimeDuplexSession.spoken_split` is where a caller asks for it. The
+arithmetic is CITED, not invented: lobes-cli's
+``lobes/realtime/_floor.py``:323 ``estimate_spoken_prefix`` already solves the
+server-side half — cut the text proportionally to the audio delivered, then
+back up to the previous word boundary — and its reasoning is the reason to
+copy it rather than improve on it: *"recording the full text as if it had been
+heard is a worse lie than recording a slightly-off prefix"*. Its caller's
+``delivered_bytes <= 0`` guard (``lobes/realtime/_conversation.py``
+``_record_interrupted_reply``) is cited too, and is load-bearing for the same
+reason it is there: the estimator answers "assume it all played" when handed
+no total, which is the exact wrong answer for a cut that landed before a byte
+existed.
+
+**What this client has that the server does not is a MEASUREMENT.** The floor
+estimates from wire delivery; :class:`PlaybackProgress` reports the bytes the
+SINK returned from. So the split is *exact to the chunk boundary and estimated
+only inside the boundary chunk* — and the chunk still inside ``play`` is
+counted as NOT said, so its words land in the remainder. That direction is
+deliberate: offering to repeat something the room half-heard is a smaller
+error than claiming a sentence nobody got.
+
+**PHASE-1 LIMITATION, recorded here rather than discovered later (spec c39).**
+Under client-side chunk playback a client-local cut is **invisible to the
+floor**: wire delivery completed at wire speed, so the server sends
+``response.done`` and appends the FULL reply to its own conversation history.
+The server's history therefore **OVERSTATES** what the room heard after any
+cut, and this client does not try to correct it — there is no frame for that
+yet (the ``conversation.item.create`` channel is a deliberate, separate
+widening of the send surface, tasks t10/t11), and inventing one here would
+break the three-frame pin. What is true, and all that is claimed, is that the
+LAYER's own record is measured at the sink and the client is the authority for
+it. The divergence is knowing, bounded, and closes when the items channel
+lands.
 
 **Audio format, stated unambiguously.** In: mono float32 in [-1, 1] (or int16,
 or PCM16 bytes). On the wire: PCM16 mono **little-endian**, base64, inside an
@@ -368,12 +412,15 @@ __all__ = [
     "ReadAudio",
     "RealtimeDuplexSession",
     "Response",
+    "SpokenSplit",
     "Utterance",
     "announces_one_shot_arming",
     "build",
     "connect_url",
+    "estimate_spoken_prefix",
     "resolve_realtime_api_key",
     "resolve_realtime_base_url",
+    "split_spoken",
     # configuration env names (owned by reachy.speech.realtime)
     "OPENAI_API_KEY_ENV",
     "OPENAI_URL_BASE_ENV",
@@ -687,6 +734,13 @@ class PlaybackProgress:
         skipped_bytes: audio queued and then skipped by a cancel, or dropped by
             a failed ``play`` — produced by the server, never heard.
         cancelled: whether a cut reached this reply.
+        total_bytes: the WHOLE reply's audio, as the server produced it — the
+            denominator :func:`split_spoken` divides the text by. ``0`` until
+            the reply completes, which is deliberate rather than lazy: while
+            deltas are still arriving there is no honest total, and dividing
+            the full text by a fraction of its audio would overstate what the
+            room heard. :meth:`RealtimeDuplexSession.spoken_split` withholds a
+            split until this is real.
     """
 
     response_id: str | None
@@ -695,11 +749,17 @@ class PlaybackProgress:
     in_flight_bytes: int
     skipped_bytes: int
     cancelled: bool
+    total_bytes: int = 0
 
 
 @dataclass
 class _PlaybackLedger:
-    """The mutable half of :class:`PlaybackProgress`, one per reply."""
+    """The mutable half of :class:`PlaybackProgress`, one per reply.
+
+    It carries two things the snapshot does not: the reply's TEXT (so the
+    said/unsaid split needs nothing but a response id) and whether the reply
+    has COMPLETED (so a split is never computed against a partial total).
+    """
 
     response_id: str | None
     queued_bytes: int = 0
@@ -707,6 +767,9 @@ class _PlaybackLedger:
     in_flight_bytes: int = 0
     skipped_bytes: int = 0
     cancelled: bool = False
+    total_bytes: int = 0
+    text: str = ""
+    complete: bool = False
 
     def snapshot(self) -> PlaybackProgress:
         return PlaybackProgress(
@@ -716,7 +779,123 @@ class _PlaybackLedger:
             in_flight_bytes=self.in_flight_bytes,
             skipped_bytes=self.skipped_bytes,
             cancelled=self.cancelled,
+            total_bytes=self.total_bytes,
         )
+
+
+@dataclass(frozen=True)
+class SpokenSplit:
+    """One reply cut in two at the measured boundary: what was said, what was not.
+
+    The layer's canonical record of an interrupted reply (spec claim c34).
+    Produced by :func:`split_spoken` and reached through
+    :meth:`RealtimeDuplexSession.spoken_split`; see the module docstring's
+    "Said and unsaid" section for the donor citation, the measured-vs-estimated
+    boundary, and the phase-1 divergence from the server's own history.
+
+    *said* and *unsaid* PARTITION *text*: nothing is discarded silently and
+    nothing is recorded as spoken twice over. ``said`` is always a prefix of
+    ``text``, ends on a word boundary, and never runs past the measured
+    ``played_bytes``.
+
+    It deliberately carries **no field about the server's record**. This client
+    knows what its own sink did; what the floor wrote into its history after a
+    client-local cut is something it cannot see and does not claim.
+
+    Attributes:
+        response_id: the reply this describes, or ``None``.
+        text: the whole reply text, exactly as the server produced it.
+        said: the measured prefix the room heard.
+        unsaid: the remainder — kept, never spoken, never recorded as said.
+        played_bytes / in_flight_bytes / total_bytes: the measurement behind
+            the split (see :class:`PlaybackProgress`).
+        cut: whether a cancel or a barge-in reached this reply.
+    """
+
+    response_id: str | None
+    text: str
+    said: str
+    unsaid: str
+    played_bytes: int
+    in_flight_bytes: int
+    total_bytes: int
+    cut: bool
+
+    @property
+    def complete(self) -> bool:
+        """Whether the whole reply reached the room (nothing left unsaid)."""
+        return not self.unsaid
+
+
+def estimate_spoken_prefix(text: str, played_bytes: int, total_bytes: int) -> str:
+    """The part of *text* the room plausibly heard, given the audio it got.
+
+    **Cited, not imported**, from lobes-cli's ``lobes/realtime/_floor.py``:323
+    ``estimate_spoken_prefix`` — same arithmetic, same bias, a different (and
+    better) input. The donor cuts the text proportionally to the audio
+    DELIVERED on the wire and then backs up to the previous word boundary,
+    because Chatterbox returns audio with no word timings; its docstring states
+    the principle this whole path rests on — *"recording the full text as if it
+    had been heard is a worse lie than recording a slightly-off prefix"*. This
+    copy is fed MEASURED played bytes from :class:`PlaybackProgress` instead of
+    a wire estimate, so the same arithmetic runs over a better number.
+
+    It is an ESTIMATE and stays one: a proportional cut assumes speech rate is
+    uniform across a reply, which it is not. The word-boundary back-up is what
+    makes the error land on the unsaid side — the prefix is always short of the
+    proportional cut, never past it.
+
+    Two branches are the donor's and are kept verbatim because callers depend
+    on them: no total (or more played than exists) answers with the FULL text —
+    "I have no measurement, assume it all played" — and nothing played answers
+    with ``""``. The first is exactly wrong for a cut that landed before any
+    audio existed, which is why :func:`split_spoken` carries the donor's own
+    caller-side guard (``lobes/realtime/_conversation.py``
+    ``_record_interrupted_reply``'s ``delivered_bytes <= 0``).
+    """
+    if not text:
+        return ""
+    if total_bytes <= 0 or played_bytes >= total_bytes:
+        return text
+    if played_bytes <= 0:
+        return ""
+    cut = max(1, len(text) * played_bytes // total_bytes)
+    prefix = text[:cut]
+    boundary = prefix.rfind(" ")
+    return prefix[:boundary] if boundary > 0 else prefix
+
+
+def split_spoken(text: str, progress: PlaybackProgress) -> SpokenSplit:
+    """Split one reply into what the room heard and what it never did.
+
+    Pure, total and never raising: a measurement in, a record out. The guard on
+    ``total_bytes <= 0`` is the donor's caller's (see
+    :func:`estimate_spoken_prefix`) and says the same thing in this module's
+    terms — a cut with nothing measured means NOTHING was said, never the whole
+    reply.
+
+    The boundary chunk (``in_flight_bytes``) is not counted as said. It cannot
+    be confirmed (the sink has not returned) and it cannot be recalled (a
+    daemon-HTTP upload-then-play has no stop handle), so its words go into
+    *unsaid*, where the worst case is the mind offering to repeat something the
+    room half-heard.
+    """
+    reply = text or ""
+    said = (
+        ""
+        if progress.total_bytes <= 0
+        else estimate_spoken_prefix(reply, progress.played_bytes, progress.total_bytes)
+    )
+    return SpokenSplit(
+        response_id=progress.response_id,
+        text=reply,
+        said=said,
+        unsaid=reply[len(said) :].strip(),
+        played_bytes=progress.played_bytes,
+        in_flight_bytes=progress.in_flight_bytes,
+        total_bytes=progress.total_bytes,
+        cut=progress.cancelled,
+    )
 
 
 @dataclass(frozen=True)
@@ -1061,6 +1240,10 @@ class RealtimeDuplexSession(_SessionObservables):
 
         The returned :class:`PlaybackProgress` describes the reply that was
         cut, measured at the sink; :meth:`playback_progress` re-reads it later.
+        What that measurement MEANS for the conversation — which words the room
+        got and which it never did — is :meth:`spoken_split`, and it is the
+        call a caller that cut the robot off owes the mind: it answers once the
+        reply has completed, whether the cut landed before or after that.
         """
         cut = self._skip_remaining()
         if cut.skipped_bytes:
@@ -1085,9 +1268,40 @@ class RealtimeDuplexSession(_SessionObservables):
         it, so a zeroed record and ``None`` are different answers.
         """
         with self._playback_lock:
-            key = response_id if response_id is not None else self._current_response_id
-            ledger = self._ledgers.get(key or "")
+            ledger = self._ledger_of(response_id)
             return ledger.snapshot() if ledger is not None else None
+
+    def spoken_split(self, response_id: str | None = None) -> SpokenSplit | None:
+        """The said/unsaid split of *response_id* (default: the reply being spoken).
+
+        The measured half of spec claim c34: what the room actually heard of a
+        reply, and what it never did. Safe from any thread, O(1), never raises.
+
+        ``None`` has exactly two meanings, and both are "not yet a fact":
+        this session has no record of that reply, or the reply has not
+        COMPLETED. The second is the important one — while deltas are still
+        arriving the reply's total audio is unknown, and splitting the full
+        text against a fraction of its audio would report MORE as said than the
+        room heard, which is the one direction c34 forbids. A cut taken
+        mid-reply is therefore recorded when ``response.done`` lands; a cut
+        taken after it is readable immediately.
+        """
+        with self._playback_lock:
+            ledger = self._ledger_of(response_id)
+            if ledger is None or not ledger.complete:
+                return None
+            return split_spoken(ledger.text, ledger.snapshot())
+
+    def _ledger_of(self, response_id: str | None) -> "_PlaybackLedger | None":
+        """The existing record for *response_id*, or the current reply's. No creation.
+
+        Caller holds ``_playback_lock``. Distinct from :meth:`_ledger_for`,
+        which CREATES: a reader asking about a reply this session never saw
+        must get ``None`` rather than a zeroed record that says "heard nothing"
+        about a reply that never existed.
+        """
+        key = response_id if response_id is not None else self._current_response_id
+        return self._ledgers.get(key or "")
 
     @property
     def sample_rate(self) -> int:
@@ -1443,6 +1657,14 @@ class RealtimeDuplexSession(_SessionObservables):
             # The tail: whatever is left below one chunk group.
             self._flush_chunks(pending, final=True)
         audio = bytes(pending.audio)
+        # Seal the measurement record BEFORE anything else can read it: the
+        # text and the total the said/unsaid split divides by are both final
+        # exactly here, and `on_response` fires from the bottom of this method.
+        with self._playback_lock:
+            ledger = self._ledger_for(pending.response_id)
+            ledger.text = pending.text
+            ledger.total_bytes = len(audio)
+            ledger.complete = True
         response = Response(
             response_id=pending.response_id,
             text=pending.text,

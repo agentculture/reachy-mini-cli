@@ -146,6 +146,7 @@ class _FakeSession:
         *,
         start_error: BaseException | None = None,
         arm_error: BaseException | None = None,
+        split_error: BaseException | None = None,
         **kwargs,
     ) -> None:
         self.kwargs = kwargs
@@ -157,6 +158,12 @@ class _FakeSession:
         self.arms = 0
         self._start_error = start_error
         self._arm_error = arm_error
+        #: The measured said/unsaid split of the last reply (task t7). ``None``
+        #: is the honest default — a session that never cut anything has no
+        #: split to report, and the composition root must record the reply
+        #: exactly as it did before.
+        self.split: object | None = None
+        self._split_error = split_error
 
     def start(self) -> None:
         if self._start_error is not None:
@@ -177,7 +184,14 @@ class _FakeSession:
     def hear(self, text: str) -> None:
         self.kwargs["on_utterance"](Utterance(text=text, t=1.0))
 
-    def reply(self, text: str, *, interrupted: bool = False) -> None:
+    def spoken_split(self, response_id: str | None = None) -> object | None:
+        if self._split_error is not None:
+            raise self._split_error
+        return self.split
+
+    def reply(self, text: str, *, interrupted: bool = False, split: object | None = None) -> None:
+        if split is not None:
+            self.split = split
         self.kwargs["on_response"](
             Response(
                 response_id="r1",
@@ -519,13 +533,15 @@ def test_a_spoken_reply_is_recorded_as_already_said_never_as_a_trigger():
         layer.close()
 
 
-def test_an_interrupted_reply_is_never_recorded_as_spoken():
-    """A barge-in truncated reply is deliberately NOT played, so it was not said.
+def test_an_interrupted_reply_with_no_measurement_is_never_recorded_as_spoken():
+    """No measured split means nothing provable reached the room, so nothing is said.
 
     ``RealtimeDuplexSession._finish_response`` publishes an interrupted reply
     through ``on_response`` like any other (the record carries the audio and
-    says why) but never speaks it. Recording it as already-said would make the
-    mind believe it had answered when the human heard nothing.
+    says why). Since task t7 the tap asks the session what the room actually
+    heard; a session reporting no split at all (this double's default) falls
+    back to the conservative pre-t7 answer — recording it as already-said would
+    make the mind believe it had answered when the human heard nothing.
     """
     factory = _SessionFactory()
     sink = _Sink()
@@ -2113,3 +2129,143 @@ def test_c4_end_to_end_the_room_hears_no_reply_to_an_utterance_attention_refused
     assert server.answered_texts == ["reachy, are you listening"]
     assert server.unanswered_texts == ["could you pass me the salt please"]
     assert layer.engine.unaddressed_utterances == 1
+
+
+# =========================================================================== #
+# t7 — the cut reply reaches the mind as said + kept remainder (c34/h22)      #
+# =========================================================================== #
+
+
+def _measured_split(
+    said_bytes: int = 16, *, cut: bool = True, text: str = "one two three four five six"
+):
+    """A REAL :class:`~reachy.speech.realtime_duplex.SpokenSplit`, not a stand-in.
+
+    The join this section is about is exactly the kind both ends can pass
+    separately: the session measures, the engine records, and a mismatch in the
+    shape between them fails nowhere. So the split handed to the tap here is
+    the one the wire actually produces.
+    """
+    from reachy.speech.realtime_duplex import PlaybackProgress, split_spoken
+
+    total = 48
+    return split_spoken(
+        text,
+        PlaybackProgress(
+            response_id="r1",
+            queued_bytes=total,
+            played_bytes=said_bytes,
+            in_flight_bytes=0,
+            skipped_bytes=total - said_bytes,
+            cancelled=cut,
+            total_bytes=total,
+        ),
+    )
+
+
+def test_t7_a_cut_reply_reaches_the_mind_as_the_said_half_plus_a_kept_remainder():
+    """duplex ``on_response`` + the measured cut -> said as spoken, rest as artifact."""
+    factory = _SessionFactory()
+    turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    sink = _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), turn_fn=turn, sink=sink
+    )
+    try:
+        factory.last.reply("one two three four five six", interrupted=True, split=_measured_split())
+        assert layer.engine.pending == 0, "a cut reply must not trigger a turn"
+        assert [artifact.text for artifact in layer.engine.wanted_to_say] == ["three four five six"]
+        assert sink.texts("message") == ["one two"]
+
+        layer.engine.submit_utterance("reachy, sorry — go on")
+        assert layer.engine.run_turn() is True
+        content = turn.last_user_content()
+        assert '"one two"' in content
+        assert "I was interrupted before saying" in content
+        assert '"one two three four five six"' not in content
+    finally:
+        layer.close()
+
+
+def test_t7_an_uncut_reply_is_still_recorded_whole():
+    """The ordinary path is untouched: no cut, no split, no artifact."""
+    factory = _SessionFactory()
+    sink = _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), sink=sink
+    )
+    try:
+        factory.last.reply(
+            "I am right here.",
+            split=_measured_split(said_bytes=48, cut=False, text="I am right here."),
+        )
+        assert sink.texts("message") == ["I am right here."]
+        assert layer.engine.wanted_to_say == ()
+    finally:
+        layer.close()
+
+
+def test_t7_a_session_that_cannot_report_the_cut_is_a_named_drop_not_a_crash():
+    """The tap runs on the session's own worker thread: a raise there is invisible."""
+    factory = _SessionFactory(split_error=RuntimeError("ledger gone"))
+    sink = _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), sink=sink
+    )
+    try:
+        factory.last.reply("I am right here.")
+        assert any(agent_mod.REASON_SPLIT_UNAVAILABLE in text for text in sink.texts("thinking"))
+        assert sink.texts("message") == ["I am right here."], "the fallback still records it"
+    finally:
+        layer.close()
+
+
+def test_t7_end_to_end_a_cut_reply_keeps_its_remainder_through_the_real_session():
+    """The join, over a real socket: session measurement -> tap -> engine record.
+
+    The session double and the pure split each prove their own half, and this
+    module's preamble is about exactly the failure that leaves: a tap asking
+    the session a question it no longer answers, with both sides' tests green.
+    So the reply here is generated, held open and then INTERRUPTED by the
+    gateway, and the assertion is on what the layer's own record ended up
+    holding.
+
+    At the shipped chunk size this reply never reaches a chunk boundary before
+    the cut, so nothing was heard and the whole sentence is kept — the
+    partially-heard case is measured against known played offsets in
+    ``tests/test_realtime_duplex.py``.
+    """
+    with FakeRealtimeServer(
+        Scenario.ONE_SHOT_ARMING,
+        announce_one_shot_arming=True,
+        transcripts=["reachy, tell me a story"],
+        arm_grace_s=0.2,
+        hold_response=True,
+        interrupt_response=True,
+        response_text="one two three four five six",
+        wait_timeout=WAIT_BUDGET_S,
+    ) as server:
+        layer, _args, _sink = _compose(
+            media=_media(),
+            session_factory=_duplex_factory(server),
+            lines=iter(()),
+            clip_reader=lambda: None,
+        )
+        try:
+            layer.start()
+            # The hold CLEARS its own release flag as it starts, so releasing
+            # before it is up is releasing nothing; its keepalive PING is the
+            # observable "the hold is live now".
+            _wait_for(lambda: server.ping_sent_count >= 1)
+            server.release_response_done()
+            _wait_for(lambda: bool(layer.engine.wanted_to_say))
+        finally:
+            layer.close()
+
+    assert [artifact.text for artifact in layer.engine.wanted_to_say] == [
+        "one two three four five six"
+    ]
+    assert layer.engine.wanted_to_say[0].response_id, "the remainder must name its reply"
+    assert layer.engine.replies_cut == 1
+    assert layer.engine.parked == 1, "the remainder is CONTEXT — parked, never a trigger"
+    assert layer.engine.pending == 1, "the utterance woke the mind; the cut added nothing"

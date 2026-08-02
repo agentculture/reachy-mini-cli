@@ -1918,3 +1918,236 @@ def test_c46_a_barge_in_still_cuts_the_reply_short_under_one_shot_arming(sense_l
     assert _count_reason(sense_log, REASON_RESPONSE_INTERRUPTED) >= 1
     assert client.cancelled_bytes > 0, "the unspoken remainder was spoken anyway"
     assert sink.played == bytes(range(16)), "the prefix the room heard was not kept"
+
+
+# =========================================================================== #
+# t7 — the said/unsaid split: measured at the sink, estimated inside one chunk #
+# (spec claims c34/c39/c41, honesty h22/h24/h26)                              #
+# =========================================================================== #
+
+#: A reply whose words map onto ``_LONG_REPLY``'s six chunks cleanly enough to
+#: reason about by hand: 27 characters over 48 audio bytes.
+_SPLIT_TEXT = "one two three four five six"
+
+
+def _progress(**kwargs) -> duplex.PlaybackProgress:
+    """A hand-built measurement record — the whole point of the pure split."""
+    fields = {
+        "response_id": "resp_split",
+        "queued_bytes": 48,
+        "played_bytes": 0,
+        "in_flight_bytes": 0,
+        "skipped_bytes": 0,
+        "cancelled": True,
+        "total_bytes": 48,
+    }
+    fields.update(kwargs)
+    return duplex.PlaybackProgress(**fields)
+
+
+def test_t7_the_estimator_cites_its_lobes_donor_by_path() -> None:
+    """h26's second half: the module docstring names the donor FUNCTION and file.
+
+    Cite-don't-import across repos: nothing here may import lobes, so the only
+    thing tying this arithmetic to the reasoning behind it is the citation.
+    """
+    doc = duplex.estimate_spoken_prefix.__doc__ or ""
+
+    assert "lobes/realtime/_floor.py" in doc
+    assert "estimate_spoken_prefix" in doc
+    assert "323" in doc
+
+
+def test_t7_the_estimator_backs_up_to_the_previous_word_boundary() -> None:
+    """A third of the audio played -> a whole-word prefix, never a split word."""
+    said = duplex.estimate_spoken_prefix(_SPLIT_TEXT, 16, 48)
+
+    assert said == "one two"
+    assert _SPLIT_TEXT.startswith(said)
+    assert not said.endswith(" ")
+
+
+@pytest.mark.parametrize("played", [1, 8, 16, 24, 32, 40, 47])
+def test_t7_the_estimator_never_counts_more_than_the_measured_proportion(played: int) -> None:
+    """h26: unsaid-biased at every offset — nothing beyond the measured boundary.
+
+    The bound is the donor's own: the proportional cut, floored at one
+    character (something played, so something was heard), and then backed up to
+    a word boundary — never past it.
+    """
+    said = duplex.estimate_spoken_prefix(_SPLIT_TEXT, played, 48)
+
+    assert len(said) <= max(1, len(_SPLIT_TEXT) * played // 48)
+    assert _SPLIT_TEXT.startswith(said)
+
+
+def test_t7_the_estimator_keeps_the_donors_no_measurement_branch() -> None:
+    """Faithful to the donor, INCLUDING the branch its own caller has to guard.
+
+    ``estimate_spoken_prefix`` answers "assume it all played" when it is handed
+    no total, which is exactly wrong for a cut that landed before any audio
+    existed — hence the guard in :func:`~reachy.speech.realtime_duplex.
+    split_spoken`, cited from the donor's caller.
+    """
+    assert duplex.estimate_spoken_prefix(_SPLIT_TEXT, 0, 0) == _SPLIT_TEXT
+    assert duplex.estimate_spoken_prefix(_SPLIT_TEXT, 99, 48) == _SPLIT_TEXT
+    assert duplex.estimate_spoken_prefix(_SPLIT_TEXT, 0, 48) == ""
+    assert duplex.estimate_spoken_prefix("", 24, 48) == ""
+
+
+def test_t7_the_split_carries_the_zero_measurement_guard_the_donor_caller_needs() -> None:
+    """A cut with nothing measured says NOTHING was said — never the whole reply."""
+    split = duplex.split_spoken(_SPLIT_TEXT, _progress(total_bytes=0, queued_bytes=0))
+
+    assert split.said == ""
+    assert split.unsaid == _SPLIT_TEXT
+
+
+def test_t7_a_split_is_measured_to_the_chunk_boundary_and_estimates_only_inside_it() -> None:
+    """The advantage over the donor: two confirmed chunks, one uncertain one.
+
+    ``played_bytes`` is what the sink RETURNED from, so the prefix is exact to
+    the chunk boundary. The chunk still inside ``play`` is not counted as said
+    — its words land in the remainder, where the worst case is the mind
+    offering to repeat something the room half-heard, rather than believing it
+    said a sentence nobody got.
+    """
+    split = duplex.split_spoken(
+        _SPLIT_TEXT, _progress(played_bytes=16, in_flight_bytes=8, skipped_bytes=24)
+    )
+
+    assert split.said == "one two"
+    assert split.unsaid == "three four five six"
+    assert "three" in split.unsaid, "the boundary chunk's words are never counted as said"
+    assert (split.played_bytes, split.in_flight_bytes, split.total_bytes) == (16, 8, 48)
+    assert split.cut is True
+
+
+def test_t7_said_and_unsaid_partition_the_reply_so_nothing_is_discarded() -> None:
+    """c34: never discarded silently, never recorded as spoken — so both halves."""
+    for played in (0, 8, 16, 24, 32, 40, 48):
+        split = duplex.split_spoken(_SPLIT_TEXT, _progress(played_bytes=played))
+        rejoined = " ".join(part for part in (split.said, split.unsaid) if part)
+
+        assert rejoined.split() == _SPLIT_TEXT.split(), played
+        assert _SPLIT_TEXT.startswith(split.said)
+
+
+def test_t7_a_reply_that_played_whole_leaves_nothing_unsaid() -> None:
+    split = duplex.split_spoken(_SPLIT_TEXT, _progress(played_bytes=48, cancelled=False))
+
+    assert split.said == _SPLIT_TEXT
+    assert split.unsaid == ""
+    assert split.complete is True
+    assert split.cut is False
+
+
+def test_t7_the_session_splits_a_reply_cut_mid_playback_at_the_measured_boundary() -> None:
+    """End to end over the dispatcher: two chunks heard, four never spoken."""
+    sink = _Sink()
+    client = _chunked(url=_dead_url(), play=sink)
+    client.start()
+    try:
+        _feed_deltas(client, "resp_cut", _LONG_REPLY[:16], _TEST_CHUNK_BYTES)
+        assert _wait_until(lambda: len(sink.calls) == 2)
+        client.cancel_playback()
+        client._dispatch_event(
+            {"type": "response.text.done", "response_id": "resp_cut", "text": _SPLIT_TEXT}
+        )
+        for start in range(16, len(_LONG_REPLY), _TEST_CHUNK_BYTES):
+            client._dispatch_event(
+                _delta_event("resp_cut", _LONG_REPLY[start : start + _TEST_CHUNK_BYTES])
+            )
+        client._dispatch_event({"type": "response.done", "response_id": "resp_cut"})
+        assert _wait_until(lambda: client.responses >= 1)
+    finally:
+        client.close()
+
+    split = client.spoken_split("resp_cut")
+    assert split is not None
+    assert split.response_id == "resp_cut"
+    assert split.said == "one two"
+    assert split.unsaid == "three four five six"
+    assert split.cut is True
+    assert (split.played_bytes, split.total_bytes) == (16, len(_LONG_REPLY))
+    # The RECORD is unchanged by the split: what the server said and what the
+    # room heard are two different facts (t6's own pin, restated here).
+    response = client.take_response()
+    assert response is not None and response.audio == _LONG_REPLY
+    assert response.text == _SPLIT_TEXT
+
+
+def test_t7_a_split_is_withheld_until_the_reply_is_complete() -> None:
+    """Mid-stream there is no honest TOTAL, so there is no honest split either.
+
+    Splitting against the audio that happens to have arrived would divide the
+    full text by a fraction of its audio and overstate what the room heard —
+    the one direction c34 forbids.
+    """
+    sink = _Sink()
+    client = _chunked(url=_dead_url(), play=sink)
+    client.start()
+    try:
+        _feed_deltas(client, "resp_live", _LONG_REPLY[:16], _TEST_CHUNK_BYTES)
+        assert _wait_until(lambda: len(sink.calls) == 2)
+        client._dispatch_event(
+            {"type": "response.text.done", "response_id": "resp_live", "text": _SPLIT_TEXT}
+        )
+
+        assert client.spoken_split("resp_live") is None
+        assert client.playback_progress("resp_live") is not None, "the MEASUREMENT is live"
+    finally:
+        client.close()
+
+
+def test_t7_a_split_is_none_for_a_reply_this_session_never_saw() -> None:
+    client = _session(url=_dead_url())
+    assert client.spoken_split("resp_never") is None
+    assert client.spoken_split() is None
+
+
+def test_t7_a_client_side_cut_sends_nothing_to_the_server_and_claims_no_agreement() -> None:
+    """c39, behaviourally: the layer does not try to correct the floor's history.
+
+    A client-local cut is INVISIBLE to the floor — wire delivery completed, so
+    the server sends ``response.done`` and appends the FULL reply to its own
+    history. Phase 1 lives with that divergence knowingly: the client is the
+    measured authority for the LAYER's record, and the send surface stays the
+    same three frame kinds (no correction frame exists to send yet — that is
+    the items channel, tasks t10/t11).
+    """
+    release = threading.Event()
+    sink = _Sink(block=release)
+    with _hold_server(response_text=_SPLIT_TEXT) as server:
+        client = _chunked(server, play=sink)
+        client.start()
+        try:
+            assert sink.entered.wait(timeout=_TIMEOUT)
+            assert _wait_until(lambda: client.chunks_queued >= 6)
+            client.cancel_playback()
+        finally:
+            release.set()
+            server.release_response_done()
+            assert _wait_until(lambda: client.responses >= 1)
+            client.close()
+
+    assert set(_sent_event_types(server)) <= {
+        wire.APPEND_EVENT_TYPE,
+        wire.RESPONSE_CREATE_EVENT_TYPE,
+    }, "the cut must not grow a fourth frame kind"
+    split = client.spoken_split()
+    assert split is not None and split.cut is True
+    assert not any(
+        field.name in {"server_said", "server_history", "floor_agrees"}
+        for field in dataclasses.fields(duplex.SpokenSplit)
+    ), "the split must claim nothing about the server's own record"
+
+
+def test_t7_the_phase_one_server_overstatement_is_documented() -> None:
+    """h24: recorded here, not discovered later by whoever reads the histories."""
+    doc = " ".join((duplex.__doc__ or "").split()).lower()
+
+    assert "response.done" in doc
+    assert "overstates" in doc
+    assert "invisible to the floor" in doc
+    assert "conversation.item.create" in doc, "and it names what closes the gap"

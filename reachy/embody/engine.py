@@ -183,6 +183,24 @@ Gemma's memory down to just the last ``m`` turns (spec claim c45, honesty
 h30). The marker clears on the next :meth:`update_summary` call that
 succeeds.
 
+Said, unsaid, and the sentence the room never got (issue #151, spec c34)
+-------------------------------------------------------------------------
+:meth:`~EmbodyTurnEngine.note_spoken` records what the layer's mouth said. When
+a human talks over an audibly speaking robot, that is no longer the whole
+truth: the reply was cut mid-sentence, and
+:meth:`~EmbodyTurnEngine.note_interrupted_reply` is where the two halves are
+recorded honestly — the MEASURED prefix as spoken, the remainder as a
+:class:`reachy.embody.interjection.WantedToSay` artifact parked as CONTEXT for
+the next turn to judge. The measurement itself is not this module's: it is
+taken at the sink by :class:`reachy.speech.realtime_duplex.
+RealtimeDuplexSession`, and arrives here as a plain structural type
+(:class:`_SpokenSplitLike`) so the mind never imports the wire.
+
+Two properties of that record are load-bearing and are stated where they are
+enforced (see the method): a cut NEVER triggers a turn, and the layer's record
+makes no claim that the SERVER's own history matches it — a client-local cut is
+invisible to the floor in phase 1, so the server still holds the full reply.
+
 The export contract
 -------------------
 Per turn the engine emits, through the shared
@@ -233,6 +251,7 @@ from reachy import senselog
 from reachy.cli._errors import CliError
 from reachy.embody.attention import DEFAULT_ATTENTION_WINDOW_S, LABEL_COLD, AttentionGate
 from reachy.embody.cues import ClassifiedCue, CueClass
+from reachy.embody.interjection import WantedToSay, make_wanted_to_say
 from reachy.embody.tools import HARMONICS, SPEAK
 from reachy.export.events import EmotionEvent, MessageEvent, ThinkingEvent
 from reachy.export.exporter import ExportHook
@@ -412,6 +431,14 @@ DEFAULT_MAX_PERCEPTION_SOURCES = 4
 DEFAULT_MIN_ALERT_INTERVAL_S = 5.0
 #: Recent already-spoken replies carried into the next turn's context.
 DEFAULT_SPOKEN_MAXLEN = 4
+#: :class:`reachy.embody.interjection.WantedToSay` artifacts the canonical
+#: record keeps at once (:meth:`EmbodyTurnEngine.note_interrupted_reply`).
+#: Small, and for the same reason the artifact expires in TURNS: a robot
+#: holding the tail ends of four old sentences is not remembering, it is
+#: hoarding. The artifact reaches the MODEL through the context park like any
+#: other fact — this deque is the layer's own record of what it kept, which is
+#: what makes attribution and expiry inspectable rather than implied.
+DEFAULT_WANTED_TO_SAY_MAXLEN = 4
 #: Minimum gap between turns in :meth:`EmbodyTurnEngine.run`.
 DEFAULT_TURN_INTERVAL = 0.5
 
@@ -673,6 +700,9 @@ class Limits:
     min_alert_interval_s: float = DEFAULT_MIN_ALERT_INTERVAL_S
     #: Recent already-spoken replies carried into the next turn's context.
     spoken_maxlen: int = DEFAULT_SPOKEN_MAXLEN
+    #: Kept remainders of interrupted replies the canonical record holds at
+    #: once (:meth:`EmbodyTurnEngine.note_interrupted_reply`).
+    wanted_to_say_maxlen: int = DEFAULT_WANTED_TO_SAY_MAXLEN
     #: Minimum gap between turns in :meth:`EmbodyTurnEngine.run`.
     turn_interval: float = DEFAULT_TURN_INTERVAL
     #: How long attention stays open after the last utterance heard or answer
@@ -768,6 +798,21 @@ class _RegistryLike(Protocol):
 
 class _TurnFn(Protocol):
     def __call__(self, messages: list[dict], **kwargs) -> _llm.TurnResult: ...
+
+
+class _SpokenSplitLike(Protocol):
+    """What :meth:`EmbodyTurnEngine.note_interrupted_reply` reads off a cut reply.
+
+    Structurally typed on purpose: the object production hands over is
+    :class:`reachy.speech.realtime_duplex.SpokenSplit`, and this module must
+    not import the WebSocket client to record what its own mouth did. The
+    dependency runs the other way — the composition root joins them.
+    """
+
+    response_id: str | None
+    text: str
+    said: str
+    unsaid: str
 
 
 # --------------------------------------------------------------------------- #
@@ -909,6 +954,12 @@ class EmbodyTurnEngine:
         self._last_alert_turn = float("-inf")
         self._deferral_logged = False
         self._spoken: deque[str] = deque(maxlen=max(0, int(self._limits.spoken_maxlen)))
+        # The kept remainders of interrupted replies (spec claim c34). The
+        # MODEL reads them through the context park like any other fact; this
+        # is the layer's own record, so attribution and expiry are inspectable.
+        self._wanted_to_say: deque[WantedToSay] = deque(
+            maxlen=max(1, int(self._limits.wanted_to_say_maxlen))
+        )
         # ONE shared conversation deque (issue #154 decision c30): the worker
         # (Qwen) replays it in FULL up to ``n``; the senses lane (Gemma) reads
         # only a tail SLICE of it (``_senses_window``) — never a second,
@@ -958,6 +1009,10 @@ class EmbodyTurnEngine:
         #: failed summary-maintenance pass, not only the first (spec claim
         #: c45, honesty h30).
         self.summary_stale_count = 0
+        #: Replies a cut reached (:meth:`note_interrupted_reply`). Counted as
+        #: well as named: "how often is this robot talked over" is a question
+        #: about the room that one drop line, long scrolled away, cannot answer.
+        self.replies_cut = 0
         # Counted apart from ``dropped_inputs``, which means "a bound was hit":
         # an unaddressed utterance is not a resource failure, it is the gate
         # working, and folding the two would make a busy room look like a sick
@@ -1098,6 +1153,119 @@ class EmbodyTurnEngine:
         self._attention.note_spoken()
         if self._export is not None:
             self._export.emit(MessageEvent(text=cleaned, ts=self._export.time_fn()))
+
+    def note_interrupted_reply(self, split: _SpokenSplitLike) -> WantedToSay | None:
+        """Record a reply a human cut off: the said half as spoken, the rest as kept.
+
+        The layer's canonical record of an interjection (spec claim c34). A
+        human — any external interlocutor, a peer robot or an automated system
+        included — talked over the robot mid-sentence, and *split* says what
+        the room actually got, measured at the sink by
+        :meth:`reachy.speech.realtime_duplex.RealtimeDuplexSession.spoken_split`.
+        Two halves, and neither may be skipped:
+
+        * ``split.said`` is recorded as spoken (through :meth:`note_spoken`, so
+          it is one path, not two) — **exactly** what was heard, never the
+          whole reply. A mind that believes it answered when the room got half
+          a sentence goes on to reason from words nobody received;
+        * ``split.unsaid`` becomes a :class:`reachy.embody.interjection.
+          WantedToSay` artifact — attributed to the reply, bounded, expiring in
+          turns, and parked as CONTEXT so the NEXT turn can decide whether it
+          is still worth saying. Never a trigger: the robot does not wake
+          itself up to finish an old sentence. Never discarded silently either
+          — a refused remainder (blank, or over the shared say cap) is one
+          named drop from :func:`~reachy.embody.interjection.make_wanted_to_say`.
+
+        **The correction case is the ordinary one.** The wire delivers a reply
+        seconds ahead of the speaker, so a human interjecting over the tail
+        does it long after ``response.done`` fired and after
+        :meth:`note_spoken` recorded the reply whole. Handed the full *text*,
+        this replaces that entry with the measured prefix rather than adding a
+        second one. It emits no further ``message`` block for the correction:
+        the export schema has no correction shape, and inventing one here is
+        not this task's to do — the cut is named on the journal and the kept
+        remainder reaches the feed with the next turn.
+
+        **What this does NOT claim (phase 1, spec claim c39).** A client-local
+        cut is invisible to the floor, so the SERVER's own conversation history
+        still holds the full reply and OVERSTATES what the room heard. This
+        record is true because the client is the measured authority for it;
+        nothing here asserts the two agree, and nothing here tries to correct
+        the server (that needs the ``conversation.item.create`` channel, tasks
+        t10/t11). The divergence is knowing, bounded and documented.
+
+        Returns the artifact, or ``None`` when there was no remainder to keep
+        (the reply finished) or the remainder was refused. Never raises: it is
+        called from a session tap on a worker thread.
+        """
+        said = (getattr(split, "said", "") or "").strip()
+        unsaid = (getattr(split, "unsaid", "") or "").strip()
+        text = (getattr(split, "text", "") or "").strip()
+        response_id = getattr(split, "response_id", "") or ""
+        self.replies_cut += 1
+        if not self._correct_spoken(text, said) and said:
+            self.note_spoken(said)
+        artifact = None
+        if unsaid:
+            artifact = make_wanted_to_say(unsaid, response_id=response_id, turn=self.turns)
+        if artifact is not None:
+            self._wanted_to_say.append(artifact)
+            self.submit_cues([artifact.as_cue()])
+        senselog.stage(
+            STAGE,
+            SOURCE,
+            uuid.uuid4().hex[:8],
+            f"reply cut id={response_id or '?'} said={len(said)} chars "
+            f"unsaid={len(unsaid)} chars kept={artifact is not None}",
+        )
+        return artifact
+
+    def _correct_spoken(self, text: str, said: str) -> bool:
+        """Replace an already-recorded WHOLE reply with the part that was heard.
+
+        Returns whether a record was corrected. Scans the already-said buffer
+        for the reply's full text — the entry :meth:`note_spoken` wrote at
+        ``response.done``, before the cut landed — and either narrows it to
+        *said* or removes it entirely when nothing was heard. The buffer holds
+        at most :attr:`Limits.spoken_maxlen` lines, so this is a walk over a
+        handful of strings.
+
+        It races one thing, bounded and on purpose: a turn that drained the
+        buffer between the reply and the cut has already shown the model the
+        coarse record. There is nothing left to narrow then (and the drain is
+        what the :class:`IndexError` arm catches), so the correction is
+        declined rather than misapplied — the kept remainder still carries the
+        truth about what was never said.
+        """
+        if not text:
+            return False
+        for index, spoken in enumerate(self._spoken):
+            if spoken != text:
+                continue
+            try:
+                if said:
+                    self._spoken[index] = said
+                else:
+                    del self._spoken[index]
+            except IndexError:  # pragma: no cover - the turn thread drained it first
+                return False
+            return True
+        return False
+
+    @property
+    def wanted_to_say(self) -> tuple[WantedToSay, ...]:
+        """The remainders still worth offering, oldest first (spec claim c43).
+
+        Expired artifacts are filtered out on READ rather than swept on a
+        timer: expiry is counted in TURNS, and the turn counter is the only
+        clock this record has. A caller therefore never sees a stale
+        remainder, and the deque stays bounded regardless.
+        """
+        live = tuple(item for item in self._wanted_to_say if not item.is_expired(self.turns))
+        if len(live) != len(self._wanted_to_say):
+            self._wanted_to_say.clear()
+            self._wanted_to_say.extend(live)
+        return live
 
     @property
     def attention(self) -> AttentionGate:

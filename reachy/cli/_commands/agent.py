@@ -645,6 +645,9 @@ def cmd_agent_attach(
 #                          the same verdict governs the mind AND the mouth)
 #   duplex on_response  -> engine.note_spoken        (CONTEXT, never a trigger;
 #                          extends a live attention window, never opens one)
+#                       -> engine.note_interrupted_reply  (for a CUT reply: the
+#                          measured said half as spoken, the remainder kept as
+#                          a wanted-to-say artifact the next turn reads — c34)
 #   runtime feed line   -> classified_cues_for_line -> engine.submit_cues
 #                          (a rule FIRE triggers; every other cue parks — #143)
 #   engine + every layer failure -> the shared --export cognition feed
@@ -690,6 +693,12 @@ REASON_CUE_SOURCE_FAILED = "cue-source-failed"
 #: swallowed exception: the tap runs on the session's own worker thread, where
 #: a raise is caught and logged as an anonymous warning at best.
 REASON_ARM_FAILED = "arm-failed"
+#: Asking the session what the room actually heard of a reply raised (task t7).
+#: The tap falls back to the pre-measurement answer — the reply is recorded as
+#: spoken unless the server itself said it was interrupted — so the mind is
+#: never left with NO record of its own voice; the drop says the record is the
+#: coarse one.
+REASON_SPLIT_UNAVAILABLE = "cut-split-unavailable"
 #: Closing a held resource raised. Named, never propagated — a fault in teardown
 #: must not mask the reason the layer was stopping.
 REASON_SHUTDOWN_FAILED = "shutdown-failed"
@@ -722,6 +731,7 @@ EMBODY_REASONS: frozenset[str] = frozenset(
         REASON_SESSION_START_FAILED,
         REASON_CUE_SOURCE_FAILED,
         REASON_ARM_FAILED,
+        REASON_SPLIT_UNAVAILABLE,
         REASON_SHUTDOWN_FAILED,
         REASON_CLIP_UNAVAILABLE,
         REASON_CLIP_STALE,
@@ -1361,7 +1371,12 @@ def _utterance_tap(
     return _heard
 
 
-def _response_tap(engine: object) -> Callable[[object], None]:
+def _response_tap(
+    engine: object,
+    session_of: Callable[[], object | None],
+    *,
+    export: object = None,
+) -> Callable[[object], None]:
     """duplex ``on_response`` -> already-said CONTEXT, never a trigger.
 
     The duplex session answers speech on its own, server-side, so without this
@@ -1369,25 +1384,63 @@ def _response_tap(engine: object) -> Callable[[object], None]:
     would cheerfully call ``speak`` to say it again (the wiring t10's docstring
     singles out as the one this composition could miss).
 
-    An INTERRUPTED reply is deliberately excluded. ``_finish_response``
-    publishes it like any other — the record carries the audio and says why —
-    but never PLAYS it, because a barge-in means the human started talking
-    again. Recording it as spoken would leave the mind believing it had
-    answered when the room heard nothing.
+    **A CUT reply is recorded as what the room heard, not as nothing and not as
+    everything (task t7, spec c34).** Since chunked playback landed, a reply a
+    human talked over has usually been PARTLY spoken — so the session is asked
+    for its measured said/unsaid split and the engine records both halves: the
+    prefix as spoken, the remainder as a kept wanted-to-say artifact the next
+    turn can weigh. Only when there is no measurement at all
+    (:meth:`~reachy.speech.realtime_duplex.RealtimeDuplexSession.spoken_split`
+    yields ``None`` — a reply this session never saw, or one still arriving)
+    does an interrupted reply fall back to the conservative pre-t7 answer of
+    recording nothing: the mind believing it had answered when the room heard
+    nothing is the worse of the two errors.
 
     It is also the second half of the attention window (issue #148): an answer
     the layer actually spoke EXTENDS a live conversation, so a long reply never
     times the human out. It cannot OPEN one — the server answers ambient
     utterances the gate refused, and a robot that could wake itself with its
     own voice would never go quiet again.
+
+    *session_of* is the same late-bound accessor :func:`_utterance_tap` takes,
+    for the same reason: the session is built WITH this tap.
     """
 
     def _spoke(response: object) -> None:
+        split = _measured_split(session_of(), response, export=export)
+        if split is not None and getattr(split, "cut", False):
+            engine.note_interrupted_reply(split)
+            return
         if getattr(response, "interrupted", False):
             return
         engine.note_spoken(getattr(response, "text", "") or "")
 
     return _spoke
+
+
+def _measured_split(session: object | None, response: object, *, export: object = None) -> object:
+    """Ask the session what the room heard of *response*. Never raises.
+
+    This runs on the session's own worker thread, where an escaping exception
+    is logged as an anonymous warning at best — so a session that cannot answer
+    is a NAMED drop and a ``None``, and the caller falls back to the coarse
+    record rather than losing the reply entirely.
+    """
+    if session is None:  # pragma: no cover - composition fills the slot first
+        return None
+    try:
+        # ``or ""`` on purpose: an id-less reply asks for the ANONYMOUS record,
+        # never for "whatever is playing right now", which is what a bare
+        # ``None`` would mean to the session and could name a different reply.
+        return session.spoken_split(getattr(response, "response_id", None) or "")
+    except Exception as err:
+        _embody_drop(
+            export,
+            EMBODY_SOURCE_SESSION,
+            REASON_SPLIT_UNAVAILABLE,
+            f"{type(err).__name__}: {err}",
+        )
+        return None
 
 
 def _require_readable_feed(feed: str) -> None:
@@ -1523,7 +1576,12 @@ def _compose_embody_seam(
         on_utterance=_utterance_tap(
             engine, lambda: session_slot[0] if session_slot else None, export=export
         ),
-        on_response=_response_tap(engine),
+        # Same late-bound accessor, same reason (task t7): the response tap
+        # asks the session what the room actually heard of the reply it is
+        # being handed.
+        on_response=_response_tap(
+            engine, lambda: session_slot[0] if session_slot else None, export=export
+        ),
     )
     session_slot.append(session)
 
