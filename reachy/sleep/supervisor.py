@@ -8,31 +8,28 @@ dir the daemon, demo-mode and vision all use. ``start`` re-invokes this very CLI
 (``python -m reachy sleep run``) so the loop keeps running after the launching
 command returns.
 
-This module deliberately owns its whole process layer rather than sharing a
-supervisor with a sibling noun: it owns its own ``sleep.pid`` / ``sleep.log``
-filenames so the loops can run side-by-side, and it reuses only the *generic*
-process primitives from :mod:`reachy.daemon` (``state_dir`` / ``is_alive`` —
-PID-file location and liveness). The process-management mechanics (PID-file
-write/read, detached spawn, signal-based stop, PID-reuse guard) are kept
-self-contained here, so a change in another noun's supervisor can never reach
-this one. (The ``listen`` supervisor this module was originally a sibling of
-retired with its noun; nothing here had to change, which is the point.)
+This module owns its own ``sleep.pid`` / ``sleep.log`` filenames so the loops
+can run side-by-side, and it reuses the *generic* process primitives from
+:mod:`reachy.daemon` (``state_dir`` / ``is_alive`` — PID-file location and
+liveness). The process-management mechanics (PID-file write/read, detached
+spawn, signal-based stop, PID-reuse guard) live once in :mod:`reachy.procsup`
+and are shared with every sibling supervisor; what stays here is what is
+genuinely sleep's — the filenames, the ``sleep run`` argv, the deliberate
+ABSENCE of a daemon-health preflight (below), and the wording of every message.
+(The ``listen`` supervisor this module was originally a sibling of retired with
+its noun; nothing here had to change, which is the point.)
 
-Pure standard library (``subprocess`` / ``signal`` / ``os``): the loop talks to
-the robot over the existing transport, so this adds **no** third-party runtime
-dependency.
+Pure standard library (``subprocess`` / ``signal`` / ``os``, reached through
+:mod:`reachy.procsup`): the loop talks to the robot over the existing
+transport, so this adds **no** third-party runtime dependency.
 """
 
 from __future__ import annotations
 
-import os
-import signal
-import subprocess  # nosec B404 - only ever re-spawns this trusted CLI (sys.executable -m reachy)
 import sys
-import time
 from pathlib import Path
 
-from reachy.cli._errors import EXIT_ENV_ERROR, CliError
+from reachy import procsup
 
 # Reuse the daemon's generic process primitives + state dir so the sleep loop,
 # the vision loop, demo-mode, and the daemon share one bookkeeping
@@ -40,13 +37,22 @@ from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.daemon import is_alive, state_dir
 from reachy.robot.transport import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
 
-# Grace window after spawning before we trust the loop came up (vs crashed).
-_START_GRACE = 0.4
-# Seconds to wait after SIGTERM before escalating to SIGKILL.
+# Seconds to wait after SIGTERM before escalating to SIGKILL. Owned per
+# supervisor rather than shared: it is an operator-facing default (the
+# ``--timeout`` flag reads it), not a mechanic.
 DEFAULT_STOP_TIMEOUT = 10.0
-# How finely _wait_gone polls for the process to exit.
-_SLEEP_SLICE = 0.25
-_STATUS_NOT_RUNNING = "not running"
+
+# The exact argv tokens the spawn line below carries — see
+# reachy.procsup.has_argv_tokens for why this is a token set and not a substring.
+_IDENTITY_TOKENS = ("reachy", "sleep")
+
+_LABELS = procsup.ProcessLabels(
+    tracked="sleep",
+    launch="sleep",
+    exited="sleep",
+    reused="a sleep loop",
+    signalled="sleep",
+)
 
 
 def pid_file() -> Path:
@@ -59,49 +65,25 @@ def log_file() -> Path:
 
 def read_pid() -> int | None:
     """Return the tracked PID, or ``None`` if the file is absent or unparseable."""
-    try:
-        text = pid_file().read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
-
-
-def _clear_pid() -> None:
-    try:
-        pid_file().unlink()
-    except FileNotFoundError:
-        pass
+    return procsup.read_pid(pid_file())
 
 
 def _wait_gone(pid: int, timeout: float) -> bool:
     """Poll until ``pid`` is gone or ``timeout`` elapses."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not is_alive(pid):
-            return True
-        time.sleep(_SLEEP_SLICE)
-    return not is_alive(pid)
+    return procsup.poll_until_gone(pid, timeout, is_alive=is_alive)
 
 
 def _is_our_process(pid: int) -> bool:
     """Best-effort guard against PID reuse: is ``pid`` actually a sleep loop?
 
-    Reads ``/proc/<pid>/cmdline`` on Linux (the spawn line contains both
-    ``reachy`` and ``sleep``). If ``/proc`` is unavailable we cannot verify, so
-    we trust the pid file. If ``/proc`` exists but the process is gone or clearly
-    isn't ours, return False so :func:`stop` never signals an unrelated pid.
+    The spawn line is ``<python> -m reachy sleep run ...``, so ``reachy`` and
+    ``sleep`` each appear as their OWN argv element — see
+    :data:`_IDENTITY_TOKENS` and :func:`reachy.procsup.has_argv_tokens` for the
+    exact-token rule. This is the noun the substring form (issue #136) failed
+    worst on: ``python -c "import time; time.sleep(60)"`` run from a checkout
+    whose path contains ``reachy`` matched BOTH halves of the old test.
     """
-    if not Path("/proc").is_dir():
-        return True
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return False
-    cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
-    return "reachy" in cmdline and "sleep" in cmdline
+    return procsup.has_argv_tokens(pid, _IDENTITY_TOKENS)
 
 
 def build_run_command(
@@ -171,12 +153,9 @@ def start(
     """
     existing = read_pid()
     if existing is not None and is_alive(existing):
-        return {
-            "status": "already-running",
-            "pid": existing,
-            "transport": transport,
-            "log": str(log_file()),
-        }
+        return procsup.already_running(
+            existing, log_path=log_file(), fields={"transport": transport}
+        )
 
     cmd = build_run_command(
         transport=transport,
@@ -186,39 +165,17 @@ def start(
         idle_timeout=idle_timeout,
         no_audio_wake=no_audio_wake,
     )
-    log_path = log_file()
-    try:
-        with open(log_path, "ab") as logf:
-            proc = subprocess.Popen(  # nosec B603 - trusted argv (this CLI), no shell
-                cmd,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-    except OSError as err:
-        raise CliError(
-            code=EXIT_ENV_ERROR,
-            message=f"failed to launch sleep ({cmd[0]}): {err}",
-            remediation="check the Python interpreter is usable and the state dir is writable",
-        ) from err
-    pid_file().write_text(str(proc.pid), encoding="utf-8")
-
-    time.sleep(_START_GRACE)
-    result: dict[str, object] = {
-        "status": "started",
-        "pid": proc.pid,
-        "transport": transport,
-        "log": str(log_path),
-    }
-    if proc.poll() is not None:
-        # Exited within the grace window — startup failed (e.g. robot unreachable).
-        # Clear the pid file we just wrote so `status`/`stop` don't report a stale pid.
-        _clear_pid()
-        result["status"] = "exited"
-        result["exit_code"] = proc.returncode
-        result["note"] = f"sleep exited during startup; see {log_path}"
-    return result
+    # clear_pid_on_exit: a loop that dies in the grace window (e.g. robot
+    # unreachable) must not leave the pid file we just wrote behind, or
+    # `status`/`stop` would report a stale pid.
+    return procsup.spawn_tracked(
+        cmd=cmd,
+        pid_path=pid_file(),
+        log_path=log_file(),
+        labels=_LABELS,
+        fields={"transport": transport},
+        clear_pid_on_exit=True,
+    )
 
 
 def stop(*, timeout: float = DEFAULT_STOP_TIMEOUT) -> dict[str, object]:
@@ -226,48 +183,14 @@ def stop(*, timeout: float = DEFAULT_STOP_TIMEOUT) -> dict[str, object]:
 
     Guards against PID reuse (never signals a process that isn't our loop).
     """
-    pid = read_pid()
-    if pid is None:
-        return {"status": _STATUS_NOT_RUNNING, "note": "no tracked sleep pid"}
-    if not is_alive(pid):
-        _clear_pid()
-        return {"status": _STATUS_NOT_RUNNING, "pid": pid, "note": "stale pid cleared"}
-    if not _is_our_process(pid):
-        _clear_pid()
-        return {
-            "status": _STATUS_NOT_RUNNING,
-            "pid": pid,
-            "note": "tracked pid is no longer a sleep loop (reused); left untouched",
-        }
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        _clear_pid()
-        return {"status": _STATUS_NOT_RUNNING, "pid": pid, "note": "process already gone"}
-    except PermissionError as err:
-        raise CliError(
-            code=EXIT_ENV_ERROR,
-            message=f"not permitted to stop sleep pid {pid}",
-            remediation="stop it as the owning user",
-        ) from err
-    signaled = "SIGTERM"
-    gone = _wait_gone(pid, timeout)
-    if not gone:
-        try:
-            os.kill(pid, signal.SIGKILL)
-            signaled = "SIGKILL"
-        except ProcessLookupError:
-            gone = True
-        if not gone:
-            gone = _wait_gone(pid, 2.0)
-    if not gone:
-        raise CliError(
-            code=EXIT_ENV_ERROR,
-            message=f"failed to stop sleep pid {pid}: still alive after SIGKILL",
-            remediation="inspect and terminate the process manually",
-        )
-    _clear_pid()
-    return {"status": "stopped", "pid": pid, "signal": signaled}
+    return procsup.stop_tracked(
+        pid_path=pid_file(),
+        labels=_LABELS,
+        timeout=timeout,
+        is_alive=is_alive,
+        is_ours=_is_our_process,
+        wait_gone=_wait_gone,
+    )
 
 
 def restart(**start_kwargs) -> dict[str, object]:
@@ -281,14 +204,8 @@ def restart(**start_kwargs) -> dict[str, object]:
 def status() -> dict[str, object]:
     """Report the sleep loop process state (PID + liveness)."""
     pid = read_pid()
-    if pid is None:
-        process = "stopped"
-    elif is_alive(pid):
-        process = "running"
-    else:
-        process = "stale"  # pid file points at a dead process
     return {
-        "process": process,
+        "process": procsup.process_state(pid, is_alive=is_alive),
         "pid": pid,
         "log": str(log_file()),
     }
