@@ -1015,6 +1015,9 @@ feeds + the intent spool, not the robot.
   spool, publish the agent's own cognition feed. Flags: `--feed <path|->`,
   `--spool-dir DIR` (default: the shared state dir), `--await-timeout SECONDS`,
   `--max-turns N`, `--max-events N`, `--export -` / `--export-blocks`, `--json`.
+- `reachy-mini-cli agent embody` — run the **embodiment layer**: the same
+  external-client shape, but with ears and a mouth. See
+  `reachy-mini-cli explain agent embody`.
 - `reachy-mini-cli agent overview` — this summary.
 
 ## Usage
@@ -1026,6 +1029,85 @@ feeds + the intent spool, not the robot.
 
 - `0` success
 - `1` user-input error
+- `2` environment error (unreadable feed)
+"""
+
+
+_AGENT_EMBODY = """\
+# reachy-mini-cli agent embody
+
+Run the **embodiment layer** — a detachable realtime harness that gives Reachy a
+voice and a conversational mind *beside* the symbolic runtime, never inside it.
+With the layer running the robot holds an out-loud conversation, reacts in voice
+when its own rules fire, and takes direct-operation commands. With it stopped the
+robot is exactly the symbolic presence it is without it: the runtime's decision
+loop and every existing condition are unchanged either way.
+
+`embody` is a sibling of `attach`, not a replacement. `attach` is turn-based,
+text-cue-driven and publish-only (its voice tools emit feed blocks and touch
+nothing). `embody` hears and speaks for real.
+
+## The four channels
+
+- **EARS + MOUTH** — ONE lobes `/v1/realtime` duplex session. Server-side VAD
+  decides where a sentence ended; the session is armed with one `response.create`
+  and its spoken reply is played back out. The layer's hearing is **ungated**:
+  unlike the runtime's transcript sense it runs no engagement gate, so it hears
+  every voice in the room. Only three things ever leave that socket
+  (session config, audio append, `response.create`) — no tool call rides it.
+- **PERCEPTION** — the runtime's own event feed (`sense`/`rule`/`intent`/`motion`)
+  read from `--feed <path|->`, mapped to first-person cues. A **rule firing is the
+  headline input**: a scratch the runtime reacted to reaches the layer as a cue,
+  which is what lets it answer out loud. The MQTT bus is the intended primary
+  route; events-cli is publish-only today, so intake degrades — with one named
+  drop — to tailing the feed.
+- **COGNITION** — streaming `/v1/chat/completions` turns (`worker` for tool-bearing
+  turns, `senses` for perception questions; picked per request from
+  `REACHY_EMBODY_WORKER_MODEL` / `REACHY_EMBODY_SENSES_MODEL`, never from
+  `environment.d`, which the runtime reads too). Every call streams.
+- **ACTION** — a CLOSED five-tool set, each wrapping a surface that already
+  validates fail-closed: `goto` (per-axis bounds, 10 s cap), `run_behavior`
+  (library + unbounded-lifetime refusal), `speak` / `harmonics` (the shared
+  500-character say cap), `create_rule` (the rules overlay, validated, written
+  temp+rename, and always `embody-` prefixed). There is no shell, no filesystem
+  tool and no way to add a sixth.
+
+## Media profiles — configuration, not a code fork
+
+`--media-profile robot` (default) reads the runtime's audio **tee socket** and
+plays through the daemon's **HTTP media route** with `transport=http` passed
+explicitly — the sdk fallback would open a second `ReachyMini`, the one forbidden
+move. `--media-profile bench` binds the dev-box microphone and speakers so the
+whole layer runs on a box with no robot attached. Same classes, same code path;
+`REACHY_EMBODY_MEDIA_PROFILE` selects.
+
+## Observability
+
+`--export -` publishes the same `thinking`/`message`/`emotion` NDJSON feed
+`agent attach` does (`docs/export-schema.md`), and **every** named failure — a
+dead session, a dead LLM, a dead speaker, a refused action, a feed that went
+away — appears both as a `[SENSE stage=embody …]` journal line and as a block on
+that feed. A consumer that disconnects mid-conversation never kills the layer.
+
+## Flags
+
+`--feed <path|->`, `--media-profile {robot,bench}`, `--spool-dir DIR`,
+`--await-timeout SECONDS`, `--turn-interval SECONDS`, `--mute-during-playback`
+(the AEC fallback; off by default), `--max-turns N`, `--max-events N`,
+`--export -` / `--export-blocks`, `--log-level LEVEL`, `--json`.
+
+## Usage
+
+    reachy-mini-cli behavior engine run --export - > /tmp/runtime.feed &
+    reachy-mini-cli agent embody --feed /tmp/runtime.feed --export -
+
+    # on a dev box with no robot:
+    reachy-mini-cli agent embody --media-profile bench --feed -
+
+## Exit codes
+
+- `0` success
+- `1` user-input error (an unknown media profile)
 - `2` environment error (unreadable feed)
 """
 
@@ -1129,4 +1211,5 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("agent",): _AGENT,
     ("agent", "overview"): _AGENT,
     ("agent", "attach"): _AGENT,
+    ("agent", "embody"): _AGENT_EMBODY,
 }
