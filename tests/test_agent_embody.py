@@ -108,28 +108,53 @@ class _SourceBackend:
 
 
 class _SinkBackend:
-    """A media sink backend recording every (pcm, samplerate) it is handed."""
+    """A media sink backend recording every (pcm, samplerate) it is handed.
 
-    def __init__(self, fail: BaseException | None = None) -> None:
+    ``block`` / ``block_after`` wedge the speaker after N confirmed chunks, so
+    a test can hold the mouth mid-reply and know EXACTLY how much the room
+    heard before an interjection lands (task t16's measured split).
+    """
+
+    def __init__(
+        self,
+        fail: BaseException | None = None,
+        *,
+        block: threading.Event | None = None,
+        block_after: int = 0,
+    ) -> None:
         self.played: list[tuple[bytes, int]] = []
         self.closed = 0
         self._fail = fail
+        self._block = block
+        self._block_after = max(0, int(block_after))
+        self._started = 0
 
     def play(self, pcm16_bytes: bytes, *, samplerate: int) -> None:
         if self._fail is not None:
             raise self._fail
+        self._started += 1
+        if self._block is not None and self._started > self._block_after:
+            self._block.wait(timeout=WAIT_BUDGET_S)
         self.played.append((pcm16_bytes, samplerate))
 
     def close(self) -> None:
         self.closed += 1
 
 
-def _media(*, sink_fails: BaseException | None = None, rate: int = 16000) -> EmbodyMedia:
+def _media(
+    *,
+    sink_fails: BaseException | None = None,
+    rate: int = 16000,
+    sink_blocks: threading.Event | None = None,
+    sink_block_after: int = 0,
+) -> EmbodyMedia:
     """The REAL profile-agnostic wrappers over recording backends."""
     return EmbodyMedia(
         profile="bench",
         source=EmbodySource(_SourceBackend(), target_sample_rate=rate),
-        sink=EmbodySink(_SinkBackend(fail=sink_fails)),
+        sink=EmbodySink(
+            _SinkBackend(fail=sink_fails, block=sink_blocks, block_after=sink_block_after)
+        ),
     )
 
 
@@ -147,6 +172,8 @@ class _FakeSession:
         start_error: BaseException | None = None,
         arm_error: BaseException | None = None,
         split_error: BaseException | None = None,
+        cancel_error: BaseException | None = None,
+        playback_pending: bool = False,
         **kwargs,
     ) -> None:
         self.kwargs = kwargs
@@ -164,6 +191,16 @@ class _FakeSession:
         #: exactly as it did before.
         self.split: object | None = None
         self._split_error = split_error
+        #: The tail cut (task t16). ``playback_pending`` models the REAL
+        #: session's own drain semantics rather than a free variable: a cut
+        #: empties the mouth queue and the cut reply can never re-queue, so it
+        #: goes False the moment ``cancel_playback`` is called. Modelling that
+        #: is what makes "the same reply is never cut twice" testable here at
+        #: all — a double that stayed pending would be describing a session
+        #: that does not exist.
+        self.playback_pending = bool(playback_pending)
+        self.cancels = 0
+        self._cancel_error = cancel_error
 
     def start(self) -> None:
         if self._start_error is not None:
@@ -179,10 +216,23 @@ class _FakeSession:
         self.arms += 1
         return True
 
-    # -- the two taps, fired the way the session worker would ---------------- #
+    def cancel_playback(self) -> object:
+        if self._cancel_error is not None:
+            raise self._cancel_error
+        self.cancels += 1
+        self.playback_pending = False
+        return _progress_of(self.split)
+
+    # -- the three taps, fired the way the session worker would -------------- #
 
     def hear(self, text: str) -> None:
         self.kwargs["on_utterance"](Utterance(text=text, t=1.0))
+
+    def speech_started(self, item_id: str = "item_1") -> None:
+        """Fire the VAD tap the way the session worker dispatches it (task t16)."""
+        self.kwargs["on_speech_started"](
+            {"type": "input_audio_buffer.speech_started", "item_id": item_id}
+        )
 
     def spoken_split(self, response_id: str | None = None) -> object | None:
         if self._split_error is not None:
@@ -192,6 +242,14 @@ class _FakeSession:
     def reply(self, text: str, *, interrupted: bool = False, split: object | None = None) -> None:
         if split is not None:
             self.split = split
+        if interrupted:
+            # ``RealtimeDuplexSession._finish_response`` drains the mouth queue
+            # (``_skip_remaining``) BEFORE it fires ``on_response``, so by the
+            # time a server-driven barge-in reaches a tap there is nothing left
+            # for a client-side cut to withhold. Modelled here rather than
+            # poked by hand in a test, because it is the whole reason the two
+            # cut paths cannot double-record one reply.
+            self.playback_pending = False
         self.kwargs["on_response"](
             Response(
                 response_id="r1",
@@ -202,6 +260,30 @@ class _FakeSession:
                 interrupted=interrupted,
             )
         )
+
+
+def _progress_of(split: object | None):
+    """The REAL ``PlaybackProgress`` a ``cancel_playback`` would return for *split*.
+
+    The composition root reads only ``response_id`` off it, but building the
+    genuine record is the same discipline :func:`_measured_split` follows: the
+    join under test is exactly the kind where a double taking ``**kwargs`` on
+    one side hides a shape disagreement on the other.
+    """
+    from reachy.speech.realtime_duplex import PlaybackProgress
+
+    total = int(getattr(split, "total_bytes", 0) or 0)
+    played = int(getattr(split, "played_bytes", 0) or 0)
+    in_flight = int(getattr(split, "in_flight_bytes", 0) or 0)
+    return PlaybackProgress(
+        response_id=getattr(split, "response_id", None) or "r1",
+        queued_bytes=total,
+        played_bytes=played,
+        in_flight_bytes=in_flight,
+        skipped_bytes=max(0, total - played - in_flight),
+        cancelled=True,
+        total_bytes=total,
+    )
 
 
 class _SessionFactory:
@@ -2077,19 +2159,23 @@ def test_a_session_that_refuses_to_arm_is_a_named_drop_not_a_crash(caplog) -> No
         layer.close()
 
 
-def _duplex_factory(server: FakeRealtimeServer):
+def _duplex_factory(server: FakeRealtimeServer, **limits):
     """Build the REAL duplex session against *server* — the end-to-end seam.
 
     An explicit ``url=`` wins over the suite-wide unreachable-gateway guard
     (``tests/conftest.py``'s ``_no_live_realtime_gateway``), which is exactly
     how ``tests/test_realtime_client.py`` points a real client at a fake.
+
+    *limits* overrides ride into the same frozen :class:`DuplexLimits`; the
+    shipped playback chunk is a second of speech, which no offline test should
+    have to synthesize.
     """
 
     def _build(**kwargs):
         return RealtimeDuplexSession(
             **kwargs,
             url=server.url,
-            limits=DuplexLimits(backoff_initial_s=5.0, backoff_max_s=5.0),
+            limits=DuplexLimits(backoff_initial_s=5.0, backoff_max_s=5.0, **limits),
         )
 
     return _build
@@ -2269,3 +2355,227 @@ def test_t7_end_to_end_a_cut_reply_keeps_its_remainder_through_the_real_session(
     assert layer.engine.replies_cut == 1
     assert layer.engine.parked == 1, "the remainder is CONTEXT — parked, never a trigger"
     assert layer.engine.pending == 1, "the utterance woke the mind; the cut added nothing"
+
+
+# =========================================================================== #
+# t16 — the client-side TAIL cut (spec c34/c35/c36, honesty h22)              #
+#                                                                            #
+# The server-driven ``response.interrupted`` path is unchanged and still      #
+# covers the bulk of a reply — upstream paces its delivery to the playhead    #
+# (lobes ``_conversation.py``'s ``delivery_pause_ms``/``DELIVERY_LEAD_MS``)   #
+# precisely so barge-in stays live. What it cannot cover is the lag OUR       #
+# client adds after receipt, which lands AFTER ``response.done``: the floor   #
+# is LISTENING again while the room still hears queued audio, so an           #
+# interjection there produces no ``response.interrupted`` at all.             #
+#                                                                            #
+# The policy is HERE, reading two mechanisms the wire gained and acts on      #
+# neither (``on_speech_started``, ``playback_pending`` — pinned in            #
+# ``tests/test_realtime_duplex.py``, whose three gate-free pins are           #
+# unchanged). Two properties are load-bearing and each has its own test:      #
+# the trigger is VAD-VERIFIED speech and never loudness (c35), and ATTENTION  #
+# does not gate it — anyone in the room, human or not (c36), may stop the     #
+# robot talking, including someone the gate would refuse to think about.      #
+# =========================================================================== #
+
+_CUT_TEXT = "one two three four five six"
+
+
+def _tail_layer(factory: _SessionFactory, **seams):
+    """Compose the layer over *factory* with a real engine and a recording sink."""
+    sink = seams.pop("sink", None) or _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), sink=sink, **seams
+    )
+    return layer, sink
+
+
+def test_t16_a_vad_onset_over_the_tail_cuts_the_queue_and_records_the_measured_split():
+    """Criteria 1 + 2: the cut lands, and the record becomes said + kept remainder.
+
+    The ordering is the REAL tail ordering, not a convenient one: the reply
+    completed and was recorded WHOLE first (``response.done`` fired seconds
+    before the speaker finished), and only then does someone talk over the
+    audio still queued. So the correction path is the ordinary path — t7's
+    ``_correct_spoken`` narrows the entry it already wrote rather than a second
+    one appearing beside it.
+    """
+    factory = _SessionFactory(playback_pending=True)
+    turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    layer, sink = _tail_layer(factory, turn_fn=turn)
+    try:
+        factory.last.reply(
+            _CUT_TEXT, split=_measured_split(said_bytes=48, cut=False, text=_CUT_TEXT)
+        )
+        assert sink.texts("message") == [_CUT_TEXT], "the tail reply is recorded whole first"
+
+        factory.last.split = _measured_split(said_bytes=16, cut=True, text=_CUT_TEXT)
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 1, "the queued tail was never cut"
+        assert layer.engine.replies_cut == 1
+        assert [a.text for a in layer.engine.wanted_to_say] == ["three four five six"]
+
+        layer.engine.submit_utterance("reachy, sorry — go on")
+        assert layer.engine.run_turn() is True
+        content = turn.last_user_content()
+        assert '"one two"' in content
+        assert f'"{_CUT_TEXT}"' not in content, "the whole reply is still recorded as said"
+        assert "I was interrupted before saying" in content
+    finally:
+        layer.close()
+
+
+def test_t16_an_onset_with_nothing_queued_cuts_nothing_and_records_nothing():
+    """Criterion 1's no-op half — and it is a no-op even when a split IS available.
+
+    Every reply this session ever spoke has a measurement, so "is there a split
+    to record" is the wrong question and would file a reply the room heard in
+    full as truncated. The question is whether a cut would WITHHOLD anything.
+    """
+    factory = _SessionFactory(playback_pending=False)
+    layer, sink = _tail_layer(factory)
+    try:
+        factory.last.reply(
+            _CUT_TEXT, split=_measured_split(said_bytes=48, cut=False, text=_CUT_TEXT)
+        )
+        factory.last.split = _measured_split(said_bytes=16, cut=True, text=_CUT_TEXT)
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 0, "a cut with nothing playing is not a no-op"
+        assert layer.engine.replies_cut == 0
+        assert layer.engine.wanted_to_say == ()
+        assert sink.texts("message") == [_CUT_TEXT], "the reply stands as spoken"
+    finally:
+        layer.close()
+
+
+def test_t16_attention_never_gates_the_cut():
+    """Being ignored for THINKING is not the same as being unable to stop the robot.
+
+    Attention is COLD here — nobody has named the robot, so this speaker's own
+    words would not wake a turn (issue #148) — and the cut still lands. Anyone
+    in the room may interrupt, and "anyone" reads as any external interlocutor,
+    a peer robot or an automated system included (spec decision c36).
+    """
+    factory = _SessionFactory(playback_pending=True)
+    layer, _sink = _tail_layer(factory)
+    try:
+        assert layer.engine.attention.is_warm() is False, "the gate must start cold"
+        factory.last.split = _measured_split(said_bytes=16, cut=True, text=_CUT_TEXT)
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 1
+        assert layer.engine.replies_cut == 1
+        assert layer.engine.attention.is_warm() is False, "and cutting opens nothing"
+    finally:
+        layer.close()
+
+
+def test_t16_a_server_driven_barge_in_and_a_tail_onset_never_double_record_one_reply():
+    """Criterion 4, first direction: the server cut it, so the client finds nothing.
+
+    ``_finish_response`` drains the mouth queue before it publishes the
+    interrupted reply, so by the time a VAD onset reaches this policy there is
+    nothing left to withhold — the at-most-once property is structural, not a
+    flag someone has to remember to clear.
+    """
+    factory = _SessionFactory(playback_pending=True)
+    layer, _sink = _tail_layer(factory)
+    try:
+        factory.last.reply(
+            _CUT_TEXT, interrupted=True, split=_measured_split(said_bytes=16, text=_CUT_TEXT)
+        )
+        assert layer.engine.replies_cut == 1
+
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 0
+        assert layer.engine.replies_cut == 1, "the reply was recorded as cut twice"
+        assert [a.text for a in layer.engine.wanted_to_say] == ["three four five six"]
+    finally:
+        layer.close()
+
+
+def test_t16_two_onsets_over_one_tail_record_the_reply_cut_exactly_once():
+    """Criterion 4, second direction: a human interjecting twice is still one cut."""
+    factory = _SessionFactory(playback_pending=True)
+    layer, _sink = _tail_layer(factory)
+    try:
+        factory.last.reply(
+            _CUT_TEXT, split=_measured_split(said_bytes=48, cut=False, text=_CUT_TEXT)
+        )
+        factory.last.split = _measured_split(said_bytes=16, cut=True, text=_CUT_TEXT)
+        factory.last.speech_started()
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 1
+        assert layer.engine.replies_cut == 1
+        assert len(layer.engine.wanted_to_say) == 1
+    finally:
+        layer.close()
+
+
+def test_t16_a_session_that_cannot_be_cut_is_a_named_drop_not_a_crash(caplog):
+    """The tap runs on the session's own worker thread: it may never raise."""
+    factory = _SessionFactory(playback_pending=True, cancel_error=RuntimeError("mouth gone"))
+    layer, sink = _tail_layer(factory)
+    try:
+        with caplog.at_level(logging.INFO, logger="reachy"):
+            factory.last.speech_started()
+        assert agent_mod.REASON_TAIL_CUT_FAILED in "\n".join(r.getMessage() for r in caplog.records)
+        assert any(agent_mod.REASON_TAIL_CUT_FAILED in text for text in sink.texts("thinking"))
+        assert layer.engine.replies_cut == 0
+    finally:
+        layer.close()
+
+
+def test_t16_the_composition_hands_the_session_a_vad_tap():
+    """The policy has to be WIRED, not merely written — the #143/#147 defect class."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert callable(factory.last.kwargs["on_speech_started"])
+    finally:
+        layer.close()
+
+
+def test_t16_end_to_end_a_tail_interjection_cuts_the_real_session_and_records_once():
+    """The whole join over a real socket: gateway VAD -> tap -> cut -> record.
+
+    ``RESPONSE_TAIL_INTERJECTION`` scripts the one window that matters: the
+    reply is complete and ``response.done`` has landed (so the layer has
+    already recorded it whole) while the media sink is wedged three chunks
+    behind. Only then does the gateway report a VAD onset — the interjection
+    the floor itself can no longer act on.
+    """
+    release = threading.Event()
+    audio = bytes(range(48))
+    with FakeRealtimeServer(
+        Scenario.RESPONSE_TAIL_INTERJECTION,
+        response_audio=audio,
+        response_chunk_bytes=8,
+        response_text=_CUT_TEXT,
+        wait_timeout=WAIT_BUDGET_S,
+    ) as server:
+        layer, _args, sink = _compose(
+            media=_media(sink_blocks=release, sink_block_after=2),
+            session_factory=_duplex_factory(
+                server, playback_chunk_bytes=8, playback_first_chunk_bytes=8
+            ),
+            lines=iter(()),
+            clip_reader=lambda: None,
+        )
+        try:
+            layer.start()
+            _wait_for(lambda: int(getattr(layer.session, "responses", 0)) >= 1)
+            _wait_for(lambda: int(getattr(layer.session, "played", 0)) == 2)
+            server.release_interjection()
+            _wait_for(lambda: layer.engine.replies_cut >= 1)
+        finally:
+            release.set()
+            layer.close()
+
+    assert layer.engine.replies_cut == 1
+    assert [a.text for a in layer.engine.wanted_to_say] == ["three four five six"]
+    assert layer.session.chunks_cancelled == 3, "the queued tail was never withheld"
+    assert sink.texts("message") == [_CUT_TEXT], "the whole reply was recorded at response.done"

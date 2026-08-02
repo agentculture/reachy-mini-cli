@@ -648,6 +648,11 @@ def cmd_agent_attach(
 #                       -> engine.note_interrupted_reply  (for a CUT reply: the
 #                          measured said half as spoken, the remainder kept as
 #                          a wanted-to-say artifact the next turn reads — c34)
+#   duplex on_speech_started -> session.cancel_playback + the same
+#                          note_interrupted_reply  (the TAIL cut: after
+#                          response.done the floor can no longer interrupt
+#                          anything, and our queue is still draining — c34/c35;
+#                          attention deliberately does NOT gate it)
 #   runtime feed line   -> classified_cues_for_line -> engine.submit_cues
 #                          (a rule FIRE triggers; every other cue parks — #143)
 #   engine + every layer failure -> the shared --export cognition feed
@@ -693,6 +698,10 @@ REASON_CUE_SOURCE_FAILED = "cue-source-failed"
 #: swallowed exception: the tap runs on the session's own worker thread, where
 #: a raise is caught and logged as an anonymous warning at best.
 REASON_ARM_FAILED = "arm-failed"
+#: Cutting the mouth off raised (task t16). The tap runs on the session's own
+#: worker thread, where a raise is an anonymous warning at best — and the room
+#: is still hearing a reply someone just talked over, so it cannot be silent.
+REASON_TAIL_CUT_FAILED = "tail-cut-failed"
 #: Asking the session what the room actually heard of a reply raised (task t7).
 #: The tap falls back to the pre-measurement answer — the reply is recorded as
 #: spoken unless the server itself said it was interrupted — so the mind is
@@ -731,6 +740,7 @@ EMBODY_REASONS: frozenset[str] = frozenset(
         REASON_SESSION_START_FAILED,
         REASON_CUE_SOURCE_FAILED,
         REASON_ARM_FAILED,
+        REASON_TAIL_CUT_FAILED,
         REASON_SPLIT_UNAVAILABLE,
         REASON_SHUTDOWN_FAILED,
         REASON_CLIP_UNAVAILABLE,
@@ -1418,8 +1428,96 @@ def _response_tap(
     return _spoke
 
 
+def _tail_cut_tap(
+    engine: object,
+    session_of: Callable[[], object | None],
+    *,
+    export: object = None,
+) -> Callable[[object], None]:
+    """duplex ``on_speech_started`` -> stop talking, and record what was said.
+
+    **This closes the TAIL only, and that is the whole design.** Upstream
+    already paces its audio delivery to track the playhead (lobes-cli's
+    ``lobes/realtime/_conversation.py``, ``delivery_pause_ms`` /
+    ``DELIVERY_LEAD_MS``) precisely so a human can barge in mid-reply and the
+    floor can see it; that path arrives as ``response.interrupted``, task t6
+    wired it, and :func:`_response_tap` records it. What upstream cannot see is
+    the lag THIS client adds after receipt — up to one playback chunk of
+    accumulation plus the daemon's upload-then-play round trip — which lands
+    AFTER ``response.done``. In that window the floor has returned to LISTENING
+    while the room is still hearing audio, so the moment a listener is most
+    likely to object (having now heard enough to object TO) produces no
+    ``response.interrupted`` at all and the queued chunks play on.
+
+    **VAD-verified speech only (spec claim c35).** The trigger is the server's
+    own ``input_audio_buffer.speech_started``, not a loudness reading: an
+    energy predicate is a LOCATOR, never a content filter, and a cough or a
+    door slam must not be able to cut the robot off mid-sentence. This is the
+    same evidence the floor itself would have acted on a second earlier.
+
+    **Attention does NOT gate this, deliberately.** Being ignored for THINKING
+    (issue #148) is not the same as being unable to stop the robot talking:
+    anyone in the room may interrupt, and "anyone" reads as any external
+    interlocutor — a peer robot or an automated system included (spec decision
+    c36). Cutting also opens no attention window; it is not an address.
+
+    **Two paths, one record.** Nothing here guards against double-recording
+    with a flag, because the session's own drain semantics already make it
+    impossible: a cut empties the mouth queue AND stamps the reply stale so
+    none of it can be re-queued, and ``_finish_response`` drains that same
+    queue before publishing a server-driven interrupt. So a second onset over
+    the same reply finds ``playback_pending`` false and withholds nothing, and
+    a server barge-in leaves nothing for this tap to cut. The one case that
+    DOES reach the engine twice — a reply recorded whole at ``response.done``
+    and then cut — is exactly what t7's ``_correct_spoken`` narrows: one entry
+    replaced, never a second one added.
+
+    **Why the pending check rather than "is there a split to record".** Every
+    reply this session spoke has a measurement, so recording on measurement
+    alone would file a reply the room heard in FULL as truncated. The question
+    is whether a cut would WITHHOLD anything, which is what
+    :attr:`~reachy.speech.realtime_duplex.RealtimeDuplexSession.
+    playback_pending` answers — and it excludes the chunk already inside
+    ``play``, which cannot be recalled.
+
+    A split of ``None`` means the reply has not completed (the cut landed
+    mid-reply, where there is no honest total to divide by). Nothing is
+    recorded here then, on purpose: the ledger carries the cancellation, and
+    :func:`_response_tap` records the measured split when ``response.done`` or
+    ``response.interrupted`` finally lands.
+    """
+
+    def _started(_event: object) -> None:
+        session = session_of()
+        if session is None:  # pragma: no cover - composition fills the slot first
+            return
+        try:
+            if not session.playback_pending:
+                return  # nothing queued: a cut here would withhold nothing
+            progress = session.cancel_playback()
+        except Exception as err:  # this runs on the session's own worker thread
+            _embody_drop(
+                export,
+                EMBODY_SOURCE_SESSION,
+                REASON_TAIL_CUT_FAILED,
+                f"{type(err).__name__}: {err}",
+            )
+            return
+        split = _measured_split(session, progress, export=export)
+        if split is not None and getattr(split, "cut", False):
+            engine.note_interrupted_reply(split)
+
+    return _started
+
+
 def _measured_split(session: object | None, response: object, *, export: object = None) -> object:
     """Ask the session what the room heard of *response*. Never raises.
+
+    *response* is anything carrying a ``response_id`` — the published
+    :class:`~reachy.speech.realtime_duplex.Response` from
+    :func:`_response_tap`, or the :class:`~reachy.speech.realtime_duplex.
+    PlaybackProgress` a cut returns to :func:`_tail_cut_tap`. One accessor for
+    both, so the two cut paths cannot ask the session two different questions.
 
     This runs on the session's own worker thread, where an escaping exception
     is logged as an anonymous warning at best — so a session that cannot answer
@@ -1580,6 +1678,12 @@ def _compose_embody_seam(
         # asks the session what the room actually heard of the reply it is
         # being handed.
         on_response=_response_tap(
+            engine, lambda: session_slot[0] if session_slot else None, export=export
+        ),
+        # The tail cut (task t16): the server's own VAD onset stops the mouth
+        # in the window AFTER ``response.done``, where the floor is listening
+        # again and can no longer interrupt anything itself.
+        on_speech_started=_tail_cut_tap(
             engine, lambda: session_slot[0] if session_slot else None, export=export
         ),
     )
