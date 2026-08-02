@@ -380,7 +380,7 @@ class TestSleepStateMachineBoundaryUnchanged:
 class TestSleepProducerBoundaryUnchanged:
     """Re-assert SleepProducer's ASLEEP contract: label / coalesce-key / near-zero-yaw."""
 
-    def _get_asleep_action(self, t: float = 100.0):  # noqa: ANN202
+    def _get_asleep_action(self, t: float = 100.0):
         """Return the MotionAction submitted by a fresh ASLEEP producer at time *t*."""
         q = MotionQueue()
         prod = SleepProducer(queue=q, state=SleepState.ASLEEP)

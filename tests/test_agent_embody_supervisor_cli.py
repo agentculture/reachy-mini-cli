@@ -48,7 +48,7 @@ class _SpyPopen:
     returncode = None
     pid = 4242
 
-    def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001 - test shim
+    def __init__(self, cmd, **kwargs) -> None:  # test shim
         self.cmd = list(cmd)
         self.kwargs = kwargs
 
@@ -57,7 +57,7 @@ class _SpyPopen:
 
 
 def _spy_popen(box):
-    def _popen(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _popen(cmd, **kwargs):  # test shim
         proc = _SpyPopen(cmd, **kwargs)
         box.append(proc)
         return proc

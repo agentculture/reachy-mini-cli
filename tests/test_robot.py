@@ -38,7 +38,7 @@ class _FakeResp:
 def _patch_urlopen(monkeypatch, payload, recorder=None, status=200):
     """Patch urllib so the http transport returns ``payload`` and records the request."""
 
-    def _fake(req, timeout=None):  # noqa: ANN001 - test shim
+    def _fake(req, timeout=None):  # test shim
         if recorder is not None:
             recorder["method"] = req.get_method()
             recorder["url"] = req.full_url
@@ -106,7 +106,7 @@ def test_doa_http_500_is_env_error(monkeypatch) -> None:
     from reachy.cli._errors import EXIT_ENV_ERROR, CliError
     from reachy.robot.http_transport import HttpTransport
 
-    def _boom(req, timeout=None):  # noqa: ANN001 - test shim
+    def _boom(req, timeout=None):  # test shim
         raise urllib.error.HTTPError(req.full_url, 500, "err", email.message.Message(), None)
 
     monkeypatch.setattr("urllib.request.urlopen", _boom)
@@ -194,7 +194,7 @@ def test_move_wake_posts(monkeypatch) -> None:
 
 
 def test_daemon_unreachable_exit_2(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
-    def _boom(req, timeout=None):  # noqa: ANN001 - test shim
+    def _boom(req, timeout=None):  # test shim
         raise urllib.error.URLError(ConnectionRefusedError("refused"))
 
     monkeypatch.setattr("urllib.request.urlopen", _boom)
@@ -207,7 +207,7 @@ def test_daemon_unreachable_exit_2(monkeypatch, capsys: pytest.CaptureFixture[st
 
 
 def test_daemon_unreachable_json(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
-    def _boom(req, timeout=None):  # noqa: ANN001 - test shim
+    def _boom(req, timeout=None):  # test shim
         raise urllib.error.URLError(ConnectionRefusedError("refused"))
 
     monkeypatch.setattr("urllib.request.urlopen", _boom)
@@ -219,7 +219,7 @@ def test_daemon_unreachable_json(monkeypatch, capsys: pytest.CaptureFixture[str]
 
 
 def test_http_4xx_is_user_error(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
-    def _raise_400(req, timeout=None):  # noqa: ANN001 - test shim
+    def _raise_400(req, timeout=None):  # test shim
         fp = io.BytesIO(json.dumps({"detail": "no such app"}).encode("utf-8"))
         raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", email.message.Message(), fp)
 

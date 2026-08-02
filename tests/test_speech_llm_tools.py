@@ -110,7 +110,7 @@ class _FakeResponse:
 def _stub_urlopen(monkeypatch, body: bytes, status: int = 200):
     captured: dict = {}
 
-    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+    def fake_urlopen(req, timeout=None):
         captured["req"] = req
         captured["timeout"] = timeout
         return _FakeResponse(body, status=status)
@@ -425,7 +425,7 @@ def test_complete_turn_sends_stream_false(monkeypatch):
 def test_stream_turn_unreachable_raises_clierror(monkeypatch):
     import urllib.error
 
-    def boom(req, timeout=None):  # noqa: ANN001
+    def boom(req, timeout=None):
         raise urllib.error.URLError("Connection refused")
 
     monkeypatch.setattr(llm.urllib.request, "urlopen", boom)
@@ -445,7 +445,7 @@ def test_stream_turn_non_200_raises_clierror(monkeypatch):
 def test_complete_turn_unreachable_raises_clierror(monkeypatch):
     import urllib.error
 
-    def boom(req, timeout=None):  # noqa: ANN001
+    def boom(req, timeout=None):
         raise urllib.error.URLError("Connection refused")
 
     monkeypatch.setattr(llm.urllib.request, "urlopen", boom)

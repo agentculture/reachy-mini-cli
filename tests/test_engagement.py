@@ -86,7 +86,7 @@ class _RecordingComplete:
         self._response = response
         self.messages: list[list[dict]] = []
 
-    def __call__(self, messages, **kwargs):  # noqa: ANN001, ANN003
+    def __call__(self, messages, **kwargs):
         self.messages.append(messages)
         return self._response
 
@@ -330,7 +330,7 @@ def test_classifier_failure_propagates_from_judge() -> None:
     not swallow — mirroring ``llm.complete``'s own "raise, don't swallow" policy.
     """
 
-    def boom(messages, **kwargs):  # noqa: ANN001, ANN003
+    def boom(messages, **kwargs):
         raise socket.timeout("timed out")
 
     clf = EngagementClassifier(complete_fn=boom)
@@ -342,7 +342,7 @@ def test_classifier_threads_tunables_to_complete_fn() -> None:
     """model / base_url / api_key / timeout are forwarded to ``complete_fn``."""
     captured: dict = {}
 
-    def capture(messages, **kwargs):  # noqa: ANN001, ANN003
+    def capture(messages, **kwargs):
         captured.update(kwargs)
         return "YES"
 
@@ -364,7 +364,7 @@ def test_classifier_default_timeout_is_bounded() -> None:
     """The classifier uses a tight, bounded default timeout (<= 10 s)."""
     captured: dict = {}
 
-    def capture(messages, **kwargs):  # noqa: ANN001, ANN003
+    def capture(messages, **kwargs):
         captured.update(kwargs)
         return "YES"
 

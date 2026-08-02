@@ -47,7 +47,7 @@ class _FakeResp:
 def _patch_urlopen(monkeypatch, payload, recorder=None, status=200):
     """Patch urllib so the http transport returns ``payload`` and records the request."""
 
-    def _fake(req, timeout=None):  # noqa: ANN001 - test shim
+    def _fake(req, timeout=None):  # test shim
         if recorder is not None:
             recorder["method"] = req.get_method()
             recorder["url"] = req.full_url

@@ -191,7 +191,7 @@ def peek_moving(moving: SelfMovingProvider | None) -> bool:
         return False
     try:
         return bool(moving())
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
@@ -212,7 +212,7 @@ def rms_from_chunk(chunk: Any) -> float | None:
         return None
     try:
         return compute_rms(chunk)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -280,7 +280,7 @@ class RmsSense:
         self._pulled_at = t
         try:
             chunk = self._audio()
-        except Exception:  # noqa: BLE001 — an unreachable source is "no reading"
+        except Exception:  # an unreachable source is "no reading"
             chunk = None
         measured = rms_from_chunk(chunk)
         self._rms = measured if self._gate is None else self._gate.apply(measured)
@@ -303,7 +303,7 @@ class RmsSense:
     def _clock(self) -> float:
         try:
             return float(self._now())
-        except Exception:  # noqa: BLE001 — a broken clock must not crash the tick
+        except Exception:  # a broken clock must not crash the tick
             return 0.0
 
 

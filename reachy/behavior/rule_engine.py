@@ -414,7 +414,7 @@ class RuleEngine:
             try:
                 if self._eval(rule.when, sense, now):
                     blocked |= set(rule.disable)
-            except Exception:  # noqa: BLE001 - a bad rule never breaks the tick
+            except Exception:  # a bad rule never breaks the tick
                 logger.exception("inhibit rule %r failed to evaluate", rule.id)
         return blocked
 
@@ -422,7 +422,7 @@ class RuleEngine:
         for rule in self._config.inhibit:
             try:
                 self._fire_inhibit_rule(ctx, rule, sense, now)
-            except Exception:  # noqa: BLE001 - isolate a single bad rule
+            except Exception:  # isolate a single bad rule
                 logger.exception("inhibit rule %r failed", rule.id)
 
     def _fire_inhibit_rule(self, ctx, rule: Rule, sense: Sense, now: float) -> None:
@@ -449,7 +449,7 @@ class RuleEngine:
             try:
                 if self._fire_react_rule(ctx, rule, sense, now, inhibited, active):
                     active.add(rule.behavior)
-            except Exception:  # noqa: BLE001 - isolate a single bad rule
+            except Exception:  # isolate a single bad rule
                 logger.exception("react rule %r failed", rule.id)
 
     def _fire_react_rule(self, ctx, rule, sense, now, inhibited, active) -> bool:
@@ -491,7 +491,7 @@ class RuleEngine:
             return
         try:
             self._speech(rule.say)
-        except Exception as err:  # noqa: BLE001 - a voice fault never breaks the tick
+        except Exception as err:  # a voice fault never breaks the tick
             logger.warning("react rule %r: speech dispatch raised", rule.id, exc_info=True)
             senselog.drop(
                 STAGE,
@@ -661,14 +661,14 @@ class TickBus:
         for driver in self._drivers:
             try:
                 driver(ctx)
-            except Exception:  # noqa: BLE001 - one rider never breaks the loop
+            except Exception:  # one rider never breaks the loop
                 logger.exception("tick driver %r raised", driver)
 
     def emit(self, event: dict) -> None:
         for consumer in self._consumers:
             try:
                 consumer(event)
-            except Exception:  # noqa: BLE001 - one consumer never breaks the fan-out
+            except Exception:  # one consumer never breaks the fan-out
                 logger.exception("event consumer %r raised", consumer)
 
 

@@ -304,7 +304,7 @@ def build_clip_encoder(
     writer) — only a genuinely unexpected cv2 error propagates, which the
     caller (:meth:`ClipRider._encode_and_publish`) already catches and names.
     """
-    global _VISION_WARNED  # noqa: PLW0603 — one process-wide warning, by design
+    global _VISION_WARNED  # one process-wide warning, by design
     if face_sense.vision_unavailable_reason(find_spec=find_spec) is not None:
         if not _VISION_WARNED:
             _VISION_WARNED = True
@@ -315,7 +315,7 @@ def build_clip_encoder(
         return None
     try:
         import cv2  # local: lazy, only after the probe confirms it is importable
-    except Exception:  # noqa: BLE001 — a broken vision stack disables the clip, nothing more
+    except Exception:  # a broken vision stack disables the clip, nothing more
         if not _VISION_WARNED:
             _VISION_WARNED = True
             logger.warning(
@@ -479,7 +479,7 @@ class ClipRider:
                 if len(self._inbox) >= self._inbox.maxlen:
                     self.inbox_dropped += 1
                 self._inbox.append((now, frame))
-        except Exception as err:  # noqa: BLE001 — a sink must never break the tick
+        except Exception as err:  # a sink must never break the tick
             logger.debug("ClipRider: offer() raised (%s); frame not queued", err)
 
     # ------------------------------------------------------------------ #
@@ -500,7 +500,7 @@ class ClipRider:
         while not self._stop.is_set():
             try:
                 self._worker_tick()
-            except Exception:  # noqa: BLE001 — never let the worker die on a bad frame
+            except Exception:  # never let the worker die on a bad frame
                 logger.warning("ClipRider worker tick raised; continuing", exc_info=True)
             self._stop.wait(_POLL_INTERVAL)
 
@@ -538,7 +538,7 @@ class ClipRider:
         fps = _infer_fps(frames)
         try:
             ok = bool(self._encoder(frames, fps, self._tmp_path))
-        except Exception as err:  # noqa: BLE001 — an encoder fault is a named drop, not a crash
+        except Exception as err:  # an encoder fault is a named drop, not a crash
             logger.warning("ClipRider: encoder raised (%s); clip not written", err, exc_info=True)
             senselog.drop(STAGE, SOURCE, _EVENT, f"encode-raised ({type(err).__name__}: {err})")
             self._cleanup_tmp()
@@ -572,7 +572,7 @@ class ClipRider:
             self._tmp_path.unlink()
         except FileNotFoundError:
             pass
-        except OSError:  # noqa: BLE001 — cleanup must never raise
+        except OSError:  # cleanup must never raise
             logger.debug("ClipRider: could not remove a stale temp clip file", exc_info=True)
 
     # ------------------------------------------------------------------ #
@@ -588,10 +588,10 @@ class ClipRider:
             return _unavailable_block(REASON_NO_CLIP_YET)
         return dict(descriptor)
 
-    def __call__(self, ctx=None) -> None:  # noqa: ARG002 - ctx unused; the block is structural
+    def __call__(self, ctx=None) -> None:  # ctx unused; the block is structural
         try:
             self._publish()
-        except Exception:  # noqa: BLE001 — a sense tap must never crash the loop
+        except Exception:  # a sense tap must never crash the loop
             logger.warning("ClipRider tick raised; skipping this tick", exc_info=True)
 
     def _publish(self) -> None:

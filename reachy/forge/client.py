@@ -311,7 +311,7 @@ class ForgeClient:
     def _run(self, goal: str, context: dict, improve: str | None) -> None:
         try:
             self._run_inner(goal, context, improve)
-        except Exception as err:  # noqa: BLE001 - last-resort safety net
+        except Exception as err:  # last-resort safety net
             self._reject(None, [f"internal error: {err}"])
 
     def _run_inner(self, goal: str, context: dict, improve: str | None) -> None:
@@ -359,7 +359,7 @@ class ForgeClient:
             return self._transport(url, payload, headers, self._timeout)
         except TimeoutError as err:
             self._reject(None, [f"request timed out: {err}"])
-        except Exception as err:  # noqa: BLE001 - any transport failure is a rejection
+        except Exception as err:  # any transport failure is a rejection
             self._reject(None, [f"endpoint unreachable: {err}"])
         return None
 
@@ -398,7 +398,7 @@ class ForgeClient:
             return
         try:
             ok, reasons = validator(skill_dir)
-        except Exception as err:  # noqa: BLE001 - a buggy validator must not activate anything
+        except Exception as err:  # a buggy validator must not activate anything
             self._reject(name, [f"validator error: {err}"], skill_dir)
             return
         if not ok:

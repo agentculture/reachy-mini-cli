@@ -60,7 +60,7 @@ class SharedPoseReader:
         if self._value is _UNSET:
             try:
                 self._value = self._source()
-            except Exception:  # noqa: BLE001 - a read-only sense tap degrades
+            except Exception:  # a read-only sense tap degrades
                 self._value = None
         value = self._value
         if value is None:
@@ -144,7 +144,7 @@ def _feel_alive_owner(ctx) -> tuple[str | None, str | None]:  # type: ignore[no-
         return None, "owner is not the canonical CLI feel-alive behavior"
     try:
         active = ctx.active_names()
-    except Exception:  # noqa: BLE001 - absence fails closed
+    except Exception:  # absence fails closed
         return None, "active behavior identity is unavailable"
     if not isinstance(active, set) or "feel-alive" not in active:
         return None, "canonical CLI feel-alive is not active"

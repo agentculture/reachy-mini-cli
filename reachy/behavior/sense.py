@@ -212,7 +212,7 @@ class DoaPoller:
             # reading" — it must never crash the 50 Hz loop.
             try:
                 self._last = self._read()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 self._last = EMPTY_SENSE
         return self._last
 
@@ -347,7 +347,7 @@ def _peek(provider, default):
         return default
     try:
         return provider()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return default
 
 

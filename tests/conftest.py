@@ -250,7 +250,7 @@ def _no_live_voice_out(monkeypatch: pytest.MonkeyPatch):
     real_urlopen = urllib.request.urlopen
     banned = {8000, 9000}
 
-    def _guarded_urlopen(req, *args, **kwargs):  # noqa: ANN001 — urlopen's own shape
+    def _guarded_urlopen(req, *args, **kwargs):  # urlopen's own shape
         url = getattr(req, "full_url", req)
         try:
             parts = urllib.parse.urlsplit(url if isinstance(url, str) else "")

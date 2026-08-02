@@ -96,7 +96,7 @@ def test_explicit_kwargs_win_over_env(monkeypatch):
 def test_embed_text_posts_openai_shaped_payload_and_parses_vector(monkeypatch):
     captured = {}
 
-    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+    def fake_urlopen(req, timeout=None):
         captured["url"] = req.full_url
         captured["headers"] = dict(req.header_items())
         captured["body"] = json.loads(req.data.decode("utf-8"))
@@ -126,7 +126,7 @@ def test_embed_text_skips_auth_header_when_no_api_key(monkeypatch):
     monkeypatch.delenv("REACHY_OPENAI_API_KEY", raising=False)
     captured = {}
 
-    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+    def fake_urlopen(req, timeout=None):
         captured["headers"] = dict(req.header_items())
         body = {"data": [{"embedding": [1.0]}]}
         return _FakeResponse(json.dumps(body).encode("utf-8"))
@@ -142,7 +142,7 @@ def test_embed_text_skips_auth_header_when_no_api_key(monkeypatch):
 
 
 def test_embed_text_http_error_raises_clean_cli_error(monkeypatch):
-    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+    def fake_urlopen(req, timeout=None):
         raise urllib.error.HTTPError(req.full_url, 500, "boom", None, None)
 
     monkeypatch.setattr(embeddings_mod.urllib.request, "urlopen", fake_urlopen)
@@ -152,7 +152,7 @@ def test_embed_text_http_error_raises_clean_cli_error(monkeypatch):
 
 
 def test_embed_text_unreachable_raises_clean_cli_error(monkeypatch):
-    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+    def fake_urlopen(req, timeout=None):
         raise OSError("connection refused")
 
     monkeypatch.setattr(embeddings_mod.urllib.request, "urlopen", fake_urlopen)
@@ -164,7 +164,7 @@ def test_embed_text_unreachable_raises_clean_cli_error(monkeypatch):
 
 
 def test_embed_text_malformed_response_raises_clean_cli_error(monkeypatch):
-    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+    def fake_urlopen(req, timeout=None):
         return _FakeResponse(json.dumps({"oops": "no data key"}).encode("utf-8"))
 
     monkeypatch.setattr(embeddings_mod.urllib.request, "urlopen", fake_urlopen)
@@ -173,7 +173,7 @@ def test_embed_text_malformed_response_raises_clean_cli_error(monkeypatch):
 
 
 def test_embed_text_non_2xx_status_raises_clean_cli_error(monkeypatch):
-    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+    def fake_urlopen(req, timeout=None):
         return _FakeResponse(b"{}", status=503)
 
     monkeypatch.setattr(embeddings_mod.urllib.request, "urlopen", fake_urlopen)

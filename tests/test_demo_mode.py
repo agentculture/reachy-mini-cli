@@ -46,7 +46,7 @@ class _FakeTransport(alive.Transport):
         self.calls.append(("wake",))
         return {"status": "ok"}
 
-    def move_goto(self, **kwargs) -> object:  # noqa: ANN003 - test shim
+    def move_goto(self, **kwargs) -> object:  # test shim
         self.calls.append(("goto", kwargs))
         self.gotos.append(kwargs)
         if self._fail_forever or self._fail_times > 0:
@@ -227,7 +227,7 @@ def test_run_command_unreachable_exits_2(monkeypatch, capsys) -> None:
 class _FakePopen:
     returncode = None
 
-    def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001 - test shim
+    def __init__(self, cmd, **kwargs) -> None:  # test shim
         self.cmd = list(cmd)
         self.kwargs = kwargs
         self.pid = 5151
@@ -241,7 +241,7 @@ class _DeadPopen(_FakePopen):
 
 
 def _popen_factory(box, cls=_FakePopen):
-    def _popen(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _popen(cmd, **kwargs):  # test shim
         proc = cls(cmd, **kwargs)
         box.append(proc)
         return proc
@@ -273,7 +273,7 @@ def test_start_preflights_and_spawns(monkeypatch, tmp_path, capsys) -> None:
 def test_start_refuses_when_daemon_unreachable(monkeypatch, capsys) -> None:
     monkeypatch.setattr("reachy.alive.health_ok", lambda *a, **k: False)
 
-    def _no_spawn(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _no_spawn(cmd, **kwargs):  # test shim
         raise AssertionError("must not spawn when the daemon is unreachable")
 
     monkeypatch.setattr("subprocess.Popen", _no_spawn)
@@ -289,7 +289,7 @@ def test_start_idempotent_when_already_running(monkeypatch, tmp_path, capsys) ->
     (tmp_path / "demo-mode.pid").write_text("5151")
     monkeypatch.setattr("reachy.alive.is_alive", lambda pid: True)
 
-    def _no_spawn(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _no_spawn(cmd, **kwargs):  # test shim
         raise AssertionError("must not spawn when a loop already runs")
 
     monkeypatch.setattr("subprocess.Popen", _no_spawn)
@@ -388,7 +388,7 @@ def test_stop_fails_when_unkillable(monkeypatch, tmp_path, capsys) -> None:
 def test_start_wraps_popen_oserror(monkeypatch, capsys) -> None:
     monkeypatch.setattr("reachy.alive.health_ok", lambda *a, **k: True)
 
-    def _boom(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _boom(cmd, **kwargs):  # test shim
         raise OSError("Exec format error")
 
     monkeypatch.setattr("subprocess.Popen", _boom)

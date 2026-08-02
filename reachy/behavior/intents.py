@@ -339,7 +339,7 @@ class IntentDriver:
     def _emit(self, ctx, event_type: str, **fields: object) -> None:
         try:
             ctx.emit({"type": event_type, "ts": ctx.now, "tick": ctx.tick, **fields})
-        except Exception:  # noqa: BLE001 - a raising consumer must never break a tick
+        except Exception:  # a raising consumer must never break a tick
             logger.exception("intent emit failed")
 
     # -- kind handlers (registered into self.registry) ------------------------ #
@@ -383,7 +383,7 @@ class IntentDriver:
             ctx.evict(previous["name"])
         return {"ok": True, "op": DECLARE_GOAL, "goal": name, "params": params}
 
-    def _apply_set_mode(self, payload: dict, ctx) -> dict:  # noqa: ARG002 - ctx unused
+    def _apply_set_mode(self, payload: dict, ctx) -> dict:  # ctx unused
         mode = payload.get("mode")
         if mode is not None and self._known_modes is not None:
             valid = set(self._known_modes())
@@ -398,7 +398,7 @@ class IntentDriver:
         self._mode = mode
         return {"ok": True, "op": SET_MODE, "mode": mode}
 
-    def _apply_set_inhibition(self, payload: dict, ctx) -> dict:  # noqa: ARG002 - ctx unused
+    def _apply_set_inhibition(self, payload: dict, ctx) -> dict:  # ctx unused
         raw = payload.get("behaviors")
         if not isinstance(raw, list):
             raise CliError(
@@ -461,7 +461,7 @@ class IntentDriver:
             "mode": self._mode,
         }
 
-    def _publish_state(self, ctx) -> None:  # noqa: ARG002 - ctx unused (kept for symmetry)
+    def _publish_state(self, ctx) -> None:  # ctx unused (kept for symmetry)
         current = self._main.read_state() or {}
         merged = dict(current)
         merged["intents"] = self._intents_view()

@@ -936,7 +936,7 @@ class EmbodyToolRegistry:
             content = tool.handler(arguments)
         except Refusal as err:
             return self._refuse(tool_call_id, event_id, name, err.reason, err.message)
-        except Exception as err:  # noqa: BLE001 - a bad tool call must never kill the turn
+        except Exception as err:  # a bad tool call must never kill the turn
             logger.warning("[embody] handler for %r raised: %s", name, err)
             return self._refuse(
                 tool_call_id, event_id, name, REFUSAL_TOOL_ERROR, f"{name!r} failed: {err}"

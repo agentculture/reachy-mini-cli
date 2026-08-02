@@ -442,7 +442,7 @@ def test_audio_and_frame_share_the_one_client(monkeypatch) -> None:
     for _ in range(25):
         holder.audio()
         holder.frame()
-        holder.camera_available  # noqa: B018 — property read, must not reconstruct
+        holder.camera_available  # property read, must not reconstruct
 
     assert len(fake_cls.calls) == 1
     assert len(fake_cls.instances) == 1

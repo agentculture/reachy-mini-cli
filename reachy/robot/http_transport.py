@@ -102,7 +102,7 @@ class HttpTransport(Transport):
             payload = json.loads(err.read())
             if isinstance(payload, dict):
                 detail = str(payload.get("detail", ""))
-        except Exception:  # noqa: BLE001 - best-effort detail extraction
+        except Exception:  # best-effort detail extraction
             detail = ""
         suffix = f": {detail}" if detail else ""
         is_user = 400 <= err.code < 500

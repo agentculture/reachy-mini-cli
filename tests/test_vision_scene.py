@@ -72,7 +72,7 @@ class _FakeResp:
 
 
 def _fake_urlopen(raw: str, capture: dict | None = None):
-    def _open(req, timeout=None):  # noqa: ANN001
+    def _open(req, timeout=None):
         if capture is not None:
             capture["req"] = req
             capture["timeout"] = timeout
@@ -231,7 +231,7 @@ def test_post_chat_no_auth_header_for_empty_sentinel(monkeypatch) -> None:
 
 
 def test_post_chat_http_error_becomes_scene_error(monkeypatch) -> None:
-    def _open(req, timeout=None):  # noqa: ANN001
+    def _open(req, timeout=None):
         raise urllib.error.HTTPError("http://x", 500, "err", {}, None)
 
     monkeypatch.setattr(scene.urllib.request, "urlopen", _open)
@@ -242,7 +242,7 @@ def test_post_chat_http_error_becomes_scene_error(monkeypatch) -> None:
 
 
 def test_post_chat_url_error_becomes_scene_error(monkeypatch) -> None:
-    def _open(req, timeout=None):  # noqa: ANN001
+    def _open(req, timeout=None):
         raise urllib.error.URLError("connection refused")
 
     monkeypatch.setattr(scene.urllib.request, "urlopen", _open)

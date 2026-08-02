@@ -143,7 +143,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     except CliError as err:
         emit_error(err, json_mode=json_mode)
         return err.code
-    except Exception as err:  # noqa: BLE001 - last-resort; wrap and route cleanly
+    except Exception as err:  # last-resort; wrap and route cleanly
         wrapped = CliError(
             code=EXIT_USER_ERROR,
             message=f"unexpected: {err.__class__.__name__}: {err}",

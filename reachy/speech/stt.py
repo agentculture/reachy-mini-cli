@@ -205,7 +205,7 @@ class Transcriber:
         try:
             return self._post(window)
         # Degrade cleanly: a network/parse failure must never crash the loop.
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("[stt] transcription request failed (%s); no transcript this tick", exc)
             return None
 
@@ -225,7 +225,7 @@ class Transcriber:
         try:
             return self._extract_text(self._post(buf))
         # Degrade cleanly: a network/parse failure must never crash the caller's loop.
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("[stt] utterance transcription failed (%s); no transcript", exc)
             return None
 

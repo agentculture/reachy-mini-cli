@@ -547,7 +547,7 @@ def _to_pcm16(audio: Any) -> bytes:
         if chunk is None or chunk.size == 0:
             return b""
         return (np.clip(chunk, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-    except Exception:  # noqa: BLE001 - the tick thread must never see a raise
+    except Exception:  # the tick thread must never see a raise
         logger.debug("realtime: unusable audio chunk of type %s", type(audio).__name__)
         return b""
 
@@ -948,7 +948,7 @@ def _ws_attempt_connect(
     """
     try:
         return connect()
-    except Exception:  # noqa: BLE001 - a connect fault costs one attempt, not the worker
+    except Exception:  # a connect fault costs one attempt, not the worker
         logger.warning("%s: connect raised", state.stage, exc_info=True)
         teardown()
         state.note_connect_failure(REASON_CONNECT_FAILED, "unexpected connect failure")
@@ -1271,7 +1271,7 @@ class RealtimeTranscriber(_SessionObservables):
             self._pump()
         except _SessionLost as lost:
             return self._after_session_lost(lost, attempts)
-        except Exception:  # noqa: BLE001 - the worker must outlive any fault
+        except Exception:  # the worker must outlive any fault
             logger.warning("realtime: session pump raised", exc_info=True)
             self._teardown_socket()
             self._state.mark_down(REASON_STREAM_CLOSED, "unexpected pump failure")
@@ -1438,7 +1438,7 @@ class RealtimeTranscriber(_SessionObservables):
         if self._on_utterance is not None:
             try:
                 self._on_utterance(utterance)
-            except Exception:  # noqa: BLE001 - a tap must not kill the session
+            except Exception:  # a tap must not kill the session
                 logger.warning("realtime: on_utterance callback raised", exc_info=True)
 
     # --- teardown ------------------------------------------------------ #

@@ -111,7 +111,7 @@ class _FakeStore:
         self._match = match
         self._raises = raises
 
-    def match(self, embedding):  # noqa: ARG002
+    def match(self, embedding):
         if self._raises is not None:
             raise self._raises
         return self._match

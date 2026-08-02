@@ -428,7 +428,7 @@ REQUIRED_SUBSCRIBER_MEMBERS: tuple[str, ...] = ("connected", "connect", "disconn
 def _exposes(client: object, name: str) -> bool:
     try:
         getattr(client, name)
-    except Exception:  # noqa: BLE001 - a sick accessor is a missing member
+    except Exception:  # a sick accessor is a missing member
         return False
     return True
 
@@ -466,13 +466,13 @@ def _try_bus_intake(subscriber: BusSubscriber, topic_filter: str) -> Iterator[st
 
     try:
         subscriber.connect()
-    except Exception as err:  # noqa: BLE001 - a dead broker must not stop the layer
+    except Exception as err:  # a dead broker must not stop the layer
         _drop(SOURCE_BUS, REASON_CONNECT_FAILED, f"({type(err).__name__}: {err})")
         return None
 
     try:
         live = bool(subscriber.connected)
-    except Exception as err:  # noqa: BLE001 - a sick client is named, not fatal
+    except Exception as err:  # a sick client is named, not fatal
         _drop(SOURCE_BUS, REASON_BROKER_UNREACHABLE, f"(connected probe raised {err})")
         return None
     if not live:
@@ -486,7 +486,7 @@ def _try_bus_intake(subscriber: BusSubscriber, topic_filter: str) -> Iterator[st
 
     try:
         subscriber.subscribe(topic_filter, _on_message)
-    except Exception as err:  # noqa: BLE001 - a refused subscribe must not stop the layer
+    except Exception as err:  # a refused subscribe must not stop the layer
         _drop(SOURCE_BUS, REASON_SUBSCRIBE_FAILED, f"({type(err).__name__}: {err})")
         return None
 

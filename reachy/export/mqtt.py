@@ -205,7 +205,7 @@ def _exposes(client: object, name: str) -> bool:
     """
     try:
         getattr(client, name)
-    except Exception:  # noqa: BLE001 - a sick accessor is a missing member
+    except Exception:  # a sick accessor is a missing member
         return False
     return True
 
@@ -405,7 +405,7 @@ class NervousPublisher:
             if callable(on_connect):
                 on_connect(self._note_client_connected)
             self._client.connect()
-        except Exception as err:  # noqa: BLE001 - a dead broker must not kill the runtime
+        except Exception as err:  # a dead broker must not kill the runtime
             self._disable(
                 REASON_CONNECT_FAILED,
                 f"url={broker_url()} ({type(err).__name__}: {err})",
@@ -429,7 +429,7 @@ class NervousPublisher:
             self._publish_raw(self._online_topic, OFFLINE_PAYLOAD, retain=True)
         try:
             self._client.disconnect()
-        except Exception as err:  # noqa: BLE001 - shutdown must never raise
+        except Exception as err:  # shutdown must never raise
             self._drop(REASON_DISCONNECT_FAILED, f"({type(err).__name__}: {err})")
         with self._lock:
             self._online = False
@@ -594,7 +594,7 @@ class NervousPublisher:
             return False
         try:
             client.publish(topic, payload, qos=QOS, retain=retain)
-        except Exception as err:  # noqa: BLE001 - a publish must never reach the tick
+        except Exception as err:  # a publish must never reach the tick
             self.failed_publishes += 1
             self._drop(
                 REASON_PUBLISH_FAILED,
@@ -618,7 +618,7 @@ class NervousPublisher:
             return False
         try:
             live = bool(self._client.connected)
-        except Exception as err:  # noqa: BLE001 - a sick client is named, not fatal
+        except Exception as err:  # a sick client is named, not fatal
             self._drop(
                 REASON_BROKER_UNREACHABLE,
                 f"(connected probe raised {type(err).__name__}: {err})",

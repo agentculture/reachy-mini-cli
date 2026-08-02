@@ -182,7 +182,7 @@ class _FakeHttpCall:
         self._json = json_response
         self.calls: list[dict] = []
 
-    def __call__(self, req, timeout=None):  # noqa: ANN001 - test shim
+    def __call__(self, req, timeout=None):  # test shim
         import json as _json
 
         info: dict = {
@@ -193,7 +193,7 @@ class _FakeHttpCall:
         if req.data:
             try:
                 info["json_body"] = _json.loads(req.data)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 info["raw_data"] = req.data
         self.calls.append(info)
         resp = MagicMock()

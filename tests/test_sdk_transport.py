@@ -54,7 +54,7 @@ class _FakeMedia:
     def stop_recording(self) -> None:
         self.recording_stopped = True
 
-    def get_DoA(self):  # noqa: N802 — matches SDK spelling
+    def get_DoA(self):  # matches SDK spelling
         return self._doa_return
 
     def get_audio_sample(self):
