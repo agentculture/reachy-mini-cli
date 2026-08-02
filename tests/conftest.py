@@ -25,9 +25,16 @@ must never leak into the other 1000+ tests in the suite.
 from __future__ import annotations
 
 import socket
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any
 
 import pytest
+
+#: Every spelling of "this machine" a URL can use — the actuator ban below must
+#: not be sidestepped by writing 127.0.0.1 where localhost was meant.
+_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})  # nosec B104
 
 #: Loopback + a port nothing listens on: connect-refused is immediate and local
 #: (no DNS, no external dependency, no flakiness) even before our guard fires.
@@ -194,6 +201,72 @@ def _no_live_event_broker(monkeypatch: pytest.MonkeyPatch):
     right tool for asserting what got published).
     """
     monkeypatch.setenv("REACHY_MQTT_URL", "127.0.0.1:1")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_voice_out(monkeypatch: pytest.MonkeyPatch):
+    """No test may synthesize speech on, or play sound through, the REAL robot.
+
+    The fourth sibling of the guards above, and it earned its place the same way
+    every one of them did — by the suite actually doing the damage. While
+    building the embodiment layer's composition root, a boundary probe dispatched
+    the ``speak`` tool on the *robot* media profile with the real voice engine
+    resolved. It POSTed to model-gear's TTS and pushed the resulting audio to the
+    daemon's play route: the deployed robot in the next room said it out loud,
+    once, before anyone noticed.
+
+    Two layers, because an env var alone cannot cover this:
+
+    * **Env pins.** TTS reads ``REACHY_TTS_URL`` at call time, so pointing it at
+      the dead loopback covers every caller that respects it. Worth stating
+      plainly: the DEFAULT is ``http://localhost:9000``, a live model-gear
+      container on this box — so "the developer exported nothing" is not the
+      safe state, it is the dangerous one.
+    * **A port ban at the socket's door.** Daemon playback cannot be fixed by an
+      env var: ``play_audio(base_url=DEFAULT_BASE_URL)`` binds that literal
+      ``http://localhost:8000`` as a DEFAULT ARGUMENT at import time, so
+      patching the module constant is already too late.
+
+    The ban is deliberately drawn at **side effects, not at HTTP**. It refuses
+    the two endpoints that act on the physical world — TTS (:9000) makes sound,
+    the daemon (:8000) drives hardware — and lets everything else through. In
+    particular the gateway (:8001) stays reachable, because reading from it is
+    inert and the opt-in live integration tests that hit it are the only thing
+    that has ever caught a served-model drift (issue #132). Banning all HTTP
+    would turn those into permanent skips and quietly delete that signal.
+
+    It refuses with ``URLError`` — an ``OSError`` subclass, exactly what a
+    refused connection raises — so every caller's existing degradation path runs
+    unchanged, including ``_gateway_or_skip``-style probes that skip on a
+    transport failure. A test asserting "a dead speaker is a named drop" still
+    sees a dead speaker; it simply no longer needs a live one to prove it.
+
+    Patching ``urlopen`` (rather than a helper further in) is what keeps the
+    escape hatch working: the several tests that legitimately exercise the http
+    playback leg install their OWN ``urllib.request.urlopen`` fake in the test
+    body, which replaces this wrapper outright and is undone at teardown.
+    """
+    real_urlopen = urllib.request.urlopen
+    banned = {8000, 9000}
+
+    def _guarded_urlopen(req, *args, **kwargs):  # noqa: ANN001 — urlopen's own shape
+        url = getattr(req, "full_url", req)
+        try:
+            parts = urllib.parse.urlsplit(url if isinstance(url, str) else "")
+            port = parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+        except ValueError:  # a malformed URL is not our business to police
+            parts, port = None, None
+        if parts is not None and parts.hostname in _LOOPBACK_NAMES and port in banned:
+            raise urllib.error.URLError(
+                f"tests never reach the robot's actuators (refused {parts.hostname}:{port}) — "
+                "inject a fake or patch urllib.request.urlopen to exercise this leg"
+            )
+        return real_urlopen(req, *args, **kwargs)
+
+    monkeypatch.setenv("REACHY_TTS_URL", _UNREACHABLE)
+    monkeypatch.setenv("REACHY_BASE_URL", _UNREACHABLE)
+    monkeypatch.setattr(urllib.request, "urlopen", _guarded_urlopen)
     yield
 
 
