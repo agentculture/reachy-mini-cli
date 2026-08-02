@@ -413,12 +413,26 @@ def test_arm_can_be_requested_again_from_the_caller_thread() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# h13 — the send surface is CLOSED                                             #
+# h13/h20 — the send surface is CLOSED, and widening it is a DECISION          #
+#                                                                             #
+# Four frame kinds leave this client, and the fourth arrived by decision c28   #
+# rather than by drift: session config (connect-URL query params, never a      #
+# frame), ``input_audio_buffer.append``, ``response.create``, and — since      #
+# task t10 — ``conversation.item.create``. The pins below widened from three   #
+# kinds to four in that same change, which is honesty condition h20's whole    #
+# requirement.                                                                 #
 # --------------------------------------------------------------------------- #
 
 
-def test_h13_only_append_and_response_create_frames_ever_reach_the_server() -> None:
-    """Behavioural half: what actually went out over a full duplex exchange."""
+def test_h13_only_the_legal_frame_kinds_ever_reach_the_server() -> None:
+    """Behavioural half: what actually went out over a full duplex exchange.
+
+    No item is in play here (no re-seed seam, and this gateway announces no
+    item support), so the exchange is exactly the two event kinds it always
+    was — the fourth frame kind costs a session that does not use it nothing.
+    Its own behavioural pin is
+    ``test_h20_the_send_surface_is_four_frame_kinds_once_the_item_channel_is_used``.
+    """
     source = _Source()
     source.offer(_chunk())  # pre-offered — see the criterion-1 test's docstring
     with FakeRealtimeServer(Scenario.DUPLEX_HAPPY_PATH, wait_timeout=_TIMEOUT) as server:
@@ -466,29 +480,41 @@ def _callee(node: ast.Call) -> str | None:
     return None
 
 
-def test_h13_the_modules_outbound_event_family_is_exactly_the_two_legal_kinds() -> None:
-    """AST half (h13): every outbound EVENT this session can construct.
+def test_h20_the_modules_outbound_event_family_is_exactly_the_three_legal_kinds() -> None:
+    """AST half (h13, widened by h20): every outbound EVENT this session can construct.
 
-    Stronger than calling the two known senders: it walks the source for every
-    way an event can come into being — a call to one of the wire's ``build_*``
+    Stronger than calling the known senders: it walks the source for every way
+    an event can come into being — a call to one of the wire's ``build_*``
     event builders, or a hand-written dict literal carrying a ``"type"`` key —
-    and asserts the resulting set is exactly ``input_audio_buffer.append`` plus
-    ``response.create``. A THIRD sender added later under any name fails this
-    immediately; an unrecognised ``build_*_event`` callee fails it too, rather
-    than being silently ignored. Session config is not in the set on purpose:
-    it rides the connect URL's query params, never a frame.
+    and asserts the resulting set is exactly ``input_audio_buffer.append``,
+    ``response.create`` and ``conversation.item.create``. A FOURTH sender added
+    later under any name fails this immediately; an unrecognised
+    ``build_*_event`` callee fails it too, rather than being silently ignored.
+    Session config is not in the set on purpose: it rides the connect URL's
+    query params, never a frame — which is why the SEND SURFACE is four kinds
+    while this EVENT family is three.
+
+    **This pin widened from two members to three in the SAME change that landed
+    ``conversation.item.create``, citing decision c28** — honesty condition h20
+    in as many words. The send surface is a pinned boundary precisely so
+    growing it has to be a decision somebody took and can be found later; a
+    widening that arrived quietly, inside a change about something else, would
+    be indistinguishable from drift. Task t8's per-utterance arming, by
+    contrast, landed with NO pin change at all, because it REUSES
+    ``response.create``.
 
     It scans BOTH source files, because this session's send path spans both:
     the shared wire mechanics live in ``reachy/speech/realtime.py`` (its
     "Shared session mechanics" section) and this module composes them. Scanning
-    only this file would have left the shared owner free to grow a third
+    only this file would have left the shared owner free to grow another
     sender unseen. The sibling pin — that the shared owner can build NOTHING
-    but ``append``, so the ears-only client cannot arm — lives in
-    ``tests/test_realtime_client.py``.
+    but ``append``, so the ears-only client can neither arm nor inject an item —
+    lives in ``tests/test_realtime_client.py``.
     """
     builders = {
         "build_append_event": wire.APPEND_EVENT_TYPE,
         "build_response_create_event": wire.RESPONSE_CREATE_EVENT_TYPE,
+        "build_conversation_item_create_event": wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE,
     }
     found: set[str] = set()
     for path in _SEND_PATH_MODULES:
@@ -505,7 +531,11 @@ def test_h13_the_modules_outbound_event_family_is_exactly_the_two_legal_kinds() 
                         resolved = _resolve_constant(value)
                         if resolved is not None:
                             found.add(resolved)
-    assert found == {wire.APPEND_EVENT_TYPE, wire.RESPONSE_CREATE_EVENT_TYPE}
+    assert found == {
+        wire.APPEND_EVENT_TYPE,
+        wire.RESPONSE_CREATE_EVENT_TYPE,
+        wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE,
+    }
 
 
 def test_h13_the_module_serialises_no_event_of_its_own() -> None:
@@ -2317,9 +2347,15 @@ def test_t7_a_client_side_cut_sends_nothing_to_the_server_and_claims_no_agreemen
     A client-local cut is INVISIBLE to the floor — wire delivery completed, so
     the server sends ``response.done`` and appends the FULL reply to its own
     history. Phase 1 lives with that divergence knowingly: the client is the
-    measured authority for the LAYER's record, and the send surface stays the
-    same three frame kinds (no correction frame exists to send yet — that is
-    the items channel, tasks t10/t11).
+    measured authority for the LAYER's record.
+
+    Task t10 made this a STRONGER statement than it was when it was written.
+    The ``conversation.item.create`` channel now exists, so "the cut sends
+    nothing" is no longer true merely because no frame could carry a
+    correction — it is true because a correction is a POLICY about the
+    canonical history, and that belongs to the layer one level up (decision
+    c27, task t11). This session, with no re-seed seam and no item support
+    announced, still puts exactly the two event kinds on the wire.
     """
     release = threading.Event()
     sink = _Sink(block=release)
@@ -2339,7 +2375,7 @@ def test_t7_a_client_side_cut_sends_nothing_to_the_server_and_claims_no_agreemen
     assert set(_sent_event_types(server)) <= {
         wire.APPEND_EVENT_TYPE,
         wire.RESPONSE_CREATE_EVENT_TYPE,
-    }, "the cut must not grow a fourth frame kind"
+    }, "the cut must not correct the floor's history behind the layer's back"
     split = client.spoken_split()
     assert split is not None and split.cut is True
     assert not any(
@@ -2584,3 +2620,530 @@ def test_t16_the_tail_window_and_its_mechanism_are_documented() -> None:
     assert "on_speech_started" in doc
     assert "playback_pending" in doc
     assert "locator" in doc, "c35: never a loudness reading taken here"
+
+
+# =========================================================================== #
+# t10 — ``conversation.item.create``: the FOURTH frame kind (decision c28)    #
+#                                                                            #
+# The mouth knows nothing the mind knows (issue #153) because there was no    #
+# channel to tell it. Decision c27 makes the LAYER the curator of the         #
+# canonical conversation history; decision c28 chose                          #
+# ``conversation.item.create`` as the per-turn channel that pushes it into    #
+# the floor's generate call — and accepted, explicitly and on both repos,     #
+# that this client's pinned send surface widens from three frame kinds to     #
+# four. Honesty condition h20 requires the pin to widen in the SAME change,   #
+# which is what the renamed AST pins above do.                                #
+#                                                                            #
+# Upstream has NOT shipped item parity (agentculture/lobes-cli#170 item 2 is  #
+# the ask, unanswered at build time), so both the schema and the capability   #
+# announcement are provisional and fail CLOSED — no item is ever sent to a    #
+# gateway that did not announce support. That is the same contract shape      #
+# ``announces_one_shot_arming`` established in task t8.                       #
+# =========================================================================== #
+
+_ITEM = wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE
+_ARM = wire.RESPONSE_CREATE_EVENT_TYPE
+
+#: The one wait in this section that spans a DROP and a full reconnect, so it
+#: budgets for a starved thread rather than for a socket round trip: under
+#: ``pytest -n auto`` this box runs dozens of socket-owning threads at once,
+#: and the ordinary ``_TIMEOUT`` proved tight enough to fail there
+#: occasionally. Costs nothing when things are fast (every wait is a poll).
+_RECONNECT_TIMEOUT = 20.0
+
+#: What a re-seed carries: Gemma's m-window (one turn here, both roles) and the
+#: Qwen-maintained summary of everything older (spec claim c40). The CONTENT is
+#: the layer's business (task t11 curates it); what this file pins is that
+#: whatever the seam returns crosses the wire, in order, before the arm.
+_SUMMARY = duplex.ConversationItem.context("earlier: the operator asked about the weather")
+_TURN = duplex.ConversationItem.history("user", "and what about tomorrow?")
+
+
+class _Reseed:
+    """The injected re-seed seam, counting its calls.
+
+    A plain callable returning a fixed list would pin the ordering just as
+    well; counting calls is what additionally proves the seam is consulted
+    ONCE PER SESSION rather than once per process — the property that makes a
+    reconnect re-seed at all.
+    """
+
+    def __init__(self, *items: duplex.ConversationItem, boom: bool = False) -> None:
+        self._items = list(items)
+        self._boom = boom
+        self.calls = 0
+
+    def __call__(self) -> list[duplex.ConversationItem]:
+        self.calls += 1
+        if self._boom:
+            raise RuntimeError("the canonical history is unavailable")
+        return list(self._items)
+
+
+def _items_announced(client: RealtimeDuplexSession) -> None:
+    """Teach a socket-less session that its gateway announces items.
+
+    The direct-dispatch escape hatch the rest of this file already uses, for
+    the unit-scale checks that need the capability WITHOUT a live session: this
+    event carries no re-seed, so nothing is sent and no socket is touched.
+    """
+    client._dispatch_event(
+        {
+            "type": realtime.SESSION_CREATED,
+            "session_id": "sess_items",
+            "config": {duplex.ITEMS_CONFIG_KEY: duplex.ITEMS_MODE_CONTEXT_AND_HISTORY},
+        }
+    )
+
+
+# --- the capability probe: explicit affirmative only, or nothing --------------
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        None,
+        {},
+        {"config": None},
+        {"config": {}},
+        {"config": {"items": "supported"}},
+        {"config": {"items": ""}},
+        {"config": {"items": True}},
+        {"config": {"items": ["context", "history"]}},
+        {"items": "context_and_history"},  # right value, wrong place
+        {"config": "context_and_history"},
+    ],
+)
+def test_the_item_capability_probe_needs_an_explicit_affirmative_announcement(event) -> None:
+    """Fail CLOSED, exactly like ``announces_one_shot_arming``: anything short of
+    the announced value means this gateway gets no items at all.
+
+    The direction matters here even more than it does for arming. A wrong guess
+    about arming costs the politeness fix; a wrong guess here would send frames
+    a gateway never agreed to parse, against a schema nobody upstream has seen.
+    """
+    assert duplex.announces_conversation_items(event) is False
+
+
+def test_the_item_capability_probe_recognises_the_announced_value() -> None:
+    announced = {
+        "type": "session.created",
+        "config": {duplex.ITEMS_CONFIG_KEY: duplex.ITEMS_MODE_CONTEXT_AND_HISTORY},
+    }
+    assert duplex.announces_conversation_items(announced) is True
+
+
+# --- criterion 1: the fourth frame kind, on a real socket ---------------------
+
+
+def test_h20_the_send_surface_is_four_frame_kinds_once_the_item_channel_is_used() -> None:
+    """Criterion 1, behaviourally: append + response.create + the item frame.
+
+    The AST pins above widen from two event kinds to three in this same change
+    (h20, citing decision c28); this is the other half — what actually leaves
+    the client over a full duplex exchange with a re-seed in play. Session
+    config still rides the connect URL, which is why the SURFACE is four kinds
+    while the EVENT family is three.
+    """
+    source = _Source()
+    source.offer(_chunk())
+    reseed = _Reseed(_SUMMARY, _TURN)
+    with FakeRealtimeServer(
+        Scenario.DUPLEX_HAPPY_PATH, announce_conversation_items=True, wait_timeout=_TIMEOUT
+    ) as server:
+        client = _session(
+            server,
+            read_audio=source,
+            reseed=reseed,
+            stale_drain_max_chunks=0,
+            backoff_initial_s=5.0,
+            backoff_max_s=5.0,
+        )
+        client.start()
+        try:
+            assert _wait_until(lambda: len(server.append_payloads) >= 1)
+            assert _wait_until(lambda: client.responses >= 1)
+        finally:
+            client.close()
+
+    assert set(_sent_event_types(server)) == {wire.APPEND_EVENT_TYPE, _ARM, _ITEM}
+    assert wire.OPCODE_BINARY not in server.received_opcodes
+    assert client.supports_conversation_items is True
+    assert client.items_sent == 2
+    assert reseed.calls == 1
+
+
+def test_an_items_disposition_survives_the_wire_as_context_or_history() -> None:
+    """The ONE distinction the schema exists to carry, checked end to end.
+
+    lobes#170 item 2's constraint is that ephemeral CONTEXT must be
+    distinguishable from a HISTORY turn, because the floor auto-appends both
+    roles already and items landing beside those auto-appends would duplicate
+    and drift. A client that sent both dispositions as one kind would pass every
+    other test in this section — so the harness sorts them, and this asserts the
+    sort.
+    """
+    reseed = _Reseed(_SUMMARY, _TURN)
+    with FakeRealtimeServer(
+        Scenario.CLOSE_MID_STREAM,
+        announce_conversation_items=True,
+        close_after_frames=10_000,
+        wait_timeout=10.0,
+    ) as server:
+        client = _session(server, reseed=reseed, backoff_initial_s=5.0, backoff_max_s=5.0)
+        client.start()
+        try:
+            assert _wait_until(lambda: len(server.items_received) >= 2)
+        finally:
+            client.close()
+
+    assert server.context_items == [("system", _SUMMARY.text)]
+    assert server.history_items == [("user", _TURN.text)]
+    assert [item["type"] for item in server.items_received] == [wire.ITEM_TYPE_MESSAGE] * 2
+
+
+# --- criterion 2 (c44/h29): no item support -> ONE named drop + the degrade ---
+
+
+def test_c44_a_gateway_without_item_support_yields_one_items_unsupported_drop(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """Criterion 2: never half-deploy, and say so exactly once.
+
+    Every gateway shipping today announces nothing about items — parity is
+    parked upstream — so this is not a hypothetical branch, it is the deployed
+    one. The layer must not send a frame the gateway never agreed to parse, must
+    not go silent about it, and must not bury the journal under one line per
+    item: ONE named ``items-unsupported`` drop for the session, however many
+    items were declined (:attr:`items_declined` carries the count).
+
+    The degrade is task t9's already-shipped leg: the connect-time
+    ``system_prompt`` still reaches the gateway on the connect URL, so the
+    session keeps whatever context that channel can carry. Pinned here against
+    the handshake the fake server actually received, not against the client's
+    own idea of its URL.
+    """
+    reseed = _Reseed(_SUMMARY, _TURN)
+    with FakeRealtimeServer(Scenario.DUPLEX_HAPPY_PATH, wait_timeout=_TIMEOUT) as server:
+        client = _session(
+            server,
+            reseed=reseed,
+            system_prompt="Be brief.",
+            backoff_initial_s=5.0,
+            backoff_max_s=5.0,
+        )
+        client.start()
+        try:
+            assert _wait_until(lambda: client.responses >= 1)
+        finally:
+            client.close()
+
+    assert client.supports_conversation_items is False
+    assert server.items_received == [], "no item may reach a gateway that never announced one"
+    assert _count_reason(sense_log, duplex.REASON_ITEMS_UNSUPPORTED) == 1
+    assert client.items_declined == 2, "the attempt was counted, not just refused"
+    assert client.items_sent == 0
+    # ... and the degraded context channel is the one t9 shipped.
+    assert _query(server.request_path or "").get("system_prompt") == ["Be brief."]
+    assert set(_sent_event_types(server)) <= {wire.APPEND_EVENT_TYPE, _ARM}
+
+
+def test_send_item_is_declined_and_counted_when_the_gateway_never_announced() -> None:
+    """The degraded return value is the caller's own answer, not just a log line.
+
+    The same shape :meth:`arm_once` already has, and for the same reason: a
+    caller (task t12's scope injector, t13's snapshot producer) needs to know
+    its context did not land, so it can say so on the export feed rather than
+    reasoning as if the floor had been told.
+    """
+    client = _session(url=_dead_url())
+    assert client.supports_conversation_items is False
+    assert client.send_item(_SUMMARY) is False
+    assert client.items_declined == 1
+    assert client.items_sent == 0
+
+
+def test_only_one_items_unsupported_line_is_logged_however_many_items_are_declined(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """Latched per session — the #99 journal-flood discipline this module already
+    applies to every other repeating failure."""
+    client = _session(url=_dead_url())
+    for _ in range(5):
+        client.send_item(_SUMMARY)
+    assert client.items_declined == 5
+    assert _count_reason(sense_log, duplex.REASON_ITEMS_UNSUPPORTED) == 1
+
+
+# --- criterion 3 (c40/h25): re-seed BEFORE re-arm, on every reconnect --------
+
+
+def test_c40_a_forced_session_drop_re_seeds_before_re_arming() -> None:
+    """Criterion 3, and the ordering is the whole claim.
+
+    A session close wipes the floor's ephemeral history (lobes
+    ``_session.py``'s ``teardown``: ``self._history = []`` — close releases it
+    all), so a reconnect that armed FIRST would let the gateway answer the next
+    turn from an empty history: Gemma silently resets to amnesia, and nothing in
+    any log says so. Ordering is therefore not an implementation detail, it is
+    the claim — pinned on the SEQUENCE the server received, across two
+    connections, because no per-kind counter can express "before".
+
+    The mechanism that guarantees it is structural rather than a convention:
+    the re-seed seam is consulted inside ``session.created`` handling and its
+    items go out on that same worker turn, while the arm is a flag the NEXT
+    pump sends. A caller cannot interleave them and a future edit cannot
+    reorder them without moving the arm INTO the event handler, which this test
+    would catch immediately.
+
+    The drop is keyed on the ARM (``DROP_AFTER_ARM``) rather than on a frame
+    count, so the trigger is the same event the claim is about: by the time it
+    fires, everything the client sends before arming has provably arrived, on
+    a loaded box as much as an idle one.
+    """
+    reseed = _Reseed(_SUMMARY, _TURN)
+    with FakeRealtimeServer(
+        Scenario.DROP_AFTER_ARM, announce_conversation_items=True, wait_timeout=_RECONNECT_TIMEOUT
+    ) as server:
+        client = _session(server, reseed=reseed)
+        client.start()
+        try:
+            assert _wait_until(
+                lambda: len(server.received_event_types) >= 6, timeout=_RECONNECT_TIMEOUT
+            )
+        finally:
+            client.close()
+
+    assert server.connections_accepted >= 2, "the forced drop and its reconnect both happened"
+    assert server.received_event_types[:6] == [_ITEM, _ITEM, _ARM, _ITEM, _ITEM, _ARM]
+    assert reseed.calls >= 2, "the seam is consulted once per SESSION, not once per process"
+    assert client.reseeds >= 2
+    # Both sessions received the whole seed, not a truncated one.
+    assert server.context_items[:2] == [("system", _SUMMARY.text)] * 2
+    assert server.history_items[:2] == [("user", _TURN.text)] * 2
+
+
+def test_a_reseed_is_never_sent_to_a_gateway_that_did_not_announce_items(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """The re-seed path obeys the capability check too — it is not a back door.
+
+    Worth its own test because the re-seed runs inside the session's own
+    ``session.created`` handling rather than through the caller-thread
+    :meth:`send_item`, so an implementation could plausibly have checked the
+    capability in one place and not the other.
+    """
+    reseed = _Reseed(_SUMMARY, _TURN)
+    with FakeRealtimeServer(
+        Scenario.CLOSE_MID_STREAM, close_after_frames=10_000, wait_timeout=10.0
+    ) as server:
+        client = _session(server, reseed=reseed, backoff_initial_s=5.0, backoff_max_s=5.0)
+        client.start()
+        try:
+            assert _established(client)
+            assert _wait_until(lambda: client.items_declined >= 2)
+        finally:
+            client.close()
+
+    assert server.items_received == []
+    assert _count_reason(sense_log, duplex.REASON_ITEMS_UNSUPPORTED) == 1
+
+
+def test_a_raising_reseed_seam_is_a_named_drop_and_the_session_still_arms(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """A broken mind must not cost the robot its voice.
+
+    The seam is injected, so it can raise for reasons this module cannot
+    anticipate. It runs on the worker thread, where an escaping exception would
+    take the session down and start a reconnect that re-ran the same broken
+    seam — a crash loop dressed as a network problem.
+    """
+    reseed = _Reseed(_SUMMARY, boom=True)
+    with FakeRealtimeServer(
+        Scenario.CLOSE_MID_STREAM,
+        announce_conversation_items=True,
+        close_after_frames=10_000,
+        wait_timeout=10.0,
+    ) as server:
+        client = _session(server, reseed=reseed, backoff_initial_s=5.0, backoff_max_s=5.0)
+        client.start()
+        try:
+            assert _established(client)
+            assert _wait_until(lambda: client.arms_sent >= 1)
+        finally:
+            client.close()
+
+    assert _count_reason(sense_log, duplex.REASON_RESEED_FAILED) == 1
+    assert server.items_received == []
+    assert server.connections_accepted == 1, "the session survived its own broken seam"
+
+
+# --- every other failure is named too, and none of them ends the session ------
+
+
+def test_a_gateway_that_rejects_an_item_is_a_named_drop_and_the_session_survives(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """A refusal is an answer, not an outage (the schema is provisional, after all).
+
+    A gateway that announces items and then rejects the shape we send is
+    exactly what a version skew looks like, and it is the most likely way this
+    provisional schema goes wrong in practice. The refusal arrives as a named
+    ``error`` event, which this client already turns into a named drop — what
+    this pins is that the session, the ears and the mouth all outlive it.
+    """
+    reseed = _Reseed(_SUMMARY)
+    with FakeRealtimeServer(
+        Scenario.CLOSE_MID_STREAM,
+        announce_conversation_items=True,
+        reject_items=True,
+        close_after_frames=10_000,
+        wait_timeout=10.0,
+    ) as server:
+        client = _session(server, reseed=reseed, backoff_initial_s=5.0, backoff_max_s=5.0)
+        client.start()
+        try:
+            assert _wait_until(lambda: bool(server.rejected_items))
+            assert _wait_until(lambda: _count_reason(sense_log, duplex.REASON_SERVER_ERROR) >= 1)
+        finally:
+            client.close()
+
+    assert server.connections_accepted == 1
+    assert client.sessions == 1
+
+
+def test_an_invalid_item_is_refused_before_the_wire_and_never_becomes_a_frame(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """Fail closed on the caller's thread, so a bad item costs a drop, not a raise.
+
+    The wire builder raises :class:`ValueError` for an unknown role or
+    disposition (guessing one is the duplicate-and-drift failure the schema
+    exists to prevent). That raise must never reach a caller: this surface is
+    O(1) and non-raising like every other caller-thread method here.
+    """
+    client = _session(url=_dead_url())
+    _items_announced(client)
+    assert client.supports_conversation_items is True
+
+    bogus = duplex.ConversationItem(role="robot", text="hello", disposition="context")
+    assert client.send_item(bogus) is False
+    assert client.send_item(duplex.ConversationItem("system", "hi", "ephemeral")) is False
+    assert client.send_item(duplex.ConversationItem("system", "   ", "context")) is False
+    assert _count_reason(sense_log, duplex.REASON_ITEM_INVALID) == 3
+    assert client.items_sent == 0
+    client.close()
+
+
+def test_a_full_item_queue_evicts_the_oldest_and_names_it(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """A bounded queue that dropped silently would lose context invisibly."""
+    client = _session(url=_dead_url(), item_maxsize=1)
+    _items_announced(client)
+    for index in range(4):
+        assert client.send_item(duplex.ConversationItem.context(f"fact {index}")) is True
+    assert _count_reason(sense_log, duplex.REASON_ITEM_QUEUE_FULL) == 1
+    client.close()
+
+
+def test_a_caller_pushed_item_reaches_the_gateway_on_the_next_pump() -> None:
+    """The between-turns channel task t12/t13 push scopes and snapshots through."""
+    with FakeRealtimeServer(
+        Scenario.CLOSE_MID_STREAM,
+        announce_conversation_items=True,
+        close_after_frames=10_000,
+        wait_timeout=10.0,
+    ) as server:
+        client = _session(server, backoff_initial_s=5.0, backoff_max_s=5.0)
+        client.start()
+        try:
+            assert _wait_until(lambda: client.supports_conversation_items)
+            assert client.send_item(duplex.ConversationItem.context("a person is at the desk"))
+            assert _wait_until(lambda: bool(server.context_items))
+        finally:
+            client.close()
+
+    assert server.context_items == [("system", "a person is at the desk")]
+    assert client.items_sent == 1
+
+
+# --- the provisional contract is written down where the next reader will look -
+
+
+def test_the_item_channel_documents_its_provisional_contract_and_cites_c28() -> None:
+    """h20's citation, pinned rather than trusted to a commit message.
+
+    The widening is legible only if the reason travels with it: a reader who
+    finds a fourth frame kind and no citation cannot tell a decision from a
+    drift. Both the decision (c28) and the unshipped upstream ask (lobes#170
+    item 2) have to be in the module's own docstring.
+    """
+    doc = " ".join((duplex.__doc__ or "").split()).lower()
+
+    assert "conversation.item.create" in doc
+    assert "c28" in doc, "the deliberate widening must cite the decision that took it"
+    assert "lobes-cli#170" in doc, "and the upstream ask it tracks"
+    assert "provisional" in doc
+    assert "four" in doc, "the send surface is four frame kinds now, and says so"
+
+
+def test_the_item_schema_restates_no_bound_of_its_own() -> None:
+    """The layer validates nothing itself (the spec's own rule): an item's text
+    is bounded by whoever produced it — ``ScopeLimits`` for a cognition scope,
+    ``Limits.summary_max_chars`` for a rolling summary — and a bound copied here
+    would be a second number to drift. The queue DEPTH is a bound this module
+    genuinely owns (it is about this client's memory, not about content), so it
+    lives in :class:`Limits` with every other one.
+    """
+    long_text = "x" * (duplex.MAX_VOICE_PROMPT_CHARS * 3)
+    item = duplex.ConversationItem.context(long_text)
+    assert item.valid is True
+    assert "item_maxsize" in {field.name for field in dataclasses.fields(duplex.Limits)}
+
+
+def test_a_reseed_seam_with_nothing_to_say_is_silent_and_not_a_failure(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """An empty re-seed is the ordinary cold-start case, not a fault.
+
+    The layer's canonical history is empty the first time the robot comes up,
+    and a drop line there would train an operator to ignore the one that
+    matters.
+    """
+    reseed = _Reseed()
+    client = _session(url=_dead_url(), reseed=reseed)
+    _items_announced(client)
+
+    assert reseed.calls == 1
+    assert client.reseeds == 0
+    assert client.items_sent == 0
+    assert _count_reason(sense_log, duplex.REASON_ITEMS_UNSUPPORTED) == 0
+    assert _count_reason(sense_log, duplex.REASON_ITEM_INVALID) == 0
+    client.close()
+
+
+def test_an_invalid_item_inside_a_reseed_is_named_and_the_rest_still_goes(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """One bad entry may not take the whole re-seed down with it.
+
+    A re-seed is built from the layer's canonical history, so a single
+    malformed turn in it must cost that turn — named — and not the session's
+    entire memory. Everything offered here is invalid on purpose (a bad
+    disposition, and something that is not an item at all) so nothing reaches a
+    socket this test does not have.
+    """
+    reseed = _Reseed(
+        duplex.ConversationItem("system", "seeded", "ephemeral"),
+        "not an item at all",  # type: ignore[arg-type]
+    )
+    client = _session(url=_dead_url(), reseed=reseed)
+    _items_announced(client)
+
+    assert client.reseeds == 1, "the seam WAS consulted and did return something"
+    assert client.items_sent == 0
+    assert client.items_declined == 2
+    assert _count_reason(sense_log, duplex.REASON_ITEM_INVALID) == 2
+    client.close()

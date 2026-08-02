@@ -304,8 +304,13 @@ def test_this_module_cannot_construct_a_response_create_at_all() -> None:
     the moment it can build the frame.
 
     The mirror image — that the DUPLEX session's send surface, which now spans
-    both files, is still exactly append + response.create + PONG + CLOSE — is
-    pinned by the ``test_h13_*`` family in ``tests/test_realtime_duplex.py``.
+    both files, is exactly append + response.create + conversation.item.create
+    + PONG + CLOSE — is pinned by the ``test_h13_*`` / ``test_h20_*`` family in
+    ``tests/test_realtime_duplex.py``. That fourth kind (decision c28, task
+    t10) is precisely why this test matters: it lives in the DUPLEX module, and
+    this assertion is what keeps it from reaching the ears-only client through
+    the shared owner. A transcriber that could inject conversation items would
+    be putting the runtime's hearing session into a conversation it is not in.
     """
     source = _MODULE_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
