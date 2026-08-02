@@ -40,10 +40,11 @@ from reachy.behavior import audio_tee as tee_mod
 from reachy.behavior.engine import EngineConfig
 from reachy.cli import main
 from reachy.cli._commands import behavior as behavior_mod
+from tests.conftest import WAIT_BUDGET_S
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _BEHAVIOR_MODULE = _REPO_ROOT / "reachy" / "cli" / "_commands" / "behavior.py"
-_TIMEOUT = 5.0
+_TIMEOUT = WAIT_BUDGET_S
 
 
 # --------------------------------------------------------------------------- #

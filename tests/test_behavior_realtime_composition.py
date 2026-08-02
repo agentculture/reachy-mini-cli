@@ -45,13 +45,14 @@ import pytest
 
 from reachy.behavior.engine import EngineConfig
 from reachy.cli._commands import behavior as behavior_mod
+from tests.conftest import WAIT_BUDGET_S
 from tests.fake_realtime_server import FakeRealtimeServer, Scenario
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _BEHAVIOR_MODULE = _REPO_ROOT / "reachy" / "cli" / "_commands" / "behavior.py"
 
 #: How long a bounded wait may spend on a background thread before failing.
-_TIMEOUT = 5.0
+_TIMEOUT = WAIT_BUDGET_S
 
 
 # --------------------------------------------------------------------------- #

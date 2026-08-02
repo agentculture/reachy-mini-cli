@@ -38,11 +38,12 @@ import pytest
 
 from reachy.behavior import audio_tee
 from reachy.embody import media
+from tests.conftest import WAIT_BUDGET_S
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MEDIA_PATH = _REPO_ROOT / "reachy" / "embody" / "media.py"
 
-_TIMEOUT_S = 5.0
+_TIMEOUT_S = WAIT_BUDGET_S
 
 
 # --------------------------------------------------------------------------- #

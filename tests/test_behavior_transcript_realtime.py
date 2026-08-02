@@ -49,6 +49,7 @@ from reachy.speech.realtime import (
     REALTIME_URL_ENV,
     RealtimeTranscriber,
 )
+from tests.conftest import WAIT_BUDGET_S
 from tests.fake_realtime_server import FakeRealtimeServer, Scenario
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -305,7 +306,7 @@ def _ctx(now: float):
     return SimpleNamespace(now=now, tick=int(now * 100), sense=Sense())
 
 
-def _tick_until(driver, predicate, *, timeout: float = 5.0) -> bool:
+def _tick_until(driver, predicate, *, timeout: float = WAIT_BUDGET_S) -> bool:
     """Drive real ticks until *predicate* holds — the loop the runtime itself is."""
     deadline = time.monotonic() + timeout
     t = T0
@@ -350,7 +351,17 @@ def test_words_spoken_into_the_wire_reach_the_sense_snapshot() -> None:
             )
             providers = SenseProviders(transcript=driver.as_provider())
             assert read_perception(providers).transcript == NAMED
-            assert server.append_payloads, "no audio ever reached the server"
+            # WAIT for the append rather than asserting it outright. The scripted
+            # HAPPY_PATH server emits its transcript on its own timetable, without
+            # waiting to be sent any audio, so "an utterance came back" does not
+            # imply "an append already reached the server" — the two race, and
+            # under load the utterance wins often enough to fail this ~1 run in 8.
+            # Ticking on is harmless here: the one-tick latch has already been
+            # read above, and this assertion is about the server's receive log.
+            assert _tick_until(driver, lambda: bool(server.append_payloads)), (
+                "no audio ever reached the server "
+                f"(streamed={driver.streamed}, sessions={client.sessions})"
+            )
         finally:
             driver.close()
             client.close()

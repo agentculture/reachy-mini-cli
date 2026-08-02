@@ -39,8 +39,13 @@ import pytest
 
 from reachy.behavior import audio_tee as tee_mod
 from reachy.behavior.audio_tee import AudioTee
+from tests.conftest import WAIT_BUDGET_S
 
-_TIMEOUT = 5.0
+#: The shared contention budget (see :data:`tests.conftest.WAIT_BUDGET_S` for
+#: why it is generous). Everything waited on here — an accept, a header, three
+#: tiny chunks — lands within a couple of ``DEFAULT_BEAT_S`` sweeps on an idle
+#: box, so this number only bounds scheduler starvation, never behaviour.
+_TIMEOUT = WAIT_BUDGET_S
 
 
 # --------------------------------------------------------------------------- #

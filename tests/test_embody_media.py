@@ -28,6 +28,7 @@ from __future__ import annotations
 import ast
 import logging
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -417,13 +418,37 @@ def test_robot_sink_ignores_reachy_transport_env_entirely(monkeypatch):
 def test_robot_sink_never_imports_reachy_mini_even_on_a_real_playback_failure():
     """The strongest form of AC2: drive the REAL play_audio (unpatched) against
     an unreachable daemon and confirm reachy_mini never enters sys.modules —
-    the sdk leg's lazy import is provably never reached."""
-    assert "reachy_mini" not in sys.modules
-    backend = media._RobotHttpSinkBackend(base_url="http://127.0.0.1:1", timeout=0.2)
+    the sdk leg's lazy import is provably never reached.
 
-    backend.play(_pcm16_bytes([1, 2, 3, 4]), samplerate=16000)  # must not raise
-
-    assert "reachy_mini" not in sys.modules
+    Probed in a SUBPROCESS, following the precedent
+    ``test_importing_the_holder_does_not_pull_in_reachy_mini`` set in
+    tests/test_robot_media_client.py. ``sys.modules`` is interpreter-global and
+    several sibling modules legitimately stub ``reachy_mini`` into it while they
+    run; an in-process assertion therefore tests the whole worker's history
+    rather than this backend, and fails intermittently under ``pytest -n auto``
+    depending on which tests xdist happened to schedule ahead of it here. (This
+    is the repo's own recorded lesson from the sleep-mode arc: probe the import
+    boundary in a subprocess, never in the shared interpreter.) A fresh
+    interpreter makes the claim both order-independent and strictly stronger —
+    nothing but this code path has run in it.
+    """
+    code = (
+        "import sys\n"
+        "from reachy.embody import media\n"
+        "backend = media._RobotHttpSinkBackend(base_url='http://127.0.0.1:1', timeout=0.2)\n"
+        "backend.play(b'\\x01\\x00\\x02\\x00', samplerate=16000)\n"
+        "print('reachy_mini' in sys.modules)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        timeout=60,
+        check=True,
+    )
+    # `check=True` already proves `play` did not raise against a dead endpoint.
+    assert proc.stdout.strip() == "False"
 
 
 def test_robot_sink_degrades_a_playback_failure_to_a_named_drop(caplog):

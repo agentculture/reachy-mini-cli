@@ -134,4 +134,19 @@ def test_integration_stream_turn_tool_calls_lenient():
     call = result.tool_calls[0]
     assert call.name == "apply_pose"
     assert isinstance(call.arguments, dict)
+    # A LIVE model decides how many argument deltas to emit, and it sometimes
+    # emits none at all — observed here as
+    # ``ToolCall(name='apply_pose', arguments={}, arguments_json='{}')``. That is
+    # a finding about the served model, not a regression in delta assembly: the
+    # call itself assembled fine, there was simply nothing to accumulate into it.
+    # This test's own contract is "assert streamed tool_call assembly, else skip
+    # with the finding", so it belongs on the skip side of the line — asserting
+    # it makes an otherwise-honest test fail intermittently on model
+    # non-determinism, which is how a suite stops being trusted.
+    if not call.arguments:
+        pytest.skip(
+            "gateway streamed a tool_call with NO argument deltas "
+            f"(arguments_json={call.arguments_json!r}) — argument accumulation "
+            "unverified this run (plan risk r2)"
+        )
     assert "emoji" in call.arguments

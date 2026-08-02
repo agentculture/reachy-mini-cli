@@ -33,6 +33,36 @@ import pytest
 #: (no DNS, no external dependency, no flakiness) even before our guard fires.
 _UNREACHABLE = "http://127.0.0.1:1"
 
+#: The shared budget for "wait until a background thread does the thing".
+#:
+#: Every concurrency test in this suite — the tee, the realtime client and its
+#: composition seams, the transcript driver — waits on some worker thread that
+#: does its job within a few milliseconds on an idle box. This number is NOT a
+#: behavioural expectation about that latency; it only decides how much
+#: scheduler starvation is tolerated before the test declares breakage.
+#:
+#: It lives here, cited by every module in that family, because five private
+#: copies is exactly how the value drifts. Each of those modules independently
+#: chose 5.0 s, and the clearest case for raising it is
+#: tests/test_realtime_client.py, where a test's own 5.0 s reconnect backoff
+#: EQUALLED its 5.0 s waiter — so a lost connect race and the deadline landed on
+#: the same instant, failing with nothing wrong. A flaky suite costs the merge
+#: gate its meaning, and generosity here costs wall-clock only when something is
+#: actually broken: a healthy run never reaches the deadline, and a broken one
+#: still fails rather than hanging.
+#:
+#: What this number is NOT is a way to make a racy assertion pass. Two flakes
+#: chased during the embodiment-layer build turned out to be genuine
+#: cross-thread ordering bugs in the tests themselves (an assertion on a counter
+#: another thread bumps after the fact; an assertion on bytes the server had not
+#: been given time to receive), and both were fixed by waiting on the thing
+#: rather than by widening a budget. Raise the budget for scheduler starvation;
+#: fix the test for everything else.
+#:
+#: A test that needs a DIFFERENT budget (a deliberate long backoff it must
+#: outlast, say) should derive it from this — not redefine it.
+WAIT_BUDGET_S = 30.0
+
 #: Every external HTTP leg the CLI can reach out over, by env var name — the
 #: canonical LLM/TTS/STT/forge endpoints plus the legacy REACHY_LLM_* alias
 #: reachy.speech.llm.py still honours as a fallback. REACHY_VISION_MODEL_ID is

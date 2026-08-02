@@ -60,9 +60,10 @@ from reachy.speech.realtime import (
     resolve_realtime_api_key,
     resolve_realtime_base_url,
 )
+from tests.conftest import WAIT_BUDGET_S
 from tests.fake_realtime_server import FakeRealtimeServer, Scenario
 
-_TIMEOUT = 5.0
+_TIMEOUT = WAIT_BUDGET_S
 _RATE = 16000
 #: Long enough that no scheduling delay can age a pre-queued chunk out.
 _NEVER_STALE = 120.0
@@ -246,12 +247,23 @@ def test_raw_pcm16_bytes_and_int16_arrays_are_accepted_verbatim() -> None:
 
 def test_the_session_never_sends_response_create() -> None:
     """Ears-only (#115 non-goal): nothing this client writes asks for a reply."""
+    # The long backoff is deliberate — it keeps this window to ONE session, so
+    # `received_frames` is one session's send history rather than several
+    # interleaved. But it must not EQUAL the waiters' budget: if the first
+    # connect attempt loses a race (which it does under `pytest -n auto` on a
+    # loaded box), the retry lands at 5.0 s and a 5.0 s `_TIMEOUT` gives up at
+    # the same instant — an intermittent false failure with nothing wrong. The
+    # waiters therefore get a budget with room for one retry AND the session
+    # that follows it. Same defect class as the fake server's own 5.0 s
+    # `response.create` wait against a 5.0 s recv timeout, fixed during t3.
+    backoff_s = 5.0
+    budget_s = 4 * backoff_s
     with FakeRealtimeServer(Scenario.HAPPY_PATH) as server:
-        client = _client(server, backoff_initial_s=5.0, backoff_max_s=5.0)
+        client = _client(server, backoff_initial_s=backoff_s, backoff_max_s=backoff_s)
         try:
             client.submit_audio(_pcm16())
-            assert _take(client) is not None
-            assert _wait_until(lambda: len(server.append_payloads) >= 1)
+            assert _take(client, timeout=budget_s) is not None
+            assert _wait_until(lambda: len(server.append_payloads) >= 1, timeout=budget_s)
         finally:
             client.close()
 
