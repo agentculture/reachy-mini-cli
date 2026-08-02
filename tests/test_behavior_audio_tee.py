@@ -142,7 +142,14 @@ def test_a_consumer_receives_the_header_then_contiguous_mono_float32(tee_path):
         assert tee.queued == len(chunks)
         assert tee.dropped == 0
         # The measurable seam an on-box run reads back (t15's tick-budget work).
-        assert tee.sent_bytes >= len(payload)
+        # WAITED on, not read once: the counter is bumped by the tee's own
+        # writer thread AFTER the bytes are on the socket, so a consumer that
+        # has already read them can legitimately observe a lagging total. Read
+        # directly, this asserted an ordering between two threads that nothing
+        # guarantees — reproducible as ``assert 64 >= 96`` under CPU contention
+        # (24 spinners + ``pytest -n auto``: 3 failures in 6 runs of this file
+        # alone), and seen in the wild on a busy box.
+        assert _wait(lambda: tee.sent_bytes >= len(payload))
         consumer.close()
     finally:
         tee.close()

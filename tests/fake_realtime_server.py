@@ -75,6 +75,28 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   well-formed frame but not valid JSON — the malformedness lives one level
   deeper, in the field content, mirroring how ``malformed_append_count``
   above already covers the inbound direction), then a graceful close.
+- ``DUPLEX_HAPPY_PATH`` (embodiment-layer plan, task t9) — the FULL duplex
+  sequence on ONE socket, which is what the layer's own client
+  (``reachy/speech/realtime_duplex.py``) has to prove: ``session.created`` ->
+  ``speech_started`` -> ``speech_stopped`` -> ``transcription.completed``
+  (the EARS half, byte-identical to ``HAPPY_PATH``) and then the
+  ``RESPONSE_HAPPY_PATH`` body (the MOUTH half: arm-and-wait ->
+  ``response.created`` -> ``response.text.done`` -> N
+  ``response.audio.delta`` -> ``response.done``), then a graceful close.
+  This mirrors the ordering observed against the real deployed gateway in
+  ``docs/evidence/2026-08-01-probe-concurrent-realtime-sessions.md``
+  (``transcription.completed`` at t=30.228, ``response.created`` 10 ms later
+  on the same session). It exists because neither half alone can show that
+  words IN and audio OUT share one socket.
+- ``ROLE_INFEASIBLE`` (embodiment-layer plan, task t9) — refuses the
+  handshake with **404**, the gateway's answer when its ``stt`` lane is
+  declared infeasible (``lobes-cli``'s ``site/src/scripts/
+  realtime-connection.ts`` warns *"stt lane declared off — /v1/realtime will
+  404 role_infeasible"* after reading ``GET /v1/capabilities``' ``stt.feasible``).
+  Deliberately its own scenario rather than a flavour of ``UNAUTHORIZED``:
+  404 here is a CONFIGURATION verdict an operator must act on, not the
+  transient outage a generic refusal implies, and a client is expected to
+  name it separately while still reconnecting.
 
 Two failure modes are deliberately NOT separate ``Scenario`` members, because
 they are properties of the REQUEST, not a server mood the harness picks:
@@ -86,6 +108,9 @@ they are properties of the REQUEST, not a server mood the harness picks:
   required). Drive it by opening a raw socket and sending a plain
   ``GET /v1/realtime HTTP/1.1`` with no ``Upgrade``/``Connection`` headers —
   no scenario selection needed.
+  (``ROLE_INFEASIBLE`` above is the one status a *scenario* selects, because
+  unlike 426 it is a property of the server's configuration, not of the
+  request.)
 - **HTTP 401 for a specific expected token** is ``require_bearer_token=...``
   (a constructor argument, checked before every scenario dispatch including
   ``UNAUTHORIZED``, which short-circuits it): connect with a missing or wrong
@@ -95,10 +120,11 @@ they are properties of the REQUEST, not a server mood the harness picks:
   the real gateway's documented default (``GATEWAY_API_KEY`` unset -> the
   ``Authorization`` header is never even read).
 
-Both refusal bodies are hand-mirrored from the real gateway
+All three refusal bodies are hand-mirrored from the real gateway
 (``lobes.gateway.server``): 401 is the OpenAI-shaped
 ``{"error": {"message": ..., "code": "invalid_api_key"}}`` with a
-``WWW-Authenticate: Bearer`` header; 426 names the fix in its message text.
+``WWW-Authenticate: Bearer`` header; 426 names the fix in its message text;
+404 carries ``code="role_infeasible"`` and names the ``stt`` lane.
 
 Event shapes — confirmed vs. genuinely guessed
 ------------------------------------------------
@@ -229,6 +255,8 @@ class Scenario(str, Enum):
     RESPONSE_HAPPY_PATH = "response_happy_path"
     RESPONSE_INTERRUPTED = "response_interrupted"
     RESPONSE_AUDIO_DELTA_MALFORMED = "response_audio_delta_malformed"
+    DUPLEX_HAPPY_PATH = "duplex_happy_path"
+    ROLE_INFEASIBLE = "role_infeasible"
 
 
 def _gen_id(prefix: str) -> str:
@@ -606,6 +634,10 @@ class FakeRealtimeServer:
             self._refuse(conn, send_lock, 401, "unauthorized")
             return
 
+        if self._scenario is Scenario.ROLE_INFEASIBLE:
+            self._refuse(conn, send_lock, 404, "role_infeasible")
+            return
+
         if self._require_bearer_token is not None and not _bearer_matches(
             self._require_bearer_token, headers.get("authorization")
         ):
@@ -675,12 +707,14 @@ class FakeRealtimeServer:
     def _refuse(
         self, conn: socket.socket, send_lock: threading.Lock, status: int, reason: str
     ) -> None:
-        """Send an OpenAI-shaped 401, or a plain 426/400, and record the refusal.
+        """Send an OpenAI-shaped 401/404, or a plain 426/400, and record the refusal.
 
         Mirrors ``lobes.gateway.server``'s own refusal shapes: 401 is
         ``{"error": {"message": ..., "code": "invalid_api_key"}}`` plus a
         ``WWW-Authenticate: Bearer`` header; 426 says what to do about it
-        rather than pretending the route doesn't exist.
+        rather than pretending the route doesn't exist; 404 carries
+        ``code="role_infeasible"`` and names the lane that is switched off,
+        which is the operator-actionable half of that answer.
         """
         if status == 401:
             body = json.dumps(
@@ -709,6 +743,21 @@ class FakeRealtimeServer:
                 }
             ).encode("utf-8")
             status_text = "Upgrade Required"
+        elif status == 404:
+            body = json.dumps(
+                {
+                    "error": {
+                        "message": (
+                            "the stt role is not feasible on this gateway, so "
+                            "/v1/realtime is not served — check "
+                            "GET /v1/capabilities for stt.feasible"
+                        ),
+                        "type": "role_infeasible",
+                        "code": "role_infeasible",
+                    }
+                }
+            ).encode("utf-8")
+            status_text = "Not Found"
         else:
             body = json.dumps({"error": {"message": reason}}).encode("utf-8")
             status_text = "Bad Request"
@@ -1032,7 +1081,12 @@ class FakeRealtimeServer:
             deadline = time.monotonic() + self._wait_timeout
             target = self._close_after_frames
             while time.monotonic() < deadline:
-                if len(self.received_frames) >= target:
+                # ``_stop_event`` is checked so a test may hold a session open
+                # with a LONG ``wait_timeout`` (the "frame target it can never
+                # reach" idiom) without that timeout becoming teardown latency:
+                # :meth:`stop` sets it, and this loop leaves at once instead of
+                # sleeping out its deadline while ``stop`` waits on the join.
+                if len(self.received_frames) >= target or self._stop_event.is_set():
                     break
                 time.sleep(0.02)
             self._abrupt_close(conn)
@@ -1062,6 +1116,19 @@ class FakeRealtimeServer:
             self._run_response_scenario(conn, send_lock, session_id, item_id, scenario)
             return
 
+        if scenario is Scenario.DUPLEX_HAPPY_PATH:
+            # Ears first, then the mouth — the ordering the live gateway used
+            # (see the module docstring's citation of the t1 probe evidence).
+            self._send_event(conn, send_lock, self._event_speech_started(session_id, item_id))
+            self._send_event(conn, send_lock, self._event_speech_stopped(session_id, item_id))
+            self._send_event(
+                conn, send_lock, self._event_transcription_completed(session_id, item_id)
+            )
+            self._run_response_scenario(
+                conn, send_lock, session_id, item_id, Scenario.RESPONSE_HAPPY_PATH
+            )
+            return
+
         # Scenario.HAPPY_PATH (and the default fallthrough for any future member).
         self._send_event(conn, send_lock, self._event_speech_started(session_id, item_id))
         self._send_event(conn, send_lock, self._event_speech_stopped(session_id, item_id))
@@ -1085,12 +1152,26 @@ class FakeRealtimeServer:
         connection over it" posture ``PING_EXPECT_PONG`` uses above: a test
         that forgot to arm still gets a deterministic, bounded scenario rather
         than a hang.
+
+        The wait POLLS the cumulative counter rather than clearing and waiting
+        on :attr:`_response_create_event`. A client that arms immediately after
+        the handshake (which is what ``reachy/speech/realtime_duplex.py`` does,
+        on ``session.created``) races that clear: the arm can land *before*
+        this method runs, and clearing would then discard the only signal it
+        will ever get — costing a full ``wait_timeout`` of dead time in every
+        such test and, worse, making the delay depend on thread scheduling.
+        Counting is monotonic, so it cannot be missed however early the arm
+        arrives. (``CLOSE_MID_STREAM`` polls ``received_frames`` for the same
+        reason.)
         """
-        self._response_create_event.clear()
         response_id = _gen_id("resp")
         with self._lock:
             self._last_response_id = response_id
-        self._response_create_event.wait(timeout=self._wait_timeout)
+        deadline = time.monotonic() + self._wait_timeout
+        while time.monotonic() < deadline and self.response_create_count < 1:
+            if self._stop_event.is_set():
+                break
+            time.sleep(0.01)
 
         self._send_event(
             conn, send_lock, self._event_response_created(session_id, response_id, item_id)
