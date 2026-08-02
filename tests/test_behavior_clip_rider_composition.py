@@ -261,9 +261,8 @@ def test_the_rider_is_wired_as_a_frame_sink_not_a_reader_of_its_own(_isolated):
     ), f"expected exactly one frame sink registration, got {len(registrations)}"
     call = registrations[0]
     (arg,) = call.args
-    assert (
-        isinstance(arg, ast.Attribute) and arg.attr == "offer"
-    ), "the registered frame sink is not the clip rider's offer()"
+    assert isinstance(arg, ast.Attribute), "the registered frame sink is not an attribute access"
+    assert arg.attr == "offer", "the registered frame sink is not the clip rider's offer()"
 
     source = Path(__file__).resolve().parent.parent / "reachy" / "behavior" / "clip_rider.py"
     clip_tree = ast.parse(source.read_text(encoding="utf-8"))
@@ -376,10 +375,11 @@ def test_the_rider_is_released_even_when_composition_fails_after_it_opens(_isola
     from reachy.behavior.engine import EngineConfig
 
     config = EngineConfig(compose_hz=50, base_layer=True, settle=False)
+    transport = _QuietTransport()
     with monkeypatch.context() as m:
         m.setattr(behavior_mod, "GotoLane", _explode)
         with pytest.raises(_Boom):
-            behavior_mod._compose_run_seam(_QuietTransport(), config, None, None)
+            behavior_mod._compose_run_seam(transport, config, None, None)
     # No direct handle survives a failed composition; the only observable proof
     # is indirect — a second composition (GotoLane restored) must still
     # succeed: no leaked global state, no wedged thread holding a lock this

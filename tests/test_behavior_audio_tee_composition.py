@@ -229,7 +229,8 @@ def test_the_tee_receives_the_very_stream_the_tap_fanned_out(_isolated, monkeypa
     consumer = None
     try:
         tee = resources.tee
-        assert tee is not None and tee.active, "the runtime composed no live audio tee"
+        assert tee is not None, "the runtime composed no audio tee"
+        assert tee.active, "the runtime composed an audio tee, but it is not live"
         consumer = _connect(tee.path)
         assert _wait(lambda: tee.clients == 1), "the tee never accepted the consumer"
         header = _read_header(consumer)
@@ -283,12 +284,14 @@ def test_the_tee_is_a_sink_on_the_tap_not_a_reader_of_its_own(_isolated):
         len(registrations) == 1
     ), f"expected exactly one audio sink registration, got {len(registrations)}"
     call = registrations[0]
-    assert isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+    assert isinstance(call.func, ast.Attribute), "the sink registration is not a method call"
+    assert isinstance(
+        call.func.value, ast.Name
+    ), "the sink registration is not called on a bare name"
     tap_name = call.func.value.id
     (arg,) = call.args
-    assert (
-        isinstance(arg, ast.Attribute) and arg.attr == "offer"
-    ), "the registered sink is not the tee's offer()"
+    assert isinstance(arg, ast.Attribute), "the registered sink is not an attribute access"
+    assert arg.attr == "offer", "the registered sink is not the tee's offer()"
 
     reader = _function(tree, "sense_reader")
     pulls = _calls(reader, "pull")
@@ -478,6 +481,7 @@ def test_the_tee_is_released_even_when_composition_fails(_isolated, monkeypatch)
 
     monkeypatch.setattr(behavior_mod, "TranscriptSenseDriver", _explode)
     config = EngineConfig(compose_hz=50, base_layer=True, settle=False)
+    transport = _QuietTransport()
     with pytest.raises(_Boom):
-        behavior_mod._compose_run_seam(_QuietTransport(), config, None, None)
+        behavior_mod._compose_run_seam(transport, config, None, None)
     assert not (_isolated / "audio_tee.sock").exists(), "a failed composition stranded the socket"

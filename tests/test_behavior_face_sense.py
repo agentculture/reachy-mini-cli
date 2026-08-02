@@ -265,7 +265,9 @@ def test_build_face_recognition_without_cv2_returns_none_and_warns_once(
         second = build_face_recognition()
         third = build_face_recognition()
 
-    assert first is None and second is None and third is None
+    assert first is None
+    assert second is None
+    assert third is None
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1, [r.getMessage() for r in warnings]
     assert "[vision]" in warnings[0].getMessage()
@@ -660,7 +662,8 @@ def test_providers_never_raise_and_read_perception_folds_them() -> None:
             frame_available=driver.as_frame_available_provider(),
         )
     )
-    assert sense.frame_available is True and sense.face is None
+    assert sense.frame_available is True
+    assert sense.face is None
 
 
 # --------------------------------------------------------------------------- #
