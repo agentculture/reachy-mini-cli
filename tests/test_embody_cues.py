@@ -20,6 +20,7 @@ import socket
 import pytest
 
 from reachy.embody import cues
+from reachy.export import events_client
 from tests.fake_bus_subscriber import FakeBusSubscriber
 
 # --------------------------------------------------------------------------- #
@@ -453,7 +454,15 @@ def test_the_default_intake_never_opens_a_live_socket(monkeypatch):
 # The reported gap: today's events-cli client is publish-only (canary)        #
 # --------------------------------------------------------------------------- #
 
-real_events_cli = pytest.importorskip("events_cli")
+# The vendor's module and class names are DEREFERENCED from the adapter's own
+# constant rather than written out again. The canary below has to reach the real
+# package to probe it — but it does not have to be a second place that knows
+# what the package is CALLED, and `reachy/export/events_client.py` is the single
+# source of truth for that (the same dereference `tests/
+# test_export_events_client.py` already uses). A vendor rename now moves one
+# constant and this canary follows.
+_VENDOR_MODULE, _VENDOR_CLASS = events_client.VENDOR_IMPORT
+real_events_cli = pytest.importorskip(_VENDOR_MODULE)
 
 
 def test_the_installed_events_cli_client_has_no_subscribe_capability():
@@ -466,8 +475,9 @@ def test_the_installed_events_cli_client_has_no_subscribe_capability():
     extended to bind it, the same way
     :mod:`reachy.export.events_client` binds the publish leg.
     """
-    assert not hasattr(real_events_cli.EventClient, "subscribe")
-    assert not hasattr(real_events_cli.EventClient, "on_message")
+    client = getattr(real_events_cli, _VENDOR_CLASS)
+    assert not hasattr(client, "subscribe")
+    assert not hasattr(client, "on_message")
 
 
 def test_cues_module_never_imports_events_cli_or_a_raw_mqtt_library():
@@ -490,5 +500,9 @@ def test_cues_module_never_imports_events_cli_or_a_raw_mqtt_library():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported_names.add(node.module.split(".")[0])
 
-    forbidden = {"events_cli", "paho"}
+    # The vendor name is dereferenced, not restated — `events_client` owns it.
+    # "paho" stays a literal because no constant in this repo names it: the
+    # recorded decision is that this repo imports NO MQTT library directly, so
+    # there is deliberately nothing here to point at.
+    forbidden = {_VENDOR_MODULE, "paho"}
     assert imported_names.isdisjoint(forbidden), imported_names & forbidden
