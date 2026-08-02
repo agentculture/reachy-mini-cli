@@ -139,6 +139,50 @@ no variable, and that is a requirement rather than an implementation detail: an
 too, silently changing the reflex robot while configuring the layer.
 ``tests/test_embody_engine.py`` proves both halves, the second by AST.
 
+Nested windows onto ONE history, and Qwen's summary (issue #154 decision c30)
+-------------------------------------------------------------------------------
+:attr:`Limits.history_maxlen` (``n``) and :attr:`Limits.senses_history_maxlen`
+(``m``) bound the SAME conversation ``deque`` — never two histories. The
+worker (:meth:`run_turn`, via :meth:`_build_messages`) replays its FULL
+``n``-turn window; Gemma (:meth:`ask`, via :meth:`_senses_window`) replays only
+its last ``m`` turns, taken as a plain tail slice of that one deque — a STRICT
+SUFFIX of what the worker sees, never a second, independently-maintained copy.
+Constructing a :class:`Limits` with ``senses_history_maxlen > history_maxlen``
+is refused (:meth:`Limits.__post_init__`), fail-closed: asking Gemma to see
+MORE turns than the shared history even keeps for Qwen is a configuration
+error, not a request this module can satisfy by clamping.
+
+Why one history rather than two: a second, independently-maintained history
+for Gemma would drift from the worker's, and the two models would then
+disagree about what was said — the worst failure mode a robot with one voice
+can have (operator decision, issue #154).
+
+The measured cost of the ``m`` window is small, not zero
+(``docs/evidence/2026-08-02-t1-media-chunk-budget.md``, task t1): twenty turns
+of ordinary spoken exchange cost **401 prompt tokens** against **2 399** for
+one clip ask — about +16% on a clip question, a correction to the "nearly
+free" the initial scope pass assumed (that comparison was in BYTES, where the
+clip really is 827× larger; in TOKENS, what actually fills the window, it is
+6×). ``m=20`` nested inside ``n=60`` (:data:`DEFAULT_SENSES_HISTORY_MAXLEN` /
+:data:`DEFAULT_HISTORY_MAXLEN`) is sized against that measurement, not a round
+number.
+
+Everything older than Gemma's ``m``-turn window is covered by ONE
+Qwen-maintained summary (:meth:`update_summary`), never regenerated per lane
+and never computed by this module — Qwen owns WRITING it (task t12's job);
+this module owns only the plumbing: storing it, bounding it
+(:attr:`Limits.summary_max_chars`, refused rather than truncated when
+over-length, the same fail-closed idiom :data:`reachy.behavior.rules.
+MAX_SAY_CHARS` uses — "a compaction that can grow without limit is a slow leak
+with extra steps", issue #154), and surfacing it to :meth:`ask`. If Qwen's
+maintenance pass fails (the worker LLM is unreachable, or the text it returns
+is itself refused), Gemma's context keeps whatever summary text it last had
+but PREFIXES it with :data:`STALE_SUMMARY_MARKER`, and the failure is a named,
+counted drop (:data:`REASON_SUMMARY_STALE`) — never a silent narrowing of
+Gemma's memory down to just the last ``m`` turns (spec claim c45, honesty
+h30). The marker clears on the next :meth:`update_summary` call that
+succeeds.
+
 The export contract
 -------------------
 Per turn the engine emits, through the shared
@@ -263,6 +307,18 @@ REASON_SILENT_TURN = "silent-turn"
 #: Imported from :mod:`reachy.embody.attention` rather than retyped: the gate's
 #: label IS the drop reason, exactly as the runtime's engagement labels are.
 REASON_NOT_ADDRESSED_COLD = LABEL_COLD
+#: :meth:`EmbodyTurnEngine.mark_summary_stale` was called: Qwen's rolling
+#: summary maintenance pass failed this cycle (the worker LLM unreachable, or
+#: the text it produced was itself refused). Named and counted rather than a
+#: silent narrowing of Gemma's memory to just the last ``m`` turns (spec claim
+#: c45, honesty h30) — see the module docstring's "Nested windows" section.
+REASON_SUMMARY_STALE = "summary-stale"
+#: :meth:`EmbodyTurnEngine.update_summary` was handed text longer than
+#: :attr:`Limits.summary_max_chars`. REFUSED, never truncated — the same
+#: fail-closed idiom :data:`reachy.behavior.rules.MAX_SAY_CHARS` uses, so the
+#: cut point is never "wherever this module happened to stop reading" instead
+#: of a decision Qwen's producer (task t12) can see and act on.
+REASON_SUMMARY_TOO_LONG = "summary-too-long"
 
 #: Every reason this module can emit, in one place so the journal, the export
 #: feed, the operator docs and the tests share ONE vocabulary.
@@ -277,6 +333,8 @@ DROP_REASONS: tuple[str, ...] = (
     REASON_EMPTY_INPUT,
     REASON_SILENT_TURN,
     REASON_NOT_ADDRESSED_COLD,
+    REASON_SUMMARY_STALE,
+    REASON_SUMMARY_TOO_LONG,
 )
 
 # --------------------------------------------------------------------------- #
@@ -294,9 +352,38 @@ DEFAULT_TEMPERATURE = 0.7
 #: Rounds one turn may take before the tool loop is force-stopped (cited from
 #: :data:`reachy.speech.agent_turn.DEFAULT_MAX_TOOL_ROUNDS`).
 DEFAULT_MAX_TOOL_ROUNDS = 6
-#: Prior (perception, reply) pairs kept for context — the same 6-entry
-#: discipline the engagement classifier and the agent engine use.
-DEFAULT_HISTORY_MAXLEN = 6
+#: Prior (perception, reply) pairs the WORKER (Qwen) lane replays in full —
+#: ``n`` in issue #154 decision c30's "m nested in n" nested-window shape.
+#: This is the single shared history's own bound: the ``deque`` in
+#: :attr:`EmbodyTurnEngine._history` never holds more than this many turns,
+#: and :data:`DEFAULT_SENSES_HISTORY_MAXLEN` is sliced from its tail. 60 turns
+#: of ordinary spoken exchange is inexpensive next to a clip ask (see the
+#: module docstring's "Nested windows" section for the measured numbers) —
+#: this is no longer the 6-entry discipline :data:`reachy.speech.agent_turn.
+#: DEFAULT_HISTORY_MAXLEN` / :data:`reachy.speech.engagement.
+#: DEFAULT_HISTORY_MAXLEN` use, and does not need to be: this lane's window is
+#: text-only, the media clip is what actually costs tokens.
+DEFAULT_HISTORY_MAXLEN = 60
+#: Prior turns Gemma (the ``senses`` lane) replays — ``m`` in issue #154
+#: decision c30. A STRICT SUFFIX of :data:`DEFAULT_HISTORY_MAXLEN`'s ``n``
+#: turns, taken from the tail of the SAME deque, never a second history of its
+#: own. Sized against the measured cost (``docs/evidence/
+#: 2026-08-02-t1-media-chunk-budget.md``): 20 turns of text cost 401 prompt
+#: tokens against 2 399 for one clip, roughly +16% on a clip ask — cheap
+#: enough to afford, not free enough to make unbounded. Refused, never
+#: silently clamped, if it exceeds ``n`` (:meth:`Limits.__post_init__`).
+DEFAULT_SENSES_HISTORY_MAXLEN = 20
+#: Upper bound, in characters, on the Qwen-maintained rolling summary of
+#: everything older than Gemma's ``m``-turn window (issue #154 decision c30).
+#: "A compaction that can grow without limit is a slow leak with extra steps"
+#: (issue #154) — this is that bound. :meth:`EmbodyTurnEngine.update_summary`
+#: REFUSES text over this length rather than truncating it, the same
+#: fail-closed idiom :data:`reachy.behavior.rules.MAX_SAY_CHARS` uses. Sized
+#: generously against the same measurement that sized ``m``: the 20-turn text
+#: window alone costs ~401 prompt tokens, and t1's evidence records that "a
+#: few hundred tokens of summary is small beside the media it accompanies and
+#: comparable to the turn window itself" — roughly 500 tokens, ~4 chars/token.
+DEFAULT_SUMMARY_MAX_CHARS = 2000
 #: Pending TRIGGERS (utterances + alerts) held between turns. Bounded: a
 #: runtime feed that outruns cognition must drop the NEWEST by name, never grow
 #: without bound.
@@ -346,6 +433,18 @@ DEFAULT_EMBODY_SYSTEM_PROMPT = (
     "Keep any speech to one or two short, natural first-person sentences. Never "
     "narrate raw sensor readings. If you want to show an expression, put a single "
     "emoji in your reply text."
+)
+
+#: Prefixed onto Gemma's last known summary (or stands alone if there was
+#: never one) when :meth:`EmbodyTurnEngine.mark_summary_stale` has been called
+#: since the last successful :meth:`~EmbodyTurnEngine.update_summary` — spec
+#: claim c45, honesty h30. Named so a reader of the journal, the export feed,
+#: or the model's own prompt recognises it on sight; see the module
+#: docstring's "Nested windows" section for why this exists instead of
+#: silently narrowing Gemma's memory to just the last ``m`` turns.
+STALE_SUMMARY_MARKER = (
+    "[The summary of the conversation before this window could not be "
+    "refreshed and may be out of date.]"
 )
 
 # --------------------------------------------------------------------------- #
@@ -544,8 +643,21 @@ class Limits:
     idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S
     #: Rounds one turn may take before the tool loop is force-stopped.
     max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS
-    #: Prior (perception, reply) pairs kept in the rolling history.
+    #: Prior (perception, reply) pairs the WORKER (Qwen) lane replays in
+    #: full — ``n`` in issue #154 decision c30. The SAME deque backs both
+    #: windows onto the shared history; this is its own bound.
     history_maxlen: int = DEFAULT_HISTORY_MAXLEN
+    #: Prior turns the SENSES (Gemma) lane replays — ``m`` in decision c30. A
+    #: STRICT SUFFIX of ``history_maxlen``'s ``n`` turns, sliced from the tail
+    #: of the SAME deque, never a second history of its own. Refused, never
+    #: silently clamped, when it exceeds ``history_maxlen``
+    #: (:meth:`Limits.__post_init__`).
+    senses_history_maxlen: int = DEFAULT_SENSES_HISTORY_MAXLEN
+    #: Upper bound, in characters, on the Qwen-maintained rolling summary of
+    #: everything older than the senses lane's ``m``-turn window (decision
+    #: c30). Refused, never truncated, past this length
+    #: (:meth:`EmbodyTurnEngine.update_summary`).
+    summary_max_chars: int = DEFAULT_SUMMARY_MAX_CHARS
     #: Pending TRIGGERS (utterances + alerts) held between turns.
     max_pending: int = DEFAULT_MAX_PENDING
     #: DISTINCT facts the context park holds.
@@ -573,6 +685,23 @@ class Limits:
     #: #150) — the composition root resolves the value BEFORE it lands here;
     #: this field itself takes whatever it is handed, unresolved.
     attention_window_s: float = DEFAULT_ATTENTION_WINDOW_S
+
+    def __post_init__(self) -> None:
+        """Refuse ``m > n`` fail-closed (issue #154 decision c30, spec claim c3).
+
+        A frozen dataclass still runs ``__post_init__`` on every construction
+        (including :func:`dataclasses.replace`), so this is the one place the
+        nested-window invariant needs to live — never re-checked, and never
+        clamped, downstream. Equality (``m == n``) is explicitly allowed: the
+        bound is ``m <= n``, not ``m < n``.
+        """
+        if self.senses_history_maxlen > self.history_maxlen:
+            raise ValueError(
+                f"senses_history_maxlen ({self.senses_history_maxlen}) must be <= "
+                f"history_maxlen ({self.history_maxlen}): Gemma's window is a "
+                "strict suffix of Qwen's over one shared history (issue #154 "
+                "decision c30), never wider than it."
+            )
 
 
 @dataclass(frozen=True)
@@ -780,9 +909,26 @@ class EmbodyTurnEngine:
         self._last_alert_turn = float("-inf")
         self._deferral_logged = False
         self._spoken: deque[str] = deque(maxlen=max(0, int(self._limits.spoken_maxlen)))
+        # ONE shared conversation deque (issue #154 decision c30): the worker
+        # (Qwen) replays it in FULL up to ``n``; the senses lane (Gemma) reads
+        # only a tail SLICE of it (``_senses_window``) — never a second,
+        # independently-maintained history. ``Limits.__post_init__`` already
+        # refused ``senses_history_maxlen > history_maxlen`` at construction,
+        # so ``n`` alone bounds what this deque can ever hold.
         self._history: deque[tuple[str, str]] = deque(
             maxlen=max(0, int(self._limits.history_maxlen))
         )
+        self._senses_history_maxlen = max(0, int(self._limits.senses_history_maxlen))
+        self._summary_max_chars = max(0, int(self._limits.summary_max_chars))
+        # Qwen's rolling summary of everything older than Gemma's ``m``-turn
+        # window, and whether the last attempt to refresh it failed (issue
+        # #154 decision c30 / spec claim c45). Both guarded by
+        # ``_summary_lock`` — ``update_summary``/``mark_summary_stale`` are
+        # meant to be called from task t12's producer, on its own thread,
+        # concurrently with ``ask()`` reading them on another.
+        self._summary = ""
+        self._summary_stale = False
+        self._summary_lock = threading.Lock()
         self._last_text = ""
         # One turn at a time; ``ask`` is deliberately outside it.
         self._turn_lock = threading.Lock()
@@ -791,6 +937,15 @@ class EmbodyTurnEngine:
         # and the duplex utterance tap) while a third drains under
         # ``_turn_lock``, and both bounds are check-then-act.
         self._intake_lock = threading.Lock()
+        # Guards ``self._history`` — the ONE shared deque both windows read
+        # from. Appended under this lock at the end of a worker turn (never
+        # across the LLM call itself: the append happens after ``_stream``
+        # already returned); read under it by both ``_build_messages`` (the
+        # worker's full replay) and ``_senses_window`` (Gemma's tail slice),
+        # the second of which runs from ``ask()`` — deliberately OUTSIDE
+        # ``_turn_lock`` — so a perception question is never serialised behind
+        # a running turn's own history read.
+        self._history_lock = threading.Lock()
 
         self.turns = 0
         self.rounds = 0
@@ -799,6 +954,10 @@ class EmbodyTurnEngine:
         self.stream_timeouts = 0
         self.stream_failures = 0
         self.dropped_inputs = 0
+        #: Named, counted occurrences of :meth:`mark_summary_stale` — every
+        #: failed summary-maintenance pass, not only the first (spec claim
+        #: c45, honesty h30).
+        self.summary_stale_count = 0
         # Counted apart from ``dropped_inputs``, which means "a bound was hit":
         # an unaddressed utterance is not a resource failure, it is the gate
         # working, and folding the two would make a busy room look like a sick
@@ -1112,7 +1271,8 @@ class EmbodyTurnEngine:
 
         result = self._tool_loop(conversation, raw, event)
         self._last_text = (result.content if result is not None else "") or ""
-        self._history.append((user_content, self._last_text))
+        with self._history_lock:
+            self._history.append((user_content, self._last_text))
         if self._export is not None:
             self._export.emit(
                 ThinkingEvent(
@@ -1171,9 +1331,9 @@ class EmbodyTurnEngine:
         ``content: null``) can cost at most an empty answer here and never a
         lost action. It emits no export block: the feed is about turns.
 
-        *prompt* is forwarded verbatim as the user message's ``content`` —
-        plain text, or an OpenAI-style multimodal content LIST (one ``text``
-        part plus one ``video_url`` data-URI part; see
+        *prompt* is forwarded verbatim as the FINAL user message's
+        ``content`` — plain text, or an OpenAI-style multimodal content LIST
+        (one ``text`` part plus one ``video_url`` data-URI part; see
         :func:`reachy.cli._commands.agent.build_clip_question`, which builds
         that shape and stays OUTSIDE this module on purpose — this engine
         reads no file, per its own model-config claim machine-checked in
@@ -1184,11 +1344,131 @@ class EmbodyTurnEngine:
         carrying a clip needed no change to this method beyond the type hint.
         The first real caller is the layer's clip poller (issue #139's h9:
         :class:`reachy.cli._commands.agent._ClipAsker`).
+
+        Ahead of *prompt*, this is where Gemma's nested window lands (issue
+        #154 decision c30 — see the module docstring's "Nested windows"
+        section): the optional *system* message, then Qwen's summary (or its
+        staleness marker, :meth:`_summary_message`), then the last ``m``
+        turns of the ONE shared history (:meth:`_senses_window`) replayed
+        exactly as :meth:`_build_messages` replays the worker's own turns.
+        None of that touches *prompt* itself — it is still appended last,
+        unmodified, which is what keeps this method's "reads no file, builds
+        no clip payload, forwards content verbatim" contract true.
         """
-        messages = [{"role": "system", "content": system}] if system else []
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        summary_message = self._summary_message()
+        if summary_message is not None:
+            messages.append(summary_message)
+        messages.extend(self._history_messages(self._senses_window()))
         messages.append({"role": "user", "content": prompt})
         result = self._stream(messages, role=role, tools=None, raw=None)
         return (result.content if result is not None else "") or ""
+
+    # ------------------------------------------------------------------ #
+    # Qwen's rolling summary of everything older than Gemma's window     #
+    # (issue #154 decision c30) — the plumbing; task t12 builds the      #
+    # producer that actually calls the LLM.                              #
+    # ------------------------------------------------------------------ #
+
+    def update_summary(self, text: str) -> bool:
+        """Replace the summary of everything older than Gemma's ``m``-turn window.
+
+        Called by whatever produces the summary — task t12's Qwen-backed
+        producer in production, a plain string in a test, since this method
+        makes no LLM call of its own and needs none to be exercised. Clears
+        the stale marker on success (spec claim c45, honesty h30): a caller
+        that successfully refreshed the summary is exactly the event that
+        should make the marker go away.
+
+        Fail-closed on length, mirroring :data:`reachy.behavior.rules.
+        MAX_SAY_CHARS`'s idiom: text longer than
+        :attr:`Limits.summary_max_chars` is REFUSED, never truncated, because
+        silently cutting a Qwen-authored summary would put the cut point
+        wherever this module happened to stop reading rather than somewhere
+        Qwen's own producer chose. A blank summary is refused the same way an
+        empty cue is (:data:`REASON_EMPTY_INPUT`) — "nothing to say yet" is
+        not the same fact as "the summary is now empty" and a caller with
+        nothing new should not call this at all.
+
+        Returns whether the update was accepted.
+        """
+        cleaned = (text or "").strip()
+        if not cleaned:
+            self._drop(REASON_EMPTY_INPUT, "summary")
+            return False
+        if len(cleaned) > self._summary_max_chars:
+            self._drop(
+                REASON_SUMMARY_TOO_LONG,
+                f"{len(cleaned)} chars > {self._summary_max_chars}",
+            )
+            return False
+        with self._summary_lock:
+            self._summary = cleaned
+            self._summary_stale = False
+        return True
+
+    def mark_summary_stale(self, detail: str = "") -> None:
+        """Record that Qwen's summary maintenance pass failed this cycle.
+
+        The worker LLM was unreachable, or the text it returned was itself
+        refused by :meth:`update_summary` — either way, Gemma's context must
+        not silently narrow to just the last ``m`` turns (spec claim c45,
+        honesty h30). This method never clears or shrinks the summary already
+        held; it only flags it, so :meth:`_summary_message` keeps showing the
+        last known text, PREFIXED with :data:`STALE_SUMMARY_MARKER`, until the
+        next :meth:`update_summary` call succeeds. Every call is a named,
+        counted drop (:attr:`summary_stale_count`) — not only the first — the
+        same discipline every other failure in this module follows.
+        """
+        with self._summary_lock:
+            self._summary_stale = True
+        self.summary_stale_count += 1
+        self._drop(REASON_SUMMARY_STALE, detail)
+
+    @property
+    def summary_is_stale(self) -> bool:
+        """Whether the last summary-maintenance attempt failed and has not yet been fixed."""
+        with self._summary_lock:
+            return self._summary_stale
+
+    def _summary_message(self) -> dict | None:
+        """The system-role message carrying Qwen's summary, or its staleness marker.
+
+        ``None`` only for an engine that has never had a summary AND has
+        never gone stale — nothing to show and nothing to explain is missing.
+        Once either has happened this always returns something: an up-to-date
+        summary renders as-is, and a stale one is PREFIXED with
+        :data:`STALE_SUMMARY_MARKER` rather than replaced by it — the last
+        known summary is still useful context even while its freshness cannot
+        be vouched for, and dropping it entirely on top of being stale would
+        be the exact silent narrowing spec claim c45 refuses.
+        """
+        with self._summary_lock:
+            summary, stale = self._summary, self._summary_stale
+        if not summary and not stale:
+            return None
+        if not stale:
+            text = summary
+        elif summary:
+            text = f"{STALE_SUMMARY_MARKER} Last known summary: {summary}"
+        else:
+            text = STALE_SUMMARY_MARKER
+        return {"role": "system", "content": text}
+
+    def _senses_window(self) -> list[tuple[str, str]]:
+        """Gemma's window: the last ``senses_history_maxlen`` entries of the ONE shared deque.
+
+        A STRICT SUFFIX, taken by slicing — never a second history collected
+        independently (issue #154 decision c30). ``Limits.__post_init__``
+        already guarantees ``senses_history_maxlen <= history_maxlen``, so
+        this can never ask for more turns than the deque itself retains.
+        """
+        if self._senses_history_maxlen <= 0:
+            return []
+        with self._history_lock:
+            return list(self._history)[-self._senses_history_maxlen :]
 
     # ------------------------------------------------------------------ #
     # The one streaming call                                             #
@@ -1277,13 +1557,33 @@ class EmbodyTurnEngine:
         return "\n".join(lines)
 
     def _build_messages(self, user_content: str) -> list[dict]:
-        """System prompt + bounded rolling history + the current perception."""
+        """System prompt + the worker's FULL ``n``-turn rolling history + the current perception.
+
+        Reads the ONE shared history the senses lane's :meth:`_senses_window`
+        also reads (issue #154 decision c30) — this replays it whole, up to
+        ``n``, where that method takes only the tail ``m``.
+        """
         messages: list[dict] = [{"role": "system", "content": self._system_prompt}]
-        for prior_user, prior_reply in self._history:
+        with self._history_lock:
+            pairs = list(self._history)
+        messages.extend(self._history_messages(pairs))
+        messages.append({"role": "user", "content": user_content})
+        return messages
+
+    @staticmethod
+    def _history_messages(pairs: Iterable[tuple[str, str]]) -> list[dict]:
+        """Turn stored ``(user, reply)`` pairs into alternating user/assistant messages.
+
+        Shared by both windows onto the one history (issue #154 decision c30)
+        — the worker's full replay in :meth:`_build_messages` and Gemma's tail
+        slice in :meth:`ask` — so the two lanes can never render the same
+        stored turn two different ways.
+        """
+        messages: list[dict] = []
+        for prior_user, prior_reply in pairs:
             messages.append({"role": "user", "content": prior_user})
             if prior_reply.strip():
                 messages.append({"role": "assistant", "content": prior_reply})
-        messages.append({"role": "user", "content": user_content})
         return messages
 
     def _drain_triggers(self) -> list[Input]:

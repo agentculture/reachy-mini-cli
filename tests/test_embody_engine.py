@@ -50,9 +50,12 @@ from reachy.embody.engine import (
     REASON_ENDPOINT_UNREACHABLE,
     REASON_INPUT_QUEUE_FULL,
     REASON_STREAM_IDLE,
+    REASON_SUMMARY_STALE,
+    REASON_SUMMARY_TOO_LONG,
     REASON_TOOL_ROUNDS_EXHAUSTED,
     ROLE_SENSES,
     ROLE_WORKER,
+    STALE_SUMMARY_MARKER,
     EmbodyModels,
     EmbodyTurnEngine,
     first_emoji,
@@ -770,7 +773,7 @@ def test_a_spoken_reply_is_exported_as_a_message_block() -> None:
 
 def test_history_is_bounded() -> None:
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
-    engine = _build(turn_fn=turn, history_maxlen=2)
+    engine = _build(turn_fn=turn, history_maxlen=2, senses_history_maxlen=2)
     for index in range(5):
         engine.submit_utterance(f"turn {index}")
         engine.run_turn()
@@ -943,6 +946,8 @@ def test_limits_defaults_match_the_documented_module_constants() -> None:
     assert limits.idle_timeout_s == engine_mod.DEFAULT_IDLE_TIMEOUT_S
     assert limits.max_tool_rounds == engine_mod.DEFAULT_MAX_TOOL_ROUNDS
     assert limits.history_maxlen == engine_mod.DEFAULT_HISTORY_MAXLEN
+    assert limits.senses_history_maxlen == engine_mod.DEFAULT_SENSES_HISTORY_MAXLEN
+    assert limits.summary_max_chars == engine_mod.DEFAULT_SUMMARY_MAX_CHARS
     assert limits.max_pending == engine_mod.DEFAULT_MAX_PENDING
     assert limits.max_context == engine_mod.DEFAULT_MAX_CONTEXT
     assert limits.min_alert_interval_s == engine_mod.DEFAULT_MIN_ALERT_INTERVAL_S
@@ -1056,3 +1061,154 @@ def test_ask_forwards_multimodal_content_verbatim_no_branching() -> None:
     sent_messages = server.requests[0]["messages"]
     user_message = next(m for m in sent_messages if m["role"] == "user")
     assert user_message["content"] == content
+
+
+# =========================================================================== #
+# issue #154 decision c30 — nested windows onto ONE history + Qwen's summary  #
+# (spec claims c3/c45, honesty h2/h30 — task t4)                              #
+# =========================================================================== #
+#
+# There is ONE conversation history. Qwen (the worker lane, run_turn) sees the
+# last n=60 turns verbatim; Gemma (the senses lane, ask()) sees the last m=20
+# turns — a STRICT SUFFIX of the SAME deque, never a second, independently
+# maintained one — plus a Qwen-maintained summary of everything older. This
+# task builds the plumbing and the staleness marker; task t12 builds the
+# actual summary PRODUCER (the LLM call that writes it).
+
+
+def test_construction_refuses_a_senses_window_wider_than_the_worker_window() -> None:
+    """m<=n is refused fail-closed at construction, never silently clamped."""
+    with pytest.raises(ValueError):
+        engine_mod.Limits(history_maxlen=10, senses_history_maxlen=11)
+
+
+def test_an_equal_window_is_allowed_the_bound_is_m_lte_n_not_m_lt_n() -> None:
+    limits = engine_mod.Limits(history_maxlen=10, senses_history_maxlen=10)
+    assert limits.senses_history_maxlen == limits.history_maxlen == 10
+
+
+def test_the_shipped_defaults_are_m20_nested_in_n60() -> None:
+    """Decision c30, sized against the t1 media measurement (401 vs 2399 tokens)."""
+    limits = engine_mod.Limits()
+    assert limits.senses_history_maxlen == engine_mod.DEFAULT_SENSES_HISTORY_MAXLEN == 20
+    assert limits.history_maxlen == engine_mod.DEFAULT_HISTORY_MAXLEN == 60
+
+
+def test_gemmas_window_is_a_strict_suffix_of_qwens_over_one_shared_history() -> None:
+    """ONE deque, not two: Gemma's window is exactly the tail of the worker's own."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, history_maxlen=5, senses_history_maxlen=3)
+    for index in range(8):
+        engine.submit_utterance(f"turn {index}")
+        engine.run_turn()
+    worker_user_texts = [m["content"] for m in turn.last_messages() if m["role"] == "user"]
+
+    engine.ask("what's going on?")
+    senses_user_texts = [m["content"] for m in turn.last_messages() if m["role"] == "user"]
+
+    # The worker's own last call already shows its full n-turn window ending
+    # in the turn it is currently building; Gemma's window (minus the fresh
+    # prompt) is exactly the tail 3 of that same sequence.
+    assert senses_user_texts[:-1] == worker_user_texts[-3:]
+    assert senses_user_texts[-1] == "what's going on?"
+
+
+def test_gemmas_context_stays_bounded_over_100_plus_turns() -> None:
+    """Honesty h2: a long conversation does not grow Gemma's per-call context."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, history_maxlen=60, senses_history_maxlen=20)
+    for index in range(60):
+        engine.submit_utterance(f"turn {index}")
+        engine.run_turn()
+    engine.ask("what's up?")
+    count_after_60_turns = len(turn.last_messages())
+
+    for index in range(60, 160):
+        engine.submit_utterance(f"turn {index}")
+        engine.run_turn()
+    engine.ask("what's up?")
+    count_after_160_turns = len(turn.last_messages())
+
+    assert count_after_60_turns == count_after_160_turns
+    # m history turns x 2 messages (user + assistant) + the fresh prompt; no
+    # summary was ever set, so there is no extra system message.
+    assert count_after_160_turns == 2 * 20 + 1
+
+
+def test_the_worker_lane_never_sees_the_summary_only_gemma_does() -> None:
+    """Never regenerate the summary per lane (design note): Qwen already has the turns."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.update_summary("earlier: the kitchen was quiet.")
+    engine.submit_utterance("hello again")
+    engine.run_turn()
+    worker_messages = turn.last_messages()
+    assert not any("kitchen was quiet" in str(m.get("content", "")) for m in worker_messages)
+
+    engine.ask("what's up?")
+    senses_messages = turn.last_messages()
+    assert any("kitchen was quiet" in str(m.get("content", "")) for m in senses_messages)
+
+
+def test_a_down_worker_yields_a_stale_summary_marker_and_a_named_drop(caplog) -> None:
+    """c45/h30: never a silent narrowing of Gemma's memory to just the m turns."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.submit_utterance("earlier turn")
+    engine.run_turn()
+
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        engine.mark_summary_stale("worker llm unreachable")
+    assert engine.summary_stale_count == 1
+    assert REASON_SUMMARY_STALE in caplog.text
+
+    engine.ask("what's up?")
+    senses_messages = turn.last_messages()
+    system_text = " ".join(
+        str(m.get("content", "")) for m in senses_messages if m["role"] == "system"
+    )
+    assert STALE_SUMMARY_MARKER in system_text
+    # The m-turn window itself is untouched: still there beside the marker,
+    # never narrowed away by the failed summary maintenance pass.
+    assert any("earlier turn" in str(m.get("content", "")) for m in senses_messages)
+
+
+def test_the_stale_marker_clears_on_the_next_successful_summary_update() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.mark_summary_stale("worker unreachable")
+    assert engine.summary_is_stale is True
+
+    assert engine.update_summary("earlier: the room was quiet.") is True
+    assert engine.summary_is_stale is False
+
+    engine.ask("what's up?")
+    senses_messages = turn.last_messages()
+    system_text = " ".join(
+        str(m.get("content", "")) for m in senses_messages if m["role"] == "system"
+    )
+    assert STALE_SUMMARY_MARKER not in system_text
+    assert "the room was quiet" in system_text
+
+
+def test_an_overlong_summary_is_refused_not_truncated(caplog) -> None:
+    """The summary itself is bounded (design note); a caller cannot silently exceed it."""
+    engine = _build(limits=engine_mod.Limits(summary_max_chars=10))
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        accepted = engine.update_summary("this summary is definitely longer than ten chars")
+    assert accepted is False
+    assert REASON_SUMMARY_TOO_LONG in caplog.text
+    assert engine.summary_is_stale is False
+
+
+def test_an_empty_summary_update_is_a_named_drop_not_a_silent_clear(caplog) -> None:
+    engine = _build()
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        accepted = engine.update_summary("   ")
+    assert accepted is False
+    assert REASON_EMPTY_INPUT in caplog.text
+
+
+def test_summary_reasons_are_in_the_shared_drop_vocabulary() -> None:
+    assert REASON_SUMMARY_STALE in DROP_REASONS
+    assert REASON_SUMMARY_TOO_LONG in DROP_REASONS
