@@ -77,11 +77,41 @@ _DYNAMIC_EXECUTION = frozenset({"eval", "exec", "compile", "__import__"})
 #: reaches the module transitively (through the spool and the rules loader) and
 #: never imports it, let alone calls its process functions. See
 #: ``test_no_layer_module_imports_the_daemon_process_module``.
-_ALLOWED_PROCESS_SPAWNERS = frozenset({"reachy.daemon"})
+#:
+#: ``reachy.embody.supervisor`` (task t12) is the second, DIRECT entry: it is
+#: the OPERATOR's own control plane for the layer PROCESS — what a human runs
+#: from a terminal (``agent embody start`` / ``stop`` / ``restart`` /
+#: ``status``) — never something a tool call or an utterance can reach. It
+#: legitimately owns ``subprocess`` (spawn the detached layer) and imports
+#: ``reachy.daemon`` directly (``state_dir()`` / ``is_alive()``, exactly like
+#: every sibling supervisor — ``reachy.sleep.supervisor`` /
+#: ``reachy.vision.supervisor`` / ``reachy.behavior.supervisor``). See
+#: ``test_the_supervisor_is_not_reachable_from_any_tool_surface`` for the other
+#: half of this exemption: a machine-checked proof that nothing on the
+#: tool-dispatch path (``tools.py`` / ``engine.py`` / ``cues.py`` / ``media.py``)
+#: ever imports it.
+_ALLOWED_PROCESS_SPAWNERS = frozenset({"reachy.daemon", "reachy.embody.supervisor"})
+
+#: The one layer module that is the OPERATOR CONTROL PLANE rather than part of
+#: the tool-dispatch action surface an utterance can reach — see
+#: :data:`_ALLOWED_PROCESS_SPAWNERS`. The no-shell / no-daemon-import claims
+#: this file makes are claims about what a TOOL CALL can reach, not about
+#: every byte physically inside ``reachy/embody/``, so this is the one
+#: documented exception on both counts, and it is provably not part of the
+#: agent-reachable surface (see the reachability test below).
+_CONTROL_PLANE_MODULES = frozenset({"reachy.embody.supervisor"})
 
 
 def _layer_modules() -> dict[str, Path]:
     return {_dotted(p): p for p in sorted(_LAYER_ROOT.rglob("*.py"))}
+
+
+def _tool_surface_modules() -> dict[str, Path]:
+    """Layer modules reachable from a tool call — i.e. every one EXCEPT the
+    operator control plane (:data:`_CONTROL_PLANE_MODULES`)."""
+    return {
+        name: path for name, path in _layer_modules().items() if name not in _CONTROL_PLANE_MODULES
+    }
 
 
 def _dotted(path: Path) -> str:
@@ -175,11 +205,44 @@ def test_the_layer_package_has_at_least_one_module_to_check() -> None:
     assert "reachy.embody.tools" in _layer_modules()
 
 
-@pytest.mark.parametrize("dotted", sorted(_layer_modules()))
+@pytest.mark.parametrize("dotted", sorted(_tool_surface_modules()))
 def test_no_layer_module_can_reach_a_shell(dotted: str) -> None:
-    path = _layer_modules()[dotted]
+    """No module on the TOOL-DISPATCH surface can reach a shell.
+
+    Parametrized over :func:`_tool_surface_modules` rather than
+    :func:`_layer_modules`: the claim under test is "no module a tool call can
+    execute reaches a shell", and the one documented exception
+    (``reachy.embody.supervisor``, the operator's own process control plane —
+    see :data:`_CONTROL_PLANE_MODULES`) is proven unreachable from that surface
+    by :func:`test_the_supervisor_is_not_reachable_from_any_tool_surface`
+    below, rather than silently exempted here.
+    """
+    path = _tool_surface_modules()[dotted]
     offences = _shell_offences(path, dotted)
     assert not offences, f"{dotted} breaches the no-shell boundary: {offences}"
+
+
+def test_the_supervisor_is_not_reachable_from_any_tool_surface() -> None:
+    """The other half of the :data:`_CONTROL_PLANE_MODULES` exemption.
+
+    ``reachy.embody.supervisor`` starts/stops/restarts the layer PROCESS from
+    the operator's own CLI (task t12: ``agent embody start`` / ``stop`` /
+    ``restart`` / ``status``) — a control-plane action a human runs, never
+    something an utterance can trigger. This is what keeps the exemption a
+    machine-checked fact rather than an unenforced comment: nothing on the
+    tool-dispatch surface (``tools.py`` / ``engine.py`` / ``cues.py`` /
+    ``media.py`` / ``__init__.py``) may import it.
+    """
+    modules = _repo_modules()
+    offenders = sorted(
+        dotted
+        for dotted, path in _tool_surface_modules().items()
+        if "reachy.embody.supervisor" in _imported_names(modules[dotted], dotted)
+    )
+    assert not offenders, (
+        f"the tool-dispatch surface can reach the supervisor: {offenders} — "
+        "the control plane must stay unreachable from any tool call"
+    )
 
 
 def test_no_module_in_the_layer_closure_spawns_a_process_unexpectedly() -> None:
@@ -201,14 +264,17 @@ def test_no_module_in_the_layer_closure_spawns_a_process_unexpectedly() -> None:
 
 
 def test_no_layer_module_imports_the_daemon_process_module() -> None:
-    """The layer never names ``reachy.daemon``; it arrives only under the spool.
+    """No module on the TOOL-DISPATCH surface names ``reachy.daemon``.
 
-    This is what makes the one allow-list entry above honest: the layer cannot
-    call ``reachy.daemon.start``/``stop`` because it never has a reference to
-    that module at all — it reaches state-dir resolution through
-    ``reachy.behavior.control`` / ``reachy.behavior.rules``.
+    This is what makes the one allow-list entry above honest: nothing a tool
+    call can execute can call ``reachy.daemon.start``/``stop``, because none of
+    it has a reference to that module at all — it reaches state-dir resolution
+    through ``reachy.behavior.control`` / ``reachy.behavior.rules``.
+    ``reachy.embody.supervisor`` (the operator control plane, task t12) is the
+    one documented exception — see :data:`_CONTROL_PLANE_MODULES` and
+    :func:`test_the_supervisor_is_not_reachable_from_any_tool_surface`.
     """
-    for dotted, path in _layer_modules().items():
+    for dotted, path in _tool_surface_modules().items():
         assert "reachy.daemon" not in _imported_names(path, dotted), dotted
 
 

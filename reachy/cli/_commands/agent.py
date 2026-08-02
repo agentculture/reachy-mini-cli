@@ -94,6 +94,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 from reachy import senselog
+from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.cli._export import add_export_args, build_export_hook
@@ -789,6 +790,17 @@ EMBODY_READER_THREAD_NAME = "embody-cue-reader"
 #: Default gap between turns when nothing is pending (seconds).
 DEFAULT_TURN_INTERVAL = 0.5
 
+#: Seconds ``agent embody stop`` waits after SIGTERM before escalating to
+#: SIGKILL (task t12). Mirrors :data:`reachy.embody.supervisor.
+#: DEFAULT_STOP_TIMEOUT` by VALUE, not by import: a command module registering
+#: this noun's CLI flags must not import :mod:`reachy.embody` at module scope
+#: (``tests/test_agent_embody.py``'s ``test_no_cognition_or_layer_module_is_
+#: imported_at_command_module_scope`` — the package's own ``__init__``
+#: contract), so this constant is independently owned here, exactly like every
+#: sibling supervisor's ``DEFAULT_STOP_TIMEOUT`` (10.0) is already independently
+#: defined three times over (sleep/vision/behavior).
+EMBODY_DEFAULT_STOP_TIMEOUT = 10.0
+
 
 def _embody_drop(export: object, source: str, reason: str, detail: str = "") -> None:
     """Name one layer failure on the journal AND on the export feed (h22).
@@ -1279,15 +1291,99 @@ def cmd_agent_embody(
 
 
 # ---------------------------------------------------------------------------
+# embody start / stop / restart / status — the supervisor (task t12)
+# ---------------------------------------------------------------------------
+#
+# reachy/embody/supervisor.py is a plain background-process supervisor (pid +
+# log under the state dir), the same shape reachy.sleep.supervisor /
+# reachy.vision.supervisor / reachy.behavior.supervisor already are — see that
+# module's own docstring for why it needs no daemon-health preflight and how
+# it stays out of the layer's "no shell reachable" claim
+# (tests/test_embody_redteam.py's documented _CONTROL_PLANE_MODULES
+# exemption).
+#
+# Every import of reachy.embody.supervisor here is FUNCTION-LOCAL, same as
+# every other reachy.embody import in this module (h15): the package's own
+# __init__ contract is "command modules import this package inside functions,
+# never at module scope", and tests/test_agent_embody.py's
+# test_no_cognition_or_layer_module_is_imported_at_command_module_scope scans
+# this file for exactly that — a forbidden-prefix match on "reachy.embody",
+# with no carve-out for a cognition-free submodule.
+
+
+def cmd_agent_embody_start(args: argparse.Namespace) -> int:
+    """Start the embodiment layer in the background (idempotent; h17: one command)."""
+    from reachy.embody import supervisor as embody_supervisor
+
+    data = embody_supervisor.start(
+        feed=args.feed,
+        media_profile=args.media_profile,
+        spool_dir=args.spool_dir,
+        await_timeout=args.await_timeout,
+        turn_interval=args.turn_interval,
+        mute_during_playback=args.mute_during_playback,
+    )
+    emit_payload(data, json_mode=bool(getattr(args, "json", False)))
+    return 0
+
+
+def cmd_agent_embody_stop(args: argparse.Namespace) -> int:
+    """Stop the layer this CLI started: SIGTERM, then SIGKILL if it lingers.
+
+    h7/h26: signals ONLY the pid :mod:`reachy.embody.supervisor` tracked — the
+    runtime, the daemon and every other process on the box are untouched — and
+    touches nothing on disk: layer-authored ``embody-*`` rules PERSIST in the
+    overlay (spec c26/q6), by design.
+    """
+    from reachy.embody import supervisor as embody_supervisor
+
+    data = embody_supervisor.stop(timeout=args.timeout)
+    emit_payload(data, json_mode=bool(getattr(args, "json", False)))
+    return 0
+
+
+def cmd_agent_embody_restart(args: argparse.Namespace) -> int:
+    """Restart the background layer (re-reads flags/code)."""
+    from reachy.embody import supervisor as embody_supervisor
+
+    data = embody_supervisor.restart(
+        feed=args.feed,
+        media_profile=args.media_profile,
+        spool_dir=args.spool_dir,
+        await_timeout=args.await_timeout,
+        turn_interval=args.turn_interval,
+        mute_during_playback=args.mute_during_playback,
+    )
+    emit_payload(data, json_mode=bool(getattr(args, "json", False)))
+    return 0
+
+
+def cmd_agent_embody_status(args: argparse.Namespace) -> int:
+    """Report the layer's process state (pid + liveness) + its log path."""
+    from reachy.embody import supervisor as embody_supervisor
+
+    data = embody_supervisor.status()
+    emit_payload(data, json_mode=bool(getattr(args, "json", False)))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # overview (rubric-required; hand-built — no transport line)
 # ---------------------------------------------------------------------------
 
 _VERBS = [
     "agent attach — read the runtime event feed, act via the intent spool, "
     "publish the agent's own cognition feed",
-    "agent embody — run the embodiment layer: hear and speak out loud over one "
-    "realtime duplex session, think over the streaming HTTP lane, act through "
-    "the direct-operation action set",
+    "agent embody — run the embodiment layer in the FOREGROUND: hear and speak "
+    "out loud over one realtime duplex session, think over the streaming HTTP "
+    "lane, act through the direct-operation action set",
+    "agent embody start — start the layer in the BACKGROUND (pid + log under "
+    "the state dir; idempotent)",
+    "agent embody stop — stop the layer this CLI started (SIGTERM, then "
+    "SIGKILL if it lingers; touches ONLY the layer's own tracked pid — "
+    "embody-authored rules PERSIST in the overlay)",
+    "agent embody restart — stop then start (re-reads code/flags)",
+    "agent embody status — report the layer's process state (pid + liveness)",
     "agent overview — describe the agent noun",
 ]
 
@@ -1322,6 +1418,13 @@ def cmd_agent_overview(args: argparse.Namespace) -> int:
                 "from the runtime's tee socket and goes out the daemon's HTTP media "
                 "route. Enable or disable it at will — the runtime is unchanged either "
                 "way.",
+                "SUPERVISION: `embody start`/`stop`/`restart`/`status` manage the layer "
+                "as a detached background process (pid + log under the state dir, "
+                "SIGTERM->SIGKILL on stop) — the same shape as sleep/vision/behavior's "
+                "engine. No systemd unit ships for it; stopping the layer removes its "
+                "process trace only — layer-authored `embody-*` rules PERSIST in the "
+                "rules overlay (the robot keeps what it was taught) and stay enumerable "
+                "by prefix.",
             ],
         },
         {"title": "Verbs", "items": list(_VERBS)},
@@ -1351,6 +1454,66 @@ def _no_verb(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # register
 # ---------------------------------------------------------------------------
+
+
+def _add_embody_operating_args(parser: argparse.ArgumentParser) -> None:
+    """The layer's own operating flags — shared by ``embody`` (the foreground
+    verb) and the ``start``/``restart`` supervisor verbs (task t12), so a
+    background layer is configured identically to a foreground run. Mirrors
+    ``behavior.py``'s ``_add_engine_tuning`` sharing the same shape between
+    ``engine run`` and ``engine start``.
+    """
+    parser.add_argument(
+        "--feed",
+        default="-",
+        metavar="PATH",
+        help="Runtime-event JSONL source: a path (stream/FIFO/file) or '-' for stdin "
+        "(default). The layer never spawns the runtime; it reads what the runtime "
+        "writes (behavior engine run --export -). The MQTT bus is the intended "
+        "primary route and falls back here today (events-cli is publish-only).",
+    )
+    parser.add_argument(
+        "--media-profile",
+        default=None,
+        dest="media_profile",
+        metavar="PROFILE",
+        help="Audio profile: 'robot' (the runtime's tee socket in, the daemon HTTP "
+        "media route out — the default) or 'bench' (dev-box mic + speakers). "
+        "Overrides REACHY_EMBODY_MEDIA_PROFILE. Same code path either way.",
+    )
+    parser.add_argument(
+        "--spool-dir",
+        default=None,
+        dest="spool_dir",
+        metavar="DIR",
+        help="Override the intents-spool root (default: the shared state dir, so the "
+        "layer writes into the SAME spool the running engine drains).",
+    )
+    parser.add_argument(
+        "--await-timeout",
+        type=float,
+        default=1.0,
+        dest="await_timeout",
+        help="Seconds an action waits for the engine to confirm a spool command "
+        "before returning 'submitted, unconfirmed' (default: 1.0).",
+    )
+    parser.add_argument(
+        "--turn-interval",
+        type=float,
+        default=DEFAULT_TURN_INTERVAL,
+        dest="turn_interval",
+        help=f"Seconds to wait between turns when nothing is pending "
+        f"(default: {DEFAULT_TURN_INTERVAL}).",
+    )
+    parser.add_argument(
+        "--mute-during-playback",
+        action="store_true",
+        dest="mute_during_playback",
+        help="Withhold microphone audio while the layer is speaking. OFF by default: "
+        "Reachy has hardware AEC against its own speakers, so the layer keeps "
+        "hearing while it talks (which is what makes barge-in possible). This is "
+        "the one-flip fallback if live AEC proves insufficient.",
+    )
 
 
 def register(sub: argparse._SubParsersAction) -> None:
@@ -1420,59 +1583,10 @@ def register(sub: argparse._SubParsersAction) -> None:
         "embody",
         help="Run the embodiment layer: hear and speak out loud over one realtime "
         "duplex session, think over the streaming HTTP lane, act via the "
-        "direct-operation action set.",
+        "direct-operation action set. See also: embody start/stop/restart/status "
+        "to run it as a background process.",
     )
-    embody.add_argument(
-        "--feed",
-        default="-",
-        metavar="PATH",
-        help="Runtime-event JSONL source: a path (stream/FIFO/file) or '-' for stdin "
-        "(default). The layer never spawns the runtime; it reads what the runtime "
-        "writes (behavior engine run --export -). The MQTT bus is the intended "
-        "primary route and falls back here today (events-cli is publish-only).",
-    )
-    embody.add_argument(
-        "--media-profile",
-        default=None,
-        dest="media_profile",
-        metavar="PROFILE",
-        help="Audio profile: 'robot' (the runtime's tee socket in, the daemon HTTP "
-        "media route out — the default) or 'bench' (dev-box mic + speakers). "
-        "Overrides REACHY_EMBODY_MEDIA_PROFILE. Same code path either way.",
-    )
-    embody.add_argument(
-        "--spool-dir",
-        default=None,
-        dest="spool_dir",
-        metavar="DIR",
-        help="Override the intents-spool root (default: the shared state dir, so the "
-        "layer writes into the SAME spool the running engine drains).",
-    )
-    embody.add_argument(
-        "--await-timeout",
-        type=float,
-        default=1.0,
-        dest="await_timeout",
-        help="Seconds an action waits for the engine to confirm a spool command "
-        "before returning 'submitted, unconfirmed' (default: 1.0).",
-    )
-    embody.add_argument(
-        "--turn-interval",
-        type=float,
-        default=DEFAULT_TURN_INTERVAL,
-        dest="turn_interval",
-        help=f"Seconds to wait between turns when nothing is pending "
-        f"(default: {DEFAULT_TURN_INTERVAL}).",
-    )
-    embody.add_argument(
-        "--mute-during-playback",
-        action="store_true",
-        dest="mute_during_playback",
-        help="Withhold microphone audio while the layer is speaking. OFF by default: "
-        "Reachy has hardware AEC against its own speakers, so the layer keeps "
-        "hearing while it talks (which is what makes barge-in possible). This is "
-        "the one-flip fallback if live AEC proves insufficient.",
-    )
+    _add_embody_operating_args(embody)
     embody.add_argument(
         "--max-turns",
         type=int,
@@ -1491,3 +1605,42 @@ def register(sub: argparse._SubParsersAction) -> None:
     add_log_level_arg(embody)
     embody.add_argument("--json", action="store_true", help=_JSON_HELP)
     embody.set_defaults(func=cmd_agent_embody)
+
+    # embody start/stop/restart/status (task t12) — the supervisor half. Nested
+    # as SUB-subcommands of `embody` (not siblings of it under `agent`) so bare
+    # `agent embody` keeps running the foreground loop unchanged (h17: one
+    # command each way is `embody start` / `embody stop`, not a new top-level
+    # verb family). parser_class propagates so nested parse errors keep the
+    # structured error contract.
+    embody_sub = embody.add_subparsers(dest="embody_command", parser_class=type(embody))
+
+    embody_start = embody_sub.add_parser(
+        "start", help="Start the embodiment layer in the background (idempotent)."
+    )
+    _add_embody_operating_args(embody_start)
+    embody_start.add_argument("--json", action="store_true", help=_JSON_HELP)
+    embody_start.set_defaults(func=cmd_agent_embody_start)
+
+    embody_stop = embody_sub.add_parser("stop", help="Stop the layer this CLI started.")
+    embody_stop.add_argument(
+        "--timeout",
+        type=float,
+        default=EMBODY_DEFAULT_STOP_TIMEOUT,
+        help="Seconds to wait after SIGTERM before SIGKILL "
+        f"(default: {EMBODY_DEFAULT_STOP_TIMEOUT:g}).",
+    )
+    embody_stop.add_argument("--json", action="store_true", help=_JSON_HELP)
+    embody_stop.set_defaults(func=cmd_agent_embody_stop)
+
+    embody_restart = embody_sub.add_parser(
+        "restart", help="Restart the background layer (re-reads code/flags)."
+    )
+    _add_embody_operating_args(embody_restart)
+    embody_restart.add_argument("--json", action="store_true", help=_JSON_HELP)
+    embody_restart.set_defaults(func=cmd_agent_embody_restart)
+
+    embody_status = embody_sub.add_parser(
+        "status", help="Report the layer's process state (pid + liveness)."
+    )
+    embody_status.add_argument("--json", action="store_true", help=_JSON_HELP)
+    embody_status.set_defaults(func=cmd_agent_embody_status)
