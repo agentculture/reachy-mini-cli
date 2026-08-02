@@ -43,13 +43,76 @@ format contract below.
 **``play`` — the mouth.** Called as ``play(pcm16_bytes, samplerate=...)`` with
 raw **little-endian PCM16 mono bytes** at :data:`DEFAULT_OUTPUT_SAMPLE_RATE`
 (24000 Hz — the gateway's TTS rate, measured in the t1 probe: 4800-byte deltas
-= 2400 samples each, matching lobes-cli's ``TTS_SAMPLE_RATE``). It is called
+= 2400 samples each, matching lobes-cli's ``TTS_SAMPLE_RATE``). One call is
+ONE CHUNK of a reply, not a whole reply (see the next section). It is called
 ONLY on a dedicated playback thread, never on the session worker, because the
 robot sink's daemon-HTTP route is an upload-then-play round trip lasting
 seconds — charging that to the socket pump would stop the ears, starve the
 keepalive, and get the session dropped. A raise, or a wedged sink, is a named
 drop; it never touches the session. ``play=None`` is legal (the layer becomes
 mute) and says so once, by name.
+
+--------------------------------------------------------------------------
+Playback is CHUNKED, so it is CANCELLABLE (issue #151 item 3, spec c12)
+--------------------------------------------------------------------------
+This client used to accumulate every ``response.audio.delta`` and hand the
+whole reply to ``play`` once, on ``response.done``. That made interruption
+impossible in the one case that matters: the robot's sink has no stop handle
+and no "what is left to play" — on the robot profile ``play`` is a daemon-HTTP
+upload-then-play round trip, and once the daemon owns the clip the room is
+going to hear all of it. So a human interjecting over an ALREADY-AUDIBLE reply
+could not cut it; the live journal shows exactly that, an interruption landing
+as ``response interrupted chars=0 audio=0B`` while the speaker talked on.
+
+The fix needs nothing new from the daemon or the gateway. A reply is played as
+SEVERAL chunks with the queue between them, so **"stop talking" becomes "do
+not send the next chunk"** — an impossible problem (cancel audio in flight)
+turned into a trivial one (empty a queue). Concretely:
+
+* ``_accumulate_audio`` flushes a chunk group the moment a reply has
+  :attr:`Limits.playback_chunk_bytes` of audio pending, so speech starts while
+  the reply is still arriving; ``_finish_response`` flushes the remainder;
+* :meth:`RealtimeDuplexSession.cancel_playback` (any thread, O(1), never
+  raises) bumps a GENERATION counter and drains the mouth queue. Every queued
+  chunk is skipped, every chunk of that reply still to ARRIVE is refused, and
+  the mouth re-checks the generation between chunks — so the cut lands within
+  ONE chunk boundary. A chunk already inside ``play`` cannot be recalled; that
+  is the whole cost, and it is why the chunk size is a bound rather than a
+  constant.
+* ``response.interrupted`` (the server's own barge-in) takes the same path.
+
+**Sizing is a genuine tradeoff, and the numbers here are a starting point.**
+Bigger chunks mean fewer daemon round trips and a smaller chance of an audible
+seam, but a LONGER cut latency (the room keeps hearing up to one chunk after
+the human speaks). Smaller chunks cut faster and start sooner, but pay a
+round trip per chunk and can leave an audible gap if that round trip exceeds
+the chunk's own duration. The shipped pair —
+:data:`DEFAULT_PLAYBACK_CHUNK_BYTES` (1.0 s) after a smaller
+:data:`DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES` (0.4 s, so the robot starts
+speaking sooner) — is chosen against the spec's "stops within roughly one
+chunk" and the operator's accepted "minor gap", NOT against a measurement:
+the per-chunk daemon ``/media/play`` round trip is unmeasured (plan task t1
+measures it, and may retune both values). Both are :class:`Limits` fields, so
+retuning is one number in one place and every test injects its own.
+
+**What the room actually heard is MEASURED, not assumed.**
+:class:`PlaybackProgress` (via :meth:`RealtimeDuplexSession.playback_progress`,
+and returned by :meth:`~RealtimeDuplexSession.cancel_playback`) reports, per
+reply, the bytes the sink CONFIRMED (returned from), the bytes still inside a
+``play`` call at the moment of the cut, and the bytes skipped. That is the
+authority for the said/unsaid split one level up (task t7): exact to the chunk
+boundary, estimated only INSIDE the boundary chunk. A failed ``play`` is
+counted as skipped, never as played — the room heard nothing.
+
+The reply RECORD is unchanged by any of this: :class:`Response` still carries
+every byte the server sent, because what the server said and what the room
+heard are two different facts and conflating them is the defect t7 exists to
+prevent. One consequence to carry forward: a reply is published on
+``response.done``, which since t6 is no longer the same instant as "the last
+chunk left the speaker". So ``on_response`` means *the server finished this
+reply*, not *the room heard all of it* — the second question is
+:meth:`~RealtimeDuplexSession.playback_progress`'s, and reconciling the two
+into a said/unsaid record is task t7's, not this module's.
 
 **Audio format, stated unambiguously.** In: mono float32 in [-1, 1] (or int16,
 or PCM16 bytes). On the wire: PCM16 mono **little-endian**, base64, inside an
@@ -168,6 +231,7 @@ import queue
 import socket
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -246,7 +310,10 @@ from reachy.speech.realtime import (
 #: re-export, not a leftover".
 __all__ = [
     "DEFAULT_OUTPUT_SAMPLE_RATE",
+    "DEFAULT_PLAYBACK_CHUNK_BYTES",
+    "DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES",
     "Limits",
+    "PlaybackProgress",
     "PlaySink",
     "ReadAudio",
     "RealtimeDuplexSession",
@@ -269,6 +336,7 @@ __all__ = [
     "REASON_MALFORMED_AUDIO_DELTA",
     "REASON_MALFORMED_EVENT",
     "REASON_NO_PLAYBACK_SINK",
+    "REASON_PLAYBACK_CANCELLED",
     "REASON_PLAYBACK_FAILED",
     "REASON_PLAYBACK_QUEUE_FULL",
     "REASON_RESPONSE_INTERRUPTED",
@@ -317,13 +385,19 @@ REASON_LANE_UNAVAILABLE = "realtime-lane-unavailable"
 REASON_MALFORMED_AUDIO_DELTA = "malformed-audio-delta"
 #: One reply's audio exceeded ``max_response_bytes``; the tail is discarded.
 REASON_RESPONSE_TOO_LONG = "response-too-long"
-#: A barge-in cut the reply short, so it is never spoken (see the handler).
+#: A barge-in cut the reply short: whatever had not reached the speaker yet is
+#: skipped, and the line says how much was heard before the cut.
 REASON_RESPONSE_INTERRUPTED = "response-interrupted"
 #: A reply arrived faster than the caller drained it (oldest evicted).
 REASON_RESPONSE_QUEUE_FULL = "response-queue-full"
 #: There is audio to speak and no ``play`` sink was injected.
 REASON_NO_PLAYBACK_SINK = "no-playback-sink"
-#: The mouth is still busy with an earlier reply.
+#: A caller cut the mouth off (:meth:`RealtimeDuplexSession.cancel_playback`)
+#: and audio the server had already produced is deliberately never spoken.
+REASON_PLAYBACK_CANCELLED = "playback-cancelled"
+#: The mouth queue is full: the REST of that reply is refused rather than one
+#: chunk being dropped out of its middle (a truncation is honest, a hole is a
+#: defect), so speech stops early instead of skipping.
 REASON_PLAYBACK_QUEUE_FULL = "playback-queue-full"
 #: The injected ``play`` raised, or the speaker is gone.
 REASON_PLAYBACK_FAILED = "playback-failed"
@@ -347,13 +421,31 @@ DEFAULT_OUTPUT_SAMPLE_RATE = 24000
 #: than a fresh one, so the OLDEST is evicted on overflow.
 DEFAULT_UTTERANCE_MAXSIZE = 8
 DEFAULT_RESPONSE_MAXSIZE = 8
-#: The mouth queue. Depth 2 (the ``SpeechActuator`` figure): one playing, one
-#: waiting; a third means the layer is talking far faster than it can speak.
-DEFAULT_PLAYBACK_MAXSIZE = 2
+
+#: One second of PCM16 at 24 kHz: the unit the mouth speaks, and the unit a
+#: cancel skips. It is therefore the WORST-CASE cut latency an interjection
+#: pays — the room keeps hearing at most this much after the human speaks —
+#: traded against a daemon ``/media/play`` round trip per chunk and the seam
+#: between chunks. Unmeasured on the deployed stack (plan task t1 measures the
+#: per-chunk round trip and may retune this); see the module docstring's
+#: chunked-playback section for the full tradeoff.
+DEFAULT_PLAYBACK_CHUNK_BYTES = DEFAULT_OUTPUT_SAMPLE_RATE * 2
+#: The FIRST chunk of a reply is smaller, so the robot starts speaking sooner
+#: (time-to-first-audio is a full chunk otherwise). Smaller than the steady
+#: chunk, and still long enough that the next chunk's round trip has somewhere
+#: to hide. 0.4 s.
+DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES = DEFAULT_OUTPUT_SAMPLE_RATE * 2 * 2 // 5
 
 #: One reply's accumulated audio cap: 60 s of PCM16 at 24 kHz. A runaway
 #: server cannot make this process grow without bound.
 DEFAULT_MAX_RESPONSE_BYTES = DEFAULT_OUTPUT_SAMPLE_RATE * 2 * 60
+
+#: The mouth queue, in CHUNKS. Deep enough to hold one capped reply
+#: (``DEFAULT_MAX_RESPONSE_BYTES`` / ``DEFAULT_PLAYBACK_CHUNK_BYTES`` = 60)
+#: plus slack, because the gateway streams a reply's deltas far faster than
+#: the speaker plays them: a shallow queue would refuse the tail of every long
+#: answer. It was depth 2 while a whole reply was ONE item.
+DEFAULT_PLAYBACK_MAXSIZE = 64
 
 #: How many chunks the connect-time backlog drain may discard (~1.3 s at 20 ms
 #: chunks). It stops early the moment the source says "nothing ready", so a
@@ -392,6 +484,11 @@ class Limits:
     module already keeps), and every field here simply carries that same
     constant forward unchanged, so the refactor cannot silently change a
     number while moving it.
+
+    The two playback CHUNK bounds arrived later (task t6) and were never bare
+    parameters, but they follow the same rule for the same reason: they are the
+    numbers a measured per-chunk daemon round trip will retune, and a bound
+    with two homes is a bound that drifts.
     """
 
     #: Bounded queue depths — see :data:`DEFAULT_UTTERANCE_MAXSIZE` and
@@ -399,6 +496,11 @@ class Limits:
     utterance_maxsize: int = DEFAULT_UTTERANCE_MAXSIZE
     response_maxsize: int = DEFAULT_RESPONSE_MAXSIZE
     playback_maxsize: int = DEFAULT_PLAYBACK_MAXSIZE
+    #: How much audio one ``play`` call speaks — hence the worst-case cut
+    #: latency of an interjection. See :data:`DEFAULT_PLAYBACK_CHUNK_BYTES`.
+    playback_chunk_bytes: int = DEFAULT_PLAYBACK_CHUNK_BYTES
+    #: The first chunk of each reply, smaller so speech starts sooner.
+    playback_first_chunk_bytes: int = DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES
     #: Cap on ONE reply's accumulated audio.
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
     #: Connect-time backlog drain bound.
@@ -413,6 +515,11 @@ class Limits:
     stable_after_s: float = DEFAULT_STABLE_AFTER_S
     #: Bounded thread join at :meth:`RealtimeDuplexSession.close`.
     join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S
+
+
+def _even(value: object) -> int:
+    """At least one PCM16 sample, and a whole number of them."""
+    return max(2, int(value) & ~1)
 
 
 class PlaySink(Protocol):
@@ -456,15 +563,103 @@ class Response:
     session_id: str | None = None
 
 
+@dataclass(frozen=True)
+class PlaybackProgress:
+    """What the ROOM heard of one reply — measured at the sink, not assumed.
+
+    Returned by :meth:`RealtimeDuplexSession.playback_progress` and by
+    :meth:`RealtimeDuplexSession.cancel_playback`, which is what makes a cut
+    *reportable*: the caller that stopped the robot mid-sentence learns, in the
+    same call, how much of the sentence the room actually got.
+
+    The split between *played_bytes* and *in_flight_bytes* is the honest one
+    and it is deliberate: a chunk inside ``play`` cannot be recalled and cannot
+    be confirmed either, so it is reported as its own quantity rather than
+    guessed into one bucket or the other. The said/unsaid text split one level
+    up (task t7) is therefore EXACT to the chunk boundary and estimated only
+    inside the boundary chunk.
+
+    Attributes:
+        response_id: the reply this describes, or ``None``.
+        queued_bytes: audio handed to the mouth for this reply.
+        played_bytes: audio the sink RETURNED from — heard, as far as anything
+            in this process can know. A failed ``play`` is never counted here.
+        in_flight_bytes: the boundary chunk: inside ``play`` right now,
+            neither confirmed nor recallable.
+        skipped_bytes: audio queued and then skipped by a cancel, or dropped by
+            a failed ``play`` — produced by the server, never heard.
+        cancelled: whether a cut reached this reply.
+    """
+
+    response_id: str | None
+    queued_bytes: int
+    played_bytes: int
+    in_flight_bytes: int
+    skipped_bytes: int
+    cancelled: bool
+
+
+@dataclass
+class _PlaybackLedger:
+    """The mutable half of :class:`PlaybackProgress`, one per reply."""
+
+    response_id: str | None
+    queued_bytes: int = 0
+    played_bytes: int = 0
+    in_flight_bytes: int = 0
+    skipped_bytes: int = 0
+    cancelled: bool = False
+
+    def snapshot(self) -> PlaybackProgress:
+        return PlaybackProgress(
+            response_id=self.response_id,
+            queued_bytes=self.queued_bytes,
+            played_bytes=self.played_bytes,
+            in_flight_bytes=self.in_flight_bytes,
+            skipped_bytes=self.skipped_bytes,
+            cancelled=self.cancelled,
+        )
+
+
+@dataclass(frozen=True)
+class _PlaybackChunk:
+    """One unit of speech on the mouth queue, stamped with its cut generation.
+
+    The stamp is what makes a cancel work without reaching into the queue's
+    internals or racing the mouth: bumping the session's generation makes every
+    chunk carrying an older one stale, wherever it happens to be — still
+    queued, or already dequeued and one instruction away from ``play``.
+    """
+
+    response_id: str | None
+    generation: int
+    pcm: bytes
+
+
 @dataclass
 class _PendingResponse:
-    """One in-flight reply being accumulated across ``response.*`` events."""
+    """One in-flight reply being accumulated across ``response.*`` events.
+
+    *audio* is the whole reply (the record); *flushed* is how much of it has
+    been handed to the mouth, so the two never disagree and no second buffer
+    can drift from the first.
+    """
 
     response_id: str | None
     item_id: str | None = None
     text: str = ""
     audio: bytearray = field(default_factory=bytearray)
     overflowed: bool = False
+    #: The cut generation this reply was created under. A cancel bumps the
+    #: session's, which is what stops chunks that have not ARRIVED yet.
+    generation: int = 0
+    #: Bytes of *audio* already handed to the mouth.
+    flushed: int = 0
+    #: Chunks handed over so far (the first one has its own size).
+    chunks: int = 0
+    #: The mouth queue refused a chunk, so the rest of this reply is refused
+    #: too — a truncation, never a hole.
+    truncated: bool = False
 
 
 class RealtimeDuplexSession(_SessionObservables):
@@ -532,6 +727,10 @@ class RealtimeDuplexSession(_SessionObservables):
         self._arm_on_connect = bool(arm_on_connect)
         self._limits = limits if limits is not None else Limits()
         self._max_response_bytes = max(0, int(self._limits.max_response_bytes))
+        # Chunk sizes are forced EVEN: a chunk boundary inside a PCM16 sample
+        # would split it across two ``play`` calls and click.
+        self._chunk_bytes = _even(self._limits.playback_chunk_bytes)
+        self._first_chunk_bytes = _even(self._limits.playback_first_chunk_bytes)
         self._stale_drain_max_chunks = max(0, int(self._limits.stale_drain_max_chunks))
         self._connect_timeout_s = max(0.1, float(self._limits.connect_timeout_s))
         self._frame_timeout_s = max(0.1, float(self._limits.frame_timeout_s))
@@ -583,6 +782,18 @@ class RealtimeDuplexSession(_SessionObservables):
         #: summary exists to avoid (69,696 lines measured, once).
         self._overflow_logged: set[str] = set()
 
+        # --- the mouth's shared state (worker + playback thread) ------------ #
+        #: Guards the cut generation, the per-reply ledgers and the id of the
+        #: reply the mouth is on. Held for a handful of integer updates and
+        #: never across ``play`` or a queue wait, so it cannot serialise
+        #: anything that matters.
+        self._playback_lock = threading.Lock()
+        #: Bumped by every cut. A chunk (or a reply) stamped with an older one
+        #: is skipped — see :class:`_PlaybackChunk`.
+        self._generation = 0
+        self._ledgers: "OrderedDict[str, _PlaybackLedger]" = OrderedDict()
+        self._current_response_id: str | None = None
+
         # --- cross-thread flags (single writer each; plain reads are atomic) - #
         self._arm_pending = False
         self._speaking = False
@@ -601,7 +812,16 @@ class RealtimeDuplexSession(_SessionObservables):
         self.ignored_events = 0
         self.muted_chunks = 0
         self.stale_chunks_discarded = 0
+        #: Chunks handed to the mouth, chunks the sink returned from, and the
+        #: bytes behind the second figure. ``played`` counts CHUNKS since t6
+        #: (it counted whole replies while a reply was one ``play`` call).
+        self.chunks_queued = 0
         self.played = 0
+        self.played_bytes = 0
+        #: Chunks a cut skipped, and the audio behind them — produced by the
+        #: server, deliberately never spoken.
+        self.chunks_cancelled = 0
+        self.cancelled_bytes = 0
         self.playback_failures = 0
 
     # ------------------------------------------------------------------ #
@@ -680,6 +900,49 @@ class RealtimeDuplexSession(_SessionObservables):
             return self._responses.get_nowait()
         except queue.Empty:
             return None
+
+    def cancel_playback(self) -> PlaybackProgress:
+        """Stop talking NOW, and report how much of the reply the room got.
+
+        The interjection primitive (issue #151 item 3). Skips every chunk still
+        queued AND every chunk of the cut reply still to arrive, so the cut
+        lands within one chunk boundary — the chunk already inside ``play``
+        finishes, because a daemon-HTTP upload-then-play has no stop handle.
+        Anything the server produced and the room never heard is a NAMED drop.
+
+        Safe from any thread, before :meth:`start` and after :meth:`close`,
+        O(1)-ish (a bounded queue drain and a few counters), and never raises.
+        A cancel with nothing to cut is silent — it withheld nothing.
+
+        The returned :class:`PlaybackProgress` describes the reply that was
+        cut, measured at the sink; :meth:`playback_progress` re-reads it later.
+        """
+        cut = self._skip_remaining()
+        if cut.skipped_bytes:
+            self._state.drop(
+                REASON_PLAYBACK_CANCELLED,
+                f"cut after {cut.played_bytes}B spoken; {cut.skipped_bytes}B not spoken",
+            )
+        elif cut.in_flight_bytes:
+            # Nothing withheld: the cut landed on the last chunk, which the
+            # speaker is already committed to. Still worth one line — it is the
+            # moment the robot was told to stop.
+            self._state.note(
+                f"playback cut after {cut.played_bytes}B spoken (last chunk in flight)"
+            )
+        return cut
+
+    def playback_progress(self, response_id: str | None = None) -> PlaybackProgress | None:
+        """What the room heard of *response_id* (default: the reply being spoken).
+
+        ``None`` when this session has no record of that reply at all — every
+        reply it has SEEN has a progress record, zeroed until the mouth touches
+        it, so a zeroed record and ``None`` are different answers.
+        """
+        with self._playback_lock:
+            key = response_id if response_id is not None else self._current_response_id
+            ledger = self._ledgers.get(key or "")
+            return ledger.snapshot() if ledger is not None else None
 
     @property
     def sample_rate(self) -> int:
@@ -774,6 +1037,15 @@ class RealtimeDuplexSession(_SessionObservables):
         self._connected_at = self._clock()
         self._lane_unavailable = False
         self._pending.clear()
+        # A reply whose session died mid-sentence is dead with it: speaking its
+        # queued tail seconds later, into a new session, is the outbound twin of
+        # the stale-audio hazard `_drain_stale_source` handles below.
+        stale = self._skip_remaining()
+        if stale.skipped_bytes:
+            self._state.drop(
+                REASON_PLAYBACK_CANCELLED,
+                f"{stale.skipped_bytes}B from the previous session are not spoken",
+            )
         self._drain_stale_source()
         self._state.mark_up(event, url)
         return True
@@ -933,18 +1205,35 @@ class RealtimeDuplexSession(_SessionObservables):
         Keyed by ``response_id`` and tolerant of its absence: a delta that
         arrives before (or without) ``response.created`` still lands in the
         right place rather than being dropped for a missing envelope field.
+
+        The reply is stamped with the CURRENT cut generation here, once: a
+        cancel bumps the session's, and from that moment every chunk this reply
+        would still have produced is refused. A reply created AFTER the cut
+        gets the new generation and speaks normally — cutting a sentence must
+        not mute the answer to the interruption.
         """
         response_id = _as_str(event.get("response_id"))
         pending = self._pending.get(response_id or "")
         if pending is None:
-            pending = _PendingResponse(response_id=response_id)
+            with self._playback_lock:
+                generation = self._generation
+                self._ledger_for(response_id)
+            pending = _PendingResponse(response_id=response_id, generation=generation)
             self._pending[response_id or ""] = pending
         if pending.item_id is None:
             pending.item_id = _as_str(event.get("item_id"))
         return pending
 
     def _accumulate_audio(self, event: dict) -> None:
-        """Append one base64 PCM16 delta to its reply, bounded."""
+        """Append one base64 PCM16 delta to its reply, bounded — and SPEAK it.
+
+        The delta is appended to the reply's record and then whatever complete
+        chunk groups that made available are handed straight to the mouth, so
+        the robot starts talking while the reply is still arriving. This is the
+        half of chunked playback that makes a cut possible at all: by the time
+        ``response.done`` lands, most of a long answer is already spoken or
+        queued, and a cut has something to skip.
+        """
         pending = self._pending_for(event)
         raw = event.get("delta")
         if not isinstance(raw, str) or not raw:
@@ -961,11 +1250,15 @@ class RealtimeDuplexSession(_SessionObservables):
                 self._state.drop(REASON_RESPONSE_TOO_LONG, f"over {self._max_response_bytes} bytes")
             return
         pending.audio.extend(pcm)
+        self._flush_chunks(pending, final=False)
 
     def _finish_response(self, event: dict, *, interrupted: bool) -> None:
-        """Complete one reply: publish it, and speak it unless it was cut short."""
+        """Complete one reply: publish it, and finish (or cut) speaking it."""
         pending = self._pending_for(event)
         self._pending.pop(pending.response_id or "", None)
+        if not interrupted:
+            # The tail: whatever is left below one chunk group.
+            self._flush_chunks(pending, final=True)
         audio = bytes(pending.audio)
         response = Response(
             response_id=pending.response_id,
@@ -986,29 +1279,131 @@ class RealtimeDuplexSession(_SessionObservables):
             f"id={pending.response_id} chars={len(pending.text)} audio={len(audio)}B"
         )
         if interrupted:
-            # A barge-in means the human started talking again. Speaking the
-            # truncated reply now would talk over them, so it is deliberately
-            # never played — the record still carries the audio and says why.
-            self._state.drop(REASON_RESPONSE_INTERRUPTED, "truncated reply is not spoken")
-        elif audio:
-            self._enqueue_playback(audio)
+            # A barge-in means the human started talking again, so everything
+            # not yet in the speaker is skipped — the queued chunks AND the
+            # tail this reply never flushed. What the room already heard is
+            # measured and named; the record still carries the whole reply.
+            cut = self._skip_remaining(pending.response_id or "")
+            self._state.drop(
+                REASON_RESPONSE_INTERRUPTED,
+                f"cut after {cut.played_bytes}B spoken; "
+                f"{max(0, len(audio) - cut.played_bytes)}B not spoken",
+            )
         self._tap(self._on_response, response, "on_response")
 
-    def _enqueue_playback(self, audio: bytes) -> None:
-        """Hand one finished reply to the mouth. O(1); never blocks the session."""
+    # --- feeding the mouth ---------------------------------------------- #
+
+    def _flush_chunks(self, pending: _PendingResponse, *, final: bool) -> None:
+        """Hand every complete chunk group of *pending* to the mouth.
+
+        With ``final=True`` (``response.done``) the remainder goes too, however
+        short — chunking must never eat a reply's tail.
+
+        Runs on the session worker and stays O(1)-ish per delta: a slice, a
+        ``put_nowait`` and a couple of counters. No socket, no encoding, no
+        blocking call — the pump is what keeps the ears open.
+        """
+        while not pending.truncated:
+            available = len(pending.audio) - pending.flushed
+            if available <= 0:
+                return
+            target = self._first_chunk_bytes if pending.chunks == 0 else self._chunk_bytes
+            if available < target:
+                if not final:
+                    return
+                target = available
+            chunk = bytes(pending.audio[pending.flushed : pending.flushed + target])
+            if not self._offer_chunk(pending, chunk):
+                return
+            pending.flushed += target
+            pending.chunks += 1
+
+    def _offer_chunk(self, pending: _PendingResponse, chunk: bytes) -> bool:
+        """Queue one chunk. Returns whether feeding this reply may continue."""
         if self._play is None:
             if not self._no_sink_logged:
                 self._no_sink_logged = True
-                self._state.drop(REASON_NO_PLAYBACK_SINK, f"{len(audio)} bytes not spoken")
-            return
+                self._state.drop(REASON_NO_PLAYBACK_SINK, f"{len(chunk)} bytes not spoken")
+            return False
+        with self._playback_lock:
+            if pending.generation != self._generation:
+                return False  # this reply was cut; its remainder is not spoken
+            item = _PlaybackChunk(pending.response_id, self._generation, chunk)
         try:
-            self._playback.put_nowait(audio)
+            self._playback.put_nowait(item)
         except queue.Full:
+            # Refuse the REST of this reply rather than dropping one chunk out
+            # of its middle: speech that stops early is honest, speech with a
+            # hole in it is a defect.
+            pending.truncated = True
             if not self._playback_full_logged:
                 self._playback_full_logged = True
-                self._state.drop(REASON_PLAYBACK_QUEUE_FULL, f"{len(audio)} bytes not spoken")
-            return
+                self._state.drop(
+                    REASON_PLAYBACK_QUEUE_FULL,
+                    f"the mouth is {self._playback.maxsize} chunks behind; "
+                    f"the rest of this reply is not spoken",
+                )
+            return False
         self._playback_full_logged = False
+        self.chunks_queued += 1
+        with self._playback_lock:
+            self._ledger_for(pending.response_id).queued_bytes += len(chunk)
+        return True
+
+    # --- cutting the mouth off ------------------------------------------ #
+
+    def _skip_remaining(self, key: str | None = None) -> PlaybackProgress:
+        """Bump the cut generation and drain the mouth queue. Never raises.
+
+        Everything drained is counted as SKIPPED against its reply, and a chunk
+        the mouth had already dequeued is skipped too — it re-checks the
+        generation immediately before ``play``. Only a chunk already inside
+        ``play`` survives a cut, which is exactly the one-chunk boundary the
+        chunk size buys.
+
+        *key* names the reply to REPORT on when the caller already knows it
+        (``response.interrupted`` does). Left out — an operator-driven cut,
+        which knows only "stop talking" — the reply reported is the next one
+        that would have been spoken, or the one in the speaker if the queue was
+        already empty.
+        """
+        with self._playback_lock:
+            self._generation += 1
+        drained: list[_PlaybackChunk] = []
+        while True:
+            try:
+                drained.append(self._playback.get_nowait())
+            except queue.Empty:
+                break
+        with self._playback_lock:
+            for item in drained:
+                ledger = self._ledger_for(item.response_id)
+                ledger.skipped_bytes += len(item.pcm)
+                ledger.cancelled = True
+                self.chunks_cancelled += 1
+                self.cancelled_bytes += len(item.pcm)
+            if key is None:
+                key = drained[0].response_id if drained else self._current_response_id
+            cut = self._ledger_for(key or None)
+            cut.cancelled = True
+            return cut.snapshot()
+
+    def _ledger_for(self, response_id: str | None) -> _PlaybackLedger:
+        """This reply's measurement record. Caller holds ``_playback_lock``.
+
+        Bounded like every other per-reply structure here: the oldest record
+        goes when a long-lived session has seen more replies than the response
+        queue is deep. A cut is read immediately by whoever made it, so the
+        history a caller can still ask about is deliberately short.
+        """
+        key = response_id or ""
+        ledger = self._ledgers.get(key)
+        if ledger is None:
+            ledger = _PlaybackLedger(response_id=response_id)
+            self._ledgers[key] = ledger
+            while len(self._ledgers) > max(1, int(self._limits.response_maxsize)):
+                self._ledgers.popitem(last=False)
+        return ledger
 
     # --- the mouth ------------------------------------------------------ #
 
@@ -1022,29 +1417,56 @@ class RealtimeDuplexSession(_SessionObservables):
         """
         while not self._closed:
             try:
-                audio = self._playback.get(timeout=_PLAYBACK_POLL_S)
+                item = self._playback.get(timeout=_PLAYBACK_POLL_S)
             except queue.Empty:
                 continue
-            self._speak(audio)
+            if self._begin_chunk(item):
+                self._speak(item)
 
-    def _speak(self, audio: bytes) -> None:
+    def _begin_chunk(self, item: _PlaybackChunk) -> bool:
+        """Adopt one chunk, unless a cut overtook it between queue and speaker."""
+        with self._playback_lock:
+            ledger = self._ledger_for(item.response_id)
+            if item.generation != self._generation:
+                ledger.skipped_bytes += len(item.pcm)
+                ledger.cancelled = True
+                self.chunks_cancelled += 1
+                self.cancelled_bytes += len(item.pcm)
+                return False
+            self._current_response_id = item.response_id
+            ledger.in_flight_bytes = len(item.pcm)
+        return True
+
+    def _speak(self, item: _PlaybackChunk) -> None:
         play = self._play
         if play is None:  # pragma: no cover - never enqueued without a sink
             return
         self._speaking = True
+        spoken = False
         try:
-            play(audio, samplerate=self._output_sample_rate)
+            play(item.pcm, samplerate=self._output_sample_rate)
         except Exception:  # a dead speaker must not end the session
             self.playback_failures += 1
             if not self._playback_failed_logged:
                 self._playback_failed_logged = True
-                self._state.drop(REASON_PLAYBACK_FAILED, f"{len(audio)} bytes")
+                self._state.drop(REASON_PLAYBACK_FAILED, f"{len(item.pcm)} bytes")
                 logger.warning("duplex: playback sink raised", exc_info=True)
         else:
+            spoken = True
             self.played += 1
+            self.played_bytes += len(item.pcm)
             self._playback_failed_logged = False
         finally:
             self._speaking = False
+            with self._playback_lock:
+                ledger = self._ledger_for(item.response_id)
+                ledger.in_flight_bytes = 0
+                # Confirmed by the sink, or not heard at all: a failed play is
+                # never counted as spoken.
+                if spoken:
+                    ledger.played_bytes += len(item.pcm)
+                else:
+                    ledger.skipped_bytes += len(item.pcm)
 
     # --- small helpers -------------------------------------------------- #
 

@@ -63,6 +63,27 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   ``response_chunk_bytes``-sized slice of ``response_audio`` (multiple
   chunks by default, so a test can prove the reassembled audio is
   CONTIGUOUS) -> ``response.done``, then a graceful close.
+- ``RESPONSE_HOLD_BEFORE_DONE`` (foreground-Gemma plan, task t6) — the same
+  arm-and-wait and the same audio deltas as ``RESPONSE_HAPPY_PATH``, but it
+  then **HOLDS** the reply open: it waits (bounded by ``wait_timeout``) for
+  :meth:`FakeRealtimeServer.release_response_done` before sending
+  ``response.done`` and closing. Two things become testable that
+  ``RESPONSE_HAPPY_PATH`` cannot express, because that scenario's whole script
+  finishes within a millisecond of the handshake:
+
+  * **playback happens as the deltas arrive, not at ``response.done``** — a
+    client that accumulates the whole reply first has spoken NOTHING while
+    this scenario holds, and one that plays chunk groups has already spoken
+    the lot;
+  * **a busy mouth starves neither the pump nor the keepalive** — the hold
+    sends one PING every ``hold_ping_interval_s`` (default 0.1 s, counted in
+    ``ping_sent_count``) for as long as it lasts, so a test that blocks the
+    client's playback sink can watch ``pong_count`` keep RISING while it is
+    blocked, and can watch its own ``input_audio_buffer.append`` frames keep
+    landing in ``append_payloads``.
+
+  ``release_response_done`` is idempotent and safe to call from a test's
+  ``finally``, including when the hold already timed out on its own.
 - ``RESPONSE_INTERRUPTED`` — the same arm-and-wait as ``RESPONSE_HAPPY_PATH``,
   then ``response.created`` -> ``response.text.done`` -> exactly ONE
   (partial) ``response.audio.delta`` -> ``response.interrupted``
@@ -239,6 +260,10 @@ _DEFAULT_ACCEPT_TIMEOUT = 5.0
 _DEFAULT_IO_TIMEOUT = 0.2
 _DEFAULT_WAIT_TIMEOUT = 5.0
 _DEFAULT_PONG_WAIT_S = 2.0
+#: How often ``RESPONSE_HOLD_BEFORE_DONE`` PINGs while it holds the reply open.
+#: Small enough that a test blocking the client's mouth sees ``pong_count``
+#: rise promptly, large enough that a held session is not a busy loop.
+_DEFAULT_HOLD_PING_INTERVAL_S = 0.1
 _MAX_HEAD_BYTES = 64 * 1024
 
 
@@ -253,6 +278,7 @@ class Scenario(str, Enum):
     ERROR_VAD_UNAVAILABLE = "error_vad_unavailable"
     ERROR_STT_FORWARD_FAILED = "error_stt_forward_failed"
     RESPONSE_HAPPY_PATH = "response_happy_path"
+    RESPONSE_HOLD_BEFORE_DONE = "response_hold_before_done"
     RESPONSE_INTERRUPTED = "response_interrupted"
     RESPONSE_AUDIO_DELTA_MALFORMED = "response_audio_delta_malformed"
     DUPLEX_HAPPY_PATH = "duplex_happy_path"
@@ -375,6 +401,7 @@ class FakeRealtimeServer:
         close_after_frames: int = 1,
         ping_payload: bytes = b"keepalive",
         pong_wait_s: float = _DEFAULT_PONG_WAIT_S,
+        hold_ping_interval_s: float = _DEFAULT_HOLD_PING_INTERVAL_S,
         wait_timeout: float = _DEFAULT_WAIT_TIMEOUT,
         accept_timeout: float = _DEFAULT_ACCEPT_TIMEOUT,
         io_timeout: float = _DEFAULT_IO_TIMEOUT,
@@ -389,6 +416,7 @@ class FakeRealtimeServer:
         self._close_after_frames = close_after_frames
         self._ping_payload = ping_payload
         self._pong_wait_s = pong_wait_s
+        self._hold_ping_interval_s = max(0.001, float(hold_ping_interval_s))
         self._wait_timeout = wait_timeout
         self._accept_timeout = accept_timeout
         self._io_timeout = io_timeout
@@ -397,6 +425,7 @@ class FakeRealtimeServer:
         self._stop_event = threading.Event()
         self._pong_event = threading.Event()
         self._response_create_event = threading.Event()
+        self._release_done_event = threading.Event()
 
         self._sock: socket.socket | None = None
         self._port = 0
@@ -577,6 +606,15 @@ class FakeRealtimeServer:
         same event internally rather than polling.
         """
         return self._response_create_event.wait(timeout=timeout)
+
+    def release_response_done(self) -> None:
+        """Let ``RESPONSE_HOLD_BEFORE_DONE`` finish the reply it is holding open.
+
+        Idempotent and safe from any thread — call it from a test's ``finally``
+        whether or not the hold is still running, and whether or not it already
+        timed out on its own.
+        """
+        self._release_done_event.set()
 
     # --- accept loop --------------------------------------------------------------
 
@@ -1110,6 +1148,7 @@ class FakeRealtimeServer:
 
         if scenario in (
             Scenario.RESPONSE_HAPPY_PATH,
+            Scenario.RESPONSE_HOLD_BEFORE_DONE,
             Scenario.RESPONSE_INTERRUPTED,
             Scenario.RESPONSE_AUDIO_DELTA_MALFORMED,
         ):
@@ -1218,5 +1257,26 @@ class FakeRealtimeServer:
             self._send_event(
                 conn, send_lock, self._event_response_audio_delta(session_id, response_id, chunk)
             )
+        if scenario is Scenario.RESPONSE_HOLD_BEFORE_DONE:
+            self._hold_reply_open(conn, send_lock)
         self._send_event(conn, send_lock, self._event_response_done(session_id, response_id))
         self._graceful_close(conn, send_lock)
+
+    def _hold_reply_open(self, conn: socket.socket, send_lock: threading.Lock) -> None:
+        """Keep a reply un-``done`` until released, PINGing throughout.
+
+        The PINGs are the point, not decoration: they are what lets a test
+        prove the client's session pump and keepalive survive a BLOCKED
+        playback sink — ``pong_count`` must keep rising while the mouth is
+        stuck. Bounded by ``wait_timeout`` so a test that forgets to release
+        still terminates (the same "make the wait observable, never hang the
+        suite" posture every other wait in this file takes).
+        """
+        deadline = time.monotonic() + self._wait_timeout
+        while time.monotonic() < deadline:
+            if self._release_done_event.is_set() or self._stop_event.is_set():
+                return
+            self._send_frame(conn, send_lock, wire.OPCODE_PING, self._ping_payload)
+            with self._lock:
+                self._ping_sent_count += 1
+            self._release_done_event.wait(timeout=self._hold_ping_interval_s)

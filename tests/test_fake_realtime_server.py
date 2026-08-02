@@ -717,6 +717,60 @@ def test_response_audio_delta_malformed_scenario_decodes_the_envelope_but_not_th
         client.close()
 
 
+def test_response_hold_before_done_withholds_done_until_released_and_pings_meanwhile() -> None:
+    """The hold scenario's two promises (foreground-Gemma plan, task t6).
+
+    Every audio delta arrives BEFORE ``response.done`` is even sent — which is
+    what lets a duplex client prove it speaks chunk groups as they arrive
+    rather than accumulating the whole reply — and the hold keeps PINGing
+    throughout, which is what lets that same client prove a blocked playback
+    sink never starves its keepalive.
+    """
+    with FakeRealtimeServer(
+        Scenario.RESPONSE_HOLD_BEFORE_DONE,
+        response_audio=bytes(range(24)),
+        response_chunk_bytes=8,
+        hold_ping_interval_s=0.02,
+    ) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        client.send_response_create()
+        client.read_event()  # response.created
+        client.read_event()  # response.text.done
+
+        deltas = []
+        pings = 0
+        for _ in range(3):
+            deltas.append(client.read_event())
+        assert [event["type"] for event in deltas] == ["response.audio.delta"] * 3
+
+        # response.done is NOT here yet: the next frames are keepalive PINGs.
+        while pings < 2:
+            _fin, opcode, _payload = client.read_frame()
+            assert opcode == wire.OPCODE_PING, "response.done arrived before the release"
+            pings += 1
+
+        server.release_response_done()
+        event = client.read_frame()
+        while event[1] == wire.OPCODE_PING:
+            event = client.read_frame()
+        decoded = wire.decode_event(event[2])
+        assert decoded is not None and decoded["type"] == "response.done"
+        client.close()
+
+    assert server.ping_sent_count >= 2
+    assembled = b"".join(base64.b64decode(delta["delta"]) for delta in deltas)
+    assert assembled == bytes(range(24))
+
+
+def test_release_response_done_is_idempotent_and_safe_before_the_hold_runs() -> None:
+    server = FakeRealtimeServer(Scenario.RESPONSE_HOLD_BEFORE_DONE)
+    server.release_response_done()
+    server.release_response_done()  # idempotent, and safe with nothing started
+    server.stop(timeout=1.0)
+
+
 def test_response_create_count_and_wait_for_response_create_observability() -> None:
     with FakeRealtimeServer(Scenario.RESPONSE_HAPPY_PATH) as server:
         client, status, _headers = _connect(server)
