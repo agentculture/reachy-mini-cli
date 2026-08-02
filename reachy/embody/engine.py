@@ -62,6 +62,31 @@ is exactly the identity the closed cue vocabulary already expresses (see
 :mod:`reachy.runtime_cues`: a fixed phrase per perception, so equal text means
 the same fact happened again).
 
+A second coalescing key, because free text has no fixed phrase (issue #154)
+-----------------------------------------------------------------------------
+Text-identity coalescing is exactly right for the closed cue vocabulary and
+exactly wrong for anything else: "a kitchen with someone at the counter" and
+"a kitchen, a person near the counter" describe the same fact and share no
+key, so a caller feeding free-form perception text (the senses lane's
+:meth:`ask`, polled roughly every 20 s by the clip-asking caller) through
+:meth:`submit_cue` fills :data:`DEFAULT_MAX_CONTEXT` with near-duplicate
+sightings inside minutes and starts refusing genuine runtime facts — the
+cheapest, most repetitive signal evicting the most valuable one.
+:meth:`submit_perception` is the escape hatch, not a retuning of the same
+dict: a SEPARATELY bounded park keyed on SOURCE rather than text, where a new
+description REPLACES the one already there instead of adding beside it — a
+:class:`PerceptionSlot` describes a STATE ("what the camera currently
+shows"), not a growing log of past sightings, so one slot per source is
+correct even after an hour of updates. The replacement is never silent: the
+slot's own ``count`` keeps incrementing on every update, so it still adds its
+share to the turn's ``coalesced-from`` total, and its rendering marks an
+update differently from a repeat (``"... (updated x180)"`` against a cue's
+``"... (x145)"``) so a reader of the journal or export feed can tell which
+happened. What this module does NOT build: freshness/staleness on the slot,
+or a structured schema for its content — both are task t13's job, over the
+seam this one leaves in place (one slot, replaced on every
+:meth:`submit_perception` call).
+
 Alert containment, because the flood has a front door too
 ----------------------------------------------------------
 ``reachy/behavior/rules.py`` permits ``cooldown_s = 0`` and several rules can
@@ -212,10 +237,20 @@ REASON_STREAM_FAILED = "stream-failed"
 REASON_TOOL_ROUNDS_EXHAUSTED = "tool-rounds-exhausted"
 #: The pending-TRIGGER buffer was full; the newest trigger was refused.
 REASON_INPUT_QUEUE_FULL = "input-queue-full"
-#: The context park already holds :data:`DEFAULT_MAX_CONTEXT` DISTINCT facts and
-#: a new one arrived. A repeat of a parked fact can never reach this: it
-#: coalesces, so a flood of one perception cannot fill the park.
+#: The context park already holds :data:`DEFAULT_MAX_CONTEXT` DISTINCT cue
+#: facts and a new one arrived. A repeat of an already-parked cue can never
+#: reach this: it coalesces, so a flood of one exact fact cannot fill the
+#: park. Free-text perception (:meth:`EmbodyTurnEngine.submit_perception`)
+#: cannot reach this reason at all — see :data:`REASON_PERCEPTION_SOURCES_FULL`,
+#: its own, separately bounded, park.
 REASON_CONTEXT_PARK_FULL = "context-park-full"
+#: :meth:`EmbodyTurnEngine.submit_perception`'s own bound: the latest-wins
+#: park already holds :data:`DEFAULT_MAX_PERCEPTION_SOURCES` distinct SOURCES
+#: and a new one arrived. An existing source's later text can never reach
+#: this: it REPLACES the slot in place, so any number of updates from one
+#: source — however many DIFFERENT descriptions — can never fill this bound;
+#: only a genuinely new source can.
+REASON_PERCEPTION_SOURCES_FULL = "perception-sources-full"
 #: A blank cue/utterance was submitted.
 REASON_EMPTY_INPUT = "empty-input"
 #: A turn produced no text, no reasoning and no tool call.
@@ -234,6 +269,7 @@ DROP_REASONS: tuple[str, ...] = (
     REASON_TOOL_ROUNDS_EXHAUSTED,
     REASON_INPUT_QUEUE_FULL,
     REASON_CONTEXT_PARK_FULL,
+    REASON_PERCEPTION_SOURCES_FULL,
     REASON_EMPTY_INPUT,
     REASON_SILENT_TURN,
     REASON_NOT_ADDRESSED_COLD,
@@ -266,6 +302,17 @@ DEFAULT_MAX_PENDING = 32
 #: park that needs more than this is describing a robot in a genuinely novel
 #: situation, not a busy one.
 DEFAULT_MAX_CONTEXT = 24
+#: The SOURCE name a caller's free-text perception is parked under when it
+#: does not name one — see :meth:`EmbodyTurnEngine.submit_perception`.
+#: Distinct sources get distinct slots; the same source's later text REPLACES
+#: rather than adds beside its predecessor.
+DEFAULT_PERCEPTION_SOURCE = "vision"
+#: DISTINCT perception SOURCES the latest-wins park holds at once — a bound
+#: that exists to fail closed rather than because a real deployment needs it:
+#: today's only caller (the clip-asking senses lane, issue #139's ``_ClipAsker``)
+#: is one source, so this only ever bites a caller that names a new source on
+#: every call, which is a bug, not a busy robot.
+DEFAULT_MAX_PERCEPTION_SOURCES = 4
 #: Seconds between ALERT-triggered turns. The first alert after quiet is never
 #: delayed; this only bites on a burst, where the fires it holds back are
 #: deferred into the next turn rather than dropped. Sized against the measured
@@ -348,6 +395,35 @@ class Parked:
         return self.text if self.count == 1 else f"{self.text} (x{self.count})"
 
 
+@dataclass
+class PerceptionSlot(Parked):
+    """One latest-wins CONTEXT slot for free-form perception text (issue #154).
+
+    A subclass of :class:`Parked`, not a second copy: it reuses ``text`` /
+    ``count`` and the same list :meth:`EmbodyTurnEngine._drain_context` reads,
+    so the turn-building and accounting code needs no branch for which kind of
+    entry it is holding. What differs is the KEY it lives under and how a
+    later update behaves — both live in
+    :meth:`EmbodyTurnEngine.submit_perception`, not here — and how it renders.
+
+    Unlike :class:`Parked`'s exact-text coalescing (the SAME fact reported
+    again), a slot coalesces on the IDENTITY OF ITS SOURCE, never on text: a
+    new description from that source REPLACES the old one, because "what the
+    camera currently shows" is a STATE, not a growing list of past sightings.
+    ``count`` still increments on every replacement, so the slot keeps adding
+    its share to the turn's ``coalesced-from`` total — a silent coalescer is
+    indistinguishable from a dropper, and that holds for a replacement exactly
+    as it does for a repeat. The render marks the two apart on purpose:
+    ``"... (updated x180)"`` here, never a bare ``"... (x180)"``, so a reader
+    can tell "the 180th version of this fact" apart from "this exact fact
+    recurred 180 times."
+    """
+
+    def render(self) -> str:
+        """``"<latest text> (updated x180)"`` — or the bare text on the first sighting."""
+        return self.text if self.count == 1 else f"{self.text} (updated x{self.count})"
+
+
 # --------------------------------------------------------------------------- #
 # Model selection                                                             #
 # --------------------------------------------------------------------------- #
@@ -428,6 +504,13 @@ class Limits:
     max_pending: int = DEFAULT_MAX_PENDING
     #: DISTINCT facts the context park holds.
     max_context: int = DEFAULT_MAX_CONTEXT
+    #: DISTINCT perception SOURCES the latest-wins park holds (see
+    #: :meth:`EmbodyTurnEngine.submit_perception`) — a bound of its own, on
+    #: purpose: free text keyed by SOURCE must never compete with the closed
+    #: cue vocabulary keyed by TEXT for the same ``max_context`` budget, which
+    #: is exactly the crowding-out defect (issue #154) this pair of bounds
+    #: exists to close.
+    max_perception_sources: int = DEFAULT_MAX_PERCEPTION_SOURCES
     #: Seconds between ALERT-triggered turns; ``0`` disables the bound.
     min_alert_interval_s: float = DEFAULT_MIN_ALERT_INTERVAL_S
     #: Recent already-spoken replies carried into the next turn's context.
@@ -632,6 +715,12 @@ class EmbodyTurnEngine:
         # flood, where a recency ordering would churn every line every tick.
         self._context: dict[str, Parked] = {}
         self._max_context = max(1, int(self._limits.max_context))
+        # A SEPARATE park, keyed on SOURCE rather than text (issue #154): see
+        # ``submit_perception`` and ``PerceptionSlot``. Kept apart from
+        # ``_context`` so free text can never compete with the closed cue
+        # vocabulary for the same distinct-fact budget.
+        self._perception: dict[str, PerceptionSlot] = {}
+        self._max_perception_sources = max(1, int(self._limits.max_perception_sources))
         self._min_alert_interval_s = max(0.0, float(self._limits.min_alert_interval_s))
         # ONE clock for the layer: the gate is a time-based state machine and a
         # second clock would make "the window elapsed" untestable and, under an
@@ -697,6 +786,53 @@ class EmbodyTurnEngine:
             else:
                 accepted += self.submit_cue(cue)
         return accepted
+
+    def submit_perception(self, text: str, *, source: str = DEFAULT_PERCEPTION_SOURCE) -> bool:
+        """Offer one free-text perception update as CONTEXT. Latest-wins per *source*.
+
+        This is the escape hatch from :meth:`submit_cue`'s text-identity
+        coalescing, for a caller whose text has no fixed phrase to key on —
+        today, the senses lane's :meth:`ask` answering a clip question,
+        polled by ``_ClipAsker`` roughly every 20 s (issue #139's h9). Two
+        renderings of one room never share a key
+        (``submit_cue("a kitchen with someone at the counter")`` and
+        ``submit_cue("a kitchen, a person near the counter")`` are two
+        DIFFERENT dict entries), so routing free text through the cue park
+        fills :data:`DEFAULT_MAX_CONTEXT` with near-duplicate sightings within
+        minutes and starts refusing genuine runtime facts — issue #154's
+        defect. This method never touches that park: *source* keys a wholly
+        separate :class:`PerceptionSlot` dict, bounded by
+        :data:`DEFAULT_MAX_PERCEPTION_SOURCES` DISTINCT SOURCES rather than
+        distinct text, so any number of updates from ONE source — however
+        many different descriptions — occupies exactly one slot.
+
+        Always CONTEXT, never a TRIGGER, and there is no parameter to make it
+        one: perception must never wake the mind on its own (mirrors
+        :meth:`submit_cue`'s CONTEXT-by-default rationale, made structural
+        rather than merely defaulted here). Like :meth:`_offer_context`, this
+        is O(1), safe from any thread, and never raises; an empty *text* is a
+        named, counted drop exactly as an empty cue is.
+        """
+        cleaned = (text or "").strip()
+        if not cleaned:
+            self._drop(REASON_EMPTY_INPUT, "perception")
+            return False
+        with self._intake_lock:
+            slot = self._perception.get(source)
+            if slot is not None:
+                # Latest-wins: replace the text IN PLACE, but keep counting —
+                # the 180th update is still visible in ``coalesced-from``, it
+                # just never grows the dict (see ``PerceptionSlot.render``).
+                slot.text = cleaned
+                slot.count += 1
+                return True
+            distinct = len(self._perception)
+            if distinct < self._max_perception_sources:
+                self._perception[source] = PerceptionSlot(text=cleaned)
+                return True
+        self.dropped_inputs += 1
+        self._drop(REASON_PERCEPTION_SOURCES_FULL, f"{distinct} perception sources parked")
+        return False
 
     def submit_utterance(self, text: str) -> bool:
         """Offer one heard utterance, subject to ATTENTION (issue #148).
@@ -780,8 +916,15 @@ class EmbodyTurnEngine:
 
     @property
     def parked(self) -> int:
-        """How many DISTINCT context facts the park is holding."""
-        return len(self._context)
+        """How many DISTINCT context facts the park is holding.
+
+        Sums both coalescing keys: exact-text cue facts and latest-wins
+        perception slots (:meth:`submit_perception`) are two separately
+        bounded dicts, but both are CONTEXT the next turn drains, so one count
+        describes the whole park to a caller that only cares "is there
+        anything parked".
+        """
+        return len(self._context) + len(self._perception)
 
     @property
     def last_text(self) -> str:
@@ -804,12 +947,15 @@ class EmbodyTurnEngine:
         return False
 
     def _offer_context(self, text: str) -> bool:
-        """Coalescing intake for everything that never runs a turn. O(1).
+        """Coalescing intake for the closed cue vocabulary. O(1). Unchanged by issue #154.
 
         Keyed on the cue TEXT: the vocabulary is closed (one fixed phrase per
         perception, :mod:`reachy.runtime_cues`), so equal text means the same
         fact happened again, and the count is the only thing worth keeping
-        about the repeat.
+        about the repeat. This is :meth:`submit_cue`'s ONLY route for a
+        CONTEXT cue — free-form text with no fixed phrase to key on belongs in
+        :meth:`submit_perception`'s separate latest-wins park instead, never
+        here.
         """
         cleaned = (text or "").strip()
         if not cleaned:
@@ -1103,16 +1249,25 @@ class EmbodyTurnEngine:
         return items
 
     def _drain_context(self) -> list[Parked]:
-        """Take the parked facts this turn will show, emptying the park.
+        """Take the parked facts this turn will show, emptying BOTH parks.
 
         Drained rather than snapshotted-and-kept: the park describes what has
         happened SINCE the last turn, so carrying an entry forward would make
         every later turn re-read the same background — the failure
-        :meth:`_drain_spoken` avoids one buffer over.
+        :meth:`_drain_spoken` avoids one buffer over. This applies uniformly
+        to the two coalescing keys: exact-text cue facts (:attr:`_context`)
+        and latest-wins :class:`PerceptionSlot`\\ s (:attr:`_perception`) drain
+        together into one list, in that order, and both dicts empty. A slot
+        surviving un-drained until its NEXT update — so a turn between two
+        clip polls still sees the room — is deliberately not built here: this
+        module's contract is only that a flood of updates costs one slot, not
+        that the slot is FRESH between updates; that discipline is task t13's,
+        over the seam this method already leaves in place.
         """
         with self._intake_lock:
-            taken = list(self._context.values())
+            taken = list(self._context.values()) + list(self._perception.values())
             self._context.clear()
+            self._perception.clear()
         return taken
 
     def _drain_spoken(self) -> list[str]:
