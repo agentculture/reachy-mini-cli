@@ -636,8 +636,10 @@ def cmd_agent_attach(
 #   media.source.read   -> duplex read_audio      (the layer's EARS)
 #   media.sink.play     -> duplex play            (the layer's MOUTH)
 #   media.sink.play     -> the speak/harmonics tools' render leg
-#   duplex on_utterance -> engine.submit_utterance   (a TRIGGER)
-#   duplex on_response  -> engine.note_spoken        (CONTEXT, never a trigger)
+#   duplex on_utterance -> engine.submit_utterance   (a TRIGGER, if attention
+#                          admits it: the name opens the window — #148)
+#   duplex on_response  -> engine.note_spoken        (CONTEXT, never a trigger;
+#                          extends a live attention window, never opens one)
 #   runtime feed line   -> classified_cues_for_line -> engine.submit_cues
 #                          (a rule FIRE triggers; every other cue parks — #143)
 #   engine + every layer failure -> the shared --export cognition feed
@@ -1008,7 +1010,14 @@ class _EmbodyLayer:
 
 
 def _utterance_tap(engine: object) -> Callable[[object], None]:
-    """duplex ``on_utterance`` -> a TRIGGER. Ungated: the layer hears everyone."""
+    """duplex ``on_utterance`` -> a candidate TRIGGER.
+
+    The SESSION is ungated — it hears everyone in the room, and its own
+    boundary tests pin that — but the ENGINE decides whether what it heard is
+    worth waking a mind for: while attention is cold only the robot's name
+    admits an utterance (issue #148, :mod:`reachy.embody.attention`). The tap
+    stays a plain forward, so that decision has exactly one home.
+    """
 
     def _heard(utterance: object) -> None:
         engine.submit_utterance(getattr(utterance, "text", "") or "")
@@ -1029,6 +1038,12 @@ def _response_tap(engine: object) -> Callable[[object], None]:
     but never PLAYS it, because a barge-in means the human started talking
     again. Recording it as spoken would leave the mind believing it had
     answered when the room heard nothing.
+
+    It is also the second half of the attention window (issue #148): an answer
+    the layer actually spoke EXTENDS a live conversation, so a long reply never
+    times the human out. It cannot OPEN one — the server answers ambient
+    utterances the gate refused, and a robot that could wake itself with its
+    own voice would never go quiet again.
     """
 
     def _spoke(response: object) -> None:
@@ -1203,13 +1218,18 @@ def cmd_agent_embody(
         "events": layer.reader.events,
         "cues": layer.reader.cues,
         "utterances": int(getattr(layer.session, "utterances", 0) or 0),
+        # Reported beside the utterance count on purpose: "it heard 12 and
+        # ignored 9" is the question an operator asks about a robot that stayed
+        # quiet, and attention (#148) is the answer more often than a fault is.
+        "unaddressed": int(getattr(layer.engine, "unaddressed_utterances", 0) or 0),
     }
     if json_mode and export_hook is None:
         emit_result({"status": "ok", **stats}, json_mode=True)
     else:
         emit_diagnostic(
             f"[embody] layer down: {stats['turns']} turn(s), {stats['cues']} cue(s) "
-            f"over {stats['events']} runtime event(s), {stats['utterances']} utterance(s)"
+            f"over {stats['events']} runtime event(s), {stats['utterances']} utterance(s) "
+            f"({stats['unaddressed']} not addressed to it)"
         )
     return 0
 
@@ -1335,7 +1355,9 @@ def cmd_agent_overview(args: argparse.Namespace) -> int:
                 "rules keep running, agent attached or not.",
                 "EMBODY (the other verb): the embodiment layer — a detachable realtime "
                 "harness that HEARS and SPEAKS out loud over ONE lobes /v1/realtime "
-                "duplex session (ungated: it hears everyone), thinks over the streaming "
+                'duplex session (it hears everyone; say "reachy" to wake it, and it '
+                "keeps listening for ~45s after each thing heard or said), thinks over "
+                "the streaming "
                 "/v1/chat/completions lane, and operates the robot through the closed "
                 "five-tool direct-operation action set (goto / speak / harmonics / "
                 "run_behavior / create_rule). It constructs no ReachyMini: audio comes "

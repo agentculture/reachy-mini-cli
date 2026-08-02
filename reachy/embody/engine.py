@@ -37,11 +37,21 @@ tick rate instead of utterance rate. So intake splits three ways:
 ============  ==========================================  =================
 class         events                                      effect
 ============  ==========================================  =================
-heard         an utterance from the duplex session        runs a turn
+heard         an utterance from the duplex session        runs a turn, if
+                                                          ATTENTION admits it
 **alert**     a rule FIRE                                 runs a turn
 **context**   ``sense`` / ``intent`` / ``motion``, and a   parked, drained
               rule SUPPRESSION                            by the next turn
 ============  ==========================================  =================
+
+The "if attention admits it" qualifier is issue #148, and it is the one clause
+of this policy that is about WHO rather than about WHAT. The ear stays ungated
+— the duplex session surfaces every voice in the room — but a turn is woken
+only by an utterance that named the robot, or by one arriving while a
+conversation the name opened is still live. The whole rule lives in
+:mod:`reachy.embody.attention`; what matters here is that it gates the HEARD
+class alone. An alert is the robot's own reflex firing: attention gates the
+ear, never the robot's reactions, so a rule fire runs a turn from cold.
 
 The context half is where :class:`~reachy.speech.agent_turn.AgentTurnEngine`'s
 snapshot-only buffer is CITED rather than imported: cues that arrive during a
@@ -152,6 +162,7 @@ from typing import Protocol
 
 from reachy import senselog
 from reachy.cli._errors import CliError
+from reachy.embody.attention import DEFAULT_ATTENTION_WINDOW_S, LABEL_COLD, AttentionGate
 from reachy.embody.cues import ClassifiedCue, CueClass
 from reachy.embody.tools import HARMONICS, SPEAK
 from reachy.export.events import EmotionEvent, MessageEvent, ThinkingEvent
@@ -209,6 +220,10 @@ REASON_CONTEXT_PARK_FULL = "context-park-full"
 REASON_EMPTY_INPUT = "empty-input"
 #: A turn produced no text, no reasoning and no tool call.
 REASON_SILENT_TURN = "silent-turn"
+#: An utterance arrived while attention was COLD and named nobody (issue #148).
+#: Imported from :mod:`reachy.embody.attention` rather than retyped: the gate's
+#: label IS the drop reason, exactly as the runtime's engagement labels are.
+REASON_NOT_ADDRESSED_COLD = LABEL_COLD
 
 #: Every reason this module can emit, in one place so the journal, the export
 #: feed, the operator docs and the tests share ONE vocabulary.
@@ -221,6 +236,7 @@ DROP_REASONS: tuple[str, ...] = (
     REASON_CONTEXT_PARK_FULL,
     REASON_EMPTY_INPUT,
     REASON_SILENT_TURN,
+    REASON_NOT_ADDRESSED_COLD,
 )
 
 # --------------------------------------------------------------------------- #
@@ -289,7 +305,10 @@ DEFAULT_EMBODY_SYSTEM_PROMPT = (
 #: cue class that triggers, because it is the one the layer cannot learn any
 #: other way (see :class:`reachy.embody.cues.CueClass`).
 KIND_ALERT = "alert"
-#: Something a person said, ungated (spec claim c4 — the layer hears everyone).
+#: Something a person said. The layer HEARS everyone (spec claim c4, pinned in
+#: the wire); whether what it heard wakes the mind is
+#: :mod:`reachy.embody.attention`'s decision, taken in
+#: :meth:`EmbodyTurnEngine.submit_utterance`.
 KIND_UTTERANCE = "utterance"
 
 
@@ -415,6 +434,13 @@ class Limits:
     spoken_maxlen: int = DEFAULT_SPOKEN_MAXLEN
     #: Minimum gap between turns in :meth:`EmbodyTurnEngine.run`.
     turn_interval: float = DEFAULT_TURN_INTERVAL
+    #: How long attention stays open after the last utterance heard or answer
+    #: spoken (issue #148); ``0`` means name-only forever. It lives here rather
+    #: than as a constructor parameter for the reason this class exists at all:
+    #: a loose bound would put the count back over ``python:S107``'s threshold.
+    #: The measured argument for the default is on
+    #: :data:`reachy.embody.attention.DEFAULT_ATTENTION_WINDOW_S`.
+    attention_window_s: float = DEFAULT_ATTENTION_WINDOW_S
 
 
 @dataclass(frozen=True)
@@ -607,6 +633,10 @@ class EmbodyTurnEngine:
         self._context: dict[str, Parked] = {}
         self._max_context = max(1, int(self._limits.max_context))
         self._min_alert_interval_s = max(0.0, float(self._limits.min_alert_interval_s))
+        # ONE clock for the layer: the gate is a time-based state machine and a
+        # second clock would make "the window elapsed" untestable and, under an
+        # injected clock, wrong.
+        self._attention = AttentionGate(window_s=self._limits.attention_window_s, clock=self._now)
         # -inf, never 0.0: an injected clock may start anywhere, and the FIRST
         # alert after quiet must never be the one the interval delays.
         self._last_alert_turn = float("-inf")
@@ -631,6 +661,11 @@ class EmbodyTurnEngine:
         self.stream_timeouts = 0
         self.stream_failures = 0
         self.dropped_inputs = 0
+        # Counted apart from ``dropped_inputs``, which means "a bound was hit":
+        # an unaddressed utterance is not a resource failure, it is the gate
+        # working, and folding the two would make a busy room look like a sick
+        # layer on the summary line.
+        self.unaddressed_utterances = 0
 
     # ------------------------------------------------------------------ #
     # Intake — O(1), safe from any thread, never raises                  #
@@ -664,8 +699,38 @@ class EmbodyTurnEngine:
         return accepted
 
     def submit_utterance(self, text: str) -> bool:
-        """Offer one heard utterance. **Ungated** — the layer hears everyone (c4)."""
-        return self._offer_trigger(KIND_UTTERANCE, text)
+        """Offer one heard utterance, subject to ATTENTION (issue #148).
+
+        The layer's ear stays ungated — the duplex session surfaces every voice
+        in the room and its own boundary tests pin that — but hearing is not
+        the same as being addressed. While attention is cold only an utterance
+        that NAMES the robot wakes a turn; while it is warm anything does, and
+        every admission extends the window. A refusal is a NAMED drop carrying
+        the text it ignored, never a silent no-op: "why is it ignoring me?" has
+        to be answerable from the journal.
+
+        The gate deliberately runs BEFORE the pending-trigger bound, and the
+        admission stands even if that bound then refuses the utterance: the
+        robot was addressed, which is a fact about the room, not about how full
+        a queue happened to be.
+        """
+        cleaned = (text or "").strip()
+        if not cleaned:
+            self._drop(REASON_EMPTY_INPUT, KIND_UTTERANCE)
+            return False
+        verdict = self._attention.decide(cleaned)
+        if not verdict.admitted:
+            self.unaddressed_utterances += 1
+            self._drop(verdict.label, f'"{cleaned[:60]}"')
+            return False
+        if verdict.opened:
+            senselog.stage(
+                STAGE,
+                SOURCE,
+                uuid.uuid4().hex[:8],
+                f"attention open ({verdict.label}) for {self._attention.window_s:g}s",
+            )
+        return self._offer_trigger(KIND_UTTERANCE, cleaned)
 
     def note_spoken(self, text: str) -> None:
         """Record something the layer's MOUTH already said. Does NOT trigger a turn.
@@ -674,13 +739,33 @@ class EmbodyTurnEngine:
         the thinking mind would have no idea it had already replied and would
         cheerfully call ``speak`` to say it again. It is context, not a trigger —
         a robot that treats its own voice as a perception talks to itself.
+
+        It also EXTENDS attention, so a long answer cannot time the human out
+        mid-exchange — but only while attention is already warm. That
+        asymmetry is load-bearing: the session is armed once and the server
+        replies to every committed utterance, including the ambient ones the
+        gate has just refused, so a voice that could OPEN attention would be a
+        robot waking itself up (see :mod:`reachy.embody.attention`).
         """
         cleaned = (text or "").strip()
         if not cleaned:
             return
         self._spoken.append(cleaned)
+        self._attention.note_spoken()
         if self._export is not None:
             self._export.emit(MessageEvent(text=cleaned, ts=self._export.time_fn()))
+
+    @property
+    def attention(self) -> AttentionGate:
+        """The two-state attention gate (issue #148).
+
+        Exposed rather than injected: it is state the engine owns and shares a
+        clock with, and a composition root configures it through
+        :attr:`Limits.attention_window_s` like every other bound. A caller that
+        knows the robot was addressed some other way opens the window with
+        :meth:`~reachy.embody.attention.AttentionGate.note_addressed`.
+        """
+        return self._attention
 
     @property
     def pending(self) -> int:

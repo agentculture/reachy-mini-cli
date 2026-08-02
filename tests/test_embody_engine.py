@@ -159,6 +159,14 @@ def _build(**kwargs) -> EmbodyTurnEngine:
 
     Passing ``base_url=`` means the test wants the REAL streaming client against
     a loopback server, so no ``turn_fn`` double is substituted in that case.
+
+    The engine comes back with its ATTENTION WINDOW ALREADY OPEN (issue #148).
+    The shipped gate starts cold — only an utterance naming the robot wakes a
+    turn — but every test in this module is about streaming, model selection,
+    the tool loop or the export contract and says whatever it likes to the
+    engine. ``tests/test_embody_attention.py`` owns attention; opening the
+    window once here beats sprinkling the robot's name through forty unrelated
+    assertions and pretending they were about being addressed.
     """
     kwargs.setdefault("registry", RecordingRegistry())
     if "base_url" not in kwargs:
@@ -170,7 +178,9 @@ def _build(**kwargs) -> EmbodyTurnEngine:
     request_kwargs = {name: kwargs.pop(name) for name in list(kwargs) if name in _REQUEST_FIELDS}
     if request_kwargs:
         kwargs.setdefault("request", engine_mod.RequestConfig(**request_kwargs))
-    return EmbodyTurnEngine(**kwargs)
+    engine = EmbodyTurnEngine(**kwargs)
+    engine.attention.note_addressed()
+    return engine
 
 
 # =========================================================================== #
@@ -388,8 +398,11 @@ def test_resolving_and_running_never_mutate_the_environment(monkeypatch) -> None
     before = dict(os.environ)
 
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    # The one engine in this module built WITHOUT ``_build`` (the point is the
+    # bare, default-configured engine), so its attention gate is genuinely cold
+    # and the utterance has to name the robot to reach a model at all (#148).
     engine = EmbodyTurnEngine(registry=RecordingRegistry(), turn_fn=turn)
-    engine.submit_utterance("hello")
+    engine.submit_utterance("reachy, hello")
     engine.run_turn()
     engine.ask("and?")
 
