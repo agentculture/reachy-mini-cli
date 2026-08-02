@@ -189,7 +189,39 @@ _MAX_FPS: float = 30.0
 
 #: The one clip file this rider ever writes (overwrite-in-place retention).
 DEFAULT_CLIP_FILENAME = "clip.mp4"
-_TMP_SUFFIX = ".tmp"
+
+#: The temp-file marker, inserted BEFORE the extension — ``clip.tmp.mp4``, never
+#: ``clip.mp4.tmp``.
+#:
+#: This ordering is load-bearing and cost 1.7 hours of dead clip leg on the
+#: deployed robot to learn. ``cv2.VideoWriter`` selects its container muxer from
+#: the filename's **suffix**, so a path ending ``.tmp`` maps to no known video
+#: format: the writer falls back to the image-sequence backend, fails an
+#: assertion, and reports ``isOpened() == False``. Measured in the deployed
+#: environment (OpenCV 4.13.0, mp4v, 640x480):
+#:
+#: =================  ==========  =======
+#: path               isOpened    bytes
+#: =================  ==========  =======
+#: ``clip.mp4``       True        1710181
+#: ``clip.mp4.tmp``   False       —
+#: ``clip.tmp``       False       —
+#: =================  ==========  =======
+#:
+#: Temp-then-``os.replace`` is still exactly right — it is this repo's own
+#: atomic-write idiom, and the reason a reader never sees a half-written clip.
+#: Only the NAME had to change, and the extension must stay last.
+_TMP_MARKER = ".tmp"
+
+
+def _temp_path_for(final: Path) -> Path:
+    """The temp sibling to encode into: ``clip.mp4`` -> ``clip.tmp.mp4``.
+
+    Same directory, so :func:`os.replace` stays atomic; extension preserved, so
+    the encoder can still infer its container.
+    """
+    return final.with_name(f"{final.stem}{_TMP_MARKER}{final.suffix}")
+
 
 #: The additive top-level ``state.json`` key this rider owns.
 STATE_KEY = "clip"
@@ -404,7 +436,7 @@ class ClipRider:
         self._main = main_control or control_mod.CommandSpool(root=root)
         clip_dir = control_mod.behavior_dir(root)
         self._clip_path = clip_dir / DEFAULT_CLIP_FILENAME
-        self._tmp_path = clip_dir / (DEFAULT_CLIP_FILENAME + _TMP_SUFFIX)
+        self._tmp_path = _temp_path_for(self._clip_path)
 
         self._inbox: deque = deque(maxlen=max(1, int(inbox_size)))
         self._inbox_lock = threading.Lock()

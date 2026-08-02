@@ -41,6 +41,7 @@ import json
 import logging
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -503,3 +504,43 @@ def test_module_does_not_import_cv2_or_reachy_mini_at_module_scope() -> None:
             assert (
                 "reachy_mini" not in line
             ), f"clip_rider must not import reachy_mini at module scope: {line}"
+
+
+# --------------------------------------------------------------------------- #
+# The temp file's NAME — a hardware-only defect the fakes could never catch     #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_temp_clip_keeps_the_video_extension_last(tmp_path) -> None:
+    """``clip.tmp.mp4``, never ``clip.mp4.tmp`` — and this is not cosmetic.
+
+    ``cv2.VideoWriter`` picks its container muxer from the filename's SUFFIX. A
+    path ending ``.tmp`` matches no known video format, so the writer silently
+    falls back to the image-sequence backend and reports ``isOpened() == False``
+    — which this rider correctly, and uselessly, reports as an
+    ``encode-refused`` drop forever.
+
+    That is exactly what happened: the clip leg was dead on the deployed robot
+    for 1.7 hours, dropping every 5 s, while cv2 was present and frames were
+    arriving. Every test in this file injects a FAKE encoder, and CI has no cv2
+    at all, so no amount of unit testing could have caught it — only running it
+    on the robot did.
+
+    The invariant is checkable without cv2, which is the whole point of pinning
+    it here: whatever the temp file is called, its extension must equal the real
+    clip's, so any extension-sniffing encoder behaves identically on both.
+    """
+    rider = _rider(tmp_path, encoder=_FakeEncoder())
+    assert rider._tmp_path.suffix == rider._clip_path.suffix
+    assert rider._tmp_path.suffix in {".mp4", ".avi", ".mkv", ".mov"}
+    assert rider._tmp_path != rider._clip_path
+    assert rider._tmp_path.parent == rider._clip_path.parent  # keeps os.replace atomic
+
+
+def test_the_temp_path_helper_preserves_directory_and_extension() -> None:
+    """The rule stated directly on the helper, for any filename a caller picks."""
+    from reachy.behavior.clip_rider import _temp_path_for
+
+    got = _temp_path_for(Path("/state/behavior/clip.mp4"))
+    assert got == Path("/state/behavior/clip.tmp.mp4")
+    assert got.suffix == ".mp4"
