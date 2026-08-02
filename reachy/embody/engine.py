@@ -359,8 +359,31 @@ class EmbodyTurnEngine:
             ``REACHY_OPENAI_*`` environment as usual.
         temperature / max_tokens: sampling controls, forwarded per call.
         idle_timeout_s: the INTER-CHUNK idle budget (see the module docstring).
-        enable_thinking: ask the server for streamed reasoning. Off by default —
-            it is what buys the 43 s time-to-first-content the probe measured.
+        enable_thinking: ask the server for streamed reasoning. Off by default,
+            and the default is a PRODUCT decision about a robot that answers out
+            loud — measured live against the deployed gateway on 2026-08-02
+            (``docs/evidence/2026-08-02-probe-thinking-vs-reasoning-deltas.md``):
+
+            ==========  ===============  =====================  ================
+            model       enable_thinking  delta keys             first *content*
+            ==========  ===============  =====================  ================
+            worker      False (shipped)  content, role          0.22 s
+            worker      True             + reasoning            9.72 s
+            cortex      False (shipped)  content, role          0.27 s
+            cortex      True             + reasoning            17.96 s
+            ==========  ===============  =====================  ================
+
+            So turning this on costs 9-18 SECONDS before the robot says or does
+            anything. For a layer whose whole point is realtime conversation
+            that is not a trade worth making, and no amount of tuning elsewhere
+            recovers it.
+
+            The consequence is worth stating plainly rather than discovering:
+            with the shipped default the gateway sends **no reasoning key at
+            all**, so :attr:`TurnResult.reasoning` is empty and the exported
+            ``thinking`` block carries cues, reply text, tool calls and results
+            — but no model reasoning. The reasoning seam is correct and dormant,
+            NOT broken. Flip this to ``True`` and it fills immediately.
         max_tool_rounds / history_maxlen / max_pending / spoken_maxlen: bounds.
         voice_tools: tool names exported as ``message`` blocks.
         on_content / on_reasoning: optional taps fired per delta, on the calling
