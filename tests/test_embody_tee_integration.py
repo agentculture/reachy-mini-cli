@@ -553,7 +553,8 @@ def test_the_robot_source_keeps_no_int16_round_trip():
         if isinstance(node, ast.Constant) and isinstance(node.value, (str, int, float))
     }
     assert "<i2" not in literals, "the int16 wire assumption survives in the reader"
-    assert 32768 not in literals and 32768.0 not in literals, "a PCM16 rescale survives"
+    assert 32768 not in literals, "a PCM16 rescale survives"
+    assert 32768.0 not in literals, "a PCM16 rescale survives"
 
 
 def test_the_wire_constants_still_say_float32():

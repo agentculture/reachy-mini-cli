@@ -249,7 +249,8 @@ def test_a_missing_events_cli_package_is_one_named_drop_and_a_live_runtime(
     from reachy.behavior import control
 
     state = control.read_state()
-    assert isinstance(state, dict) and "ownership" in state, "the runtime ran unchanged"
+    assert isinstance(state, dict), "the runtime ran unchanged"
+    assert "ownership" in state, "the runtime ran unchanged"
 
 
 def test_an_incompatible_client_is_one_named_drop_and_a_live_runtime(
@@ -321,7 +322,8 @@ def test_shutdown_flips_the_retained_availability_topic_false(_isolated, monkeyp
     online = client.by_topic("reachy/state/online")
     assert [p.payload for p in online] == [M.ONLINE_PAYLOAD, M.OFFLINE_PAYLOAD]
     assert client.disconnect_calls == 1
-    assert client.will is not None and client.will.payload == M.OFFLINE_PAYLOAD
+    assert client.will is not None
+    assert client.will.payload == M.OFFLINE_PAYLOAD
 
 
 # --------------------------------------------------------------------------- #
@@ -622,7 +624,8 @@ def test_the_state_json_mirror_is_additive_to_the_disk_write(_isolated, monkeypa
     assert main(["behavior", "engine", "run", "--max-ticks", "5"]) == 0
 
     on_disk = control.read_state()
-    assert isinstance(on_disk, dict) and "ownership" in on_disk
+    assert isinstance(on_disk, dict)
+    assert "ownership" in on_disk
 
     retained = {
         p.topic.rsplit("/", 1)[-1]: p.payload

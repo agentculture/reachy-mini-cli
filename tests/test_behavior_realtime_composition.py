@@ -418,7 +418,8 @@ def test_an_unknown_mic_rate_is_announced_on_both_channels(caplog) -> None:
     text = caplog.text
     assert "mic sample rate unknown" in text
     assert "mic-rate-unknown" in text
-    assert "stage=warmup" in text and "source=realtime" in text
+    assert "stage=warmup" in text
+    assert "source=realtime" in text
 
 
 def test_a_known_mic_rate_is_carried_into_the_constructed_session(_state_dir, monkeypatch) -> None:

@@ -253,7 +253,8 @@ def test_the_driver_reaches_the_session_only_through_its_non_blocking_pair() -> 
     reached = _session_surface(defs, _closure(defs, ("__call__",)))
 
     assert reached, "nothing reaches the session client — this scan is blind"
-    assert "submit_audio" in reached and "take_utterance" in reached
+    assert "submit_audio" in reached
+    assert "take_utterance" in reached
     assert reached <= set(_CLIENT_TICK_SURFACE), (
         f"the driver reaches the session client through {sorted(reached)}; only "
         f"{list(_CLIENT_TICK_SURFACE)} are non-blocking. Anything else is "

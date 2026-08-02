@@ -434,7 +434,8 @@ def test_build_clip_encoder_without_cv2_returns_none_and_warns_once(monkeypatch,
         first = build_clip_encoder()
         second = build_clip_encoder()
 
-    assert first is None and second is None
+    assert first is None
+    assert second is None
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1, [r.getMessage() for r in warnings]
     assert "[vision]" in warnings[0].getMessage()

@@ -25,6 +25,7 @@ import json
 
 import pytest
 
+from reachy.cli._errors import CliError
 from reachy.speech import llm
 from tests.fake_sse_server import (
     FakeChatServer,
@@ -223,6 +224,6 @@ def test_every_streaming_call_sends_stream_true_on_the_wire() -> None:
 def test_a_non_2xx_status_is_a_clean_cli_error_not_a_traceback() -> None:
     """The exit-2 environment-error contract holds against a real socket, too."""
     with FakeChatServer(script=json_body({"error": "nope"}, status=503)) as server:
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(CliError) as excinfo:
             llm.stream_turn(_MESSAGES, base_url=server.base_url, model="worker")
     assert "503" in str(excinfo.value)
