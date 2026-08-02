@@ -90,6 +90,7 @@ from __future__ import annotations
 import argparse
 import base64
 import functools
+import json
 import logging
 import os
 import sys
@@ -730,6 +731,14 @@ REASON_CLIP_ASK_FAILED = "clip-ask-failed"
 #: ``ask()`` returned no usable answer (an empty/blank stream) — nothing worth
 #: parking as context.
 REASON_CLIP_ASK_EMPTY = "clip-ask-empty"
+#: The senses lane answered, but :func:`parse_perception_answer` could not
+#: find the requested ``{"summary": ..., "entities": [...], "confidence":
+#: ...}`` shape in it (task t13, issue #155 c7). NOT a lost observation: the
+#: raw answer text still becomes a summary-only snapshot — this reason names
+#: the DEGRADE, never the drop of the whole update. The senses lane is a
+#: cheap model answering in free text; assume it will sometimes ignore the
+#: requested format.
+REASON_CLIP_ANSWER_UNSTRUCTURED = "clip-answer-unstructured"
 
 #: Every failure this composition root can name, in one place so the journal,
 #: the export feed, the operator docs and the tests share ONE vocabulary — the
@@ -748,6 +757,7 @@ EMBODY_REASONS: frozenset[str] = frozenset(
         REASON_CLIP_UNREADABLE,
         REASON_CLIP_ASK_FAILED,
         REASON_CLIP_ASK_EMPTY,
+        REASON_CLIP_ANSWER_UNSTRUCTURED,
     }
 )
 
@@ -1036,12 +1046,20 @@ class _CueReader:
 #: runtime's own rolling clip (issue #139's h9: "ask the worker model where it
 #: is"). Framed as a single perception question, matching
 #: :meth:`~reachy.embody.engine.EmbodyTurnEngine.ask`'s own contract — the
-#: answer becomes a CONTEXT cue for the next TRIGGERED turn, never a reply
-#: spoken on its own.
+#: answer becomes a structured :class:`~reachy.embody.engine.
+#: PerceptionSnapshot` for the next TRIGGERED turn (task t13, issue #155
+#: c7), never a reply spoken on its own. Requests ONE JSON object so
+#: :func:`parse_perception_answer` has a fixed shape to look for; the senses
+#: lane is a cheap model and will sometimes ignore this, which is exactly
+#: what that function's degrade path is for.
 DEFAULT_CLIP_PROMPT = (
-    "You are shown a short recent clip from your own camera. In one or two "
-    "plain sentences, describe where you appear to be and what is happening "
-    "in view right now."
+    "You are shown a short recent clip from your own camera. Reply with "
+    "exactly one JSON object and nothing else, in this shape: "
+    '{"summary": "<one or two plain sentences: where you appear to be and '
+    'what is happening right now>", "entities": ["<a person, object, or '
+    'place you notice>", ...], "confidence": <a number from 0.0 to 1.0 for '
+    "how sure you are of this description>}. Use an empty list for "
+    '"entities" if nothing stands out.'
 )
 
 
@@ -1081,6 +1099,70 @@ def build_clip_question(path: str | Path, prompt: str = DEFAULT_CLIP_PROMPT) -> 
     ]
 
 
+#: :func:`parse_perception_answer`'s expected JSON keys (task t13, spec c7).
+_PERCEPTION_SUMMARY_KEY = "summary"
+_PERCEPTION_ENTITIES_KEY = "entities"
+_PERCEPTION_CONFIDENCE_KEY = "confidence"
+
+
+def parse_perception_answer(raw: str) -> tuple[str, tuple[str, ...], float | None] | None:
+    """Parse the senses lane's structured clip answer, or ``None`` if it isn't one.
+
+    :data:`DEFAULT_CLIP_PROMPT` asks for one JSON object
+    (``{"summary": ..., "entities": [...], "confidence": ...}``), but the
+    senses lane is a CHEAP model answering in free text — assume it will
+    sometimes wrap the object in a sentence or a code fence, or ignore the
+    shape entirely. So this is tolerant, not strict: it looks for the FIRST
+    ``{...}`` span in *raw* rather than requiring the whole reply to be JSON,
+    and returns ``None`` — never raises — the moment anything about that span
+    fails to yield a non-blank ``summary`` string. The caller
+    (:meth:`_ClipAsker._ask_about`) is what turns a ``None`` here into the
+    documented degrade: a summary-only snapshot plus one named drop
+    (:data:`REASON_CLIP_ANSWER_UNSTRUCTURED`) — this function names no drop
+    of its own, so it stays trivially unit-testable with no export sink at
+    all, exactly like :func:`build_clip_question`.
+
+    ``entities`` is coerced to a tuple of non-blank strings, silently
+    dropping anything that is not a JSON string/number (never a whole-answer
+    failure just because one list entry is the wrong shape) and defaulting
+    to ``()`` when the key is missing or not a list. ``confidence`` is
+    accepted only as a plain number — ``bool`` is explicitly excluded,
+    because ``json`` parses ``true``/``false`` as :class:`bool`, a subtype of
+    :class:`int` in Python, which would otherwise silently read as 0.0/1.0 —
+    and clamped to ``[0.0, 1.0]``; anything else becomes ``None``, because
+    "the model did not say how sure it was" is honest and a fabricated
+    number is not.
+    """
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        payload = json.loads(raw[start : end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    summary = payload.get(_PERCEPTION_SUMMARY_KEY)
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    entities_raw = payload.get(_PERCEPTION_ENTITIES_KEY)
+    entities: tuple[str, ...] = ()
+    if isinstance(entities_raw, list):
+        entities = tuple(
+            str(item).strip()
+            for item in entities_raw
+            if isinstance(item, (str, int, float))
+            and not isinstance(item, bool)
+            and str(item).strip()
+        )
+    confidence_raw = payload.get(_PERCEPTION_CONFIDENCE_KEY)
+    confidence: float | None = None
+    if isinstance(confidence_raw, (int, float)) and not isinstance(confidence_raw, bool):
+        confidence = max(0.0, min(1.0, float(confidence_raw)))
+    return summary.strip(), entities, confidence
+
+
 class _ClipAsker:
     """Poll the runtime's clip reference and turn it into perception CONTEXT.
 
@@ -1091,8 +1173,14 @@ class _ClipAsker:
     where it is"). This class is its first real caller: it reads
     ``state.json``'s ``clip`` key (:mod:`reachy.behavior.clip_rider`'s path
     reference), and when it names a fresh clip, asks about it and parks the
-    answer as CONTEXT the next TRIGGERED turn drains (issue #143's policy) —
-    never a trigger of its own.
+    answer as a structured :class:`~reachy.embody.engine.PerceptionSnapshot`
+    (task t13, issue #155 c7) — never a trigger of its own. Since t13 the
+    slot the answer lands in PERSISTS across turns (:meth:`~reachy.embody.
+    engine.EmbodyTurnEngine._live_perception`) until a later poll supersedes
+    it or it goes stale, rather than being drained by the one turn that
+    happens to run right after a poll (issue #143's turn-drain policy still
+    applies to the closed cue vocabulary — see the engine module docstring's
+    "A state PERSISTS" section for why perception is the one exception).
 
     A background THREAD, for the same reason :class:`_CueReader` is one — but
     the constraint here is sharper than "must not block on I/O": ``ask()`` is
@@ -1126,6 +1214,11 @@ class _ClipAsker:
     state (mirroring :meth:`~reachy.behavior.clip_rider.ClipRider._report`) so
     a box with no clip ever published (no ``[vision]`` extra, the http-remote
     profile, a fresh boot) logs ONE line, not one every poll cycle forever.
+    One outcome is a DEGRADE rather than a negative path:
+    :data:`REASON_CLIP_ANSWER_UNSTRUCTURED` names an answer that reached the
+    park anyway, as a summary-only snapshot, when it did not parse as the
+    requested JSON shape (task t13) — the observation is never lost, only its
+    structure.
     """
 
     def __init__(
@@ -1197,11 +1290,21 @@ class _ClipAsker:
             self._report(REASON_CLIP_STALE, f"age={age:.1f}s > {self._stale_after_s:g}s")
             return
         self._last_ts = ts
-        self._ask_about(str(path))
+        self._ask_about(str(path), float(ts))
 
-    def _ask_about(self, path: str) -> None:
-        """Turn *path* into a question, ask it, and park the answer as CONTEXT."""
-        from reachy.embody.cues import CueClass
+    def _ask_about(self, path: str, ts: float) -> None:
+        """Turn *path* into a question, ask it, and park the answer as a snapshot.
+
+        *ts* is the clip's OWN monotonic capture time — already validated
+        fresh enough by :meth:`poll_once`'s own staleness check — carried
+        straight through as the resulting :class:`~reachy.embody.engine.
+        PerceptionSnapshot`'s ``captured_at``. This is the freshness
+        discipline the engine module docstring's "A state PERSISTS" section
+        describes: a snapshot that sits unread in the park is judged by the
+        true age of the FRAME it describes, not by when this call happened
+        to run.
+        """
+        from reachy.embody.engine import PerceptionSnapshot
 
         try:
             content = build_clip_question(path, self._prompt or DEFAULT_CLIP_PROMPT)
@@ -1219,10 +1322,30 @@ class _ClipAsker:
             return
         self._last_report = None  # the lane recovered; the next failure reports fresh
         self.asks += 1
-        # CONTEXT, explicitly — never a trigger (t7/#143's policy): a clip
-        # answer is a perception the NEXT triggered turn reads, exactly like
-        # any other sense cue, never a reason to run one by itself.
-        self._engine.submit_cue(f"camera view: {answer}", cue_class=CueClass.CONTEXT)
+        parsed = parse_perception_answer(answer)
+        if parsed is None:
+            # Degrade, never drop: the raw answer still becomes a
+            # summary-only snapshot (task t13) — only the STRUCTURE was
+            # lost, not the observation.
+            self._report(REASON_CLIP_ANSWER_UNSTRUCTURED, answer[:120])
+            summary, entities, confidence = answer, (), None
+        else:
+            summary, entities, confidence = parsed
+        # A structured PERCEPTION snapshot, explicitly — never a trigger
+        # (t7/#143's policy): a clip answer is a perception the NEXT
+        # triggered turn reads, exactly like any other sense cue, never a
+        # reason to run one by itself. Unlike a cue, this slot PERSISTS
+        # across turns (:meth:`~reachy.embody.engine.EmbodyTurnEngine.
+        # _live_perception`) until superseded or stale.
+        self._engine.submit_perception(
+            PerceptionSnapshot(
+                summary=summary,
+                entities=entities,
+                confidence=confidence,
+                captured_at=ts,
+                frame_ref=path,
+            )
+        )
 
     def _report(self, reason: str, detail: str) -> None:
         key = (reason, detail)
