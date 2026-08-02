@@ -41,6 +41,34 @@ be a claim that the attacker will not say "reachy" — which is not a claim at
 all. Containment is still the closed action set and the fail-closed validators,
 which is why every test below still submits its hostile request directly to the
 tool surface rather than through a conversation.
+
+Interjection (issue #155) widens WHO may speak, and widens NOTHING else
+------------------------------------------------------------------------
+:mod:`reachy.embody.interjection` lets an AUTHORIZED background source — the
+worker model, or an external system sending a typed event — put a sentence in
+front of the foreground voice. Read that widening precisely, because the two
+halves land in different places:
+
+* **what it does widen:** the set of things that can put TEXT in front of the
+  mind. That is a cost-and-manners surface, and the policy bounds it the way
+  this layer bounds everything else — default OFF, per-source default-deny, a
+  rate bound, and a NAMED drop for every refusal, so an attempt is never a
+  silent no-op. Those bounds ship as the shipped defaults in
+  :class:`~reachy.embody.interjection.InterjectionLimits`, which is what
+  :func:`test_the_interjection_policy_ships_closed` pins.
+* **what it does NOT widen:** the action set. An interjection is text plus
+  provenance — it carries nothing executable, it reaches no tool surface, and
+  the security lens said so before the build: a spoofed cue could already reach
+  speech through the worker's tool path, so interjection shortcuts the MIND,
+  not the containment. Every refusal below still comes from a validator that
+  already shipped, and the five-tool action set is unchanged.
+
+The same sentence as the attention paragraph applies, one family over and for
+the same reason: the interjection policy is not a containment boundary.
+:func:`test_warming_attention_never_buys_an_unauthorized_source_a_voice` is the
+machine-checked version of that — an attacker who has warmed attention by
+saying "reachy" out loud still gets a named refusal, because the two gates
+answer different questions and neither is load-bearing for blast radius.
 """
 
 from __future__ import annotations
@@ -57,7 +85,14 @@ from reachy.behavior.goto_intent import GOTO, MAX_DURATION_S
 from reachy.behavior.intents import RUN_BEHAVIOR
 from reachy.behavior.rules import MAX_SAY_CHARS
 from reachy.embody import tools as embody_tools
-from reachy.embody.tools import CREATE_RULE, HARMONICS, REFUSALS, SPEAK, EmbodyToolRegistry
+from reachy.embody.tools import (
+    ACTION_SET,
+    CREATE_RULE,
+    HARMONICS,
+    REFUSALS,
+    SPEAK,
+    EmbodyToolRegistry,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _LAYER_ROOT = _REPO_ROOT / "reachy" / "embody"
@@ -593,3 +628,108 @@ def test_the_catalog_boundary_is_not_a_wall(tmp_path) -> None:
         )["content"]
     )
     assert rule["ok"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Interjection (issue #155) — a wider WHO, an unchanged WHAT                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_interjection_policy_is_covered_by_the_ast_pins() -> None:
+    """Guard the guard: the newest layer module must be ON the checked surface.
+
+    The AST tests above are parametrized over a glob, so a new module is
+    covered automatically — but only for as long as it stays inside
+    ``reachy/embody/`` and off :data:`_CONTROL_PLANE_MODULES`. This names it, so
+    moving it out is a visible decision rather than a quiet loss of coverage.
+    """
+    assert "reachy.embody.interjection" in _tool_surface_modules()
+    assert "reachy.embody.interjection" not in _CONTROL_PLANE_MODULES
+
+
+def test_the_interjection_policy_ships_closed() -> None:
+    """Default OFF and default-deny per source, in the config object itself.
+
+    Not in documentation: an operator who installs the layer and starts it
+    gets a robot no background source can speak through, and turning that on is
+    a deliberate act (spec claim c22, honesty condition h13).
+    """
+    from reachy.embody.interjection import Authorization, InterjectionLimits, InterjectionPolicy
+
+    shipped = InterjectionLimits()
+    assert shipped.authorization is Authorization.OFF
+    assert shipped.sources == ()
+
+    verdict = InterjectionPolicy().admit("say this out loud", source="worker")
+    assert verdict.admitted is False
+    assert verdict.interjection is None
+
+
+def test_warming_attention_never_buys_an_unauthorized_source_a_voice() -> None:
+    """The two gates answer different questions, and neither bounds blast radius.
+
+    Anyone in the room can warm attention by saying "reachy" out loud — that is
+    stated in this module's docstring and it is exactly why containment does not
+    rest on it. It does not rest on the interjection policy either; what this
+    pins is only that warming one gate does not open the other.
+    """
+    from reachy.embody.attention import AttentionGate
+    from reachy.embody.interjection import (
+        REFUSAL_UNAUTHORIZED,
+        Authorization,
+        InterjectionLimits,
+        InterjectionPolicy,
+    )
+
+    gate = AttentionGate(window_s=45.0)
+    assert gate.decide("reachy, hello").admitted is True
+
+    off = InterjectionPolicy(attention=gate)
+    assert off.admit("now let me talk", source="worker").label == REFUSAL_UNAUTHORIZED
+
+    on_but_unlisted = InterjectionPolicy(
+        limits=InterjectionLimits(authorization=Authorization.PROACTIVE),
+        attention=gate,
+    )
+    assert on_but_unlisted.admit("now let me talk", source="worker").admitted is False
+
+
+def test_an_interjection_carries_nothing_executable() -> None:
+    """It is text plus provenance — the widening is WHO speaks, not WHAT runs."""
+    from reachy.embody.interjection import (
+        Authorization,
+        InterjectionLimits,
+        InterjectionPolicy,
+    )
+
+    policy = InterjectionPolicy(
+        limits=InterjectionLimits(authorization=Authorization.PROACTIVE, sources=("worker",))
+    )
+    event = policy.admit("shall I mention the kettle?", source="worker").interjection.as_event()
+
+    assert set(event) == {"t", "id", "source", "text", "ts"}
+    assert set(event) & set(ACTION_SET) == set(), "an interjection names no action"
+
+
+def test_the_interjection_policy_cannot_reach_the_action_surface() -> None:
+    """AST: the policy decides who may speak; it dispatches nothing itself."""
+    modules = _repo_modules()
+    dotted = "reachy.embody.interjection"
+    imported = _imported_names(modules[dotted], dotted)
+
+    assert "reachy.embody.tools" not in imported
+    assert not any(name.startswith("reachy.behavior.control") for name in imported)
+    assert not any(name.startswith("reachy.behavior.intents") for name in imported)
+
+    tree = ast.parse(modules[dotted].read_text(encoding="utf-8"))
+    calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "dispatch" not in calls, "the policy must not be able to run a tool"
+
+
+def test_the_action_set_is_unchanged_by_the_interjection_family() -> None:
+    """The five-tool closed set is the containment claim; #155 did not touch it."""
+    assert ACTION_SET == (GOTO, SPEAK, HARMONICS, RUN_BEHAVIOR, CREATE_RULE)

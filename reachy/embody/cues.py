@@ -60,6 +60,12 @@ mattered. This module only decides and carries the class; giving ALERT and
 CONTEXT different admission behaviour in the turn engine is issue #143b, a
 later task, not this one.
 
+Two further line types are RECOGNISED and always refused here — the layer's own
+``interjection`` and ``wanted_to_say`` families (issue #155). See "The two
+policy-only families" beside :data:`CUE_MAPPERS` for why a pure mapper is the
+wrong place to admit either one, and :mod:`reachy.embody.interjection` for the
+policy that does.
+
 Nothing here changes what the runtime publishes. This module is a pure
 CONSUMER of two already-shipped, already-tested wire contracts (the bus topic
 map in ``reachy/export/mqtt.py`` and the NDJSON feed in
@@ -133,6 +139,14 @@ SOURCE_BUS = "bus"
 
 REASON_UNKNOWN_LINE_TYPE = "unknown-line-type"
 REASON_MALFORMED_LINE = "malformed-line"
+#: An ``interjection`` line arrived on the wire. Recognised, and refused HERE:
+#: admitting one is :mod:`reachy.embody.interjection`'s decision, and this
+#: module holds no policy state (see "The two policy-only families" below).
+REASON_INTERJECTION_UNADMITTED = "interjection-requires-policy"
+#: A ``wanted_to_say`` line arrived on the wire. The artifact is produced INSIDE
+#: the layer from its own measured playback, so a wire line claiming to be one
+#: is not a perception — it is somebody else's text wearing the robot's voice.
+REASON_WANTED_TO_SAY_OFF_WIRE = "wanted-to-say-not-from-the-wire"
 REASON_NO_SUBSCRIBER = "no-bus-subscriber"
 REASON_SUBSCRIBER_INCOMPATIBLE = "bus-subscriber-incompatible"
 REASON_CONNECT_FAILED = "bus-connect-failed"
@@ -199,6 +213,43 @@ def _sense_cues(event: dict) -> list[str]:
     return cues
 
 
+# ---------------------------------------------------------------------------
+# The two policy-only families (issue #155) — recognised, never admitted here
+# ---------------------------------------------------------------------------
+#
+# ``reachy.runtime_cues`` names two line types the LAYER authors rather than
+# the runtime: an ``interjection`` (an authorized background source proposing a
+# sentence for the foreground voice) and a ``wanted_to_say`` artifact (the
+# measured remainder of a reply a human cut off). Both are listed in
+# :data:`CUE_MAPPERS` and both map to NOTHING, by design and in two different
+# senses:
+#
+# * an interjection is admitted by :mod:`reachy.embody.interjection`'s policy —
+#   default OFF, per-source default-deny, rate-bounded — and this module holds
+#   no policy state, so it cannot admit one. Default-deny means it must not
+#   quietly fall through to "unrecognised" either: that would hide the family
+#   behind a generic drop and make "an unauthorized interjection by ANY route
+#   is a named drop" (spec honesty condition h12) a claim with a hole in it.
+# * a wanted-to-say artifact never crosses a wire at all: the layer measures
+#   its own played chunks and constructs it in-process, so a line claiming to
+#   be one is text from somewhere else wearing the robot's own voice.
+#
+# The composition root that HOLDS the policy routes interjection lines to it
+# before reaching this mapper; if it ever forgets, this is what catches it.
+
+
+def _policy_only_cues(event: dict) -> list[str]:
+    """Refuse a layer-authored family that arrived on the wire, by name."""
+    line_type = event.get("t")
+    reason = (
+        REASON_INTERJECTION_UNADMITTED
+        if line_type == runtime_cues.LINE_INTERJECTION
+        else REASON_WANTED_TO_SAY_OFF_WIRE
+    )
+    _drop(SOURCE_RUNTIME, reason, f"t={line_type!r}")
+    return []
+
+
 #: Every runtime line type this module recognises, mapped to its cue function.
 #: This IS the table :mod:`tests.test_embody_cues`' table test pins. ``rule``
 #: is listed first — not load-bearing for dict lookup, but it keeps the
@@ -206,11 +257,15 @@ def _sense_cues(event: dict) -> list[str]:
 #: at the point of use: a ``fire`` NEVER maps to an empty cue (see
 #: :func:`reachy.runtime_cues.rule_cues`), so the robot's own react/inhibit
 #: decision is always worth narrating, whether or not it names a behavior.
+#: The last two entries are the layer's own families, recognised so that they
+#: can be REFUSED by name — see :func:`_policy_only_cues`.
 CUE_MAPPERS: dict[str, Callable[[dict], list[str]]] = {
     "rule": runtime_cues.rule_cues,
     "sense": _sense_cues,
     "intent": runtime_cues.intent_cues,
     "motion": runtime_cues.motion_cues,
+    runtime_cues.LINE_INTERJECTION: _policy_only_cues,
+    runtime_cues.LINE_WANTED_TO_SAY: _policy_only_cues,
 }
 
 
@@ -333,6 +388,15 @@ CUE_CLASSIFIERS: dict[str, Callable[[dict], CueClass]] = {
     "sense": _context_cue_class,
     "intent": _context_cue_class,
     "motion": _context_cue_class,
+    # Belt and braces for the two policy-only families. Their mapper already
+    # returns nothing, so these entries are unreachable today — and they are
+    # CONTEXT rather than absent on purpose: if a future edit ever gave either
+    # family a rendering here, the wire route still could not wake the mind.
+    # Promoting an ADMITTED interjection to the alert lane is
+    # :mod:`reachy.embody.interjection`'s decision, taken with the policy in
+    # hand, never the wire's.
+    runtime_cues.LINE_INTERJECTION: _context_cue_class,
+    runtime_cues.LINE_WANTED_TO_SAY: _context_cue_class,
 }
 
 
