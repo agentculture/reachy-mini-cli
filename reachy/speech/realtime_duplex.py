@@ -524,6 +524,13 @@ class RealtimeDuplexSession:
         self._session_seq = 0
         self._utterance_seq = 0
         self._source_failed_logged = False
+        #: Overflow reasons already reported for the CURRENT episode. `_offer`
+        #: adds on the first eviction and clears on the first clean enqueue, so
+        #: a persistently-full sink costs ONE line per episode rather than one
+        #: per chunk — the same discipline the rest of this module's failures
+        #: already follow, and the defect class the runtime's tick-overrun
+        #: summary exists to avoid (69,696 lines measured, once).
+        self._overflow_logged: set[str] = set()
 
         # --- cross-thread flags (single writer each; plain reads are atomic) - #
         self._arm_pending = False
@@ -1143,12 +1150,22 @@ class RealtimeDuplexSession:
     # --- small helpers -------------------------------------------------- #
 
     def _offer(self, sink: queue.Queue, item: Any, reason: str) -> bool:
-        """Enqueue *item*, evicting the OLDEST on overflow (stale is worth less)."""
+        """Enqueue *item*, evicting the OLDEST on overflow (stale is worth less).
+
+        The overflow report is LATCHED per episode. A consumer that stops
+        draining does not fail once — it fails on every single chunk, and an
+        unlatched line there would bury the journal exactly as the runtime's
+        tick overruns once did. The latch clears on the first clean enqueue, so
+        a sink that recovers and fails again is reported again.
+        """
         try:
             sink.put_nowait(item)
+            self._overflow_logged.discard(reason)
             return True
         except queue.Full:
-            self._drop(reason, "oldest evicted")
+            if reason not in self._overflow_logged:
+                self._overflow_logged.add(reason)
+                self._drop(reason, "oldest evicted (latched until this sink drains)")
         try:
             sink.get_nowait()
             sink.put_nowait(item)
