@@ -42,6 +42,39 @@ been revisited for the newer field, not as an intentional omission. Whoever
 owns ``agent attach`` next can decide whether to extend it; this extraction
 does not change either caller's observable behaviour.
 
+The two layer-authored families (issue #155)
+----------------------------------------------
+The runtime publishes four line types (``sense``/``rule``/``intent``/
+``motion``). The embodiment layer adds two of its own, and their PHRASING lives
+here for the same reason the runtime's does — one owner, so the robot cannot
+end up described two ways:
+
+* :data:`LINE_INTERJECTION` — an authorized background source (the worker
+  model, a mesh peer, an external system) proposing a sentence for the
+  foreground voice. Rendered by :func:`interjection_cue`.
+* :data:`LINE_WANTED_TO_SAY` — the measured remainder of a reply a human cut
+  off mid-sentence, kept so the next turn can decide whether it is still worth
+  saying. Rendered by :func:`wanted_to_say_cue`.
+
+**This extension keeps the closed-vocabulary property, deliberately.** The
+value of a closed vocabulary is that equal text means the same fact happened
+again, which is what makes the embodiment engine's exact-text coalescing
+correct (:meth:`reachy.embody.engine.EmbodyTurnEngine._offer_context`). Both
+new families carry FREE TEXT inside a FIXED phrasing, so that direction still
+holds: two identical renderings really are the same proposal, or the same
+unsaid remainder, arriving twice. What free text costs is the *reverse*
+direction — two wordings of one idea no longer coalesce — and that is bounded
+here rather than assumed away: an interjection passes a per-source rate bound
+before it is ever rendered (:mod:`reachy.embody.interjection`), and a
+wanted-to-say artifact is at most one per interrupted response and expires in
+turns. A future family whose text is neither closed nor bounded does NOT belong
+in a text-keyed park; that is the free-text eviction defect issue #154 names,
+and it wants a latest-wins slot instead.
+
+Neither family is produced by the runtime, so neither is a mapper here: they
+are constructed in-process by the layer, and :mod:`reachy.embody.cues` refuses
+both by name if one ever arrives off the wire.
+
 Import boundary
 ----------------
 This module depends on nothing beyond the standard library (``json``,
@@ -74,6 +107,48 @@ LOUD_RMS_THRESHOLD: float = 0.02
 #: Touch phrasing — keys match the strings reachy.motion.pat.PatDetector emits.
 PAT_KIND_PHRASE: dict[str, str] = {"scratch": "scratch", "side_pat": "sideways nudge"}
 PAT_LEVEL_INTENSITY: dict[str, str] = {"level1": "gentle", "level2": "firm"}
+
+# ---------------------------------------------------------------------------
+# The two layer-authored line types (issue #155)
+# ---------------------------------------------------------------------------
+# The ``t`` discriminator each family carries on the wire, named here rather
+# than typed as a bare string at each use site — the same discipline the
+# embodiment tool registry keeps for its command kinds ("the tool name and the
+# command kind must not be two independently drifting strings").
+
+#: An authorized background source proposing a sentence for the foreground voice.
+LINE_INTERJECTION = "interjection"
+#: The unsaid remainder of a reply a human cut off mid-sentence.
+LINE_WANTED_TO_SAY = "wanted_to_say"
+
+#: Both of them, for a caller that needs to ask "is this one of the layer's
+#: own families?" without listing them again. Deliberately DISJOINT from the
+#: runtime's four line types: nothing here is something the runtime publishes.
+EMBODY_LINE_TYPES: tuple[str, ...] = (LINE_INTERJECTION, LINE_WANTED_TO_SAY)
+
+
+def interjection_cue(text: str, source: str) -> str:
+    """The ONE phrasing for a proposed interjection, source named in the line.
+
+    The source is in the rendered text, not only in the event's metadata,
+    because the mind reading this line is being asked to say someone else's
+    words out loud — "who wants this said" is part of the fact, not a footnote.
+    It also keeps two identical suggestions from two different sources distinct
+    under exact-text coalescing, which is correct: they are two facts.
+    """
+    return f'{source} suggests saying: "{text}"'
+
+
+def wanted_to_say_cue(text: str) -> str:
+    """The ONE phrasing for the unsaid remainder of an interrupted reply.
+
+    The interrupted response's id is deliberately NOT in the line: it is
+    attribution the artifact carries for the layer's own record, and a hex id
+    in the middle of a perception is noise to the model. Two identical
+    remainders therefore coalesce with a count, which reads correctly — the
+    robot was cut off saying the same thing twice.
+    """
+    return f'I was interrupted before saying: "{text}"'
 
 
 def direction_word(doa: object) -> str | None:
