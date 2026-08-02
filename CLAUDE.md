@@ -912,13 +912,37 @@ profile.
 **`reachy/embody/engine.py` — cue-triggered, streaming, and it never gives up.**
 Several seams are cited verbatim from `AgentTurnEngine` (bounded history, the
 `run(max_turns=, stop=, before_turn=)` shape, export-before-dispatch,
-`max_tool_rounds`). Two are deliberately NOT inherited: there is **no permanent
+`max_tool_rounds`). One is deliberately NOT inherited: there is **no permanent
 failure latch** (that engine mutes itself for the process lifetime after a
 failure streak; a layer that goes permanently quiet because the gateway blipped
 is indistinguishable from one that crashed, so every failure here is a named,
-counted drop and the next turn retries), and **no snapshot-only buffer** — a
-turn is TRIGGERED by an arriving cue or utterance, which is what makes "the
-robot's own rule fired, so it says something about it" possible at all.
+counted drop and the next turn retries). A turn is TRIGGERED rather than
+polled, which is what makes "the robot's own rule fired, so it says something
+about it" possible at all — but **not by everything that arrives** (issue #143).
+Measured live: 187 cues in ~40 s produced 23 turns and 19 queue-full
+drops, mix 145 "speech from the left/ahead/right" + 44 "loud sound" + **zero**
+rule fires. The layer has its OWN ears, so those cues duplicated what the
+duplex session already heard, at tick rate rather than utterance rate. So
+intake is THREE classes, routed at `_CueReader` by t6's
+`cues.classified_cues_for_line`: an utterance TRIGGERS, an ALERT (a rule fire)
+TRIGGERS, and every CONTEXT cue (`sense`/`intent`/`motion`, and a rule
+SUPPRESSION) lands in a bounded park the next turn DRAINS and that never causes
+one. That park is where `AgentTurnEngine`'s snapshot-only buffer IS cited (cues
+arriving during a turn accumulate for the next); what is added on top is
+COALESCING keyed on the cue TEXT — the vocabulary is closed
+(`reachy/runtime_cues.py`), so equal text means the same fact happened again,
+and 145 lines reach the model as `speech from the left (x145)`. Two bounds
+contain the ALERT class, because `rules.py` permits `cooldown_s=0` and several
+rules can fire in one tick: the trigger buffer is drained WHOLE (ten fires
+inside one turn window cost a second turn, never ten) and
+`DEFAULT_MIN_ALERT_INTERVAL_S` (5.0 s) bounds alert-TRIGGERED turns — inside
+it an alert is DEFERRED, never dropped, and an utterance lifts the bound
+outright. `submit_cue` defaults to CONTEXT on purpose: a caller that has not
+thought about which lane a cue belongs to must not be able to wake the mind up
+by accident. Every turn's senselog line and its exported `thinking` text OPEN
+with `triggers=T context=N coalesced-from=M` — a silent coalescer is
+indistinguishable from a dropper — and `docs/export-schema.md` documents both
+(the block SHAPE did not move; no key was added or removed).
 `note_spoken` feeds the layer's own speech back as CONTEXT, never as a trigger:
 a robot that treats its own voice as a perception talks to itself. Both lanes
 stream, and the stall detector is armed on **inter-chunk idle, never total
