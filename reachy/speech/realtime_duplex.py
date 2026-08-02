@@ -158,6 +158,40 @@ LAYER's own record is measured at the sink and the client is the authority for
 it. The divergence is knowing, bounded, and closes when the items channel
 lands.
 
+--------------------------------------------------------------------------
+The TAIL window: a VAD tap, and nothing else (task t16)
+--------------------------------------------------------------------------
+``response.interrupted`` covers the bulk of a reply and needs nothing from
+this module beyond what t6 already wired: upstream PACES its audio delivery to
+track the playhead (lobes-cli's ``lobes/realtime/_conversation.py``,
+``delivery_pause_ms`` / ``DELIVERY_LEAD_MS = 400``) precisely so a human can
+barge in mid-reply and the floor can see it. What upstream cannot see is the
+lag this CLIENT adds after receipt: up to one chunk of accumulation
+(:data:`DEFAULT_PLAYBACK_CHUNK_BYTES`, 1.0 s) plus the daemon's
+upload-then-play round trip. That lag lands AFTER ``response.done`` — the
+floor has returned to LISTENING while the room is still hearing audio — so an
+interjection in exactly the window where a listener is most likely to object
+produces no ``response.interrupted`` at all, and the queued chunks play on.
+
+The mechanism that closes it is deliberately tiny, and it is only a mechanism:
+
+* ``on_speech_started`` fires on the worker thread for every
+  ``input_audio_buffer.speech_started`` — the server's own **VAD-verified**
+  onset, never a loudness reading taken here (spec claim c35: an energy
+  predicate is a LOCATOR, never a content filter, so a cough or a door slam
+  must not be able to cut the robot off);
+* :attr:`RealtimeDuplexSession.playback_pending` says whether a cut would
+  actually withhold anything — chunks queued and not yet taken by the mouth.
+  A chunk already inside ``play`` is not counted: it cannot be recalled, so
+  "cutting" it would withhold nothing while recording its words as unsaid.
+
+**Nothing here acts on either.** With no tap injected a ``speech_started``
+event changes nothing about playback, exactly as before — this module reaches
+no gate and forms no opinion about whose speech is worth stopping the robot
+for (see the UNGATED section below). ``reachy/cli/_commands/agent.py`` is
+where the two are joined into a policy, the same mechanism-here/policy-there
+split :meth:`~RealtimeDuplexSession.arm_once` already follows.
+
 **Audio format, stated unambiguously.** In: mono float32 in [-1, 1] (or int16,
 or PCM16 bytes). On the wire: PCM16 mono **little-endian**, base64, inside an
 ``input_audio_buffer.append`` JSON TEXT event — never a binary frame. Out:
@@ -1196,6 +1230,13 @@ class RealtimeDuplexSession(_SessionObservables):
             :class:`Limits` for what each one bounds.
         on_utterance / on_response: optional taps, fired on the WORKER thread
             and guarded — a raising callback is logged and swallowed.
+        on_speech_started: the VAD tap (task t16) — fired with the raw
+            ``input_audio_buffer.speech_started`` event, on the WORKER thread,
+            guarded like the other two. It is the ONLY interruption evidence
+            this client offers a caller, and it is deliberately the server's
+            (spec claim c35). What a caller does with it — typically
+            :attr:`playback_pending` then :meth:`cancel_playback` — is policy
+            and lives one level up; this module still acts on nothing.
         clock: injectable monotonic clock.
 
     Attributes:
@@ -1219,6 +1260,7 @@ class RealtimeDuplexSession(_SessionObservables):
         limits: Limits | None = None,
         on_utterance: Callable[[Utterance], None] | None = None,
         on_response: Callable[[Response], None] | None = None,
+        on_speech_started: Callable[[dict], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.url = resolve_realtime_base_url(url)
@@ -1252,6 +1294,7 @@ class RealtimeDuplexSession(_SessionObservables):
         self._join_timeout_s = max(0.0, float(self._limits.join_timeout_s))
         self._on_utterance = on_utterance
         self._on_response = on_response
+        self._on_speech_started = on_speech_started
         self._clock = clock
 
         self._utterances: queue.Queue = queue.Queue(
@@ -1578,6 +1621,24 @@ class RealtimeDuplexSession(_SessionObservables):
         return self._speaking
 
     @property
+    def playback_pending(self) -> bool:
+        """Whether a cut right now would actually WITHHOLD audio (task t16).
+
+        ``True`` while chunks are queued for the mouth and have not been taken
+        yet — the audio :meth:`cancel_playback` would skip. Safe from any
+        thread, O(1), never raises.
+
+        The chunk already inside ``play`` is deliberately NOT counted. It
+        cannot be recalled (a daemon-HTTP upload-then-play has no stop handle),
+        so a cut taken with the queue empty withholds nothing while still
+        marking the reply as cut and pushing that chunk's words into the
+        remainder — a reply the room heard in full, recorded as truncated. A
+        caller wanting "is the mouth busy at all" wants :attr:`speaking`; a
+        caller deciding whether to CUT wants this.
+        """
+        return not self._playback.empty()
+
+    @property
     def muted(self) -> bool:
         """Whether audio is being withheld this instant (always ``False`` by default)."""
         return self._mute_during_playback and (self._speaking or not self._playback.empty())
@@ -1783,6 +1844,12 @@ class RealtimeDuplexSession(_SessionObservables):
             self._on_session_created(event)
         elif kind in (SPEECH_STARTED, SPEECH_STOPPED):
             self._state.note(_vad_stage_line(kind, event))
+            if kind == SPEECH_STARTED:
+                # The ONLY interruption evidence this client hands out, and it
+                # is the server's VAD rather than anything measured here (spec
+                # c35). Publishing it changes nothing on its own — see the
+                # module docstring's TAIL WINDOW section.
+                self._tap(self._on_speech_started, event, "on_speech_started")
         elif kind == ERROR_EVENT:
             reason, detail = _server_error(event)
             self._state.drop(reason, detail)

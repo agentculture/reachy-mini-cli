@@ -84,6 +84,20 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
 
   ``release_response_done`` is idempotent and safe to call from a test's
   ``finally``, including when the hold already timed out on its own.
+- ``RESPONSE_TAIL_INTERJECTION`` (foreground-Gemma plan, task t16) — the same
+  arm-and-wait and the same audio deltas as ``RESPONSE_HAPPY_PATH``, then
+  ``response.done``, and only THEN — after waiting (bounded by
+  ``wait_timeout``, PINGing throughout exactly as the hold above does) for
+  :meth:`FakeRealtimeServer.release_interjection` — one
+  ``input_audio_buffer.speech_started``, after which the session is held OPEN
+  until the test tears it down. It scripts the one window
+  ``RESPONSE_INTERRUPTED`` cannot express: the floor has finished the reply
+  and returned to LISTENING while the client's own playback queue is still
+  draining, so a human talking over that tail produces a VAD onset and NO
+  ``response.interrupted``. The release gate is what makes the test
+  deterministic — it lets a test wait until a known number of chunks have
+  reached its sink before the interjection lands, so the measured said/unsaid
+  split is a fixed number rather than a race.
 - ``RESPONSE_INTERRUPTED`` — the same arm-and-wait as ``RESPONSE_HAPPY_PATH``,
   then ``response.created`` -> ``response.text.done`` -> exactly ONE
   (partial) ``response.audio.delta`` -> ``response.interrupted``
@@ -348,6 +362,7 @@ class Scenario(str, Enum):
     ERROR_STT_FORWARD_FAILED = "error_stt_forward_failed"
     RESPONSE_HAPPY_PATH = "response_happy_path"
     RESPONSE_HOLD_BEFORE_DONE = "response_hold_before_done"
+    RESPONSE_TAIL_INTERJECTION = "response_tail_interjection"
     RESPONSE_INTERRUPTED = "response_interrupted"
     RESPONSE_AUDIO_DELTA_MALFORMED = "response_audio_delta_malformed"
     DUPLEX_HAPPY_PATH = "duplex_happy_path"
@@ -506,6 +521,12 @@ class FakeRealtimeServer:
         self._pong_event = threading.Event()
         self._response_create_event = threading.Event()
         self._release_done_event = threading.Event()
+        #: ``RESPONSE_TAIL_INTERJECTION``'s own gate. Deliberately NOT the
+        #: ``_release_done_event`` above: that one releases a reply the server
+        #: is still holding, this one releases a VAD onset AFTER the reply
+        #: finished, and a test that needs both would otherwise have one lever
+        #: for two moments.
+        self._release_interjection_event = threading.Event()
 
         self._sock: socket.socket | None = None
         self._port = 0
@@ -753,6 +774,15 @@ class FakeRealtimeServer:
         timed out on its own.
         """
         self._release_done_event.set()
+
+    def release_interjection(self) -> None:
+        """Let ``RESPONSE_TAIL_INTERJECTION`` send the VAD onset it is holding back.
+
+        Idempotent and safe from any thread, exactly like
+        :meth:`release_response_done` — and separate from it on purpose, so a
+        test can hold a reply open AND time the interjection independently.
+        """
+        self._release_interjection_event.set()
 
     # --- accept loop --------------------------------------------------------------
 
@@ -1295,6 +1325,7 @@ class FakeRealtimeServer:
         if scenario in (
             Scenario.RESPONSE_HAPPY_PATH,
             Scenario.RESPONSE_HOLD_BEFORE_DONE,
+            Scenario.RESPONSE_TAIL_INTERJECTION,
             Scenario.RESPONSE_INTERRUPTED,
             Scenario.RESPONSE_AUDIO_DELTA_MALFORMED,
         ):
@@ -1410,6 +1441,13 @@ class FakeRealtimeServer:
         if scenario is Scenario.RESPONSE_HOLD_BEFORE_DONE:
             self._hold_reply_open(conn, send_lock)
         self._send_event(conn, send_lock, self._event_response_done(session_id, response_id))
+        if scenario is Scenario.RESPONSE_TAIL_INTERJECTION:
+            # The floor has finished and is LISTENING again — and the client's
+            # own playback queue is still draining. This is the ONE window a
+            # `response.interrupted` can never appear in.
+            self._hold_until(conn, send_lock, self._release_interjection_event)
+            self._send_event(conn, send_lock, self._event_speech_started(session_id, item_id))
+            self._idle_until_stopped()
         self._graceful_close(conn, send_lock)
 
     # --- the ONE_SHOT_ARMING script (foreground-Gemma plan, task t8) ---------------
@@ -1541,11 +1579,22 @@ class FakeRealtimeServer:
         still terminates (the same "make the wait observable, never hang the
         suite" posture every other wait in this file takes).
         """
+        self._hold_until(conn, send_lock, self._release_done_event)
+
+    def _hold_until(
+        self, conn: socket.socket, send_lock: threading.Lock, released: threading.Event
+    ) -> None:
+        """PING until *released* is set, the server stops, or ``wait_timeout`` elapses.
+
+        The shared body behind :meth:`_hold_reply_open` and
+        ``RESPONSE_TAIL_INTERJECTION``'s post-``response.done`` gate: two
+        different moments a test needs to time, one keepalive-preserving wait.
+        """
         deadline = time.monotonic() + self._wait_timeout
         while time.monotonic() < deadline:
-            if self._release_done_event.is_set() or self._stop_event.is_set():
+            if released.is_set() or self._stop_event.is_set():
                 return
             self._send_frame(conn, send_lock, wire.OPCODE_PING, self._ping_payload)
             with self._lock:
                 self._ping_sent_count += 1
-            self._release_done_event.wait(timeout=self._hold_ping_interval_s)
+            released.wait(timeout=self._hold_ping_interval_s)

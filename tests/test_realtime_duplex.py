@@ -162,21 +162,35 @@ class _Sink:
     ``threads`` records which thread each call ran on, because "playback never
     runs on the session pump" is a pinned property, not a convention (the robot
     sink's daemon-HTTP route is a seconds-long round trip).
+
+    ``block_after`` lets the first N chunks complete before the sink wedges,
+    which is what makes a MEASURED said/unsaid split deterministic (task t16):
+    the test waits until exactly N chunks are confirmed, and only then lets the
+    interjection land.
     """
 
-    def __init__(self, *, block: threading.Event | None = None, boom: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        block: threading.Event | None = None,
+        boom: bool = False,
+        block_after: int = 0,
+    ) -> None:
         self.calls: list[tuple[bytes, int]] = []
         self.threads: list[str] = []
         self.entered = threading.Event()
         self._block = block
         self._boom = boom
+        self._block_after = max(0, int(block_after))
+        self._started = 0
 
     def __call__(self, pcm16_bytes: bytes, *, samplerate: int) -> None:
         self.threads.append(threading.current_thread().name)
+        self._started += 1
         self.entered.set()
         if self._boom:
             raise RuntimeError("sink fault")
-        if self._block is not None:
+        if self._block is not None and self._started > self._block_after:
             self._block.wait(timeout=_TIMEOUT)
         self.calls.append((pcm16_bytes, samplerate))
 
@@ -1814,7 +1828,14 @@ def test_the_constructor_keeps_seams_explicit_and_moves_only_bounds_into_limits(
     assert names.isdisjoint(_LIMIT_FIELDS), "a bound is still a bare parameter"
     assert "limits" in names
 
-    seams = {"read_audio", "play", "on_utterance", "on_response", "clock"}
+    seams = {
+        "read_audio",
+        "play",
+        "on_utterance",
+        "on_response",
+        "on_speech_started",
+        "clock",
+    }
     assert seams <= names, "an injectable seam must stay an explicit parameter"
     assert all(params[name].kind is inspect.Parameter.KEYWORD_ONLY for name in names)
 
@@ -2335,3 +2356,231 @@ def test_t7_the_phase_one_server_overstatement_is_documented() -> None:
     assert "overstates" in doc
     assert "invisible to the floor" in doc
     assert "conversation.item.create" in doc, "and it names what closes the gap"
+
+
+# =========================================================================== #
+# t16 — the TAIL cut: the MECHANISM only (spec c34/c35, honesty h22)          #
+#                                                                            #
+# The server-driven ``response.interrupted`` path is t6's and is unchanged —  #
+# upstream paces its delivery to the playhead precisely so barge-in stays     #
+# live, and it covers the bulk of a reply. What it cannot cover is the lag    #
+# THIS client adds after receipt (up to one chunk, plus the daemon's          #
+# upload-then-play round trip), which lands AFTER ``response.done``: the      #
+# floor is LISTENING again while the room still hears audio.                  #
+#                                                                            #
+# What this module gained for that is two things and no more: a tap on the    #
+# server's OWN VAD onset, and a predicate saying whether a cut would withhold #
+# anything. It acts on neither. The POLICY — cut, measure, record — lives in  #
+# ``reachy/cli/_commands/agent.py`` and is pinned in                          #
+# ``tests/test_agent_embody.py``; the three gate-free pins above are          #
+# unchanged, which is the point.                                              #
+# =========================================================================== #
+
+
+def _cut_on_speech(box: dict):
+    """A hand-written stand-in for the composition root's tail-cut policy.
+
+    Deliberately hand-written rather than imported, for the same reason
+    :func:`_arm_on_name` is: this module may reach no gate and no layer, and
+    the mechanism has to be demonstrable without one. The real policy — which
+    additionally asks for the measured split and records it — is one level up.
+    """
+    box.setdefault("cuts", [])
+    box.setdefault("noops", [])
+
+    def _started(event: dict) -> None:
+        client = box["client"]
+        if not client.playback_pending:
+            box["noops"].append(event)
+            return
+        box["cuts"].append(client.cancel_playback())
+
+    return _started
+
+
+def _tail_server(**kwargs) -> FakeRealtimeServer:
+    kwargs.setdefault("response_audio", _LONG_REPLY)
+    kwargs.setdefault("response_chunk_bytes", _TEST_CHUNK_BYTES)
+    kwargs.setdefault("response_text", _SPLIT_TEXT)
+    kwargs.setdefault("wait_timeout", _TIMEOUT)
+    return FakeRealtimeServer(Scenario.RESPONSE_TAIL_INTERJECTION, **kwargs)
+
+
+def test_t16_the_servers_vad_onset_reaches_the_caller_as_a_tap() -> None:
+    """The mechanism: ``speech_started`` is published, on the worker thread.
+
+    It is the SERVER's VAD, never a loudness reading taken here (spec c35) —
+    which is why the tap carries the raw event rather than any number this
+    client computed.
+    """
+    seen: list[dict] = []
+    threads: list[str] = []
+
+    def _started(event: dict) -> None:
+        seen.append(event)
+        threads.append(threading.current_thread().name)
+
+    with FakeRealtimeServer(Scenario.HAPPY_PATH, wait_timeout=_TIMEOUT) as server:
+        client = _session(server, on_speech_started=_started)
+        client.start()
+        try:
+            assert _wait_until(lambda: bool(seen))
+        finally:
+            client.close()
+
+    assert seen[0]["type"] == realtime.SPEECH_STARTED
+    assert threads == [duplex.WORKER_THREAD_NAME]
+
+
+def test_t16_speech_stopped_is_not_interruption_evidence() -> None:
+    """Only the ONSET may cut: an ending is the human giving the floor back."""
+    seen: list[dict] = []
+    client = _session(url=_dead_url(), on_speech_started=seen.append)
+
+    client._dispatch_event({"type": realtime.SPEECH_STOPPED, "item_id": "item_1"})
+    assert seen == []
+
+    client._dispatch_event({"type": realtime.SPEECH_STARTED, "item_id": "item_1"})
+    assert len(seen) == 1
+
+
+def test_t16_playback_pending_names_the_audio_a_cut_would_actually_withhold() -> None:
+    """Criterion 1's other half: "nothing playing" has to be answerable.
+
+    A chunk already inside ``play`` is NOT pending: it cannot be recalled, so
+    cutting on it would withhold nothing while still recording its words as
+    unsaid — a reply the room heard in full, filed as truncated.
+    """
+    release = threading.Event()
+    sink = _Sink(block=release)
+    client = _chunked(url=_dead_url(), play=sink)
+    assert client.playback_pending is False, "an idle session has nothing to cut"
+    client.start()
+    try:
+        _feed_deltas(client, "resp_pending", _LONG_REPLY, _TEST_CHUNK_BYTES)
+        assert sink.entered.wait(timeout=_TIMEOUT)
+        assert _wait_until(lambda: client.playback_pending is True)
+        client.cancel_playback()
+        assert client.playback_pending is False, "the cut drained the queue"
+        # One chunk is still inside ``play`` — busy, but nothing left to skip.
+        assert client.speaking is True
+    finally:
+        release.set()
+        client.close()
+
+
+def test_t16_the_wire_itself_cuts_nothing_on_a_vad_onset() -> None:
+    """The gate-free pin, behaviourally: the module publishes, it does not act.
+
+    A recording tap observes the very onset a policy WOULD cut on, and the
+    reply plays out whole. Anything else would mean this module had formed an
+    opinion about whose speech is worth stopping the robot for — the opinion
+    the three structural c4 pins above say it cannot hold.
+    """
+    seen: list[dict] = []
+    sink = _Sink()
+    with _tail_server() as server:
+        client = _chunked(server, play=sink, on_speech_started=seen.append)
+        client.start()
+        try:
+            assert _wait_until(lambda: client.responses >= 1)
+            assert _wait_until(lambda: sink.played == _LONG_REPLY)
+            server.release_interjection()
+            assert _wait_until(lambda: bool(seen))
+        finally:
+            client.close()
+
+    assert sink.played == _LONG_REPLY, "the wire cut a reply nobody asked it to cut"
+    assert client.chunks_cancelled == 0
+
+
+def test_t16_a_vad_onset_over_the_tail_cuts_the_queue_within_one_chunk() -> None:
+    """Criterion 1, end to end over a real socket, in the window that matters.
+
+    ``response.done`` has already landed — the floor is LISTENING and will send
+    no ``response.interrupted`` however loudly the room talks — and the mouth
+    is still three chunks behind. The onset arrives, the policy cuts, and the
+    room keeps only the chunk already committed to the speaker.
+    """
+    release = threading.Event()
+    sink = _Sink(block=release, block_after=2)
+    box: dict = {}
+    with _tail_server() as server:
+        client = _chunked(server, play=sink, on_speech_started=_cut_on_speech(box))
+        box["client"] = client
+        client.start()
+        try:
+            assert _wait_until(lambda: client.responses >= 1), "the reply never completed"
+            assert _wait_until(lambda: len(sink.calls) == 2), "two chunks were never confirmed"
+            server.release_interjection()
+            assert _wait_until(lambda: bool(box["cuts"]))
+        finally:
+            release.set()
+            client.close()
+
+    (cut,) = box["cuts"]
+    assert cut.cancelled is True
+    assert (cut.played_bytes, cut.in_flight_bytes, cut.skipped_bytes) == (16, 8, 24)
+    # ... and the measured split of exactly that cut (criterion 2's input).
+    split = client.spoken_split(cut.response_id)
+    assert split is not None
+    assert (split.said, split.unsaid) == ("one two", "three four five six")
+    assert split.cut is True
+
+
+def test_t16_a_second_onset_after_the_queue_drained_is_a_clean_noop() -> None:
+    """Criterion 1's no-op half — and the reason one reply is never cut twice.
+
+    A cut drains the queue AND stamps the reply stale, so nothing of it can be
+    re-queued: a human interjecting twice over one tail finds nothing left to
+    withhold the second time. That is what makes at-most-one cut per reply
+    structural rather than a flag someone has to remember to clear.
+    """
+    sink = _Sink()
+    box: dict = {}
+    client = _chunked(url=_dead_url(), play=sink, on_speech_started=_cut_on_speech(box))
+    box["client"] = client
+    client.start()
+    try:
+        _feed_deltas(client, "resp_tail", _LONG_REPLY, _TEST_CHUNK_BYTES)
+        client._dispatch_event(
+            {"type": "response.text.done", "response_id": "resp_tail", "text": _SPLIT_TEXT}
+        )
+        client._dispatch_event({"type": "response.done", "response_id": "resp_tail"})
+        assert _wait_until(lambda: client.chunks_queued >= 6)
+
+        client._dispatch_event({"type": realtime.SPEECH_STARTED, "item_id": "item_1"})
+        cancelled = client.chunks_cancelled
+        client._dispatch_event({"type": realtime.SPEECH_STARTED, "item_id": "item_2"})
+    finally:
+        client.close()
+
+    assert len(box["cuts"]) == 1, "the same reply was cut twice"
+    assert len(box["noops"]) == 1, "the second onset withheld nothing, and said so"
+    assert client.chunks_cancelled == cancelled
+
+
+def test_t16_a_raising_speech_started_tap_never_stops_the_session() -> None:
+    """The tap runs on the worker thread, so it may not take the session down."""
+
+    def _boom(_event: dict) -> None:
+        raise RuntimeError("policy fault")
+
+    client = _session(url=_dead_url(), on_speech_started=_boom)
+    client._dispatch_event({"type": realtime.SPEECH_STARTED, "item_id": "item_1"})
+    client._dispatch_event({"type": realtime.SPEECH_STARTED, "item_id": "item_2"})
+    assert client.ignored_events == 0
+
+
+def test_t16_the_tail_window_and_its_mechanism_are_documented() -> None:
+    """The gap is a client-side one, and the docstring has to say whose it is.
+
+    Without this, the next reader sees a cut path beside ``response.interrupted``
+    and reasonably concludes one of them is redundant.
+    """
+    doc = " ".join((duplex.__doc__ or "").split()).lower()
+
+    assert "delivery_pause_ms" in doc, "upstream's pacing is why the gap is only the tail"
+    assert "on_speech_started" in doc
+    assert "playback_pending" in doc
+    assert "locator" in doc, "c35: never a loudness reading taken here"
