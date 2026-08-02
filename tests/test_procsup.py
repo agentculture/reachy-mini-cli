@@ -24,6 +24,13 @@ from the issue::
 ``reachy.embody.supervisor`` and now the shared implementation — splits the
 NUL-separated cmdline and matches EXACT argv tokens.
 
+**The two sites the first fix missed.** ``reachy.alive`` (``demo-mode``) and
+``reachy.daemon`` are PID-guarded too but are not procsup-shaped supervisors, so
+they kept their own substring scans. ``demo-mode`` migrates to the same
+exact-token rule; the daemon cannot, because it is a console script rather than
+a ``python -m reachy <verb>`` line — hence
+:func:`reachy.procsup.has_argv_basename` and its own tests below.
+
 Every ``stop``-spares-a-bystander test below spawns a REAL process, per the
 repo's hard rule using only a trivial, hardcoded-argv stand-in
 (``sys.executable -c "import time; time.sleep(...)"``) — never a real robot
@@ -44,7 +51,8 @@ from pathlib import Path
 
 import pytest
 
-from reachy import procsup
+import reachy
+from reachy import alive, daemon, procsup
 from reachy.behavior import supervisor as behavior_supervisor
 from reachy.embody import supervisor as embody_supervisor
 from reachy.sleep import supervisor as sleep_supervisor
@@ -132,7 +140,7 @@ def _cmdline_tokens(pid: int) -> set[str]:
     return {token.decode("utf-8", "replace") for token in raw.split(b"\x00") if token}
 
 
-def _spawn(*extra_argv: str) -> subprocess.Popen:
+def _spawn_argv(argv: list[str]) -> subprocess.Popen:
     """Spawn a trivial stand-in and WAIT until its own argv is the live one.
 
     ``Popen`` returns as soon as the child exists, which is BEFORE ``execve``
@@ -144,7 +152,6 @@ def _spawn(*extra_argv: str) -> subprocess.Popen:
     child's last argv element visible in ``/proc`` — closes it. Budget is
     ``tests.conftest.WAIT_BUDGET_S``.
     """
-    argv = [sys.executable, "-c", _STANDIN_CODE, *extra_argv]
     proc = subprocess.Popen(  # nosec B603 B607 - fixed argv, sys.executable, no shell
         argv,
         stdout=subprocess.DEVNULL,
@@ -154,6 +161,26 @@ def _spawn(*extra_argv: str) -> subprocess.Popen:
         lambda: argv[-1] in _cmdline_tokens(proc.pid)
     ), f"the stand-in never exec'd its own argv: {argv[-1]!r}"
     return proc
+
+
+def _spawn(*extra_argv: str) -> subprocess.Popen:
+    """The ``python -c <stand-in body> [extra…]`` shape every supervisor test uses."""
+    return _spawn_argv([sys.executable, "-c", _STANDIN_CODE, *extra_argv])
+
+
+def _spawn_daemon_shaped(tmp_path: Path) -> subprocess.Popen:
+    """A real process wearing the MEASURED live daemon's argv shape.
+
+    On the deployed box ``/proc/<pid>/cmdline`` for ``reachy-mini-daemon`` is
+    ``[…/bin/python3, …/bin/reachy-mini-daemon]`` — the interpreter at argv[0]
+    and the console script, as an absolute path, at argv[1]. Reproducing that
+    needs a real file named after the binary, so the stand-in body is written to
+    one instead of passed with ``-c``; the body is the same inert sleep.
+    """
+    script = tmp_path / "bin" / daemon.DAEMON_BINARY
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(_STANDIN_CODE, encoding="utf-8")
+    return _spawn_argv([sys.executable, str(script)])
 
 
 def _pid_alive(pid: int) -> bool:
@@ -186,6 +213,12 @@ def _reap_in_background(proc: subprocess.Popen) -> None:
     threading.Thread(target=proc.wait, daemon=True).start()
 
 
+def _flattened_cmdline(pid: int) -> str:
+    """*pid*'s command line the way every retired guard read it: one string."""
+    raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+
+
 def _legacy_substring_match(pid: int, tokens: tuple[str, ...]) -> bool:
     """The predicate issue #136 deleted, kept HERE so the regression stays real.
 
@@ -195,9 +228,19 @@ def _legacy_substring_match(pid: int, tokens: tuple[str, ...]) -> bool:
     from quietly going vacuous — without it, a future change to the stand-in
     argv could make them pass for the boring reason that nothing ever matched.
     """
-    raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
-    return all(token in cmdline for token in tokens)
+    return all(token in _flattened_cmdline(pid) for token in tokens)
+
+
+def _retired_demo_mode_match(pid: int) -> bool:
+    """``reachy.alive._is_our_process`` as it stood before this change, verbatim."""
+    cmdline = _flattened_cmdline(pid)
+    return "demo-mode" in cmdline or "demo_mode" in cmdline
+
+
+def _retired_daemon_match(pid: int) -> bool:
+    """``reachy.daemon._is_our_daemon`` as it stood before this change, verbatim."""
+    cmdline = _flattened_cmdline(pid)
+    return daemon.DAEMON_BINARY in cmdline or "reachy_mini" in cmdline
 
 
 def _write_pid(noun: _Noun, pid: int) -> Path:
@@ -250,6 +293,58 @@ def test_has_argv_tokens_trusts_the_pid_file_without_proc(monkeypatch) -> None:
     """No ``/proc`` (non-Linux) means we cannot verify — so we do not refuse."""
     monkeypatch.setattr(Path, "is_dir", lambda self: False)
     assert procsup.has_argv_tokens(1, ("reachy", "sleep"))
+
+
+# --------------------------------------------------------------------------- #
+# has_argv_basename — the console-script guard                                 #
+# --------------------------------------------------------------------------- #
+
+#: The daemon's command line as MEASURED on the deployed robot. Both facts that
+#: pick the predicate are in it: the interpreter is argv[0], and the binary
+#: arrives at argv[1] as an absolute path.
+_MEASURED_DAEMON_CMDLINE = (
+    b"/home/spark/.local/share/uv/tools/reachy-mini-cli/bin/python3\x00"
+    b"/home/spark/.local/share/uv/tools/reachy-mini-cli/bin/reachy-mini-daemon\x00"
+)
+
+
+def test_has_argv_basename_matches_the_measured_live_daemon_cmdline(monkeypatch) -> None:
+    """The predicate exists because the two cheaper rules both miss this line."""
+    monkeypatch.setattr(Path, "read_bytes", lambda self: _MEASURED_DAEMON_CMDLINE)
+
+    assert procsup.has_argv_basename(1, (daemon.DAEMON_BINARY,))
+    assert not procsup.has_argv_tokens(1, (daemon.DAEMON_BINARY,)), (
+        "an exact-token rule must NOT match the real daemon — if it does, this "
+        "test no longer explains why the basename predicate is needed"
+    )
+
+
+def test_has_argv_basename_ignores_a_path_component_that_is_not_the_program(
+    monkeypatch,
+) -> None:
+    """The sibling checkout on this very box: ``…/git/reachy_mini/…``.
+
+    The retired substring guard accepted ``reachy_mini`` anywhere in the
+    flattened command line, so anything launched from that directory read as the
+    daemon. A basename names the PROGRAM, never the directory it came out of.
+    """
+    innocent = b"/usr/bin/python3\x00/home/spark/git/reachy_mini/scripts/probe.py\x00"
+    monkeypatch.setattr(Path, "read_bytes", lambda self: innocent)
+
+    assert not procsup.has_argv_basename(1, (daemon.DAEMON_BINARY, "reachy_mini"))
+
+
+def test_has_argv_basename_says_not_ours_for_a_dead_pid() -> None:
+    proc = _spawn()
+    proc.kill()
+    proc.wait(timeout=WAIT_BUDGET_S)
+    assert not procsup.has_argv_basename(proc.pid, (daemon.DAEMON_BINARY,))
+
+
+def test_has_argv_basename_trusts_the_pid_file_without_proc(monkeypatch) -> None:
+    """Same unverifiable-means-do-not-refuse rule as its exact-token sibling."""
+    monkeypatch.setattr(Path, "is_dir", lambda self: False)
+    assert procsup.has_argv_basename(1, (daemon.DAEMON_BINARY,))
 
 
 def test_every_supervisor_identity_is_a_token_set_not_a_substring_scan() -> None:
@@ -338,6 +433,139 @@ def test_stop_still_ends_the_real_tracked_process(noun: _Noun) -> None:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=WAIT_BUDGET_S)
+
+
+# --------------------------------------------------------------------------- #
+# #136 — the two guarded sites that are not procsup-shaped supervisors         #
+# --------------------------------------------------------------------------- #
+
+#: A bystander argv element shaped like a path out of THIS checkout. It carries
+#: ``demo-mode`` as a substring and as nothing else.
+_DEMO_MODE_BYSTANDER_ARG = "/home/user/git/reachy-mini-cli/docs/demo-mode.md"
+#: A bystander argv element shaped like a path out of the SIBLING checkout that
+#: sits beside this one on the development box.
+_DAEMON_BYSTANDER_ARG = "/home/user/git/reachy_mini/scripts/probe.py"
+
+
+def test_demo_mode_stop_spares_a_real_bystander_named_by_a_checkout_path() -> None:
+    """``demo-mode``'s half of #136, against a real process.
+
+    Nothing about this process is a demo-mode loop; one argument merely names a
+    file under a checkout. The retired substring guard called that ours, and
+    ``stop`` escalates to SIGKILL.
+    """
+    bystander = _spawn(_DEMO_MODE_BYSTANDER_ARG)
+    try:
+        assert _retired_demo_mode_match(bystander.pid), (
+            "the stand-in no longer reproduces #136 — the retired substring guard "
+            "must still have matched it for this to be a regression test"
+        )
+        alive.pid_file().write_text(str(bystander.pid), encoding="utf-8")
+
+        result = alive.stop()
+
+        assert result["status"] == "not running"
+        assert "reused" in result["note"]
+        assert _pid_alive(bystander.pid), "demo-mode stop signalled an unrelated process"
+        assert not alive.pid_file().exists()
+    finally:
+        if bystander.poll() is None:
+            bystander.kill()
+            bystander.wait(timeout=WAIT_BUDGET_S)
+
+
+def test_demo_mode_stop_still_ends_its_own_tracked_loop() -> None:
+    """The other half: the guard must not simply refuse everything."""
+    tracked = _spawn(*alive._IDENTITY_TOKENS)
+    bystander = _spawn(_DEMO_MODE_BYSTANDER_ARG)
+    try:
+        _reap_in_background(tracked)
+        _reap_in_background(bystander)
+        alive.pid_file().write_text(str(tracked.pid), encoding="utf-8")
+
+        result = alive.stop()
+
+        assert result["status"] == "stopped"
+        assert result["pid"] == tracked.pid
+        assert _wait_until(lambda: not _pid_alive(tracked.pid)), "demo-mode loop not stopped"
+        assert _pid_alive(bystander.pid), "demo-mode stop signalled a bystander"
+    finally:
+        for proc in (tracked, bystander):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=WAIT_BUDGET_S)
+
+
+def test_daemon_stop_spares_a_real_bystander_from_the_sibling_checkout() -> None:
+    """The daemon's half of #136, and the one that is live on this box.
+
+    ``/home/…/git/reachy_mini`` is a real sibling checkout here, so the retired
+    ``"reachy_mini" in cmdline`` test made every process launched out of it a
+    candidate for ``daemon stop``'s SIGKILL.
+    """
+    bystander = _spawn(_DAEMON_BYSTANDER_ARG)
+    try:
+        assert _retired_daemon_match(bystander.pid), (
+            "the stand-in no longer reproduces #136 — the retired substring guard "
+            "must still have matched it for this to be a regression test"
+        )
+        daemon.pid_file().write_text(str(bystander.pid), encoding="utf-8")
+
+        result = daemon.stop()
+
+        assert result["status"] == "not running"
+        assert "reused" in result["note"]
+        assert _pid_alive(bystander.pid), "daemon stop signalled an unrelated process"
+        assert not daemon.pid_file().exists()
+    finally:
+        if bystander.poll() is None:
+            bystander.kill()
+            bystander.wait(timeout=WAIT_BUDGET_S)
+
+
+def test_daemon_stop_still_ends_a_process_shaped_like_the_live_daemon(tmp_path) -> None:
+    """The basename rule has to match the MEASURED shape, not just reject things.
+
+    ``[<interpreter>, …/bin/reachy-mini-daemon]`` is what the daemon actually
+    looks like in ``/proc``; a guard that misses it turns every ``daemon stop``
+    into a "reused, left untouched" no-op and strands the daemon.
+    """
+    tracked = _spawn_daemon_shaped(tmp_path)
+    bystander = _spawn(_DAEMON_BYSTANDER_ARG)
+    try:
+        _reap_in_background(tracked)
+        _reap_in_background(bystander)
+        daemon.pid_file().write_text(str(tracked.pid), encoding="utf-8")
+
+        result = daemon.stop()
+
+        assert result["status"] == "stopped"
+        assert result["pid"] == tracked.pid
+        assert _wait_until(lambda: not _pid_alive(tracked.pid)), "daemon stand-in not stopped"
+        assert _pid_alive(bystander.pid), "daemon stop signalled a bystander"
+    finally:
+        for proc in (tracked, bystander):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=WAIT_BUDGET_S)
+
+
+def test_no_substring_cmdline_check_survives_anywhere_outside_procsup() -> None:
+    """Structural, repo-wide: ``procsup`` is the ONLY module that reads ``/proc``.
+
+    #136 was fixed once and stayed broken in five other places because each site
+    owned a copy. Site-by-site tests cannot catch the seventh copy; this can.
+    """
+    package = Path(reachy.__file__).parent
+    offenders = sorted(
+        str(path.relative_to(package))
+        for path in package.rglob("*.py")
+        if path.name != "procsup.py"
+        and any(
+            marker in path.read_text(encoding="utf-8") for marker in ('replace(b"\\x00"', "/proc/")
+        )
+    )
+    assert offenders == []
 
 
 # --------------------------------------------------------------------------- #
