@@ -87,3 +87,24 @@ cadence in the module, so tests pin it without wall-clock.
   candidate on the motion leg. It is not implicated by this measurement: the
   motion POSTs continued unchanged across 10:30:59 while the streak stopped.
 - **#145** — the read-cadence issue this evidence closes.
+
+## Post-fix verification (live, same box)
+
+The fix was deployed by restarting `reachy-runtime` at 17:44:57 (this box runs an
+editable install, so a restart *is* the deploy). The restart also revived the
+camera — the first clip appeared 23 s later, a second confirmation of #138's
+restart-recovery.
+
+Measured over the following **578 s with the camera alive**:
+
+| | before the fix (camera alive) | after the fix (camera alive) |
+|---|---|---|
+| sustained overrun streaks | `count=31090`, `mean_ms=21.06` | **none** |
+| isolated overruns | — | 2 (one of them at `tick=1`, a startup artifact) |
+| clip health | — | 55 frames / 5.94 s ≈ **9.3 fps** |
+
+The streak is gone under exactly the condition that used to produce it, and the
+clip's effective frame rate lands where the 10 Hz gate predicts — above the
+8 fps the encoder needs, so no consumer lost anything.
+
+`face` and `frame_available` both report available on the live `state.json`.
