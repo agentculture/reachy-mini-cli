@@ -229,6 +229,33 @@ Gemma's memory down to just the last ``m`` turns (spec claim c45, honesty
 h30). The marker clears on the next :meth:`update_summary` call that
 succeeds.
 
+The THIRD reader: the floor's history is what the layer put there (c27)
+--------------------------------------------------------------------------
+Decision **c27** settled who owns the conversation record. The layer does: it
+already receives every utterance and every reply text over the duplex wire, so
+lobes' server-side history becomes a PROJECTION of the deque above rather than
+a second account of the same conversation — the two-histories drift issue #154
+warned about, arriving one level down. Two methods produce those projections,
+both returning :class:`FloorItem`\\ s the composition root joins to
+:class:`reachy.speech.realtime_duplex.ConversationItem`:
+
+* :meth:`floor_reseed` — what a NEW session must be told, consulted by the
+  duplex client inside ``session.created`` handling and BEFORE it arms (spec
+  claim c40; a session close wipes the floor's ephemeral history, so a
+  reconnect that armed first would answer out of an empty one). It is Gemma's
+  ``m``-window as curated HISTORY turns plus Qwen's summary as ONE ephemeral
+  CONTEXT item, taken through :meth:`_senses_window` and
+  :meth:`_history_messages` — the same views the two lanes already read, never
+  a third derivation and never a cached copy.
+* :meth:`floor_correction` — what the room ACTUALLY heard of a reply a human
+  cut off, which the floor cannot see for itself (spec claim c39).
+
+Both are bounded by bounds that already exist
+(:attr:`Limits.senses_history_maxlen`, :attr:`Limits.summary_max_chars`), and
+both are refused wholesale by a gateway that announced no conversation-item
+support — one named drop, the connect-time ``system_prompt`` context task t9
+wired, and the phase-1 overstatement documented rather than papered over.
+
 Cognition scopes: what the background mind may put in front of the voice
 --------------------------------------------------------------------------
 Qwen influences the conversation only through explicit, inspectable typed
@@ -336,6 +363,11 @@ from reachy.embody.tools import HARMONICS, SPEAK
 from reachy.export.events import EmotionEvent, MessageEvent, ThinkingEvent
 from reachy.export.exporter import ExportHook
 from reachy.speech import llm as _llm
+from reachy.speech.realtime_wire import (
+    ITEM_DISPOSITION_CONTEXT,
+    ITEM_DISPOSITION_HISTORY,
+    ITEM_ROLE_SYSTEM,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -602,6 +634,26 @@ STALE_SUMMARY_MARKER = (
 SCOPE_PREAMBLE = (
     "Your background mind is working on the following. Use any of it that helps "
     "you answer well; the wording, and whether to say anything at all, are yours."
+)
+
+#: Opens every item :meth:`EmbodyTurnEngine.floor_correction` builds (spec claim
+#: c39). A correction APPENDS to the floor's history rather than rewriting the
+#: turn already in it — the schema has no operation for that — so it has to
+#: announce itself in words the reading model, the journal and a test can all
+#: recognise. Kept as a constant for the usual reason: a phrase restated in a
+#: test is a phrase that drifts.
+FLOOR_CORRECTION_PREFIX = "Correction:"
+#: The correction when the room heard SOME of the reply, ``{said}`` filled with
+#: the measured prefix. Deliberately says "was cut off" rather than naming the
+#: interrupter: the layer knows a cut happened, not who caused it.
+FLOOR_CORRECTION_PARTIAL = (
+    FLOOR_CORRECTION_PREFIX + ' my previous reply was cut off. Only "{said}" was '
+    "actually spoken aloud; the rest of it was never heard."
+)
+#: The correction when the cut landed before a single word reached the room.
+FLOOR_CORRECTION_NOTHING = (
+    FLOOR_CORRECTION_PREFIX + " my previous reply was cut off before any of it "
+    "was spoken aloud; none of it was heard."
 )
 
 # --------------------------------------------------------------------------- #
@@ -1013,6 +1065,49 @@ class RequestConfig:
     #: and dormant, NOT broken. Flip this to ``True`` and it fills
     #: immediately.
     enable_thinking: bool = False
+
+
+@dataclass(frozen=True)
+class FloorItem:
+    """ONE projection of the canonical history, addressed to the realtime floor.
+
+    Decision **c27**: the layer curates the conversation record and PUSHES
+    projections of it to the floor, so lobes' server-side history becomes what
+    the layer put there rather than a second account of the same conversation.
+    :meth:`EmbodyTurnEngine.floor_reseed` and
+    :meth:`EmbodyTurnEngine.floor_correction` are the two producers.
+
+    Structurally identical to
+    :class:`reachy.speech.realtime_duplex.ConversationItem`, and deliberately
+    NOT that class. The dependency runs one way — the composition root joins
+    this module to the WebSocket client, the same arrangement
+    :class:`_SpokenSplitLike` already keeps for the value travelling in the
+    other direction — so this module can build what the floor needs without
+    importing the socket that carries it. The role and disposition VOCABULARY
+    is shared by import from :mod:`reachy.speech.realtime_wire` (the pure
+    codec) rather than restated, because a second copy of a vocabulary is a
+    second thing to drift; the wire re-validates every value on the way out, so
+    a drift fails closed at the frame rather than silently mislabelling an item.
+
+    Attributes:
+        role: ``system`` / ``user`` / ``assistant`` — the roles the floor
+            itself appends.
+        text: carried verbatim, bounded by whoever produced it (the ``m``
+            window's ``Limits.senses_history_maxlen``, a summary's
+            ``Limits.summary_max_chars``).
+        disposition: ``context`` for an ephemeral item that informs the next
+            generate call and never enters history, ``history`` for a curated
+            turn. The distinction is the whole reason the channel needed an
+            upstream ask (agentculture/lobes-cli#170 item 2, spec claim c38):
+            the floor ALREADY auto-appends both roles, so an item that landed
+            in history when it meant to be ephemeral would duplicate and drift
+            — the two-histories failure this arc exists to eliminate, arriving
+            one level down.
+    """
+
+    role: str
+    text: str
+    disposition: str
 
 
 # --------------------------------------------------------------------------- #
@@ -2091,6 +2186,125 @@ class EmbodyTurnEngine:
         else:
             text = STALE_SUMMARY_MARKER
         return {"role": "system", "content": text}
+
+    # ------------------------------------------------------------------ #
+    # The canonical history's projections onto the realtime floor         #
+    # (decision c27, task t11)                                            #
+    # ------------------------------------------------------------------ #
+
+    def floor_reseed(self) -> list[FloorItem]:
+        """Everything a NEW floor session must be told, projected from ONE record.
+
+        The re-seed seam
+        (:class:`reachy.speech.realtime_duplex.Reseed`) production hands the
+        duplex client. A session close wipes the floor's ephemeral history
+        (lobes ``_session.py``'s ``teardown`` empties ``_history`` — close
+        "releases it all"), so a reconnect that armed without re-seeding would
+        let the gateway answer the next turn out of nothing: Gemma silently
+        reset to amnesia, with no line in any log saying so (spec claim c40).
+        The ORDERING that prevents it is the wire's, guaranteed structurally
+        inside its ``session.created`` handling; the CONTENT is this method's,
+        and that split is why the seam exists at all.
+
+        **This is the third reader of the ONE canonical history, not a second
+        copy of it.** The turns come from :meth:`_senses_window` — Gemma's own
+        ``m``-window, a strict suffix of Qwen's ``n`` over the same deque
+        (decision c30) — rendered by :meth:`_history_messages`, the ONE
+        renderer both lanes already use. Nothing is re-derived here, so a
+        stored turn cannot reach the floor rendered a third way, and a future
+        "re-seed cache" would be exactly the second, independently-maintained
+        history #154 warned about.
+
+        **The two dispositions, and why each artifact gets the one it does.**
+
+        * Qwen's rolling summary of everything older (:meth:`_summary_message`,
+          carrying :data:`STALE_SUMMARY_MARKER` when the last maintenance pass
+          failed) rides as ONE ephemeral **context** item. It is not a turn
+          anybody took, and it is REGENERATED — appending each new version as a
+          history turn would leave the floor holding every superseded one.
+        * The ``m``-window rides as curated **history** turns, because that is
+          what they are: the conversation the floor lost when the socket
+          dropped.
+
+        **Bounded by what already bounds the lanes**, never by a number of its
+        own: :attr:`Limits.senses_history_maxlen` caps the turns and
+        :attr:`Limits.summary_max_chars` caps the summary, both enforced where
+        they live (an over-length summary is refused by
+        :meth:`update_summary` and so never reaches here at all).
+
+        Safe from any thread and never raises: it runs on the session's worker
+        thread, inside ``session.created`` handling, where an escaping
+        exception would take the session down and reconnect straight back into
+        the same fault. Returns ``[]`` for a conversation that has not started
+        — nothing to re-seed is not a failure.
+        """
+        items: list[FloorItem] = []
+        summary = self._summary_message()
+        if summary is not None:
+            items.append(
+                FloorItem(
+                    role=ITEM_ROLE_SYSTEM,
+                    text=str(summary["content"]),
+                    disposition=ITEM_DISPOSITION_CONTEXT,
+                )
+            )
+        items.extend(
+            FloorItem(
+                role=str(message["role"]),
+                text=str(message["content"]),
+                disposition=ITEM_DISPOSITION_HISTORY,
+            )
+            for message in self._history_messages(self._senses_window())
+        )
+        return items
+
+    def floor_correction(self, split: _SpokenSplitLike) -> FloorItem | None:
+        """The item that tells the floor what the room ACTUALLY heard of a cut reply.
+
+        **Spec claim c39, closing.** A client-local cut is invisible to the
+        floor: wire delivery completed at wire speed, so the server sent
+        ``response.done`` and appended the WHOLE reply to its own history. Its
+        record therefore OVERSTATES what the room heard after every cut, while
+        the layer's own record — narrowed by :meth:`note_interrupted_reply` —
+        is right, because the client is the measured authority for what its
+        sink played. Until task t10 there was no frame that could carry the
+        difference. There is one now, and this builds what goes in it.
+
+        **It APPENDS; it does not rewrite.** The schema has no operation for
+        editing a turn the floor already stored, so this is a
+        ``history``-disposition item that says, in words the reading model can
+        act on, that the previous reply was cut and how much of it was spoken.
+        Two consequences worth stating rather than discovering: the raw
+        overstated turn is still in the floor's history (nothing here claims
+        the two records now agree — only that the floor has been TOLD), and the
+        disposition is ``history`` rather than ``context`` on purpose, because
+        a correction that evaporated after one generate call would let the
+        overstatement come straight back on the next turn.
+
+        Where the gateway announced no conversation-item support the push is
+        declined by :meth:`reachy.speech.realtime_duplex.RealtimeDuplexSession.
+        send_item` — one named, latched drop, the c44/h29 degrade — and the
+        overstatement simply remains, documented rather than papered over.
+
+        Returns ``None`` when there is nothing to correct: the reply the room
+        heard whole (``unsaid`` empty) leaves the floor's record already true,
+        and an object this method cannot read structurally is a ``None`` too
+        rather than an exception, since it is called from a session tap on a
+        worker thread.
+
+        Its size is bounded by the reply it corrects, which the floor already
+        stored — so this adds no growth the conversation did not already have.
+        """
+        said = (getattr(split, "said", "") or "").strip()
+        unsaid = (getattr(split, "unsaid", "") or "").strip()
+        if not unsaid:
+            return None
+        text = FLOOR_CORRECTION_PARTIAL.format(said=said) if said else FLOOR_CORRECTION_NOTHING
+        return FloorItem(
+            role=ITEM_ROLE_SYSTEM,
+            text=text,
+            disposition=ITEM_DISPOSITION_HISTORY,
+        )
 
     def _senses_window(self) -> list[tuple[str, str]]:
         """Gemma's window: the last ``senses_history_maxlen`` entries of the ONE shared deque.
