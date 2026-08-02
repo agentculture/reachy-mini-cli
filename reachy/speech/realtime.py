@@ -113,6 +113,12 @@ inbound ``response.*`` event — from a future server that volunteers one — is
 ignored with a debug log and counted in ``ignored_events``. The robot's voice
 lives in :mod:`reachy.behavior.speech_act`, and cognition in ``agent attach``.
 
+That is not a matter of discipline, and it did not become one when the ARMED
+duplex session started sharing this module's session mechanics: nothing in
+this file — client or shared section — names the wire's arming builder or
+writes the event type, and it does not import ``json``, so it cannot hand-roll
+one either. ``tests/test_realtime_client.py`` asserts all three.
+
 --------------------------------------------------------------------------
 Configuration
 --------------------------------------------------------------------------
@@ -135,6 +141,16 @@ An unusable URL scheme is a clean exit-1 :class:`~reachy.cli._errors.CliError`
 raised at CONSTRUCTION — a typo is a startup error, never a mid-session
 surprise, exactly as :func:`reachy.behavior.speech_act.resolve_playback_transport`
 treats its own.
+
+--------------------------------------------------------------------------
+This module is also the ONE OWNER of the session mechanics
+--------------------------------------------------------------------------
+:mod:`reachy.speech.realtime_duplex` — the embodiment layer's duplex session —
+speaks the same wire to the same gateway. Everything both clients do
+identically (the handshake, the frame pump, the up/down latch, the named
+reasons, the backoff arithmetic) lives in the "Shared session mechanics"
+section below and is imported from here, never re-derived there. The section
+header states what is deliberately NOT shared, and why.
 
 Standard library plus numpy and :mod:`reachy.speech.realtime_wire` — no
 WebSocket dependency, no new package (``pyproject.toml`` is untouched).
@@ -222,7 +238,9 @@ REASON_SERVER_ERROR = "server-error"
 #: A ``transcription.completed`` carrying no usable text.
 REASON_EMPTY_TRANSCRIPT = "empty-transcript"
 
-#: Server ``error.code`` -> this module's kebab-case drop reason.
+#: Server ``error.code`` -> this module's kebab-case drop reason. SHARED (see
+#: the "Shared session mechanics" section below): change its BEHAVIOUR and you
+#: change the duplex session's too.
 _ERROR_REASONS = {
     "vad_unavailable": REASON_VAD_UNAVAILABLE,
     "stt_forward_failed": REASON_STT_FORWARD_FAILED,
@@ -382,8 +400,49 @@ class Utterance:
     session_id: str | None = None
 
 
+# =========================================================================== #
+# Shared session mechanics — ONE OWNER for the wire                           #
+#                                                                             #
+# Everything from here to `RealtimeTranscriber` is the RFC 6455 + gateway      #
+# session machinery that reachy/speech/realtime_duplex.py (the embodiment      #
+# layer's duplex session) runs on TOO, and imports from here rather than       #
+# keeping a second copy. These two modules are the two ends of ONE wire, and   #
+# this arc has already paid once — the t4/t6 audio-tee integration — for two   #
+# agents independently deriving one protocol: it does not fail loudly, it      #
+# produces plausible garbage. A fix applied to one copy and not the other      #
+# diverges SILENTLY, and one of the copies is the deployed robot's hearing leg.#
+#                                                                             #
+# This section is deliberately POLICY-FREE. It opens a socket, upgrades it,    #
+# moves frames, latches the up/down state and NAMES the failures. What is      #
+# deliberately NOT here, because the two clients are allowed to differ:        #
+#                                                                             #
+#   * the reconnect POLICY (`_run` / `_pump_once`): this client has an         #
+#     INTENTIONAL teardown — a `set_sample_rate` re-negotiation costs no       #
+#     backoff and logs no drop — that the duplex session has no analogue for;  #
+#   * how a non-101 handshake is NAMED: `_ws_connect` reports the status and   #
+#     the caller names it, so the duplex session can turn a 404 into its own   #
+#     `realtime-lane-unavailable` diagnosis while this one reports a generic   #
+#     refusal;                                                                 #
+#   * the connect-time staleness discipline: a bounded QUEUE drained by age    #
+#     here, a PULL source drained by count there;                              #
+#   * queue-overflow reporting: the duplex session latches one line per        #
+#     episode, this one reports every eviction;                                #
+#   * ARMING. Nothing in this section can construct a `response.create`. The   #
+#     ears-only guarantee (#115's non-goal) is not a promise this client keeps #
+#     by convention — it is a frame no shared code knows how to build, pinned  #
+#     by an AST scan over BOTH modules in tests/test_realtime_client.py.       #
+# =========================================================================== #
+
+
 class _SessionLost(Exception):
-    """Internal: this session ended. Never escapes the worker thread."""
+    """Internal: this session ended. Never escapes the worker thread.
+
+    ``intentional`` marks an end nobody should treat as a fault (this client's
+    sample-rate re-negotiation is the only one today). The duplex session never
+    raises with it set; it costs that client nothing to share the type, and a
+    second exception class would mean the shared helpers below could raise
+    something one of its callers does not catch.
+    """
 
     def __init__(self, reason: str, detail: str = "", *, intentional: bool = False) -> None:
         super().__init__(f"{reason} {detail}".strip())
@@ -488,12 +547,492 @@ def _to_pcm16(audio: Any) -> bytes:
         return b""
 
 
+def _as_str(value: Any) -> str | None:
+    """Return *value* when it is a non-empty string, else ``None``."""
+    return value if isinstance(value, str) and value else None
+
+
+def _ws_backoff(attempts: int, initial: float, maximum: float) -> float:
+    """Bounded exponential backoff for the *attempts*-th consecutive failure."""
+    return min(maximum, initial * (2 ** max(0, attempts - 1)))
+
+
+class _SessionState:
+    """One client's session identity and its up/down LATCH.
+
+    This is the #99 journal-flood discipline, with one owner. Audio arrives 50
+    times a second; a drop line per undeliverable chunk would put 50 lines/s in
+    the journal. So entering the down state logs the CAUSE and the latched
+    ``session-down`` EXACTLY ONCE, however many reconnect attempts fail after
+    it, recovery logs ONE ``session up`` line, and a session torn down by
+    ``close()`` is silent (``close()`` shuts the socket down under the worker on
+    purpose, so the worker's last act is always a read failure — reporting it
+    would put a drop in the journal on every clean shutdown).
+
+    Everything else here answers the same question — "is there a session, what
+    is it called, and when do we try again" — so it lives here too rather than
+    twice in the clients: the three lifecycle counters (``sessions``,
+    ``connect_failures``, ``pongs_sent``, re-exported by both clients as
+    read-only properties), the wake signal that interrupts a worker parked in
+    the backoff, and the backoff bounds themselves.
+
+    Args:
+        stage / source: this client's ``[SENSE stage=… source=…]`` identity,
+            which is what keeps ONE journal splittable by which ear heard what.
+        is_closed: reads the owner's closing flag (see the silence rule above).
+        backoff_initial_s / backoff_max_s: bounded exponential reconnect delay.
+    """
+
+    def __init__(
+        self,
+        stage: str,
+        source: str,
+        *,
+        is_closed: Callable[[], bool],
+        backoff_initial_s: float = DEFAULT_BACKOFF_INITIAL_S,
+        backoff_max_s: float = DEFAULT_BACKOFF_MAX_S,
+    ) -> None:
+        self.stage = stage
+        self.source = source
+        self._is_closed = is_closed
+        self._backoff_initial_s = max(0.0, float(backoff_initial_s))
+        self._backoff_max_s = max(self._backoff_initial_s, float(backoff_max_s))
+        self._wake = threading.Event()
+        self._seq = 0
+        self.event = "sess0"
+        self._up = False
+        self._down = True
+        self._down_logged = False
+        self.sessions = 0
+        self.connect_failures = 0
+        self.pongs_sent = 0
+
+    @property
+    def closed(self) -> bool:
+        """Whether the owning client is shutting down."""
+        return self._is_closed()
+
+    def wake(self) -> None:
+        """Interrupt a worker parked in the reconnect backoff. Safe from any thread."""
+        self._wake.set()
+
+    def wait_backoff(self, attempts: int) -> bool:
+        """Wait out the delay for the *attempts*-th consecutive failure.
+
+        Interruptible: returns ``False`` when the client is closing, so a
+        ``close()`` never waits out a 30 s backoff before the worker leaves.
+        """
+        self._wake.wait(_ws_backoff(attempts, self._backoff_initial_s, self._backoff_max_s))
+        if self._is_closed():
+            return False
+        self._wake.clear()
+        return True
+
+    @property
+    def connected(self) -> bool:
+        """Whether a session is established right now."""
+        return self._up
+
+    @property
+    def down(self) -> bool:
+        """Whether the client is in the LATCHED down state (no session)."""
+        return self._down
+
+    def next_event(self) -> str:
+        """Name the session about to be attempted. NOT adopted until it comes up.
+
+        A failed connect therefore reports against the PREVIOUS session's name,
+        which is what makes a run of failures read as one episode.
+        """
+        self._seq += 1
+        return f"sess{self._seq}"
+
+    def note(self, detail: str, *, event: str | None = None) -> None:
+        """One ``[SENSE stage=…]`` progress line, against this session by default."""
+        senselog.stage(self.stage, self.source, event or self.event, detail)
+
+    def drop(self, reason: str, detail: str = "") -> None:
+        """One NAMED drop line. The reason is always first, so a grep still works."""
+        senselog.drop(
+            self.stage, self.source, self.event, f"{reason} ({detail})" if detail else reason
+        )
+
+    def mark_up(self, event: str, url: str) -> None:
+        """Adopt *event* as the live session and clear the latch."""
+        recovered = self._down_logged
+        self._up = True
+        self._down = False
+        self._down_logged = False
+        self.event = event
+        self.sessions += 1
+        self.note(f"session up url={url}{' (recovered)' if recovered else ''}")
+
+    def mark_down(self, reason: str, detail: str = "") -> None:
+        """Latch the down state, logging the cause + the state EXACTLY ONCE."""
+        self._up = False
+        self._down = True
+        if self._is_closed() or self._down_logged:
+            return
+        self._down_logged = True
+        self.drop(reason, detail)
+        senselog.drop(self.stage, self.source, self.event, REASON_SESSION_DOWN)
+
+    def mark_released(self) -> None:
+        """The socket went away. Not a latch transition — teardown says nothing."""
+        self._up = False
+
+    def note_connect_failure(self, reason: str, detail: str) -> bool:
+        """Count one failed attempt and latch it. Always returns ``False``."""
+        self.connect_failures += 1
+        self.mark_down(reason, detail)
+        return False
+
+    def note_pong(self) -> None:
+        self.pongs_sent += 1
+
+
+class _SessionObservables:
+    """The five read-only lifecycle observables both session clients expose.
+
+    A MIXIN, and deliberately the narrowest one possible: five properties over
+    ``self._state`` and NOTHING else — no state, no ``__init__``, no method. It
+    is not a base class in the template-method sense and **must never become
+    one**. That rule has a reason. The two classes that mix it in are an
+    EARS-ONLY session and an ARMED one, and a shared base that could carry
+    behaviour is precisely where an arming path would grow and reach the
+    ears-only client for free. Shared BEHAVIOUR lives in the free functions in
+    this section instead, which take their seams explicitly and cannot be
+    inherited by accident.
+
+    ``tests/test_realtime_client.py`` pins the narrowness: every attribute
+    defined here must be a ``property``.
+    """
+
+    #: Supplied by the mixing class' ``__init__``.
+    _state: _SessionState
+
+    @property
+    def connected(self) -> bool:
+        """Whether a session is established right now."""
+        return self._state.connected
+
+    @property
+    def session_down(self) -> bool:
+        """Whether the client is in the LATCHED down state (no session)."""
+        return self._state.down
+
+    @property
+    def sessions(self) -> int:
+        """How many sessions have come up over this client's life."""
+        return self._state.sessions
+
+    @property
+    def connect_failures(self) -> int:
+        """How many connect/handshake attempts have failed."""
+        return self._state.connect_failures
+
+    @property
+    def pongs_sent(self) -> int:
+        """How many keepalive PONGs this client has answered with."""
+        return self._state.pongs_sent
+
+
+def _close_socket(sock: socket.socket | None) -> None:
+    """Close *sock*. Idempotent for ``None``, never raises."""
+    if sock is None:
+        return
+    try:
+        sock.close()
+    except OSError:  # pragma: no cover - defensive
+        pass
+
+
+def _ws_release(sock: socket.socket | None, *, graceful: bool) -> None:
+    """Release one session socket, sending a CLOSE frame first when *graceful*."""
+    if sock is None:
+        return
+    if graceful:
+        try:
+            sock.sendall(wire.build_frame(wire.OPCODE_CLOSE, b"\x03\xe8", mask=True))
+        except OSError:
+            pass
+    _close_socket(sock)
+
+
+@dataclass(frozen=True)
+class _Handshake:
+    """The outcome of ONE connect + upgrade attempt.
+
+    A failure NEVER carries a live socket: :func:`_ws_connect` closes whatever
+    it opened before returning, so a caller has nothing to clean up. *status* is
+    the HTTP status the server answered with, when it answered at all — the one
+    piece of the refusal the two clients name differently.
+    """
+
+    sock: socket.socket | None = None
+    reader: _FrameReader | None = None
+    status: int | None = None
+    reason: str = ""
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.sock is not None and self.reader is not None
+
+
+def _ws_connect(
+    url: str,
+    *,
+    api_key: str | None,
+    connect_timeout_s: float,
+    frame_timeout_s: float,
+) -> _Handshake:
+    """Open ONE ws(s) session to *url* and upgrade it. Never raises.
+
+    Everything from the TCP connect through the RFC 6455 upgrade: TLS when the
+    scheme says so, the handshake request, the response head, and the
+    ``Sec-WebSocket-Accept`` verification. The reader is handed back because it
+    is the SAME buffer the head was read from — a server that pipelines
+    ``session.created`` into the segment carrying its 101 response would
+    otherwise lose those bytes.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or "localhost"
+    port = parts.port or (443 if parts.scheme == "wss" else 80)
+    path = parts.path or wire.REALTIME_PATH
+    if parts.query:
+        path = f"{path}?{parts.query}"
+    key = wire.make_sec_websocket_key()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+
+    sock: socket.socket | None = None
+    try:
+        sock = socket.create_connection((host, port), timeout=connect_timeout_s)
+        if parts.scheme == "wss":
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+        sock.settimeout(_SOCKET_TIMEOUT_S)
+        sock.sendall(wire.build_handshake_request(parts.netloc, path, key, headers))
+        reader = _FrameReader(sock, frame_timeout_s)
+        head = reader.read_until(b"\r\n\r\n", time.monotonic() + connect_timeout_s)
+    except (OSError, ValueError) as err:
+        _close_socket(sock)
+        return _Handshake(reason=REASON_CONNECT_FAILED, detail=f"{type(err).__name__}: {err}")
+    if head is None:
+        _close_socket(sock)
+        return _Handshake(reason=REASON_CONNECT_FAILED, detail="no handshake response")
+
+    status, response_headers = wire.parse_response_head(head)
+    if status != 101:
+        _close_socket(sock)
+        return _Handshake(status=status, reason=REASON_HANDSHAKE_REFUSED, detail=f"HTTP {status}")
+    if not wire.verify_accept_key(key, response_headers.get("sec-websocket-accept", "")):
+        _close_socket(sock)
+        return _Handshake(
+            status=status, reason=REASON_HANDSHAKE_REFUSED, detail="bad Sec-WebSocket-Accept"
+        )
+    return _Handshake(sock=sock, reader=reader)
+
+
+def _ws_send(sock: socket.socket | None, opcode: int, payload: bytes) -> None:
+    """Mask and write ONE frame. Raises :class:`_SessionLost`, never anything else."""
+    if sock is None:
+        raise _SessionLost(REASON_STREAM_CLOSED, "socket released")
+    try:
+        sock.sendall(wire.build_frame(opcode, payload, mask=True))
+    except OSError as err:
+        raise _SessionLost(REASON_STREAM_CLOSED, f"send failed: {err}") from err
+
+
+def _ws_readable(sock: socket.socket | None, reader: _FrameReader, *, timeout: float) -> bool:
+    """Whether a frame can be read now — buffered bytes count, ``select`` cannot see them."""
+    if reader.has_pending():
+        return True
+    if sock is None:
+        raise _SessionLost(REASON_STREAM_CLOSED, "socket released")
+    try:
+        ready, _, _ = select.select([sock], [], [], timeout)
+    except (OSError, ValueError) as err:
+        raise _SessionLost(REASON_STREAM_CLOSED, f"select failed: {err}") from err
+    return bool(ready)
+
+
+def _ws_pump_frames(
+    *,
+    socket_of: Callable[[], "socket.socket | None"],
+    reader: _FrameReader | None,
+    poll_interval_s: float,
+    is_closed: Callable[[], bool],
+    on_event: Callable[[dict], None],
+    state: _SessionState,
+    max_frames: int = _MAX_FRAMES_PER_PUMP,
+) -> None:
+    """Read up to *max_frames* inbound frames, answering the protocol ones itself.
+
+    A TEXT frame is decoded and handed to *on_event* (an undecodable one is a
+    named drop and nothing else); a PING is PONGed, because uvicorn pings
+    roughly every 20 s and disconnects a client that stays quiet; a CLOSE ends
+    the session. Only *on_event* is the caller's business.
+
+    *socket_of* is a live accessor rather than a snapshot ON PURPOSE: ``close()``
+    releases the socket from another thread, and a snapshot would leave this
+    loop selecting on a descriptor the process may already have reused.
+    """
+    if reader is None:  # pragma: no cover - defensive
+        raise _SessionLost(REASON_STREAM_CLOSED, "reader released")
+    for index in range(max_frames):
+        timeout = poll_interval_s if index == 0 else 0.0
+        if is_closed() or not _ws_readable(socket_of(), reader, timeout=timeout):
+            return
+        try:
+            _fin, opcode, payload = wire.read_frame(reader.recv_exact)
+        except wire.FrameReadError as err:
+            raise _SessionLost(REASON_STREAM_CLOSED, str(err)) from err
+        _ws_dispatch_frame(
+            opcode=opcode,
+            payload=payload,
+            socket_of=socket_of,
+            on_event=on_event,
+            state=state,
+        )
+
+
+def _ws_dispatch_frame(
+    *,
+    opcode: int,
+    payload: bytes,
+    socket_of: Callable[[], "socket.socket | None"],
+    on_event: Callable[[dict], None],
+    state: _SessionState,
+) -> None:
+    """Act on ONE decoded frame. Split from the read loop above for readability.
+
+    Kept a free function rather than a closure so the opcode policy is testable
+    on its own and so the loop reads as "read a frame, act on it" — the two
+    concerns Sonar's complexity warning was really pointing at.
+    """
+    if opcode == wire.OPCODE_TEXT:
+        event = wire.decode_event(payload)
+        if event is None:
+            state.drop(REASON_MALFORMED_EVENT, f"{len(payload)} bytes")
+        else:
+            on_event(event)
+    elif opcode == wire.OPCODE_PING:
+        # uvicorn pings roughly every 20 s and disconnects a client that stays
+        # quiet, so the PONG is keepalive, not politeness.
+        _ws_send(socket_of(), wire.OPCODE_PONG, payload)
+        state.note_pong()
+    elif opcode == wire.OPCODE_PONG:
+        logger.debug("%s: pong received", state.stage)
+    elif opcode == wire.OPCODE_CLOSE:
+        raise _SessionLost(REASON_STREAM_CLOSED, "server closed the session")
+    else:
+        logger.debug("%s: ignoring unexpected opcode 0x%x", state.stage, opcode)
+
+
+def _ws_attempt_connect(
+    connect: Callable[[], bool], teardown: Callable[..., None], state: _SessionState
+) -> bool:
+    """Run *connect* under a TOTAL guard — a fault costs one attempt, not the worker.
+
+    *connect* already handles the failure types a socket really raises, but it
+    is the one call in the loop below that used to sit outside a ``try``:
+    anything else escaping it killed the session worker outright and silently,
+    so the client stopped reconnecting forever while still reporting a latched
+    ``session-down``.
+    """
+    try:
+        return connect()
+    except Exception:  # noqa: BLE001 - a connect fault costs one attempt, not the worker
+        logger.warning("%s: connect raised", state.stage, exc_info=True)
+        teardown()
+        state.note_connect_failure(REASON_CONNECT_FAILED, "unexpected connect failure")
+        return False
+
+
+def _ws_run_session(
+    *,
+    state: _SessionState,
+    is_connected: Callable[[], bool],
+    connect: Callable[[], bool],
+    pump_once: Callable[[int], int],
+    teardown: Callable[..., None],
+) -> None:
+    """The session worker's whole loop. Owns the SHAPE; the caller owns the steps.
+
+    Three states, in order: wait out the reconnect backoff, connect, pump one
+    session until it ends — leaving only when the client is closing. WHAT each
+    step does is the caller's policy: *connect* is one client's own
+    handshake-and-adopt (including how it names a refusal and how it drops a
+    stale backlog), and *pump_once* is where the two sessions genuinely differ
+    — the ears-only client has an INTENTIONAL teardown for a sample-rate
+    re-negotiation that the duplex session has no analogue for.
+
+    What must NOT differ, and is therefore here: a first attempt is never
+    delayed, a failed attempt costs exactly one backoff step, a successful one
+    resets the count, and the connect is totally guarded
+    (:func:`_ws_attempt_connect`).
+
+    Returning is all it does — the LAST teardown stays with the caller, which
+    owns the socket slot this loop only ever reaches through *teardown*.
+    """
+    attempts = 0
+    while not state.closed:
+        if is_connected():
+            attempts = pump_once(attempts)
+            continue
+        if attempts and not state.wait_backoff(attempts):
+            return
+        attempts = 0 if _ws_attempt_connect(connect, teardown, state) else attempts + 1
+
+
+def _session_created_line(event: dict) -> str:
+    """The journal line for ``session.created`` — what the server says it negotiated."""
+    config = event.get("config") if isinstance(event.get("config"), dict) else {}
+    return (
+        f"session.created rate={config.get('input_sample_rate')} "
+        f"vad={config.get('turn_detection')}"
+    )
+
+
+def _vad_stage_line(kind: str, event: dict) -> str:
+    """The journal line for one SERVER-side VAD boundary (#115's whole point)."""
+    if kind == SPEECH_STARTED:
+        return "speech started (server vad)"
+    return f"speech stopped (server vad) reason={event.get('reason')}"
+
+
+def _server_error(event: dict) -> tuple[str, str]:
+    """One ``error`` event -> ``(named reason, detail)``. The two named codes win."""
+    code = _as_str(event.get("code")) or "unknown"
+    reason = _ERROR_REASONS.get(code, REASON_SERVER_ERROR)
+    return reason, f"code={code} {_as_str(event.get('message')) or ''}".strip()
+
+
+def _utterance_from(event: dict, *, t: float, session_id: str | None) -> Utterance | None:
+    """One ``transcription.completed`` -> an :class:`Utterance`, or ``None`` if empty.
+
+    The lobes gateway spells the transcript ``text``; the OpenAI shape spells it
+    ``transcript``. Both are honoured, in one place, so the two clients cannot
+    end up understanding different halves of the same event.
+    """
+    text = _as_str(event.get("text")) or _as_str(event.get("transcript"))
+    if not text or not text.strip():
+        return None
+    return Utterance(
+        text=text,
+        t=t,
+        item_id=_as_str(event.get("item_id")),
+        session_id=_as_str(event.get("session_id")) or session_id,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # The client                                                                  #
 # --------------------------------------------------------------------------- #
 
 
-class RealtimeTranscriber:
+class RealtimeTranscriber(_SessionObservables):
     """A worker-owned ``/v1/realtime`` session: audio in, endpointed words out.
 
     See the module docstring for the API contract, the threading split, the
@@ -549,8 +1088,6 @@ class RealtimeTranscriber:
         self._connect_timeout_s = max(0.1, float(connect_timeout_s))
         self._frame_timeout_s = max(0.1, float(frame_timeout_s))
         self._poll_interval_s = max(0.001, float(poll_interval_s))
-        self._backoff_initial_s = max(0.0, float(backoff_initial_s))
-        self._backoff_max_s = max(self._backoff_initial_s, float(backoff_max_s))
         self._stable_after_s = max(0.0, float(stable_after_s))
         self._stale_after_s = max(0.0, float(stale_after_s))
         self._join_timeout_s = max(0.0, float(join_timeout_s))
@@ -563,8 +1100,16 @@ class RealtimeTranscriber:
         self.worker: threading.Thread | None = None
         self._start_lock = threading.Lock()
         self._sock_lock = threading.Lock()
-        self._wake = threading.Event()
         self._closed = False
+        #: The session lifecycle: identity, the up/down latch, its counters,
+        #: the wake signal and the reconnect backoff (SHARED).
+        self._state = _SessionState(
+            STAGE,
+            SOURCE,
+            is_closed=lambda: self._closed,
+            backoff_initial_s=backoff_initial_s,
+            backoff_max_s=backoff_max_s,
+        )
 
         # --- worker-thread state ------------------------------------------- #
         self._sock: socket.socket | None = None
@@ -572,23 +1117,15 @@ class RealtimeTranscriber:
         self._connected_at = 0.0
         self._session_id: str | None = None
         self._reconfigure = False
-        self._session_seq = 0
         self._utterance_seq = 0
 
         # --- cross-thread flags (single writer each; plain reads are atomic) - #
-        self._up = False
-        self._down = True
-        self._down_logged = False
-        self._session_event = "sess0"
         self._queue_full_logged = False
 
         self.submitted = 0
         self.sent = 0
         self.dropped = 0
         self.utterances = 0
-        self.sessions = 0
-        self.connect_failures = 0
-        self.pongs_sent = 0
         self.ignored_events = 0
         #: Size in bytes of the last chunk accepted — proof that a stereo chunk
         #: was channel-SELECTED (N samples) and not interleaved (2N).
@@ -619,7 +1156,7 @@ class RealtimeTranscriber:
                 return
             self._closed = True
             worker = self.worker
-        self._wake.set()
+        self._state.wake()
         # Shut the socket DOWN (not closed) from here: it unblocks a worker
         # parked in recv/sendall without ever releasing the fd number out from
         # under it, so there is no window in which the worker could touch a
@@ -664,7 +1201,7 @@ class RealtimeTranscriber:
             self.dropped += 1
             if not self._queue_full_logged:
                 self._queue_full_logged = True
-                senselog.drop(STAGE, SOURCE, self._session_event, REASON_QUEUE_FULL)
+                self._state.drop(REASON_QUEUE_FULL)
             return False
         self._queue_full_logged = False
         self.submitted += 1
@@ -690,7 +1227,7 @@ class RealtimeTranscriber:
             return
         self._sample_rate = rate
         self._reconfigure = True
-        self._wake.set()
+        self._state.wake()
 
     @property
     def sample_rate(self) -> int:
@@ -702,37 +1239,28 @@ class RealtimeTranscriber:
         """The full ws(s) URL this client connects to, sample rate included."""
         return connect_url(self.url, self._sample_rate)
 
-    @property
-    def connected(self) -> bool:
-        """Whether a session is established right now."""
-        return self._up
-
-    @property
-    def session_down(self) -> bool:
-        """Whether the client is in the LATCHED down state (no session)."""
-        return self._down
-
     # ------------------------------------------------------------------ #
     # Worker thread                                                      #
     # ------------------------------------------------------------------ #
 
     def _run(self) -> None:
         """Own the socket for the life of the client. Never lets an error out."""
-        attempts = 0
-        while not self._closed:
-            if self._sock is None:
-                if attempts and not self._sleep(self._backoff_for(attempts)):
-                    break
-                attempts = 0 if self._attempt_connect() else attempts + 1
-                continue
-            attempts = self._pump_once(attempts)
+        _ws_run_session(
+            state=self._state,
+            is_connected=lambda: self._sock is not None,
+            connect=self._connect,
+            pump_once=self._pump_once,
+            teardown=self._teardown_socket,
+        )
         self._teardown_socket(graceful=True)
 
     def _pump_once(self, attempts: int) -> int:
         """Pump one session until it ends; return the next backoff attempt count.
 
-        Split out of :meth:`_run` so the loop reads as its three states (connect,
-        pump, shut down) rather than carrying the recovery arithmetic inline.
+        This client's half of the shared loop, and where the two sessions
+        genuinely differ: a rate re-negotiation ends the session INTENTIONALLY
+        (see :meth:`_after_session_lost`), which the duplex session has no
+        analogue for.
         """
         try:
             self._pump()
@@ -741,7 +1269,7 @@ class RealtimeTranscriber:
         except Exception:  # noqa: BLE001 - the worker must outlive any fault
             logger.warning("realtime: session pump raised", exc_info=True)
             self._teardown_socket()
-            self._enter_down(REASON_STREAM_CLOSED, "unexpected pump failure")
+            self._state.mark_down(REASON_STREAM_CLOSED, "unexpected pump failure")
             return attempts + 1
         return attempts
 
@@ -758,130 +1286,38 @@ class RealtimeTranscriber:
         self._teardown_socket(graceful=lost.intentional)
         if lost.intentional:
             return 0
-        self._enter_down(lost.reason, lost.detail)
+        self._state.mark_down(lost.reason, lost.detail)
         return 0 if stable else attempts + 1
-
-    def _attempt_connect(self) -> bool:
-        """:meth:`_connect` under a total guard — the worker must outlive any fault.
-
-        :meth:`_connect` handles the failure types a socket really raises
-        (``OSError``/``ValueError``), but it is the ONE call in :meth:`_run` that
-        used to sit outside a ``try``: anything else escaping it killed the
-        session worker outright and silently, so the client stopped reconnecting
-        forever while still reporting a latched ``session-down``. Same posture as
-        the pump's guard below.
-        """
-        try:
-            return self._connect()
-        except Exception:  # noqa: BLE001 - a connect fault costs one attempt, not the worker
-            logger.warning("realtime: connect raised", exc_info=True)
-            self._teardown_socket()
-            self.connect_failures += 1
-            self._enter_down(REASON_CONNECT_FAILED, "unexpected connect failure")
-            return False
-
-    def _backoff_for(self, attempts: int) -> float:
-        delay = self._backoff_initial_s * (2 ** max(0, attempts - 1))
-        return min(self._backoff_max_s, delay)
-
-    def _sleep(self, delay: float) -> bool:
-        """Interruptible wait. Returns ``False`` when the client is closing."""
-        self._wake.wait(delay)
-        if self._closed:
-            return False
-        self._wake.clear()
-        return True
 
     # --- connect ------------------------------------------------------- #
 
     def _connect(self) -> bool:
-        """One connect + handshake attempt. Returns success; never raises."""
-        event = self._next_session_event()
+        """One connect + handshake attempt. Returns success; never raises.
+
+        The wire half is :func:`_ws_connect` (SHARED). What stays here is this
+        client's own: an unusable answer is a GENERIC refusal — the duplex
+        session diagnoses a 404 further, this one has no lane to diagnose — and
+        a fresh session drops the standing audio backlog by AGE.
+        """
+        event = self._state.next_event()
         url = self.connect_url
-        parts = urlsplit(url)
-        host = parts.hostname or "localhost"
-        port = parts.port or (443 if parts.scheme == "wss" else 80)
-        path = parts.path or wire.REALTIME_PATH
-        if parts.query:
-            path = f"{path}?{parts.query}"
-        key = wire.make_sec_websocket_key()
-        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-
-        sock: socket.socket | None = None
-        try:
-            sock = socket.create_connection((host, port), timeout=self._connect_timeout_s)
-            if parts.scheme == "wss":
-                context = ssl.create_default_context()
-                sock = context.wrap_socket(sock, server_hostname=host)
-            sock.settimeout(_SOCKET_TIMEOUT_S)
-            sock.sendall(wire.build_handshake_request(parts.netloc, path, key, headers))
-            reader = _FrameReader(sock, self._frame_timeout_s)
-            head = reader.read_until(b"\r\n\r\n", time.monotonic() + self._connect_timeout_s)
-        except (OSError, ValueError) as err:
-            self._close_socket(sock)
-            return self._note_connect_failure(REASON_CONNECT_FAILED, f"{type(err).__name__}: {err}")
-        if head is None:
-            self._close_socket(sock)
-            return self._note_connect_failure(REASON_CONNECT_FAILED, "no handshake response")
-
-        status, response_headers = wire.parse_response_head(head)
-        if status != 101:
-            self._close_socket(sock)
-            return self._note_connect_failure(REASON_HANDSHAKE_REFUSED, f"HTTP {status}")
-        if not wire.verify_accept_key(key, response_headers.get("sec-websocket-accept", "")):
-            self._close_socket(sock)
-            return self._note_connect_failure(REASON_HANDSHAKE_REFUSED, "bad Sec-WebSocket-Accept")
+        handshake = _ws_connect(
+            url,
+            api_key=self._api_key,
+            connect_timeout_s=self._connect_timeout_s,
+            frame_timeout_s=self._frame_timeout_s,
+        )
+        if not handshake.ok:
+            return self._state.note_connect_failure(handshake.reason, handshake.detail)
 
         with self._sock_lock:
-            self._sock = sock
-        self._reader = reader
+            self._sock = handshake.sock
+        self._reader = handshake.reader
         self._connected_at = self._clock()
         self._reconfigure = False
         self._discard_stale_audio()
-        self._mark_up(event, url)
+        self._state.mark_up(event, url)
         return True
-
-    def _note_connect_failure(self, reason: str, detail: str) -> bool:
-        self.connect_failures += 1
-        self._enter_down(reason, detail)
-        return False
-
-    def _mark_up(self, event: str, url: str) -> None:
-        recovered = self._down_logged
-        self._up = True
-        self._down = False
-        self._down_logged = False
-        self._session_event = event
-        self.sessions += 1
-        senselog.stage(
-            STAGE,
-            SOURCE,
-            event,
-            f"session up url={url}{' (recovered)' if recovered else ''}",
-        )
-
-    def _enter_down(self, reason: str, detail: str = "") -> None:
-        """Latch the down state, logging the cause + the state EXACTLY ONCE.
-
-        Every subsequent failure while already down is silent — a retry loop
-        that logs per attempt (or worse, per audio chunk) is the #99 journal
-        flood this discipline exists to prevent.
-
-        A session torn down by :meth:`close` is silent too. ``close()`` shuts
-        the socket down under the worker on purpose (that is how a parked
-        ``recv`` is unblocked), so the worker's last act is always a read
-        failure — reporting it would put a session-down drop in the journal on
-        every clean shutdown, which is noise, not news.
-        """
-        self._up = False
-        self._down = True
-        if self._closed or self._down_logged:
-            return
-        self._down_logged = True
-        senselog.drop(
-            STAGE, SOURCE, self._session_event, f"{reason} ({detail})" if detail else reason
-        )
-        senselog.drop(STAGE, SOURCE, self._session_event, REASON_SESSION_DOWN)
 
     def _discard_stale_audio(self) -> None:
         """Drop queued chunks older than ``stale_after_s`` before going live."""
@@ -916,60 +1352,18 @@ class RealtimeTranscriber:
                 _stamped, pcm = self._audio.get_nowait()
             except queue.Empty:
                 return
-            self._send(wire.OPCODE_TEXT, wire.build_append_event(pcm).encode("utf-8"))
+            _ws_send(self._sock, wire.OPCODE_TEXT, wire.build_append_event(pcm).encode("utf-8"))
             self.sent += 1
 
-    def _send(self, opcode: int, payload: bytes) -> None:
-        sock = self._sock
-        if sock is None:
-            raise _SessionLost(REASON_STREAM_CLOSED, "socket released")
-        try:
-            sock.sendall(wire.build_frame(opcode, payload, mask=True))
-        except OSError as err:
-            raise _SessionLost(REASON_STREAM_CLOSED, f"send failed: {err}") from err
-
     def _read_frames(self) -> None:
-        reader = self._reader
-        if reader is None:  # pragma: no cover - defensive
-            raise _SessionLost(REASON_STREAM_CLOSED, "reader released")
-        for index in range(_MAX_FRAMES_PER_PUMP):
-            if self._closed or not self._readable(reader, first=index == 0):
-                return
-            try:
-                _fin, opcode, payload = wire.read_frame(reader.recv_exact)
-            except wire.FrameReadError as err:
-                raise _SessionLost(REASON_STREAM_CLOSED, str(err)) from err
-            self._handle_frame(opcode, payload)
-
-    def _readable(self, reader: _FrameReader, *, first: bool) -> bool:
-        if reader.has_pending():
-            return True
-        sock = self._sock
-        if sock is None:
-            raise _SessionLost(REASON_STREAM_CLOSED, "socket released")
-        try:
-            ready, _, _ = select.select([sock], [], [], self._poll_interval_s if first else 0.0)
-        except (OSError, ValueError) as err:
-            raise _SessionLost(REASON_STREAM_CLOSED, f"select failed: {err}") from err
-        return bool(ready)
-
-    def _handle_frame(self, opcode: int, payload: bytes) -> None:
-        if opcode == wire.OPCODE_TEXT:
-            event = wire.decode_event(payload)
-            if event is None:
-                self._drop(REASON_MALFORMED_EVENT, f"{len(payload)} bytes")
-                return
-            self._dispatch_event(event)
-        elif opcode == wire.OPCODE_PING:
-            # uvicorn pings roughly every 20 s and disconnects without a pong.
-            self._send(wire.OPCODE_PONG, payload)
-            self.pongs_sent += 1
-        elif opcode == wire.OPCODE_PONG:
-            logger.debug("realtime: pong received")
-        elif opcode == wire.OPCODE_CLOSE:
-            raise _SessionLost(REASON_STREAM_CLOSED, "server closed the session")
-        else:
-            logger.debug("realtime: ignoring unexpected opcode 0x%x", opcode)
+        _ws_pump_frames(
+            socket_of=lambda: self._sock,
+            reader=self._reader,
+            poll_interval_s=self._poll_interval_s,
+            is_closed=lambda: self._closed,
+            on_event=self._dispatch_event,
+            state=self._state,
+        )
 
     def _dispatch_event(self, event: dict) -> None:
         """Branch on one decoded event. Ears-only: ``response.*`` is ignored."""
@@ -978,27 +1372,12 @@ class RealtimeTranscriber:
             self._publish(event)
         elif kind == SESSION_CREATED:
             self._session_id = _as_str(event.get("session_id"))
-            config = event.get("config") if isinstance(event.get("config"), dict) else {}
-            senselog.stage(
-                STAGE,
-                SOURCE,
-                self._session_event,
-                f"session.created rate={config.get('input_sample_rate')} "
-                f"vad={config.get('turn_detection')}",
-            )
-        elif kind == SPEECH_STARTED:
-            senselog.stage(STAGE, SOURCE, self._session_event, "speech started (server vad)")
-        elif kind == SPEECH_STOPPED:
-            senselog.stage(
-                STAGE,
-                SOURCE,
-                self._session_event,
-                f"speech stopped (server vad) reason={event.get('reason')}",
-            )
+            self._state.note(_session_created_line(event))
+        elif kind in (SPEECH_STARTED, SPEECH_STOPPED):
+            self._state.note(_vad_stage_line(kind, event))
         elif kind == ERROR_EVENT:
-            code = _as_str(event.get("code")) or "unknown"
-            reason = _ERROR_REASONS.get(code, REASON_SERVER_ERROR)
-            self._drop(reason, f"code={code} {_as_str(event.get('message')) or ''}".strip())
+            reason, detail = _server_error(event)
+            self._state.drop(reason, detail)
         elif isinstance(kind, str) and kind.startswith("response."):
             # Ears-only: nothing here ever asked for a response.
             self.ignored_events += 1
@@ -1008,24 +1387,20 @@ class RealtimeTranscriber:
             logger.debug("realtime: unhandled event type %r", kind)
 
     def _publish(self, event: dict) -> None:
-        text = _as_str(event.get("text")) or _as_str(event.get("transcript"))
-        if not text or not text.strip():
-            self._drop(REASON_EMPTY_TRANSCRIPT, "transcription.completed with no text")
+        utterance = _utterance_from(event, t=self._clock(), session_id=self._session_id)
+        if utterance is None:
+            self._state.drop(REASON_EMPTY_TRANSCRIPT, "transcription.completed with no text")
             return
         self._utterance_seq += 1
         tag = f"utt{self._utterance_seq}"
-        utterance = Utterance(
-            text=text,
-            t=self._clock(),
-            item_id=_as_str(event.get("item_id")),
-            session_id=_as_str(event.get("session_id")) or self._session_id,
-        )
         try:
             self._ready.put_nowait(utterance)
         except queue.Full:
             # A stale transcript is worth less than a fresh one: evict the
-            # oldest rather than refusing the newest.
-            self._drop(REASON_UTTERANCE_QUEUE_FULL, "oldest transcript evicted")
+            # oldest rather than refusing the newest. Reported EVERY time, not
+            # latched: this queue is drained by the tick, so a full one means
+            # the caller stalled — which is news each time it happens.
+            self._state.drop(REASON_UTTERANCE_QUEUE_FULL, "oldest transcript evicted")
             try:
                 self._ready.get_nowait()
                 self._ready.put_nowait(utterance)
@@ -1033,7 +1408,7 @@ class RealtimeTranscriber:
                 logger.debug("realtime: could not enqueue utterance %s", tag)
                 return
         self.utterances += 1
-        senselog.stage(STAGE, SOURCE, tag, f"utterance chars={len(text)}")
+        self._state.note(f"utterance chars={len(utterance.text)}", event=tag)
         if self._on_utterance is not None:
             try:
                 self._on_utterance(utterance)
@@ -1048,40 +1423,8 @@ class RealtimeTranscriber:
             sock = self._sock
             self._sock = None
         self._reader = None
-        self._up = False
-        if sock is None:
-            return
-        if graceful:
-            try:
-                sock.sendall(wire.build_frame(wire.OPCODE_CLOSE, b"\x03\xe8", mask=True))
-            except OSError:
-                pass
-        self._close_socket(sock)
-
-    @staticmethod
-    def _close_socket(sock: socket.socket | None) -> None:
-        if sock is None:
-            return
-        try:
-            sock.close()
-        except OSError:  # pragma: no cover - defensive
-            pass
-
-    # --- small helpers -------------------------------------------------- #
-
-    def _next_session_event(self) -> str:
-        self._session_seq += 1
-        return f"sess{self._session_seq}"
-
-    def _drop(self, reason: str, detail: str = "") -> None:
-        senselog.drop(
-            STAGE, SOURCE, self._session_event, f"{reason} ({detail})" if detail else reason
-        )
-
-
-def _as_str(value: Any) -> str | None:
-    """Return *value* when it is a non-empty string, else ``None``."""
-    return value if isinstance(value, str) and value else None
+        self._state.mark_released()
+        _ws_release(sock, graceful=graceful)
 
 
 def build(**kwargs: Any) -> RealtimeTranscriber:

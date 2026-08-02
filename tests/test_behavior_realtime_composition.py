@@ -45,13 +45,14 @@ import pytest
 
 from reachy.behavior.engine import EngineConfig
 from reachy.cli._commands import behavior as behavior_mod
+from tests.conftest import WAIT_BUDGET_S
 from tests.fake_realtime_server import FakeRealtimeServer, Scenario
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _BEHAVIOR_MODULE = _REPO_ROOT / "reachy" / "cli" / "_commands" / "behavior.py"
 
 #: How long a bounded wait may spend on a background thread before failing.
-_TIMEOUT = 5.0
+_TIMEOUT = WAIT_BUDGET_S
 
 
 # --------------------------------------------------------------------------- #
@@ -188,7 +189,7 @@ def _compose(monkeypatch, *, media: _FakeMedia, session_factory=None):
     return behavior_mod._compose_run_seam(_QuietTransport(), config, None, None)
 
 
-@pytest.fixture()
+@pytest.fixture
 def _state_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
     monkeypatch.delenv("REACHY_BASE_URL", raising=False)
@@ -417,7 +418,8 @@ def test_an_unknown_mic_rate_is_announced_on_both_channels(caplog) -> None:
     text = caplog.text
     assert "mic sample rate unknown" in text
     assert "mic-rate-unknown" in text
-    assert "stage=warmup" in text and "source=realtime" in text
+    assert "stage=warmup" in text
+    assert "source=realtime" in text
 
 
 def test_a_known_mic_rate_is_carried_into_the_constructed_session(_state_dir, monkeypatch) -> None:

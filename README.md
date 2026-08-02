@@ -27,8 +27,10 @@ voice (`say`), bench-check a head pat (`pat`), and park itself when left alone
 (`sleep`). The **symbolic runtime** (`behavior engine run`) is where the senses
 come together: one deterministic 50 Hz presence that hears words, feels pats,
 leans its antennas toward sound and answers out loud, and that an AI agent
-attaches to (`agent attach`) rather than replaces. `service` makes one presence
-mode survive a reboot.
+attaches to (`agent attach`) rather than replaces. The **embodiment layer**
+(`agent embody`) is the optional other half — ears, a voice and a
+cue-triggered mind running *beside* that runtime, switched on and off like a
+peripheral. `service` makes one presence mode survive a reboot.
 
 ## Noun map
 
@@ -48,7 +50,8 @@ The complete robot surface. Every noun supports `--json`; run
 | `pat` | Bench check: feel a head pat and lean into it (no touch sensor) | `sdk` only |
 | `sleep` | Park the robot: decay to sleep when idle; wake on sound / wake-word / pat | `sdk` default |
 | [`service`](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot) | Boot-persist exactly one presence mode (`demo` or `runtime`) via systemd `--user` | none (manages systemd) |
-| [`agent`](docs/operating-reachy.md#agent--attach-over-the-runtime-feed-and-the-intent-spool) | Attach an external AI agent to the running runtime over its feed + intent spool | none (feeds + spool) |
+| [`agent attach`](docs/operating-reachy.md#agent--attach-over-the-runtime-feed-and-the-intent-spool) | Attach an external AI agent to the running runtime over its feed + intent spool (voice and pose tools publish-only) | none (feeds + spool) |
+| [`agent embody`](docs/operating-reachy.md#the-embodiment-layer--agent-embody) | The embodiment layer: ears + a real voice on one realtime duplex session, a streaming mind, and a closed five-tool action set — running beside the runtime | none (tee socket, feeds, spools, daemon `http`) |
 | `whoami` `quickstart` `learn` `explain` `overview` `doctor` `cli` | Agent-first introspection — no robot needed | — |
 
 > ⚠️ **Before you run two behaviors at once, read
@@ -74,6 +77,12 @@ bare install exits `2` with a hint to install `[sdk]` — never a traceback. See
 rationale. `reachy-cli` remains a transitional alias that pulls in
 `reachy-mini-cli`.
 
+Optional extras on top, all lazy-imported (absent → the feature goes quiet after
+one named warning, never a crash): `[vision]` (OpenCV — face recognition, scene
+description, the rolling video clip), `[cpu]` (on-box `openwakeword`), and
+`[bench]` (`sounddevice`, needed **only** for the embodiment layer's bench media
+profile — the deployed robot path uses a unix socket and `urllib`, both stdlib).
+
 ## Operating Reachy live
 
 The full operating guide is **[`docs/operating-reachy.md`](docs/operating-reachy.md)**:
@@ -83,6 +92,7 @@ The full operating guide is **[`docs/operating-reachy.md`](docs/operating-reachy
 - [Transports — `sdk` vs `http`](docs/operating-reachy.md#transports--sdk-vs-http)
 - [Boot persistence](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot) — make one presence (`demo`/`runtime`) survive a reboot via `service`
 - [The symbolic runtime](docs/operating-reachy.md#the-symbolic-runtime) — a deterministic, model-free presence (`behavior` + `rules.toml`) an AI agent can attach to (`reachy-mini-cli agent attach`) instead of replace
+- [The embodiment layer](docs/operating-reachy.md#the-embodiment-layer--agent-embody) — the optional conversational mind (`reachy-mini-cli agent embody`) that runs beside it
 - [Verify it's working](docs/operating-reachy.md#verify-its-working)
 - [The `~/.asoundrc` mic-array gotcha](docs/operating-reachy.md#the-asoundrc-mic-array-gotcha) — the most common silent failure
 - [Environment variables](docs/operating-reachy.md#environment-variables) — every `REACHY_*` var in one table
@@ -189,6 +199,47 @@ A true machine-reboot check is manual: a `systemctl --user` service starts at
 boot only when the user has **linger** enabled (`loginctl enable-linger $USER`).
 See [Boot persistence](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot).
 
+### The embodiment layer — a conversational mind you can switch on
+
+The runtime above is symbolic and **mute in conversation**: `agent attach` is
+turn-based, has no transcript cue, and composes its voice tools publish-only, so
+nothing in that process ever makes a sound. `reachy-mini-cli agent embody` is
+the optional other half. It runs as a **separate process beside** the runtime
+and gives the robot ears (one lobes `/v1/realtime` duplex session with
+server-side VAD, ungated — it hears every voice in the room), a real voice, and
+a cue-triggered mind that reacts **in voice** when the robot's own rules fire.
+It operates the robot only through a closed five-tool set — `goto`,
+`run_behavior`, `speak`, `harmonics`, `create_rule` — each wrapping a validator
+that already exists and already refuses fail-closed. There is no shell.
+
+```bash
+reachy-mini-cli behavior engine run --export - > /tmp/runtime.feed &   # the runtime
+reachy-mini-cli agent embody --feed /tmp/runtime.feed --export -       # the layer
+reachy-mini-cli agent embody start   # …or as a tracked background process
+reachy-mini-cli agent embody stop
+```
+
+**It is genuinely a peripheral**, and that was checked rather than asserted: the
+whole arc's footprint inside `reachy/behavior/` is 3 files, 6 diff hunks, 1486
+inserted lines and **0 deleted lines** — only two additive export legs (an audio
+tee and a rolling-clip rider), each measured at **zero** tick overruns on the
+deployed robot even with a wedged consumer. Stop the layer and the robot is
+exactly the symbolic presence above. Swapping the mind is configuration too:
+models are chosen per request from `REACHY_EMBODY_WORKER_MODEL` /
+`REACHY_EMBODY_SENSES_MODEL`.
+
+One thing deliberately survives a stop: rules the layer authored (always
+`embody-` prefixed) **persist** in the overlay and keep running — the robot
+keeps what it was taught — and stay enumerable and removable by that prefix.
+
+Honest status: on real hardware the layer heard, thought, spoke aloud and moved
+the robot (a rule fire became a spoken reaction; `run_behavior` and `goto` were
+admitted by the live engine). It has **not** yet held a sustained two-way
+conversation — the test box has one audio output, which blocked the
+browser-harness acceptance run — and `harmonics`, `create_rule` and the
+clip→worker-model leg are not yet exercised live. See [What is proven live — and
+what is not](docs/operating-reachy.md#what-is-proven-live--and-what-is-not).
+
 ## Export feed
 
 `agent attach --export -` streams a live newline-delimited JSON (NDJSON)
@@ -196,7 +247,10 @@ feed of what the attached **agent** is thinking, proposing to say, and
 proposing to express — one object per line. `agent attach` composes its speech
 and pose tools **publish-only**, so a `message` block is what the agent
 *proposed* saying, not proof of sound; audible speech comes from a rule's `say`
-in the runtime and carries no block of its own. `behavior engine run --export -`
+in the runtime and carries no block of its own. `agent embody --export -`
+publishes the same three block types from the embodiment layer, where the voice
+tools are **real** — there a `message` is an utterance dispatched to a live
+speaker, or one already spoken. `behavior engine run --export -`
 streams the complementary *runtime* feed (`sense` / `rule` / `intent` /
 `motion`). The renderer stays **out of this repo** by design (the export
 decoupling boundary): `reachy-mini-cli` emits a documented contract, a separate

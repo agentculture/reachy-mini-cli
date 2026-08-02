@@ -25,13 +25,50 @@ must never leak into the other 1000+ tests in the suite.
 from __future__ import annotations
 
 import socket
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any
 
 import pytest
 
+#: Every spelling of "this machine" a URL can use — the actuator ban below must
+#: not be sidestepped by writing 127.0.0.1 where localhost was meant.
+_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})  # nosec B104
+
 #: Loopback + a port nothing listens on: connect-refused is immediate and local
 #: (no DNS, no external dependency, no flakiness) even before our guard fires.
 _UNREACHABLE = "http://127.0.0.1:1"
+
+#: The shared budget for "wait until a background thread does the thing".
+#:
+#: Every concurrency test in this suite — the tee, the realtime client and its
+#: composition seams, the transcript driver — waits on some worker thread that
+#: does its job within a few milliseconds on an idle box. This number is NOT a
+#: behavioural expectation about that latency; it only decides how much
+#: scheduler starvation is tolerated before the test declares breakage.
+#:
+#: It lives here, cited by every module in that family, because five private
+#: copies is exactly how the value drifts. Each of those modules independently
+#: chose 5.0 s, and the clearest case for raising it is
+#: tests/test_realtime_client.py, where a test's own 5.0 s reconnect backoff
+#: EQUALLED its 5.0 s waiter — so a lost connect race and the deadline landed on
+#: the same instant, failing with nothing wrong. A flaky suite costs the merge
+#: gate its meaning, and generosity here costs wall-clock only when something is
+#: actually broken: a healthy run never reaches the deadline, and a broken one
+#: still fails rather than hanging.
+#:
+#: What this number is NOT is a way to make a racy assertion pass. Two flakes
+#: chased during the embodiment-layer build turned out to be genuine
+#: cross-thread ordering bugs in the tests themselves (an assertion on a counter
+#: another thread bumps after the fact; an assertion on bytes the server had not
+#: been given time to receive), and both were fixed by waiting on the thing
+#: rather than by widening a budget. Raise the budget for scheduler starvation;
+#: fix the test for everything else.
+#:
+#: A test that needs a DIFFERENT budget (a deliberate long backoff it must
+#: outlast, say) should derive it from this — not redefine it.
+WAIT_BUDGET_S = 30.0
 
 #: Every external HTTP leg the CLI can reach out over, by env var name — the
 #: canonical LLM/TTS/STT/forge endpoints plus the legacy REACHY_LLM_* alias
@@ -164,6 +201,100 @@ def _no_live_event_broker(monkeypatch: pytest.MonkeyPatch):
     right tool for asserting what got published).
     """
     monkeypatch.setenv("REACHY_MQTT_URL", "127.0.0.1:1")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_voice_out(monkeypatch: pytest.MonkeyPatch):
+    """No test may synthesize speech on, or play sound through, the REAL robot.
+
+    The fourth sibling of the guards above, and it earned its place the same way
+    every one of them did — by the suite actually doing the damage. While
+    building the embodiment layer's composition root, a boundary probe dispatched
+    the ``speak`` tool on the *robot* media profile with the real voice engine
+    resolved. It POSTed to model-gear's TTS and pushed the resulting audio to the
+    daemon's play route: the deployed robot in the next room said it out loud,
+    once, before anyone noticed.
+
+    Two layers, because an env var alone cannot cover this:
+
+    * **Env pins.** TTS reads ``REACHY_TTS_URL`` at call time, so pointing it at
+      the dead loopback covers every caller that respects it. Worth stating
+      plainly: the DEFAULT is ``http://localhost:9000``, a live model-gear
+      container on this box — so "the developer exported nothing" is not the
+      safe state, it is the dangerous one.
+    * **A port ban at the socket's door.** Daemon playback cannot be fixed by an
+      env var: ``play_audio(base_url=DEFAULT_BASE_URL)`` binds that literal
+      ``http://localhost:8000`` as a DEFAULT ARGUMENT at import time, so
+      patching the module constant is already too late.
+
+    The ban is deliberately drawn at **side effects, not at HTTP**. It refuses
+    the two endpoints that act on the physical world — TTS (:9000) makes sound,
+    the daemon (:8000) drives hardware — and lets everything else through. In
+    particular the gateway (:8001) stays reachable, because reading from it is
+    inert and the opt-in live integration tests that hit it are the only thing
+    that has ever caught a served-model drift (issue #132). Banning all HTTP
+    would turn those into permanent skips and quietly delete that signal.
+
+    It refuses with ``URLError`` — an ``OSError`` subclass, exactly what a
+    refused connection raises — so every caller's existing degradation path runs
+    unchanged, including ``_gateway_or_skip``-style probes that skip on a
+    transport failure. A test asserting "a dead speaker is a named drop" still
+    sees a dead speaker; it simply no longer needs a live one to prove it.
+
+    Patching ``urlopen`` (rather than a helper further in) is what keeps the
+    escape hatch working: the several tests that legitimately exercise the http
+    playback leg install their OWN ``urllib.request.urlopen`` fake in the test
+    body, which replaces this wrapper outright and is undone at teardown.
+    """
+    real_urlopen = urllib.request.urlopen
+    banned = {8000, 9000}
+
+    def _guarded_urlopen(req, *args, **kwargs):  # noqa: ANN001 — urlopen's own shape
+        url = getattr(req, "full_url", req)
+        try:
+            parts = urllib.parse.urlsplit(url if isinstance(url, str) else "")
+            port = parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+        except ValueError:  # a malformed URL is not our business to police
+            parts, port = None, None
+        if parts is not None and parts.hostname in _LOOPBACK_NAMES and port in banned:
+            raise urllib.error.URLError(
+                f"tests never reach the robot's actuators (refused {parts.hostname}:{port}) — "
+                "inject a fake or patch urllib.request.urlopen to exercise this leg"
+            )
+        return real_urlopen(req, *args, **kwargs)
+
+    monkeypatch.setenv("REACHY_TTS_URL", _UNREACHABLE)
+    monkeypatch.setenv("REACHY_BASE_URL", _UNREACHABLE)
+    monkeypatch.setattr(urllib.request, "urlopen", _guarded_urlopen)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_audio_tee_socket(monkeypatch: pytest.MonkeyPatch, tmp_path_factory):
+    """No test may bind — or unlink — the REAL runtime's audio-tee socket.
+
+    The fourth sibling of the three guards above, filed before it could do the
+    damage they each did. ``behavior engine run`` composes
+    :class:`~reachy.behavior.audio_tee.AudioTee` unconditionally, and its path
+    defaults to ``state_dir()/audio_tee.sock`` — which on this box is the socket
+    the DEPLOYED runtime is serving to its embodiment layer. A composition test
+    that does not set ``REACHY_STATE_DIR`` would bind there, and a tee that owns
+    the path removes it on ``close()``: the suite would quietly cut a live
+    consumer's only way back in.
+
+    (The tee already refuses a path a live listener answers on — that guard is
+    real and tested — but it degrades QUIETLY, which is exactly why it must not
+    be the only thing standing between the suite and the robot.)
+
+    So every test gets the socket pointed at its xdist worker's own temp dir
+    (``tmp_path_factory`` is per-worker, so parallel workers never collide).
+    Tests that care about the path re-set this same variable with their own
+    function-scoped ``monkeypatch``, which wins and is undone at teardown.
+    """
+    from reachy.behavior.audio_tee import SOCKET_ENV
+
+    monkeypatch.setenv(SOCKET_ENV, str(tmp_path_factory.getbasetemp() / "audio_tee.sock"))
     yield
 
 

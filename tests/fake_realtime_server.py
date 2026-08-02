@@ -54,6 +54,49 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   ``speech_started`` -> ``speech_stopped``, then a named ``error`` event with
   ``code="stt_forward_failed"`` (mirroring the real point in the flow where a
   committed turn's forward to STT can fail), then closes gracefully.
+- ``RESPONSE_HAPPY_PATH`` (embodiment-layer plan, task t3) — emits
+  ``session.created``, then WAITS (bounded by ``wait_timeout``, proceeding
+  regardless once it elapses — same "make the wait observable, not fail the
+  connection" posture as ``PING_EXPECT_PONG``) for the client's
+  ``response.create`` arming frame, then emits ``response.created`` ->
+  ``response.text.done`` -> one ``response.audio.delta`` per
+  ``response_chunk_bytes``-sized slice of ``response_audio`` (multiple
+  chunks by default, so a test can prove the reassembled audio is
+  CONTIGUOUS) -> ``response.done``, then a graceful close.
+- ``RESPONSE_INTERRUPTED`` — the same arm-and-wait as ``RESPONSE_HAPPY_PATH``,
+  then ``response.created`` -> ``response.text.done`` -> exactly ONE
+  (partial) ``response.audio.delta`` -> ``response.interrupted``
+  (``truncated=True``) instead of ``response.done`` — models a barge-in
+  cutting a reply short.
+- ``RESPONSE_AUDIO_DELTA_MALFORMED`` — the same arm-and-wait, then
+  ``response.created`` -> ``response.text.done`` -> ONE
+  ``response.audio.delta`` whose ``"delta"`` field is deliberately not valid
+  base64 (a well-formed JSON envelope, exactly like ``MALFORMED_JSON`` is a
+  well-formed frame but not valid JSON — the malformedness lives one level
+  deeper, in the field content, mirroring how ``malformed_append_count``
+  above already covers the inbound direction), then a graceful close.
+- ``DUPLEX_HAPPY_PATH`` (embodiment-layer plan, task t9) — the FULL duplex
+  sequence on ONE socket, which is what the layer's own client
+  (``reachy/speech/realtime_duplex.py``) has to prove: ``session.created`` ->
+  ``speech_started`` -> ``speech_stopped`` -> ``transcription.completed``
+  (the EARS half, byte-identical to ``HAPPY_PATH``) and then the
+  ``RESPONSE_HAPPY_PATH`` body (the MOUTH half: arm-and-wait ->
+  ``response.created`` -> ``response.text.done`` -> N
+  ``response.audio.delta`` -> ``response.done``), then a graceful close.
+  This mirrors the ordering observed against the real deployed gateway in
+  ``docs/evidence/2026-08-01-probe-concurrent-realtime-sessions.md``
+  (``transcription.completed`` at t=30.228, ``response.created`` 10 ms later
+  on the same session). It exists because neither half alone can show that
+  words IN and audio OUT share one socket.
+- ``ROLE_INFEASIBLE`` (embodiment-layer plan, task t9) — refuses the
+  handshake with **404**, the gateway's answer when its ``stt`` lane is
+  declared infeasible (``lobes-cli``'s ``site/src/scripts/
+  realtime-connection.ts`` warns *"stt lane declared off — /v1/realtime will
+  404 role_infeasible"* after reading ``GET /v1/capabilities``' ``stt.feasible``).
+  Deliberately its own scenario rather than a flavour of ``UNAUTHORIZED``:
+  404 here is a CONFIGURATION verdict an operator must act on, not the
+  transient outage a generic refusal implies, and a client is expected to
+  name it separately while still reconnecting.
 
 Two failure modes are deliberately NOT separate ``Scenario`` members, because
 they are properties of the REQUEST, not a server mood the harness picks:
@@ -65,6 +108,9 @@ they are properties of the REQUEST, not a server mood the harness picks:
   required). Drive it by opening a raw socket and sending a plain
   ``GET /v1/realtime HTTP/1.1`` with no ``Upgrade``/``Connection`` headers —
   no scenario selection needed.
+  (``ROLE_INFEASIBLE`` above is the one status a *scenario* selects, because
+  unlike 426 it is a property of the server's configuration, not of the
+  request.)
 - **HTTP 401 for a specific expected token** is ``require_bearer_token=...``
   (a constructor argument, checked before every scenario dispatch including
   ``UNAUTHORIZED``, which short-circuits it): connect with a missing or wrong
@@ -74,10 +120,11 @@ they are properties of the REQUEST, not a server mood the harness picks:
   the real gateway's documented default (``GATEWAY_API_KEY`` unset -> the
   ``Authorization`` header is never even read).
 
-Both refusal bodies are hand-mirrored from the real gateway
+All three refusal bodies are hand-mirrored from the real gateway
 (``lobes.gateway.server``): 401 is the OpenAI-shaped
 ``{"error": {"message": ..., "code": "invalid_api_key"}}`` with a
-``WWW-Authenticate: Bearer`` header; 426 names the fix in its message text.
+``WWW-Authenticate: Bearer`` header; 426 names the fix in its message text;
+404 carries ``code="role_infeasible"`` and names the ``stt`` lane.
 
 Event shapes — confirmed vs. genuinely guessed
 ------------------------------------------------
@@ -101,6 +148,18 @@ event carries ``type``/``session_id``/``event_id``/``timestamp_ms`` plus:
 - ``conversation.item.input_audio_transcription.completed``: ``item_id``,
   ``text``.
 - ``error``: ``code``, ``message``, ``item_id`` (``None`` unless tied to one).
+- ``response.created``: ``response_id``, ``item_id`` (``None`` unless the
+  reply answers one specific transcribed turn).
+- ``response.text.done``: ``response_id``, ``text`` (the full reply, whole —
+  the donor's generate call is not streamed onto this wire).
+- ``response.audio.delta``: ``response_id``, ``delta`` (one already
+  base64-encoded PCM16 chunk — mirrors ``Session.emit_audio_delta``'s simpler
+  session-schema shape, NOT ``_wire.py``'s richer standalone
+  ``serialize_audio_delta`` shape, which that module's own docstring says the
+  live route does not actually send).
+- ``response.done``: ``response_id`` only.
+- ``response.interrupted``: ``response_id``, ``truncated`` (always ``True``
+  here — a barge-in is the only trigger this harness models).
 
 **What is genuinely made up, not mirrored, and why it's safe:** the *numeric*
 ``at_ms`` values and the *default* ``reason="silence"`` are placeholders —
@@ -138,10 +197,16 @@ Observability (thread-safe reads, populated by the reader thread)
   whose ``audio`` field failed to base64-decode (or was missing/non-string).
 - ``pong_count`` / ``wait_for_pong(timeout)`` — how many PONG frames arrived,
   and a blocking wait for the next one.
+- ``response_create_count`` / ``wait_for_response_create(timeout)`` — how many
+  well-formed ``response.create`` frames arrived, and a blocking wait for the
+  next one (embodiment-layer plan, task t3) — the arm-and-wait scenarios above
+  poll this the same way ``CLOSE_MID_STREAM`` polls ``received_frames``.
 - ``ping_sent_count``, ``connections_accepted``, ``handshake_headers``
   (lowercased dict from the most recently accepted handshake), ``request_path``,
   ``sent_events`` (every event this server sent, for debugging), ``refusals``
-  (``list[tuple[int, str]]`` of ``(status, reason)`` for each non-101 response).
+  (``list[tuple[int, str]]`` of ``(status, reason)`` for each non-101 response),
+  ``last_response_id`` (the most recently generated ``resp_...`` id, mirroring
+  ``last_session_id``/``last_item_id``).
 """
 
 from __future__ import annotations
@@ -160,6 +225,15 @@ from reachy.speech import realtime_wire as wire
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_TRANSCRIPT = "The quick brown fox jumps over the lazy dog."
+#: The scripted spoken reply's text (embodiment-layer plan, task t3).
+DEFAULT_RESPONSE_TEXT = "This is a scripted spoken reply."
+#: The scripted reply's PCM16 bytes — every byte value once, so a truncated or
+#: reordered reassembly is easy to catch by eye as well as by assertion.
+DEFAULT_RESPONSE_AUDIO = bytes(range(24))
+#: Splits DEFAULT_RESPONSE_AUDIO into 3 deltas by default — plural on purpose,
+#: so "the reassembled audio is contiguous" is an assertion about ORDER, not
+#: just about there being exactly one chunk.
+DEFAULT_RESPONSE_CHUNK_BYTES = 8
 
 _DEFAULT_ACCEPT_TIMEOUT = 5.0
 _DEFAULT_IO_TIMEOUT = 0.2
@@ -178,6 +252,11 @@ class Scenario(str, Enum):
     MALFORMED_JSON = "malformed_json"
     ERROR_VAD_UNAVAILABLE = "error_vad_unavailable"
     ERROR_STT_FORWARD_FAILED = "error_stt_forward_failed"
+    RESPONSE_HAPPY_PATH = "response_happy_path"
+    RESPONSE_INTERRUPTED = "response_interrupted"
+    RESPONSE_AUDIO_DELTA_MALFORMED = "response_audio_delta_malformed"
+    DUPLEX_HAPPY_PATH = "duplex_happy_path"
+    ROLE_INFEASIBLE = "role_infeasible"
 
 
 def _gen_id(prefix: str) -> str:
@@ -289,6 +368,9 @@ class FakeRealtimeServer:
         *,
         host: str = DEFAULT_HOST,
         transcript: str = DEFAULT_TRANSCRIPT,
+        response_text: str = DEFAULT_RESPONSE_TEXT,
+        response_audio: bytes = DEFAULT_RESPONSE_AUDIO,
+        response_chunk_bytes: int = DEFAULT_RESPONSE_CHUNK_BYTES,
         require_bearer_token: str | None = None,
         close_after_frames: int = 1,
         ping_payload: bytes = b"keepalive",
@@ -300,6 +382,9 @@ class FakeRealtimeServer:
         self._scenario = Scenario(scenario)
         self._host = host
         self._transcript = transcript
+        self._response_text = response_text
+        self._response_audio = response_audio
+        self._response_chunk_bytes = max(1, int(response_chunk_bytes))
         self._require_bearer_token = require_bearer_token
         self._close_after_frames = close_after_frames
         self._ping_payload = ping_payload
@@ -311,6 +396,7 @@ class FakeRealtimeServer:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._pong_event = threading.Event()
+        self._response_create_event = threading.Event()
 
         self._sock: socket.socket | None = None
         self._port = 0
@@ -323,6 +409,7 @@ class FakeRealtimeServer:
         self._malformed_append_count = 0
         self._pong_count = 0
         self._ping_sent_count = 0
+        self._response_create_count = 0
         self._connections_accepted = 0
         self._handshake_headers: dict[str, str] | None = None
         self._request_path: str | None = None
@@ -330,6 +417,7 @@ class FakeRealtimeServer:
         self._refusals: list[tuple[int, str]] = []
         self._last_session_id: str | None = None
         self._last_item_id: str | None = None
+        self._last_response_id: str | None = None
         self._last_input_sample_rate: int | None = None
 
     # --- lifecycle ----------------------------------------------------------
@@ -423,6 +511,11 @@ class FakeRealtimeServer:
             return self._pong_count
 
     @property
+    def response_create_count(self) -> int:
+        with self._lock:
+            return self._response_create_count
+
+    @property
     def ping_sent_count(self) -> int:
         with self._lock:
             return self._ping_sent_count
@@ -463,6 +556,11 @@ class FakeRealtimeServer:
             return self._last_item_id
 
     @property
+    def last_response_id(self) -> str | None:
+        with self._lock:
+            return self._last_response_id
+
+    @property
     def last_input_sample_rate(self) -> int | None:
         with self._lock:
             return self._last_input_sample_rate
@@ -470,6 +568,15 @@ class FakeRealtimeServer:
     def wait_for_pong(self, timeout: float | None = None) -> bool:
         """Block until a PONG has arrived (or *timeout* elapses). Returns whether one has."""
         return self._pong_event.wait(timeout=timeout)
+
+    def wait_for_response_create(self, timeout: float | None = None) -> bool:
+        """Block until a well-formed ``response.create`` frame has arrived.
+
+        Mirrors :meth:`wait_for_pong`. Returns whether one has (or *timeout*
+        elapsed first) — the arm-and-wait ``response_*`` scenarios use the
+        same event internally rather than polling.
+        """
+        return self._response_create_event.wait(timeout=timeout)
 
     # --- accept loop --------------------------------------------------------------
 
@@ -525,6 +632,10 @@ class FakeRealtimeServer:
 
         if self._scenario is Scenario.UNAUTHORIZED:
             self._refuse(conn, send_lock, 401, "unauthorized")
+            return
+
+        if self._scenario is Scenario.ROLE_INFEASIBLE:
+            self._refuse(conn, send_lock, 404, "role_infeasible")
             return
 
         if self._require_bearer_token is not None and not _bearer_matches(
@@ -596,12 +707,14 @@ class FakeRealtimeServer:
     def _refuse(
         self, conn: socket.socket, send_lock: threading.Lock, status: int, reason: str
     ) -> None:
-        """Send an OpenAI-shaped 401, or a plain 426/400, and record the refusal.
+        """Send an OpenAI-shaped 401/404, or a plain 426/400, and record the refusal.
 
         Mirrors ``lobes.gateway.server``'s own refusal shapes: 401 is
         ``{"error": {"message": ..., "code": "invalid_api_key"}}`` plus a
         ``WWW-Authenticate: Bearer`` header; 426 says what to do about it
-        rather than pretending the route doesn't exist.
+        rather than pretending the route doesn't exist; 404 carries
+        ``code="role_infeasible"`` and names the lane that is switched off,
+        which is the operator-actionable half of that answer.
         """
         if status == 401:
             body = json.dumps(
@@ -630,6 +743,21 @@ class FakeRealtimeServer:
                 }
             ).encode("utf-8")
             status_text = "Upgrade Required"
+        elif status == 404:
+            body = json.dumps(
+                {
+                    "error": {
+                        "message": (
+                            "the stt role is not feasible on this gateway, so "
+                            "/v1/realtime is not served — check "
+                            "GET /v1/capabilities for stt.feasible"
+                        ),
+                        "type": "role_infeasible",
+                        "code": "role_infeasible",
+                    }
+                }
+            ).encode("utf-8")
+            status_text = "Not Found"
         else:
             body = json.dumps({"error": {"message": reason}}).encode("utf-8")
             status_text = "Bad Request"
@@ -684,8 +812,17 @@ class FakeRealtimeServer:
 
     def _record_text_frame(self, payload: bytes) -> None:
         event = wire.decode_event(payload)
-        if event is None or event.get("type") != wire.APPEND_EVENT_TYPE:
+        if event is None:
             return
+        event_type = event.get("type")
+        if event_type == wire.APPEND_EVENT_TYPE:
+            self._record_append_event(event)
+        elif event_type == wire.RESPONSE_CREATE_EVENT_TYPE:
+            with self._lock:
+                self._response_create_count += 1
+            self._response_create_event.set()
+
+    def _record_append_event(self, event: dict) -> None:
         audio_field = event.get("audio")
         decoded: bytes | None = None
         if isinstance(audio_field, str):
@@ -817,6 +954,84 @@ class FakeRealtimeServer:
             "item_id": item_id,
         }
 
+    # --- event builders: the response.* family (embodiment-layer plan, task t3) ----
+    # Mirrors lobes-cli's Session.begin_response / complete_response_text /
+    # emit_audio_delta / complete_response / interrupt_response — the SESSION
+    # SCHEMA shape (_session.py), not the richer standalone shape _wire.py's
+    # own serialize_audio_delta builds, which that module's docstring says the
+    # live route does not actually send.
+
+    def _event_response_created(
+        self, session_id: str, response_id: str, item_id: str | None
+    ) -> dict:
+        return {
+            "type": "response.created",
+            "session_id": session_id,
+            "event_id": _gen_id("event"),
+            "timestamp_ms": _timestamp_ms(),
+            "response_id": response_id,
+            "item_id": item_id,
+        }
+
+    def _event_response_text_done(self, session_id: str, response_id: str, text: str) -> dict:
+        return {
+            "type": "response.text.done",
+            "session_id": session_id,
+            "event_id": _gen_id("event"),
+            "timestamp_ms": _timestamp_ms(),
+            "response_id": response_id,
+            "text": text,
+        }
+
+    def _event_response_audio_delta(self, session_id: str, response_id: str, pcm: bytes) -> dict:
+        return {
+            "type": "response.audio.delta",
+            "session_id": session_id,
+            "event_id": _gen_id("event"),
+            "timestamp_ms": _timestamp_ms(),
+            "response_id": response_id,
+            "delta": base64.b64encode(pcm).decode("ascii"),
+        }
+
+    def _event_response_audio_delta_malformed(self, session_id: str, response_id: str) -> dict:
+        """A well-formed envelope carrying a deliberately non-base64 ``delta``.
+
+        Mirrors ``MALFORMED_JSON`` one level deeper: the JSON itself decodes
+        fine (:func:`~reachy.speech.realtime_wire.decode_event` sees a valid
+        object with a ``type``), but the field CONTENT a caller must
+        base64-decode does not — the outbound-direction counterpart of
+        :attr:`malformed_append_count` above.
+        """
+        return {
+            "type": "response.audio.delta",
+            "session_id": session_id,
+            "event_id": _gen_id("event"),
+            "timestamp_ms": _timestamp_ms(),
+            "response_id": response_id,
+            "delta": "***not valid base64***",
+        }
+
+    def _event_response_done(self, session_id: str, response_id: str) -> dict:
+        return {
+            "type": "response.done",
+            "session_id": session_id,
+            "event_id": _gen_id("event"),
+            "timestamp_ms": _timestamp_ms(),
+            "response_id": response_id,
+        }
+
+    def _event_response_interrupted(
+        self, session_id: str, response_id: str, truncated: bool = True
+    ) -> dict:
+        return {
+            "type": "response.interrupted",
+            "session_id": session_id,
+            "event_id": _gen_id("event"),
+            "timestamp_ms": _timestamp_ms(),
+            "response_id": response_id,
+            "truncated": truncated,
+        }
+
     # --- scenario dispatch ---------------------------------------------------------
 
     def _run_scenario(
@@ -866,7 +1081,12 @@ class FakeRealtimeServer:
             deadline = time.monotonic() + self._wait_timeout
             target = self._close_after_frames
             while time.monotonic() < deadline:
-                if len(self.received_frames) >= target:
+                # ``_stop_event`` is checked so a test may hold a session open
+                # with a LONG ``wait_timeout`` (the "frame target it can never
+                # reach" idiom) without that timeout becoming teardown latency:
+                # :meth:`stop` sets it, and this loop leaves at once instead of
+                # sleeping out its deadline while ``stop`` waits on the join.
+                if len(self.received_frames) >= target or self._stop_event.is_set():
                     break
                 time.sleep(0.02)
             self._abrupt_close(conn)
@@ -888,8 +1108,115 @@ class FakeRealtimeServer:
             self._graceful_close(conn, send_lock)
             return
 
+        if scenario in (
+            Scenario.RESPONSE_HAPPY_PATH,
+            Scenario.RESPONSE_INTERRUPTED,
+            Scenario.RESPONSE_AUDIO_DELTA_MALFORMED,
+        ):
+            self._run_response_scenario(conn, send_lock, session_id, item_id, scenario)
+            return
+
+        if scenario is Scenario.DUPLEX_HAPPY_PATH:
+            # Ears first, then the mouth — the ordering the live gateway used
+            # (see the module docstring's citation of the t1 probe evidence).
+            self._send_event(conn, send_lock, self._event_speech_started(session_id, item_id))
+            self._send_event(conn, send_lock, self._event_speech_stopped(session_id, item_id))
+            self._send_event(
+                conn, send_lock, self._event_transcription_completed(session_id, item_id)
+            )
+            self._run_response_scenario(
+                conn, send_lock, session_id, item_id, Scenario.RESPONSE_HAPPY_PATH
+            )
+            return
+
         # Scenario.HAPPY_PATH (and the default fallthrough for any future member).
         self._send_event(conn, send_lock, self._event_speech_started(session_id, item_id))
         self._send_event(conn, send_lock, self._event_speech_stopped(session_id, item_id))
         self._send_event(conn, send_lock, self._event_transcription_completed(session_id, item_id))
+        self._graceful_close(conn, send_lock)
+
+    def _run_response_scenario(
+        self,
+        conn: socket.socket,
+        send_lock: threading.Lock,
+        session_id: str,
+        item_id: str,
+        scenario: Scenario,
+    ) -> None:
+        """The shared arm-and-wait body for every ``response_*`` scenario
+        (embodiment-layer plan, task t3).
+
+        Waits (bounded by ``wait_timeout``) for the client's
+        ``response.create`` frame, then proceeds regardless of whether it
+        arrived — the same "make the wait observable, never fail the
+        connection over it" posture ``PING_EXPECT_PONG`` uses above: a test
+        that forgot to arm still gets a deterministic, bounded scenario rather
+        than a hang.
+
+        The wait POLLS the cumulative counter rather than clearing and waiting
+        on :attr:`_response_create_event`. A client that arms immediately after
+        the handshake (which is what ``reachy/speech/realtime_duplex.py`` does,
+        on ``session.created``) races that clear: the arm can land *before*
+        this method runs, and clearing would then discard the only signal it
+        will ever get — costing a full ``wait_timeout`` of dead time in every
+        such test and, worse, making the delay depend on thread scheduling.
+        Counting is monotonic, so it cannot be missed however early the arm
+        arrives. (``CLOSE_MID_STREAM`` polls ``received_frames`` for the same
+        reason.)
+        """
+        response_id = _gen_id("resp")
+        with self._lock:
+            self._last_response_id = response_id
+        deadline = time.monotonic() + self._wait_timeout
+        while time.monotonic() < deadline and self.response_create_count < 1:
+            if self._stop_event.is_set():
+                break
+            time.sleep(0.01)
+
+        self._send_event(
+            conn, send_lock, self._event_response_created(session_id, response_id, item_id)
+        )
+        self._send_event(
+            conn,
+            send_lock,
+            self._event_response_text_done(session_id, response_id, self._response_text),
+        )
+
+        if scenario is Scenario.RESPONSE_AUDIO_DELTA_MALFORMED:
+            self._send_event(
+                conn,
+                send_lock,
+                self._event_response_audio_delta_malformed(session_id, response_id),
+            )
+            self._graceful_close(conn, send_lock)
+            return
+
+        chunk_bytes = self._response_chunk_bytes
+        chunks = [
+            self._response_audio[start : start + chunk_bytes]
+            for start in range(0, len(self._response_audio), chunk_bytes)
+        ]
+
+        if scenario is Scenario.RESPONSE_INTERRUPTED:
+            # Only the FIRST chunk is delivered before the barge-in cuts the
+            # reply short — the rest stays undelivered, exactly what
+            # truncated=True on the interrupted event means.
+            if chunks:
+                self._send_event(
+                    conn,
+                    send_lock,
+                    self._event_response_audio_delta(session_id, response_id, chunks[0]),
+                )
+            self._send_event(
+                conn, send_lock, self._event_response_interrupted(session_id, response_id)
+            )
+            self._graceful_close(conn, send_lock)
+            return
+
+        # Scenario.RESPONSE_HAPPY_PATH: every chunk, in order, then response.done.
+        for chunk in chunks:
+            self._send_event(
+                conn, send_lock, self._event_response_audio_delta(session_id, response_id, chunk)
+            )
+        self._send_event(conn, send_lock, self._event_response_done(session_id, response_id))
         self._graceful_close(conn, send_lock)

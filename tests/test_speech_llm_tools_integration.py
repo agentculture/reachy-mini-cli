@@ -24,10 +24,13 @@ import pytest
 
 from reachy.speech import llm
 
-# The verified cortex model (tool_use responsibility, parser qwen3_coder). We pin
-# it explicitly so the test asserts tool-calling even when the box env is pinned to
-# the senses (Gemma) role for day-to-day live cognition.
-_CORTEX_MODEL = "sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP"
+# The cortex ROLE (tool_use responsibility, parser qwen3_coder). We name the role
+# rather than a served model id so the test asserts tool-calling even when the box
+# env is pinned to the senses (Gemma) role for day-to-day live cognition — and so a
+# gateway-side model promotion cannot break it. Pinning the id drifted once already:
+# `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` 404ed after lobes promoted cortex to
+# `unsloth/Qwen3.6-27B-NVFP4`. lobes' resolve_model accepts role names by contract.
+_CORTEX_MODEL = "cortex"
 
 _PROBE_TIMEOUT = 3.0
 _CALL_TIMEOUT = 30.0
@@ -131,4 +134,19 @@ def test_integration_stream_turn_tool_calls_lenient():
     call = result.tool_calls[0]
     assert call.name == "apply_pose"
     assert isinstance(call.arguments, dict)
+    # A LIVE model decides how many argument deltas to emit, and it sometimes
+    # emits none at all — observed here as
+    # ``ToolCall(name='apply_pose', arguments={}, arguments_json='{}')``. That is
+    # a finding about the served model, not a regression in delta assembly: the
+    # call itself assembled fine, there was simply nothing to accumulate into it.
+    # This test's own contract is "assert streamed tool_call assembly, else skip
+    # with the finding", so it belongs on the skip side of the line — asserting
+    # it makes an otherwise-honest test fail intermittently on model
+    # non-determinism, which is how a suite stops being trusted.
+    if not call.arguments:
+        pytest.skip(
+            "gateway streamed a tool_call with NO argument deltas "
+            f"(arguments_json={call.arguments_json!r}) — argument accumulation "
+            "unverified this run (plan risk r2)"
+        )
     assert "emoji" in call.arguments

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.0] - 2026-08-02
+
+### Added
+
+- `agent embody` — the embodiment layer: a detachable realtime harness that gives Reachy a voice and a cue-triggered mind running BESIDE the symbolic runtime, never inside it. Ears and mouth on one armed lobes /v1/realtime duplex session; cognition on the streaming chat-completions lane; actions confined to a closed five-tool set (goto, run_behavior, speak, harmonics, create_rule) reaching the robot only through the sanctioned intents spool and rules overlay.
+- `agent embody start|stop|restart|status` — a background supervisor (pid + log under the state dir), one command each way. Rules the layer wrote survive a stop by design.
+- Audio tee (`reachy/behavior/audio_tee.py`) — a THIRD consumer of the runtime's one per-tick mic chunk, fanned to a local unix socket so an external process can hear without opening a second SDK media session it could never win.
+- Clip rider (`reachy/behavior/clip_rider.py`) — a rolling last-X-seconds camera ring encoded to one bounded file, published on the bus as a path reference only.
+- `reachy/speech/realtime_duplex.py` — the duplex peer of the runtime's ears-only realtime client: audio in, server-VAD utterances and response audio out, over one socket.
+- `[bench]` extra (`sounddevice`) for the layer's dev-box media profile. The deployed robot profile needs none of it.
+
+### Changed
+
+- `reachy/speech/llm.py` gains an additive, opt-in streamed-reasoning seam (the gateway sends `delta.reasoning`, not the documented `reasoning_content`). The request payload is byte-identical when unused.
+- `FaceSenseDriver` gains `add_frame_sink()`, so camera frames reach new consumers by push and it remains the only caller of `media.frame()`.
+- Docs: a new operating-guide chapter for the layer, plus CLAUDE.md noun catalog and internals.
+
+### Fixed
+
+- The clip rider wrote nothing on the robot: cv2.VideoWriter picks its container from the filename suffix, so the atomic temp name `clip.mp4.tmp` opened no muxer. Now `clip.tmp.mp4`; found on hardware, invisible to the suite (#137-adjacent).
+- Runtime speech playback was documented as http-default when it has defaulted to sdk-via-held-client since 7ea6878 (closes #131).
+- The test suite could reach the robot's actuators: TTS (:9000) and the daemon (:8000) are now refused suite-wide, after a boundary probe made the deployed robot speak out loud.
+- Four intermittent test failures, three of which were genuine cross-thread ordering bugs in the tests rather than slow machines.
+- A live-model integration test pinned a served model id, so a gateway promotion broke the suite (#132).
+
 ## [0.44.1] - 2026-07-24
 
 ### Fixed

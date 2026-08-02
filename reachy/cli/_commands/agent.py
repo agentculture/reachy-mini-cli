@@ -1,5 +1,13 @@
 """``reachy-mini-cli agent`` — attach an external AI agent over the runtime seams.
 
+Two verbs, two minds, one noun. ``attach`` is the turn-based, text-cue-driven
+client described below. ``embody`` is the **embodiment layer**'s composition
+root (``docs/specs/2026-08-01-embodiment-layer.md``, decision: "the layer lives
+under the agent noun — a new verb beside attach"): a detachable realtime
+harness that hears and speaks out loud over ONE lobes ``/v1/realtime`` duplex
+session while it thinks over the streaming HTTP lane. Its own section lives at
+the bottom of this module; everything down to that point is ``attach``.
+
 This noun is the *external agent client* of the symbolic runtime. It realizes two
 decisions from the ``symbolic-runtime-70`` spec:
 
@@ -67,28 +75,38 @@ perception cue reusing the same vocabulary :mod:`reachy.speech.events` defines:
   own — or a peer's — declared goal taking effect).
 * ``motion`` → ``"started moving: <behavior>"`` / ``"stopped moving: …"`` (a
   low-level ``goto`` is not surfaced, to keep turns focused).
+
+The mapping itself (the per-type functions above, plus the DoA band / loudness
+floor / pat-phrasing constants they use) lives in :mod:`reachy.runtime_cues`,
+shared with the embodiment layer's own cue reader
+(:mod:`reachy.embody.cues`) — SonarCloud flagged the two as duplicated
+blocks on PR #140. See that module's docstring for exactly what is shared and
+what deliberately stays local to each caller (this module's dispatch never
+logs a drop for an unrecognised event; ``reachy.embody.cues`` does).
 """
 
 from __future__ import annotations
 
 import argparse
 import functools
-import json
 import logging
-import math
+import os
 import sys
 import threading
 import uuid
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
-from reachy import senselog
+from reachy import runtime_cues, senselog
+from reachy.cli._commands._robot import emit_payload
 from reachy.cli._commands.overview import emit_overview
 from reachy.cli._errors import EXIT_ENV_ERROR, CliError
 from reachy.cli._export import add_export_args, build_export_hook
+from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
+from reachy.export.events import ThinkingEvent
 
 if TYPE_CHECKING:  # annotations only — never imported at runtime
     from reachy.speech.events import SenseCue
@@ -113,18 +131,6 @@ logger = logging.getLogger(__name__)
 
 _JSON_HELP = "Emit structured JSON."
 
-# Sound-direction band + loudness threshold — mirror reachy.speech.events'
-# DoA convention (0 = left, pi/2 = front, pi = right; ~15° "ahead" band) and its
-# loud-sound floor, so the agent's perception vocabulary matches the folded
-# retired listen --live cognition path exactly.
-_AHEAD_BAND_RAD: float = 0.26
-_LOUD_RMS_THRESHOLD: float = 0.02
-
-# Touch phrasing — keys match the strings reachy.motion.pat.PatDetector emits and
-# reachy.speech.events uses for the folded pat cue.
-_PAT_KIND_PHRASE: dict[str, str] = {"scratch": "scratch", "side_pat": "sideways nudge"}
-_PAT_LEVEL_INTENSITY: dict[str, str] = {"level1": "gentle", "level2": "firm"}
-
 # Inert voice sample rates for the publish-only speak/harmonics tools (a no-op
 # playback ignores them — they only satisfy the VoiceEngine shape).
 _TTS_RATE = 24000
@@ -134,103 +140,23 @@ _HARMONIC_RATE = 16000
 # ---------------------------------------------------------------------------
 # Runtime-event → perception-cue mapping
 # ---------------------------------------------------------------------------
-
-
-def _direction_word(doa: object) -> str | None:
-    """Map a DoA angle (radians) to ``"left"`` / ``"ahead"`` / ``"right"``, or ``None``.
-
-    Convention (``reachy.behavior.sense`` / ``reachy.speech.events``): ``0`` = left,
-    ``pi/2`` = front, ``pi`` = right. A ``None``/unparseable angle yields ``None``.
-    """
-    if doa is None:
-        return None
-    try:
-        angle = float(doa)
-    except (TypeError, ValueError):
-        return None
-    front = math.pi / 2.0
-    if angle < front - _AHEAD_BAND_RAD:
-        return "left"
-    if angle > front + _AHEAD_BAND_RAD:
-        return "right"
-    return "ahead"
-
-
-def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _sense_cues(event: dict) -> list[str]:
-    """Cues for a ``sense`` runtime event (perception snapshot)."""
-    cues: list[str] = []
-    direction = _direction_word(event.get("doa"))
-    rms = event.get("rms")
-    if event.get("speech"):
-        cues.append(f"speech from the {direction}" if direction else "speech nearby")
-    elif _is_number(rms) and rms >= _LOUD_RMS_THRESHOLD:
-        cues.append(f"loud sound {direction}" if direction else "loud sound nearby")
-
-    pat = event.get("pat")
-    if isinstance(pat, (list, tuple)) and len(pat) == 2:
-        phrase = _PAT_KIND_PHRASE.get(pat[0])
-        intensity = _PAT_LEVEL_INTENSITY.get(pat[1])
-        if phrase and intensity:
-            cues.append(f"felt a {intensity} {phrase} on the head")
-
-    face = event.get("face")
-    if isinstance(face, str) and face.strip():
-        cues.append(f"saw {face.strip()}")
-    return cues
-
-
-def _rule_cues(event: dict) -> list[str]:
-    """Cues for a ``rule`` runtime event (a rule fire/suppress decision)."""
-    rule = str(event.get("rule") or "a rule")
-    action = event.get("action")
-    if action == "fire":
-        behavior = event.get("behavior")
-        disable = event.get("disable") or []
-        if behavior:
-            return [f"a behavior rule fired ({rule}): now doing {behavior}"]
-        if disable:
-            joined = ", ".join(str(d) for d in disable)
-            return [f"a behavior rule fired ({rule}): stopping {joined}"]
-        return [f"a behavior rule fired ({rule})"]
-    if action == "suppress":
-        return [f"a behavior rule held off ({rule})"]
-    return []
-
-
-def _intent_cues(event: dict) -> list[str]:
-    """Cues for an ``intent`` runtime event (a standing goal declared/updated/cleared)."""
-    action = event.get("action")
-    name = str(event.get("name") or "").strip()
-    if action == "clear":
-        return ["a standing intent was cleared"]
-    if action in ("declare", "update"):
-        verb = "set" if action == "declare" else "updated"
-        return [
-            f"a standing intent was {verb}: {name}" if name else f"a standing intent was {verb}"
-        ]
-    return []
-
-
-def _motion_cues(event: dict) -> list[str]:
-    """Cues for a ``motion`` runtime event (a behavior admission/eviction)."""
-    action = event.get("action")
-    label = str(event.get("behavior") or "a body behavior")
-    if action == "admit":
-        return [f"started moving: {label}"]
-    if action == "evict":
-        return [f"stopped moving: {label}"]
-    return []  # a low-level goto keyframe is not surfaced as a cognition cue
+#
+# The per-type mapper functions, the DoA band / loudness floor / pat-phrasing
+# constants they use, and the JSONL line parser all live in
+# :mod:`reachy.runtime_cues` — the shared owner cited by both this module's
+# ``_CUE_MAPPERS`` and :mod:`reachy.embody.cues`'s ``CUE_MAPPERS`` (SonarCloud
+# PR #140: the two were duplicated blocks before this extraction). See that
+# module's docstring for exactly what is shared and what is not — in
+# particular, this dispatch stays silent on an unrecognised/malformed event
+# where ``reachy.embody.cues`` logs a named drop; that difference is
+# deliberate and is NOT flattened by sharing the per-type mappers.
 
 
 _CUE_MAPPERS: dict[str, Callable[[dict], list[str]]] = {
-    "sense": _sense_cues,
-    "rule": _rule_cues,
-    "intent": _intent_cues,
-    "motion": _motion_cues,
+    "sense": runtime_cues.sense_cues,
+    "rule": runtime_cues.rule_cues,
+    "intent": runtime_cues.intent_cues,
+    "motion": runtime_cues.motion_cues,
 }
 
 
@@ -249,15 +175,12 @@ def _cues_for_runtime_event(event: object) -> list[str]:
 
 
 def _parse_runtime_line(line: str) -> dict | None:
-    """Parse one JSONL feed line into an event dict, or ``None`` for junk/blank."""
-    stripped = line.strip()
-    if not stripped:
-        return None
-    try:
-        obj = json.loads(stripped)
-    except (TypeError, ValueError):
-        return None
-    return obj if isinstance(obj, dict) else None
+    """Parse one JSONL feed line into an event dict, or ``None`` for junk/blank.
+
+    Delegates to the shared :func:`reachy.runtime_cues.parse_runtime_line` —
+    identical logic to :func:`reachy.embody.cues.parse_runtime_line`.
+    """
+    return runtime_cues.parse_runtime_line(line)
 
 
 def _event_ts(event: dict) -> float:
@@ -699,6 +622,662 @@ def cmd_agent_attach(
     return 0
 
 
+# ===========================================================================
+# embody — the embodiment layer's composition root (task t11)
+# ===========================================================================
+#
+# Everything below composes pieces that already exist and are already tested.
+# The value this section adds is the JOINS, and the arc has already paid once
+# for getting a join wrong quietly: t4 wrote the audio tee's wire with a JSON
+# header and float32 samples while t6 independently read it as headerless
+# int16. Nothing raised — the reader simply heard noise — because no test
+# connected the two ends. So the wirings here are stated, not implied:
+#
+#   media.source.read   -> duplex read_audio      (the layer's EARS)
+#   media.sink.play     -> duplex play            (the layer's MOUTH)
+#   media.sink.play     -> the speak/harmonics tools' render leg
+#   duplex on_utterance -> engine.submit_utterance   (a TRIGGER)
+#   duplex on_response  -> engine.note_spoken        (CONTEXT, never a trigger)
+#   runtime feed line   -> cues_for_line -> engine.submit_cues
+#   engine + every layer failure -> the shared --export cognition feed
+#
+# IMPORT BOUNDARY (h15). Every import of the layer, the realtime client and the
+# speech stack in this section is FUNCTION-LOCAL, for the same reason ``attach``
+# defers ``SenseCue``: ``_build_parser()`` imports every command module, so one
+# module-scope import here would put an LLM client and a WebSocket client on the
+# import path of ``say run``, ``daemon status`` and ``--help``.
+# ``tests/test_agent_embody.py`` pins both the syntactic form and the
+# fresh-interpreter behaviour, and the runtime's own closure is pinned to gain
+# no edge to the layer at all.
+#
+# NO ``reachy_mini`` (h14). Nothing here — or anywhere it can reach at run
+# time — constructs a ``ReachyMini``. The layer hears through the runtime's tee
+# socket and speaks through the daemon's HTTP media route; the single-SDK-owner
+# model gives the SDK itself to the runtime process alone.
+
+#: ``[SENSE stage=embody source=<...> event=<id>]`` — the composition root's own
+#: journal identity, distinct from the engine's ``turn``, the session's
+#: ``duplex`` and the tools' ``action`` so one journal can be split by layer.
+EMBODY_STAGE = "embody"
+
+EMBODY_SOURCE_VOICE = "voice"
+EMBODY_SOURCE_SESSION = "session"
+EMBODY_SOURCE_CUES = "cue-reader"
+EMBODY_SOURCE_SHUTDOWN = "shutdown"
+
+#: A voice engine would not resolve at composition, so that tool refuses for the
+#: life of the process rather than the tool set changing shape per box.
+REASON_VOICE_UNAVAILABLE = "voice-unavailable"
+#: Synthesis or playback raised — a wedged TTS, a dead speaker, a refused
+#: daemon route. The model is told (a named refusal) and the feed shows it.
+REASON_SPEAK_FAILED = "speak-failed"
+#: The duplex session refused to start; the layer is deaf and mute but alive.
+REASON_SESSION_START_FAILED = "session-start-failed"
+#: The runtime line source raised mid-stream (the feed went away, the bus died).
+REASON_CUE_SOURCE_FAILED = "cue-source-failed"
+#: Closing a held resource raised. Named, never propagated — a fault in teardown
+#: must not mask the reason the layer was stopping.
+REASON_SHUTDOWN_FAILED = "shutdown-failed"
+
+#: Every failure this composition root can name, in one place so the journal,
+#: the export feed, the operator docs and the tests share ONE vocabulary — the
+#: same discipline :mod:`reachy.embody.tools` and :mod:`reachy.embody.engine`
+#: each keep for their own layer.
+EMBODY_REASONS: frozenset[str] = frozenset(
+    {
+        REASON_VOICE_UNAVAILABLE,
+        REASON_SPEAK_FAILED,
+        REASON_SESSION_START_FAILED,
+        REASON_CUE_SOURCE_FAILED,
+        REASON_SHUTDOWN_FAILED,
+    }
+)
+
+#: The two voices the layer composes, by :mod:`reachy.speech.voice` engine name.
+_EMBODY_VOICES = ("tts", "harmonic")
+
+EMBODY_READER_THREAD_NAME = "embody-cue-reader"
+
+#: Default gap between turns when nothing is pending (seconds).
+DEFAULT_TURN_INTERVAL = 0.5
+
+#: Seconds ``agent embody stop`` waits after SIGTERM before escalating to
+#: SIGKILL (task t12). Mirrors :data:`reachy.embody.supervisor.
+#: DEFAULT_STOP_TIMEOUT` by VALUE, not by import: a command module registering
+#: this noun's CLI flags must not import :mod:`reachy.embody` at module scope
+#: (``tests/test_agent_embody.py``'s ``test_no_cognition_or_layer_module_is_
+#: imported_at_command_module_scope`` — the package's own ``__init__``
+#: contract), so this constant is independently owned here, exactly like every
+#: sibling supervisor's ``DEFAULT_STOP_TIMEOUT`` (10.0) is already independently
+#: defined three times over (sleep/vision/behavior).
+EMBODY_DEFAULT_STOP_TIMEOUT = 10.0
+
+
+def _embody_drop(export: object, source: str, reason: str, detail: str = "") -> None:
+    """Name one layer failure on the journal AND on the export feed (h22).
+
+    The house rule is "no silent no-op anywhere"; the layer's observability
+    requirement (spec c27) adds "and a conversational robot with an invisible
+    mind is undebuggable". So a failure is reported TWICE, deliberately: once as
+    the grep-able ``[SENSE stage=embody …]`` line every other subsystem emits,
+    and once as a ``thinking`` block on the operator's ``--export`` feed, which
+    is the only surface a remote consumer (the reTerminal panel, a log tail)
+    ever sees.
+
+    ``export`` is optional — a run without ``--export`` still journals — and a
+    broken export consumer is already handled inside
+    :class:`~reachy.export.exporter.JsonlExporter`, which latches itself off
+    rather than raising. This function therefore never raises.
+    """
+    detail = detail.strip()
+    senselog.drop(
+        EMBODY_STAGE,
+        source,
+        uuid.uuid4().hex[:8],
+        f"{reason} ({detail})" if detail else reason,
+    )
+    if export is None:
+        return
+    try:
+        export.emit(
+            ThinkingEvent(
+                cues=[f"[drop] {source}: {reason}"],
+                text=f"[drop reason={reason} source={source}" + (f" {detail}]" if detail else "]"),
+                ts=export.time_fn(),
+            )
+        )
+    except Exception:  # noqa: BLE001 — observability must never break the layer
+        logger.warning("[embody] export sink raised while naming %s", reason, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# The voice seams — the layer's mouth for its own DELIBERATE utterances
+# ---------------------------------------------------------------------------
+#
+# Distinct from the duplex session's mouth: that one plays the SERVER's spoken
+# reply, this one renders a ``speak`` / ``harmonics`` tool call. Both end at the
+# same :class:`~reachy.embody.media.EmbodySink`, which is what keeps the
+# profile decision (daemon-http on the robot, monitor speakers on the bench) in
+# exactly one place.
+
+
+def _voice_seam(
+    name: str,
+    synthesize: Callable[[str], bytes],
+    samplerate: int,
+    sink: object,
+    *,
+    export: object,
+) -> Callable[[str], str]:
+    """Build ``seam(text) -> str``: synthesize, play through *sink*, or name it.
+
+    A failure is named with the layer's own precise reason AND re-raised as the
+    tool layer's :class:`~reachy.embody.tools.Refusal`, so the model is told in
+    the same turn that its mouth did not work. A failure the model cannot see is
+    not a failure — it is a robot that believes it spoke.
+    """
+
+    def _speak(text: str) -> str:
+        from reachy.embody.tools import REFUSAL_TOOL_ERROR, Refusal
+
+        try:
+            pcm = synthesize(text)
+            sink.play(pcm, samplerate=samplerate)
+        except Exception as err:  # noqa: BLE001 — every voice fault is NAMED, never raw
+            _embody_drop(
+                export,
+                EMBODY_SOURCE_VOICE,
+                REASON_SPEAK_FAILED,
+                f"{name}: {type(err).__name__}: {err}",
+            )
+            raise Refusal(REFUSAL_TOOL_ERROR, f"the {name} voice failed: {err}") from err
+        return f"{len(pcm)} bytes at {samplerate} Hz"
+
+    return _speak
+
+
+def _build_voice_seams(
+    sink: object,
+    *,
+    export: object,
+    synthesize: Mapping[str, Callable[[str], bytes]] | None = None,
+) -> tuple[Callable[[str], str] | None, Callable[[str], str] | None]:
+    """The ``(speak, harmonics)`` pair for :class:`EmbodyToolRegistry`.
+
+    Both legs reuse :func:`reachy.speech.voice.resolve_voice_engine` — the same
+    registry ``say`` and the runtime's ``SpeechActuator`` resolve through — so
+    the layer inherits their synthesis and their sample rates rather than
+    inventing a third pair. ``synthesize`` overrides the callable per engine
+    name (tests only); the rate always comes from the resolved engine.
+
+    A voice that will not resolve yields ``None``, which leaves the tool
+    ADVERTISED but refusing by name — the layer's action set must not change
+    shape with the box's audio configuration, or the model learns a different
+    robot on every start (``reachy/embody/tools.py``'s own reasoning).
+    """
+    from reachy.speech.voice import resolve_voice_engine
+
+    overrides = dict(synthesize or {})
+    seams: dict[str, Callable[[str], str] | None] = {}
+    for name in _EMBODY_VOICES:
+        try:
+            engine = resolve_voice_engine(name)
+        except Exception as err:  # noqa: BLE001 — a missing voice is not a dead layer
+            _embody_drop(export, EMBODY_SOURCE_VOICE, REASON_VOICE_UNAVAILABLE, f"{name}: {err}")
+            seams[name] = None
+            continue
+        seams[name] = _voice_seam(
+            name,
+            overrides.get(name, engine.synthesize),
+            engine.samplerate,
+            sink,
+            export=export,
+        )
+    return seams["tts"], seams["harmonic"]
+
+
+# ---------------------------------------------------------------------------
+# The cue reader — the runtime's own reflex life, on a background thread
+# ---------------------------------------------------------------------------
+
+
+class _CueReader:
+    """Drain :func:`reachy.embody.cues.open_runtime_lines` into the turn engine.
+
+    A THREAD, because the intake is blocking by construction: the bus route
+    blocks on a queue and the feed-tail route blocks on a FIFO/stdin read. The
+    ears (the duplex session) must keep producing utterances while the feed is
+    quiet, so pumping lines on the turn loop's own thread would make a silent
+    runtime a deaf layer. Daemon, so a blocked read can never hold up
+    interpreter exit.
+
+    Everything it touches is O(1) and non-raising:
+    :meth:`~reachy.embody.engine.EmbodyTurnEngine.submit_cues` appends to a
+    bounded deque and names its own overflow.
+    """
+
+    def __init__(
+        self,
+        lines: Iterable[str],
+        engine: object,
+        *,
+        export: object = None,
+        max_events: int | None = None,
+    ) -> None:
+        self._lines = lines
+        self._engine = engine
+        self._export = export
+        self._max_events = max_events
+        self._stop = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.events = 0
+        self.cues = 0
+        #: Set LAST, after every cue of the final line has been submitted, so a
+        #: reader that is ``done`` with an empty engine really has nothing more
+        #: to give — which is exactly what :meth:`_EmbodyLayer.should_stop`
+        #: keys on to end a bounded run.
+        self.done = False
+
+    def start(self) -> None:
+        """Start the reader thread. Idempotent."""
+        if self.thread is not None:
+            return
+        self.thread = threading.Thread(
+            target=self._run, name=EMBODY_READER_THREAD_NAME, daemon=True
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        """Ask the reader to stop after the line it is on. Never blocks."""
+        self._stop.set()
+
+    def _run(self) -> None:
+        from reachy.embody.cues import cues_for_line
+
+        try:
+            for line in self._lines:
+                if self._stop.is_set():
+                    break
+                self.events += 1
+                self.cues += self._engine.submit_cues(cues_for_line(line))
+                if self._max_events is not None and self.events >= self._max_events:
+                    break
+        except Exception as err:  # noqa: BLE001 — a dead feed must not kill the conversation
+            _embody_drop(
+                self._export,
+                EMBODY_SOURCE_CUES,
+                REASON_CUE_SOURCE_FAILED,
+                f"{type(err).__name__}: {err}",
+            )
+        finally:
+            self.done = True
+
+
+# ---------------------------------------------------------------------------
+# The composed layer
+# ---------------------------------------------------------------------------
+
+
+class _EmbodyLayer:
+    """Everything one ``agent embody`` process holds, and how it shuts down."""
+
+    def __init__(
+        self,
+        *,
+        profile: str,
+        media: object,
+        session: object,
+        registry: object,
+        engine: object,
+        reader: _CueReader,
+        export: object = None,
+    ) -> None:
+        self.profile = profile
+        self.media = media
+        self.session = session
+        self.registry = registry
+        self.engine = engine
+        self.reader = reader
+        self._export = export
+        self._stop = threading.Event()
+        self._closed = False
+
+    def start(self) -> None:
+        """Open the ears/mouth and start reading the runtime's reflex life.
+
+        A session that will not start is a NAMED drop, not a raise: a gateway
+        that is not up yet is the ordinary resting state of a boot-persistent
+        box, and a layer that can still think about its own reflexes is worth
+        more than one that exits.
+        """
+        try:
+            self.session.start()
+        except Exception as err:  # noqa: BLE001 — a dead gateway is deaf, not fatal
+            _embody_drop(
+                self._export,
+                EMBODY_SOURCE_SESSION,
+                REASON_SESSION_START_FAILED,
+                f"{type(err).__name__}: {err}",
+            )
+        self.reader.start()
+
+    def request_stop(self) -> None:
+        """Ask the run loop to finish after the current turn. Safe from any thread."""
+        self._stop.set()
+
+    def should_stop(self) -> bool:
+        """The run loop's ``stop`` predicate.
+
+        Two ways a run ends. An explicit stop (``Ctrl-C``, :meth:`close`) always
+        wins. Otherwise the run ends when the LINE SOURCE has run dry and the
+        engine has nothing left to think about — which is what makes ``--feed
+        <file>`` a bounded run, and what makes ``--feed -`` end when the
+        runtime writing it goes away. In production the feed is a FIFO or stdin
+        held open by a live runtime, so this is false for the whole life of the
+        robot.
+        """
+        if self._stop.is_set():
+            return True
+        return self.reader.done and self.engine.pending == 0
+
+    def close(self) -> None:
+        """Release everything, in order, naming any fault. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        self.reader.stop()
+        for label, closer in (("session", self.session.close), ("media", self.media.close)):
+            try:
+                closer()
+            except Exception as err:  # noqa: BLE001 — teardown names faults, never raises
+                _embody_drop(
+                    self._export,
+                    EMBODY_SOURCE_SHUTDOWN,
+                    REASON_SHUTDOWN_FAILED,
+                    f"{label}: {type(err).__name__}: {err}",
+                )
+
+
+def _utterance_tap(engine: object) -> Callable[[object], None]:
+    """duplex ``on_utterance`` -> a TRIGGER. Ungated: the layer hears everyone."""
+
+    def _heard(utterance: object) -> None:
+        engine.submit_utterance(getattr(utterance, "text", "") or "")
+
+    return _heard
+
+
+def _response_tap(engine: object) -> Callable[[object], None]:
+    """duplex ``on_response`` -> already-said CONTEXT, never a trigger.
+
+    The duplex session answers speech on its own, server-side, so without this
+    the thinking mind would not know its own mouth had already replied and
+    would cheerfully call ``speak`` to say it again (the wiring t10's docstring
+    singles out as the one this composition could miss).
+
+    An INTERRUPTED reply is deliberately excluded. ``_finish_response``
+    publishes it like any other — the record carries the audio and says why —
+    but never PLAYS it, because a barge-in means the human started talking
+    again. Recording it as spoken would leave the mind believing it had
+    answered when the room heard nothing.
+    """
+
+    def _spoke(response: object) -> None:
+        if getattr(response, "interrupted", False):
+            return
+        engine.note_spoken(getattr(response, "text", "") or "")
+
+    return _spoke
+
+
+def _require_readable_feed(feed: str) -> None:
+    """Pre-flight the fallback intake route: a typo'd feed is an exit-2, not a drop.
+
+    ``os.access`` rather than an ``open``: opening a FIFO for reading BLOCKS
+    until a writer appears, and pre-flighting must not hang on the very thing
+    it is checking.
+
+    This checks the feed-tail route because that is the only intake route that
+    exists today — events-cli is publish-only (upstream events-cli#14), so
+    :func:`reachy.embody.cues.open_runtime_lines` always falls back to it after
+    one named drop. If a bus subscriber ever lands, this pre-flight moves
+    behind the same decision.
+    """
+    if feed == "-" or os.access(feed, os.R_OK):
+        return
+    raise CliError(
+        code=EXIT_ENV_ERROR,
+        message=f"cannot read runtime feed {feed!r}",
+        remediation="pass --feed - to read from stdin, or a readable path/FIFO the "
+        "runtime writes (behavior engine run --export -)",
+    )
+
+
+def _compose_embody_seam(
+    args: argparse.Namespace,
+    *,
+    export: object = None,
+    media: object = None,
+    session_factory: Callable[..., object] | None = None,
+    registry_factory: Callable[..., object] | None = None,
+    engine_factory: Callable[..., object] | None = None,
+    turn_fn: object | None = None,
+    synthesize: Mapping[str, Callable[[str], bytes]] | None = None,
+    lines: Iterable[str] | None = None,
+    stdin: TextIO | None = None,
+) -> _EmbodyLayer:
+    """Build the whole layer — the ONE place the wave-1/2/3 seams meet.
+
+    Every collaborator is injectable so the composition is exercised with no
+    gateway, no broker, no robot, no tee socket and no audio device; the
+    defaults are the real thing.
+
+    Order matters in one place only: the media profile is built FIRST, because
+    its sink is shared by three consumers (the duplex mouth, and both voice
+    tools) and its source is the duplex ears. Building it twice would give the
+    layer two mouths and, on the robot profile, two readers contending for one
+    tee socket.
+    """
+    from reachy.embody.cues import open_runtime_lines
+    from reachy.embody.engine import EmbodyTurnEngine
+    from reachy.embody.media import build_media
+    from reachy.embody.tools import EmbodyToolRegistry
+    from reachy.speech.realtime_duplex import RealtimeDuplexSession
+
+    resolved_media = (
+        media if media is not None else build_media(getattr(args, "media_profile", None))
+    )
+
+    speak_seam, harmonic_seam = _build_voice_seams(
+        resolved_media.sink, export=export, synthesize=synthesize
+    )
+
+    build_registry = registry_factory if registry_factory is not None else EmbodyToolRegistry
+    registry = build_registry(
+        speak=speak_seam,
+        harmonics=harmonic_seam,
+        spool_root=_resolve_spool_dir(args),
+        await_timeout=float(getattr(args, "await_timeout", 1.0)),
+    )
+
+    build_engine = engine_factory if engine_factory is not None else EmbodyTurnEngine
+    engine_kwargs: dict[str, object] = {
+        "registry": registry,
+        "export": export,
+        "turn_interval": float(getattr(args, "turn_interval", DEFAULT_TURN_INTERVAL)),
+    }
+    if turn_fn is not None:
+        engine_kwargs["turn_fn"] = turn_fn
+    engine = build_engine(**engine_kwargs)
+
+    build_session = session_factory if session_factory is not None else RealtimeDuplexSession
+    session = build_session(
+        read_audio=resolved_media.source.read,
+        sample_rate=resolved_media.source.sample_rate,
+        play=resolved_media.sink.play,
+        mute_during_playback=bool(getattr(args, "mute_during_playback", False)),
+        on_utterance=_utterance_tap(engine),
+        on_response=_response_tap(engine),
+    )
+
+    feed_lines = (
+        lines
+        if lines is not None
+        else open_runtime_lines(feed=getattr(args, "feed", "-"), stdin=stdin)
+    )
+    reader = _CueReader(
+        feed_lines, engine, export=export, max_events=getattr(args, "max_events", None)
+    )
+
+    return _EmbodyLayer(
+        profile=getattr(resolved_media, "profile", "unknown"),
+        media=resolved_media,
+        session=session,
+        registry=registry,
+        engine=engine,
+        reader=reader,
+        export=export,
+    )
+
+
+def cmd_agent_embody(
+    args: argparse.Namespace,
+    *,
+    stream: TextIO | None = None,
+    compose: Callable[..., _EmbodyLayer] | None = None,
+) -> int:
+    """Run the embodiment layer in the foreground: hear, think, act, speak.
+
+    ``compose`` is the one injection seam the verb itself takes — tests hand in
+    a :func:`_compose_embody_seam` closure carrying fakes, production takes the
+    default. ``stream`` is the ``--export`` sink (default stdout).
+
+    Logging is installed here on purpose. Every named failure this layer can
+    produce is a ``[SENSE …]`` line at INFO, and a process with no handler on
+    the ``reachy`` logger drops those on the floor — so without this the
+    observability contract (spec c27) would be satisfied on paper and invisible
+    in practice. Stderr-only by construction, so ``--export -``'s stdout stays
+    pure JSONL.
+    """
+    install_logging(getattr(args, "log_level", None))
+    json_mode = bool(getattr(args, "json", False))
+
+    export_hook = build_export_hook(args, stream=stream)
+    _require_readable_feed(str(getattr(args, "feed", "-")))
+
+    builder = compose if compose is not None else _compose_embody_seam
+    layer = builder(args, export=export_hook)
+
+    emit_diagnostic(
+        f"[embody] layer up: profile={layer.profile}; ears+mouth on one realtime "
+        "session, cognition on the streaming HTTP lane, actions via the spools"
+    )
+
+    turns = 0
+    try:
+        layer.start()
+        turns = layer.engine.run(max_turns=getattr(args, "max_turns", None), stop=layer.should_stop)
+    except KeyboardInterrupt:
+        layer.request_stop()
+        emit_diagnostic("[embody] interrupted; shutting the layer down")
+    finally:
+        layer.close()
+
+    stats = {
+        "profile": layer.profile,
+        "turns": turns,
+        "events": layer.reader.events,
+        "cues": layer.reader.cues,
+        "utterances": int(getattr(layer.session, "utterances", 0) or 0),
+    }
+    if json_mode and export_hook is None:
+        emit_result({"status": "ok", **stats}, json_mode=True)
+    else:
+        emit_diagnostic(
+            f"[embody] layer down: {stats['turns']} turn(s), {stats['cues']} cue(s) "
+            f"over {stats['events']} runtime event(s), {stats['utterances']} utterance(s)"
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# embody start / stop / restart / status — the supervisor (task t12)
+# ---------------------------------------------------------------------------
+#
+# reachy/embody/supervisor.py is a plain background-process supervisor (pid +
+# log under the state dir), the same shape reachy.sleep.supervisor /
+# reachy.vision.supervisor / reachy.behavior.supervisor already are — see that
+# module's own docstring for why it needs no daemon-health preflight and how
+# it stays out of the layer's "no shell reachable" claim
+# (tests/test_embody_redteam.py's documented _CONTROL_PLANE_MODULES
+# exemption).
+#
+# Every import of reachy.embody.supervisor here is FUNCTION-LOCAL, same as
+# every other reachy.embody import in this module (h15): the package's own
+# __init__ contract is "command modules import this package inside functions,
+# never at module scope", and tests/test_agent_embody.py's
+# test_no_cognition_or_layer_module_is_imported_at_command_module_scope scans
+# this file for exactly that — a forbidden-prefix match on "reachy.embody",
+# with no carve-out for a cognition-free submodule.
+
+
+def cmd_agent_embody_start(args: argparse.Namespace) -> int:
+    """Start the embodiment layer in the background (idempotent; h17: one command)."""
+    from reachy.embody import supervisor as embody_supervisor
+
+    data = embody_supervisor.start(
+        feed=args.feed,
+        media_profile=args.media_profile,
+        spool_dir=args.spool_dir,
+        await_timeout=args.await_timeout,
+        turn_interval=args.turn_interval,
+        mute_during_playback=args.mute_during_playback,
+    )
+    emit_payload(data, json_mode=bool(getattr(args, "json", False)))
+    return 0
+
+
+def cmd_agent_embody_stop(args: argparse.Namespace) -> int:
+    """Stop the layer this CLI started: SIGTERM, then SIGKILL if it lingers.
+
+    h7/h26: signals ONLY the pid :mod:`reachy.embody.supervisor` tracked — the
+    runtime, the daemon and every other process on the box are untouched — and
+    touches nothing on disk: layer-authored ``embody-*`` rules PERSIST in the
+    overlay (spec c26/q6), by design.
+    """
+    from reachy.embody import supervisor as embody_supervisor
+
+    data = embody_supervisor.stop(timeout=args.timeout)
+    emit_payload(data, json_mode=bool(getattr(args, "json", False)))
+    return 0
+
+
+def cmd_agent_embody_restart(args: argparse.Namespace) -> int:
+    """Restart the background layer (re-reads flags/code)."""
+    from reachy.embody import supervisor as embody_supervisor
+
+    data = embody_supervisor.restart(
+        feed=args.feed,
+        media_profile=args.media_profile,
+        spool_dir=args.spool_dir,
+        await_timeout=args.await_timeout,
+        turn_interval=args.turn_interval,
+        mute_during_playback=args.mute_during_playback,
+    )
+    emit_payload(data, json_mode=bool(getattr(args, "json", False)))
+    return 0
+
+
+def cmd_agent_embody_status(args: argparse.Namespace) -> int:
+    """Report the layer's process state (pid + liveness) + its log path."""
+    from reachy.embody import supervisor as embody_supervisor
+
+    data = embody_supervisor.status()
+    emit_payload(data, json_mode=bool(getattr(args, "json", False)))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # overview (rubric-required; hand-built — no transport line)
 # ---------------------------------------------------------------------------
@@ -706,6 +1285,16 @@ def cmd_agent_attach(
 _VERBS = [
     "agent attach — read the runtime event feed, act via the intent spool, "
     "publish the agent's own cognition feed",
+    "agent embody — run the embodiment layer in the FOREGROUND: hear and speak "
+    "out loud over one realtime duplex session, think over the streaming HTTP "
+    "lane, act through the direct-operation action set",
+    "agent embody start — start the layer in the BACKGROUND (pid + log under "
+    "the state dir; idempotent)",
+    "agent embody stop — stop the layer this CLI started (SIGTERM, then "
+    "SIGKILL if it lingers; touches ONLY the layer's own tracked pid — "
+    "embody-authored rules PERSIST in the overlay)",
+    "agent embody restart — stop then start (re-reads code/flags)",
+    "agent embody status — report the layer's process state (pid + liveness)",
     "agent overview — describe the agent noun",
 ]
 
@@ -731,6 +1320,22 @@ def cmd_agent_overview(args: argparse.Namespace) -> int:
                 "--export - (decision c27: the runtime feed carries no cognition block).",
                 "Detaching changes nothing about the loop — it keeps ticking and its "
                 "rules keep running, agent attached or not.",
+                "EMBODY (the other verb): the embodiment layer — a detachable realtime "
+                "harness that HEARS and SPEAKS out loud over ONE lobes /v1/realtime "
+                "duplex session (ungated: it hears everyone), thinks over the streaming "
+                "/v1/chat/completions lane, and operates the robot through the closed "
+                "five-tool direct-operation action set (goto / speak / harmonics / "
+                "run_behavior / create_rule). It constructs no ReachyMini: audio comes "
+                "from the runtime's tee socket and goes out the daemon's HTTP media "
+                "route. Enable or disable it at will — the runtime is unchanged either "
+                "way.",
+                "SUPERVISION: `embody start`/`stop`/`restart`/`status` manage the layer "
+                "as a detached background process (pid + log under the state dir, "
+                "SIGTERM->SIGKILL on stop) — the same shape as sleep/vision/behavior's "
+                "engine. No systemd unit ships for it; stopping the layer removes its "
+                "process trace only — layer-authored `embody-*` rules PERSIST in the "
+                "rules overlay (the robot keeps what it was taught) and stay enumerable "
+                "by prefix.",
             ],
         },
         {"title": "Verbs", "items": list(_VERBS)},
@@ -760,6 +1365,66 @@ def _no_verb(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # register
 # ---------------------------------------------------------------------------
+
+
+def _add_embody_operating_args(parser: argparse.ArgumentParser) -> None:
+    """The layer's own operating flags — shared by ``embody`` (the foreground
+    verb) and the ``start``/``restart`` supervisor verbs (task t12), so a
+    background layer is configured identically to a foreground run. Mirrors
+    ``behavior.py``'s ``_add_engine_tuning`` sharing the same shape between
+    ``engine run`` and ``engine start``.
+    """
+    parser.add_argument(
+        "--feed",
+        default="-",
+        metavar="PATH",
+        help="Runtime-event JSONL source: a path (stream/FIFO/file) or '-' for stdin "
+        "(default). The layer never spawns the runtime; it reads what the runtime "
+        "writes (behavior engine run --export -). The MQTT bus is the intended "
+        "primary route and falls back here today (events-cli is publish-only).",
+    )
+    parser.add_argument(
+        "--media-profile",
+        default=None,
+        dest="media_profile",
+        metavar="PROFILE",
+        help="Audio profile: 'robot' (the runtime's tee socket in, the daemon HTTP "
+        "media route out — the default) or 'bench' (dev-box mic + speakers). "
+        "Overrides REACHY_EMBODY_MEDIA_PROFILE. Same code path either way.",
+    )
+    parser.add_argument(
+        "--spool-dir",
+        default=None,
+        dest="spool_dir",
+        metavar="DIR",
+        help="Override the intents-spool root (default: the shared state dir, so the "
+        "layer writes into the SAME spool the running engine drains).",
+    )
+    parser.add_argument(
+        "--await-timeout",
+        type=float,
+        default=1.0,
+        dest="await_timeout",
+        help="Seconds an action waits for the engine to confirm a spool command "
+        "before returning 'submitted, unconfirmed' (default: 1.0).",
+    )
+    parser.add_argument(
+        "--turn-interval",
+        type=float,
+        default=DEFAULT_TURN_INTERVAL,
+        dest="turn_interval",
+        help=f"Seconds to wait between turns when nothing is pending "
+        f"(default: {DEFAULT_TURN_INTERVAL}).",
+    )
+    parser.add_argument(
+        "--mute-during-playback",
+        action="store_true",
+        dest="mute_during_playback",
+        help="Withhold microphone audio while the layer is speaking. OFF by default: "
+        "Reachy has hardware AEC against its own speakers, so the layer keeps "
+        "hearing while it talks (which is what makes barge-in possible). This is "
+        "the one-flip fallback if live AEC proves insufficient.",
+    )
 
 
 def register(sub: argparse._SubParsersAction) -> None:
@@ -824,3 +1489,69 @@ def register(sub: argparse._SubParsersAction) -> None:
     add_export_args(attach)
     attach.add_argument("--json", action="store_true", help=_JSON_HELP)
     attach.set_defaults(func=cmd_agent_attach)
+
+    embody = noun_sub.add_parser(
+        "embody",
+        help="Run the embodiment layer: hear and speak out loud over one realtime "
+        "duplex session, think over the streaming HTTP lane, act via the "
+        "direct-operation action set. See also: embody start/stop/restart/status "
+        "to run it as a background process.",
+    )
+    _add_embody_operating_args(embody)
+    embody.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        dest="max_turns",
+        help="Stop after this many turns that ran (default: unbounded).",
+    )
+    embody.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        dest="max_events",
+        help="Stop reading runtime events after this many (default: unbounded).",
+    )
+    add_export_args(embody)
+    add_log_level_arg(embody)
+    embody.add_argument("--json", action="store_true", help=_JSON_HELP)
+    embody.set_defaults(func=cmd_agent_embody)
+
+    # embody start/stop/restart/status (task t12) — the supervisor half. Nested
+    # as SUB-subcommands of `embody` (not siblings of it under `agent`) so bare
+    # `agent embody` keeps running the foreground loop unchanged (h17: one
+    # command each way is `embody start` / `embody stop`, not a new top-level
+    # verb family). parser_class propagates so nested parse errors keep the
+    # structured error contract.
+    embody_sub = embody.add_subparsers(dest="embody_command", parser_class=type(embody))
+
+    embody_start = embody_sub.add_parser(
+        "start", help="Start the embodiment layer in the background (idempotent)."
+    )
+    _add_embody_operating_args(embody_start)
+    embody_start.add_argument("--json", action="store_true", help=_JSON_HELP)
+    embody_start.set_defaults(func=cmd_agent_embody_start)
+
+    embody_stop = embody_sub.add_parser("stop", help="Stop the layer this CLI started.")
+    embody_stop.add_argument(
+        "--timeout",
+        type=float,
+        default=EMBODY_DEFAULT_STOP_TIMEOUT,
+        help="Seconds to wait after SIGTERM before SIGKILL "
+        f"(default: {EMBODY_DEFAULT_STOP_TIMEOUT:g}).",
+    )
+    embody_stop.add_argument("--json", action="store_true", help=_JSON_HELP)
+    embody_stop.set_defaults(func=cmd_agent_embody_stop)
+
+    embody_restart = embody_sub.add_parser(
+        "restart", help="Restart the background layer (re-reads code/flags)."
+    )
+    _add_embody_operating_args(embody_restart)
+    embody_restart.add_argument("--json", action="store_true", help=_JSON_HELP)
+    embody_restart.set_defaults(func=cmd_agent_embody_restart)
+
+    embody_status = embody_sub.add_parser(
+        "status", help="Report the layer's process state (pid + liveness)."
+    )
+    embody_status.add_argument("--json", action="store_true", help=_JSON_HELP)
+    embody_status.set_defaults(func=cmd_agent_embody_status)

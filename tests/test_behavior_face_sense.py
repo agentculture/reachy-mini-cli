@@ -265,7 +265,9 @@ def test_build_face_recognition_without_cv2_returns_none_and_warns_once(
         second = build_face_recognition()
         third = build_face_recognition()
 
-    assert first is None and second is None and third is None
+    assert first is None
+    assert second is None
+    assert third is None
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1, [r.getMessage() for r in warnings]
     assert "[vision]" in warnings[0].getMessage()
@@ -557,6 +559,88 @@ def test_a_raising_engine_or_store_degrades_to_no_match() -> None:
     raising_engine(_Ctx(0.02))
     assert raising_engine.peek_face() is None
 
+
+# --------------------------------------------------------------------------- #
+# add_frame_sink — the clip rider's frame-handoff seam (t5)                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_add_frame_sink_receives_every_usable_frame() -> None:
+    """A registered sink is pushed each usable frame, in order, once per tick."""
+    frames = [_frame(width=4), _frame(width=6), _frame(width=8)]
+    driver = FaceSenseDriver(media=_FakeMedia(list(frames)), engine=None, store=None)
+    received: list = []
+    driver.add_frame_sink(received.append)
+    try:
+        _drive(driver, ticks=3, dt=0.02)
+    finally:
+        driver.close()
+    assert len(received) == 3
+    for got, expected in zip(received, frames):
+        assert got is expected, "the sink must receive the SAME frame object (no copy)"
+
+
+def test_add_frame_sink_is_never_called_with_a_none_or_degenerate_frame() -> None:
+    """No frame this tick means no sink call — never a ``None`` push."""
+    driver = FaceSenseDriver(media=_FakeMedia([None]), engine=None, store=None)
+    received: list = []
+    driver.add_frame_sink(received.append)
+    try:
+        _drive(driver, ticks=3)
+    finally:
+        driver.close()
+    assert received == []
+
+
+def test_add_frame_sink_runs_regardless_of_recognizer_readiness() -> None:
+    """A cv2-less box (no engine/store) still feeds a registered frame sink.
+
+    Reading a raw camera frame needs no cv2 — only face DETECTION does — so a
+    consumer with its own reason to want frames (the clip rider) must not go
+    quiet just because face recognition itself is unavailable.
+    """
+    driver = FaceSenseDriver(media=_FakeMedia([_frame()]), engine=None, store=None)
+    received: list = []
+    driver.add_frame_sink(received.append)
+    try:
+        _drive(driver, ticks=1)
+    finally:
+        driver.close()
+    assert len(received) == 1
+
+
+def test_a_raising_frame_sink_does_not_break_the_tick_or_other_sinks() -> None:
+    """A misbehaving sink degrades to a dropped frame, never a tick fault."""
+
+    def _boom(_frame):
+        raise RuntimeError("consumer exploded")
+
+    well_behaved: list = []
+    driver = FaceSenseDriver(media=_FakeMedia([_frame()]), engine=None, store=None)
+    driver.add_frame_sink(_boom)
+    driver.add_frame_sink(well_behaved.append)
+    try:
+        _drive(driver, ticks=1)  # must not raise
+        sense = _sense(driver)
+    finally:
+        driver.close()
+    assert sense.frame_available is True, "a raising sink must not break the rest of the tick"
+    assert len(well_behaved) == 1, "a sink registered after a raising one must still be fed"
+
+
+def test_frame_sink_receives_frames_on_the_tick_thread_synchronously() -> None:
+    """The push is inline with ``_update_frame`` — no worker involved for the sink itself."""
+    driver = FaceSenseDriver(media=_FakeMedia([_frame()]), engine=None, store=None)
+    calls: list[int] = []
+    driver.add_frame_sink(lambda _frame: calls.append(threading.get_ident()))
+    try:
+        _drive(driver, ticks=1)
+    finally:
+        driver.close()
+    assert calls == [
+        threading.get_ident()
+    ], "the sink must run synchronously on the caller's thread"
+
     raising_store = FaceSenseDriver(
         media=_FakeMedia([_frame()]),
         engine=_FakeEngine(),
@@ -578,7 +662,8 @@ def test_providers_never_raise_and_read_perception_folds_them() -> None:
             frame_available=driver.as_frame_available_provider(),
         )
     )
-    assert sense.frame_available is True and sense.face is None
+    assert sense.frame_available is True
+    assert sense.face is None
 
 
 # --------------------------------------------------------------------------- #
