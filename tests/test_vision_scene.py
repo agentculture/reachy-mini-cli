@@ -100,11 +100,13 @@ def test_scene_config_reads_openai_env(monkeypatch) -> None:
     assert cfg.model == "custom-vlm"
 
 
-def test_scene_config_default_model_is_the_gemma_senses_role(monkeypatch) -> None:
+def test_scene_config_default_model_is_the_senses_role(monkeypatch) -> None:
+    """issue #132: the default names the gateway ROLE, never the served id behind
+    it — a served id (like the sibling forge default's old ``qwen3``) 404s the
+    moment lobes promotes it; a role name survives the promotion."""
     monkeypatch.delenv("REACHY_VISION_MODEL_ID", raising=False)
     cfg = scene.SceneConfig.from_env()
-    assert cfg.model == scene.DEFAULT_VISION_MODEL
-    assert "gemma" in cfg.model.lower()
+    assert cfg.model == scene.DEFAULT_VISION_MODEL == "senses"
 
 
 def test_scene_config_is_legacy_free(monkeypatch) -> None:
