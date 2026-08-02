@@ -640,6 +640,9 @@ def cmd_agent_attach(
 #   media.sink.play     -> the speak/harmonics tools' render leg
 #   duplex on_utterance -> engine.submit_utterance   (a TRIGGER, if attention
 #                          admits it: the name opens the window — #148)
+#                       -> session.arm_once          (ONE spoken reply, and
+#                          only for an utterance attention admitted — #149;
+#                          the same verdict governs the mind AND the mouth)
 #   duplex on_response  -> engine.note_spoken        (CONTEXT, never a trigger;
 #                          extends a live attention window, never opens one)
 #   runtime feed line   -> classified_cues_for_line -> engine.submit_cues
@@ -682,6 +685,11 @@ REASON_SPEAK_FAILED = "speak-failed"
 REASON_SESSION_START_FAILED = "session-start-failed"
 #: The runtime line source raised mid-stream (the feed went away, the bus died).
 REASON_CUE_SOURCE_FAILED = "cue-source-failed"
+#: Asking the session for ONE spoken reply raised (issue #149). The utterance
+#: was admitted and the room will now hear nothing back, so it cannot be a
+#: swallowed exception: the tap runs on the session's own worker thread, where
+#: a raise is caught and logged as an anonymous warning at best.
+REASON_ARM_FAILED = "arm-failed"
 #: Closing a held resource raised. Named, never propagated — a fault in teardown
 #: must not mask the reason the layer was stopping.
 REASON_SHUTDOWN_FAILED = "shutdown-failed"
@@ -713,6 +721,7 @@ EMBODY_REASONS: frozenset[str] = frozenset(
         REASON_SPEAK_FAILED,
         REASON_SESSION_START_FAILED,
         REASON_CUE_SOURCE_FAILED,
+        REASON_ARM_FAILED,
         REASON_SHUTDOWN_FAILED,
         REASON_CLIP_UNAVAILABLE,
         REASON_CLIP_STALE,
@@ -1282,18 +1291,72 @@ class _EmbodyLayer:
                 )
 
 
-def _utterance_tap(engine: object) -> Callable[[object], None]:
-    """duplex ``on_utterance`` -> a candidate TRIGGER.
+def _utterance_tap(
+    engine: object,
+    session_of: Callable[[], object | None],
+    *,
+    export: object = None,
+) -> Callable[[object], None]:
+    """duplex ``on_utterance`` -> a candidate TRIGGER, and the ROBOT'S VOICE.
 
     The SESSION is ungated — it hears everyone in the room, and its own
     boundary tests pin that — but the ENGINE decides whether what it heard is
     worth waking a mind for: while attention is cold only the robot's name
-    admits an utterance (issue #148, :mod:`reachy.embody.attention`). The tap
-    stays a plain forward, so that decision has exactly one home.
+    admits an utterance (issue #148, :mod:`reachy.embody.attention`). This tap
+    is where that ONE decision reaches BOTH of the things it should govern.
+
+    **Attention gates the voice too (issue #149).** Until this task it gated
+    only cognition, and the room got a spoken reply to every sentence anyway:
+    the duplex session armed itself once at ``session.created`` and the gateway
+    then answered every committed turn, so a conversation the robot had been
+    told to ignore was answered — thoughtlessly — out loud. A robot butting
+    into a conversation it was explicitly excluded from is worse than one that
+    answers everything, so ignore has to mean ignore SILENTLY. An admitted
+    utterance therefore also asks the session for exactly one reply
+    (:meth:`~reachy.speech.realtime_duplex.RealtimeDuplexSession.arm_once`),
+    and a refused one asks for nothing.
+
+    **The policy lives here, and the mechanism lives in the wire.** The duplex
+    module reaches no gate and must not (three structural pins in
+    ``tests/test_realtime_duplex.py`` say so); it knows only that *someone*
+    asked for a reply. Which someone, and on what grounds, is this function.
+
+    **Why the admission is read from the gate's own counter rather than from
+    ``submit_utterance``'s return.** That return is ``False`` for two unrelated
+    reasons: the robot was not addressed, and the robot WAS addressed but the
+    turn engine's trigger queue is full. Only the first is a reason to stay
+    silent. The engine's own docstring is explicit that the admission stands
+    through a full queue — "a fact about the room, not about how full a queue
+    happened to be" — and the voice belongs to the realtime floor, not to this
+    queue, so a saturated mind must not mute a robot mid-conversation.
+    ``unaddressed_utterances`` moves on exactly the refusal, and nothing else.
+
+    *session_of* is a late-bound accessor because the session is built WITH
+    this tap: see :func:`_compose_embody_seam`. It yields ``None`` only before
+    composition finishes, which is before the worker thread that fires the tap
+    exists.
     """
 
     def _heard(utterance: object) -> None:
-        engine.submit_utterance(getattr(utterance, "text", "") or "")
+        text = (getattr(utterance, "text", "") or "").strip()
+        if not text:
+            return
+        ignored_before = int(getattr(engine, "unaddressed_utterances", 0) or 0)
+        engine.submit_utterance(text)
+        if int(getattr(engine, "unaddressed_utterances", 0) or 0) != ignored_before:
+            return  # attention refused it: the room hears nothing back
+        session = session_of()
+        if session is None:  # pragma: no cover - composition fills the slot first
+            return
+        try:
+            session.arm_once()
+        except Exception as err:  # this runs on the session's own worker thread
+            _embody_drop(
+                export,
+                EMBODY_SOURCE_SESSION,
+                REASON_ARM_FAILED,
+                f"{type(err).__name__}: {err}",
+            )
 
     return _heard
 
@@ -1442,14 +1505,27 @@ def _compose_embody_seam(
     engine = build_engine(**engine_kwargs)
 
     build_session = session_factory if session_factory is not None else RealtimeDuplexSession
+    # The utterance tap has to reach the session that is being built WITH it
+    # (issue #149: an admitted utterance arms one reply). A one-slot box closes
+    # that circle without a post-hoc attribute poke, and it is safe by
+    # construction: the tap only ever fires on the session's worker thread,
+    # which `start()` spawns — long after this function has returned.
+    session_slot: list[object] = []
     session = build_session(
         read_audio=resolved_media.source.read,
         sample_rate=resolved_media.source.sample_rate,
         play=resolved_media.sink.play,
         mute_during_playback=bool(getattr(args, "mute_during_playback", False)),
-        on_utterance=_utterance_tap(engine),
+        # Opt in to per-ADMITTED-utterance arming. The wire's own default is
+        # still arm-once, and against a gateway that cannot do one-shot arming
+        # this degrades back to exactly that, with one named drop (h9).
+        arm_per_utterance=True,
+        on_utterance=_utterance_tap(
+            engine, lambda: session_slot[0] if session_slot else None, export=export
+        ),
         on_response=_response_tap(engine),
     )
+    session_slot.append(session)
 
     feed_lines = (
         lines

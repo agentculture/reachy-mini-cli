@@ -1639,3 +1639,282 @@ def test_a_bound_passed_through_limits_reaches_the_session() -> None:
     """Behavioural proof, not just a signature check: the value actually takes."""
     client = _session(read_audio=lambda: None, limits=duplex.Limits(join_timeout_s=0.0))
     assert client._join_timeout_s == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# criterion 5 — per-utterance arming: the MECHANISM (issue #149, task t8)      #
+#                                                                             #
+# The POLICY — which utterance deserves a reply — is not here and must never   #
+# be: ``tests/test_agent_embody.py`` pins the composition root driving these   #
+# calls from ``reachy.embody.attention``. What this section pins is the        #
+# mechanism that policy needs: a session that does not arm itself, an          #
+# ``arm_once`` that buys exactly one reply, a capability check that degrades   #
+# to today's behaviour, and the c46 completion-clearing property that keeps a  #
+# reply interruptible while it is being spoken.                                #
+# --------------------------------------------------------------------------- #
+
+_AMBIENT = "could you pass me the salt please"
+_ADDRESSED = "reachy, are you listening"
+
+
+def _arm_on_name(box: dict, name: str = "reachy"):
+    """An ``on_utterance`` tap that arms only for an utterance naming the robot.
+
+    A hand-written stand-in for :class:`reachy.embody.attention.AttentionGate`,
+    on purpose: this module may not import a gate (the c4 pins above), and the
+    mechanism must be demonstrable without one. The real gate drives the real
+    thing one level up.
+    """
+
+    def _heard(utterance) -> None:
+        if name in (getattr(utterance, "text", "") or "").lower():
+            box["client"].arm_once()
+
+    return _heard
+
+
+def test_a_per_utterance_session_does_not_arm_itself_on_session_created() -> None:
+    """The whole defect in one assertion: nobody asked, so nobody answers.
+
+    Today's session arms on ``session.created`` and the gateway then answers
+    EVERY committed utterance — which is why the room's ambient chatter gets
+    spoken replies however firmly the layer decided to ignore it (#149).
+    """
+    with FakeRealtimeServer(
+        Scenario.ONE_SHOT_ARMING,
+        announce_one_shot_arming=True,
+        transcripts=[_AMBIENT],
+        arm_grace_s=0.2,
+    ) as server:
+        client = _session(server, arm_per_utterance=True, backoff_initial_s=5.0, backoff_max_s=5.0)
+        client.start()
+        try:
+            assert _wait_until(lambda: client.utterances >= 1)
+            assert _wait_until(lambda: server.unanswered_transcripts >= 1)
+        finally:
+            client.close()
+
+    assert server.response_create_count == 0, "an ambient utterance asked for a reply"
+    assert client.arms_sent == 0
+    assert client.responses == 0
+    assert server.answered_texts == []
+    assert server.unanswered_texts == [_AMBIENT]
+    assert server.is_armed is False
+
+
+def test_a_cold_ambient_utterance_is_silent_and_an_admitted_one_arms_exactly_one_reply() -> None:
+    """Criterion 1, over ONE session: silence, then exactly one spoken reply.
+
+    Both utterances are HEARD — the wire is ungated and stays that way — but
+    only the one the caller admits reaches the room as sound.
+    """
+    box: dict = {}
+    with FakeRealtimeServer(
+        Scenario.ONE_SHOT_ARMING,
+        announce_one_shot_arming=True,
+        transcripts=[_AMBIENT, _ADDRESSED],
+        arm_grace_s=0.2,
+    ) as server:
+        client = _session(
+            server,
+            arm_per_utterance=True,
+            on_utterance=_arm_on_name(box),
+            backoff_initial_s=5.0,
+            backoff_max_s=5.0,
+        )
+        box["client"] = client
+        client.start()
+        try:
+            assert _wait_until(lambda: client.responses >= 1)
+            assert _wait_until(lambda: client.utterances >= 2)
+        finally:
+            client.close()
+
+    assert server.response_create_count == 1, "exactly one reply was asked for"
+    assert client.arms_sent == 1
+    # WHICH one was answered, not just how many: the counts alone are satisfied
+    # by a client that got the wiring exactly backwards.
+    assert server.answered_texts == [_ADDRESSED]
+    assert server.unanswered_texts == [_AMBIENT]
+    assert client.supports_one_shot_arming is True
+    # h13 stays exactly as wide as it was: per-utterance arming REUSES
+    # response.create and adds no frame kind (the AST pins above are untouched).
+    assert set(_sent_event_types(server)) <= {
+        wire.APPEND_EVENT_TYPE,
+        wire.RESPONSE_CREATE_EVENT_TYPE,
+    }
+
+
+def test_h9_a_gateway_without_one_shot_arming_degrades_to_arming_once(sense_log) -> None:
+    """Criterion 2: never half-deploy — degrade to today's behaviour, and say so.
+
+    ``ConversationBridge.arm()`` latches ``armed = True`` with no disarm today
+    (lobes-cli#170 item 1 is the ask). Against that gateway a per-utterance
+    session must NOT go quiet — silence would be a regression the operator
+    never asked for — so it arms once at connect exactly as it always did, and
+    names the degrade once.
+    """
+    box: dict = {}
+    with FakeRealtimeServer(
+        Scenario.ONE_SHOT_ARMING,
+        announce_one_shot_arming=False,
+        transcripts=[_AMBIENT, _ADDRESSED],
+        arm_grace_s=0.2,
+    ) as server:
+        client = _session(
+            server,
+            arm_per_utterance=True,
+            on_utterance=_arm_on_name(box),
+            backoff_initial_s=5.0,
+            backoff_max_s=5.0,
+        )
+        box["client"] = client
+        client.start()
+        try:
+            assert _wait_until(lambda: client.responses >= 2)
+        finally:
+            client.close()
+
+    assert client.supports_one_shot_arming is False
+    assert client.arms_sent == 1, "today's arm-once behaviour, unchanged"
+    assert server.answered_texts == [_AMBIENT, _ADDRESSED], "the old gateway answers everything"
+    assert server.unanswered_texts == []
+    assert _count_reason(sense_log, duplex.REASON_ONE_SHOT_ARMING_UNSUPPORTED) == 1
+    # The caller's request was seen and declined rather than silently dropped.
+    assert client.arms_declined >= 1
+
+
+def test_arm_once_is_declined_and_counted_when_the_gateway_never_announced() -> None:
+    """The degraded return value is the caller's own answer, not just a log line."""
+    client = _session(url="ws://127.0.0.1:1/v1/realtime", arm_per_utterance=True)
+    assert client.supports_one_shot_arming is False
+    assert client.arm_once() is False
+    assert client.arms_declined == 1
+    assert client.arms_sent == 0
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        None,
+        {},
+        {"config": None},
+        {"config": {}},
+        {"config": {"arming": "latched"}},
+        {"config": {"arming": ""}},
+        {"config": {"arming": True}},
+        {"arming": "one_shot"},  # right value, wrong place
+        {"config": "one_shot"},
+    ],
+)
+def test_the_capability_probe_needs_an_explicit_affirmative_announcement(event) -> None:
+    """Fail CLOSED: anything short of the announced value means arm-once."""
+    assert duplex.announces_one_shot_arming(event) is False
+
+
+def test_the_capability_probe_recognises_the_announced_value() -> None:
+    announced = {"type": "session.created", "config": {"arming": duplex.ARMING_MODE_ONE_SHOT}}
+    assert duplex.announces_one_shot_arming(announced) is True
+
+
+def test_c46_one_shot_arming_clears_at_completion_so_a_reply_stays_interruptible() -> None:
+    """c46/h31: ``armed`` must survive the whole reply, or barge-in dies with it.
+
+    Every floor call upstream sits behind ``if self.armed``
+    (``lobes/realtime/_conversation.py``:450), so a gateway clearing ``armed``
+    when it consumes ``response.create`` would answer the turn and then be
+    unable to honour the human who speaks over it. The fake gateway therefore
+    holds the reply open and this test reads ``is_armed`` MID-SYNTHESIS —
+    still armed — and again after it ends: spent.
+    """
+    box: dict = {}
+    sink = _Sink()
+    with FakeRealtimeServer(
+        Scenario.ONE_SHOT_ARMING,
+        announce_one_shot_arming=True,
+        transcripts=[_ADDRESSED],
+        arm_grace_s=0.2,
+        hold_response=True,
+        interrupt_response=True,
+        response_audio=bytes(64),
+        response_chunk_bytes=16,
+        wait_timeout=_TIMEOUT,
+    ) as server:
+        client = _session(
+            server,
+            play=sink,
+            on_utterance=_arm_on_name(box),
+            arm_per_utterance=True,
+            playback_chunk_bytes=16,
+            playback_first_chunk_bytes=16,
+            backoff_initial_s=5.0,
+            backoff_max_s=5.0,
+        )
+        box["client"] = client
+        client.start()
+        try:
+            assert _wait_until(lambda: server.arms_consumed >= 1)
+            # The reply is in flight and the mouth is speaking it...
+            assert _wait_until(lambda: sink.entered.is_set())
+            assert server.is_armed is True, "cleared at consumption — barge-in is dead"
+        finally:
+            server.release_response_done()
+            assert _wait_until(lambda: client.responses >= 1)
+            client.close()
+
+    assert server.is_armed is False, "one arm must not buy a second reply"
+    assert server.arms_consumed == 1
+
+
+def test_c46_a_barge_in_still_cuts_the_reply_short_under_one_shot_arming(sense_log) -> None:
+    """h31's other half: the interruption itself still lands, and is named.
+
+    The reply is held open long enough for the mouth to speak its first chunks
+    and is then INTERRUPTED. Under one-shot arming that must behave exactly as
+    it did before: the remainder is skipped, the played prefix is kept, and the
+    cut is a named drop.
+    """
+    box: dict = {}
+    block = threading.Event()
+    sink = _Sink(block=block)
+    with FakeRealtimeServer(
+        Scenario.ONE_SHOT_ARMING,
+        announce_one_shot_arming=True,
+        transcripts=[_ADDRESSED],
+        arm_grace_s=0.2,
+        hold_response=True,
+        interrupt_response=True,
+        response_audio=bytes(range(64)),
+        response_chunk_bytes=16,
+        wait_timeout=_TIMEOUT,
+    ) as server:
+        client = _session(
+            server,
+            play=sink,
+            on_utterance=_arm_on_name(box),
+            arm_per_utterance=True,
+            playback_chunk_bytes=16,
+            playback_first_chunk_bytes=16,
+            backoff_initial_s=5.0,
+            backoff_max_s=5.0,
+        )
+        box["client"] = client
+        client.start()
+        try:
+            # The mouth is inside its FIRST chunk and blocked there, so the
+            # rest of the reply is queued and cancellable when the cut lands.
+            assert _wait_until(lambda: sink.entered.is_set())
+            server.release_response_done()
+            assert _wait_until(lambda: client.responses >= 1)
+            assert _wait_until(lambda: client.chunks_cancelled >= 1)
+            block.set()
+            # The blocked chunk is only CONFIRMED when ``play`` returns, so
+            # wait on that rather than on ``close()``'s bounded join.
+            assert _wait_until(lambda: client.played >= 1)
+        finally:
+            block.set()
+            client.close()
+
+    assert _count_reason(sense_log, REASON_RESPONSE_INTERRUPTED) >= 1
+    assert client.cancelled_bytes > 0, "the unspoken remainder was spoken anyway"
+    assert sink.played == bytes(range(16)), "the prefix the room heard was not kept"
