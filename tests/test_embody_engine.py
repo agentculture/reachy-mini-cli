@@ -1,0 +1,821 @@
+"""The embodiment layer's streaming cognition loop (task t10, claim c6 / honesty h6).
+
+Three acceptance criteria, and every one of them is a claim about something
+observable rather than about code shape:
+
+1. **Every LLM call streams.** Asserted against a real loopback socket
+   (``tests/fake_sse_server.py``): the received payload says ``stream: true``,
+   and the deltas are proven to be consumed INCREMENTALLY by making the server
+   refuse to write chunk 2 until the client has surfaced chunk 1 — a client
+   that buffered the body whole would deadlock its own proof. A stalled stream
+   resolves as a named timeout drop and the loop keeps running.
+2. **The model is a per-request field**, resolved from process-scoped
+   environment only: no ``environment.d`` read, no global mutation.
+3. **Tool results and refusals flow back into the conversation**, and the
+   ``thinking`` / ``message`` / ``emotion`` export contract is emitted per turn.
+
+The inter-chunk bound is its own test class
+--------------------------------------------
+h6 says a stalled stream must resolve as a named drop "never a hang". The
+subtlety that makes it non-obvious is measured, not guessed: streaming turns a
+total deadline into an inter-chunk IDLE bound (the first content delta took
+43.2 s on our own gateway while the largest gap between chunks was 0.124 s —
+``docs/evidence/2026-08-01-cited-findings-from-embodiment-sibling.md``). So a
+drop armed on total elapsed would kill every long think as if it were a stall.
+``test_the_stall_bound_is_inter_chunk_idle_not_total_elapsed`` is the test that
+fails if anyone rearms it on total elapsed.
+"""
+
+from __future__ import annotations
+
+import ast
+import copy
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from reachy.behavior.goto_intent import GOTO
+from reachy.embody import engine as engine_mod
+from reachy.embody.engine import (
+    DROP_REASONS,
+    ENV_SENSES_MODEL,
+    ENV_WORKER_MODEL,
+    REASON_EMPTY_INPUT,
+    REASON_ENDPOINT_UNREACHABLE,
+    REASON_INPUT_QUEUE_FULL,
+    REASON_STREAM_IDLE,
+    REASON_TOOL_ROUNDS_EXHAUSTED,
+    ROLE_SENSES,
+    ROLE_WORKER,
+    EmbodyModels,
+    EmbodyTurnEngine,
+    first_emoji,
+)
+from reachy.embody.tools import CREATE_RULE, REFUSAL_RULE_NAMESPACE, SPEAK, EmbodyToolRegistry
+from reachy.export.exporter import ExportHook
+from reachy.speech.llm import ToolCall, TurnResult
+from tests.conftest import WAIT_BUDGET_S
+from tests.fake_sse_server import (
+    FakeChatServer,
+    Script,
+    content_chunk,
+    finish,
+    reasoning_chunk,
+    role_chunk,
+    tool_call_chunk,
+)
+
+# --------------------------------------------------------------------------- #
+# Doubles                                                                     #
+# --------------------------------------------------------------------------- #
+
+
+class ScriptedTurn:
+    """A ``turn_fn`` double returning canned turns and recording every call.
+
+    The messages list is DEEP-COPIED at call time: the engine appends tool
+    results to the same list across rounds, so a shallow record would show every
+    round the final conversation and quietly make the "results flow back"
+    assertion vacuous.
+    """
+
+    def __init__(self, *results: TurnResult) -> None:
+        self._results = list(results)
+        self.calls: list[dict] = []
+
+    def __call__(self, messages: list[dict], **kwargs) -> TurnResult:
+        self.calls.append({"messages": copy.deepcopy(messages), "kwargs": kwargs})
+        if not self._results:
+            return TurnResult(content="", tool_calls=[], finish_reason="stop")
+        return self._results.pop(0) if len(self._results) > 1 else self._results[0]
+
+    @property
+    def models(self) -> list[str | None]:
+        return [call["kwargs"].get("model") for call in self.calls]
+
+    def last_messages(self) -> list[dict]:
+        return self.calls[-1]["messages"]
+
+
+class RecordingRegistry:
+    """An :class:`~reachy.embody.tools.EmbodyToolRegistry`-shaped double."""
+
+    def __init__(self, result: dict | None = None) -> None:
+        self.dispatched: list[tuple[str, str | None, str | None]] = []
+        self._result = result
+
+    def tools(self) -> list[dict]:
+        return [{"type": "function", "function": {"name": SPEAK, "parameters": {}}}]
+
+    def dispatch(self, name, arguments_json=None, tool_call_id=None) -> dict:
+        self.dispatched.append((name, arguments_json, tool_call_id))
+        content = json.dumps(self._result if self._result is not None else {"ok": True})
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+
+class Sink:
+    """An export sink recording every emitted block."""
+
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    def emit(self, event: object) -> None:
+        self.events.append(event)
+
+    def hook(self, *, poses: dict | None = None) -> ExportHook:
+        table = poses if poses is not None else {"🤔": {"head_pitch": -5.0}}
+        return ExportHook(
+            emit=self.emit,
+            pose_resolver=table.get,
+            time_fn=lambda: 1234.5,
+        )
+
+    def of_type(self, block: str) -> list[object]:
+        return [event for event in self.events if getattr(event, "t", None) == block]
+
+
+def _speak_call(text: str, call_id: str = "call_1") -> ToolCall:
+    payload = json.dumps({"text": text})
+    return ToolCall(id=call_id, name=SPEAK, arguments={"text": text}, arguments_json=payload)
+
+
+def _build(**kwargs) -> EmbodyTurnEngine:
+    """An engine with every collaborator faked unless the test says otherwise.
+
+    Passing ``base_url=`` means the test wants the REAL streaming client against
+    a loopback server, so no ``turn_fn`` double is substituted in that case.
+    """
+    kwargs.setdefault("registry", RecordingRegistry())
+    if "base_url" not in kwargs:
+        kwargs.setdefault("turn_fn", ScriptedTurn(TurnResult(content="ok", finish_reason="stop")))
+    kwargs.setdefault("models", EmbodyModels(worker="worker", senses="senses"))
+    return EmbodyTurnEngine(**kwargs)
+
+
+# =========================================================================== #
+# AC 1 — every LLM call streams                                               #
+# =========================================================================== #
+
+
+def test_a_turn_streams_and_the_wire_carries_stream_true_and_the_tools() -> None:
+    """The claim is about the wire, so it is asserted against a received payload."""
+    script = Script(chunks=[role_chunk(), content_chunk("hello"), finish()])
+    with FakeChatServer(script=script) as server:
+        engine = _build(base_url=server.base_url)
+        engine.submit_utterance("hi there")
+        assert engine.run_turn() is True
+
+    assert server.requests[0]["stream"] is True
+    assert server.requests[0]["model"] == "worker"
+    assert [tool["function"]["name"] for tool in server.requests[0]["tools"]] == [SPEAK]
+
+
+def test_the_senses_lane_streams_too() -> None:
+    """``ask`` is the second LLM call the layer makes, and it streams as well."""
+    script = Script(chunks=[content_chunk("a cat"), finish()])
+    with FakeChatServer(script=script) as server:
+        engine = _build(base_url=server.base_url)
+        answer = engine.ask("what do you see?")
+
+    assert answer == "a cat"
+    assert server.requests[0]["stream"] is True
+    assert server.requests[0]["model"] == "senses"
+    assert "tools" not in server.requests[0]
+
+
+def test_deltas_are_consumed_incrementally_never_buffered_whole() -> None:
+    """The server withholds chunk 2 until the client has surfaced chunk 1.
+
+    A client that read the whole body before yielding anything would never set
+    the gate, the server would fall through on its own bounded wait, and
+    ``observed`` would be ``False``.
+    """
+    import threading
+
+    surfaced = threading.Event()
+    observed: list[bool] = []
+
+    def gate(index: int) -> None:
+        if index == 2:  # about to write the SECOND content delta
+            observed.append(surfaced.wait(WAIT_BUDGET_S))
+
+    script = Script(
+        chunks=[role_chunk(), content_chunk("first"), content_chunk(" second"), finish()],
+        on_chunk=gate,
+    )
+    with FakeChatServer(script=script) as server:
+        engine = _build(base_url=server.base_url, on_content=lambda _text: surfaced.set())
+        engine.submit_utterance("go")
+        engine.run_turn()
+
+    assert observed == [True]
+
+
+def test_a_stalled_stream_is_a_named_timeout_drop(caplog) -> None:
+    """h6: a stream that goes quiet mid-flight is named, never a hang."""
+    script = Script(
+        chunks=[content_chunk("a"), content_chunk("b"), finish()],
+        stall_after=2,
+        stall_timeout_s=WAIT_BUDGET_S,
+    )
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        with FakeChatServer(script=script) as server:
+            engine = _build(base_url=server.base_url, idle_timeout_s=0.5)
+            engine.submit_utterance("say something")
+            assert engine.run_turn() is True
+
+    assert engine.stream_timeouts == 1
+    assert REASON_STREAM_IDLE in caplog.text
+
+
+def test_the_loop_survives_a_stalled_stream_and_runs_the_next_turn() -> None:
+    """ "...and the loop continues" — the second half of the acceptance line."""
+
+    def scripted(payload: dict) -> Script:
+        if len(payload["messages"]) <= 2:  # the first turn: system + one perception
+            return Script(chunks=[content_chunk("a"), finish()], stall_after=1, stall_timeout_s=1.0)
+        return Script(chunks=[content_chunk("recovered"), finish()])
+
+    with FakeChatServer(script_fn=scripted) as server:
+        engine = _build(base_url=server.base_url, idle_timeout_s=0.5)
+        engine.submit_utterance("first")
+        engine.run_turn()
+        engine.submit_utterance("second")
+        engine.run_turn()
+
+    assert engine.turns == 2
+    assert engine.stream_timeouts == 1
+    assert engine.last_text == "recovered"
+
+
+def test_the_stall_bound_is_inter_chunk_idle_not_total_elapsed() -> None:
+    """A long think is not a stall: many chunks, each within the bound, total well over it.
+
+    The measured shape this pins (43.2 s to first content, 0.124 s largest
+    inter-chunk gap) is why the bound must be armed per-read. Armed on total
+    elapsed, this test fails — which is the point.
+    """
+    idle = 0.5
+    chunks = [content_chunk(str(i)) for i in range(8)] + [finish()]
+    script = Script(chunks=chunks, chunk_delay_s=idle * 0.4)
+
+    with FakeChatServer(script=script) as server:
+        engine = _build(base_url=server.base_url, idle_timeout_s=idle)
+        engine.submit_utterance("think hard")
+        engine.run_turn()
+
+    # 9 chunks x 0.2 s = ~1.8 s of wall clock against a 0.5 s bound.
+    assert engine.stream_timeouts == 0
+    assert engine.last_text == "01234567"
+
+
+def test_a_streamed_tool_call_is_dispatched_and_its_result_returns_over_the_wire() -> None:
+    """End to end over a socket: assembled from deltas, dispatched, fed back, answered.
+
+    The other context tests inject a ready-made ``ToolCall``; this one makes the
+    real streaming assembler produce it, so the two ends of the turn loop are
+    connected once rather than each tested against its own idea of the shape.
+    """
+
+    def scripted(payload: dict) -> Script:
+        if any(message.get("role") == "tool" for message in payload["messages"]):
+            return Script(chunks=[content_chunk("said it"), finish()])
+        return Script(
+            chunks=[
+                tool_call_chunk(index=0, call_id="call_7", name=SPEAK),
+                tool_call_chunk(index=0, arguments='{"text": "hello"}'),
+                finish("tool_calls"),
+            ]
+        )
+
+    registry = RecordingRegistry()
+    with FakeChatServer(script_fn=scripted) as server:
+        engine = _build(base_url=server.base_url, registry=registry)
+        engine.submit_utterance("say hello")
+        engine.run_turn()
+
+    assert registry.dispatched == [(SPEAK, '{"text": "hello"}', "call_7")]
+    assert server.requests[1]["messages"][-1]["role"] == "tool"
+    assert engine.last_text == "said it"
+
+
+def test_an_unreachable_endpoint_is_a_named_drop_not_a_raise(caplog) -> None:
+    """A dead gateway must not raise into the layer's loop."""
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        engine = _build(base_url="http://127.0.0.1:1")
+        engine.submit_utterance("anyone home?")
+        assert engine.run_turn() is True
+
+    assert engine.stream_failures == 1
+    assert REASON_ENDPOINT_UNREACHABLE in caplog.text
+
+
+def test_the_streamed_reasoning_reaches_the_engine() -> None:
+    """The gateway's ``delta.reasoning`` is what fills the thinking feed."""
+    script = Script(
+        chunks=[reasoning_chunk("Here"), reasoning_chunk(" we go"), content_chunk("hi"), finish()]
+    )
+    sink = Sink()
+    with FakeChatServer(script=script) as server:
+        engine = _build(base_url=server.base_url, export=sink.hook())
+        engine.submit_utterance("hello")
+        engine.run_turn()
+
+    thinking = sink.of_type("thinking")
+    assert len(thinking) == 1
+    assert "Here we go" in thinking[0].text
+
+
+# =========================================================================== #
+# AC 2 — the model is a per-request field from process-scoped env only        #
+# =========================================================================== #
+
+
+def test_the_turn_uses_the_worker_model_and_ask_uses_the_senses_model() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.submit_cue("a behavior rule fired (pat-acknowledge)")
+    engine.run_turn()
+    engine.ask("describe the clip")
+
+    assert turn.models == ["worker", "senses"]
+
+
+def test_the_role_names_are_the_shipped_defaults() -> None:
+    """lobes' ``resolve_model`` accepts ROLE names, so the default IS the role."""
+    models = EmbodyModels.resolve(env={})
+    assert (models.worker, models.senses) == (ROLE_WORKER, ROLE_SENSES)
+    assert models.model_for(ROLE_WORKER) == ROLE_WORKER
+    assert models.model_for(ROLE_SENSES) == ROLE_SENSES
+
+
+def test_models_resolve_from_process_env_only() -> None:
+    models = EmbodyModels.resolve(
+        env={ENV_WORKER_MODEL: "qwen-on-thor", ENV_SENSES_MODEL: "gemma-on-orin"}
+    )
+    assert (models.worker, models.senses) == ("qwen-on-thor", "gemma-on-orin")
+
+
+def test_an_explicit_argument_wins_over_the_environment() -> None:
+    models = EmbodyModels.resolve(env={ENV_WORKER_MODEL: "from-env"}, worker="explicit")
+    assert models.worker == "explicit"
+
+
+def test_resolving_and_running_never_mutate_the_environment(monkeypatch) -> None:
+    """No global mutation: ``environment.d`` would re-point the runtime classifier too."""
+    monkeypatch.setenv(ENV_WORKER_MODEL, "qwen-on-thor")
+    before = dict(os.environ)
+
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = EmbodyTurnEngine(registry=RecordingRegistry(), turn_fn=turn)
+    engine.submit_utterance("hello")
+    engine.run_turn()
+    engine.ask("and?")
+
+    assert dict(os.environ) == before
+    assert turn.models == ["qwen-on-thor", ROLE_SENSES]
+
+
+def test_the_engine_reads_no_file_and_writes_no_environment_variable() -> None:
+    """AST proof: process-scoped env only — no ``environment.d``, no ``os.environ[...] =``."""
+    source = Path(engine_mod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # ``environment.d`` may appear in prose (the docstring explains WHY it is
+    # not read); it must never appear in a path the code actually uses.
+    docstrings = _docstring_ids(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) not in docstrings:
+                assert "environment" not in node.value.lower() or node.value.startswith("REACHY_")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else ""
+            attr = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+            assert name != "open", "the layer's model config must not read a file"
+            assert attr not in {"read_text", "read_bytes", "putenv", "setenv"}, attr
+        if isinstance(node, (ast.Assign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                assert not _is_environ_write(target), "the model must never be set globally"
+
+
+def _docstring_ids(tree: ast.AST) -> set[int]:
+    """Object ids of every docstring node, so prose is exempt from the literal scan."""
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", [])
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            ids.add(id(body[0].value))
+    return ids
+
+
+def _is_environ_write(target: ast.expr) -> bool:
+    return (
+        isinstance(target, ast.Subscript)
+        and isinstance(target.value, ast.Attribute)
+        and target.value.attr == "environ"
+    )
+
+
+# =========================================================================== #
+# AC 3 — results + refusals in context; the export contract per turn          #
+# =========================================================================== #
+
+
+def test_a_tool_result_is_appended_to_the_conversation_the_model_sees_next() -> None:
+    turn = ScriptedTurn(
+        TurnResult(content="", tool_calls=[_speak_call("hello")], finish_reason="tool_calls"),
+        TurnResult(content="done", finish_reason="stop"),
+    )
+    registry = RecordingRegistry({"ok": True, "voice": SPEAK})
+    engine = _build(registry=registry, turn_fn=turn)
+    engine.submit_utterance("say hello")
+    engine.run_turn()
+
+    second_round = turn.calls[1]["messages"]
+    assert second_round[-2]["role"] == "assistant"
+    assert second_round[-1] == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": json.dumps({"ok": True, "voice": SPEAK}),
+    }
+
+
+def test_a_named_refusal_reaches_the_model_verbatim(tmp_path) -> None:
+    """The real registry's refusal — name and validator words — enters the context."""
+    bad_rule = ToolCall(
+        id="call_9",
+        name=CREATE_RULE,
+        arguments={"id": "not-namespaced"},
+        arguments_json=json.dumps({"id": "not-namespaced", "when": {}, "run": "nod"}),
+    )
+    turn = ScriptedTurn(
+        TurnResult(content="", tool_calls=[bad_rule], finish_reason="tool_calls"),
+        TurnResult(content="understood", finish_reason="stop"),
+    )
+    registry = EmbodyToolRegistry(rules_path=tmp_path / "rules.toml", reload_seam=lambda _t: None)
+    engine = _build(registry=registry, turn_fn=turn)
+    engine.submit_utterance("make a rule")
+    engine.run_turn()
+
+    tool_message = turn.calls[1]["messages"][-1]
+    payload = json.loads(tool_message["content"])
+    assert payload["ok"] is False
+    assert payload["refusal"] == REFUSAL_RULE_NAMESPACE
+    assert engine.refusals == 1
+
+
+def test_every_turn_emits_one_thinking_block_carrying_its_cues() -> None:
+    sink = Sink()
+    turn = ScriptedTurn(TurnResult(content="quiet", finish_reason="stop"))
+    engine = _build(turn_fn=turn, export=sink.hook())
+    engine.submit_cue("felt a gentle scratch on the head")
+    engine.submit_utterance("who's there?")
+    engine.run_turn()
+
+    thinking = sink.of_type("thinking")
+    assert len(thinking) == 1
+    assert thinking[0].cues == ["felt a gentle scratch on the head", 'heard: "who\'s there?"']
+    assert "quiet" in thinking[0].text
+    assert thinking[0].ts == 1234.5
+
+
+def test_a_voice_tool_call_emits_a_message_block() -> None:
+    sink = Sink()
+    turn = ScriptedTurn(
+        TurnResult(content="", tool_calls=[_speak_call("hello there")], finish_reason="tool_calls"),
+        TurnResult(content="", finish_reason="stop"),
+    )
+    engine = _build(turn_fn=turn, export=sink.hook())
+    engine.submit_utterance("hi")
+    engine.run_turn()
+
+    messages = sink.of_type("message")
+    assert [event.text for event in messages] == ["hello there"]
+
+
+def test_an_emoji_in_the_reply_emits_an_emotion_block_with_its_pose() -> None:
+    sink = Sink()
+    turn = ScriptedTurn(TurnResult(content="🤔 let me think", finish_reason="stop"))
+    engine = _build(turn_fn=turn, export=sink.hook())
+    engine.submit_utterance("hard question")
+    engine.run_turn()
+
+    emotions = sink.of_type("emotion")
+    assert [(event.emoji, event.pose) for event in emotions] == [("🤔", {"head_pitch": -5.0})]
+
+
+def test_an_unknown_emoji_exports_a_null_pose() -> None:
+    """The schema requires ``pose: null`` for an emoji the catalog does not know."""
+    sink = Sink()
+    turn = ScriptedTurn(TurnResult(content="🦄 unusual", finish_reason="stop"))
+    engine = _build(turn_fn=turn, export=sink.hook())
+    engine.submit_utterance("?")
+    engine.run_turn()
+
+    assert [(e.emoji, e.pose) for e in sink.of_type("emotion")] == [("🦄", None)]
+
+
+def test_first_emoji_ignores_ordinary_text() -> None:
+    assert first_emoji("no expression here, just words. 1234 :-)") is None
+    assert first_emoji("plain 🎉 party") == "🎉"
+
+
+def test_a_refusal_is_visible_in_the_exported_thinking_text(tmp_path) -> None:
+    """The spec's red-team line: every refusal visible in the export feed."""
+    sink = Sink()
+    bad_rule = ToolCall(
+        id="call_9",
+        name=CREATE_RULE,
+        arguments={"id": "nope"},
+        arguments_json=json.dumps({"id": "nope", "when": {}, "run": "nod"}),
+    )
+    turn = ScriptedTurn(
+        TurnResult(content="", tool_calls=[bad_rule], finish_reason="tool_calls"),
+        TurnResult(content="ok", finish_reason="stop"),
+    )
+    registry = EmbodyToolRegistry(rules_path=tmp_path / "rules.toml", reload_seam=lambda _t: None)
+    engine = _build(registry=registry, turn_fn=turn, export=sink.hook())
+    engine.submit_utterance("make a rule")
+    engine.run_turn()
+
+    text = sink.of_type("thinking")[0].text
+    assert CREATE_RULE in text
+    assert REFUSAL_RULE_NAMESPACE in text
+
+
+def test_a_failed_turn_still_reaches_the_export_feed_by_name() -> None:
+    """No silent no-op: a drop names itself on the feed as well as in the journal."""
+    sink = Sink()
+    engine = _build(base_url="http://127.0.0.1:1", export=sink.hook())
+    engine.submit_utterance("hello?")
+    engine.run_turn()
+
+    assert REASON_ENDPOINT_UNREACHABLE in sink.of_type("thinking")[0].text
+
+
+# =========================================================================== #
+# The loop itself                                                             #
+# =========================================================================== #
+
+
+def test_no_input_means_no_llm_call() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    assert engine.run_turn() is False
+    assert turn.calls == []
+
+
+def test_cues_and_utterances_are_both_rendered_into_the_turn() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.submit_cue("a behavior rule fired (pat-acknowledge): now doing nod")
+    engine.submit_utterance("are you awake?")
+    engine.run_turn()
+
+    user = turn.last_messages()[-1]
+    assert user["role"] == "user"
+    assert "pat-acknowledge" in user["content"]
+    assert "are you awake?" in user["content"]
+
+
+def test_input_is_consumed_by_the_turn_that_ran() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.submit_cue("something happened")
+    engine.run_turn()
+    assert engine.pending == 0
+    assert engine.run_turn() is False
+
+
+def test_the_input_buffer_is_bounded_and_names_its_drop(caplog) -> None:
+    engine = _build(max_pending=2)
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        assert engine.submit_cue("one") is True
+        assert engine.submit_cue("two") is True
+        assert engine.submit_cue("three") is False
+
+    assert engine.dropped_inputs == 1
+    assert REASON_INPUT_QUEUE_FULL in caplog.text
+    assert engine.pending == 2
+
+
+def test_an_empty_submission_is_a_named_drop(caplog) -> None:
+    engine = _build()
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        assert engine.submit_utterance("   ") is False
+    assert REASON_EMPTY_INPUT in caplog.text
+    assert engine.pending == 0
+
+
+def test_the_tool_loop_is_bounded(caplog) -> None:
+    """A model that never stops calling tools cannot spin forever."""
+    forever = TurnResult(content="", tool_calls=[_speak_call("again")], finish_reason="tool_calls")
+    turn = ScriptedTurn(forever)
+    engine = _build(turn_fn=turn, max_tool_rounds=3)
+    engine.submit_utterance("go")
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        engine.run_turn()
+
+    assert len(turn.calls) == 3
+    assert REASON_TOOL_ROUNDS_EXHAUSTED in caplog.text
+
+
+def test_the_registry_tools_are_published_on_every_round() -> None:
+    """Never a no-tools round: lobes-cli#161 makes a tool call on such a round lossy."""
+    turn = ScriptedTurn(
+        TurnResult(content="", tool_calls=[_speak_call("hi")], finish_reason="tool_calls"),
+        TurnResult(content="done", finish_reason="stop"),
+    )
+    engine = _build(turn_fn=turn)
+    engine.submit_utterance("go")
+    engine.run_turn()
+
+    assert all(call["kwargs"].get("tools") for call in turn.calls)
+
+
+def test_what_the_mouth_already_said_enters_the_next_turn_without_triggering_one() -> None:
+    """The realtime session speaks on its own; the thinking mind must know what it said."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.note_spoken("I'm right here.")
+    assert engine.pending == 0
+    assert engine.run_turn() is False
+
+    engine.submit_utterance("hello?")
+    engine.run_turn()
+    assert "I'm right here." in turn.last_messages()[-1]["content"]
+
+
+def test_a_spoken_line_is_carried_into_one_turn_and_then_forgotten() -> None:
+    """Drained by the turn that showed it — otherwise every later turn re-reads it."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.note_spoken("already said this")
+    engine.submit_utterance("one")
+    engine.run_turn()
+    engine.submit_utterance("two")
+    engine.run_turn()
+
+    assert "already said this" in turn.calls[0]["messages"][-1]["content"]
+    assert "already said this" not in turn.calls[1]["messages"][-1]["content"]
+
+
+def test_a_spoken_reply_is_exported_as_a_message_block() -> None:
+    sink = Sink()
+    engine = _build(export=sink.hook())
+    engine.note_spoken("hello from the realtime session")
+    assert [event.text for event in sink.of_type("message")] == ["hello from the realtime session"]
+
+
+def test_history_is_bounded() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, history_maxlen=2)
+    for index in range(5):
+        engine.submit_utterance(f"turn {index}")
+        engine.run_turn()
+
+    # system + 2 history pairs + the current perception
+    assert len(turn.last_messages()) == 1 + 2 * 2 + 1
+
+
+def test_run_stops_on_the_stop_predicate() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, sleep=lambda _s: None)
+    calls = {"n": 0}
+
+    def stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    def before_turn() -> None:
+        engine.submit_cue("tick")
+
+    ran = engine.run(stop=stop, before_turn=before_turn)
+    assert ran == 3
+
+
+def test_run_bounded_by_max_turns() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, sleep=lambda _s: None)
+    ran = engine.run(max_turns=2, before_turn=lambda: engine.submit_cue("tick"))
+    assert ran == 2
+
+
+def test_the_cancel_seam_is_handed_to_the_stream() -> None:
+    """A closing layer aborts an in-flight stream rather than waiting it out."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, cancel=lambda: True)
+    engine.submit_cue("tick")
+    engine.run_turn()
+    assert callable(turn.calls[0]["kwargs"]["cancel"])
+    assert turn.calls[0]["kwargs"]["cancel"]() is True
+
+
+def test_submit_cues_takes_what_the_cue_mapper_returns() -> None:
+    """The composition root hands ``cues_for_line``'s list straight in."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    assert engine.submit_cues(["a rule fired", "", "felt a gentle scratch"]) == 2
+    assert engine.pending == 2
+
+
+def test_noting_an_empty_reply_is_a_no_op() -> None:
+    sink = Sink()
+    engine = _build(export=sink.hook())
+    engine.note_spoken("   ")
+    assert sink.events == []
+
+
+def test_a_turn_that_produces_nothing_at_all_is_named(caplog) -> None:
+    """No text, no reasoning, no tool call — a silence the journal can explain."""
+    turn = ScriptedTurn(TurnResult(content="", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.submit_cue("a camera frame is available")
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        engine.run_turn()
+    assert "silent-turn" in caplog.text
+
+
+def test_a_raising_turn_function_is_a_named_drop_not_a_crash(caplog) -> None:
+    """Whatever goes wrong in a turn, the layer is still there for the next one."""
+
+    def explode(_messages, **_kwargs):
+        raise ValueError("model client blew up")
+
+    engine = _build(turn_fn=explode)
+    engine.submit_utterance("hello")
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        assert engine.run_turn() is True
+    assert engine.stream_failures == 1
+    assert "stream-failed" in caplog.text
+
+
+def test_a_reset_connection_is_its_own_named_drop(caplog) -> None:
+    """A socket reset is not an idle stall and must not be counted as one."""
+
+    def reset(_messages, **_kwargs):
+        raise ConnectionResetError("peer went away")
+
+    engine = _build(turn_fn=reset)
+    engine.submit_utterance("hello")
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        engine.run_turn()
+    assert engine.stream_timeouts == 0
+    assert engine.stream_failures == 1
+    assert "stream-failed" in caplog.text
+
+
+def test_a_modifier_is_never_mistaken_for_the_expression() -> None:
+    """A variation selector / ZWJ is a modifier; the emoji after it is the face."""
+    assert first_emoji("️\U0001f642 hello") == "🙂"
+
+
+def test_max_tokens_is_forwarded_only_when_set() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, max_tokens=256)
+    engine.submit_cue("tick")
+    engine.run_turn()
+    assert turn.calls[0]["kwargs"]["max_tokens"] == 256
+
+    plain = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    other = _build(turn_fn=plain)
+    other.submit_cue("tick")
+    other.run_turn()
+    assert "max_tokens" not in plain.calls[0]["kwargs"]
+
+
+def test_run_without_a_producer_stops_rather_than_spinning() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, sleep=lambda _s: None)
+    engine.submit_cue("only one")
+    assert engine.run(max_turns=5) == 1
+
+
+def test_every_drop_reason_is_exported_and_unique() -> None:
+    """One vocabulary shared by the journal, the export feed and these tests."""
+    assert REASON_STREAM_IDLE in DROP_REASONS
+    assert len(DROP_REASONS) == len(set(DROP_REASONS))
+    for reason in DROP_REASONS:
+        assert reason == reason.lower().strip()
+        assert " " not in reason
+
+
+@pytest.mark.parametrize("role", [ROLE_WORKER, ROLE_SENSES])
+def test_an_unknown_role_is_refused_rather_than_guessed(role: str) -> None:
+    models = EmbodyModels.resolve(env={})
+    assert models.model_for(role)
+    with pytest.raises(ValueError):
+        models.model_for("cortex")
+
+
+def test_the_goto_tool_name_is_imported_not_retyped() -> None:
+    """A drift canary: the engine's voice-tool set names the shipped constants."""
+    assert GOTO not in engine_mod.DEFAULT_VOICE_TOOLS
+    assert SPEAK in engine_mod.DEFAULT_VOICE_TOOLS
