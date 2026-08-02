@@ -26,16 +26,19 @@ that wedges the worker fails the test instead of hanging the suite.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import logging
 import socket
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from reachy.cli._errors import CliError
+from reachy.speech import realtime
 from reachy.speech import realtime_wire as wire
 from reachy.speech.realtime import (
     NO_KEY_SENTINEL,
@@ -67,6 +70,9 @@ _TIMEOUT = WAIT_BUDGET_S
 _RATE = 16000
 #: Long enough that no scheduling delay can age a pre-queued chunk out.
 _NEVER_STALE = 120.0
+#: This module's own source — scanned by the ears-only static pin below, which
+#: also covers the session mechanics the ARMED duplex session shares from here.
+_MODULE_PATH = Path(realtime.__file__)
 
 _ENV_VARS = (REALTIME_URL_ENV, REALTIME_API_KEY_ENV, OPENAI_URL_BASE_ENV, OPENAI_API_KEY_ENV)
 
@@ -203,7 +209,8 @@ def test_happy_path_yields_exactly_one_utterance_carrying_the_transcript() -> No
             utterance = _take(client)
             assert utterance is not None
             assert utterance.text == "hello robot"
-            assert isinstance(utterance.t, float) and utterance.t > 0.0
+            assert isinstance(utterance.t, float)
+            assert utterance.t > 0.0
             assert utterance.item_id == server.last_item_id
             assert utterance.session_id == server.last_session_id
             assert client.take_utterance() is None
@@ -277,6 +284,77 @@ def test_the_session_never_sends_response_create() -> None:
     assert types  # something really was sent
     assert "response.create" not in types
     assert all(not name.startswith("response.") for name in types)
+
+
+def test_this_module_cannot_construct_a_response_create_at_all() -> None:
+    """Ears-only, STATICALLY — the half the behavioural test above cannot reach.
+
+    The test above proves that one scripted exchange sent no ``response.create``.
+    This one proves the frame is unreachable: the module never names the wire's
+    arming builder, never writes the event type as a literal, and cannot
+    hand-roll a payload past either check because it does not import ``json``.
+
+    It matters more since the duplication cleanup than it did before. This
+    module is now the ONE OWNER of the session mechanics the ARMED duplex
+    session runs on too (its "Shared session mechanics" section), so a shared
+    abstraction is exactly where an arming path could grow and reach the
+    ears-only client for free. The three checks below are what stops that being
+    a matter of discipline: adding ``arm`` to the shared code fails this test
+    the moment it can build the frame.
+
+    The mirror image — that the DUPLEX session's send surface, which now spans
+    both files, is still exactly append + response.create + PONG + CLOSE — is
+    pinned by the ``test_h13_*`` family in ``tests/test_realtime_duplex.py``.
+    """
+    source = _MODULE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    builders: set[str] = set()
+    literals: set[str] = set()
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name and name.startswith("build_") and name.endswith("_event"):
+                builders.add(name)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.startswith("response."):
+                literals.add(node.value)
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+
+    # The ONE permitted mention is the bare prefix the dispatcher matches on to
+    # IGNORE an inbound ``response.*`` event — a read, not a write, and not a
+    # complete event type, so nothing can send it as one.
+    assert builders == {"build_append_event"}, "the ears-only owner gained an event builder"
+    assert literals <= {"response."}, f"a response.* event type is written here: {sorted(literals)}"
+    assert "json" not in imported, "this module could hand-roll an event past the scans above"
+
+
+def test_the_shared_observables_mixin_can_only_ever_read() -> None:
+    """The one shared thing both sessions INHERIT must stay incapable of acting.
+
+    Everything else they share is a free function taking explicit seams, which
+    cannot be inherited by accident. ``_SessionObservables`` is the exception,
+    and it is safe only while it remains five read-only properties: a base
+    class that could carry behaviour is exactly where an arming path would grow
+    and reach this ears-only client for free. So: every attribute it defines
+    must be a ``property``, and it must have no ``__init__`` of its own.
+    """
+    defined = {
+        name: value
+        for name, value in vars(realtime._SessionObservables).items()
+        if not name.startswith("__")
+    }
+    assert defined, "the mixin is empty — this pin would be vacuous"
+    assert "__init__" not in vars(realtime._SessionObservables), "the mixin gained state"
+    offenders = sorted(name for name, value in defined.items() if not isinstance(value, property))
+    assert not offenders, f"the shared mixin gained something that is not a read: {offenders}"
+    # Both clients really do take their observables from it, or the pin is moot.
+    assert issubclass(RealtimeTranscriber, realtime._SessionObservables)
 
 
 def test_an_inbound_response_event_is_ignored_without_error() -> None:
@@ -396,7 +474,8 @@ def test_a_non_upgrade_request_is_refused_426_and_named(
 
     assert _count_reason(sense_log, REASON_HANDSHAKE_REFUSED) == 1
     assert any("426" in message for message in _messages(sense_log))
-    assert server.refusals and server.refusals[0] == (426, "upgrade_required")
+    assert server.refusals
+    assert server.refusals[0] == (426, "upgrade_required")
 
 
 def test_close_mid_stream_is_a_named_drop_and_a_backoff_reconnect_follows(
@@ -712,7 +791,8 @@ def test_the_context_manager_starts_and_closes_the_worker() -> None:
     with FakeRealtimeServer(Scenario.HAPPY_PATH) as server:
         with RealtimeTranscriber(url=server.url, sample_rate=_RATE) as client:
             assert _established(client)
-        assert client.worker is not None and client.worker.is_alive() is False
+        assert client.worker is not None
+        assert client.worker.is_alive() is False
     assert _wait_until(lambda: threading.active_count() <= before, timeout=2.0)
 
 
@@ -779,7 +859,8 @@ def test_the_utterance_callback_receives_the_same_utterance_as_the_queue() -> No
         finally:
             client.close()
 
-    assert utterance is not None and utterance.text == "ping"
+    assert utterance is not None
+    assert utterance.text == "ping"
     assert seen == [utterance]
 
 
@@ -794,7 +875,8 @@ def test_a_raising_utterance_callback_never_stops_the_session() -> None:
             utterance = _take(client)
         finally:
             client.close()
-    assert utterance is not None and utterance.text == "still here"
+    assert utterance is not None
+    assert utterance.text == "still here"
 
 
 def test_a_transcription_with_no_usable_text_is_a_named_drop(
@@ -819,7 +901,8 @@ def test_a_full_utterance_queue_evicts_the_oldest_transcript(
         client._dispatch_event({"type": TRANSCRIPTION_COMPLETED, "text": "first"})
         client._dispatch_event({"type": TRANSCRIPTION_COMPLETED, "text": "second"})
         newest = client.take_utterance()
-        assert newest is not None and newest.text == "second"
+        assert newest is not None
+        assert newest.text == "second"
         assert client.take_utterance() is None
     finally:
         client.close()
@@ -833,7 +916,8 @@ def test_the_openai_transcript_field_name_is_honoured_as_well_as_lobes_text() ->
         utterance = client.take_utterance()
     finally:
         client.close()
-    assert utterance is not None and utterance.text == "words"
+    assert utterance is not None
+    assert utterance.text == "words"
 
 
 def test_audio_queued_long_before_a_session_is_discarded_as_stale() -> None:

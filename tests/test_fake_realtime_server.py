@@ -209,7 +209,8 @@ def test_happy_path_sequence_and_configurable_transcript() -> None:
 
         created = client.read_event()
         assert created["type"] == "session.created"
-        assert "session_id" in created and created["session_id"]
+        assert "session_id" in created
+        assert created["session_id"]
         assert created["config"]["input_audio_format"] == "pcm16"
 
         started = client.read_event()
@@ -528,8 +529,10 @@ def test_last_session_and_item_ids_are_populated_and_opaque_strings() -> None:
             client.read_event()
         client.close()
 
-    assert isinstance(server.last_session_id, str) and server.last_session_id
-    assert isinstance(server.last_item_id, str) and server.last_item_id
+    assert isinstance(server.last_session_id, str)
+    assert server.last_session_id
+    assert isinstance(server.last_item_id, str)
+    assert server.last_item_id
 
 
 # --- scenario accepts either the enum or its plain string value -----------------------------
@@ -740,7 +743,8 @@ def test_last_response_id_is_populated_and_opaque() -> None:
         while event["type"] != "response.done":
             event = client.read_event()
         client.close()
-    assert isinstance(server.last_response_id, str) and server.last_response_id
+    assert isinstance(server.last_response_id, str)
+    assert server.last_response_id
     assert server.last_response_id != server.last_session_id
     assert server.last_response_id != server.last_item_id
 

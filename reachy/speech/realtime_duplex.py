@@ -86,8 +86,11 @@ Plus protocol-level PONG and CLOSE frames, which are RFC 6455 mechanics rather
 than session events. **No tool call ever travels over this socket.** Tool use
 rides the HTTP ``/v1/chat/completions`` lane beside it (the layer's turn
 engine, task t10); if lobes later ships socket tool-calls, adopting them is a
-new arc. Both halves are pinned by AST scan over this file, so a third sender
-added later under any name fails the suite immediately.
+new arc. Both halves are pinned by AST scan over this file **and over**
+:mod:`reachy.speech.realtime` — the PONG and CLOSE frames are emitted by the
+shared session mechanics that live there, so a scan of this file alone would
+be blind to half of what actually leaves. A third sender added later under any
+name, in either file, fails the suite immediately.
 
 --------------------------------------------------------------------------
 Arming: once per session, on ``session.created``
@@ -162,18 +165,14 @@ from __future__ import annotations
 import base64
 import logging
 import queue
-import select
 import socket
-import ssl
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
-from urllib.parse import urlsplit
 
 import numpy as np
 
-from reachy import senselog
 from reachy.speech import realtime_wire as wire
 
 # ---------------------------------------------------------------------------
@@ -181,17 +180,24 @@ from reachy.speech import realtime_wire as wire
 #
 # These two modules are the two ends of ONE wire, and this arc has already paid
 # once (the t4/t6 audio-tee integration) for two agents independently deriving
-# one protocol: it does not fail loudly, it produces plausible garbage. So the
-# endpoint/key precedence, the connect-URL builder, the utterance record, the
-# named reason strings, the buffered frame reader and the float->PCM16
-# coercion all keep ONE owner — reachy.speech.realtime — and are imported here
-# rather than copied. Four of them are private names in that module; importing
-# a leading-underscore name from a SIBLING module of the same package is the
-# lesser evil against a second copy that can drift, and it is deliberate: none
-# of them is worth a public API change to a module the runtime holds live.
+# one protocol: it does not fail loudly, it produces plausible garbage. So
+# everything both sessions do IDENTICALLY keeps ONE owner —
+# reachy.speech.realtime, see its "Shared session mechanics" section — and is
+# imported here rather than copied: the endpoint/key precedence, the connect-URL
+# builder, the utterance record, the named reason strings, the buffered frame
+# reader, the float->PCM16 coercion, the handshake, the frame pump, the up/down
+# latch and the backoff arithmetic. Most are private names in that module;
+# importing a leading-underscore name from a SIBLING module of the same package
+# is the lesser evil against a second copy that can drift, and it is deliberate:
+# none of them is worth a public API change to a module the runtime holds live.
+#
+# What this module does NOT inherit is policy — its reconnect loop, its 404
+# lane diagnosis, its pull-source staleness drain, its latched overflow
+# reporting and its ARMING are all its own, and the shared code has no notion
+# of any of them. In particular nothing imported here can build a
+# `response.create`: arming lives in `_send_pending_arm` below and nowhere else.
 # ---------------------------------------------------------------------------
 from reachy.speech.realtime import (
-    _ERROR_REASONS,
     ERROR_EVENT,
     OPENAI_API_KEY_ENV,
     OPENAI_URL_BASE_ENV,
@@ -214,7 +220,20 @@ from reachy.speech.realtime import (
     Utterance,
     _as_str,
     _FrameReader,
+    _Handshake,
+    _server_error,
+    _session_created_line,
+    _SessionLost,
+    _SessionObservables,
+    _SessionState,
     _to_pcm16,
+    _utterance_from,
+    _vad_stage_line,
+    _ws_connect,
+    _ws_pump_frames,
+    _ws_release,
+    _ws_run_session,
+    _ws_send,
     connect_url,
     resolve_realtime_api_key,
     resolve_realtime_base_url,
@@ -341,7 +360,6 @@ DEFAULT_MAX_RESPONSE_BYTES = DEFAULT_OUTPUT_SAMPLE_RATE * 2 * 60
 DEFAULT_STALE_DRAIN_MAX_CHUNKS = 64
 #: Chunks sent per pump iteration, so the send side cannot starve the read side.
 _MAX_CHUNKS_PER_PUMP = 8
-_MAX_FRAMES_PER_PUMP = 32
 
 DEFAULT_CONNECT_TIMEOUT_S = 5.0
 DEFAULT_FRAME_TIMEOUT_S = 5.0
@@ -350,8 +368,6 @@ DEFAULT_BACKOFF_INITIAL_S = 0.5
 DEFAULT_BACKOFF_MAX_S = 30.0
 DEFAULT_STABLE_AFTER_S = 10.0
 DEFAULT_JOIN_TIMEOUT_S = 2.0
-#: Socket-level timeout: the granularity at which the worker re-checks close().
-_SOCKET_TIMEOUT_S = 0.2
 #: How long the mouth thread parks between queue polls (bounds close()).
 _PLAYBACK_POLL_S = 0.05
 
@@ -408,16 +424,7 @@ class _PendingResponse:
     overflowed: bool = False
 
 
-class _SessionLost(Exception):
-    """Internal: this session ended. Never escapes the worker thread."""
-
-    def __init__(self, reason: str, detail: str = "") -> None:
-        super().__init__(f"{reason} {detail}".strip())
-        self.reason = reason
-        self.detail = detail
-
-
-class RealtimeDuplexSession:
+class RealtimeDuplexSession(_SessionObservables):
     """One armed ``/v1/realtime`` session: audio in, words + spoken replies out.
 
     See the module docstring for the seam contracts, the closed send surface,
@@ -496,8 +503,6 @@ class RealtimeDuplexSession:
         self._connect_timeout_s = max(0.1, float(connect_timeout_s))
         self._frame_timeout_s = max(0.1, float(frame_timeout_s))
         self._poll_interval_s = max(0.001, float(poll_interval_s))
-        self._backoff_initial_s = max(0.0, float(backoff_initial_s))
-        self._backoff_max_s = max(self._backoff_initial_s, float(backoff_max_s))
         self._stable_after_s = max(0.0, float(stable_after_s))
         self._join_timeout_s = max(0.0, float(join_timeout_s))
         self._on_utterance = on_utterance
@@ -512,8 +517,16 @@ class RealtimeDuplexSession:
         self.mouth: threading.Thread | None = None
         self._start_lock = threading.Lock()
         self._sock_lock = threading.Lock()
-        self._wake = threading.Event()
         self._closed = False
+        #: The session lifecycle: identity, the up/down latch, its counters,
+        #: the wake signal and the reconnect backoff (SHARED).
+        self._state = _SessionState(
+            STAGE,
+            SOURCE,
+            is_closed=lambda: self._closed,
+            backoff_initial_s=backoff_initial_s,
+            backoff_max_s=backoff_max_s,
+        )
 
         # --- worker-thread state ------------------------------------------- #
         self._sock: socket.socket | None = None
@@ -521,7 +534,6 @@ class RealtimeDuplexSession:
         self._connected_at = 0.0
         self._session_id: str | None = None
         self._pending: dict[str, _PendingResponse] = {}
-        self._session_seq = 0
         self._utterance_seq = 0
         self._source_failed_logged = False
         #: Overflow reasons already reported for the CURRENT episode. `_offer`
@@ -534,10 +546,6 @@ class RealtimeDuplexSession:
 
         # --- cross-thread flags (single writer each; plain reads are atomic) - #
         self._arm_pending = False
-        self._up = False
-        self._down = True
-        self._down_logged = False
-        self._session_event = "sess0"
         self._speaking = False
         self._muted_logged = False
         self._no_sink_logged = False
@@ -545,15 +553,12 @@ class RealtimeDuplexSession:
         self._playback_failed_logged = False
         self._lane_unavailable = False
 
-        self.sessions = 0
-        self.connect_failures = 0
         self.chunks_sent = 0
         self.bytes_sent = 0
         self.utterances = 0
         self.responses = 0
         self.response_audio_bytes = 0
         self.arms_sent = 0
-        self.pongs_sent = 0
         self.ignored_events = 0
         self.muted_chunks = 0
         self.stale_chunks_discarded = 0
@@ -587,7 +592,7 @@ class RealtimeDuplexSession:
                 return
             self._closed = True
             worker, mouth = self.worker, self.mouth
-        self._wake.set()
+        self._state.wake()
         # Shut the socket DOWN (not closed) from here: it unblocks a worker
         # parked in recv/sendall without releasing the fd number out from under
         # it. The worker's own teardown does the close.
@@ -621,7 +626,7 @@ class RealtimeDuplexSession:
         ``session.created`` unless ``arm_on_connect=False``.
         """
         self._arm_pending = True
-        self._wake.set()
+        self._state.wake()
 
     def take_utterance(self) -> Utterance | None:
         """Pop the oldest heard utterance, or ``None``. **Ungated** — see c4."""
@@ -653,16 +658,6 @@ class RealtimeDuplexSession:
         return connect_url(self.url, self._sample_rate)
 
     @property
-    def connected(self) -> bool:
-        """Whether a session is established right now."""
-        return self._up
-
-    @property
-    def session_down(self) -> bool:
-        """Whether the client is in the LATCHED down state (no session)."""
-        return self._down
-
-    @property
     def lane_unavailable(self) -> bool:
         """Whether the last refusal was a 404 (the gateway's stt lane is off)."""
         return self._lane_unavailable
@@ -683,155 +678,86 @@ class RealtimeDuplexSession:
 
     def _run(self) -> None:
         """Own the socket for the life of the client. Never lets an error out."""
-        attempts = 0
-        while not self._closed:
-            if self._sock is None:
-                if attempts and not self._sleep(self._backoff_for(attempts)):
-                    break
-                attempts = 0 if self._attempt_connect() else attempts + 1
-                continue
-            attempts = self._pump_once(attempts)
+        _ws_run_session(
+            state=self._state,
+            is_connected=lambda: self._sock is not None,
+            connect=self._connect,
+            pump_once=self._pump_once,
+            teardown=self._teardown_socket,
+        )
         self._teardown_socket(graceful=True)
 
     def _pump_once(self, attempts: int) -> int:
+        """This session's half of the shared loop: pump until the session ends.
+
+        Every end is a fault here — unlike the ears-only client, which can end
+        a session INTENTIONALLY to re-negotiate its sample rate. A session that
+        had been up for ``stable_after_s`` still restarts the backoff from zero
+        rather than compounding across an outage that already recovered once.
+        """
         try:
             self._pump()
         except _SessionLost as lost:
             stable = (self._clock() - self._connected_at) >= self._stable_after_s
             self._teardown_socket()
-            self._enter_down(lost.reason, lost.detail)
+            self._state.mark_down(lost.reason, lost.detail)
             return 0 if stable else attempts + 1
         except Exception:  # noqa: BLE001 - the worker must outlive any fault
             logger.warning("duplex: session pump raised", exc_info=True)
             self._teardown_socket()
-            self._enter_down(REASON_STREAM_CLOSED, "unexpected pump failure")
+            self._state.mark_down(REASON_STREAM_CLOSED, "unexpected pump failure")
             return attempts + 1
         return attempts
-
-    def _attempt_connect(self) -> bool:
-        """:meth:`_connect` under a total guard — a fault costs one attempt, not the worker."""
-        try:
-            return self._connect()
-        except Exception:  # noqa: BLE001
-            logger.warning("duplex: connect raised", exc_info=True)
-            self._teardown_socket()
-            self.connect_failures += 1
-            self._enter_down(REASON_CONNECT_FAILED, "unexpected connect failure")
-            return False
-
-    def _backoff_for(self, attempts: int) -> float:
-        return min(self._backoff_max_s, self._backoff_initial_s * (2 ** max(0, attempts - 1)))
-
-    def _sleep(self, delay: float) -> bool:
-        """Interruptible wait. Returns ``False`` when the client is closing."""
-        self._wake.wait(delay)
-        if self._closed:
-            return False
-        self._wake.clear()
-        return True
 
     # --- connect ------------------------------------------------------- #
 
     def _connect(self) -> bool:
-        """One connect + handshake attempt. Returns success; never raises."""
-        event = self._next_session_event()
+        """One connect + handshake attempt. Returns success; never raises.
+
+        The wire half is :func:`~reachy.speech.realtime._ws_connect` (SHARED).
+        What stays here is this session's own: the 404 lane DIAGNOSIS, the
+        per-session reply bookkeeping, and a pull-source backlog drain.
+        """
+        event = self._state.next_event()
         url = self.connect_url
-        parts = urlsplit(url)
-        host = parts.hostname or "localhost"
-        port = parts.port or (443 if parts.scheme == "wss" else 80)
-        path = parts.path or wire.REALTIME_PATH
-        if parts.query:
-            path = f"{path}?{parts.query}"
-        key = wire.make_sec_websocket_key()
-        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-
-        sock: socket.socket | None = None
-        try:
-            sock = socket.create_connection((host, port), timeout=self._connect_timeout_s)
-            if parts.scheme == "wss":
-                context = ssl.create_default_context()
-                sock = context.wrap_socket(sock, server_hostname=host)
-            sock.settimeout(_SOCKET_TIMEOUT_S)
-            sock.sendall(wire.build_handshake_request(parts.netloc, path, key, headers))
-            reader = _FrameReader(sock, self._frame_timeout_s)
-            head = reader.read_until(b"\r\n\r\n", time.monotonic() + self._connect_timeout_s)
-        except (OSError, ValueError) as err:
-            self._close_socket(sock)
-            return self._note_connect_failure(REASON_CONNECT_FAILED, f"{type(err).__name__}: {err}")
-        if head is None:
-            self._close_socket(sock)
-            return self._note_connect_failure(REASON_CONNECT_FAILED, "no handshake response")
-
-        status, response_headers = wire.parse_response_head(head)
-        if status != 101:
-            self._close_socket(sock)
-            return self._note_refusal(status)
-        if not wire.verify_accept_key(key, response_headers.get("sec-websocket-accept", "")):
-            self._close_socket(sock)
-            return self._note_connect_failure(REASON_HANDSHAKE_REFUSED, "bad Sec-WebSocket-Accept")
+        handshake = _ws_connect(
+            url,
+            api_key=self._api_key,
+            connect_timeout_s=self._connect_timeout_s,
+            frame_timeout_s=self._frame_timeout_s,
+        )
+        if not handshake.ok:
+            return self._note_refusal(handshake)
 
         with self._sock_lock:
-            self._sock = sock
-        self._reader = reader
+            self._sock = handshake.sock
+        self._reader = handshake.reader
         self._connected_at = self._clock()
         self._lane_unavailable = False
         self._pending.clear()
         self._drain_stale_source()
-        self._mark_up(event, url)
+        self._state.mark_up(event, url)
         return True
 
-    def _note_refusal(self, status: int) -> bool:
-        """Name a non-101 handshake response — 404 is its own DIAGNOSIS.
+    def _note_refusal(self, handshake: _Handshake) -> bool:
+        """Name a failed handshake — an HTTP 404 is its own DIAGNOSIS.
 
-        Every other status is the generic refusal: something answered and said
-        no, and retrying is the right move. A 404 says the route is not served
-        because the gateway's ``stt`` role is infeasible — the fix is operator
+        Everything else is reported exactly as the shared connect named it:
+        something answered and said no (or nothing answered at all), and
+        retrying is the right move. A 404 says the route is not served because
+        the gateway's ``stt`` role is infeasible — the fix is operator
         configuration, so the log has to say so rather than read as a flaky
         gateway. Retrying stays right either way (the lane can be switched on
         while we run), and the latch keeps this to one line.
         """
-        if status == 404:
+        if handshake.status == 404:
             self._lane_unavailable = True
-            return self._note_connect_failure(
+            return self._state.note_connect_failure(
                 REASON_LANE_UNAVAILABLE,
                 "HTTP 404 - the gateway's stt lane is likely declared off; "
                 "check GET /v1/capabilities for stt.feasible",
             )
-        return self._note_connect_failure(REASON_HANDSHAKE_REFUSED, f"HTTP {status}")
-
-    def _note_connect_failure(self, reason: str, detail: str) -> bool:
-        self.connect_failures += 1
-        self._enter_down(reason, detail)
-        return False
-
-    def _mark_up(self, event: str, url: str) -> None:
-        recovered = self._down_logged
-        self._up = True
-        self._down = False
-        self._down_logged = False
-        self._session_event = event
-        self.sessions += 1
-        senselog.stage(
-            STAGE, SOURCE, event, f"session up url={url}{' (recovered)' if recovered else ''}"
-        )
-
-    def _enter_down(self, reason: str, detail: str = "") -> None:
-        """Latch the down state, logging the CAUSE and the state EXACTLY ONCE.
-
-        Every later failure while already down is silent — a retry loop that
-        logs per attempt is the #99 journal flood this exists to prevent. A
-        session torn down by :meth:`close` is silent too: ``close()`` shuts the
-        socket down under the worker on purpose, so the worker's last act is
-        always a read failure, and reporting it would put a drop in the journal
-        on every clean shutdown.
-        """
-        self._up = False
-        self._down = True
-        if self._closed or self._down_logged:
-            return
-        self._down_logged = True
-        self._drop(reason, detail)
-        senselog.drop(STAGE, SOURCE, self._session_event, REASON_SESSION_DOWN)
+        return self._state.note_connect_failure(handshake.reason, handshake.detail)
 
     def _drain_stale_source(self) -> None:
         """Discard whatever the source has ALREADY buffered, before going live.
@@ -862,9 +788,9 @@ class RealtimeDuplexSession:
         if not self._arm_pending:
             return
         self._arm_pending = False
-        self._send(wire.OPCODE_TEXT, wire.build_response_create_event().encode("utf-8"))
+        _ws_send(self._sock, wire.OPCODE_TEXT, wire.build_response_create_event().encode("utf-8"))
         self.arms_sent += 1
-        senselog.stage(STAGE, SOURCE, self._session_event, "armed (response.create)")
+        self._state.note("armed (response.create)")
 
     def _pump_audio(self) -> None:
         """Pull from the source and append to the session. Bounded per iteration."""
@@ -878,13 +804,13 @@ class RealtimeDuplexSession:
                 self.muted_chunks += 1
                 if not self._muted_logged:
                     self._muted_logged = True
-                    senselog.drop(STAGE, SOURCE, self._session_event, REASON_SELF_MUTE)
+                    self._state.drop(REASON_SELF_MUTE)
                 continue
             self._muted_logged = False
             pcm = _to_pcm16(chunk)
             if not pcm:
                 continue
-            self._send(wire.OPCODE_TEXT, wire.build_append_event(pcm).encode("utf-8"))
+            _ws_send(self._sock, wire.OPCODE_TEXT, wire.build_append_event(pcm).encode("utf-8"))
             self.chunks_sent += 1
             self.bytes_sent += len(pcm)
 
@@ -895,63 +821,21 @@ class RealtimeDuplexSession:
         except Exception:  # noqa: BLE001 - a broken source must not end the session
             if not self._source_failed_logged:
                 self._source_failed_logged = True
-                self._drop(REASON_SOURCE_FAILED, "read_audio raised")
+                self._state.drop(REASON_SOURCE_FAILED, "read_audio raised")
                 logger.warning("duplex: read_audio raised", exc_info=True)
             return None
         self._source_failed_logged = False
         return chunk
 
-    def _send(self, opcode: int, payload: bytes) -> None:
-        sock = self._sock
-        if sock is None:
-            raise _SessionLost(REASON_STREAM_CLOSED, "socket released")
-        try:
-            sock.sendall(wire.build_frame(opcode, payload, mask=True))
-        except OSError as err:
-            raise _SessionLost(REASON_STREAM_CLOSED, f"send failed: {err}") from err
-
     def _read_frames(self) -> None:
-        reader = self._reader
-        if reader is None:  # pragma: no cover - defensive
-            raise _SessionLost(REASON_STREAM_CLOSED, "reader released")
-        for index in range(_MAX_FRAMES_PER_PUMP):
-            if self._closed or not self._readable(reader, first=index == 0):
-                return
-            try:
-                _fin, opcode, payload = wire.read_frame(reader.recv_exact)
-            except wire.FrameReadError as err:
-                raise _SessionLost(REASON_STREAM_CLOSED, str(err)) from err
-            self._handle_frame(opcode, payload)
-
-    def _readable(self, reader: _FrameReader, *, first: bool) -> bool:
-        if reader.has_pending():
-            return True
-        sock = self._sock
-        if sock is None:
-            raise _SessionLost(REASON_STREAM_CLOSED, "socket released")
-        try:
-            ready, _, _ = select.select([sock], [], [], self._poll_interval_s if first else 0.0)
-        except (OSError, ValueError) as err:
-            raise _SessionLost(REASON_STREAM_CLOSED, f"select failed: {err}") from err
-        return bool(ready)
-
-    def _handle_frame(self, opcode: int, payload: bytes) -> None:
-        if opcode == wire.OPCODE_TEXT:
-            event = wire.decode_event(payload)
-            if event is None:
-                self._drop(REASON_MALFORMED_EVENT, f"{len(payload)} bytes")
-                return
-            self._dispatch_event(event)
-        elif opcode == wire.OPCODE_PING:
-            # uvicorn pings roughly every 20 s and disconnects without a pong.
-            self._send(wire.OPCODE_PONG, payload)
-            self.pongs_sent += 1
-        elif opcode == wire.OPCODE_PONG:
-            logger.debug("duplex: pong received")
-        elif opcode == wire.OPCODE_CLOSE:
-            raise _SessionLost(REASON_STREAM_CLOSED, "server closed the session")
-        else:
-            logger.debug("duplex: ignoring unexpected opcode 0x%x", opcode)
+        _ws_pump_frames(
+            socket_of=lambda: self._sock,
+            reader=self._reader,
+            poll_interval_s=self._poll_interval_s,
+            is_closed=lambda: self._closed,
+            on_event=self._dispatch_event,
+            state=self._state,
+        )
 
     # --- events -------------------------------------------------------- #
 
@@ -967,62 +851,41 @@ class RealtimeDuplexSession:
             pending.text = _as_str(event.get("text")) or pending.text
         elif kind == RESPONSE_CREATED:
             pending = self._pending_for(event)
-            senselog.stage(
-                STAGE, SOURCE, self._session_event, f"response started id={pending.response_id}"
-            )
+            self._state.note(f"response started id={pending.response_id}")
         elif kind == RESPONSE_DONE:
             self._finish_response(event, interrupted=False)
         elif kind == RESPONSE_INTERRUPTED:
             self._finish_response(event, interrupted=True)
         elif kind == SESSION_CREATED:
             self._on_session_created(event)
-        elif kind == SPEECH_STARTED:
-            senselog.stage(STAGE, SOURCE, self._session_event, "speech started (server vad)")
-        elif kind == SPEECH_STOPPED:
-            senselog.stage(
-                STAGE,
-                SOURCE,
-                self._session_event,
-                f"speech stopped (server vad) reason={event.get('reason')}",
-            )
+        elif kind in (SPEECH_STARTED, SPEECH_STOPPED):
+            self._state.note(_vad_stage_line(kind, event))
         elif kind == ERROR_EVENT:
-            code = _as_str(event.get("code")) or "unknown"
-            reason = _ERROR_REASONS.get(code, REASON_SERVER_ERROR)
-            self._drop(reason, f"code={code} {_as_str(event.get('message')) or ''}".strip())
+            reason, detail = _server_error(event)
+            self._state.drop(reason, detail)
         else:
             self.ignored_events += 1
             logger.debug("duplex: unhandled event type %r", kind)
 
     def _on_session_created(self, event: dict) -> None:
         self._session_id = _as_str(event.get("session_id"))
-        config = event.get("config") if isinstance(event.get("config"), dict) else {}
-        senselog.stage(
-            STAGE,
-            SOURCE,
-            self._session_event,
-            f"session.created rate={config.get('input_sample_rate')} "
-            f"vad={config.get('turn_detection')}",
-        )
+        self._state.note(_session_created_line(event))
         if self._arm_on_connect:
             self._arm_pending = True
 
     def _publish_utterance(self, event: dict) -> None:
         """Publish one heard utterance. **No engagement gate** (spec claim c4)."""
-        text = _as_str(event.get("text")) or _as_str(event.get("transcript"))
-        if not text or not text.strip():
-            self._drop(REASON_EMPTY_TRANSCRIPT, "transcription.completed with no text")
+        utterance = _utterance_from(event, t=self._clock(), session_id=self._session_id)
+        if utterance is None:
+            self._state.drop(REASON_EMPTY_TRANSCRIPT, "transcription.completed with no text")
             return
         self._utterance_seq += 1
-        utterance = Utterance(
-            text=text,
-            t=self._clock(),
-            item_id=_as_str(event.get("item_id")),
-            session_id=_as_str(event.get("session_id")) or self._session_id,
-        )
         if not self._offer(self._utterances, utterance, REASON_UTTERANCE_QUEUE_FULL):
             return
         self.utterances += 1
-        senselog.stage(STAGE, SOURCE, f"utt{self._utterance_seq}", f"utterance chars={len(text)}")
+        self._state.note(
+            f"utterance chars={len(utterance.text)}", event=f"utt{self._utterance_seq}"
+        )
         self._tap(self._on_utterance, utterance, "on_utterance")
 
     def _pending_for(self, event: dict) -> _PendingResponse:
@@ -1046,17 +909,17 @@ class RealtimeDuplexSession:
         pending = self._pending_for(event)
         raw = event.get("delta")
         if not isinstance(raw, str) or not raw:
-            self._drop(REASON_MALFORMED_AUDIO_DELTA, "delta missing or not a string")
+            self._state.drop(REASON_MALFORMED_AUDIO_DELTA, "delta missing or not a string")
             return
         try:
             pcm = base64.b64decode(raw, validate=True)
         except (ValueError, TypeError):
-            self._drop(REASON_MALFORMED_AUDIO_DELTA, f"{len(raw)} base64 chars")
+            self._state.drop(REASON_MALFORMED_AUDIO_DELTA, f"{len(raw)} base64 chars")
             return
         if len(pending.audio) + len(pcm) > self._max_response_bytes:
             if not pending.overflowed:
                 pending.overflowed = True
-                self._drop(REASON_RESPONSE_TOO_LONG, f"over {self._max_response_bytes} bytes")
+                self._state.drop(REASON_RESPONSE_TOO_LONG, f"over {self._max_response_bytes} bytes")
             return
         pending.audio.extend(pcm)
 
@@ -1079,18 +942,15 @@ class RealtimeDuplexSession:
             return
         self.responses += 1
         self.response_audio_bytes += len(audio)
-        senselog.stage(
-            STAGE,
-            SOURCE,
-            self._session_event,
+        self._state.note(
             f"response {'interrupted' if interrupted else 'done'} "
-            f"id={pending.response_id} chars={len(pending.text)} audio={len(audio)}B",
+            f"id={pending.response_id} chars={len(pending.text)} audio={len(audio)}B"
         )
         if interrupted:
             # A barge-in means the human started talking again. Speaking the
             # truncated reply now would talk over them, so it is deliberately
             # never played — the record still carries the audio and says why.
-            self._drop(REASON_RESPONSE_INTERRUPTED, "truncated reply is not spoken")
+            self._state.drop(REASON_RESPONSE_INTERRUPTED, "truncated reply is not spoken")
         elif audio:
             self._enqueue_playback(audio)
         self._tap(self._on_response, response, "on_response")
@@ -1100,14 +960,14 @@ class RealtimeDuplexSession:
         if self._play is None:
             if not self._no_sink_logged:
                 self._no_sink_logged = True
-                self._drop(REASON_NO_PLAYBACK_SINK, f"{len(audio)} bytes not spoken")
+                self._state.drop(REASON_NO_PLAYBACK_SINK, f"{len(audio)} bytes not spoken")
             return
         try:
             self._playback.put_nowait(audio)
         except queue.Full:
             if not self._playback_full_logged:
                 self._playback_full_logged = True
-                self._drop(REASON_PLAYBACK_QUEUE_FULL, f"{len(audio)} bytes not spoken")
+                self._state.drop(REASON_PLAYBACK_QUEUE_FULL, f"{len(audio)} bytes not spoken")
             return
         self._playback_full_logged = False
 
@@ -1139,7 +999,7 @@ class RealtimeDuplexSession:
             self.playback_failures += 1
             if not self._playback_failed_logged:
                 self._playback_failed_logged = True
-                self._drop(REASON_PLAYBACK_FAILED, f"{len(audio)} bytes")
+                self._state.drop(REASON_PLAYBACK_FAILED, f"{len(audio)} bytes")
                 logger.warning("duplex: playback sink raised", exc_info=True)
         else:
             self.played += 1
@@ -1165,7 +1025,7 @@ class RealtimeDuplexSession:
         except queue.Full:
             if reason not in self._overflow_logged:
                 self._overflow_logged.add(reason)
-                self._drop(reason, "oldest evicted (latched until this sink drains)")
+                self._state.drop(reason, "oldest evicted (latched until this sink drains)")
         try:
             sink.get_nowait()
             sink.put_nowait(item)
@@ -1187,33 +1047,8 @@ class RealtimeDuplexSession:
             sock = self._sock
             self._sock = None
         self._reader = None
-        self._up = False
-        if sock is None:
-            return
-        if graceful:
-            try:
-                sock.sendall(wire.build_frame(wire.OPCODE_CLOSE, b"\x03\xe8", mask=True))
-            except OSError:
-                pass
-        self._close_socket(sock)
-
-    @staticmethod
-    def _close_socket(sock: socket.socket | None) -> None:
-        if sock is None:
-            return
-        try:
-            sock.close()
-        except OSError:  # pragma: no cover - defensive
-            pass
-
-    def _next_session_event(self) -> str:
-        self._session_seq += 1
-        return f"sess{self._session_seq}"
-
-    def _drop(self, reason: str, detail: str = "") -> None:
-        senselog.drop(
-            STAGE, SOURCE, self._session_event, f"{reason} ({detail})" if detail else reason
-        )
+        self._state.mark_released()
+        _ws_release(sock, graceful=graceful)
 
 
 def build(**kwargs: Any) -> RealtimeDuplexSession:
