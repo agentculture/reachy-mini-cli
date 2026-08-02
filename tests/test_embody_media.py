@@ -224,10 +224,23 @@ def test_media_module_never_shells_out():
 
 
 def test_pyproject_base_dependencies_are_unchanged():
-    """AC3: this task may not add a base runtime dependency, machine-checked.
+    """AC3: the layer may not add a BASE runtime dependency, machine-checked.
 
     Pinned by equality (the same style ``test_zero_llm_boundary.py`` uses for
     its own hard sets) so drift in either direction fails loudly.
+
+    The base list is the part that must never grow: it is what a bare
+    ``pip install reachy-mini-cli`` drags onto a box with no system libraries,
+    and the keep-base-light rule in CLAUDE.md gives it exactly three pure
+    wheels. ``sounddevice`` binds PortAudio and could never qualify.
+
+    It IS allowed in the ``[bench]`` extra, which is the home this module's own
+    docstring named for it — the task that wrote the lazy import was forbidden
+    from editing ``pyproject.toml``, so it left the pin to be added here later.
+    The assertion below is therefore about PLACEMENT, not absence: sounddevice
+    may appear under ``bench`` and nowhere else, so a future change that
+    promotes it to base — or quietly attaches it to ``[sdk]`` and thus to every
+    robot install — still fails.
     """
     data = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
     assert data["project"]["dependencies"] == [
@@ -236,10 +249,9 @@ def test_pyproject_base_dependencies_are_unchanged():
         "events-cli>=0.9",
     ]
     optional = data["project"]["optional-dependencies"]
-    assert set(optional.keys()) == {"daemon", "sdk", "cpu", "gpu", "vision"}
-    assert "sounddevice" not in repr(
-        optional
-    ), "bench capture must stay a lazy import, not an extra pin"
+    assert set(optional.keys()) == {"daemon", "sdk", "cpu", "gpu", "vision", "bench"}
+    carriers = {name for name, pins in optional.items() if "sounddevice" in repr(pins)}
+    assert carriers == {"bench"}, f"sounddevice must live only in [bench], found in {carriers}"
 
 
 # ---------------------------------------------------------------------------

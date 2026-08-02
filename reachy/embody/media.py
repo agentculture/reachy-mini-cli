@@ -142,12 +142,12 @@ requested here). It is **lazily imported** inside
 absent, it logs exactly ONE process-wide warning
 (:data:`BENCH_AUDIO_EXTRA_ABSENT`) and the bench profile's source/sink degrade
 to permanently quiet (reads return ``None``, plays are a named
-:func:`reachy.senselog.drop`) rather than raising. **This file does not, and
-must not, edit ``pyproject.toml``** — a future extra (a `[bench]` extra, or
-widening ``harmonics-cli[audio]``'s own reach) is the natural home for a hard
-``sounddevice`` pin; until one exists, an operator who wants the bench profile
-installs it by hand (``pip install sounddevice``) same as any other optional
-engine on a bare install.
+:func:`reachy.senselog.drop`) rather than raising. The pin lives where the other
+engine pins live: ``pip install 'reachy-mini-cli[bench]'``. It is deliberately
+an extra rather than a base dep because ``sounddevice`` binds PortAudio, a
+system library absent on a bare box and in CI — and because the DEPLOYED path
+never needs it: the robot profile hears through the runtime's tee socket and
+speaks through the daemon's http route, both stdlib.
 
 Import boundary
 ----------------
@@ -802,7 +802,7 @@ def _warn_bench_audio_once(reason: str) -> None:
         logger.warning(
             "embody: bench audio needs the lazily-imported 'sounddevice' package "
             "(PortAudio bindings); not installed — bench mic/speaker stay unavailable "
-            "(pip install sounddevice; see reachy/embody/media.py's module docstring)"
+            "(pip install 'reachy-mini-cli[bench]'; the robot profile needs none of this)"
         )
     else:
         logger.warning(

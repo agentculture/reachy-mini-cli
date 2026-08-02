@@ -67,6 +67,18 @@ gpu = []
 # missing extra raises the same clean exit-2 CliError pattern as the other
 # lazy-imported engines.
 vision = ["opencv-python-headless>=4.9,<5"]
+# [bench] — the embodiment layer's BENCH media profile only (dev-box microphone
+# and speakers, for talking to the layer from this machine instead of through
+# the robot). The shipped ROBOT profile needs none of this: it hears through the
+# runtime's audio tee (a unix socket) and speaks through the daemon's http
+# route, both stdlib.
+#
+# So this extra is a development convenience, not part of the deployed path, and
+# it stays an extra for the usual reason — sounddevice binds PortAudio, a system
+# library absent on a bare box and in CI. `reachy/embody/media.py` lazy-imports
+# it and degrades to one named `bench-audio-extra-absent` drop, exactly like the
+# other engine extras.
+bench = ["sounddevice>=0.4,<0.6"]
 
 [project.urls]
 Homepage = "https://github.com/agentculture/reachy-mini-cli"
