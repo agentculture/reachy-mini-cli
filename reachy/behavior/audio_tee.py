@@ -681,6 +681,11 @@ class AudioTee:
                 consumer.enqueue(payload)
 
     def _flush_all(self) -> None:
+        # Iterate a SNAPSHOT: `_detach` below removes from `self._consumers`
+        # mid-loop, so dropping the `list()` would mutate the sequence being
+        # iterated. Static analysis reads this as a redundant copy (Sonar
+        # S7504); it is not, and removing it turns a write error into skipped
+        # consumers.
         for consumer in list(self._consumers):
             try:
                 consumer.flush()

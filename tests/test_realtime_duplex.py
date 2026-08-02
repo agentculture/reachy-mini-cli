@@ -235,7 +235,7 @@ def _feed_response(client: RealtimeDuplexSession, response_id: str, pcm: bytes) 
     client._dispatch_event({"type": "response.done", "response_id": response_id})
 
 
-@pytest.fixture()
+@pytest.fixture
 def sense_log(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
     caplog.set_level(logging.INFO, logger="reachy.sense")
     return caplog

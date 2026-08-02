@@ -181,7 +181,7 @@ class _PinnedPortServer(FakeRealtimeServer):
         self._accept_thread.start()
 
 
-@pytest.fixture()
+@pytest.fixture
 def sense_log(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
     caplog.set_level(logging.INFO, logger="reachy.sense")
     return caplog

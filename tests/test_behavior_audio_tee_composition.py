@@ -195,7 +195,7 @@ def _calls(node: ast.AST, name: str) -> list[ast.Call]:
     return found
 
 
-@pytest.fixture()
+@pytest.fixture
 def _isolated(monkeypatch, tmp_path):
     monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
     monkeypatch.setenv(tee_mod.SOCKET_ENV, str(tmp_path / "audio_tee.sock"))

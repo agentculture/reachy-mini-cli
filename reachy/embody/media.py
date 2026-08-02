@@ -639,7 +639,10 @@ class _RobotTeeSourceBackend:
         """
         try:
             header = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
+        except ValueError:
+            # ValueError alone covers both failures here: UnicodeDecodeError is
+            # a ValueError subclass, so naming it as well was redundant (Sonar
+            # S5713). Undecodable bytes and malformed JSON are the same verdict.
             return (TEE_HEADER_INVALID, "the first line is not JSON")
         # ``type(...) is`` rather than ``isinstance``: this module is pinned
         # isinstance-free (tests/test_embody_media.py), and an exact-type check

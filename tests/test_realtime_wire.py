@@ -394,8 +394,18 @@ def test_build_response_create_event_is_exactly_the_bare_type_object() -> None:
 
 
 def test_build_response_create_event_takes_no_arguments_and_is_stable() -> None:
-    # No body, no per-call state: every call renders identically.
-    assert wire.build_response_create_event() == wire.build_response_create_event()
+    """The builder carries NO per-call state — no timestamp, id, or counter.
+
+    Stated over several calls rather than by comparing one call to itself: the
+    self-comparison form asserts the same expression on both sides, which reads
+    as vacuous even though it would in fact catch a per-call id. Collecting the
+    renders and collapsing them to a set says the property directly, and pinning
+    the literal alongside it means a builder that became stably WRONG still
+    fails.
+    """
+    renders = {wire.build_response_create_event() for _ in range(3)}
+    assert len(renders) == 1, f"per-call state leaked into the arming event: {renders}"
+    assert json.loads(renders.pop()) == {"type": wire.RESPONSE_CREATE_EVENT_TYPE}
 
 
 def test_build_response_create_event_is_valid_json_text_ready_for_a_text_frame() -> None:

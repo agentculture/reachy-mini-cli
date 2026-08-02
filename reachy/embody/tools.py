@@ -232,7 +232,10 @@ class _InertLane:
     shipped validator — not a copy of it.
     """
 
-    def submit(self, spec: object) -> str:
+    def submit(self, _spec: object) -> str:
+        # `_spec` is deliberately unused and underscore-named: this stub exists
+        # to satisfy the lane Protocol during pre-flight, and the shipped
+        # validator has already run by the time it is called.
         return "preflight"
 
 

@@ -108,7 +108,7 @@ class _FakeEncoder:
         return self.result
 
 
-@pytest.fixture()
+@pytest.fixture
 def _isolated(monkeypatch, tmp_path):
     monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
     monkeypatch.delenv("REACHY_BASE_URL", raising=False)

@@ -104,7 +104,7 @@ def _drop_reasons(caplog) -> list[str]:
     ]
 
 
-@pytest.fixture()
+@pytest.fixture
 def tee_path(tmp_path) -> Path:
     return tmp_path / "audio_tee.sock"
 

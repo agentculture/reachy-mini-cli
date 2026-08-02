@@ -189,7 +189,7 @@ def _compose(monkeypatch, *, media: _FakeMedia, session_factory=None):
     return behavior_mod._compose_run_seam(_QuietTransport(), config, None, None)
 
 
-@pytest.fixture()
+@pytest.fixture
 def _state_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("REACHY_STATE_DIR", str(tmp_path))
     monkeypatch.delenv("REACHY_BASE_URL", raising=False)
