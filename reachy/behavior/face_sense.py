@@ -545,10 +545,19 @@ class FaceSenseDriver:
             self._frame_available = self._within_ttl(now)
             return
         if not self._connected() or not self._camera_available():
-            # A camera-less robot: the condition collapses at once — no TTL hold,
-            # nothing to be stale about.
+            # A camera-less robot: the condition collapses at once — no TTL hold.
+            #
+            # But this is ALSO the branch a died pipeline arrives on, which is
+            # what #138 is about: measured on the deployed box, the daemon
+            # reports camera_available FALSE once its GStreamer pipeline EOSes,
+            # so a detector that only watched the believed-present path never
+            # fired on the one failure it was built for. `_last_frame_at` is
+            # therefore NOT cleared here — it is the evidence a stream existed,
+            # and clearing it would re-exempt the loss as "a camera that never
+            # was". A camera that genuinely never existed still has it `None`,
+            # so that exemption is untouched.
             self._frame_available = False
-            self._last_frame_at = None
+            self._check_stream_staleness(now)
             return
 
         # Stamped only where a read is actually attempted: a disconnected or

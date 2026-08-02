@@ -969,3 +969,41 @@ def test_staleness_detection_never_constructs_rebuilds_or_restarts_anything() ->
     )
     for token in forbidden:
         assert token not in code, f"{token!r} must not appear in the staleness check's CODE: {code}"
+
+
+def test_stream_ended_fires_when_the_camera_goes_unavailable_after_streaming(caplog) -> None:
+    """The failure mode #138 actually produces, measured on the deployed box.
+
+    The daemon reports ``camera_available`` FALSE once its GStreamer pipeline
+    EOSes — not the believed-present-but-silent shape the first detector
+    watched, which is why that detector stayed silent through three real camera
+    deaths in one afternoon. A camera that streamed and then vanished is a
+    stream that ENDED.
+    """
+    media = _FakeMedia([_frame()])
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        driver(_Ctx(0.0))  # a real frame anchors `_last_frame_at`
+        assert driver.peek_frame_available() is True
+        media.camera_available = False  # the pipeline dies
+        driver(_Ctx(0.5))
+        assert not _drop_messages(caplog, FS.REASON_STREAM_ENDED), "fired inside the window"
+        for now in (2.0, 5.0, 20.0):
+            driver(_Ctx(now))
+
+    drops = _drop_messages(caplog, FS.REASON_STREAM_ENDED)
+    assert len(drops) == 1, f"a died pipeline was not named exactly once: {drops}"
+
+
+def test_a_camera_that_never_streamed_and_is_unavailable_produces_no_drop(caplog) -> None:
+    """The never-existed exemption survives the fix: no frame ever, no stream."""
+    media = _FakeMedia([_frame()], camera_available=False)
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        for tick in range(4):
+            driver(_Ctx(tick * 30.0))
+    assert not _drop_messages(caplog, FS.REASON_STREAM_ENDED)
