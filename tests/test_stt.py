@@ -101,17 +101,17 @@ class TestReturnsText:
 
     def test_text_field_returned_verbatim(self):
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: {"text": "hello there reachy"}  # noqa: SLF001
+        backend._post = lambda audio: {"text": "hello there reachy"}
         assert backend.transcribe(_chunk()) == "hello there reachy"
 
     def test_transcript_alias_returned(self):
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: {"transcript": "legacy alias text"}  # noqa: SLF001
+        backend._post = lambda audio: {"transcript": "legacy alias text"}
         assert backend.transcribe(_chunk()) == "legacy alias text"
 
     def test_text_preferred_over_transcript(self):
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: {  # noqa: SLF001
+        backend._post = lambda audio: {
             "text": "preferred",
             "transcript": "legacy",
         }
@@ -119,22 +119,22 @@ class TestReturnsText:
 
     def test_post_returning_none_yields_none(self):
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: None  # noqa: SLF001
+        backend._post = lambda audio: None
         assert backend.transcribe(_chunk()) is None
 
     def test_payload_without_text_yields_none(self):
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: {"detected": True}  # noqa: SLF001
+        backend._post = lambda audio: {"detected": True}
         assert backend.transcribe(_chunk()) is None
 
     def test_empty_text_yields_none(self):
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: {"text": ""}  # noqa: SLF001
+        backend._post = lambda audio: {"text": ""}
         assert backend.transcribe(_chunk()) is None
 
     def test_non_str_text_yields_none(self):
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: {"text": 12345}  # noqa: SLF001
+        backend._post = lambda audio: {"text": 12345}
         assert backend.transcribe(_chunk()) is None
 
 
@@ -149,18 +149,18 @@ class TestTranscribePayload:
     def test_returns_full_payload_dict(self):
         payload = {"text": "hi", "detected": True, "phrase": "p"}
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: dict(payload)  # noqa: SLF001
+        backend._post = lambda audio: dict(payload)
         assert backend.transcribe_payload(_chunk()) == payload
 
     def test_payload_without_text_still_returned(self):
         """Unlike transcribe(), a textless payload is returned verbatim (not None)."""
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: {"detected": True}  # noqa: SLF001
+        backend._post = lambda audio: {"detected": True}
         assert backend.transcribe_payload(_chunk()) == {"detected": True}
 
     def test_post_returning_none_yields_none(self):
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: None  # noqa: SLF001
+        backend._post = lambda audio: None
         assert backend.transcribe_payload(_chunk()) is None
 
     def test_sub_window_yields_none(self):
@@ -170,14 +170,14 @@ class TestTranscribePayload:
         backend = Transcriber(
             stt_url="http://stt.local", sample_rate=1000, window_seconds=1.0, min_interval=0.0
         )
-        backend._post = lambda audio: {"text": "x"}  # noqa: SLF001
+        backend._post = lambda audio: {"text": "x"}
         assert backend.transcribe_payload(_chunk(400)) is None
 
     def test_throttled_yields_none(self):
         clock = {"t": 100.0}
         backend = _nowindow(stt_url="http://stt.local", min_interval=5.0)
-        backend._clock = lambda: clock["t"]  # noqa: SLF001
-        backend._post = lambda audio: {"text": "x"}  # noqa: SLF001
+        backend._clock = lambda: clock["t"]
+        backend._post = lambda audio: {"text": "x"}
         assert backend.transcribe_payload(_chunk()) == {"text": "x"}  # first post
         assert backend.transcribe_payload(_chunk()) is None  # throttled (same time)
 
@@ -186,13 +186,13 @@ class TestTranscribePayload:
             raise RuntimeError("network exploded")
 
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = _boom  # noqa: SLF001
+        backend._post = _boom
         assert backend.transcribe_payload(_chunk()) is None
 
     def test_transcribe_delegates_to_payload(self):
         """transcribe() == _extract_text(transcribe_payload(...)) — same window state."""
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = lambda audio: {"text": "delegated text"}  # noqa: SLF001
+        backend._post = lambda audio: {"text": "delegated text"}
         assert backend.transcribe(_chunk()) == "delegated text"
 
 
@@ -215,7 +215,7 @@ class TestNeverRaises:
             raise RuntimeError("network exploded")
 
         backend = _nowindow(stt_url="http://stt.invalid")
-        backend._post = _boom  # noqa: SLF001
+        backend._post = _boom
         assert backend.transcribe(_chunk()) is None
 
     def _patch_urlopen(self, monkeypatch, resp):
@@ -270,7 +270,7 @@ class TestWindowing:
             calls["n"] += 1
             return {"text": "transcribed"}
 
-        backend._post = _post  # noqa: SLF001
+        backend._post = _post
         return backend, calls
 
     def test_no_post_until_window_full(self):
@@ -281,9 +281,7 @@ class TestWindowing:
             stt_url="http://stt.local", sample_rate=1000, window_seconds=1.0, min_interval=0.0
         )
         posted = {"n": 0}
-        backend._post = lambda audio: posted.__setitem__("n", posted["n"] + 1) or {  # noqa: SLF001
-            "text": "x"
-        }
+        backend._post = lambda audio: posted.__setitem__("n", posted["n"] + 1) or {"text": "x"}
 
         assert backend.transcribe(_chunk(400)) is None  # 400 < 1000
         assert backend.transcribe(_chunk(400)) is None  # 800 < 1000
@@ -294,8 +292,8 @@ class TestWindowing:
     def test_throttle_limits_post_rate(self):
         clock = {"t": 100.0}
         backend, calls = self._counting_backend()
-        backend._clock = lambda: clock["t"]  # noqa: SLF001
-        backend._min_interval = 5.0  # noqa: SLF001
+        backend._clock = lambda: clock["t"]
+        backend._min_interval = 5.0
 
         assert backend.transcribe(_chunk()) == "transcribed"  # first post
         assert backend.transcribe(_chunk()) is None  # throttled (same time)
@@ -307,11 +305,11 @@ class TestWindowing:
     def test_reset_clears_window_and_throttle(self):
         backend, calls = self._counting_backend(min_interval=5.0)
         clock = {"t": 0.0}
-        backend._clock = lambda: clock["t"]  # noqa: SLF001
+        backend._clock = lambda: clock["t"]
         assert backend.transcribe(_chunk()) == "transcribed"
         backend.reset()
-        assert backend._buffered == 0  # noqa: SLF001
-        assert backend._last_post is None  # noqa: SLF001
+        assert backend._buffered == 0
+        assert backend._last_post is None
 
     def test_empty_chunk_yields_none_through_real_post(self, monkeypatch):
         """An empty chunk -> empty WAV -> _post returns None (no urlopen call)."""

@@ -414,7 +414,7 @@ class GotoLane:
 
     def _evaluate_inflight(self, ctx) -> None:
         inflight = self._inflight
-        assert inflight is not None  # guarded by the caller  # noqa: S101
+        assert inflight is not None  # guarded by the caller
         gid = inflight.behavior.id
         # Natural completion first: at/after its end the engine has expired it, so
         # its channels are no longer its own — but this is DONE, not a preemption.

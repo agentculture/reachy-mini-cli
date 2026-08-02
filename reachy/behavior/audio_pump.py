@@ -269,7 +269,7 @@ class AudioPump:
                     if streak >= self._yield_every:
                         streak = 0
                         beat = True
-            except Exception:  # noqa: BLE001 — the pump must outlive any one read
+            except Exception:  # the pump must outlive any one read
                 logger.warning("AudioPump: loop iteration raised; continuing", exc_info=True)
                 beat = True
             if self._stop.is_set():
@@ -287,7 +287,7 @@ class AudioPump:
         self.reads += 1
         try:
             raw = self._media.audio()
-        except Exception:  # noqa: BLE001 — a raising source is "no audio"
+        except Exception:  # a raising source is "no audio"
             logger.debug("AudioPump: media read raised; no audio", exc_info=True)
             return None
         chunk = to_mono(raw)
@@ -351,7 +351,7 @@ class AudioPump:
         """The source's free liveness predicate; unknown/raising means live."""
         try:
             return bool(getattr(self._media, "connected", True))
-        except Exception:  # noqa: BLE001 — a raising probe is not a verdict
+        except Exception:  # a raising probe is not a verdict
             return True
 
     def _flush_overflow_episode(self) -> None:
@@ -367,7 +367,7 @@ class AudioPump:
         if self._sleep is not None:
             try:
                 self._sleep(self._beat_s)
-            except Exception:  # noqa: BLE001 — an injected beat must not kill the pump
+            except Exception:  # an injected beat must not kill the pump
                 logger.debug("AudioPump: injected sleep raised", exc_info=True)
             return
         # Event-based by default so close() interrupts a beat immediately.

@@ -179,7 +179,7 @@ class _MotionExecutor:
                 stop=self._stop,
                 max_errors=10**9,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._error.append(exc)
 
     def start(self) -> None:

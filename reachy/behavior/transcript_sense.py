@@ -452,7 +452,7 @@ class TranscriptSenseDriver:
         try:
             self._process(ctx)
         # A sense tap must never crash the loop.
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("TranscriptSenseDriver tick raised; transcript dropped", exc_info=True)
 
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
@@ -505,7 +505,7 @@ class TranscriptSenseDriver:
         try:
             client.submit_audio(chunk)
         # A duck-typed client that raises costs one chunk, never the tick.
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("TranscriptSenseDriver: submit_audio raised; chunk dropped", exc_info=True)
             return
         self.streamed += 1
@@ -527,7 +527,7 @@ class TranscriptSenseDriver:
         try:
             raw = self._media.audio()
         # A raising media client degrades, never propagates.
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("TranscriptSenseDriver media read raised; no audio", exc_info=True)
             return None
         chunk = to_mono(raw)
@@ -551,7 +551,7 @@ class TranscriptSenseDriver:
         rate: Any = None
         try:
             rate = self._media.samplerate
-        except Exception:  # noqa: BLE001
+        except Exception:
             rate = None
         try:
             self._rate = int(rate) if rate else _FALLBACK_RATE
@@ -562,7 +562,7 @@ class TranscriptSenseDriver:
             return
         try:
             setter(self._rate)
-        except Exception:  # noqa: BLE001 — a rate push must never cost a tick
+        except Exception:  # a rate push must never cost a tick
             logger.debug("TranscriptSenseDriver: set_sample_rate raised", exc_info=True)
 
     # ------------------------------------------------------------------
@@ -578,7 +578,7 @@ class TranscriptSenseDriver:
             try:
                 utterance = take()
             # A duck-typed client that raises costs this tick's words, not the tick.
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("TranscriptSenseDriver: take_utterance raised", exc_info=True)
                 return
             if utterance is None:
@@ -668,7 +668,7 @@ class TranscriptSenseDriver:
             try:
                 self._handle(job)
             # A worker fault must cost one utterance, never the worker.
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning("TranscriptSenseDriver worker degraded", exc_info=True)
             self.judged += 1
 
@@ -710,7 +710,7 @@ class TranscriptSenseDriver:
             return
         try:
             self._on_engage()
-        except Exception:  # noqa: BLE001 — a turn-signal fault must not lose the words
+        except Exception:  # a turn-signal fault must not lose the words
             logger.warning("TranscriptSenseDriver on_engage raised; ignoring", exc_info=True)
 
     # ------------------------------------------------------------------
@@ -869,5 +869,5 @@ class TranscriptSenseDriver:
             from reachy.speech.events import _doa_direction
 
             return _doa_direction(float(angle))
-        except Exception:  # noqa: BLE001 — a bad angle must never drop the words
+        except Exception:  # a bad angle must never drop the words
             return None

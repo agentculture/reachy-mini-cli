@@ -115,7 +115,7 @@ class StashStore:
             try:
                 record = StashRecord.from_dict(item["record"])
                 embedding = [float(x) for x in item["embedding"]]
-            except Exception as err:  # noqa: BLE001 — one bad record must not sink the store
+            except Exception as err:  # one bad record must not sink the store
                 log.warning("[stash] dropping unreadable record in %s: %s", self._path, err)
                 continue
             entries.append((record, embedding))

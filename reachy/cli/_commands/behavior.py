@@ -325,7 +325,7 @@ def _rules_status() -> dict[str, object]:
     try:
         loader = RulesLoader()
         loader.reload()
-    except Exception as err:  # noqa: BLE001 - status must never crash on rules
+    except Exception as err:  # status must never crash on rules
         return {"path": None, "exists": False, "ok": False, "error": str(err)}
     info: dict[str, object] = {
         "path": str(loader.path),
@@ -1295,7 +1295,7 @@ def _mic_sample_rate(source) -> int:
     """
     try:
         rate = source.samplerate
-    except Exception as err:  # noqa: BLE001 — a rate probe must never block boot
+    except Exception as err:  # a rate probe must never block boot
         logger.debug("behavior: mic samplerate probe raised (%s); assuming unknown", err)
         rate = None
     try:
@@ -1431,7 +1431,7 @@ def _import_events_client(spec: tuple[str, str] = EVENTS_CLIENT_IMPORT):
     module_name, attr = spec
     try:
         module = importlib.import_module(module_name)
-    except Exception as err:  # noqa: BLE001 — an optional package must never raise here
+    except Exception as err:  # an optional package must never raise here
         logger.debug("behavior: events-cli client unavailable (%s: %s)", type(err).__name__, err)
         return None
     if getattr(module, attr, None) is None:
@@ -1464,7 +1464,7 @@ def _make_events_client():
     url = broker_url()
     try:
         return factory(url)
-    except Exception as err:  # noqa: BLE001 — a broken client must not block boot
+    except Exception as err:  # a broken client must not block boot
         logger.warning(
             "behavior: events-cli client construction failed for %s (%s: %s); "
             "the nervous-system bus is disabled for this run",
@@ -1579,7 +1579,7 @@ def _warm_holder(holder, *, label: str) -> bool:
     warm_up = holder.warm_up
     try:
         warmed = bool(warm_up())
-    except Exception as err:  # noqa: BLE001 — a warm-up fault must not block boot
+    except Exception as err:  # a warm-up fault must not block boot
         logger.warning("behavior: %s holder warm-up raised (%s); sense degraded", label, err)
         senselog.drop(_WARM_STAGE, label, "setup", f"warm-up raised ({err}); keeper will retry")
         return False
@@ -1656,7 +1656,7 @@ class _HolderKeeper:
             try:
                 if holder.connected:
                     continue
-            except Exception as err:  # noqa: BLE001 — a raising probe is not a verdict
+            except Exception as err:  # a raising probe is not a verdict
                 logger.debug("behavior: %s liveness probe raised (%s)", label, err)
                 continue
             if _warm_holder(holder, label=label):
@@ -1666,7 +1666,7 @@ class _HolderKeeper:
         while not self._stop.is_set():
             try:
                 self.poll_once()
-            except Exception:  # noqa: BLE001 — the keeper must outlive any single sweep
+            except Exception:  # the keeper must outlive any single sweep
                 logger.warning("behavior: holder keeper sweep raised; continuing", exc_info=True)
             self._stop.wait(self._period)
 
@@ -1728,7 +1728,7 @@ class _AudioTap:
         self._pulled_at = t
         try:
             self._chunk = self._pump.take()
-        except Exception as err:  # noqa: BLE001 — a take fault degrades to no audio
+        except Exception as err:  # a take fault degrades to no audio
             logger.debug("behavior: audio take raised (%s); no audio this tick", err)
             self._chunk = None
         if self._chunk is None:
@@ -1736,7 +1736,7 @@ class _AudioTap:
         for sink in self._sinks:
             try:
                 sink(self._chunk)
-            except Exception as err:  # noqa: BLE001 — a sink must never break the tick
+            except Exception as err:  # a sink must never break the tick
                 logger.debug("behavior: audio sink raised (%s); chunk not fanned out", err)
 
     def audio(self):
@@ -1856,7 +1856,7 @@ class _RuntimeResources:
     def _release(close, what: str) -> None:
         try:
             close()
-        except Exception:  # noqa: BLE001 — one failing teardown must not skip the rest
+        except Exception:  # one failing teardown must not skip the rest
             logger.warning("behavior: closing the %s raised; continuing", what, exc_info=True)
 
 
@@ -1883,7 +1883,7 @@ def _engagement_classifier():
         # No base_url/model/api_key overrides — llm.complete resolves the one
         # REACHY_OPENAI_* endpoint, the same backend any external cognition uses.
         return EngagementClassifier()
-    except Exception:  # noqa: BLE001 — a build fault must not disable hearing
+    except Exception:  # a build fault must not disable hearing
         logger.warning(
             "behavior: engagement classifier unavailable; the transcript gate "
             "stays on the heuristic",

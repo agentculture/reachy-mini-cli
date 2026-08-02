@@ -160,7 +160,7 @@ def _encode_jpeg(
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
     except SceneError:
         raise
-    except Exception as err:  # noqa: BLE001 — any cv2/array error is a describe failure
+    except Exception as err:  # any cv2/array error is a describe failure
         raise SceneError(f"failed to JPEG-encode the camera frame: {err}") from err
     if not ok:
         raise SceneError("failed to JPEG-encode the camera frame")
@@ -258,7 +258,7 @@ def describe_frame(frame: object, *, transport=None, cfg: SceneConfig | None = N
         text = post(messages, cfg)
     except SceneError:
         raise
-    except Exception as err:  # noqa: BLE001 — normalise any transport error to SceneError
+    except Exception as err:  # normalise any transport error to SceneError
         raise SceneError(f"scene description request failed: {err}") from err
 
     if not isinstance(text, str) or not text.strip():

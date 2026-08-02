@@ -92,7 +92,7 @@ def test_integration_forge_default_model_resolves_via_cortex_role(monkeypatch):
     }
     try:
         response = _default_transport(url, payload, headers, _CALL_TIMEOUT)
-    except Exception as err:  # noqa: BLE001 - the assertion below decides fail vs skip
+    except Exception as err:  # the assertion below decides fail vs skip
         text = str(err)
         model_missing = any(marker in text for marker in _MODEL_NOT_FOUND_MARKERS)
         assert (

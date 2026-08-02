@@ -175,8 +175,8 @@ def _iter_argparse_paths(parser: argparse.ArgumentParser) -> set[tuple[str, ...]
 
     def walk(p: argparse.ArgumentParser, prefix: tuple[str, ...]) -> None:
         paths.add(prefix)
-        for action in p._actions:  # noqa: SLF001 - argparse has no public walk API
-            if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+        for action in p._actions:  # argparse has no public walk API
+            if isinstance(action, argparse._SubParsersAction):
                 for name, subparser in action.choices.items():
                     walk(subparser, prefix + (name,))
 

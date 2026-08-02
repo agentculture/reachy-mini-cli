@@ -765,7 +765,7 @@ class _RobotHttpSinkBackend:
             senselog_drop(
                 _STAGE, _SOURCE_ROBOT_SINK, uuid.uuid4().hex[:8], f"playback-failed ({err.message})"
             )
-        except Exception as err:  # noqa: BLE001 — a sink must never raise into its caller
+        except Exception as err:  # a sink must never raise into its caller
             senselog_drop(
                 _STAGE, _SOURCE_ROBOT_SINK, uuid.uuid4().hex[:8], f"playback-failed ({err})"
             )
@@ -797,7 +797,7 @@ def _import_sounddevice() -> Any | None:
 
 def _warn_bench_audio_once(reason: str) -> None:
     """Log the missing/broken bench-audio fact exactly once per process."""
-    global _BENCH_WARNED  # noqa: PLW0603 — one process-wide warning, by design
+    global _BENCH_WARNED  # one process-wide warning, by design
     if _BENCH_WARNED:
         return
     _BENCH_WARNED = True
@@ -869,7 +869,7 @@ class _BenchMicSourceBackend:
                 blocksize=self._blocksize,
             )
             stream.start()
-        except Exception as err:  # noqa: BLE001 — a device open fault must degrade, never raise
+        except Exception as err:  # a device open fault must degrade, never raise
             self._unavailable_reason = BENCH_AUDIO_STACK_UNAVAILABLE
             _warn_bench_audio_once(self._unavailable_reason)
             senselog_drop(
@@ -892,7 +892,7 @@ class _BenchMicSourceBackend:
             return None
         try:
             data, _overflowed = stream.read(self._blocksize)
-        except Exception as err:  # noqa: BLE001 — a read fault must degrade, never raise
+        except Exception as err:  # a read fault must degrade, never raise
             senselog_drop(_STAGE, _SOURCE_BENCH_SRC, uuid.uuid4().hex[:8], f"read-failed ({err})")
             return None
         samples = np.asarray(data, dtype=np.float32).reshape(-1)
@@ -904,7 +904,7 @@ class _BenchMicSourceBackend:
             try:
                 self._stream.stop()
                 self._stream.close()
-            except Exception:  # noqa: BLE001 — teardown must never raise
+            except Exception:  # teardown must never raise
                 logger.warning("embody: bench mic stream close raised", exc_info=True)
             self._stream = None
 
@@ -941,7 +941,7 @@ class _BenchSpeakerSinkBackend:
         samples = np.frombuffer(pcm16_bytes, dtype="<i2")
         try:
             sd.play(samples, samplerate=samplerate, device=self._device)
-        except Exception as err:  # noqa: BLE001 — a sink must never raise into its caller
+        except Exception as err:  # a sink must never raise into its caller
             senselog_drop(
                 _STAGE, _SOURCE_BENCH_SINK, uuid.uuid4().hex[:8], f"playback-failed ({err})"
             )

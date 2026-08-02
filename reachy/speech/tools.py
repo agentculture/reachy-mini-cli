@@ -271,7 +271,7 @@ def _make_describe_scene_handler(describe: DescribeSceneSeam) -> Handler:
     raising seam (a :class:`~reachy.vision.scene.SceneError` from an unreachable VLM)
     surfaces as an error tool-result via :meth:`ToolRegistry.dispatch`."""
 
-    def handler(arguments: dict) -> str:  # noqa: ARG001 — no parameters
+    def handler(arguments: dict) -> str:  # no parameters
         text = describe()
         if not isinstance(text, str) or not text.strip():
             raise ValueError("the scene description was empty")
@@ -551,7 +551,7 @@ class ToolRegistry:
 
         try:
             content = tool.handler(arguments)
-        except Exception as exc:  # noqa: BLE001 — a bad tool call must never kill the loop
+        except Exception as exc:  # a bad tool call must never kill the loop
             log.warning("[tools] handler for %r raised: %s", name, exc)
             senselog.drop("action", name, event_id, "tool-error")
             return self._error(tool_call_id, f"{name!r} failed: {exc}")

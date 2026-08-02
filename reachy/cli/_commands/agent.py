@@ -277,7 +277,7 @@ def _forge_stack_available() -> bool:
     """Whether the forge self-extension stack imports (advertise the tool only if so)."""
     try:
         import reachy.forge  # noqa: F401
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
     return True
 
@@ -356,7 +356,7 @@ def _activate_forge(
         activator.reload_active()
         factory = client_factory if client_factory is not None else _default_forge_client_factory
         holder.append(factory(activator.publish))
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             "agent attach: forge subsystem unavailable; self-extension disabled",
             exc_info=True,
@@ -476,7 +476,7 @@ def _build_default_engine(
                 ),
                 client_factory=forge_client_factory,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 "agent attach: forge composition failed; self-extension disabled",
                 exc_info=True,
@@ -797,7 +797,7 @@ def _embody_drop(export: object, source: str, reason: str, detail: str = "") -> 
                 ts=export.time_fn(),
             )
         )
-    except Exception:  # noqa: BLE001 — observability must never break the layer
+    except Exception:  # observability must never break the layer
         logger.warning("[embody] export sink raised while naming %s", reason, exc_info=True)
 
 
@@ -834,7 +834,7 @@ def _voice_seam(
         try:
             pcm = synthesize(text)
             sink.play(pcm, samplerate=samplerate)
-        except Exception as err:  # noqa: BLE001 — every voice fault is NAMED, never raw
+        except Exception as err:  # every voice fault is NAMED, never raw
             _embody_drop(
                 export,
                 EMBODY_SOURCE_VOICE,
@@ -873,7 +873,7 @@ def _build_voice_seams(
     for name in _EMBODY_VOICES:
         try:
             engine = resolve_voice_engine(name)
-        except Exception as err:  # noqa: BLE001 — a missing voice is not a dead layer
+        except Exception as err:  # a missing voice is not a dead layer
             _embody_drop(export, EMBODY_SOURCE_VOICE, REASON_VOICE_UNAVAILABLE, f"{name}: {err}")
             seams[name] = None
             continue
@@ -960,7 +960,7 @@ class _CueReader:
                 self.cues += self._engine.submit_cues(classified_cues_for_line(line))
                 if self._max_events is not None and self.events >= self._max_events:
                     break
-        except Exception as err:  # noqa: BLE001 — a dead feed must not kill the conversation
+        except Exception as err:  # a dead feed must not kill the conversation
             _embody_drop(
                 self._export,
                 EMBODY_SOURCE_CUES,
@@ -1120,7 +1120,7 @@ class _ClipAsker:
         """
         try:
             block = self._read_clip()
-        except Exception as err:  # noqa: BLE001 — a broken read is a named drop, not a raise
+        except Exception as err:  # a broken read is a named drop, not a raise
             self._report(REASON_CLIP_UNAVAILABLE, f"read raised {type(err).__name__}: {err}")
             return
         if not isinstance(block, dict) or not block.get("available"):
@@ -1148,12 +1148,12 @@ class _ClipAsker:
 
         try:
             content = build_clip_question(path, self._prompt or DEFAULT_CLIP_PROMPT)
-        except Exception as err:  # noqa: BLE001 — an unreadable clip is a named drop
+        except Exception as err:  # an unreadable clip is a named drop
             self._report(REASON_CLIP_UNREADABLE, f"{path}: {type(err).__name__}: {err}")
             return
         try:
             answer = self._engine.ask(content)
-        except Exception as err:  # noqa: BLE001 — ask() must never wedge this thread
+        except Exception as err:  # ask() must never wedge this thread
             self._report(REASON_CLIP_ASK_FAILED, f"{type(err).__name__}: {err}")
             return
         answer = (answer or "").strip()
@@ -1217,7 +1217,7 @@ class _EmbodyLayer:
         """
         try:
             self.session.start()
-        except Exception as err:  # noqa: BLE001 — a dead gateway is deaf, not fatal
+        except Exception as err:  # a dead gateway is deaf, not fatal
             _embody_drop(
                 self._export,
                 EMBODY_SOURCE_SESSION,
@@ -1259,7 +1259,7 @@ class _EmbodyLayer:
         for label, closer in (("session", self.session.close), ("media", self.media.close)):
             try:
                 closer()
-            except Exception as err:  # noqa: BLE001 — teardown names faults, never raises
+            except Exception as err:  # teardown names faults, never raises
                 _embody_drop(
                     self._export,
                     EMBODY_SOURCE_SHUTDOWN,

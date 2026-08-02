@@ -85,7 +85,7 @@ def _scripted_turn_fn(*results: TurnResult):
     """
     state = {"n": 0}
 
-    def turn_fn(messages, *, tools=None, **kw):  # noqa: ANN001 - test double
+    def turn_fn(messages, *, tools=None, **kw):  # test double
         i = state["n"]
         state["n"] += 1
         if i < len(results):

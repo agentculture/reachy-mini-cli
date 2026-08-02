@@ -113,7 +113,7 @@ class TestResolveBackend:
 
         backend = resolve_backend(enabled=True, kind="http", stt_url="http://127.0.0.1:1")
         # Window/throttle now live on the delegated Transcriber.
-        backend._transcriber._window_samples = 0  # noqa: SLF001  (post immediately, no net wait)
+        backend._transcriber._window_samples = 0  # (post immediately, no net wait)
         out = backend.update(_make_sense(), _chunk())
         assert out in (True, False)
 
@@ -139,27 +139,23 @@ class TestHttpSttBackend:
         We inject the HTTP POST so no real server is needed. The POST seam now
         lives on the delegated Transcriber (`backend._transcriber._post`)."""
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._transcriber._post = lambda audio: {  # noqa: SLF001
-            "text": "well, hey Reachy, wake up"
-        }
+        backend._transcriber._post = lambda audio: {"text": "well, hey Reachy, wake up"}
         assert backend.update(_make_sense(), _chunk()) is True
 
     def test_no_match_returns_false(self):
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._transcriber._post = lambda audio: {  # noqa: SLF001
-            "text": "the weather is nice today"
-        }
+        backend._transcriber._post = lambda audio: {"text": "the weather is nice today"}
         assert backend.update(_make_sense(), _chunk()) is False
 
     def test_detected_field_fires(self):
         """A response with an explicit boolean `detected` field is honoured."""
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._transcriber._post = lambda audio: {"detected": True}  # noqa: SLF001
+        backend._transcriber._post = lambda audio: {"detected": True}
         assert backend.update(_make_sense(), _chunk()) is True
 
     def test_post_returning_none_is_false(self):
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._transcriber._post = lambda audio: None  # noqa: SLF001
+        backend._transcriber._post = lambda audio: None
         assert backend.update(_make_sense(), _chunk()) is False
 
     def test_post_raising_is_swallowed(self):
@@ -169,7 +165,7 @@ class TestHttpSttBackend:
             raise RuntimeError("network exploded")
 
         backend = _nowindow(stt_url="http://stt.invalid", phrase="hey reachy")
-        backend._transcriber._post = _boom  # noqa: SLF001
+        backend._transcriber._post = _boom
         assert backend.update(_make_sense(), _chunk()) is False
 
     def test_env_var_default_url(self, monkeypatch):
@@ -554,7 +550,7 @@ class TestWindowing:
             calls["n"] += 1
             return {"text": "hey reachy"}
 
-        backend._transcriber._post = _post  # noqa: SLF001
+        backend._transcriber._post = _post
         return backend, calls
 
     def test_no_post_until_window_full(self):
@@ -565,9 +561,9 @@ class TestWindowing:
             stt_url="http://stt.local", sample_rate=1000, window_seconds=1.0, min_interval=0.0
         )
         posted = {"n": 0}
-        backend._transcriber._post = lambda audio: posted.__setitem__(  # noqa: SLF001
-            "n", posted["n"] + 1
-        ) or {"text": "x"}
+        backend._transcriber._post = lambda audio: posted.__setitem__("n", posted["n"] + 1) or {
+            "text": "x"
+        }
 
         assert backend.update(_make_sense(), _chunk(400)) is False  # 400 < 1000
         assert backend.update(_make_sense(), _chunk(400)) is False  # 800 < 1000
@@ -579,8 +575,8 @@ class TestWindowing:
         # Fake clock that does not advance → second tick is throttled.
         clock = {"t": 100.0}
         backend, calls = self._counting_backend()
-        backend._transcriber._clock = lambda: clock["t"]  # noqa: SLF001
-        backend._transcriber._min_interval = 5.0  # noqa: SLF001
+        backend._transcriber._clock = lambda: clock["t"]
+        backend._transcriber._min_interval = 5.0
 
         assert backend.update(_make_sense(), _chunk()) is True  # first post
         assert backend.update(_make_sense(), _chunk()) is False  # throttled (same time)
@@ -592,8 +588,8 @@ class TestWindowing:
     def test_reset_clears_window_and_throttle(self):
         backend, calls = self._counting_backend(min_interval=5.0)
         clock = {"t": 0.0}
-        backend._transcriber._clock = lambda: clock["t"]  # noqa: SLF001
+        backend._transcriber._clock = lambda: clock["t"]
         assert backend.update(_make_sense(), _chunk()) is True
         backend.reset()  # a real wake → clear so we don't immediately re-fire on stale audio
-        assert backend._transcriber._buffered == 0  # noqa: SLF001
-        assert backend._transcriber._last_post is None  # noqa: SLF001
+        assert backend._transcriber._buffered == 0
+        assert backend._transcriber._last_post is None

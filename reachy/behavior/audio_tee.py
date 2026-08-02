@@ -574,7 +574,7 @@ class AudioTee:
         while not self._stop.is_set():
             try:
                 self._serve_once()
-            except Exception:  # noqa: BLE001 — the tee must outlive any one sweep
+            except Exception:  # the tee must outlive any one sweep
                 logger.warning("AudioTee: worker sweep raised; continuing", exc_info=True)
                 self._stop.wait(self._beat_s)
 
@@ -767,7 +767,7 @@ class AudioTee:
         try:
             probe.settimeout(PROBE_TIMEOUT_S)
             probe.connect(str(path))
-        except Exception:  # noqa: BLE001 — anything but a connect is "not served"
+        except Exception:  # anything but a connect is "not served"
             return False
         finally:
             probe.close()
@@ -779,7 +779,7 @@ class AudioTee:
             return None
         try:
             return provider()
-        except Exception:  # noqa: BLE001 — a cold holder is a null rate, not a crash
+        except Exception:  # a cold holder is a null rate, not a crash
             logger.debug("AudioTee: samplerate probe raised", exc_info=True)
             return None
 

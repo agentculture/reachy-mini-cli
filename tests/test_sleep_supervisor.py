@@ -164,7 +164,7 @@ def test_build_run_command_no_audio_wake_false_also_absent() -> None:
 class _FakePopen:
     returncode = None
 
-    def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001 - test shim
+    def __init__(self, cmd, **kwargs) -> None:  # test shim
         self.cmd = list(cmd)
         self.kwargs = kwargs
         self.pid = 9191
@@ -174,7 +174,7 @@ class _FakePopen:
 
 
 def _popen_factory(box):
-    def _popen(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _popen(cmd, **kwargs):  # test shim
         proc = _FakePopen(cmd, **kwargs)
         box.append(proc)
         return proc
@@ -182,7 +182,7 @@ def _popen_factory(box):
     return _popen
 
 
-def _no_spawn(cmd, **kwargs):  # noqa: ANN001 - test shim
+def _no_spawn(cmd, **kwargs):  # test shim
     raise AssertionError("must not spawn a process here")
 
 

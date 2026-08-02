@@ -44,7 +44,7 @@ class _FakeTransport:
         self._specs = specs or {"width": 640, "height": 480, "name": "test-cam"}
         self._move_error = move_error
 
-    def move_goto(self, **kwargs) -> object:  # noqa: ANN003 - test shim
+    def move_goto(self, **kwargs) -> object:  # test shim
         if self._move_error is not None:
             raise self._move_error
         self.gotos.append(kwargs)
@@ -127,7 +127,7 @@ def test_run_installs_stop_handlers_and_settles_on_interrupt(monkeypatch) -> Non
         lambda stop: seen.__setitem__("stop", stop),  # returns None -> restore is a no-op
     )
 
-    def _boom(self, **kwargs):  # noqa: ANN003 - test shim
+    def _boom(self, **kwargs):  # test shim
         raise RuntimeError("interrupted mid-loop")
 
     monkeypatch.setattr("reachy.vision.producer.VisionProducer.run", _boom)
@@ -324,7 +324,7 @@ def test_status_json_stopped(monkeypatch, capsys) -> None:
 class _FakePopen:
     returncode = None
 
-    def __init__(self, cmd, **kwargs) -> None:  # noqa: ANN001 - test shim
+    def __init__(self, cmd, **kwargs) -> None:  # test shim
         self.cmd = list(cmd)
         self.kwargs = kwargs
         self.pid = 5151
@@ -334,7 +334,7 @@ class _FakePopen:
 
 
 def _popen_factory(box):
-    def _popen(cmd, **kwargs):  # noqa: ANN001 - test shim
+    def _popen(cmd, **kwargs):  # test shim
         proc = _FakePopen(cmd, **kwargs)
         box.append(proc)
         return proc
@@ -342,7 +342,7 @@ def _popen_factory(box):
     return _popen
 
 
-def _no_spawn(cmd, **kwargs):  # noqa: ANN001 - test shim
+def _no_spawn(cmd, **kwargs):  # test shim
     raise AssertionError("must not spawn a process here")
 
 

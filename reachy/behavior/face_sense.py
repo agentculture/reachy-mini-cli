@@ -315,7 +315,7 @@ def usable_frame(frame: object) -> bool:
         return False
     try:
         arr = np.asarray(frame)
-    except Exception:  # noqa: BLE001 — an unconvertible object is just not a frame
+    except Exception:  # an unconvertible object is just not a frame
         return False
     if arr.dtype == object or arr.ndim not in (2, 3) or arr.size == 0:
         return False
@@ -341,7 +341,7 @@ def build_face_recognition(
     stays importable with no opencv installed. ``models_dir`` / ``store_base_dir``
     are passed through for test isolation when given.
     """
-    global _VISION_WARNED  # noqa: PLW0603 — one process-wide warning, by design
+    global _VISION_WARNED  # one process-wide warning, by design
     # The SAME probe the availability block reads, so the boot log and the
     # standing `state.json` reason can never disagree about why face is dead.
     if vision_unavailable_reason() is not None:
@@ -358,7 +358,7 @@ def build_face_recognition(
 
         engine = FaceEngine(models_dir=models_dir) if models_dir is not None else FaceEngine()
         store = FaceStore(base_dir=store_base_dir) if store_base_dir is not None else FaceStore()
-    except Exception:  # noqa: BLE001 — a broken vision stack disables the cue, nothing more
+    except Exception:  # a broken vision stack disables the cue, nothing more
         if not _VISION_WARNED:
             _VISION_WARNED = True
             logger.warning(
@@ -522,7 +522,7 @@ class FaceSenseDriver:
         self._face = None
         try:
             self._process(ctx)
-        except Exception:  # noqa: BLE001 — a sense tap must never crash the loop
+        except Exception:  # a sense tap must never crash the loop
             logger.warning("FaceSenseDriver tick raised; face cue dropped", exc_info=True)
 
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
@@ -656,7 +656,7 @@ class FaceSenseDriver:
             return False
         try:
             return bool(getattr(self._media, "connected", True))
-        except Exception:  # noqa: BLE001 — a raising probe is not a liveness verdict
+        except Exception:  # a raising probe is not a liveness verdict
             logger.debug("FaceSenseDriver liveness probe raised; assuming live", exc_info=True)
             return True
 
@@ -671,7 +671,7 @@ class FaceSenseDriver:
             return False
         try:
             return bool(getattr(self._media, "camera_available", True))
-        except Exception:  # noqa: BLE001 — a raising probe is not a camera verdict
+        except Exception:  # a raising probe is not a camera verdict
             logger.debug("FaceSenseDriver camera probe raised; assuming a camera", exc_info=True)
             return True
 
@@ -682,7 +682,7 @@ class FaceSenseDriver:
             return None
         try:
             return media.frame()  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001 — a read fault degrades, never propagates
+        except Exception:  # a read fault degrades, never propagates
             logger.debug("FaceSenseDriver frame read raised; no frame this tick", exc_info=True)
             return None
 
@@ -706,7 +706,7 @@ class FaceSenseDriver:
         for sink in self._frame_sinks:
             try:
                 sink(frame)
-            except Exception as err:  # noqa: BLE001 — a fan-out consumer must never break the tick
+            except Exception as err:  # a fan-out consumer must never break the tick
                 logger.debug("FaceSenseDriver: frame sink raised (%s); frame not delivered", err)
 
     # -- match leg ------------------------------------------------------ #
@@ -747,7 +747,7 @@ class FaceSenseDriver:
         while not self._stop.is_set():
             try:
                 self._worker_tick()
-            except Exception:  # noqa: BLE001 — never let the worker die on a bad frame
+            except Exception:  # never let the worker die on a bad frame
                 logger.warning("FaceSenseDriver worker tick raised; continuing", exc_info=True)
             self._stop.wait(_POLL_INTERVAL)
 
@@ -781,14 +781,14 @@ class FaceSenseDriver:
         """
         try:
             detection = self._engine.detect(frame)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("FaceSenseDriver detection raised; skipping frame", exc_info=True)
             return None
         if detection is None:
             return None
         try:
             match = self._store.match(detection.embedding)  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("FaceSenseDriver store match raised; skipping frame", exc_info=True)
             return None
         if match is None:

@@ -51,7 +51,7 @@ def _safe_call(fn: Callable[[], object] | None) -> object | None:
         return None
     try:
         return fn()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 

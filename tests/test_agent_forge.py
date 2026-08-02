@@ -78,7 +78,7 @@ def _scripted_turn_fn(*results: TurnResult):
     state = {"n": 0}
     advertised: list[list[str]] = []
 
-    def turn_fn(messages, *, tools=None, **kw):  # noqa: ANN001 - test double
+    def turn_fn(messages, *, tools=None, **kw):  # test double
         advertised.append([t["function"]["name"] for t in (tools or [])])
         i = state["n"]
         state["n"] += 1
@@ -141,7 +141,7 @@ def _inline_forge_factory(reply: dict, *, seen: list | None = None):
     paths the production wiring uses.
     """
 
-    def transport(url, payload, headers, timeout):  # noqa: ANN001 - test double
+    def transport(url, payload, headers, timeout):  # test double
         if seen is not None:
             seen.append(payload)
         return reply
@@ -159,7 +159,7 @@ def _inline_forge_factory(reply: dict, *, seen: list | None = None):
         class _Inline:
             """Same ``dispatch(goal, improve=...)`` shape, run on the calling thread."""
 
-            def dispatch(self, goal, context=None, improve=None):  # noqa: ANN001
+            def dispatch(self, goal, context=None, improve=None):
                 real._run(goal, context or {}, improve)
                 return None
 

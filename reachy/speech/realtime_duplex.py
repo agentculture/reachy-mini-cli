@@ -741,7 +741,7 @@ class RealtimeDuplexSession(_SessionObservables):
             self._teardown_socket()
             self._state.mark_down(lost.reason, lost.detail)
             return 0 if stable else attempts + 1
-        except Exception:  # noqa: BLE001 - the worker must outlive any fault
+        except Exception:  # the worker must outlive any fault
             logger.warning("duplex: session pump raised", exc_info=True)
             self._teardown_socket()
             self._state.mark_down(REASON_STREAM_CLOSED, "unexpected pump failure")
@@ -857,7 +857,7 @@ class RealtimeDuplexSession(_SessionObservables):
         """One guarded ``read_audio()`` call. Never raises; a fault is latched."""
         try:
             chunk = self._read_audio()
-        except Exception:  # noqa: BLE001 - a broken source must not end the session
+        except Exception:  # a broken source must not end the session
             if not self._source_failed_logged:
                 self._source_failed_logged = True
                 self._state.drop(REASON_SOURCE_FAILED, "read_audio raised")
@@ -1034,7 +1034,7 @@ class RealtimeDuplexSession(_SessionObservables):
         self._speaking = True
         try:
             play(audio, samplerate=self._output_sample_rate)
-        except Exception:  # noqa: BLE001 - a dead speaker must not end the session
+        except Exception:  # a dead speaker must not end the session
             self.playback_failures += 1
             if not self._playback_failed_logged:
                 self._playback_failed_logged = True
@@ -1077,7 +1077,7 @@ class RealtimeDuplexSession(_SessionObservables):
             return
         try:
             callback(item)
-        except Exception:  # noqa: BLE001 - a tap must not kill the session
+        except Exception:  # a tap must not kill the session
             logger.warning("duplex: %s callback raised", name, exc_info=True)
 
     def _teardown_socket(self, *, graceful: bool = False) -> None:

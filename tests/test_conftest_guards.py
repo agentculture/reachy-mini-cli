@@ -115,7 +115,7 @@ def test_a_test_may_still_install_its_own_urlopen_fake(monkeypatch: pytest.Monke
     """
     calls: list[str] = []
 
-    def _fake(req, *_args, **_kwargs):  # noqa: ANN001 — urlopen's own shape
+    def _fake(req, *_args, **_kwargs):  # urlopen's own shape
         calls.append(getattr(req, "full_url", req))
         raise AssertionError("reached the fake, which is the point")
 

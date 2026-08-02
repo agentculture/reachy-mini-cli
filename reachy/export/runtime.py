@@ -350,7 +350,7 @@ def _pat_state_payload(value: object) -> dict | None:
     def read(name, default=None):
         try:
             return raw_read(name, default)
-        except Exception:  # noqa: BLE001 - one bad field must not drop legacy sense
+        except Exception:  # one bad field must not drop legacy sense
             return default
 
     availability = read("availability", "unavailable")
@@ -522,7 +522,7 @@ class RuntimeConsumer:
     def __call__(self, event: dict) -> None:
         try:
             mapped = to_runtime_event(event)
-        except Exception:  # noqa: BLE001 - a malformed event must never break the fan-out
+        except Exception:  # a malformed event must never break the fan-out
             return
         if mapped is not None:
             self._sink.emit(mapped)

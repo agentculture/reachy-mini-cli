@@ -124,7 +124,7 @@ class EventsCliClient:
             return False
         try:
             return bool(client.is_connected)
-        except Exception:  # noqa: BLE001 - a state read must never raise
+        except Exception:  # a state read must never raise
             return False
 
     def will_set(self, topic: str, payload: str, *, qos: int = 0, retain: bool = True) -> None:
@@ -169,7 +169,7 @@ class EventsCliClient:
         self._client = None
         try:
             client.close()
-        except Exception as err:  # noqa: BLE001 - shutdown must never raise
+        except Exception as err:  # shutdown must never raise
             logger.warning(
                 "events: closing the bus client failed (%s: %s)", type(err).__name__, err
             )
@@ -220,7 +220,7 @@ def _resolve_vendor() -> Any | None:
     module_name, attr = VENDOR_IMPORT
     try:
         module = importlib.import_module(module_name)
-    except Exception as err:  # noqa: BLE001 - an absent optional package is normal
+    except Exception as err:  # an absent optional package is normal
         logger.debug("events: %s unavailable (%s: %s)", module_name, type(err).__name__, err)
         return None
     return getattr(module, attr, None)

@@ -451,7 +451,7 @@ class PatSenseDriver:
         try:
             self._process(ctx)
         # A sense tap must never crash the loop.
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("PatSenseDriver tick raised; pat cue dropped", exc_info=True)
 
     def _process(self, ctx) -> None:  # type: ignore[no-untyped-def]
@@ -896,7 +896,7 @@ class PatSenseDriver:
     def _draw_enough_after(self) -> float:
         try:
             value = float(self._enough_after_fn())
-        except Exception:  # noqa: BLE001
+        except Exception:
             value = ENOUGH_MAX_S
         if not math.isfinite(value):
             value = ENOUGH_MAX_S
@@ -1108,7 +1108,7 @@ class PatSenseDriver:
         try:
             reading = self._reader()
         # A raising reader degrades, never propagates.
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("PatSenseDriver reader raised; treating as no reading", exc_info=True)
             return None
         if reading is None:

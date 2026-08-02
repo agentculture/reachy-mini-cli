@@ -265,7 +265,7 @@ def make_default_play(
             return None
         try:
             return media_session_provider()
-        except Exception as err:  # noqa: BLE001 — a broken holder must not lose the clip
+        except Exception as err:  # a broken holder must not lose the clip
             logger.warning("speech: held media session provider raised (%s); using http", err)
             return None
 
@@ -543,7 +543,7 @@ class SpeechActuator:
                 return
             try:
                 self._render(*item)
-            except Exception:  # noqa: BLE001 — the worker must outlive any utterance
+            except Exception:  # the worker must outlive any utterance
                 logger.warning("speech: rendering an utterance raised", exc_info=True)
             finally:
                 with self._idle:
@@ -562,7 +562,7 @@ class SpeechActuator:
             return
         try:
             pcm = self.voice.synthesize(text)
-        except Exception as err:  # noqa: BLE001 — an unreachable TTS is silence
+        except Exception as err:  # an unreachable TTS is silence
             self._note_failure(event, REASON_SYNTHESIZE, err)
             return
         if not pcm:
@@ -578,7 +578,7 @@ class SpeechActuator:
         self._stamp_mute(duration_s)
         try:
             self._play(pcm, samplerate=self.voice.samplerate)
-        except Exception as err:  # noqa: BLE001 — a dead speaker is silence
+        except Exception as err:  # a dead speaker is silence
             self._note_failure(event, REASON_PLAYBACK, err)
             return
         self._stamp_mute(duration_s)

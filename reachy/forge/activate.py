@@ -149,7 +149,7 @@ class ForgedSkillContext:
         try:
             seam(emoji)
             return f"[expressed {emoji}]"
-        except Exception as err:  # noqa: BLE001 - a forged skill must never crash the loop
+        except Exception as err:  # a forged skill must never crash the loop
             logger.warning("ForgedSkillContext.express failed: %s", err)
             return f"[express error: {err}]"
 
@@ -181,7 +181,7 @@ class ForgedSkillContext:
             return "[run_behavior unavailable]"
         try:
             return str(seam(name, params=params, duration=duration))
-        except Exception as err:  # noqa: BLE001 - a refusal must never crash forged code
+        except Exception as err:  # a refusal must never crash forged code
             logger.warning("ForgedSkillContext.run_behavior refused %r: %s", name, err)
             return f"[run_behavior refused: {err}]"
 
@@ -189,7 +189,7 @@ class ForgedSkillContext:
         """Read one field from the forged-skill scratch state (``None`` if unset)."""
         try:
             return self._state.get(key)
-        except Exception as err:  # noqa: BLE001 - defensive
+        except Exception as err:  # defensive
             logger.warning("ForgedSkillContext.state_get failed: %s", err)
             return None
 
@@ -198,7 +198,7 @@ class ForgedSkillContext:
         try:
             self._state.update(fields)
             return "[state updated]"
-        except Exception as err:  # noqa: BLE001 - defensive
+        except Exception as err:  # defensive
             logger.warning("ForgedSkillContext.state_update failed: %s", err)
             return f"[state_update error: {err}]"
 
@@ -209,7 +209,7 @@ class ForgedSkillContext:
         try:
             seam(text)
             return f"[{label}]"
-        except Exception as err:  # noqa: BLE001 - a forged skill must never crash the loop
+        except Exception as err:  # a forged skill must never crash the loop
             logger.warning("ForgedSkillContext.%s failed: %s", label, err)
             return f"[{label} error: {err}]"
 
@@ -277,7 +277,7 @@ def wrap_executor(
         def _run() -> None:
             try:
                 outcome["result"] = execute_fn(arguments or {}, ctx)
-            except Exception as err:  # noqa: BLE001 - forged code must never crash the loop
+            except Exception as err:  # forged code must never crash the loop
                 outcome["error"] = err
 
         worker = threading.Thread(target=_run, name=f"forge-exec-{name}", daemon=True)
@@ -388,14 +388,14 @@ class ForgeActivator:
         """
         try:
             _senselog_event(event_type, payload)
-        except Exception as err:  # noqa: BLE001 - observability must never break dispatch
+        except Exception as err:  # observability must never break dispatch
             logger.warning("forge senselog failed for %s: %s", event_type, err)
         if event_type == lifecycle.EVENT_STAGED:
             name = payload.get("name")
             if name:
                 try:
                     self.activate(name)
-                except Exception as err:  # noqa: BLE001 - activation must never crash dispatch
+                except Exception as err:  # activation must never crash dispatch
                     logger.warning("forge auto-activation failed for %s: %s", name, err)
 
     # -- activation ----------------------------------------------------------
@@ -420,7 +420,7 @@ class ForgeActivator:
         if self._announce is not None:
             try:
                 self._announce(f"learned a new skill: {name}")
-            except Exception as err:  # noqa: BLE001 - announcing must never break activation
+            except Exception as err:  # announcing must never break activation
                 logger.warning("forge announce failed for %s: %s", name, err)
         return True
 
@@ -458,7 +458,7 @@ class ForgeActivator:
         """Validate → import (only after ok) → wrap → hot-register. Never raises."""
         try:
             ok, reasons = self._validator(skill_dir)
-        except Exception as err:  # noqa: BLE001 - a raising validator fails closed
+        except Exception as err:  # a raising validator fails closed
             logger.warning("forge activate: validator raised for %s: %s", name, err)
             return False
         if not ok:
@@ -469,7 +469,7 @@ class ForgeActivator:
 
         try:
             execute_fn = self._importer(skill_dir / lifecycle.EXECUTOR_FILENAME, name)
-        except Exception as err:  # noqa: BLE001 - a raising import skips just this skill
+        except Exception as err:  # a raising import skips just this skill
             logger.warning("forge activate: importing %s failed: %s", name, err)
             return False
         if execute_fn is None:
@@ -480,7 +480,7 @@ class ForgeActivator:
         handler = wrap_executor(execute_fn, self._ctx, name)
         try:
             self._register(name, description, dict(DEFAULT_FORGED_PARAMS), handler)
-        except Exception as err:  # noqa: BLE001 - a broken register callback isolates
+        except Exception as err:  # a broken register callback isolates
             logger.warning("forge activate: registering %s failed: %s", name, err)
             return False
         logger.info("forge activate: hot-registered forged skill %r", name)

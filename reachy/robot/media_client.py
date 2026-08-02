@@ -182,7 +182,7 @@ def _http(url: str, timeout: float, method: str) -> bytes | None:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
             return resp.read()
-    except Exception:  # noqa: BLE001 - a probe must degrade, never raise
+    except Exception:  # a probe must degrade, never raise
         return None
 
 
@@ -193,7 +193,7 @@ def _get_json(url: str, timeout: float) -> Any | None:
         return None
     try:
         return json.loads(raw)
-    except Exception:  # noqa: BLE001 - an unparseable body is "no information"
+    except Exception:  # an unparseable body is "no information"
         return None
 
 
@@ -386,7 +386,7 @@ class HeldMediaClient:
         try:
             raw = media.get_audio_sample()
         # A read fault must degrade, not raise.
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             self._drop_client(reason=f"audio read failed ({err})")
             return None
         return to_mono(raw)
@@ -412,7 +412,7 @@ class HeldMediaClient:
         try:
             return self._media.get_frame()  # type: ignore[union-attr]
         # A read fault must degrade, not raise.
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             self._drop_client(reason=f"frame read failed ({err})")
             return None
 
@@ -535,7 +535,7 @@ class HeldMediaClient:
             samplerate = int(media.get_input_audio_samplerate())
             channels = int(media.get_input_channels())
         # A construction fault must degrade, not raise.
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             self._release_raw(client)
             # We acquired media and then could not use it — hand it straight back
             # rather than sit on a single-consumer resource for the whole backoff.
@@ -579,7 +579,7 @@ class HeldMediaClient:
             return True  # gate disabled by configuration
         try:
             return self._run_media_gate()
-        except Exception as err:  # noqa: BLE001 - the gate must never raise
+        except Exception as err:  # the gate must never raise
             logger.warning("HeldMediaClient: media gate failed (%s); constructing anyway", err)
             return True
 
@@ -654,7 +654,7 @@ class HeldMediaClient:
             if not _post_ok(self._base_url + MEDIA_RELEASE_PATH, self._gate_timeout):
                 logger.warning("HeldMediaClient: media release was refused by the daemon")
                 return
-        except Exception as err:  # noqa: BLE001 - teardown must never raise
+        except Exception as err:  # teardown must never raise
             logger.warning("HeldMediaClient: media release failed (%s)", err)
             return
         self._log_transition("media released back to the daemon")
@@ -682,7 +682,7 @@ class HeldMediaClient:
                         self._media = self._client.media  # acquire re-creates the manager
                 self._camera = getattr(self._media, "camera", None)
             # Camera resolution must degrade, not raise.
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 logger.warning("HeldMediaClient: camera resolution failed (%s)", err)
                 self._camera = None
             self._camera_resolved = True
@@ -714,7 +714,7 @@ class HeldMediaClient:
             if stop is not None:
                 try:
                     stop()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     # Teardown must never raise — and a wedged recorder must not
                     # stop us releasing the client itself (the part that hangs
                     # interpreter exit if left open).
@@ -736,7 +736,7 @@ class HeldMediaClient:
                 continue
             try:
                 method()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # A raising close() must not stop us trying disconnect().
                 logger.warning("HeldMediaClient: %s() raised during release", method_name)
                 continue

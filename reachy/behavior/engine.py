@@ -249,7 +249,7 @@ class Engine:
             return {"ok": False, "error": f"unknown op {op!r}"}
         except CliError as err:
             return {"ok": False, "op": op, "error": err.message}
-        except Exception as err:  # noqa: BLE001 - defensive: isolate a bad command
+        except Exception as err:  # defensive: isolate a bad command
             return {"ok": False, "op": op, "error": f"{type(err).__name__}: {err}"}
 
     # --- composition -----------------------------------------------------

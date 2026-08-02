@@ -385,7 +385,7 @@ def _open_checked(cfg: LlmConfig, req: urllib.request.Request, timeout: float):
         ) from err
 
 
-def _check_status(resp, cfg: LlmConfig) -> None:  # noqa: ANN001
+def _check_status(resp, cfg: LlmConfig) -> None:
     """Raise a ``CliError`` (exit-2) if the entered response is not a 2xx."""
     status = getattr(resp, "status", None) or resp.getcode()
     if not (200 <= int(status) < 300):
@@ -762,7 +762,7 @@ def _parse_message_tool_calls(message: dict) -> list[ToolCall]:
     return calls
 
 
-def _iter_sse_chunks(resp) -> Iterator[dict]:  # noqa: ANN001
+def _iter_sse_chunks(resp) -> Iterator[dict]:
     """Parse an SSE byte stream line-by-line, yielding each decoded chunk dict.
 
     Honors the OpenAI contract: lines beginning ``data: ``; the ``[DONE]``
@@ -788,7 +788,7 @@ def _iter_sse_chunks(resp) -> Iterator[dict]:  # noqa: ANN001
             continue
 
 
-def _iter_sse_deltas(resp) -> Iterator[str]:  # noqa: ANN001
+def _iter_sse_deltas(resp) -> Iterator[str]:
     """Parse an SSE byte stream, yielding text content deltas.
 
     Thin content-only view over :func:`_iter_sse_chunks`: extracts
@@ -846,7 +846,7 @@ def stream_sentences(
         yield buffer.strip()
 
 
-def _coerce_cancel(cancel) -> "callable":  # noqa: ANN001
+def _coerce_cancel(cancel) -> "callable":
     """Normalize a cancel token (None / callable / Event-like) to a predicate."""
     if cancel is None:
         return lambda: False

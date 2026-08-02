@@ -1046,7 +1046,7 @@ class EmbodyTurnEngine:
         except OSError as err:
             self.stream_failures += 1
             return self._fail(REASON_STREAM_FAILED, f"{type(err).__name__}: {err}", raw)
-        except Exception as err:  # noqa: BLE001 - a bad turn must never kill the layer
+        except Exception as err:  # a bad turn must never kill the layer
             self.stream_failures += 1
             logger.warning("[embody] %s turn raised", role, exc_info=True)
             return self._fail(REASON_STREAM_FAILED, f"{type(err).__name__}: {err}", raw)

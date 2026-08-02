@@ -566,7 +566,7 @@ class CorroboratedGate:
     def __call__(self, sense: Sense, now: float, params: OrientParams) -> OrientTier:
         try:
             return self._decide(sense, now, params)
-        except Exception:  # noqa: BLE001 - an unreadable sense must never steer or raise
+        except Exception:  # an unreadable sense must never steer or raise
             self._ref_angle = None
             self._envelope.reset()
             return OrientTier.NONE
@@ -712,12 +712,12 @@ class LatchedDoaGuard:
     def __call__(self, sense: Sense, now: float, params: OrientParams) -> OrientTier:
         try:
             frozen = self._track(sense, now, params)
-        except Exception:  # noqa: BLE001 - an unreadable bearing must never steer or raise
+        except Exception:  # an unreadable bearing must never steer or raise
             self._reset()
             return OrientTier.NONE
         try:
             tier = self.inner(sense, now, params)
-        except Exception:  # noqa: BLE001 - a raising inner gate means "no reading"
+        except Exception:  # a raising inner gate means "no reading"
             return OrientTier.NONE
         if not isinstance(tier, OrientTier):
             return OrientTier.NONE
@@ -955,7 +955,7 @@ class OrientToSound:
     def _tier(self, sense, now: float, params: OrientParams) -> OrientTier:
         try:
             tier = self._gate(sense, now, params)
-        except Exception:  # noqa: BLE001 - a raising gate means "no reading", never a crash
+        except Exception:  # a raising gate means "no reading", never a crash
             return OrientTier.NONE
         return tier if isinstance(tier, OrientTier) else OrientTier.NONE
 

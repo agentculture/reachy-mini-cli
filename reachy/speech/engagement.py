@@ -385,7 +385,7 @@ def _judge_or_degrade(
     """
     try:
         verdict = classifier.judge(text, context)
-    except Exception:  # noqa: BLE001 — any failure means "classifier unavailable"
+    except Exception:  # any failure means "classifier unavailable"
         return Decision.DEGRADE
     return Decision.ENGAGE if verdict else Decision.DROP
 
