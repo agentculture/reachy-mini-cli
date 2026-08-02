@@ -512,6 +512,31 @@ def test_the_duplex_session_reads_and_speaks_through_the_media_profile():
         layer.close()
 
 
+def test_the_composed_session_kwargs_bind_to_the_REAL_duplex_signature():
+    """The double must not be the only thing that accepts what we hand it.
+
+    Every other collaborator in this module's tests is the real class, so a
+    renamed or dropped parameter fails immediately. The duplex session is the
+    one exception — it is always a double, because constructing the real one
+    starts threads that dial a gateway — and a double taking ``**kwargs``
+    accepts anything. That is precisely the shape of this arc's recurring
+    defect: two ends of one contract disagreeing while both sides' tests pass.
+    So bind the kwargs we actually composed against the REAL signature.
+    """
+    import inspect
+
+    from reachy.speech.realtime_duplex import RealtimeDuplexSession
+
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        signature = inspect.signature(RealtimeDuplexSession.__init__)
+        # Raises TypeError naming the offending parameter if the two disagree.
+        signature.bind(object(), **factory.last.kwargs)
+    finally:
+        layer.close()
+
+
 def test_the_mute_during_playback_seam_is_one_flag_away():
     """The AEC fallback is configuration, not a code change (t9's own words)."""
     factory = _SessionFactory()
