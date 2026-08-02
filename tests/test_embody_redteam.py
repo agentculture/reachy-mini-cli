@@ -69,6 +69,18 @@ the same reason: the interjection policy is not a containment boundary.
 machine-checked version of that — an attacker who has warmed attention by
 saying "reachy" out loud still gets a named refusal, because the two gates
 answer different questions and neither is load-bearing for blast radius.
+
+The tail cut (task t16) widens NOTHING, and is worth naming anyway
+--------------------------------------------------------------------
+``reachy/cli/_commands/agent.py``'s ``_tail_cut_tap`` lets a VAD-verified onset
+stop the robot mid-sentence in the window after ``response.done``, ungated by
+attention. Stated plainly: anyone audible can keep the robot from finishing a
+sentence. That is not a new surface — the gateway's own barge-in
+(``response.interrupted``) already acts on exactly the same evidence for the
+rest of every reply, and upstream paces its delivery to make sure it can. The
+cut adds no action, reaches no tool, and can only ever WITHHOLD speech, so the
+two claims above are untouched: the action set is still closed and the
+validators still do the refusing.
 """
 
 from __future__ import annotations
