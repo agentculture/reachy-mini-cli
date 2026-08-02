@@ -1007,3 +1007,37 @@ def test_a_camera_that_never_streamed_and_is_unavailable_produces_no_drop(caplog
         for tick in range(4):
             driver(_Ctx(tick * 30.0))
     assert not _drop_messages(caplog, FS.REASON_STREAM_ENDED)
+
+
+def test_a_disconnected_client_is_never_reported_as_a_dead_stream(caplog) -> None:
+    """A dropped or unwarmed client is not a camera whose stream ended.
+
+    ``HeldMediaClient.connected`` is false whenever no live client is HELD —
+    not warmed yet, dropped, mid-backoff. Sharing the ``camera-stream-ended``
+    name with that state would report a dead camera on every reconnect window,
+    which is the misleading-diagnosis class #138 exists to remove.
+    """
+
+    class _Dropping:
+        def __init__(self) -> None:
+            self.connected = True
+            self.camera_available = True
+
+        def frame(self):
+            return _frame()
+
+    media = _Dropping()
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        driver(_Ctx(0.0))  # a real frame anchors `_last_frame_at`
+        assert driver.peek_frame_available() is True
+        media.connected = False  # the client drops — NOT a dead pipeline
+        for now in (2.0, 10.0, 60.0):  # far past the staleness window
+            driver(_Ctx(now))
+        assert driver.peek_frame_available() is False
+
+    assert not _drop_messages(
+        caplog, FS.REASON_STREAM_ENDED
+    ), "a merely disconnected client was mislabelled as a dead camera stream"

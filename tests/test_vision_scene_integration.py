@@ -81,13 +81,16 @@ def test_integration_scene_default_model_resolves_via_senses_role(monkeypatch):
         text = scene._post_chat(messages, cfg)
     except scene.SceneError as err:
         message = str(err)
-        assert "model_not_found" not in message and "404" not in message, (
+        unresolved = (
             f"scene's default model {scene.DEFAULT_VISION_MODEL!r} failed to resolve "
             f"live: {message}"
         )
+        assert "model_not_found" not in message, unresolved
+        assert "404" not in message, unresolved
         pytest.skip(f"scene endpoint failed for a non-#132 reason: {message}")
 
-    assert isinstance(text, str) and text.strip()
+    assert isinstance(text, str)
+    assert text.strip()
 
 
 if __name__ == "__main__":  # pragma: no cover

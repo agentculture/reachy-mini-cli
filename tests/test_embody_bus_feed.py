@@ -56,7 +56,8 @@ def _load_bus_feed() -> ModuleType:
     just by importing it.
     """
     spec = importlib.util.spec_from_file_location("embody_bus_feed", _SCRIPT_PATH)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -106,9 +107,16 @@ class TestOpenFeedFifo:
         path = tmp_path / "embody-feed.fifo"
         os.mkfifo(path, 0o600)
 
+        # ONE possibly-throwing call inside the block: os.open is the subject,
+        # and on the ENXIO path it returns no descriptor at all. The close sits
+        # outside, guarded — it is unreachable today and exists so a regression
+        # that starts succeeding here leaks nothing.
+        writer_fd = -1
         with pytest.raises(OSError) as exc_info:
-            os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+            writer_fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
         assert exc_info.value.errno == errno.ENXIO
+        if writer_fd >= 0:
+            os.close(writer_fd)
 
         fd = bus_feed.open_feed_fifo(str(path))  # must not raise or block
         os.close(fd)
