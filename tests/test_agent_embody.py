@@ -311,6 +311,22 @@ def _speak_turn(text: str) -> TurnResult:
     )
 
 
+def _open_interjection_limits():
+    """Interjection limits an operator has deliberately opened for the worker.
+
+    The SHIPPED limits are closed (issue #155 c22), which is right and is
+    pinned elsewhere; a test about something else entirely — a broken export
+    consumer, an import boundary — needs the open ones, or the thing it means
+    to observe never happens for an unrelated reason. Only the LIMITS are
+    injectable: ``_compose_embody_seam`` always builds the policy itself, so
+    the attention wiring cannot be forgotten by a caller.
+    """
+    from reachy.embody.interjection import Authorization, InterjectionLimits
+    from reachy.embody.tools import TOOL_SOURCE
+
+    return InterjectionLimits(authorization=Authorization.PROACTIVE, sources=(TOOL_SOURCE,))
+
+
 def _wait_for(predicate, *, budget: float = WAIT_BUDGET_S) -> None:
     """Wait on the CONDITION, never on a sleep — see ``tests.conftest``."""
     deadline = time.monotonic() + budget
@@ -643,23 +659,24 @@ def test_the_mute_during_playback_seam_is_one_flag_away():
         layer.close()
 
 
-def test_the_voice_tools_render_through_the_same_profile_sink():
-    """``speak`` synthesises and plays through the profile's sink, not a new one."""
+def test_the_profile_sink_has_exactly_one_consumer_the_foreground_voice():
+    """Since task t12 the sink is the realtime floor's, and nobody else's.
+
+    This test used to assert the opposite — that a ``speak`` tool call
+    synthesised and played through this sink. Issue #155's claim c2 retired
+    that path: the worker model's text may not reach a speaker by any route, so
+    the voice tools became PROPOSALS and the sink kept one consumer, the duplex
+    session playing the FOREGROUND voice's own reply.
+    ``tests/test_embody_governed_voice.py`` pins the retired half in full.
+    """
     media = _media()
-    layer, _args, _sink = _compose(
-        media=media,
-        session_factory=_SessionFactory(),
-        lines=iter(()),
-        synthesize={"tts": lambda text: b"\x01\x02" * len(text)},
-    )
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=media, session_factory=factory, lines=iter(()))
     try:
+        assert factory.last.kwargs["play"] == media.sink.play
         result = layer.registry.dispatch(SPEAK, json.dumps({"text": "hi"}), "call_1")
-        assert json.loads(result["content"])["ok"] is True
-        played = media.sink._backend.played
-        assert len(played) == 1
-        pcm, rate = played[0]
-        assert pcm == b"\x01\x02" * 2
-        assert rate == 24000, "the tts leg's PCM16 rate must travel with the audio"
+        assert json.loads(result["content"])["ok"] is False
+        assert media.sink._backend.played == []
     finally:
         layer.close()
 
@@ -830,8 +847,8 @@ def test_composing_the_whole_layer_never_pulls_reachy_mini_into_sys_modules(tmp_
             def start(self): pass
             def close(self): pass
 
-        def _silent(_text):
-            return b"\\x00\\x00"
+        from reachy.embody.interjection import Authorization, InterjectionLimits
+        from reachy.embody.tools import TOOL_SOURCE
 
         args = _build_parser().parse_args(["agent", "embody"])
         layer = agent._compose_embody_seam(
@@ -839,7 +856,11 @@ def test_composing_the_whole_layer_never_pulls_reachy_mini_into_sys_modules(tmp_
             export=None,
             session_factory=lambda **kw: FakeSession(**kw),
             lines=iter(()),
-            synthesize={{"tts": _silent, "harmonic": _silent}},
+            # Deliberately OPEN: a refused proposal would prove nothing about
+            # which import legs an ADMITTED one takes.
+            interjection_limits=InterjectionLimits(
+                authorization=Authorization.PROACTIVE, sources=(TOOL_SOURCE,)
+            ),
         )
         layer.registry.dispatch("speak", '{{"text": "hello"}}', "c1")
         layer.registry.dispatch("harmonics", '{{"text": "hello"}}', "c2")
@@ -939,48 +960,19 @@ def test_every_named_failure_reaches_the_journal_and_the_export_feed(reason, cap
 def test_a_drop_without_an_export_hook_is_still_a_named_journal_line(caplog):
     """The feed is optional; the journal is not."""
     with caplog.at_level(logging.INFO, logger="reachy"):
-        agent_mod._embody_drop(None, "layer", agent_mod.REASON_SPEAK_FAILED, "")
-    assert agent_mod.REASON_SPEAK_FAILED in "\n".join(r.getMessage() for r in caplog.records)
-
-
-def test_a_dead_speaker_is_a_named_drop_on_the_feed_and_a_refusal_to_the_model():
-    """A wedged sink must not vanish: the model is told, and the feed shows it."""
-    sink = _Sink()
-    layer, _args, _sink = _compose(
-        media=_media(sink_fails=RuntimeError("no such device")),
-        session_factory=_SessionFactory(),
-        lines=iter(()),
-        sink=sink,
+        agent_mod._embody_drop(None, "layer", agent_mod.REASON_SESSION_START_FAILED, "")
+    assert agent_mod.REASON_SESSION_START_FAILED in "\n".join(
+        r.getMessage() for r in caplog.records
     )
-    try:
-        result = layer.registry.dispatch(SPEAK, json.dumps({"text": "hello"}), "c1")
-        payload = json.loads(result["content"])
-        assert payload["ok"] is False
-        assert any(agent_mod.REASON_SPEAK_FAILED in text for text in sink.texts("thinking"))
-    finally:
-        layer.close()
 
 
-def test_a_synthesis_failure_is_a_named_drop_not_a_crash():
-    """A wedged TTS resolves the same way a wedged speaker does."""
-    sink = _Sink()
-
-    def _boom(_text: str) -> bytes:
-        raise RuntimeError("tts is down")
-
-    layer, _args, _sink = _compose(
-        media=_media(),
-        session_factory=_SessionFactory(),
-        lines=iter(()),
-        synthesize={"tts": _boom},
-        sink=sink,
-    )
-    try:
-        result = layer.registry.dispatch(SPEAK, json.dumps({"text": "hello"}), "c1")
-        assert json.loads(result["content"])["ok"] is False
-        assert any(agent_mod.REASON_SPEAK_FAILED in text for text in sink.texts("thinking"))
-    finally:
-        layer.close()
+# The two tests that used to sit here — a dead speaker and a wedged TTS, each
+# surfacing as a named ``speak-failed`` drop — went with the code they covered.
+# The layer no longer synthesises or plays the worker model's text at all
+# (issue #155 claim c2), so there is no synthesis leg left to wedge and no
+# speaker for a tool call to find dead. What replaced them is a structural
+# claim rather than a failure mode: ``tests/test_embody_governed_voice.py``
+# proves no code path reaches either.
 
 
 def test_a_cue_source_that_dies_mid_stream_is_a_named_drop_not_a_crash():
@@ -1003,20 +995,17 @@ def test_a_cue_source_that_dies_mid_stream_is_a_named_drop_not_a_crash():
         layer.close()
 
 
-def test_a_voice_that_will_not_resolve_leaves_the_tool_advertised_but_refusing(monkeypatch):
-    """The action set must not change SHAPE with the box's audio configuration.
+def test_a_closed_interjection_policy_leaves_the_tool_advertised_but_refusing():
+    """The action set must not change SHAPE with the box's configuration.
 
     A model that finds a different tool list on every start learns a different
-    robot every time, so an unresolvable voice engine yields an advertised tool
-    that refuses by name — never a missing tool.
+    robot every time. That argument outlived the voice pipe it was written for:
+    the shipped interjection policy is CLOSED, and what a ``speak`` call gets
+    is an advertised tool returning a named refusal — never a missing tool.
     """
-    from reachy.embody.tools import ACTION_SET, REFUSAL_NO_VOICE
-    from reachy.speech import voice as voice_mod
+    from reachy.embody.interjection import REFUSAL_UNAUTHORIZED
+    from reachy.embody.tools import ACTION_SET
 
-    def _no_voice(_name=None):
-        raise CliError(code=1, message="no such engine", remediation="install one")
-
-    monkeypatch.setattr(voice_mod, "resolve_voice_engine", _no_voice)
     sink = _Sink()
     layer, _args, _sink = _compose(
         media=_media(), session_factory=_SessionFactory(), lines=iter(()), sink=sink
@@ -1024,8 +1013,7 @@ def test_a_voice_that_will_not_resolve_leaves_the_tool_advertised_but_refusing(m
     try:
         assert tuple(layer.registry.names()) == ACTION_SET
         result = layer.registry.dispatch(SPEAK, json.dumps({"text": "hello"}), "c1")
-        assert json.loads(result["content"])["refusal"] == REFUSAL_NO_VOICE
-        assert any(agent_mod.REASON_VOICE_UNAVAILABLE in text for text in sink.texts("thinking"))
+        assert json.loads(result["content"])["refusal"] == REFUSAL_UNAUTHORIZED
     finally:
         layer.close()
 
@@ -1058,8 +1046,10 @@ def test_an_export_sink_that_raises_never_takes_the_drop_path_down(caplog):
 
     hook = ExportHook(emit=_hostile, pose_resolver={}.get, time_fn=lambda: 0.0)
     with caplog.at_level(logging.INFO, logger="reachy"):
-        agent_mod._embody_drop(hook, "layer", agent_mod.REASON_SPEAK_FAILED, "detail")
-    assert agent_mod.REASON_SPEAK_FAILED in "\n".join(r.getMessage() for r in caplog.records)
+        agent_mod._embody_drop(hook, "layer", agent_mod.REASON_SESSION_START_FAILED, "detail")
+    assert agent_mod.REASON_SESSION_START_FAILED in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
 
 
 def test_max_events_bounds_the_cue_reader(tmp_path):
@@ -1194,24 +1184,39 @@ def test_killing_the_export_consumer_mid_run_leaves_the_layer_alive(tmp_path, ca
     turn = _ScriptedTurn(_speak_turn("hi"), TurnResult(content="done", finish_reason="stop"))
     factory = _SessionFactory()
     media = _media()
+    # An OPEN policy, so "the layer kept acting" is observable: the turn's own
+    # ``speak`` call still reaches the interjection route after the feed breaks.
+    # (Before task t12 this test watched the profile sink instead; the worker's
+    # text no longer reaches a speaker by any route — issue #155 claim c2.)
+    limits = _open_interjection_limits()
+    layer_box: list = []
 
-    code = agent_mod.cmd_agent_embody(
-        _parse(f"--feed={feed}", "--export=-", "--max-turns=3", "--turn-interval=0.001"),
-        stream=stream,
-        compose=lambda args, *, export: agent_mod._compose_embody_seam(
+    def _compose_seam(args, *, export):
+        layer = agent_mod._compose_embody_seam(
             args,
             export=export,
             media=media,
             session_factory=factory,
             turn_fn=turn,
-            synthesize={"tts": lambda text: b"\x00\x00"},
-        ),
+            interjection_limits=limits,
+        )
+        layer_box.append(layer)
+        return layer
+
+    code = agent_mod.cmd_agent_embody(
+        _parse(f"--feed={feed}", "--export=-", "--max-turns=3", "--turn-interval=0.001"),
+        stream=stream,
+        compose=_compose_seam,
     )
 
     assert code == 0, "the layer died when its export consumer went away"
     assert stream.attempts > 1, "the exporter never tried to write past the break"
     assert len(turn.calls) >= 1, "no turn ran at all"
-    assert media.sink._backend.played, "the layer stopped speaking when the feed broke"
+    scopes = layer_box[0].engine.scopes
+    assert [s.suggested_next_step for s in scopes] == [
+        "hi"
+    ], "the layer stopped acting when the feed broke"
+    assert media.sink._backend.played == [], "the worker's text reached the speaker"
 
 
 # =========================================================================== #
@@ -1700,7 +1705,6 @@ def test_embody_runs_turns_over_a_feed_and_publishes_its_own_cognition_feed(tmp_
             media=_media(),
             session_factory=_SessionFactory(),
             turn_fn=turn,
-            synthesize={"tts": lambda text: b"\x00\x00"},
         )
         layer_box.append(layer)
         return layer
@@ -1736,7 +1740,6 @@ def test_embody_summary_goes_to_stdout_as_json_when_not_exporting(tmp_path, caps
             media=_media(),
             session_factory=_SessionFactory(),
             turn_fn=turn,
-            synthesize={"tts": lambda text: b"\x00\x00"},
         ),
     )
     assert code == 0
