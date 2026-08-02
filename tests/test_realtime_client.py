@@ -49,6 +49,7 @@ from reachy.speech.realtime import (
     REASON_CONNECT_FAILED,
     REASON_EMPTY_TRANSCRIPT,
     REASON_HANDSHAKE_REFUSED,
+    REASON_LANE_UNAVAILABLE,
     REASON_MALFORMED_EVENT,
     REASON_QUEUE_FULL,
     REASON_SESSION_DOWN,
@@ -451,6 +452,29 @@ def test_unauthorized_handshake_is_a_named_refusal_and_never_raises(
     assert any("401" in message for message in _messages(sense_log))
     assert _count_reason(sense_log, REASON_SESSION_DOWN) == 1
     assert server.refusals[0] == (401, "unauthorized")
+
+
+def test_a_404_handshake_is_the_named_lane_unavailable_drop_not_a_generic_refusal(
+    sense_log: pytest.LogCaptureFixture,
+) -> None:
+    """A 404 on ``/v1/realtime`` means the gateway's stt lane is declared off —
+    an operator fix, not a transient outage (issue #134). It gets its own
+    reason, keeps reconnecting on the same backoff (the lane can be switched
+    on under us), and stays latched to one line — the same treatment
+    :mod:`reachy.speech.realtime_duplex` already ships for its own session."""
+    with FakeRealtimeServer(Scenario.ROLE_INFEASIBLE) as server:
+        client = _client(server)
+        client.start()
+        try:
+            assert _wait_until(lambda: client.connect_failures >= 2)
+        finally:
+            client.close()
+
+    assert _count_reason(sense_log, REASON_LANE_UNAVAILABLE) == 1
+    assert _count_reason(sense_log, REASON_HANDSHAKE_REFUSED) == 0
+    assert _count_reason(sense_log, REASON_SESSION_DOWN) == 1
+    assert any("capabilities" in message for message in _messages(sense_log))
+    assert server.refusals[0] == (404, "role_infeasible")
 
 
 def test_a_non_upgrade_request_is_refused_426_and_named(

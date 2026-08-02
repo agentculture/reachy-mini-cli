@@ -219,6 +219,10 @@ ERROR_EVENT = "error"
 REASON_SESSION_DOWN = "session-down"
 #: The gateway answered the handshake with something other than 101.
 REASON_HANDSHAKE_REFUSED = "handshake-refused"
+#: HTTP 404 on the handshake: the gateway's ``stt`` lane is declared off, so
+#: ``/v1/realtime`` is not served at all. An operator fix, not an outage — see
+#: :meth:`RealtimeTranscriber._note_refusal`.
+REASON_LANE_UNAVAILABLE = "realtime-lane-unavailable"
 #: The TCP/TLS connect itself failed (nothing listening, DNS, timeout).
 REASON_CONNECT_FAILED = "connect-failed"
 #: An established session ended (CLOSE frame, EOF, or a send/read failure).
@@ -419,10 +423,11 @@ class Utterance:
 #   * the reconnect POLICY (`_run` / `_pump_once`): this client has an         #
 #     INTENTIONAL teardown — a `set_sample_rate` re-negotiation costs no       #
 #     backoff and logs no drop — that the duplex session has no analogue for;  #
-#   * how a non-101 handshake is NAMED: `_ws_connect` reports the status and   #
-#     the caller names it, so the duplex session can turn a 404 into its own   #
-#     `realtime-lane-unavailable` diagnosis while this one reports a generic   #
-#     refusal;                                                                 #
+#   * `_ws_connect` only REPORTS the status; each caller's own `_note_refusal` #
+#     NAMES it — `REASON_LANE_UNAVAILABLE` for a 404 is one such name both     #
+#     clients happen to define identically (issue #134 ported this client's   #
+#     copy from the duplex session's, which shipped it first), not a shared   #
+#     helper, so the two `_note_refusal`s stay free to diverge again;          #
 #   * the connect-time staleness discipline: a bounded QUEUE drained by age    #
 #     here, a PULL source drained by count there;                              #
 #   * queue-overflow reporting: the duplex session latches one line per        #
@@ -1295,9 +1300,9 @@ class RealtimeTranscriber(_SessionObservables):
         """One connect + handshake attempt. Returns success; never raises.
 
         The wire half is :func:`_ws_connect` (SHARED). What stays here is this
-        client's own: an unusable answer is a GENERIC refusal — the duplex
-        session diagnoses a 404 further, this one has no lane to diagnose — and
-        a fresh session drops the standing audio backlog by AGE.
+        client's own: an HTTP 404 is its own DIAGNOSIS (see
+        :meth:`_note_refusal`), and a fresh session drops the standing audio
+        backlog by AGE.
         """
         event = self._state.next_event()
         url = self.connect_url
@@ -1308,7 +1313,7 @@ class RealtimeTranscriber(_SessionObservables):
             frame_timeout_s=self._frame_timeout_s,
         )
         if not handshake.ok:
-            return self._state.note_connect_failure(handshake.reason, handshake.detail)
+            return self._note_refusal(handshake)
 
         with self._sock_lock:
             self._sock = handshake.sock
@@ -1318,6 +1323,27 @@ class RealtimeTranscriber(_SessionObservables):
         self._discard_stale_audio()
         self._state.mark_up(event, url)
         return True
+
+    def _note_refusal(self, handshake: "_Handshake") -> bool:
+        """Name a failed handshake — an HTTP 404 is its own DIAGNOSIS (issue #134).
+
+        Everything else is reported exactly as the shared connect named it:
+        something answered and said no (or nothing answered at all), and
+        retrying is the right move. A 404 says the route is not served because
+        the gateway's ``stt`` role is infeasible (mirrors the duplex session's
+        own :meth:`~reachy.speech.realtime_duplex.RealtimeDuplexSession.
+        _note_refusal`, not re-derived) — the fix is operator configuration,
+        so the log has to say so rather than read as a flaky gateway. Retrying
+        stays right either way (the lane can be switched on while we run), and
+        the latch keeps this to one line.
+        """
+        if handshake.status == 404:
+            return self._state.note_connect_failure(
+                REASON_LANE_UNAVAILABLE,
+                "HTTP 404 - the gateway's stt lane is likely declared off; "
+                "check GET /v1/capabilities for stt.feasible",
+            )
+        return self._state.note_connect_failure(handshake.reason, handshake.detail)
 
     def _discard_stale_audio(self) -> None:
         """Drop queued chunks older than ``stale_after_s`` before going live."""
