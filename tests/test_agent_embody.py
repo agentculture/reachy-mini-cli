@@ -1136,6 +1136,42 @@ def test_a_closed_interjection_policy_leaves_the_tool_advertised_but_refusing():
         layer.close()
 
 
+def test_the_late_attention_adapter_forwards_an_injected_clock():
+    """Accepting ``now`` and dropping it is a silently wrong answer.
+
+    ``_LateAttention`` stands in front of a real ``AttentionGate`` whose
+    ``is_warm``/``note_spoken`` both honour an injected clock. When the adapter
+    took ``now`` and ignored it, a caller that had pinned the moment got an
+    answer computed from wall time instead — and nothing said so. Sonar
+    (python:S1172) flagged it as an unused parameter; the fix is to FORWARD it,
+    not to delete it, because the parameter is the seam's shape.
+    """
+    seen: list[float | None] = []
+
+    class _Gate:
+        def is_warm(self, now=None):
+            seen.append(now)
+            return True
+
+        def note_spoken(self, now=None):
+            seen.append(now)
+            return True
+
+    class _Engine:
+        attention = _Gate()
+
+    adapter = agent_mod._LateAttention(lambda: _Engine())
+    assert adapter.is_warm(1234.5) is True
+    assert adapter.note_spoken(6789.0) is True
+    assert seen == [1234.5, 6789.0], "the adapter dropped the caller's clock"
+
+    # And it still answers safely before the engine exists — the whole reason
+    # the adapter is 'late' in the first place.
+    absent = agent_mod._LateAttention(lambda: None)
+    assert absent.is_warm(1234.5) is False
+    assert absent.note_spoken(1234.5) is False
+
+
 def test_a_resource_that_refuses_to_close_is_a_named_drop_not_a_raise():
     """A fault in teardown must never mask the reason the layer was stopping."""
 

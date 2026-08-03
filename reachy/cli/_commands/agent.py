@@ -908,13 +908,22 @@ class _LateAttention:
         engine = self._engine_of()
         return getattr(engine, "attention", None) if engine is not None else None
 
+    # ``now`` is FORWARDED, not decoration: this adapter stands in front of a
+    # real :class:`~reachy.embody.attention.AttentionGate` whose own
+    # ``is_warm``/``note_spoken`` honour an injected clock. Accepting the
+    # argument and dropping it would make a caller's clock silently
+    # ineffective — the adapter would answer from wall time while the caller
+    # believed it had pinned the moment. (Sonar python:S1172 flagged the
+    # unused parameter; forwarding is the fix, removing it would break the
+    # seam's shape.)
+
     def is_warm(self, now: float | None = None) -> bool:
         gate = self._gate()
-        return bool(gate.is_warm()) if gate is not None else False
+        return bool(gate.is_warm(now)) if gate is not None else False
 
     def note_spoken(self, now: float | None = None) -> bool:
         gate = self._gate()
-        return bool(gate.note_spoken()) if gate is not None else False
+        return bool(gate.note_spoken(now)) if gate is not None else False
 
 
 def _interjection_publisher(
@@ -1186,7 +1195,7 @@ def parse_perception_answer(raw: str) -> tuple[str, tuple[str, ...], float | Non
         return None
     try:
         payload = json.loads(raw[start : end + 1])
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:  # json.JSONDecodeError IS a ValueError (Sonar python:S5713)
         return None
     if not isinstance(payload, dict):
         return None
