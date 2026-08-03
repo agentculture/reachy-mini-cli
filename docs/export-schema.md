@@ -10,8 +10,9 @@ There are **two, separate** feeds. This first half of the document covers the
 publishing what it perceived, said, and expressed. It has **two** producers,
 which emit the same block types with the same fields: `agent attach --export -`
 (the turn-based tool-use agent, whose voice and pose seams are publish-only)
-and `agent embody --export -` (the embodiment layer, whose voice is real — see
-the per-block notes below, and
+and `agent embody --export -` (the embodiment layer, which really does speak
+in the room — but through its realtime voice, not through the tools whose
+calls this feed carries; see the per-block notes below, and
 [the operating guide](operating-reachy.md#the-embodiment-layer--agent-embody)).
 The **runtime feed**
 (`sense` / `rule` / `intent` / `motion`, produced by `behavior engine run
@@ -62,10 +63,12 @@ notes below.
 
 ### `"message"` — speech segment
 
-Emitted when the agent calls a speech tool (`speak` or `harmonics`), at the
-moment that call is dispatched — **before**, and independently of, any synthesis
-or playback. `agent embody` emits one for a second trigger too: speech its
-duplex session already produced and played (see below).
+Emitted when the agent calls a speech tool (`speak` or `harmonics`), just
+before that call is dispatched — **before**, and independently of, whatever the
+call turns out to reach (synthesis and playback for `agent attach`'s inert
+seams; an interjection policy for `agent embody`'s). `agent embody` emits one
+for a second trigger too: speech its duplex session already produced and played
+(see below).
 
 **Whether the block is proof of sound depends on the producer, so a renderer
 that captions it must know which one it is reading.**
@@ -77,11 +80,17 @@ that captions it must know which one it is reading.**
   to say; making the robot audible is the runtime's job (a react rule's `say`
   field). A consumer rendering "what the robot said" is rendering an utterance
   no speaker in that process reproduces.
-- **`agent embody` — a real utterance.** The layer's `speak` / `harmonics`
-  tools drive a live sink, so the block is either an utterance being dispatched
-  to the speaker (emitted at dispatch, so a synthesis or playback failure still
-  follows it as a named refusal on the same feed) or one the layer's duplex
-  session has **already spoken aloud**.
+- **`agent embody` — one of two things, and only the second is sound.** Since
+  the two-tempo split (issue #155) the layer's `speak` / `harmonics` tools no
+  longer reach any sink: they are **proposals** from the background mind, which
+  the interjection policy may refuse and which the foreground voice may
+  re-word or decline. So a `message` from `agent embody` is either
+  (a) **a proposal**, emitted *before* dispatch, recording what the mind wanted
+  said — the policy's verdict lands in the same turn's `thinking` block,
+  verbatim, as the tool result — or (b) **an utterance the duplex session
+  already spoke aloud**, recorded after the fact. Emitting the proposal before
+  dispatch is deliberate: *what it wanted* and *what it was allowed* are two
+  facts, and folding them into one would hide every refusal.
 
 Either way, speech produced by the *runtime itself* (a rule's `say`) carries no
 block on any feed — it is logged as `[SENSE stage=speech source=say …]`.
@@ -168,6 +177,67 @@ for raw_line in sys.stdin:
   (x145)`; a fact seen once carries no count. A consumer that renders `cues` as
   "why the robot thought" should show the leading trigger lines, not the
   background.
+- **Three more kinds of line can appear in `agent embody`'s `cues`** since the
+  two-tempo split (issue #155). None of them is a new block type and none of
+  them changes the field's type; they are additional CONTEXT lines, except
+  where noted:
+  - a **perception snapshot** — what the camera currently shows, rendered from
+    a structured snapshot rather than free prose. It lives in a latest-wins
+    slot per source and PERSISTS across turns until superseded or stale (30 s),
+    so the same slot can legitimately appear on consecutive turns. An updated
+    slot renders `… (updated x180)` where a repeated cue renders `… (x145)` —
+    a reader can tell "the same fact happened again" from "this state was
+    refreshed";
+  - a **wanted-to-say** line — `I was interrupted before saying: "…"` — the
+    measured remainder of a reply a human cut off mid-sentence. It expires
+    after two turns and is **structurally context-only**: the robot never
+    wakes itself to finish an old sentence;
+  - an **interjection** line — `<source> suggests saying: "…"` — an authorized
+    background source proposing a sentence for the foreground voice. This one
+    arrives as an **alert**, so it leads the array rather than trailing it,
+    the same lane a rule fire uses. It is off by default: nothing produces
+    these unless an operator has authorized a source.
+- **Cognition scopes reach the foreground prompt, not this feed.** A
+  `cognition.scope` artifact — the compact `{goal, relevant_facts,
+  suggested_next_step, priority, expires_after_turns, speakable}` object the
+  background mind produces — is rendered into a system message for the
+  foreground voice. It is **not** published as a block or a cue in this
+  version, so a consumer cannot see one directly; what it CAN see is the tool
+  result that created one (below). Raw model reasoning is never in a scope by
+  construction, and `thinking.text` carries none either while
+  `enable_thinking` stays off.
+- **Tool RESULTS are in `thinking.text`, and that is where interjection
+  verdicts show up.** Every dispatched tool's result is appended verbatim,
+  prefixed with an arrow (`->` and a space). For a governed voice tool that is either
+  `{"ok": false, "refusal": "interjection-unauthorized", …, "voice": "speak"}`
+  or `{"ok": true, "admitted": "interjection-warm", "interjection": {"t":
+  "interjection", "id": …, "source": …, "text": …, "ts": …}, "voice": "speak",
+  "chars": …}`. The refusal vocabulary is closed: `interjection-unauthorized`,
+  `interjection-source-denied`, `interjection-cold`,
+  `interjection-rate-limited`, `interjection-too-long`, `interjection-empty`,
+  plus `no-voice-seam` when no interjection route was wired at all. The same
+  word appears on the journal as the drop reason — one vocabulary, three
+  readers.
+- **Only the composition root's failures become blocks; the engine's and the
+  wire's are journal-only.** `agent embody` reports a *composition-level*
+  failure twice — once as `[SENSE stage=embody …]` on stderr and once as a
+  standalone `thinking` block whose single cue is `[drop] <source>: <reason>`
+  and whose text is `[drop reason=… source=… …]`. New reasons from the
+  two-tempo arc that reach the feed this way: `arm-failed` (the per-utterance
+  arm could not be sent), `tail-cut-failed` and `cut-split-unavailable` (the
+  client-side interruption path), `floor-push-failed` (a conversation item
+  could not be pushed), and `clip-answer-unstructured` (the perception model's
+  answer did not parse as the requested structure, so the layer degraded to a
+  summary-only snapshot). The *engine's* own drops
+  (`perception-sources-full`, `perception-stale`, `scope-park-full`,
+  `summary-stale`, `summary-too-long`) and the *duplex wire's*
+  (`one-shot-arming-unsupported`, `items-unsupported`, `item-invalid`,
+  `item-queue-full`, `reseed-failed`, `playback-cancelled`,
+  `voice-prompt-invalid`) are named on the journal only — do not build a
+  consumer that expects them on this feed. Two of those journal-only reasons
+  are the expected steady state against every gateway shipping today
+  (`one-shot-arming-unsupported`, `items-unsupported`); see [the operating
+  guide](operating-reachy.md#the-two-tempo-architecture--gemma-speaks-qwen-thinks).
 - Consumers should treat unknown `t` values as forward-compatible extensions
   and skip them gracefully.
 - **Block ordering within a turn is stable.** A turn emits its `"message"` and

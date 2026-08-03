@@ -1373,8 +1373,9 @@ class EmbodyTurnEngine:
     def submit_cues(self, cues: Iterable[str | ClassifiedCue]) -> int:
         """Offer several cues, routing each by its class. Returns how many landed.
 
-        Accepts what :func:`reachy.embody.cues.classified_cues_for_line`
-        returns — the composition root's intake — and, for a caller that has no
+        Accepts what
+        :func:`reachy.embody.cues.classified_cues_for_runtime_event` returns —
+        the composition root's intake — and, for a caller that has no
         classification to give, bare strings, which park.
         """
         accepted = 0
@@ -1614,10 +1615,13 @@ class EmbodyTurnEngine:
 
         It also EXTENDS attention, so a long answer cannot time the human out
         mid-exchange — but only while attention is already warm. That
-        asymmetry is load-bearing: the session is armed once and the server
-        replies to every committed utterance, including the ambient ones the
-        gate has just refused, so a voice that could OPEN attention would be a
-        robot waking itself up (see :mod:`reachy.embody.attention`).
+        asymmetry is load-bearing: against the gateway deployed today the
+        session is armed once and the server replies to every committed
+        utterance, including the ambient ones the gate has just refused, so a
+        voice that could OPEN attention would be a robot waking itself up.
+        Per-utterance arming (issue #149) narrows that to admitted utterances
+        WHERE THE GATEWAY SUPPORTS IT, and fails closed where it does not —
+        which is why the asymmetry stays (see :mod:`reachy.embody.attention`).
         """
         cleaned = (text or "").strip()
         if not cleaned:

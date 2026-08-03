@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.0] - 2026-08-03
+
+### Added
+
+- **The two-tempo architecture** (issue #155): the embodiment layer now runs a FOREGROUND interlocutor (the lobes realtime floor — the only thing that speaks) beside a BACKGROUND mind (the layer's worker lane) that follows the same conversation, reasons over longer horizons, operates the tools, and reaches the room ONLY through typed, inspectable events. The event is the background mind's output; the speech stays the foreground voice's.
+- `reachy/embody/scope.py` — cognition scopes: a compact, attributed, expiring `cognition.scope` artifact (goal, relevant facts, suggested next step, priority, expiry in turns, speakable flag) that the background mind puts in front of the voice. Never raw model reasoning, structurally: `from_event` reads only the fields it knows. Parked latest-wins on `(kind, goal)`, never on free text, and context-only — there is no parameter that could make one a trigger.
+- `reachy/embody/interjection.py` — the interjection policy and its typed event family. Six named checks cheapest-first, one decision point for every route (worker tool call, mesh peer, external system). Ships OFF, with an EMPTY source allow-list, enforced in the configuration object rather than in documentation; rate-bounded at 3 per 60 s per source. Also home to the `WantedToSay` artifact: the measured remainder of a reply a human cut off, attributed, expiring in turns, and structurally context-only.
+- `reachy/embody/summary.py` — `SummaryProducer`, the ONE production writer of the layer's rolling summary (pinned by AST). A failed maintenance pass keeps the last summary, marks it stale in the foreground context and names a `summary-stale` drop — never a silent narrowing of the voice's memory.
+- Nested conversation windows over ONE history (issue #154 decision c30): the worker replays 60 turns, the foreground voice the last 20 as a strict suffix, everything older covered by the summary. `senses_history_maxlen > history_maxlen` is refused fail-closed at construction.
+- Chunked, cancellable playback in `reachy/speech/realtime_duplex.py`: a reply plays in chunks (a shorter first chunk, then ~1 s at a time), so 'stop talking' means 'do not send the next chunk'. `cancel_playback()` / `playback_progress()` / `spoken_split()`.
+- The measured said/unsaid split: `estimate_spoken_prefix` cited (not imported) from lobes-cli `lobes/realtime/_floor.py`:323, fed MEASURED played-chunk offsets from the sink rather than the server's wire estimate — exact to the chunk boundary, estimated only inside it, with the still-playing chunk counted as NOT said.
+- The client-side tail cut (deviation d1): a VAD-verified `speech_started` while the playback queue is non-empty cuts the mouth in the window after `response.done`, records the split, and keeps the remainder as a wanted-to-say artifact. Keys on verified speech only, never raw loudness.
+- Per-utterance arming (issue #149) — attention now gates the VOICE, not only the mind. Behind a capability check that FAILS CLOSED (`session.created`'s `config.arming == "one_shot"`); against a gateway without it the layer degrades to arm-once with one named `one-shot-arming-unsupported` drop.
+- `conversation.item.create` — the FOURTH outbound frame kind, widening the duplex send surface from three to four exactly once and on purpose (decision c28), behind its own capability check. With it the layer curates ONE canonical history and projects it: `floor_reseed()` (the voice's window as curated history turns plus the summary as one ephemeral context item, ordered BEFORE re-arming on every reconnect) and `floor_correction()`.
+- Structured perception snapshots (summary, entities, confidence, capture time, frame reference) in a latest-wins slot per source that PERSISTS across turns until superseded or stale (30 s) — so 'what can you see?' between two camera polls is answerable. An unparseable answer degrades to a summary-only snapshot with a named drop.
+- `--attention-window` / `REACHY_EMBODY_ATTENTION_WINDOW` (issue #150) — the attention window is an operator knob, reaching the child `embody start`/`restart` spawns; `0` still means name-only forever.
+- `REACHY_EMBODY_VOICE_PROMPT` — connect-time voice conventions via the realtime session's `system_prompt` override, with no new frame kind. Blank or over-long is refused, never silently repaired.
+- `doctor` gains a `model_pair` check: it names the realtime service's `OPENAI_MODEL` (the voice), `REACHY_EMBODY_SENSES_MODEL` (perception) and `REACHY_EMBODY_WORKER_MODEL` (the background mind, expected to differ) and warns only on genuine divergence between the first two.
+
+### Changed
+
+- **`agent embody`'s `speak` / `harmonics` are PROPOSALS, not playback.** The layer's own voice seams were deleted: the tool registry now holds no audio seam at all, imports no synthesis and no playback, and there is no code path — authorized or not — from a tool call to a speaker. `no-voice-seam` accordingly changed meaning: it now names a missing interjection ROUTE, refused before the policy is consulted.
+- A kind-aware context park (issue #154): free-text perception lands in a latest-wins slot instead of the text-keyed cue park, so verbose sightings can no longer evict runtime facts. Exact-text coalescing is unchanged for the closed cue vocabulary.
+- `reachy/runtime_cues.py` gains the two layer-authored line types (`interjection`, `wanted_to_say`) and their phrasing, so the robot cannot end up described two ways.
+- Docs: CLAUDE.md, `docs/operating-reachy.md` (a new two-tempo section) and `docs/export-schema.md` describe the split, the interjection policy, the phase-1 limitation and the non-goals. Several statements that the arc made FALSE were corrected in place: 'exactly three frame kinds' (now four), 'the session is armed once and the server answers every committed utterance' (now the degraded path, and said so), and 'the layer's voice tools are real'.
+
+### Fixed
+
+- `_CueReader`'s docstring named `classified_cues_for_line`; the production path is `parse_runtime_line` + `classified_cues_for_runtime_event`.
+
+### Known limitations
+
+- **None of the two-tempo arc has been judged from the room yet.** It is proven by the offline suite and one probe against the deployed gateway (`docs/evidence/2026-08-02-t1-media-chunk-budget.md`); the live acceptance run is separate work.
+- **Two pieces cannot pass yet and are recorded blocked, not rounded up.** Per-utterance arming and the `conversation.item.create` channel both wait on agentculture/lobes-cli#170. Against every gateway shipping today the layer degrades — the room is still answered aloud (`one-shot-arming-unsupported`) and the gateway's own conversation history still OVERSTATES what was heard after a client-side interruption (`items-unsupported`). `floor_correction()` APPENDS a correction where items exist; it does not rewrite, because the schema has no rewrite operation, so the overstated turn stays.
+- **Interjection ships with no operator surface** — the policy, the event family and the enforced default-OFF state are real, but no CLI flag or environment variable turns it on in this release.
+- **The per-chunk daemon `/media/play` round trip is still unmeasured** (it plays audio on the deployed robot), so the chunk sizes are defensible, injectable defaults rather than tuned numbers.
+
 ## [0.46.0] - 2026-08-02
 
 ### Added

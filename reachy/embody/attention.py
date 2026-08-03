@@ -61,13 +61,23 @@ said YES 36 times out of 36. So every rule here changes control flow and is
 provable by a test.
 
 That matters more here than there, because this layer has a second ratchet door
-the runtime never had: its duplex session is armed once and the SERVER answers
-every committed utterance out loud ("every committed turn on this session gets
-a spoken reply" — ``docs/evidence/2026-08-02-t14-live-acceptance.md``). So
+the runtime never had, and **on the path deployed today it is still open**.
+Issue #149's fix (task t8) lets this gate's verdict drive arming per admitted
+utterance, so where the gateway announces one-shot arming the layer decides
+which utterances get an answer at all. That capability check fails CLOSED, and
+upstream has not shipped it (agentculture/lobes-cli#170 item 1): against the
+deployed gateway the session still arms ONCE and the SERVER answers every
+committed utterance out loud ("every committed turn on this session gets a
+spoken reply" — ``docs/evidence/2026-08-02-t14-live-acceptance.md``). So
 :meth:`AttentionGate.note_spoken` fires for replies to the very chatter this
 gate refused. If speaking could open attention, a robot in a talkative room
-would hold its own ear open with its own voice. Hence the asymmetry, which is
-the one thing to keep intact if this file is ever edited:
+would hold its own ear open with its own voice.
+
+The asymmetry is therefore load-bearing on the degraded path and merely
+correct on the other one — which is exactly the order to keep it in. Do not
+"simplify" it away when one-shot arming ships: a gate that only holds while an
+upstream capability is present is a gate that fails open. It is the one thing
+to keep intact if this file is ever edited:
 
     a NAME opens. Being heard while warm, and speaking while warm, EXTEND.
     Nothing else opens.
