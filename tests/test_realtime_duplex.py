@@ -2505,6 +2505,52 @@ def test_t16_playback_pending_names_the_audio_a_cut_would_actually_withhold() ->
         client.close()
 
 
+def test_playback_pending_covers_the_chunk_taken_but_not_yet_committed() -> None:
+    """The guard must be as wide as the cut it guards (Qodo, PR #158).
+
+    A chunk the mouth has ``get``-ed but not yet committed to ``play`` is OUT
+    of the queue and STILL cancellable: ``_skip_remaining`` bumps the
+    generation and ``_begin_chunk`` re-checks it immediately before speaking.
+    So ``self._playback.empty()`` is a strictly NARROWER predicate than what
+    ``cancel_playback`` can withhold, and a ``speech_started`` landing in that
+    window would read "nothing to cut" about a chunk a cut would in fact have
+    skipped — the one-chunk boundary the design promises, lost.
+
+    This drives the mouth into exactly that window: the consumer is blocked
+    between the queue and ``_begin_chunk``, so the queue is EMPTY while the
+    chunk is still skippable. The old ``empty()`` implementation returns False
+    here; the counter returns True, and a cut then really does skip it.
+    """
+    adopted = threading.Event()
+    proceed = threading.Event()
+    client = _chunked(url=_dead_url(), play=_Sink())
+    real_begin = client._begin_chunk
+
+    def _stalled_begin(item):
+        adopted.set()
+        assert proceed.wait(timeout=_TIMEOUT)
+        return real_begin(item)
+
+    client._begin_chunk = _stalled_begin  # type: ignore[method-assign]
+    client.start()
+    try:
+        # EXACTLY one chunk, so the queue drains to empty while the mouth
+        # holds it — the window this test exists to describe.
+        _feed_deltas(client, "resp_window", _LONG_REPLY[:_TEST_CHUNK_BYTES], _TEST_CHUNK_BYTES)
+        assert adopted.wait(timeout=_TIMEOUT), "the mouth never took a chunk"
+        # The precondition that makes this test meaningful: the queue really is
+        # empty, so the OLD predicate would have said "nothing to cut".
+        assert client._playback.empty() is True
+        assert client.playback_pending is True, "a cut here would still withhold audio"
+        before = client.chunks_cancelled
+        client.cancel_playback()
+        proceed.set()
+        assert _wait_until(lambda: client.chunks_cancelled > before), "the chunk was not skipped"
+    finally:
+        proceed.set()
+        client.close()
+
+
 def test_t16_the_wire_itself_cuts_nothing_on_a_vad_onset() -> None:
     """The gate-free pin, behaviourally: the module publishes, it does not act.
 

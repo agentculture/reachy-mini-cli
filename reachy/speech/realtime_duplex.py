@@ -1653,6 +1653,10 @@ class RealtimeDuplexSession(_SessionObservables):
         #: Bumped by every cut. A chunk (or a reply) stamped with an older one
         #: is skipped — see :class:`_PlaybackChunk`.
         self._generation = 0
+        #: Chunks a cut would still WITHHOLD: queued, plus the one the mouth
+        #: has taken but not yet committed to ``play``. Deliberately wider than
+        #: the queue's own occupancy — see :attr:`playback_pending`.
+        self._withholdable = 0
         self._ledgers: "OrderedDict[str, _PlaybackLedger]" = OrderedDict()
         self._current_response_id: str | None = None
 
@@ -2021,8 +2025,24 @@ class RealtimeDuplexSession(_SessionObservables):
         remainder — a reply the room heard in full, recorded as truncated. A
         caller wanting "is the mouth busy at all" wants :attr:`speaking`; a
         caller deciding whether to CUT wants this.
+
+        **Not ``self._playback.empty()``, and the difference is a missed cut.**
+        A chunk the mouth has already ``get``-ed but not yet committed to
+        ``play`` is OUT of the queue and STILL cancellable — :meth:`_skip_
+        remaining` bumps the generation and :meth:`_begin_chunk` re-checks it
+        immediately before speaking. So the queue's emptiness is a strictly
+        NARROWER predicate than what a cut can actually withhold, and a
+        ``speech_started`` landing in that window would read "nothing to cut"
+        about a chunk a cut would in fact have skipped — losing exactly the one
+        chunk boundary the chunk size buys. The counter is maintained under
+        ``_playback_lock`` at the two points that change the answer (enqueue,
+        and adoption-or-skip in :meth:`_begin_chunk`), so it tracks
+        :meth:`cancel_playback`'s real reach rather than the queue's occupancy.
+        Reported by Qodo on PR #158, via a different mechanism than the one
+        that turned out to be there.
         """
-        return not self._playback.empty()
+        with self._playback_lock:
+            return self._withholdable > 0
 
     @property
     def muted(self) -> bool:
@@ -2526,6 +2546,7 @@ class RealtimeDuplexSession(_SessionObservables):
         self._playback_full_logged = False
         self.chunks_queued += 1
         with self._playback_lock:
+            self._withholdable += 1
             self._ledger_for(pending.response_id).queued_bytes += len(chunk)
         return True
 
@@ -2555,6 +2576,7 @@ class RealtimeDuplexSession(_SessionObservables):
             except queue.Empty:
                 break
         with self._playback_lock:
+            self._withholdable = max(0, self._withholdable - len(drained))
             for item in drained:
                 ledger = self._ledger_for(item.response_id)
                 ledger.skipped_bytes += len(item.pcm)
@@ -2603,8 +2625,15 @@ class RealtimeDuplexSession(_SessionObservables):
                 self._speak(item)
 
     def _begin_chunk(self, item: _PlaybackChunk) -> bool:
-        """Adopt one chunk, unless a cut overtook it between queue and speaker."""
+        """Adopt one chunk, unless a cut overtook it between queue and speaker.
+
+        This is where a chunk stops being withholdable, in BOTH branches — it
+        either becomes uncancellable audio inside ``play`` or is skipped
+        outright — so it is where :attr:`playback_pending`'s counter is
+        released, under the same lock that decides its fate.
+        """
         with self._playback_lock:
+            self._withholdable = max(0, self._withholdable - 1)
             ledger = self._ledger_for(item.response_id)
             if item.generation != self._generation:
                 ledger.skipped_bytes += len(item.pcm)
