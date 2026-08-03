@@ -51,7 +51,7 @@ The complete robot surface. Every noun supports `--json`; run
 | `sleep` | Park the robot: decay to sleep when idle; wake on sound / wake-word / pat | `sdk` default |
 | [`service`](docs/operating-reachy.md#boot-persistence--one-presence-per-reboot) | Boot-persist exactly one presence mode (`demo` or `runtime`) via systemd `--user` | none (manages systemd) |
 | [`agent attach`](docs/operating-reachy.md#agent--attach-over-the-runtime-feed-and-the-intent-spool) | Attach an external AI agent to the running runtime over its feed + intent spool (voice and pose tools publish-only) | none (feeds + spool) |
-| [`agent embody`](docs/operating-reachy.md#the-embodiment-layer--agent-embody) | The embodiment layer: ears + a real voice on one realtime duplex session, a streaming mind, and a closed five-tool action set — running beside the runtime | none (tee socket, feeds, spools, daemon `http`) |
+| [`agent embody`](docs/operating-reachy.md#the-embodiment-layer--agent-embody) | The embodiment layer: ears + a real voice on one realtime duplex session, a background mind over a streaming HTTP lane, and a closed five-tool action set — running beside the runtime | none (tee socket, feeds, spools, daemon `http`) |
 | `whoami` `quickstart` `learn` `explain` `overview` `doctor` `cli` | Agent-first introspection — no robot needed | — |
 
 > ⚠️ **Before you run two behaviors at once, read
@@ -212,6 +212,16 @@ It operates the robot only through a closed five-tool set — `goto`,
 `run_behavior`, `speak`, `harmonics`, `create_rule` — each wrapping a validator
 that already exists and already refuses fail-closed. There is no shell.
 
+It runs **two models at two tempos over one conversation**: a *foreground*
+interlocutor (the lobes realtime floor) that hears, answers and owns the
+wording, and a *background* mind that follows along, thinks longer, operates
+the tools — and reaches the room **only through typed, inspectable events**,
+never by generating speech itself. So `speak` and `harmonics` are proposals
+rather than playback, long replies stream as cancellable chunks a human can
+talk over, and what the room actually heard is measured at the speaker rather
+than assumed. See [the two-tempo
+architecture](docs/operating-reachy.md#the-two-tempo-architecture--gemma-speaks-qwen-thinks).
+
 ```bash
 reachy-mini-cli behavior engine run --export - > /tmp/runtime.feed &   # the runtime
 reachy-mini-cli agent embody --feed /tmp/runtime.feed --export -       # the layer
@@ -226,7 +236,8 @@ tee and a rolling-clip rider), each measured at **zero** tick overruns on the
 deployed robot even with a wedged consumer. Stop the layer and the robot is
 exactly the symbolic presence above. Swapping the mind is configuration too:
 models are chosen per request from `REACHY_EMBODY_WORKER_MODEL` /
-`REACHY_EMBODY_SENSES_MODEL`.
+`REACHY_EMBODY_SENSES_MODEL`, and how long it keeps listening after hearing its
+name is `--attention-window` / `REACHY_EMBODY_ATTENTION_WINDOW`.
 
 One thing deliberately survives a stop: rules the layer authored (always
 `embody-` prefixed) **persist** in the overlay and keep running — the robot
@@ -237,7 +248,12 @@ the robot (a rule fire became a spoken reaction; `run_behavior` and `goto` were
 admitted by the live engine). It has **not** yet held a sustained two-way
 conversation — the test box has one audio output, which blocked the
 browser-harness acceptance run — and `harmonics`, `create_rule` and the
-clip→worker-model leg are not yet exercised live. See [What is proven live — and
+clip→worker-model leg are not yet exercised live. The **two-tempo split has
+not been judged from the room at all** — it is proven by the offline suite and
+one gateway probe — and two of its pieces cannot pass yet: per-utterance
+arming and the conversation-item channel both wait on upstream lobes-cli#170,
+so today the room is still answered aloud and the gateway's own history
+overstates after an interruption. See [What is proven live — and
 what is not](docs/operating-reachy.md#what-is-proven-live--and-what-is-not).
 
 ## Export feed
@@ -248,9 +264,10 @@ proposing to express — one object per line. `agent attach` composes its speech
 and pose tools **publish-only**, so a `message` block is what the agent
 *proposed* saying, not proof of sound; audible speech comes from a rule's `say`
 in the runtime and carries no block of its own. `agent embody --export -`
-publishes the same three block types from the embodiment layer, where the voice
-tools are **real** — there a `message` is an utterance dispatched to a live
-speaker, or one already spoken. `behavior engine run --export -`
+publishes the same three block types from the embodiment layer, where a
+`message` is either a proposal the background mind made (the interjection
+policy's verdict is in the same turn's `thinking` block) or an utterance the
+realtime voice already spoke aloud. `behavior engine run --export -`
 streams the complementary *runtime* feed (`sense` / `rule` / `intent` /
 `motion`). The renderer stays **out of this repo** by design (the export
 decoupling boundary): `reachy-mini-cli` emits a documented contract, a separate

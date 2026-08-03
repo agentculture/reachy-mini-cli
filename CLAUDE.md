@@ -227,7 +227,7 @@ transport. Deep notes for the non-trivial nouns follow in
 | `sleep` | `_commands/sleep.py` | `reachy/sleep/{state,stimulus,wake,patwake,wakeword,supervisor}.py`, `reachy/motion/{sleep,sleep_signal}.py` | `sdk` default |
 | `service` | `_commands/service.py` | `reachy/service/{units,manager}.py` (`ServiceManager`, systemd `--user`) | none (systemd) |
 | `agent attach` | `_commands/agent.py` | `reachy/speech/{agent_turn,tools,intent_tools,events}.py` + `reachy/forge/*`, over `--feed` + the intents spool | none (feeds + spool) |
-| `agent embody` (+ `start`/`stop`/`restart`/`status`) | `_commands/agent.py` (`_compose_embody_seam`, `cmd_agent_embody*`) | `reachy/embody/{media,tools,cues,engine,attention,supervisor}.py` + `reachy/speech/realtime_duplex.py`, consuming the runtime's `behavior/{audio_tee,clip_rider}.py` legs | none (tee socket, feed/bus, spools, daemon `http`) |
+| `agent embody` (+ `start`/`stop`/`restart`/`status`) | `_commands/agent.py` (`_compose_embody_seam`, `cmd_agent_embody*`) | `reachy/embody/{media,tools,cues,engine,attention,interjection,scope,summary,supervisor}.py` + `reachy/speech/realtime_duplex.py` + the two layer-authored line types in `reachy/runtime_cues.py`, consuming the runtime's `behavior/{audio_tee,clip_rider}.py` legs | none (tee socket, feed/bus, spools, daemon `http`) |
 
 ## Noun internals
 
@@ -853,6 +853,20 @@ guide](docs/operating-reachy.md#the-embodiment-layer--agent-embody). Spec and
 plan: `docs/specs/2026-08-01-embodiment-layer.md`,
 `docs/plans/2026-08-01-embodiment-layer.md`.
 
+**Since v0.47.0 the layer is TWO-TEMPO, and that is the frame to read the rest
+of this section in** (issue #155;
+`docs/specs/2026-08-02-foreground-gemma-background-qwen-155.md`,
+`docs/plans/2026-08-02-foreground-gemma-background-qwen-155.md`). The
+FOREGROUND interlocutor is the lobes realtime floor — Gemma — and it is the
+only thing that speaks: it hears, it answers, it owns turn-taking and the
+wording. The BACKGROUND mind is the layer's own worker lane — Qwen — which
+follows the same conversation, reasons over longer horizons, operates the
+five-tool action set, and **reaches the room only through typed, inspectable
+events** (a cognition scope; an authorized interjection). Qwen never generates
+realtime speech. The one sentence to keep: *the event is Qwen's output, the
+speech stays Gemma's.* Two-tempo walkthrough for operators: [the two-tempo
+architecture](docs/operating-reachy.md#the-two-tempo-architecture--gemma-speaks-qwen-thinks).
+
 **The peripheral property is measured, not asserted.** The whole arc's footprint
 inside `reachy/behavior/` is **3 files, 6 hunks, 1486 insertions, 0 deletions**
 — every hunk an additive tee or clip leg
@@ -875,9 +889,9 @@ cognition-free.
 **`reachy/embody/tools.py` — five tools, and the layer validates NOTHING
 itself.** `goto` (the shipped goto handler: per-axis bounds, 10 s cap),
 `run_behavior` (library + param checks, the unbounded-lifetime refusal), both
-via the intents spool; `speak` / `harmonics` (the injected synth + playback
-seams, bounded by the ONE imported `rules.MAX_SAY_CHARS`); `create_rule` (a
-candidate overlay handed to `load_rules`, `os.replace`d only if it returns).
+via the intents spool; `speak` / `harmonics` (**PROPOSALS, not playback** —
+see below — bounded by the ONE imported `rules.MAX_SAY_CHARS`); `create_rule`
+(a candidate overlay handed to `load_rules`, `os.replace`d only if it returns).
 A second copy of a bound is a second number to drift, and a bound living only
 in the layer is one an operator using the CLI does not get. Two consequences
 worth keeping: motion/behavior actions run the shipped kind handler against
@@ -889,6 +903,33 @@ rule-id namespace: layer-authored rules **PERSIST** after the layer stops (spec
 c26, a confirmed product decision — the robot keeps what it was taught), so
 there is deliberately **no** deletion-on-exit hook anywhere; the prefix is what
 makes them enumerable and removable as a set.
+
+**The layer's own voice seams are GONE — do not re-add them** (issue #155
+task t12, spec claim c2). Until then `speak`/`harmonics` reached an injected
+`synthesize` + `play_audio` pair (`_voice_seam` / `_build_voice_seams` in
+`_commands/agent.py`, both deleted): the background model wrote a sentence and
+the room heard it. Now the tool NAMES are kept — a model that learned to call
+`speak` keeps working — and the EFFECT is an interjection governed by
+`reachy/embody/interjection.py`. Refused (the shipped default is OFF) → a
+NAMED refusal returned as the tool result; admitted → a typed `Interjection`
+handed to the injected `on_interjection` seam, which composition binds to
+`EmbodyTurnEngine.note_interjection`, where it becomes a `speakable` cognition
+scope Gemma may re-word or decline. Three consequences to keep straight:
+
+- **The registry holds no audio seam at all**, structurally: the constructor
+  has no parameter for one and the module imports no synthesis and no
+  playback, so there is no code path — authorized or not — from a tool call to
+  a speaker (`tests/test_embody_governed_voice.py` pins it over the module's
+  own surface).
+- **`no-voice-seam` changed meaning.** It used to mean "no mouth was
+  injected"; it now means **no interjection ROUTE was injected**, and it is
+  refused BEFORE the policy is consulted — telling the model `ok: true` for a
+  proposal that went nowhere is the mirror image of the unseen refusal this
+  module refuses to ship, and it would spend the source's rate budget on a
+  proposal that could never land.
+- **`REFUSALS` is now two vocabularies**: `tools.REFUSALS` (this module's own)
+  and `VOICE_REFUSALS` (the policy's, IMPORTED not restated). `ALL_REFUSALS`
+  is the union for a consumer asking "was this a named refusal?".
 
 **`reachy/embody/media.py` — two profiles, ONE code path.** `EmbodySource` /
 `EmbodySink` are literally the same classes for `robot` and `bench`; a profile
@@ -923,8 +964,11 @@ Measured live: 187 cues in ~40 s produced 23 turns and 19 queue-full
 drops, mix 145 "speech from the left/ahead/right" + 44 "loud sound" + **zero**
 rule fires. The layer has its OWN ears, so those cues duplicated what the
 duplex session already heard, at tick rate rather than utterance rate. So
-intake is THREE classes, routed at `_CueReader` by t6's
-`cues.classified_cues_for_line`: an utterance TRIGGERS, an ALERT (a rule fire)
+intake is THREE classes, routed at `_CueReader` by
+`cues.classified_cues_for_runtime_event` (renamed in t12 from
+`classified_cues_for_line`, which still exists but is no longer the production
+path — `_CueReader` parses with `parse_runtime_line` first): an utterance
+TRIGGERS, an ALERT (a rule fire)
 TRIGGERS, and every CONTEXT cue (`sense`/`intent`/`motion`, and a rule
 SUPPRESSION) lands in a bounded park the next turn DRAINS and that never causes
 one. That park is where `AgentTurnEngine`'s snapshot-only buffer IS cited (cues
@@ -946,11 +990,101 @@ indistinguishable from a dropper — and `docs/export-schema.md` documents both
 `note_spoken` feeds the layer's own speech back as CONTEXT, never as a trigger:
 a robot that treats its own voice as a perception talks to itself.
 
+**A SECOND coalescing key, because free text has no fixed phrase (issue #154,
+task t3).** Text-identity coalescing is exactly right for the closed cue
+vocabulary and exactly wrong for anything else: "a kitchen with someone at the
+counter" and "a kitchen, a person near the counter" are the same fact sharing
+no key, so free-form perception through `submit_cue` filled
+`DEFAULT_MAX_CONTEXT` (24) with near-duplicates within minutes and then
+REFUSED genuine runtime facts — the cheapest signal evicting the most
+valuable. `submit_perception` is the escape hatch, not a retuning: a
+SEPARATELY bounded park (`DEFAULT_MAX_PERCEPTION_SOURCES` = 4) keyed on SOURCE
+where a new description REPLACES the one there. Two further properties are
+task t13's: the payload is a structured `PerceptionSnapshot` (summary,
+entities, confidence, `captured_at`, `frame_ref` — a bare string is still
+accepted and wrapped), and a slot PERSISTS across turns until SUPERSEDED or
+STALE (`DEFAULT_PERCEPTION_STALE_AFTER_S` = 30.0, mirroring
+`_commands/agent.py`'s `DEFAULT_CLIP_STALE_AFTER_S` **by value with a pin
+test**, because the two are the same rule at ask time and at read time). A cue
+describes something that HAPPENED and is drained; a slot describes a STATE and
+is not. `_ClipAsker` produces the snapshots via `parse_perception_answer`,
+degrading to summary-only with a named drop rather than crashing.
+
+**Nested windows onto ONE history, plus Qwen's summary (issue #154 decision
+c30, task t4).** `Limits.history_maxlen` (`n` = 60) and
+`Limits.senses_history_maxlen` (`m` = 20) bound the SAME deque — never two
+histories. Qwen replays its full `n`; Gemma replays the tail `m`, a STRICT
+SUFFIX. Constructing `Limits` with `m > n` is refused fail-closed in
+`__post_init__`. Everything older is covered by ONE Qwen-maintained summary
+(`update_summary`, bounded by `summary_max_chars` = 2000, **refused not
+truncated**), written by `reachy/embody/summary.py`'s `SummaryProducer` — the
+repo's ONE production caller, pinned by AST. A failed maintenance pass keeps
+the last summary but prefixes `STALE_SUMMARY_MARKER` and names a
+`summary-stale` drop: never a silent narrowing of Gemma's memory to the last
+`m` turns. The `m` window's cost is measured, not assumed — 20 turns are 401
+prompt tokens against 2 399 for one clip ask, about +16% on a clip question
+(`docs/evidence/2026-08-02-t1-media-chunk-budget.md`; that file also corrects
+the earlier "the text window is nearly free" reading, which was true in BYTES
+and 6× off in TOKENS).
+
+**Cognition scopes — what the background mind may put in front of the voice**
+(`reachy/embody/scope.py`, task t12). Qwen influences the conversation only
+through explicit typed events, and this is the type: a compact, attributed,
+expiring `CognitionScope` — goal, relevant facts, suggested next step,
+priority, expiry in turns, `speakable` flag; wire `type` is `cognition.scope`.
+**Never raw model reasoning** (claim c8), which is structural rather than
+conventional: `from_event` reads only the fields it knows, so a payload
+carrying `reasoning` never had it stripped — it was never read. `submit_scope`
+parks one latest-wins on `(kind, normalized goal)` — never on free text
+(issue #154's lesson, one family over) — bounded by `Limits.max_scopes` (3) and
+filtered on READ by turn expiry. `ask` (the FOREGROUND lane) renders the live
+ones into one system message under `SCOPE_PREAMBLE`, whose wording is
+load-bearing: the background mind is introduced as a colleague with
+suggestions, and the decision to speak is named as Gemma's. A scope is
+**context, never a trigger** — `submit_scope` has no class parameter at all.
+
+**The layer curates ONE canonical history, and the floor's is a projection of
+it** (decision c27, task t11). Two methods produce `FloorItem`s the
+composition joins to `realtime_duplex.ConversationItem`: `floor_reseed()` —
+Gemma's `m`-window as curated HISTORY turns plus the summary as ONE ephemeral
+CONTEXT item, taken through the same `_senses_window` / `_history_messages`
+both lanes already read (a "re-seed cache" would be the second history #154
+warned about) — and `floor_correction()`, which tells the floor what the room
+ACTUALLY heard of a cut reply. Re-seed is ordered BEFORE re-arming on every
+reconnect, structurally inside the wire's `session.created` handling, because
+a session close wipes the floor's ephemeral history and a reconnect that armed
+first would answer out of amnesia with nothing in any log saying so.
+
+**The phase-1 limitation, stated plainly and not rounded up (claim c39).** A
+client-local cut is INVISIBLE to the floor: wire delivery completed at wire
+speed, so the server fired `response.done` and appended the WHOLE reply to its
+own history. `floor_correction` **APPENDS** a `Correction: …` history item —
+it does not rewrite, because the schema has no rewrite operation — so **the
+overstated turn stays in the floor's history**. The layer's own record is
+narrowed by `note_interrupted_reply` and is right (the client is the measured
+authority for what its sink played), and nothing claims the two agree: only
+that the floor has been TOLD. Where the gateway announced no item support the
+push is declined with one named latched drop and the overstatement simply
+remains. Pinned by
+`tests/test_agent_embody.py::test_t11_without_item_support_the_overstatement_stands_and_is_not_dressed_up`
+and `tests/test_embody_canonical_history.py::test_the_correction_makes_no_claim_that_the_server_record_matches`.
+It closes when upstream ships a rewrite/edit operation; until then, do not
+write a sentence anywhere that says the two histories agree.
+
 **The heard class is gated on ATTENTION (issue #148), and the gate is
 `reachy/embody/attention.py` — never the wire.** Two states: COLD, where only
 an utterance that NAMES the robot wakes a turn, and WARM, where anything does,
 until `Limits.attention_window_s` (45.0 s) passes with nothing heard and
-nothing spoken. Four things about it are load-bearing:
+nothing spoken. **Since issue #150 (task t2) the window is an operator knob**:
+`agent embody --attention-window SECONDS`, else `REACHY_EMBODY_ATTENTION_WINDOW`
+in the PROCESS env, else 45.0 (`resolve_attention_window_s`; `0` still means
+name-only-forever, so `explicit` is checked against `None` by identity — a bare
+`or` chain would read an explicit `0.0` as unset). The flag is declared on
+`embody` AND on `start`/`restart` via `_add_embody_operating_args(inherit=True)`
+so it reaches the SPAWNED child — that `argparse.SUPPRESS` detail is the #147
+defect class and is pinned by test. Never `environment.d`: that mechanism is
+login-session-wide and would re-point the runtime too. Five things about the
+gate are load-bearing:
 
 - **It reaches `reachy/speech/name_match.py`, NOT `engagement.py`.**
   `is_name_match` is pure `difflib` + `re`; `engagement.py` additionally
@@ -962,22 +1096,90 @@ nothing spoken. Four things about it are load-bearing:
 - **Only a NAME opens; being heard and speaking both EXTEND.** A refused
   utterance changes no state, so ambient chatter cannot warm the robot up by
   being refused often enough — and `note_spoken` extends a live window but
-  never opens one. That asymmetry is not fastidiousness: the duplex session is
-  armed once and the SERVER answers every committed utterance ("every
-  committed turn on this session gets a spoken reply",
-  `docs/evidence/2026-08-02-t14-live-acceptance.md`), so `note_spoken` fires
-  for replies to the very chatter the gate just refused. A voice that could
-  open attention would be a robot waking itself up — engagement.py's
-  one-way-ratchet defect (199 correct drops, 39 accepts, *all wrong*) arriving
-  through a door the runtime never had.
+  never opens one. That asymmetry is not fastidiousness, and **on the path
+  deployed today it is still the only thing holding**: against a gateway
+  without one-shot arming the duplex session is armed ONCE and the SERVER
+  answers every committed utterance ("every committed turn on this session
+  gets a spoken reply", `docs/evidence/2026-08-02-t14-live-acceptance.md`), so
+  `note_spoken` fires for replies to the very chatter the gate just refused. A
+  voice that could open attention would be a robot waking itself up —
+  engagement.py's one-way-ratchet defect (199 correct drops, 39 accepts, *all
+  wrong*) arriving through a door the runtime never had. Do not delete the
+  asymmetry when one-shot arming ships: a gate that only holds while an
+  upstream capability is present is a gate that fails open.
+- **Since issue #149 (task t8) attention gates the VOICE, not only the mind.**
+  Composition opts into `arm_per_utterance=True` and drives
+  `session.arm_once()` from the gate's verdict per ADMITTED utterance — a cold
+  ambient utterance sends no `response.create` at all, so the room hears
+  nothing. The wire stays gate-free: the DECISION lives in
+  `_commands/agent.py`'s `_utterance_tap`, and `realtime_duplex.py` only knows
+  that *someone* asked for a reply. It is behind a capability check that FAILS
+  CLOSED — `announces_one_shot_arming(event)` reads exactly
+  `session.created`'s `config.arming == "one_shot"`, the ONE shape this repo
+  guessed for the not-yet-shipped agentculture/lobes-cli#170 item 1 — and
+  degrades to today's arm-at-connect with one named
+  `one-shot-arming-unsupported` drop. The degrade direction is deliberate: a
+  client that went silent against an old gateway would take the robot's voice
+  away to fix a politeness bug. **So on the deployed gateway this is wired and
+  inert**; do not describe #149 as closed live until t15's evidence says so.
 - **Attention gates the EAR, never the robot's own reactions.** An ALERT (a
   rule fire) still triggers a turn from cold, and does not open the window
-  either.
+  either. Nor does an interjection, at either authorization level.
 - **It bounds cost and manners, never blast radius.** Anyone in the room can
   open it by saying one word out loud, so containment still rests entirely on
   the closed action set and the fail-closed validators —
   `tests/test_embody_redteam.py`'s docstring now says exactly that, and
   distinguishes the ungated WIRE from the attention-gated LAYER.
+
+**`reachy/embody/interjection.py` — who else may speak through the robot's
+mouth, and how the layer says no** (task t5). One decision point for every
+route, because a per-route policy would be four places to get default-deny
+wrong. `InterjectionPolicy.admit(text, source=…)` runs six checks
+cheapest-first, and every outcome is NAMED — the label is used verbatim as the
+`senselog.drop` reason AND as the tool result's `refusal` field, so the
+journal, the feed and the model all see the same word: non-blank text
+(`interjection-empty`) → authorization is not OFF (`interjection-unauthorized`)
+→ the source is allow-listed (`interjection-source-denied`) → within
+`MAX_SAY_CHARS` (`interjection-too-long`) → attention permits it
+(`interjection-cold`) → the source's rate budget (`interjection-rate-limited`).
+Two orderings are load-bearing rather than tidy: source-before-rate means the
+rate table is only ever keyed by allow-listed names, so a flood of forged
+sources allocates nothing; and the budget is spent only on an ADMISSION, so an
+interjection refused for arriving into a quiet room does not cost its source
+the chance to say the same thing later.
+
+`Authorization` is three states, not a boolean, because "may interject" and
+"may interject UNINVITED" are different permissions: `OFF` (the shipped
+default), `WARM` (only while attention is warm — a human is already in
+conversation), `PROACTIVE` (the above, plus into a cold room). **Everything
+ships closed and it ships closed in the CONFIG, not in the docs**: the frozen
+`InterjectionLimits` carries `authorization = OFF` and `sources = ()` —
+default-deny per source, empty rather than "the worker", because naming a
+LEVEL is not naming a SOURCE. Rate: `DEFAULT_MAX_PER_WINDOW` = 3 per
+`DEFAULT_RATE_WINDOW_S` = 60.0 s.
+
+**Be exact about the operator surface: there is none yet.** Production
+composition builds `InterjectionPolicy(limits=interjection_limits, …)` with
+`interjection_limits=None`, so the shipped defaults apply and *this version
+has no CLI flag and no env var that turns interjection on*. Turning it on
+today means injecting `InterjectionLimits` at the composition seam. If you add
+the operator surface, add it there and document the level names — do not add a
+second copy of the defaults.
+
+**The wanted-to-say artifact** is the other type in that module, and the other
+side of interjection: when a HUMAN cuts an audibly speaking robot, the said
+portion is recorded as spoken and the remainder becomes a `WantedToSay` —
+attributed to its `response_id`, bounded, expiring in TURNS
+(`DEFAULT_WANTED_TO_SAY_EXPIRY_TURNS` = 2; `Limits.wanted_to_say_maxlen` = 4),
+and **CONTEXT only, structurally**: it has no class-carrying field, its
+`as_cue` is hard-wired to `WANTED_TO_SAY_CUE_CLASS`, and a test walks the
+module's AST to prove the artifact's surface never mentions the alert lane.
+The robot never wakes itself up to finish an old sentence — the same
+no-self-wake asymmetry, one family over. Both families' PHRASING lives in
+`reachy/runtime_cues.py` (`interjection_cue` / `wanted_to_say_cue`,
+`LINE_INTERJECTION` / `LINE_WANTED_TO_SAY`, `EMBODY_LINE_TYPES`), so the robot
+cannot end up described two ways; they are constructed in-process by the layer
+and `reachy/embody/cues.py` refuses them BY NAME if one arrives off the wire.
 
 Both lanes
 stream, and the stall detector is armed on **inter-chunk idle, never total
@@ -996,8 +1198,10 @@ drop-in would silently re-point the RUNTIME's engagement classifier too.
 
 **`reachy/speech/realtime_duplex.py` — the duplex peer of `realtime.py`.** Same
 wire, same server-side VAD, same never-raise discipline, plus the half the
-runtime refuses: it ARMS with one `response.create` and plays the response
-audio out. **One session per process, and it must remain the only ARMED session
+runtime refuses: it ARMS with `response.create` — once per session, or once per
+ADMITTED utterance where the gateway announces one-shot arming (see the
+attention bullets above) — and plays the response audio out. **One session per
+process, and it must remain the only ARMED session
 on the box** — the t1 probe
 (`docs/evidence/2026-08-01-probe-concurrent-realtime-sessions.md`) is why it may
 coexist with the runtime's hearing session at all (~85 s, zero cross-talk), but
@@ -1011,8 +1215,67 @@ waking a mind for belongs one level up, in `reachy/embody/attention.py`. Do not
 correctly. `play` runs on a DEDICATED thread, never the socket pump, because
 the robot sink's daemon-HTTP route is a seconds-long upload-then-play round
 trip: charging that to the pump stops the ears, starves the keepalive and gets
-the session dropped. Exactly three frame kinds may leave the socket (session
-config, `input_audio_buffer.append`, `response.create`), pinned by test.
+the session dropped. Exactly **FOUR** frame kinds may leave the socket (session
+config, `input_audio_buffer.append`, `response.create`, and — since task t10,
+behind a capability check — `conversation.item.create`), pinned by test. **The
+count went from three to four exactly once, on purpose**, under decision c28,
+in the same change that landed the items leg; the test citing that decision is
+what makes a future fifth a decision rather than an accident. The fourth kind
+is gated on `announces_conversation_items(event)` — the same fail-closed shape
+as the arming probe — so a gateway that announced nothing yields one named
+items-unsupported drop and the layer degrades to connect-time `system_prompt`
+context.
+
+**Playback is CHUNKED, so it is CANCELLABLE** (issue #151 item 3, task t6).
+`_accumulate_audio` no longer waits for `response.done` to hand one whole clip
+to `EmbodySink.play`: a chunk is enqueued once `Limits.playback_chunk_bytes`
+(`DEFAULT_PLAYBACK_CHUNK_BYTES`, 1.0 s of audio) has accumulated, after a
+smaller first chunk (`DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES`, 0.4 s) so speech
+starts sooner. `cancel_playback()` is then just "do not send the next chunk",
+which is the only cancellation the daemon-HTTP route can implement without new
+daemon capability. Two consequences to carry: `on_response` now means *the
+server finished this reply*, not *the room heard all of it* (ask
+`playback_progress()` for the second question), and a failed `play` counts as
+SKIPPED, never played — the room heard nothing.
+
+**The said/unsaid split is MEASURED at the sink** (task t7).
+`estimate_spoken_prefix` is **cited, not imported**, from lobes-cli's
+`lobes/realtime/_floor.py`:323 — cut the text proportionally to the audio
+delivered, then back up to the previous word boundary — for its own stated
+reason: *"recording the full text as if it had been heard is a worse lie than
+recording a slightly-off prefix"*. What this client adds is that the input is
+a MEASUREMENT rather than the server's wire estimate: `PlaybackProgress`
+reports the bytes the sink RETURNED from, so `spoken_split()` is exact to the
+chunk boundary and estimated only inside the boundary chunk — and the chunk
+still inside `play` counts as NOT said, so its words land in the remainder.
+That direction is deliberate: offering to repeat something half-heard is a
+smaller error than claiming a sentence nobody got.
+
+**The client-side TAIL cut** (task t16, deviation d1 — `devague deviate
+--list`). Upstream paces delivery to the playhead, so the floor covers the
+bulk of a reply and `response.interrupted` already works; the gap is only the
+window AFTER `response.done`, where the wire is finished but the speaker is
+still going. `_tail_cut_tap` in `_commands/agent.py` closes it: a VAD-verified
+`speech_started` while our playback queue is non-empty →`cancel_playback()` →
+`spoken_split()` → `note_interrupted_reply()`. It keys on VAD-verified speech
+ONLY, never raw loudness (claim c35), so a cough or a door slam does not cut
+the robot; a cut with nothing playing is a no-op; and the two paths cannot
+double-record one reply because both narrow through `_correct_spoken`. The
+policy lives at the composition layer — `realtime_duplex.py` stays gate-free,
+with its structural pins untouched.
+
+**Connect-time voice conventions — no new frame kind** (task t9). lobes'
+`parse_session_config` already accepts a per-session `system_prompt` override
+in the connect config riding the URL query params, so the layer uses it for
+persona + reply-length policy: `resolve_voice_prompt(default=…)` at the ONE
+production construction site, precedence explicit → `REACHY_EMBODY_VOICE_PROMPT`
+in the PROCESS env → this module's own `DEFAULT_VOICE_PROMPT` (chunk-friendly,
+longer-answer-permitting). A REJECTED override (blank after stripping, or over
+`MAX_VOICE_PROMPT_CHARS` = 2000) resolves to *no override* and a named
+degrade — never silently repaired to the default, because silently repairing a
+malformed configuration is how an operator ends up debugging a persona they
+never set. Passing `default=` at composition (rather than baking it into the
+resolver) is what stopped the capability shipping with no caller.
 
 **`reachy/embody/cues.py` + `supervisor.py`.** Cues map the runtime's own
 `sense`/`rule`/`intent`/`motion` lines to first-person text — a **rule fire is
@@ -1042,6 +1305,20 @@ worth carrying forward: Reachy's hardware AEC is scoped to **the daemon's own
 playback**, not to the speaker as a device (2.06x for its own voice vs 4.72x
 peak for PipeWire playback, at its own mic) — which is why a probe listening on
 the tee can never prove the robot's own voice was audible.
+
+**And the two-tempo arc's live status is: NOT YET MEASURED.** Everything
+issue #155's section above describes is proven by the offline suite and by one probe
+against the deployed gateway (the media budget,
+`docs/evidence/2026-08-02-t1-media-chunk-budget.md`). The eight #155 acceptance
+scenarios — silent ambient handling judged AT THE SPEAKER, a human interjection
+stopping an audibly speaking robot, what-can-you-see answered from a snapshot,
+a background scope reaching the room without being spoken directly — belong to
+task t15 and have not run. Two of them cannot pass yet at all and are recorded
+BLOCKED-ON-UPSTREAM rather than rounded up: the live items half and the
+one-shot-arming barge-in check both wait on agentculture/lobes-cli#170. The
+per-chunk daemon `/media/play` round trip is also still unmeasured (it plays
+audio on the deployed robot), so the audible gap between chunks and the true
+cut latency are both defensible defaults rather than numbers.
 
 ### `pat` noun — bench-only proprioceptive touch + snuggle (SDK-first)
 

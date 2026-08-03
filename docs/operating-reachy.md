@@ -41,8 +41,11 @@ a **noun** you run from the shell or an agent loop:
 - **Switch on a conversational mind** — the optional
   [embodiment layer](#the-embodiment-layer--agent-embody) (`agent embody`):
   ears, a voice and a cue-triggered mind running *beside* the runtime, so the
-  robot answers out loud and reacts in voice when its own rules fire. Stop it
-  and the robot is exactly the symbolic presence above.
+  robot answers out loud and reacts in voice when its own rules fire. It runs
+  [two models at two tempos](#the-two-tempo-architecture--gemma-speaks-qwen-thinks)
+  — a foreground voice that answers now, and a background mind that thinks
+  longer and reaches the conversation only through typed events. Stop it and
+  the robot is exactly the symbolic presence above.
 
 See the [noun map in the README](../README.md#noun-map) for the one-line table,
 and `reachy-mini-cli explain <noun>` for the full reference of any noun.
@@ -493,7 +496,9 @@ vars override the built-in default.
 | `REACHY_CLIP_SECONDS` | `6.0` | X — how many seconds of camera frames the rolling clip ring keeps before each re-encode | `behavior/clip_rider.py` |
 | `REACHY_EMBODY_MEDIA_PROFILE` | `robot` | Embodiment-layer media profile: `robot` (tee socket in, daemon HTTP route out) or `bench` (dev-box mic + speakers). `--media-profile` wins | `embody/media.py` |
 | `REACHY_EMBODY_WORKER_MODEL` | `worker` (the lobes ROLE name) | Model id for the layer's tool-bearing turns. Process env only — an `environment.d` drop-in would re-point the runtime's engagement classifier too | `embody/engine.py` |
-| `REACHY_EMBODY_SENSES_MODEL` | `senses` (the lobes ROLE name) | Model id for the layer's tool-less perception questions | `embody/engine.py` |
+| `REACHY_EMBODY_SENSES_MODEL` | `senses` (the lobes ROLE name) | Model id for the layer's tool-less perception questions. Pairs with the **realtime service's own** `OPENAI_MODEL` (the voice) — `doctor`'s `model_pair` check warns if the two explicitly name different models | `embody/engine.py` |
+| `REACHY_EMBODY_ATTENTION_WINDOW` | `45` (seconds) | How long attention stays open after the last utterance heard or answer spoken; `0` means name-only forever. `--attention-window` wins. Process env only — and the flag/env reaches the child `embody start` spawns | `embody/engine.py` |
+| `REACHY_EMBODY_VOICE_PROMPT` | (unset → the layer's own chunk-friendly default) | Connect-time `system_prompt` override for the realtime session: persona and reply-length conventions for the foreground voice. Blank or over 2000 chars is **refused, not truncated** — the session then connects with no override and names the degrade | `speech/realtime_duplex.py` |
 | `REACHY_EMBODY_TARGET_SAMPLE_RATE` | `16000` | The one rate every layer audio read is normalised to — the runtime's measured mic rate, so the `robot` profile resamples nothing and only `bench` converts | `embody/media.py` |
 | `REACHY_EMBODY_BENCH_INPUT_DEVICE` | (system default) | Bench capture device. Point it at the `module-echo-cancel` **source** for AEC | `embody/media.py` |
 | `REACHY_EMBODY_BENCH_OUTPUT_DEVICE` | (system default) | Bench playback device. Point it at the paired echo-cancel **sink** — using only one half of the pair gets no cancellation | `embody/media.py` |
@@ -2412,9 +2417,9 @@ graph LR
     end
 
     subgraph LAYER["agent embody (a separate process)"]
-        DUPLEX["ONE lobes /v1/realtime session<br/>server VAD in · response audio out"]
-        MIND["streaming /v1/chat/completions<br/>worker · senses"]
-        TOOLS["five tools<br/>goto · run_behavior · speak · harmonics · create_rule"]
+        DUPLEX["ONE lobes /v1/realtime session<br/>FOREGROUND voice (Gemma)<br/>server VAD in · chunked audio out"]
+        MIND["streaming /v1/chat/completions<br/>BACKGROUND mind (Qwen) · senses lane"]
+        TOOLS["five tools<br/>goto · run_behavior · create_rule<br/>speak · harmonics (PROPOSALS)"]
     end
 
     TEE -->|"unix socket, mono f32"| DUPLEX
@@ -2422,16 +2427,23 @@ graph LR
     CLIP -->|"path reference"| MIND
     DUPLEX -->|"utterances"| MIND
     MIND --> TOOLS
-    DUPLEX -->|"spoken reply"| SPK["speaker<br/>daemon http route"]
+    TOOLS -->|"typed events: scope · interjection"| DUPLEX
+    DUPLEX -->|"spoken reply, in chunks"| SPK["speaker<br/>daemon http route"]
     TOOLS -->|"intents spool / rules overlay"| TICK
 ```
 
-- **EARS + MOUTH — one duplex session.** The layer holds exactly **one** lobes
-  `/v1/realtime` WebSocket. The server's own VAD decides where a sentence
-  ended; the session is armed with a single `response.create`, and the spoken
-  reply comes back as audio deltas that get played out. Only three frame kinds
-  ever leave the socket (session config, audio append, `response.create`) — no
-  tool call rides it, because lobes parks socket tool-calling upstream.
+- **EARS + MOUTH — one duplex session, and the ONLY thing that speaks.** The
+  layer holds exactly **one** lobes `/v1/realtime` WebSocket. The server's own
+  VAD decides where a sentence ended; the session is armed with
+  `response.create`, and the spoken reply comes back as audio deltas that are
+  played out **in chunks** (see [the two-tempo
+  architecture](#the-two-tempo-architecture--gemma-speaks-qwen-thinks) for why
+  that matters). **Four** frame kinds ever leave the socket — session config,
+  audio append, `response.create`, and `conversation.item.create` — no
+  tool call rides it, because lobes parks socket tool-calling upstream. The
+  fourth arrived deliberately, once, to let the layer put what it knows in
+  front of the voice; against a gateway that does not announce item support it
+  is declined with one named drop and never sent.
   **Hearing here is UNGATED**: unlike the runtime's transcript sense the
   session runs no engagement gate and no name match, so it hears every voice in
   the room, including utterances the runtime would drop as ambient. That is
@@ -2465,7 +2477,253 @@ graph LR
   **no model reasoning**. The seam is dormant, not broken; one flag fills it.
 - **ACTION — a closed five-tool set.** `goto`, `run_behavior`, `speak`,
   `harmonics`, `create_rule`. There is no shell, no filesystem tool, no network
-  tool, and no way to register a sixth.
+  tool, and no way to register a sixth. Three of them act on the robot.
+  **`speak` and `harmonics` no longer do**: since the two-tempo split they are
+  *proposals* — the background mind asks for something to be said, the
+  interjection policy decides whether the ask may travel at all, and the
+  foreground voice keeps the wording and the decision to speak. Nothing in the
+  layer's tool path can open a speaker.
+
+### The two-tempo architecture — Gemma speaks, Qwen thinks
+
+The layer runs **two models at two tempos over one conversation**, and one of
+them owns the mouth. That is the whole design, and every rule below follows
+from it:
+
+| | **Foreground** | **Background** |
+|---|---|---|
+| Who | **Gemma**, the lobes realtime floor | **Qwen**, the layer's worker lane |
+| Tempo | one utterance, one reply — realtime | seconds to minutes, multi-round, tool-using |
+| Job | hear, answer, hold the turn, keep the wording | follow along, reason, operate the robot, notice things |
+| Reaches the room | **directly — it is the voice** | **only through typed events** |
+
+**The invariant: Qwen never generates realtime speech.** It can propose a
+sentence; it cannot say one. The event is Qwen's output, the speech stays
+Gemma's — which is what keeps the robot sounding like one presence instead of
+two arguing scripts. This is not a convention: the layer's tool registry
+contains no audio seam at all, imports no synthesis and no playback, and there
+is no code path — authorized or not — from a tool call to a speaker.
+
+Why bother with two: a realtime voice has to answer *now*, which rules out the
+long, tool-using, multi-round thinking that actually operates a robot; and a
+thinking loop that owned the mouth would leave people waiting mid-sentence
+while it worked. Splitting them buys both, at the cost of having to be
+explicit about how the slow one influences the fast one. The rest of this
+section is that explicitness.
+
+#### One conversation, two windows onto it
+
+There is **one** history, not one per model. Qwen replays its full window of
+**60** turns; Gemma replays the last **20**, which are a strict *suffix* of
+Qwen's — the same stored turns, never a second independently-maintained copy,
+because two histories are two accounts of one conversation and the robot would
+eventually disagree with itself about what was said.
+
+Everything older than Gemma's 20 turns is covered by **one rolling summary,
+maintained by Qwen**. That is the background mind doing something the
+foreground cannot: compacting an hour of conversation into the paragraph the
+voice needs.
+
+If the summary cannot be refreshed — the worker gateway is down, the answer
+came back empty or over-length — the layer does **not** quietly narrow Gemma's
+memory to the last 20 turns. It keeps the last good summary, marks it, and
+names the failure:
+
+```bash
+tail -f "$STATE/embody.log" | grep summary-stale
+```
+
+Gemma's context then carries a visible "this summary could not be refreshed
+and may be out of date" line until a pass succeeds, at which point the marker
+clears on its own. A silently shortened memory looks exactly like a robot that
+has forgotten you; a marked one is a robot that says so.
+
+The cost of Gemma's window was measured rather than assumed
+([the media-budget probe](evidence/2026-08-02-t1-media-chunk-budget.md)):
+twenty turns of ordinary spoken exchange are **401 prompt tokens** against
+**2 399** for one camera-clip question — about +16% on a clip ask. The same
+probe corrects an earlier claim worth un-learning: the text window is *cheap*,
+not *free*. In bytes the clip is 827× bigger; in tokens, which is what
+actually fills a context window, it is 6×.
+
+#### How the background mind reaches the conversation: cognition scopes
+
+Qwen's influence travels as a **cognition scope** — a compact, attributed,
+expiring artifact, and never raw model reasoning:
+
+```json
+{"type": "cognition.scope", "source": "qwen",
+ "goal": "Clarify what object the user is referring to",
+ "relevant_facts": ["The latest image contains two visible objects",
+                    "The user previously referred to the left object"],
+ "suggested_next_step": "Ask whether they mean the left object",
+ "priority": "normal", "expires_after_turns": 2, "speakable": false}
+```
+
+Gemma reads the live scopes under a preamble that says, in as many words, that
+the wording and whether to say anything at all are its own. Four properties
+are load-bearing:
+
+- **attributed** — a suggestion nobody can trace is one nobody can withdraw;
+- **bounded** — per field and in total, refused rather than truncated, because
+  a truncated scope misstates what the background mind meant;
+- **expiring in turns** — a conversation moves on, and a stale scope shaping a
+  later turn is worse than no scope;
+- **context, never a trigger** — a scope cannot wake the robot up. It has no
+  field that could, and the method that parks one has no parameter for it.
+
+Raw reasoning is banned outright, and not merely on taste: it is long, written
+for nobody, and with thinking enabled the deployed gateway took 9–18 s to
+produce any of it. A scope is the useful part, at a size a realtime prompt can
+afford.
+
+#### Interjection — when the background mind wants to say something *now*
+
+Sometimes the slow mind has something worth saying while the fast one is
+mid-conversation. An **interjection** is the speakable face of a scope: a
+typed, inspectable event carrying its own provenance, which the foreground
+voice may render into speech — re-worded, or declined. Qwen still never owns
+the mouth.
+
+**It is OFF by default, and off means off.** Authorization is three states,
+not a switch:
+
+| Level | What it permits |
+|---|---|
+| `off` | nothing. **The shipped default.** |
+| `warm` | interjecting while a conversation is already live |
+| `proactive` | the above, plus speaking into a cold room |
+
+Two are separate permissions on purpose: *may join a conversation* and *may
+start one* are different things to grant. Underneath, the allow-list of
+sources ships **empty** — default-deny per source — because naming a level is
+not the same as naming who. A source may land at most **3 interjections per
+60 s**, and the budget is spent only on an admission, so being refused while
+the room was quiet does not cost a source the chance to say the same thing
+later.
+
+Every outcome is named, and the same word reaches the journal, the export feed
+and the model's own tool result: `interjection-unauthorized`,
+`interjection-source-denied`, `interjection-cold`,
+`interjection-rate-limited`, `interjection-too-long`, `interjection-empty`. A
+refusal the model cannot see is not a refusal — it is a silence the model
+reads as success and repeats.
+
+**Two things this does not do.** It never opens the attention window (an
+admitted interjection rides the same lane a rule fire does: it may trigger a
+turn from cold, it never makes the robot start listening to the room). And it
+does not widen what the robot can *do* — containment still rests entirely on
+the closed five-tool set and the fail-closed validators, exactly as it did
+before. What interjection widens is **who may put text in front of the mind**,
+and how often.
+
+> **Operator note, stated plainly:** this release ships the policy and the
+> event family with **no CLI flag and no environment variable to turn them
+> on**. The default-OFF state is enforced in the layer's own configuration
+> object, not in this document — which is the right way round — but it also
+> means an operator cannot currently enable interjection without changing how
+> the layer is composed. If you need it, that is a feature request, not a
+> setting you have missed.
+
+#### Long answers, and interrupting one
+
+A reply is no longer synthesized, uploaded and played as one indivisible clip.
+Audio is played in **chunks** (a shorter first chunk so speech starts sooner,
+then roughly one second at a time), which is what makes "stop talking" mean
+"do not send the next chunk" — the only cancellation the daemon's HTTP media
+route can implement without new daemon capability.
+
+So a human — or another robot, or an automated system; the rules are the same
+for any external interlocutor — can talk over an audibly speaking Reachy and
+have it stop, within roughly one chunk. The cut keys on **VAD-verified
+speech**, never on raw loudness, so a cough or a door slam does not cut the
+robot off.
+
+What happens next is the part worth understanding, because it is where a robot
+usually starts lying to itself:
+
+- **the said half is recorded as said** — measured at the speaker, not
+  estimated from what the server sent. What the room actually heard is exact
+  to the chunk boundary and estimated only *inside* the boundary chunk, and
+  the chunk still playing counts as **not** said. Offering to repeat something
+  half-heard is a smaller error than claiming a sentence nobody got;
+- **the unsaid half is kept, not discarded** — as a *wanted-to-say* artifact,
+  attributed to the reply it came from, bounded, and expiring after two turns.
+  The next turn can read it and decide whether it is still worth saying;
+- **it is context, never a trigger.** The robot does not wake itself up to
+  finish an old sentence.
+
+##### The phase-1 limitation — do not round this up
+
+The client cuts the speaker; the *server* never sees it. Wire delivery
+finished at wire speed, so lobes already fired `response.done` and appended
+the **whole** reply to its own conversation history. After any client-side
+interruption the floor's record therefore **overstates** what the room heard.
+
+The layer does two things about that, and neither of them is "fixes it":
+
+1. its own canonical history is narrowed to the measured prefix — the client
+   is the authority for what its own speaker played;
+2. where the gateway announces conversation-item support, it **appends** a
+   `Correction: my previous reply was cut off. Only "…" was actually spoken
+   aloud` item, so the reading model is *told*.
+
+It is an append because the schema has **no rewrite operation**. The
+overstated turn is still sitting in the floor's history. Nothing in this repo
+claims the two records agree — only that one of them has been told about the
+other. Against every gateway shipping today the correction is declined
+outright (one named drop) and the overstatement simply stands.
+
+That divergence closes when upstream can edit a stored turn
+(agentculture/lobes-cli#170). Until then, if you are reading the gateway's own
+history to reconstruct a conversation, it is the wrong source after an
+interruption.
+
+#### What this deliberately is not
+
+- **This repo does not operate the lobes realtime service.** Which model
+  speaks (`OPENAI_MODEL`) and how its VAD is tuned (`VAD_THRESHOLD`,
+  `VAD_SILENCE_MS`, `VAD_PREFIX_PADDING_MS`) are *that service's* deployment
+  configuration. Gaps there become issues on lobes-cli, not code here. See
+  [the model pair](#the-model-pair--doctor-names-it-you-keep-it-together)
+  below for the one place the two configurations have to agree.
+- **No local VAD or endpointing comes back.** Server-side VAD is the settled
+  answer for both the runtime's hearing and the layer's; there is no local
+  fallback and there is not going to be one.
+- **The `say` noun stays a dumb TTS pipe**, and `sleep`'s wake-word leg is
+  untouched. Neither is part of this architecture.
+- **The runtime is untouched.** The zero-LLM boundary still holds, the
+  engagement gate still has exactly one classifier edge, and the layer's
+  attention gate still reaches `name_match.py` rather than `engagement.py`.
+
+#### The model pair — `doctor` names it, you keep it together
+
+Gemma ends up named in **two** configurations that live in different places:
+
+| Setting | Where it lives | What it decides |
+|---|---|---|
+| `OPENAI_MODEL` | the **lobes realtime service's** environment | which model speaks |
+| `REACHY_EMBODY_SENSES_MODEL` | the **layer process's** environment | which model answers perception questions |
+| `REACHY_EMBODY_WORKER_MODEL` | the layer process's environment | the background mind — **a different model on purpose** |
+
+Nothing makes the first two move together, so they can silently drift into a
+robot that describes one scene and talks about another. `doctor` now names all
+three:
+
+```bash
+reachy-mini-cli doctor --json | jq '.checks[] | select(.id=="model_pair")'
+```
+
+It warns only on genuine divergence: both halves explicitly set, neither of
+them a routing alias (`worker` / `senses`, which the gateway resolves itself),
+and the two naming different models. Leaving them unset — the state every box
+is in today — passes. And it never compares the worker lane: flagging that
+would be telling you to undo the architecture.
+
+The check reads **this process's** environment. The gateway holds its own
+`OPENAI_MODEL` in its own service environment, which is not readable from
+here, so an unset value is reported as *not visible*, never as *not
+configured*.
 
 ### What is worth a turn — the three input classes
 
@@ -2500,6 +2758,42 @@ turn's prompt keeps them in a section of their own (`Meanwhile, in the
 background:`) so the model can tell what woke it up from what was merely going
 on. Parked context alone never causes a turn; if none ever runs, it is simply
 never read, which is the right outcome for ambient background.
+
+**Perception gets a second park, and this is why** (issue #154). Coalescing on
+text is exactly right for the closed cue vocabulary — a fixed phrase per
+perception, so identical text really does mean the same thing happened again —
+and exactly wrong for anything a model wrote. "A kitchen with someone at the
+counter" and "a kitchen, a person near the counter" are the same fact sharing
+no key. Feed camera descriptions through the text-keyed park and it fills with
+near-duplicate sightings within minutes, and then starts **refusing genuine
+runtime facts** — the cheapest, most repetitive signal evicting the most
+valuable one.
+
+So what the camera sees lands in a separate, **latest-wins** slot, one per
+source, holding a small structured snapshot rather than prose:
+
+```text
+observation summary · salient entities · confidence · capture time · frame reference
+```
+
+A new description **replaces** the one in the slot instead of queueing beside
+it — a slot describes a *state* ("what the camera currently shows"), not a log
+of past sightings — so a room described every 20 s for an hour still occupies
+exactly one slot. The replacement is never silent: the slot keeps counting, so
+it still contributes to `coalesced-from`, and a repeat renders differently
+from an update.
+
+And unlike a cue, a slot **persists across turns** until it is superseded or
+goes stale (30 s, the same freshness rule the clip poller already applies, now
+re-checked at read time). That is the difference between a cue and a state: a
+cue describes something that *happened*, and a happening does not stay true; a
+snapshot describes something that *is*. Before this, asking "what can you
+see?" between two camera polls got you nothing, because the last answer had
+already been read and thrown away by whichever turn ran first.
+
+If the perception model's answer does not parse as the requested structure,
+the layer degrades to a summary-only snapshot with a named drop — never a
+crash, and never a silently empty slot.
 
 Alerts get their own containment, because `cooldown_s = 0` is legal and
 several rules can fire in one tick — otherwise the same flood walks back in
@@ -2552,16 +2846,57 @@ decide the robot is broken:
   back-and-forth never drops out mid-exchange — including while the robot is
   taking a long turn of its own. The name is only needed to *start*.
 - **Only a name opens it.** Ambient chatter cannot warm the robot up by being
-  refused often enough, and neither can the robot's own voice: the duplex
-  session is armed once and the server answers every committed utterance, so a
-  reply spoken while cold — to a conversation the layer is not part of —
-  extends nothing. A robot that could wake itself with its own voice would
-  never go quiet again. This is the same failure the runtime's engagement gate
-  measured the hard way (199 correct drops, 39 accepts, *all wrong*, from a
-  history that could only accumulate reasons to say yes).
+  refused often enough, and neither can the robot's own voice: against the
+  gateway deployed today the duplex session is armed once and the server
+  answers every committed utterance, so a reply spoken while cold — to a
+  conversation the layer is not part of — extends nothing. A robot that could
+  wake itself with its own voice would never go quiet again. This is the same
+  failure the runtime's engagement gate measured the hard way (199 correct
+  drops, 39 accepts, *all wrong*, from a history that could only accumulate
+  reasons to say yes).
 - **A rule fire still wakes it from cold.** Attention gates the *ear*, never
   the robot's own reactions — patting its head still produces a turn, and it
   may still speak about what it just did.
+
+**Attention now gates the VOICE too — where the gateway supports it.** Until
+this release the gate decided only whether a *turn* ran; the room got a spoken
+reply to every sentence anyway, because the session armed itself once at
+connect and the server then answered every committed turn. That is the ignored
+room being answered aloud, and it is the defect this closes. The layer now
+asks for **one reply per admitted utterance**: a cold ambient sentence sends no
+`response.create` at all, so nothing is spoken.
+
+Read the next paragraph before you conclude your robot is broken or fixed.
+The mechanism is behind a **capability check that fails closed**, and upstream
+has not shipped the other half yet (the ask is agentculture/lobes-cli#170). So
+against the gateway you are running today the layer degrades to the old
+arm-once behaviour and names it once:
+
+```bash
+tail -f "$STATE/embody.log" | grep one-shot-arming-unsupported
+```
+
+The degrade direction is deliberate — a client that went silent against an
+older gateway would take the robot's voice away in order to fix a politeness
+bug. When that line is in your log, the ignored room is still answered aloud
+and the journal-level `not-addressed-cold` drop is the only thing that changed.
+
+**The window is now an operator knob** (issue #150). Precedence:
+
+```bash
+reachy-mini-cli agent embody --attention-window 90     # this flag wins
+export REACHY_EMBODY_ATTENTION_WINDOW=90               # then this
+#                                                      # then the 45 s default
+```
+
+`0` still means *name-only forever* — every utterance must name the robot, and
+nothing ever opens a window. The flag is declared on `embody start` and
+`embody restart` as well as on the foreground verb, so a background layer is
+configured identically; that is not free, and it is pinned by test, because a
+flag that silently fails to reach the spawned child has bitten this repo
+before. Set the environment variable in the **layer process's own**
+environment, never in an `environment.d` drop-in: that mechanism is
+login-session-wide and would re-point the runtime too.
 
 The name matcher is the runtime's, so the mishearings it already forgives
 ("richie", "reachie", "richy") work here too, and the everyday `r`-words its
@@ -2584,11 +2919,11 @@ tail -f "$STATE/embody.log" | grep -E 'attention open|not-addressed-cold'
 ```
 
 The window length is `Limits.attention_window_s` in
-`reachy/embody/engine.py` (45 s; `0` means name-only forever). It is longer
+`reachy/embody/engine.py` (45 s by default). It is longer
 than the runtime's 20 s transcript window on purpose — a *spoken* exchange
 spends most of its time on things a transcript stream never pays for: the
 robot's own multi-round turn, seconds of synthesized speech, and the human
-listening to it before replying. There is no CLI flag for it yet.
+listening to it before replying.
 
 ### Containment — an ungated ear does not widen actuation
 
@@ -2603,7 +2938,7 @@ second copy of any bound:
 |---|---|
 | `goto` | the shipped goto handler — per-axis bounds, the 10 s duration cap; refuses, never clamps |
 | `run_behavior` | the intent driver's library-name/param checks and the unbounded-lifetime refusal |
-| `speak` / `harmonics` | the one shared 500-character `say` cap (`MAX_SAY_CHARS`), imported rather than restated |
+| `speak` / `harmonics` | the one shared 500-character `say` cap (`MAX_SAY_CHARS`, imported rather than restated), and then the interjection policy — which is **OFF by default**, so out of the box these two reach nothing at all |
 | `create_rule` | the real rules validator: a candidate overlay is handed to the loader and only `os.replace`d into place if it passes |
 
 Motion and behavior actions run the shipped validator **synchronously as a
@@ -2841,11 +3176,22 @@ feed that went away — appears both as a `[SENSE stage=embody …]` line on std
 and as a block on that feed. A consumer that disconnects mid-conversation never
 kills the layer.
 
-One difference from `agent attach` matters to anyone rendering the feed: the
-layer's voice tools are **real**, not publish-only. A `message` block from
-`agent embody` is either an utterance it is dispatching to a live speaker or one
-the duplex session has already spoken aloud — where the same block from `agent
-attach` is an intention no speaker in that process reproduces.
+One difference from `agent attach` matters to anyone rendering the feed, and
+it **changed** with the two-tempo split. A `message` block from `agent embody`
+is now one of two things, and only the second is sound:
+
+- **a proposal** — the background mind called `speak` or `harmonics`. The
+  block is emitted *before* dispatch, so it records what the mind wanted said;
+  whether the interjection policy allowed it is in the same turn's `thinking`
+  block, verbatim, as the tool result. Keeping those two as separate facts is
+  the point;
+- **an utterance the duplex session actually spoke aloud** — recorded through
+  the same seam, after the fact.
+
+So a renderer captioning every `message` from `agent embody` as "the robot said
+this" is now sometimes captioning an intention, exactly as it always was for
+`agent attach`. If the distinction matters to your renderer, read the
+`thinking` block beside it.
 
 The layer has no systemd unit, so its lines are **not** in the journal: in the
 foreground they are on stderr, and under `agent embody start` they are in
@@ -2949,6 +3295,37 @@ devices; robot profile also exercises the deployed path.
 Finally, a webcam gotcha that cost time: the C270 exposes **only** a
 `pro-audio` profile, which the browser would not open — capture worked only
 after switching the default source to a different device.
+
+#### The two-tempo arc: not yet measured live
+
+Everything in [the two-tempo
+architecture](#the-two-tempo-architecture--gemma-speaks-qwen-thinks) is proven
+by the offline suite and by exactly one probe against the deployed gateway
+(the media budget above). **None of it has been judged from the room.** The
+acceptance scenarios that matter — a cold ambient sentence producing no sound
+*at the speaker*, a human interjection stopping an audibly speaking robot
+within roughly one chunk, "what can you see?" answered from the latest
+snapshot, a background scope shaping a reply without being spoken directly —
+are a separate piece of work and have not run.
+
+Two of them cannot pass yet at all, and are recorded blocked rather than
+rounded up:
+
+- **per-utterance arming** needs the gateway to announce one-shot arming;
+  until then the layer degrades to arm-once and the room is still answered
+  aloud (grep `one-shot-arming-unsupported`);
+- **the conversation-item channel** — and with it the floor correction after
+  an interruption — needs upstream item support; until then it is declined
+  with one named drop and the server's history keeps overstating.
+
+Both wait on agentculture/lobes-cli#170.
+
+Also still unmeasured: the **per-chunk daemon `/media/play` round trip**. It
+sets both the audible gap between spoken chunks and the true interruption
+latency, and measuring it plays audio on the deployed robot, so it was
+deferred to a moment an operator is in the room. The shipped chunk sizes are
+defensible defaults, injectable, and expected to be retuned by that number
+rather than blocked on it.
 
 ---
 
@@ -3166,7 +3543,7 @@ for the operator workflow.
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
 | `agent attach` | attach an external AI agent over the runtime's event feed; acts through the four intent tools (`run_behavior`/`declare_goal`/`set_mode`/`set_inhibition`) via the intents spool; publishes its own cognition feed. Its voice and pose tools are **publish-only** | the `behavior engine run --export -` feed (`--feed`) | intent-spool commands, not the robot directly | none (feeds + intent spool, not the robot) |
-| `agent embody` (+ `start`/`stop`/`restart`/`status`) | the [embodiment layer](#the-embodiment-layer--agent-embody): ears + a mouth on one lobes `/v1/realtime` duplex session, a streaming cognition loop, and a closed five-tool action set (`goto`, `run_behavior`, `speak`, `harmonics`, `create_rule`). Its voice is **real**. Runs beside the runtime; enabling or disabling it changes nothing about how the robot behaves alone | the runtime feed **or** the MQTT bus, plus mic audio off the runtime's audio tee | the intents spool + the `embody-`prefixed rules overlay; audio out through the daemon HTTP media route | none (tee socket, feeds, spools, daemon HTTP) |
+| `agent embody` (+ `start`/`stop`/`restart`/`status`) | the [embodiment layer](#the-embodiment-layer--agent-embody): ears + a mouth on one lobes `/v1/realtime` duplex session, a streaming cognition loop, and a closed five-tool action set (`goto`, `run_behavior`, `create_rule` act; `speak`/`harmonics` are PROPOSALS the interjection policy governs). The voice belongs to the realtime floor. Runs beside the runtime; enabling or disabling it changes nothing about how the robot behaves alone | the runtime feed **or** the MQTT bus, plus mic audio off the runtime's audio tee | the intents spool + the `embody-`prefixed rules overlay; audio out through the daemon HTTP media route | none (tee socket, feeds, spools, daemon HTTP) |
 
 `behavior` (above, under [Idle presence](#idle-presence)) is the deterministic
 50 Hz engine `agent` attaches to. See [The symbolic
@@ -3276,6 +3653,20 @@ What is honestly **not** delivered, so you do not go looking for it:
   clip→worker-model leg were not exercised live. The precise boundary is in
   [What is proven live — and what is
   not](#what-is-proven-live--and-what-is-not); do not round it up.
+- **The two-tempo split has not been judged from the room.** Nested windows,
+  cognition scopes, the interjection policy, chunked cancellable speech, the
+  measured said/unsaid split and structured perception snapshots are all
+  proven by the offline suite and one gateway probe — no live acceptance run
+  has happened. Two pieces of it *cannot* pass yet and are recorded blocked,
+  not rounded up: per-utterance arming and the conversation-item channel both
+  wait on agentculture/lobes-cli#170, so today the room is still answered
+  aloud and the server's history still overstates after an interruption. See
+  [the two-tempo arc: not yet measured
+  live](#the-two-tempo-arc-not-yet-measured-live).
+- **Interjection ships with no operator surface.** The policy, the event
+  family and the default-OFF state are all real and enforced in configuration,
+  but there is no CLI flag and no environment variable that turns interjection
+  on in this release — see [interjection](#interjection--when-the-background-mind-wants-to-say-something-now).
 - **The layer's `thinking` block carries no model reasoning.**
   `enable_thinking` is off by design (it costs 9–18 s to first output), so the
   block carries cues, reply text, tool calls and results only. The seam is

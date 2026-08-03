@@ -79,10 +79,12 @@ level         what it permits
 An interjection **never opens the attention window**, at either level. This
 mirrors, exactly, the extend-never-open asymmetry
 :meth:`reachy.embody.attention.AttentionGate.note_spoken` already carries, and
-the reason is the same and is worth restating rather than re-deriving: the
-duplex session is armed once and the SERVER answers every committed utterance
-out loud, so the robot's own voice fires ``note_spoken`` for replies to chatter
-the gate has just refused. A voice that could open attention would be a robot
+the reason is the same and is worth restating rather than re-deriving: against
+the gateway deployed today the duplex session is armed once and the SERVER
+answers every committed utterance out loud (per-utterance arming is wired and
+fails closed — see that module's docstring), so the robot's own voice fires
+``note_spoken`` for replies to chatter the gate has just refused. A voice that
+could open attention would be a robot
 waking itself up — ``reachy/speech/engagement.py``'s one-way-ratchet defect
 (199 correct drops, 39 accepts, *all wrong*) arriving through a door the
 runtime never had. An interjection is the layer speaking uninvited, which is

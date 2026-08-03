@@ -952,9 +952,10 @@ class _CueReader:
     runtime a deaf layer. Daemon, so a blocked read can never hold up
     interpreter exit.
 
-    The line is mapped through
-    :func:`~reachy.embody.cues.classified_cues_for_line`, not the bare
-    ``cues_for_line``, so each cue reaches the engine carrying the #143 class
+    The line is parsed by :func:`~reachy.embody.cues.parse_runtime_line` and
+    the resulting event mapped through
+    :func:`~reachy.embody.cues.classified_cues_for_runtime_event`, not the bare
+    ``cues_for_runtime_event``, so each cue reaches the engine carrying the #143 class
     its runtime event decided: a rule FIRE is an ALERT and triggers a turn,
     everything else parks. Erasing the class here is precisely the defect that
     turned 187 cues into 23 turns — the mapper always knew which was which.
