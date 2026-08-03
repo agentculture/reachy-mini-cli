@@ -768,7 +768,8 @@ def test_response_hold_before_done_withholds_done_until_released_and_pings_meanw
         while event[1] == wire.OPCODE_PING:
             event = client.read_frame()
         decoded = wire.decode_event(event[2])
-        assert decoded is not None and decoded["type"] == "response.done"
+        assert decoded is not None
+        assert decoded["type"] == "response.done"
         client.close()
 
     assert server.ping_sent_count >= 2
@@ -936,7 +937,8 @@ def test_reject_items_answers_each_item_with_a_named_error_event() -> None:
 
     assert error["type"] == "error"
     assert error["code"] == "item_rejected"
-    assert server.rejected_items and server.context_items == []
+    assert server.rejected_items
+    assert server.context_items == []
 
 
 def test_received_event_types_records_every_inbound_event_in_order() -> None:
