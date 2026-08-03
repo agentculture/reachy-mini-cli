@@ -736,14 +736,24 @@ def test_ac4_the_artifact_renders_through_the_one_cue_vocabulary() -> None:
 
 
 def test_the_two_new_families_have_exactly_one_phrasing_each() -> None:
-    """Equal facts render equal text, which is what makes coalescing correct."""
-    assert runtime_cues.interjection_cue("hello", "worker") == runtime_cues.interjection_cue(
-        "hello", "worker"
-    )
+    """Equal facts render equal text, which is what makes coalescing correct.
+
+    Pinned against the LITERAL rendering rather than against a second call to
+    the same function. ``f(x) == f(x)`` is a self-comparison — it holds for any
+    pure function, so it would survive a silent rewording, and rewording is
+    precisely what breaks coalescing: the park keys on the cue TEXT, so two
+    renderings of one fact must be byte-identical across the process. Naming
+    the string is what makes a wording change fail here.
+    """
+    assert runtime_cues.interjection_cue("hello", "worker") == 'worker suggests saying: "hello"'
+    assert runtime_cues.wanted_to_say_cue("x") == 'I was interrupted before saying: "x"'
+
+    # ...and DIFFERENT facts must not collide, or coalescing would merge two
+    # separate events into one count. The source is part of the fact (two
+    # sources proposing the same sentence are two proposals, not one).
     assert runtime_cues.interjection_cue("hello", "worker") != runtime_cues.interjection_cue(
         "hello", "mesh-peer"
     )
-    assert runtime_cues.wanted_to_say_cue("x") == runtime_cues.wanted_to_say_cue("x")
     assert runtime_cues.wanted_to_say_cue("x") != runtime_cues.wanted_to_say_cue("y")
 
 
