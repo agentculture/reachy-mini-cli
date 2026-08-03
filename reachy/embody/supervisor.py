@@ -121,6 +121,7 @@ def build_run_command(
     await_timeout: float = 1.0,
     turn_interval: float = DEFAULT_TURN_INTERVAL,
     mute_during_playback: bool = False,
+    attention_window: float | None = None,
 ) -> list[str]:
     """The argv the background process runs: ``python -m reachy agent embody``.
 
@@ -135,6 +136,18 @@ def build_run_command(
     background process's stdout/stderr already go to :func:`log_file`, so
     piping a JSONL export feed there would bury it in the log rather than
     serve it to a live consumer).
+
+    *attention_window* (issue #150) is forwarded only when explicitly given —
+    ``None`` means the operator did not pass ``--attention-window``, and
+    omitting the flag here (rather than baking in a resolved value) lets the
+    SPAWNED process resolve its own ``REACHY_EMBODY_ATTENTION_WINDOW`` from
+    ITS environment (inherited from this one via ordinary ``subprocess``
+    env-inheritance, exactly like every other unset env-backed flag in this
+    group) or the shipped default, at its own composition time. ``0`` is a
+    legitimate, meaningfully different value from "not given" (name-only-
+    forever — see :func:`reachy.embody.engine.resolve_attention_window_s`),
+    so this checks identity against ``None`` rather than truthiness — the
+    same hazard ``mute_during_playback``'s bare boolean does not have.
     """
     cmd = [
         sys.executable,
@@ -155,6 +168,8 @@ def build_run_command(
         cmd += ["--spool-dir", str(spool_dir)]
     if mute_during_playback:
         cmd.append("--mute-during-playback")
+    if attention_window is not None:
+        cmd += ["--attention-window", str(attention_window)]
     return cmd
 
 
@@ -166,6 +181,7 @@ def start(
     await_timeout: float = 1.0,
     turn_interval: float = DEFAULT_TURN_INTERVAL,
     mute_during_playback: bool = False,
+    attention_window: float | None = None,
 ) -> dict[str, object]:
     """Start the embodiment layer in the background (idempotent).
 
@@ -189,6 +205,7 @@ def start(
         await_timeout=await_timeout,
         turn_interval=turn_interval,
         mute_during_playback=mute_during_playback,
+        attention_window=attention_window,
     )
     # clear_pid_on_exit: a layer that dies in the grace window (a bad flag, an
     # unreadable --feed path) must not leave a pid file behind for status/stop

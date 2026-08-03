@@ -33,28 +33,39 @@ import copy
 import dataclasses
 import inspect
 import json
+import logging
 import os
 from pathlib import Path
 
 import pytest
 
 from reachy.behavior.goto_intent import GOTO
+from reachy.behavior.rules import MAX_SAY_CHARS
 from reachy.embody import engine as engine_mod
 from reachy.embody.cues import CueClass
 from reachy.embody.engine import (
     DROP_REASONS,
+    ENV_ATTENTION_WINDOW_S,
     ENV_SENSES_MODEL,
     ENV_WORKER_MODEL,
     REASON_EMPTY_INPUT,
     REASON_ENDPOINT_UNREACHABLE,
     REASON_INPUT_QUEUE_FULL,
     REASON_STREAM_IDLE,
+    REASON_SUMMARY_STALE,
+    REASON_SUMMARY_TOO_LONG,
     REASON_TOOL_ROUNDS_EXHAUSTED,
     ROLE_SENSES,
     ROLE_WORKER,
+    STALE_SUMMARY_MARKER,
     EmbodyModels,
     EmbodyTurnEngine,
     first_emoji,
+    resolve_attention_window_s,
+)
+from reachy.embody.interjection import (
+    DEFAULT_WANTED_TO_SAY_EXPIRY_TURNS,
+    REFUSAL_WANTED_TO_SAY_TOO_LONG,
 )
 from reachy.embody.tools import CREATE_RULE, REFUSAL_RULE_NAMESPACE, SPEAK, EmbodyToolRegistry
 from reachy.export.exporter import ExportHook
@@ -410,6 +421,64 @@ def test_resolving_and_running_never_mutate_the_environment(monkeypatch) -> None
     assert turn.models == ["qwen-on-thor", ROLE_SENSES]
 
 
+# =========================================================================== #
+# issue #150 — the attention window is an operator knob, resolved the same   #
+# way the model names are: explicit argument, then process env, then default #
+# =========================================================================== #
+
+
+def test_attention_window_default_matches_the_documented_constant() -> None:
+    assert resolve_attention_window_s(env={}) == engine_mod.DEFAULT_ATTENTION_WINDOW_S
+
+
+def test_attention_window_resolves_from_process_env_only() -> None:
+    resolved = resolve_attention_window_s(env={ENV_ATTENTION_WINDOW_S: "10"})
+    assert resolved == 10.0
+
+
+def test_an_explicit_attention_window_wins_over_the_environment() -> None:
+    resolved = resolve_attention_window_s(5.0, env={ENV_ATTENTION_WINDOW_S: "10"})
+    assert resolved == 5.0
+
+
+def test_an_explicit_zero_attention_window_is_not_treated_as_unset() -> None:
+    """The falsy-zero hazard: an ``or`` chain would read 0.0 as "not given".
+
+    Unlike :meth:`EmbodyModels.resolve`'s string fields (where an empty
+    string and "unset" are the same thing), ``0`` is a legitimate,
+    meaningfully different value here — name-only-forever, the same
+    convention ``Limits.min_alert_interval_s`` already uses for ``0``. This
+    pins that :func:`resolve_attention_window_s` checks *explicit* by
+    identity against ``None``, not by truthiness.
+    """
+    resolved = resolve_attention_window_s(0.0, env={ENV_ATTENTION_WINDOW_S: "10"})
+    assert resolved == 0.0
+
+
+def test_attention_window_env_value_of_zero_is_also_honoured() -> None:
+    resolved = resolve_attention_window_s(env={ENV_ATTENTION_WINDOW_S: "0"})
+    assert resolved == 0.0
+
+
+def test_a_non_numeric_attention_window_env_value_degrades_to_the_default(caplog) -> None:
+    """Mirrors ``reachy.embody.media._env_int``: never raise, log and fall back."""
+    with caplog.at_level("WARNING"):
+        resolved = resolve_attention_window_s(env={ENV_ATTENTION_WINDOW_S: "not-a-number"})
+    assert resolved == engine_mod.DEFAULT_ATTENTION_WINDOW_S
+    assert "not-a-number" in caplog.text
+
+
+def test_resolving_the_attention_window_never_mutates_the_environment(monkeypatch) -> None:
+    """Same guarantee as the model resolution: no global mutation, no file I/O."""
+    monkeypatch.setenv(ENV_ATTENTION_WINDOW_S, "12")
+    before = dict(os.environ)
+
+    resolved = resolve_attention_window_s()
+
+    assert dict(os.environ) == before
+    assert resolved == 12.0
+
+
 def test_the_engine_reads_no_file_and_writes_no_environment_variable() -> None:
     """AST proof: process-scoped env only — no ``environment.d``, no ``os.environ[...] =``."""
     source = Path(engine_mod.__file__).read_text(encoding="utf-8")
@@ -710,7 +779,7 @@ def test_a_spoken_reply_is_exported_as_a_message_block() -> None:
 
 def test_history_is_bounded() -> None:
     turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
-    engine = _build(turn_fn=turn, history_maxlen=2)
+    engine = _build(turn_fn=turn, history_maxlen=2, senses_history_maxlen=2)
     for index in range(5):
         engine.submit_utterance(f"turn {index}")
         engine.run_turn()
@@ -883,11 +952,14 @@ def test_limits_defaults_match_the_documented_module_constants() -> None:
     assert limits.idle_timeout_s == engine_mod.DEFAULT_IDLE_TIMEOUT_S
     assert limits.max_tool_rounds == engine_mod.DEFAULT_MAX_TOOL_ROUNDS
     assert limits.history_maxlen == engine_mod.DEFAULT_HISTORY_MAXLEN
+    assert limits.senses_history_maxlen == engine_mod.DEFAULT_SENSES_HISTORY_MAXLEN
+    assert limits.summary_max_chars == engine_mod.DEFAULT_SUMMARY_MAX_CHARS
     assert limits.max_pending == engine_mod.DEFAULT_MAX_PENDING
     assert limits.max_context == engine_mod.DEFAULT_MAX_CONTEXT
     assert limits.min_alert_interval_s == engine_mod.DEFAULT_MIN_ALERT_INTERVAL_S
     assert limits.spoken_maxlen == engine_mod.DEFAULT_SPOKEN_MAXLEN
     assert limits.turn_interval == engine_mod.DEFAULT_TURN_INTERVAL
+    assert limits.attention_window_s == engine_mod.DEFAULT_ATTENTION_WINDOW_S
 
 
 def test_limits_is_frozen() -> None:
@@ -995,3 +1067,384 @@ def test_ask_forwards_multimodal_content_verbatim_no_branching() -> None:
     sent_messages = server.requests[0]["messages"]
     user_message = next(m for m in sent_messages if m["role"] == "user")
     assert user_message["content"] == content
+
+
+# =========================================================================== #
+# issue #154 decision c30 — nested windows onto ONE history + Qwen's summary  #
+# (spec claims c3/c45, honesty h2/h30 — task t4)                              #
+# =========================================================================== #
+#
+# There is ONE conversation history. Qwen (the worker lane, run_turn) sees the
+# last n=60 turns verbatim; Gemma (the senses lane, ask()) sees the last m=20
+# turns — a STRICT SUFFIX of the SAME deque, never a second, independently
+# maintained one — plus a Qwen-maintained summary of everything older. This
+# task builds the plumbing and the staleness marker; task t12 builds the
+# actual summary PRODUCER (the LLM call that writes it).
+
+
+def test_construction_refuses_a_senses_window_wider_than_the_worker_window() -> None:
+    """m<=n is refused fail-closed at construction, never silently clamped."""
+    with pytest.raises(ValueError):
+        engine_mod.Limits(history_maxlen=10, senses_history_maxlen=11)
+
+
+def test_an_equal_window_is_allowed_the_bound_is_m_lte_n_not_m_lt_n() -> None:
+    limits = engine_mod.Limits(history_maxlen=10, senses_history_maxlen=10)
+    assert limits.senses_history_maxlen == limits.history_maxlen == 10
+
+
+def test_the_shipped_defaults_are_m20_nested_in_n60() -> None:
+    """Decision c30, sized against the t1 media measurement (401 vs 2399 tokens)."""
+    limits = engine_mod.Limits()
+    assert limits.senses_history_maxlen == engine_mod.DEFAULT_SENSES_HISTORY_MAXLEN == 20
+    assert limits.history_maxlen == engine_mod.DEFAULT_HISTORY_MAXLEN == 60
+
+
+def test_gemmas_window_is_a_strict_suffix_of_qwens_over_one_shared_history() -> None:
+    """ONE deque, not two: Gemma's window is exactly the tail of the worker's own."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, history_maxlen=5, senses_history_maxlen=3)
+    for index in range(8):
+        engine.submit_utterance(f"turn {index}")
+        engine.run_turn()
+    worker_user_texts = [m["content"] for m in turn.last_messages() if m["role"] == "user"]
+
+    engine.ask("what's going on?")
+    senses_user_texts = [m["content"] for m in turn.last_messages() if m["role"] == "user"]
+
+    # The worker's own last call already shows its full n-turn window ending
+    # in the turn it is currently building; Gemma's window (minus the fresh
+    # prompt) is exactly the tail 3 of that same sequence.
+    assert senses_user_texts[:-1] == worker_user_texts[-3:]
+    assert senses_user_texts[-1] == "what's going on?"
+
+
+def test_gemmas_context_stays_bounded_over_100_plus_turns() -> None:
+    """Honesty h2: a long conversation does not grow Gemma's per-call context."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn, history_maxlen=60, senses_history_maxlen=20)
+    for index in range(60):
+        engine.submit_utterance(f"turn {index}")
+        engine.run_turn()
+    engine.ask("what's up?")
+    count_after_60_turns = len(turn.last_messages())
+
+    for index in range(60, 160):
+        engine.submit_utterance(f"turn {index}")
+        engine.run_turn()
+    engine.ask("what's up?")
+    count_after_160_turns = len(turn.last_messages())
+
+    assert count_after_60_turns == count_after_160_turns
+    # m history turns x 2 messages (user + assistant) + the fresh prompt; no
+    # summary was ever set, so there is no extra system message.
+    assert count_after_160_turns == 2 * 20 + 1
+
+
+def test_the_worker_lane_never_sees_the_summary_only_gemma_does() -> None:
+    """Never regenerate the summary per lane (design note): Qwen already has the turns."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.update_summary("earlier: the kitchen was quiet.")
+    engine.submit_utterance("hello again")
+    engine.run_turn()
+    worker_messages = turn.last_messages()
+    assert not any("kitchen was quiet" in str(m.get("content", "")) for m in worker_messages)
+
+    engine.ask("what's up?")
+    senses_messages = turn.last_messages()
+    assert any("kitchen was quiet" in str(m.get("content", "")) for m in senses_messages)
+
+
+def test_a_down_worker_yields_a_stale_summary_marker_and_a_named_drop(caplog) -> None:
+    """c45/h30: never a silent narrowing of Gemma's memory to just the m turns."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.submit_utterance("earlier turn")
+    engine.run_turn()
+
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        engine.mark_summary_stale("worker llm unreachable")
+    assert engine.summary_stale_count == 1
+    assert REASON_SUMMARY_STALE in caplog.text
+
+    engine.ask("what's up?")
+    senses_messages = turn.last_messages()
+    system_text = " ".join(
+        str(m.get("content", "")) for m in senses_messages if m["role"] == "system"
+    )
+    assert STALE_SUMMARY_MARKER in system_text
+    # The m-turn window itself is untouched: still there beside the marker,
+    # never narrowed away by the failed summary maintenance pass.
+    assert any("earlier turn" in str(m.get("content", "")) for m in senses_messages)
+
+
+def test_the_stale_marker_clears_on_the_next_successful_summary_update() -> None:
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+    engine.mark_summary_stale("worker unreachable")
+    assert engine.summary_is_stale is True
+
+    assert engine.update_summary("earlier: the room was quiet.") is True
+    assert engine.summary_is_stale is False
+
+    engine.ask("what's up?")
+    senses_messages = turn.last_messages()
+    system_text = " ".join(
+        str(m.get("content", "")) for m in senses_messages if m["role"] == "system"
+    )
+    assert STALE_SUMMARY_MARKER not in system_text
+    assert "the room was quiet" in system_text
+
+
+def test_an_overlong_summary_is_refused_not_truncated(caplog) -> None:
+    """The summary itself is bounded (design note); a caller cannot silently exceed it."""
+    engine = _build(limits=engine_mod.Limits(summary_max_chars=10))
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        accepted = engine.update_summary("this summary is definitely longer than ten chars")
+    assert accepted is False
+    assert REASON_SUMMARY_TOO_LONG in caplog.text
+    assert engine.summary_is_stale is False
+
+
+def test_an_empty_summary_update_is_a_named_drop_not_a_silent_clear(caplog) -> None:
+    engine = _build()
+    with caplog.at_level("INFO", logger="reachy.sense"):
+        accepted = engine.update_summary("   ")
+    assert accepted is False
+    assert REASON_EMPTY_INPUT in caplog.text
+
+
+def test_summary_reasons_are_in_the_shared_drop_vocabulary() -> None:
+    assert REASON_SUMMARY_STALE in DROP_REASONS
+    assert REASON_SUMMARY_TOO_LONG in DROP_REASONS
+
+
+# =========================================================================== #
+# t7 — the said/unsaid record and the wanted-to-say artifact                   #
+# (spec claims c34/c39/c41, honesty h22/h24/h26)                              #
+# =========================================================================== #
+
+_CUT_TEXT = "one two three four five six"
+_CUT_SAID = "one two"
+_CUT_UNSAID = "three four five six"
+
+
+@dataclasses.dataclass(frozen=True)
+class _StubSplit:
+    """The four fields the engine reads — the duck type, without the wire.
+
+    The engine takes the split as a structural type on purpose (it must not
+    import the WebSocket client to record what its own mouth did), so most of
+    these tests hand it this stub; the one test about the JOIN hands it the
+    real :class:`~reachy.speech.realtime_duplex.SpokenSplit`.
+    """
+
+    response_id: str
+    text: str
+    said: str
+    unsaid: str
+
+
+def _split(
+    said: str = _CUT_SAID,
+    unsaid: str = _CUT_UNSAID,
+    *,
+    text: str = _CUT_TEXT,
+    response_id: str = "resp_cut",
+) -> _StubSplit:
+    return _StubSplit(response_id=response_id, text=text, said=said, unsaid=unsaid)
+
+
+def _last_user(turn: ScriptedTurn) -> str:
+    return turn.last_messages()[-1]["content"]
+
+
+def test_t7_a_cut_reply_records_only_the_measured_said_portion_as_spoken() -> None:
+    """c34: the mind learns exactly what the room got, never the whole reply."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    engine.note_interrupted_reply(_split())
+    engine.submit_utterance("sorry, go on")
+    engine.run_turn()
+
+    said_section = _last_user(turn)
+    assert f'"{_CUT_SAID}"' in said_section
+    assert f'"{_CUT_TEXT}"' not in said_section, "the unspoken remainder was recorded as said"
+
+
+def test_t7_the_unsaid_remainder_is_readable_by_the_next_turn() -> None:
+    """h22: the remainder is kept so the mind can decide whether it still matters."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    artifact = engine.note_interrupted_reply(_split())
+    assert artifact is not None
+    engine.submit_utterance("what were you saying?")
+    engine.run_turn()
+
+    assert artifact.render() in _last_user(turn)
+    assert _CUT_UNSAID in _last_user(turn)
+
+
+def test_t7_the_remainder_is_attributed_to_the_interrupted_response() -> None:
+    engine = _build()
+    artifact = engine.note_interrupted_reply(_split())
+
+    assert artifact is not None
+    assert artifact.response_id == "resp_cut"
+    assert artifact.text == _CUT_UNSAID
+    assert engine.wanted_to_say == (artifact,)
+
+
+def test_t7_the_remainder_never_triggers_a_turn() -> None:
+    """The robot never wakes itself up to finish an old sentence (c43)."""
+    engine = _build()
+    engine.note_interrupted_reply(_split())
+
+    assert engine.pending == 0
+    assert engine.parked == 1
+    assert engine.run_turn() is False
+
+
+def test_t7_a_cut_after_the_reply_was_recorded_whole_corrects_the_record() -> None:
+    """The ordering phase 1 actually produces: ``response.done`` first, cut second.
+
+    The wire delivers a reply seconds ahead of the speaker, so the human who
+    interjects over the tail does it long after ``on_response`` fired. The
+    record must end up describing the room, not the wire.
+    """
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    engine.note_spoken(_CUT_TEXT)
+    engine.note_interrupted_reply(_split())
+    engine.submit_utterance("sorry, carry on")
+    engine.run_turn()
+
+    content = _last_user(turn)
+    assert f'"{_CUT_SAID}"' in content
+    assert f'"{_CUT_TEXT}"' not in content
+    assert content.count("I have already said out loud") == 1
+
+
+def test_t7_a_reply_cut_before_a_word_was_heard_is_never_recorded_as_spoken() -> None:
+    """Nothing measured means nothing said — the donor's own load-bearing guard."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    artifact = engine.note_interrupted_reply(_split(said="", unsaid=_CUT_TEXT))
+    engine.submit_utterance("hello?")
+    engine.run_turn()
+
+    assert artifact is not None
+    assert artifact.text == _CUT_TEXT
+    assert "I have already said out loud" not in _last_user(turn)
+    assert artifact.render() in _last_user(turn)
+
+
+def test_t7_an_over_long_remainder_is_a_named_drop_and_the_said_half_still_stands(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Refused, never truncated (t5's rule) — and never silently."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        artifact = engine.note_interrupted_reply(
+            _split(said="here we go", unsaid="a" * (MAX_SAY_CHARS + 1))
+        )
+
+    assert artifact is None
+    assert REFUSAL_WANTED_TO_SAY_TOO_LONG in caplog.text
+    engine.submit_utterance("go on")
+    engine.run_turn()
+    assert '"here we go"' in _last_user(turn)
+
+
+def test_t7_the_canonical_record_of_remainders_is_bounded_and_expires() -> None:
+    """c43: bounded and expiring, so a stale sentence cannot shape a later turn."""
+    engine = _build(wanted_to_say_maxlen=2)
+    for index in range(4):
+        engine.note_interrupted_reply(_split(unsaid=f"remainder {index}"))
+
+    assert len(engine.wanted_to_say) == 2
+    assert [artifact.text for artifact in engine.wanted_to_say] == ["remainder 2", "remainder 3"]
+
+    for _ in range(DEFAULT_WANTED_TO_SAY_EXPIRY_TURNS + 1):
+        engine.submit_utterance("keep talking")
+        engine.run_turn()
+    assert engine.wanted_to_say == ()
+
+
+def test_t7_the_layers_record_makes_no_claim_the_server_matches() -> None:
+    """h24: the divergence is knowing and bounded, and the docstring says so."""
+    doc = EmbodyTurnEngine.note_interrupted_reply.__doc__ or ""
+
+    assert "server" in doc.lower()
+    assert "overstate" in doc.lower()
+    engine = _build()
+    engine.note_interrupted_reply(_split())
+    # Nothing in the canonical record asserts anything about the floor: the
+    # said half is the measured prefix and the unsaid half is an artifact.
+    assert [artifact.text for artifact in engine.wanted_to_say] == [_CUT_UNSAID]
+    assert engine.replies_cut == 1
+
+
+def test_t7_the_engine_consumes_the_real_duplex_split_type() -> None:
+    """The join, unmocked: the wire's own dataclass satisfies the engine's seam."""
+    from reachy.speech.realtime_duplex import PlaybackProgress, split_spoken
+
+    engine = _build()
+    split = split_spoken(
+        _CUT_TEXT,
+        PlaybackProgress(
+            response_id="resp_cut",
+            queued_bytes=48,
+            played_bytes=16,
+            in_flight_bytes=0,
+            skipped_bytes=32,
+            cancelled=True,
+            total_bytes=48,
+        ),
+    )
+
+    assert (split.said, split.unsaid) == (_CUT_SAID, _CUT_UNSAID)
+    artifact = engine.note_interrupted_reply(split)
+    assert artifact is not None
+    assert artifact.response_id == "resp_cut"
+
+
+def test_t7_a_reply_that_played_whole_is_recorded_exactly_as_before() -> None:
+    """No cut, no artifact: the ordinary path is untouched."""
+    engine = _build()
+    artifact = engine.note_interrupted_reply(_split(said=_CUT_TEXT, unsaid=""))
+
+    assert artifact is None
+    assert engine.wanted_to_say == ()
+    assert engine.parked == 0
+
+
+def test_t7_a_cut_that_heard_nothing_removes_the_record_it_had_already_made() -> None:
+    """The correction's other half: cut before a word landed, after ``response.done``."""
+    turn = ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    engine = _build(turn_fn=turn)
+
+    engine.note_spoken(_CUT_TEXT)
+    artifact = engine.note_interrupted_reply(_split(said="", unsaid=_CUT_TEXT))
+    engine.submit_utterance("hello?")
+    engine.run_turn()
+
+    assert artifact is not None
+    assert artifact.text == _CUT_TEXT
+    assert "I have already said out loud" not in _last_user(turn)
+    assert artifact.render() in _last_user(turn)
+
+
+def test_t7_a_cut_reply_with_no_text_at_all_is_counted_and_keeps_nothing() -> None:
+    """A reply whose text never arrived: named and counted, never invented."""
+    engine = _build()
+
+    assert engine.note_interrupted_reply(_split(said="", unsaid="", text="")) is None
+    assert (engine.replies_cut, engine.parked, engine.wanted_to_say) == (1, 0, ())

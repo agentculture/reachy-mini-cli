@@ -7,8 +7,9 @@ authoring contract; ``tests/test_embody_redteam.py`` pins the refusals and the
 no-shell property.
 
 Nothing here needs a robot, an engine, a network, or an LLM: the intents spool
-is a directory, the rules overlay is a file, and the voice is two injected
-callables.
+is a directory, the rules overlay is a file, and the voice is two PROPOSALS
+governed by an injected policy (issue #155 task t12 —
+``tests/test_embody_governed_voice.py`` pins that half in full).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from reachy.behavior import rules as rules_mod
 from reachy.behavior.goto_intent import GOTO
 from reachy.behavior.intents import INTENT_NAMESPACE, RUN_BEHAVIOR
 from reachy.embody import tools as embody_tools
+from reachy.embody.interjection import Authorization, InterjectionLimits, InterjectionPolicy
 from reachy.embody.tools import (
     ACTION_SET,
     CREATE_RULE,
@@ -31,6 +33,7 @@ from reachy.embody.tools import (
     RULE_ID_PREFIX,
     SANCTIONED_SURFACES,
     SPEAK,
+    TOOL_SOURCE,
     EmbodyToolRegistry,
     list_embody_rules,
 )
@@ -82,14 +85,26 @@ def overlay(state_dir: Path) -> Path:
 
 
 class RecordingSeam:
-    """A voice seam that records instead of speaking."""
+    """An interjection route that records the PROPOSALS handed to it.
+
+    Since task t12 a voice tool proposes rather than plays: this receives an
+    :class:`~reachy.embody.interjection.Interjection`, never PCM, and there is
+    no audio seam anywhere in this suite to record instead.
+    """
 
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def __call__(self, text: str) -> str:
-        self.calls.append(text)
-        return "played"
+    def __call__(self, interjection) -> str:
+        self.calls.append(interjection.text)
+        return "proposed"
+
+
+def authorized_policy(source: str = TOOL_SOURCE):
+    """A policy an operator has deliberately opened for *source*."""
+    return InterjectionPolicy(
+        limits=InterjectionLimits(authorization=Authorization.PROACTIVE, sources=(source,))
+    )
 
 
 class RecordingReload:
@@ -105,8 +120,8 @@ class RecordingReload:
 
 
 def build_registry(**kwargs) -> EmbodyToolRegistry:
-    kwargs.setdefault("speak", RecordingSeam())
-    kwargs.setdefault("harmonics", RecordingSeam())
+    kwargs.setdefault("interjection", authorized_policy())
+    kwargs.setdefault("on_interjection", RecordingSeam())
     kwargs.setdefault("reload_seam", RecordingReload())
     kwargs.setdefault("await_timeout", 0.0)
     return EmbodyToolRegistry(**kwargs)
@@ -250,19 +265,21 @@ def test_a_confirmed_engine_result_is_reported_verbatim(state_dir: Path, monkeyp
 # --------------------------------------------------------------------------- #
 
 
-def test_speak_and_harmonics_call_only_their_injected_seams(state_dir: Path) -> None:
-    speak, harmonics = RecordingSeam(), RecordingSeam()
-    registry = build_registry(speak=speak, harmonics=harmonics)
+def test_speak_and_harmonics_reach_only_the_injected_interjection_route(
+    state_dir: Path,
+) -> None:
+    """Both voice tools PROPOSE through the one route; neither plays anything."""
+    route = RecordingSeam()
+    registry = build_registry(on_interjection=route)
 
     assert content(registry.dispatch(SPEAK, json.dumps({"text": "hello"})))["ok"] is True
     assert content(registry.dispatch(HARMONICS, json.dumps({"text": "la la"})))["ok"] is True
 
-    assert speak.calls == ["hello"]
-    assert harmonics.calls == ["la la"]
+    assert route.calls == ["hello", "la la"]
 
 
-def test_a_missing_voice_seam_is_a_named_refusal_not_a_crash(state_dir: Path) -> None:
-    registry = EmbodyToolRegistry(speak=None, harmonics=None, reload_seam=RecordingReload())
+def test_a_missing_interjection_route_is_a_named_refusal_not_a_crash(state_dir: Path) -> None:
+    registry = EmbodyToolRegistry(on_interjection=None, reload_seam=RecordingReload())
     body = content(registry.dispatch(SPEAK, json.dumps({"text": "hello"})))
     assert body["ok"] is False
     assert body["refusal"] == embody_tools.REFUSAL_NO_VOICE
@@ -429,7 +446,7 @@ def test_rule_authoring_submits_a_reload_so_the_change_goes_live(overlay: Path) 
 
 def test_the_default_reload_seam_writes_the_real_reload_spool(overlay: Path) -> None:
     """No injected seam: the write lands in the same spool ``behavior reload`` uses."""
-    registry = EmbodyToolRegistry(speak=RecordingSeam(), await_timeout=0.0)
+    registry = EmbodyToolRegistry(on_interjection=RecordingSeam(), await_timeout=0.0)
     assert content(registry.dispatch(CREATE_RULE, json.dumps(a_rule())))["ok"] is True
 
     commands = sorted((overlay.parent / "reload" / "commands").iterdir())

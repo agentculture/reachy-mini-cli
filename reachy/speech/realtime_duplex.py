@@ -43,13 +43,232 @@ format contract below.
 **``play`` — the mouth.** Called as ``play(pcm16_bytes, samplerate=...)`` with
 raw **little-endian PCM16 mono bytes** at :data:`DEFAULT_OUTPUT_SAMPLE_RATE`
 (24000 Hz — the gateway's TTS rate, measured in the t1 probe: 4800-byte deltas
-= 2400 samples each, matching lobes-cli's ``TTS_SAMPLE_RATE``). It is called
+= 2400 samples each, matching lobes-cli's ``TTS_SAMPLE_RATE``). One call is
+ONE CHUNK of a reply, not a whole reply (see the next section). It is called
 ONLY on a dedicated playback thread, never on the session worker, because the
 robot sink's daemon-HTTP route is an upload-then-play round trip lasting
 seconds — charging that to the socket pump would stop the ears, starve the
 keepalive, and get the session dropped. A raise, or a wedged sink, is a named
 drop; it never touches the session. ``play=None`` is legal (the layer becomes
 mute) and says so once, by name.
+
+--------------------------------------------------------------------------
+Playback is CHUNKED, so it is CANCELLABLE (issue #151 item 3, spec c12)
+--------------------------------------------------------------------------
+This client used to accumulate every ``response.audio.delta`` and hand the
+whole reply to ``play`` once, on ``response.done``. That made interruption
+impossible in the one case that matters: the robot's sink has no stop handle
+and no "what is left to play" — on the robot profile ``play`` is a daemon-HTTP
+upload-then-play round trip, and once the daemon owns the clip the room is
+going to hear all of it. So a human interjecting over an ALREADY-AUDIBLE reply
+could not cut it; the live journal shows exactly that, an interruption landing
+as ``response interrupted chars=0 audio=0B`` while the speaker talked on.
+
+The fix needs nothing new from the daemon or the gateway. A reply is played as
+SEVERAL chunks with the queue between them, so **"stop talking" becomes "do
+not send the next chunk"** — an impossible problem (cancel audio in flight)
+turned into a trivial one (empty a queue). Concretely:
+
+* ``_accumulate_audio`` flushes a chunk group the moment a reply has
+  :attr:`Limits.playback_chunk_bytes` of audio pending, so speech starts while
+  the reply is still arriving; ``_finish_response`` flushes the remainder;
+* :meth:`RealtimeDuplexSession.cancel_playback` (any thread, O(1), never
+  raises) bumps a GENERATION counter and drains the mouth queue. Every queued
+  chunk is skipped, every chunk of that reply still to ARRIVE is refused, and
+  the mouth re-checks the generation between chunks — so the cut lands within
+  ONE chunk boundary. A chunk already inside ``play`` cannot be recalled; that
+  is the whole cost, and it is why the chunk size is a bound rather than a
+  constant.
+* ``response.interrupted`` (the server's own barge-in) takes the same path.
+
+**Sizing is a genuine tradeoff, and the numbers here are a starting point.**
+Bigger chunks mean fewer daemon round trips and a smaller chance of an audible
+seam, but a LONGER cut latency (the room keeps hearing up to one chunk after
+the human speaks). Smaller chunks cut faster and start sooner, but pay a
+round trip per chunk and can leave an audible gap if that round trip exceeds
+the chunk's own duration. The shipped pair —
+:data:`DEFAULT_PLAYBACK_CHUNK_BYTES` (1.0 s) after a smaller
+:data:`DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES` (0.4 s, so the robot starts
+speaking sooner) — is chosen against the spec's "stops within roughly one
+chunk" and the operator's accepted "minor gap", NOT against a measurement:
+the per-chunk daemon ``/media/play`` round trip is unmeasured (plan task t1
+measures it, and may retune both values). Both are :class:`Limits` fields, so
+retuning is one number in one place and every test injects its own.
+
+**What the room actually heard is MEASURED, not assumed.**
+:class:`PlaybackProgress` (via :meth:`RealtimeDuplexSession.playback_progress`,
+and returned by :meth:`~RealtimeDuplexSession.cancel_playback`) reports, per
+reply, the bytes the sink CONFIRMED (returned from), the bytes still inside a
+``play`` call at the moment of the cut, and the bytes skipped. That is the
+authority for the said/unsaid split one level up (task t7): exact to the chunk
+boundary, estimated only INSIDE the boundary chunk. A failed ``play`` is
+counted as skipped, never as played — the room heard nothing.
+
+The reply RECORD is unchanged by any of this: :class:`Response` still carries
+every byte the server sent, because what the server said and what the room
+heard are two different facts and conflating them is the defect the said/unsaid
+split below exists to prevent. One consequence to carry forward: a reply is
+published on ``response.done``, which since t6 is no longer the same instant as
+"the last chunk left the speaker". So ``on_response`` means *the server
+finished this reply*, not *the room heard all of it* — the second question is
+:meth:`~RealtimeDuplexSession.playback_progress`'s.
+
+--------------------------------------------------------------------------
+Said and unsaid: the measured cut (issue #151, spec c34/c39/c41)
+--------------------------------------------------------------------------
+A human — meaning any external interlocutor, a peer robot or an automated
+system included — who talks over an audibly speaking robot cuts it
+mid-sentence. The mind on the other side of this client must then know
+**exactly what was actually said aloud**, because recording the whole reply as
+if it had been heard would leave it believing it answered when the room got
+half a sentence, and it would go on to reason from words nobody received.
+
+:func:`estimate_spoken_prefix` + :func:`split_spoken` produce that split, and
+:meth:`RealtimeDuplexSession.spoken_split` is where a caller asks for it. The
+arithmetic is CITED, not invented: lobes-cli's
+``lobes/realtime/_floor.py``:323 ``estimate_spoken_prefix`` already solves the
+server-side half — cut the text proportionally to the audio delivered, then
+back up to the previous word boundary — and its reasoning is the reason to
+copy it rather than improve on it: *"recording the full text as if it had been
+heard is a worse lie than recording a slightly-off prefix"*. Its caller's
+``delivered_bytes <= 0`` guard (``lobes/realtime/_conversation.py``
+``_record_interrupted_reply``) is cited too, and is load-bearing for the same
+reason it is there: the estimator answers "assume it all played" when handed
+no total, which is the exact wrong answer for a cut that landed before a byte
+existed.
+
+**What this client has that the server does not is a MEASUREMENT.** The floor
+estimates from wire delivery; :class:`PlaybackProgress` reports the bytes the
+SINK returned from. So the split is *exact to the chunk boundary and estimated
+only inside the boundary chunk* — and the chunk still inside ``play`` is
+counted as NOT said, so its words land in the remainder. That direction is
+deliberate: offering to repeat something the room half-heard is a smaller
+error than claiming a sentence nobody got.
+
+**PHASE-1 LIMITATION, recorded here rather than discovered later (spec c39).**
+Under client-side chunk playback a client-local cut is **invisible to the
+floor**: wire delivery completed at wire speed, so the server sends
+``response.done`` and appends the FULL reply to its own conversation history.
+The server's history therefore **OVERSTATES** what the room heard after any
+cut, and this client **still does not try to correct it**. Since task t10 the
+``conversation.item.create`` channel exists (see the next section), so the
+reason is no longer "there is no frame for that" — it is that a correction is a
+POLICY about the canonical history, and the canonical history belongs to the
+layer one level up (decision c27, task t11). Nothing on the cut path sends an
+item, and a test pins that. What is true, and all that is claimed, is that the
+LAYER's own record is measured at the sink and the client is the authority for
+it.
+
+**Since task t11 the layer DOES push a correction, and the divergence is
+narrower — not gone.** ``reachy/cli/_commands/agent.py``'s ``_record_cut``
+builds one through :meth:`reachy.embody.engine.EmbodyTurnEngine.
+floor_correction` and sends it here as a ``history`` item, so a gateway that
+announced the schema is TOLD what the room actually heard. It is an APPEND: the
+overstated turn the floor already wrote is still in its history, because the
+schema has no operation for editing one. And against every gateway shipping
+today — parity is parked upstream — the push is declined by :meth:`send_item`,
+named once, and the phase-1 overstatement stands exactly as described above.
+
+--------------------------------------------------------------------------
+Conversation items: the CONTEXT channel (decision c28, issue #153)
+--------------------------------------------------------------------------
+**The problem it exists for.** The mouth knew nothing the mind knew. Everything
+this client could say about the conversation was decided at connect time (the
+``system_prompt`` override) or generated by the floor from its own
+auto-accumulated history — so a cognition scope the background model produced,
+a perception snapshot, or a rolling summary of everything older had no way to
+reach the generate call that actually answers the room. Decision **c27** makes
+the LAYER the curator of the canonical conversation history; decision **c28**
+chose ``conversation.item.create`` as the per-turn channel that pushes
+projections of it to the floor, and accepted the widening of this module's
+pinned send surface that comes with it.
+
+**Two dispositions, and the distinction is the whole ask.**
+:class:`ConversationItem` is either ephemeral **context** (participates in the
+next generate call, never enters the session's history) or a curated
+**history** turn. That key is not decoration: the floor ALREADY auto-appends
+both roles (lobes-cli's ``lobes/realtime/_conversation.py``:489/523 for the
+user, :647/:680 for the assistant), so items injected beside those
+auto-appends would duplicate and drift — the two-histories failure this arc
+exists to eliminate, arriving one level down. It is filed as the constraint on
+agentculture/lobes-cli#170 item 2.
+
+**PROVISIONAL, and it fails closed.** Upstream has NOT shipped conversation-item
+parity — ``_conversation.py`` adopted ``response.create`` "for its SHAPE only",
+naming the conversation-item schema an explicitly parked follow-up — and #170
+item 2 was unanswered when this landed. So the schema
+(:func:`reachy.speech.realtime_wire.build_conversation_item_create_event`) and
+the announcement (:func:`announces_conversation_items`, reading
+``session.created``'s ``config.items == "context_and_history"``) are ONE guess
+this repo committed to, in exactly the shape task t8's
+:func:`announces_one_shot_arming` established: one pure predicate, one home,
+explicit affirmative only. **No item is ever sent to a gateway that did not
+announce support** — the attempt becomes one named, latched
+:data:`REASON_ITEMS_UNSUPPORTED` drop per session and the layer degrades to
+task t9's connect-time ``system_prompt`` context, which every gateway shipping
+today accepts. If upstream answers with a different shape, that predicate and
+that builder are the two lines that change.
+
+**Re-seed BEFORE re-arm, on every reconnect (spec claim c40).** A session close
+wipes the floor's ephemeral history (lobes ``_session.py``'s ``teardown``
+empties ``_history`` — close "releases it all, including history"), so a
+reconnect that armed first would let the gateway answer the next turn out of an
+empty history: Gemma silently reset to amnesia, with nothing in any log saying
+so. The ordering is therefore guaranteed STRUCTURALLY rather than by
+convention. The injected ``reseed`` seam is consulted inside
+``session.created`` handling and its items go out on that same worker turn,
+while the arm is only a FLAG the next pump sends — so a caller cannot
+interleave them, and re-ordering them would mean moving the arm into the event
+handler, which the offline suite catches immediately.
+
+The seam is a plain callable returning items (``() -> Sequence[ConversationItem]``);
+WHAT to re-seed — Gemma's m-window and the Qwen-maintained summary — is the
+layer's business, not this module's, exactly as ``arm_once`` knows nothing
+about which utterance deserved a reply. A raising seam is a named
+:data:`REASON_RESEED_FAILED` drop and the session arms anyway: a broken mind
+must not cost the robot its voice.
+
+**This module still validates nothing about content.** An item's text is
+carried verbatim and bounded by whoever produced it
+(:class:`reachy.embody.scope.ScopeLimits` for a cognition scope,
+``reachy.embody.engine.Limits.summary_max_chars`` for a summary) — a second
+copy of a bound is a second number to drift. What IS bounded here is this
+client's own memory: :attr:`Limits.item_maxsize` caps the caller-thread queue,
+and an overflow is named like every other one.
+
+--------------------------------------------------------------------------
+The TAIL window: a VAD tap, and nothing else (task t16)
+--------------------------------------------------------------------------
+``response.interrupted`` covers the bulk of a reply and needs nothing from
+this module beyond what t6 already wired: upstream PACES its audio delivery to
+track the playhead (lobes-cli's ``lobes/realtime/_conversation.py``,
+``delivery_pause_ms`` / ``DELIVERY_LEAD_MS = 400``) precisely so a human can
+barge in mid-reply and the floor can see it. What upstream cannot see is the
+lag this CLIENT adds after receipt: up to one chunk of accumulation
+(:data:`DEFAULT_PLAYBACK_CHUNK_BYTES`, 1.0 s) plus the daemon's
+upload-then-play round trip. That lag lands AFTER ``response.done`` — the
+floor has returned to LISTENING while the room is still hearing audio — so an
+interjection in exactly the window where a listener is most likely to object
+produces no ``response.interrupted`` at all, and the queued chunks play on.
+
+The mechanism that closes it is deliberately tiny, and it is only a mechanism:
+
+* ``on_speech_started`` fires on the worker thread for every
+  ``input_audio_buffer.speech_started`` — the server's own **VAD-verified**
+  onset, never a loudness reading taken here (spec claim c35: an energy
+  predicate is a LOCATOR, never a content filter, so a cough or a door slam
+  must not be able to cut the robot off);
+* :attr:`RealtimeDuplexSession.playback_pending` says whether a cut would
+  actually withhold anything — chunks queued and not yet taken by the mouth.
+  A chunk already inside ``play`` is not counted: it cannot be recalled, so
+  "cutting" it would withhold nothing while recording its words as unsaid.
+
+**Nothing here acts on either.** With no tap injected a ``speech_started``
+event changes nothing about playback, exactly as before — this module reaches
+no gate and forms no opinion about whose speech is worth stopping the robot
+for (see the UNGATED section below). ``reachy/cli/_commands/agent.py`` is
+where the two are joined into a policy, the same mechanism-here/policy-there
+split :meth:`~RealtimeDuplexSession.arm_once` already follows.
 
 **Audio format, stated unambiguously.** In: mono float32 in [-1, 1] (or int16,
 or PCM16 bytes). On the wire: PCM16 mono **little-endian**, base64, inside an
@@ -73,27 +292,160 @@ this module's import closure reaches either gate, and
 transitive closure, and ``sys.modules`` after a fresh import).
 
 --------------------------------------------------------------------------
-The send surface is CLOSED (honesty condition h13)
+The send surface is CLOSED (honesty h13), and widening it is a DECISION (h20)
 --------------------------------------------------------------------------
-Exactly three things ever leave this client:
+Exactly FOUR things ever leave this client:
 
 1. **session config** — which rides the connect URL's query params
-   (``?input_sample_rate=``), not a frame at all;
+   (``?input_sample_rate=``, and — since task t9 — optionally
+   ``&system_prompt=``), not a frame at all;
 2. ``input_audio_buffer.append`` — one JSON TEXT frame per mic chunk;
-3. ``response.create`` — the arming frame, once per session.
+3. ``response.create`` — the arming frame, once per session (or once per
+   admitted utterance — see the arming section);
+4. ``conversation.item.create`` — the CONTEXT channel, added by task t10 under
+   decision **c28**. See its own section below.
 
 Plus protocol-level PONG and CLOSE frames, which are RFC 6455 mechanics rather
 than session events. **No tool call ever travels over this socket.** Tool use
 rides the HTTP ``/v1/chat/completions`` lane beside it (the layer's turn
-engine, task t10); if lobes later ships socket tool-calls, adopting them is a
-new arc. Both halves are pinned by AST scan over this file **and over**
+engine); if lobes later ships socket tool-calls, adopting them is a new arc.
+Both halves are pinned by AST scan over this file **and over**
 :mod:`reachy.speech.realtime` — the PONG and CLOSE frames are emitted by the
 shared session mechanics that live there, so a scan of this file alone would
-be blind to half of what actually leaves. A third sender added later under any
+be blind to half of what actually leaves. A FIFTH sender added later under any
 name, in either file, fails the suite immediately.
 
+**The count went from three to four exactly once, on purpose.** That is worth
+stating because two other capabilities landed on this client WITHOUT touching
+it: task t9's ``system_prompt`` is a query parameter on surface item 1
+(``test_h13_the_three_frame_pin_is_unaffected_by_a_configured_system_prompt``
+proves it), and task t8's per-utterance arming REUSES ``response.create``. The
+items channel is the one genuine widening in the arc, it was decided on both
+repos (decision c28, agentculture/lobes-cli#170 item 2), and honesty condition
+h20 requires the pin and its tests to widen in the SAME change that lands the
+frame — so a reader who finds a fourth kind can always find the decision that
+took it, instead of a surface that quietly grew.
+
 --------------------------------------------------------------------------
-Arming: once per session, on ``session.created``
+Connect-time voice conventions: the ``system_prompt`` override (spec c10, h8)
+--------------------------------------------------------------------------
+**The finding.** Before this task, this client sent the realtime session no
+instructions at all, so what a listener heard was entirely the gateway's own
+default voice behaviour — this client had no way to shape its own persona,
+its reply length, or its spoken style (issue #151 item 2, issue #153).
+
+**The channel already existed; this task only adopts it.** lobes-cli's
+``lobes/realtime/_session.py``:465-540 ``parse_session_config`` accepts a
+per-session ``system_prompt`` override riding the connect config (the SAME
+query-string channel ``input_sample_rate`` already uses — see
+:func:`reachy.speech.realtime.connect_url`), and a client's own value ALWAYS
+wins over the gateway's env-level ``default_system_prompt``. So adopting it
+adds no new frame kind, only a second query parameter — see the send-surface
+section above.
+
+**Why sending a BLANK override would be actively harmful, not merely
+useless.** Chatterbox reads the reply aloud verbatim. lobes-cli's own
+``_settings.py`` ``default_system_prompt`` field comment makes the point
+explicitly, and the mechanics back it up:
+``Session.system_prompt = config.system_prompt if config.system_prompt is not
+None else DEFAULT_SYSTEM_PROMPT`` — an explicit ``""`` IS NOT ``None``, so a
+blank override is used VERBATIM instead of falling through to the gateway's
+own default, and a reply generated with no formatting guidance at all reverts
+to the model's normal WRITTEN register (markdown, bullet lists, code fences)
+— "asterisk asterisk", literal list markers, read aloud as spoken nonsense.
+This is why :func:`resolve_voice_prompt` never lets a blank string reach the
+wire: a rejected override degrades to **omitting the key entirely** (``None``
+on :func:`~reachy.speech.realtime.connect_url`'s ``system_prompt=``
+parameter), which is what lets the GATEWAY's own configured default take
+over — never a blank or broken string.
+
+**Resolution, and WHO ships :data:`DEFAULT_VOICE_PROMPT`.**
+:func:`resolve_voice_prompt` resolves an explicit argument, then
+:data:`ENV_VOICE_PROMPT` (``REACHY_EMBODY_VOICE_PROMPT``) from the PROCESS
+environment ONLY — mirroring
+:func:`reachy.embody.engine.resolve_attention_window_s`'s scoping and its
+reasoning verbatim: an operator who wants a different voice sets the env var
+in the LAYER PROCESS's own environment, never an ``environment.d`` drop-in,
+which would silently re-point :class:`~reachy.speech.realtime.RealtimeTranscriber`
+(the runtime's ears-only session, sharing this env var's owning module) too —
+except that transcriber never arms a reply and so never reads this env var or
+passes ``system_prompt`` to :func:`~reachy.speech.realtime.connect_url` at
+all.
+
+The function itself stays conservative when called bare — *default* is an
+opt-in keyword-only argument, ``None`` unless a caller asks otherwise, so a
+direct call (a test, a future script) keeps meaning exactly what it always
+did: nothing configured resolves to ``None``, an absent override is not a
+fault the way an unparseable numeric bound would be. But **the PRODUCTION
+composition root asks for a default, and that is the deliberate decision this
+task ships**: ``reachy/cli/_commands/agent.py``'s ``_compose_embody_seam``
+calls ``resolve_voice_prompt(default=DEFAULT_VOICE_PROMPT)`` and passes the
+result straight into this class's ``system_prompt=`` — so on the deployed
+robot, "nothing configured" resolves to :data:`DEFAULT_VOICE_PROMPT`, not to
+silence. A built-but-unreachable capability is indistinguishable from a
+missing one (this exact shape bit task t6's ``cancel_playback`` earlier in
+this arc), so the fix belongs at the ONE production call site, not merely in
+this module's own vocabulary.
+
+*default* only ever fills in for a **genuine absence** — *explicit* is
+``None`` AND the env key is not present at all. A REJECTED attempt (blank
+after stripping, or over :data:`MAX_VOICE_PROMPT_CHARS`) is never silently
+repaired into *default*: it resolves to ``None`` regardless, because an
+operator who tried something and got it wrong deserves the named
+:data:`REASON_VOICE_PROMPT_INVALID` drop and an honestly empty override, not
+a quiet substitution of an opinion they never asked for. This is also,
+consequently, the one way to reach ``None`` (the bare gateway default) on the
+shipped path deliberately: set :data:`ENV_VOICE_PROMPT` to a blank string
+(present, but empty) rather than leaving it unset — a present-but-blank key
+is structurally distinguishable from an absent one (``Mapping.get`` returns
+``""`` for the former, ``None`` for the latter), so it reads as an EXPLICIT
+"I want nothing here", not as "nobody configured this". It costs one named
+drop, which is the honest price of overriding the layer's own recommendation
+with silence.
+
+**What the shipped default asks for, and why.** :data:`DEFAULT_VOICE_PROMPT`
+keeps the spoken-register guidance lobes' own default already has (no
+markdown, no lists, no code, no emoji — dropping it would reopen exactly the
+harm described above), but deliberately does NOT keep upstream's own length
+cap ("answer in one or two short spoken sentences"): issue #151's own
+complaint is that replies are too terse, and that brevity comes from the
+GATEWAY's default prompt, not from any cap this client enforces. So this
+text asks for complete, natural, SENTENCE-SHAPED spoken thoughts instead of a
+sentence-count limit — a longer answer is welcome, composed as several such
+thoughts, because since task t6 a reply is played as several chunks with a
+brief pause between them (issue #151's explicitly accepted "minor gap")
+rather than one unbroken clip. Chunk-friendly phrasing and permitting length
+are therefore the SAME request, not two: short complete sentences are what
+both a natural spoken cadence and a clean chunk boundary want.
+
+**Validation is REFUSED, never truncated** (the same fail-closed idiom
+:data:`reachy.behavior.rules.MAX_SAY_CHARS` uses): blank (after stripping) or
+longer than :data:`MAX_VOICE_PROMPT_CHARS` degrades to the "omit, gateway
+default" outcome above, and :class:`RealtimeDuplexSession` — never the pure
+:func:`resolve_voice_prompt` — turns a REJECTED explicit-or-env attempt (as
+opposed to nothing configured at all, which is not a failure) into one named,
+counted :data:`REASON_VOICE_PROMPT_INVALID` drop at construction time, the
+same discipline every other named failure in this module follows.
+
+**No CLI flag yet, by choice, not oversight.** ``agent embody`` gains no new
+``--voice-prompt`` argument in this task — the env var alone is the
+operator-facing knob, matching every earlier revision of this module's own
+"operator-configurable" claim. A dedicated flag is a natural extension (the
+same shape :data:`~reachy.embody.engine.DEFAULT_ATTENTION_WINDOW_S`'s
+``--attention-window`` already has), left for whichever composition task
+next touches this seam's flag set, rather than folded in here as a
+drive-by addition.
+
+**What this task does NOT claim.** Nothing here has been checked against a
+live gateway: whether the override actually changes spoken persona/length
+behaviour end to end (query param → ``parse_session_config`` → the floor's
+generate call) is honesty condition h8's LIVE half, and it belongs to task
+t15's live acceptance — this task claims only what the offline suite proves,
+that the value composition resolves is exactly the value that reaches the
+connect URL, with no new frame kind.
+
+--------------------------------------------------------------------------
+Arming: once per session, or once per ADMITTED utterance (issue #149)
 --------------------------------------------------------------------------
 The server starts DISARMED and answers nothing until it sees one
 ``response.create`` (lobes-cli's ``lobes/realtime/_conversation.py``); arming
@@ -105,6 +457,54 @@ verified — and re-arms on every new session. :meth:`RealtimeDuplexSession.arm`
 lets a caller request another one; it costs nothing if the session is already
 armed. ``arm_on_connect=False`` degrades this client to the runtime's own
 ears-only shape.
+
+**Arm-once is exactly the defect issue #149 names.** The layer's attention gate
+can decide an utterance is not worth waking a mind for, and then the room hears
+a spoken reply to it anyway — because the decision the gateway acts on was
+taken at ``session.created``, long before anyone heard the sentence. A robot
+that butts into a conversation it was explicitly told to ignore is worse than
+one that answers everything. So this client offers a second arming MODE:
+
+``arm_per_utterance=True`` + a gateway that announces one-shot arming
+    Nothing is armed at connect. Each :meth:`RealtimeDuplexSession.arm_once`
+    call buys exactly ONE reply — the caller's way of saying "this particular
+    utterance deserves an answer" — and it reaches the already-transcribed turn
+    through upstream's existing
+    ``response.create``-after-transcript flow (``ConversationBridge.arm()``
+    answers a pending transcript on the spot).
+
+``arm_per_utterance=True`` + a gateway that announces nothing
+    Today's behaviour, unchanged, plus one named
+    :data:`REASON_ONE_SHOT_ARMING_UNSUPPORTED` drop: the session arms itself at
+    connect and the server answers everything. This is the h9 never-half-deploy
+    rule and the direction of the degrade is deliberate — a client that went
+    silent against an old gateway would take the robot's voice away to fix a
+    politeness bug.
+
+**The capability check is a provisional contract, and it fails closed.**
+Upstream has NOT shipped one-shot arming: ``ConversationBridge.arm()`` latches
+``armed = True`` and nothing clears it (``_floor.py``'s ``_disarm`` is
+stage-timeout bookkeeping). The ask is agentculture/lobes-cli#170 item 1, and
+:func:`announces_one_shot_arming` reads the ONE shape this repo guessed for it
+(``session.created``'s ``config.arming == "one_shot"``). Any other shape, any
+other value, or no announcement at all reads as "no one-shot arming" — so
+guessing wrong costs the degraded path, never a robot that stops answering. If
+upstream ships a different name, that predicate is the one line that changes.
+
+That ask carries a second note, also filed upstream, which is a property of the
+SERVER and stated here because it explains why this client asks for one reply
+per utterance rather than trying to disarm one itself: ``armed`` must clear at
+a reply's **completion**, never when the ``response.create`` frame is consumed.
+Every floor call sits behind ``if self.armed``, so an arm that cleared early
+would answer the turn and then be unable to honour the human who speaks over
+it — mid-synthesis barge-in would die silently, which is the interruption
+:meth:`cancel_playback` and the whole of task t6 exist to make work.
+
+**The policy that drives this lives one level up, and must stay there.** This
+module contains no gate and reaches none (see the UNGATED section above); it
+knows only that *someone* asked for a reply. ``reachy/cli/_commands/agent.py``
+is where :class:`reachy.embody.attention.AttentionGate`'s verdict turns into an
+:meth:`arm_once` call.
 
 --------------------------------------------------------------------------
 The mute seam: present, and OFF by default (the AEC decision)
@@ -164,10 +564,13 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import queue
 import socket
 import threading
 import time
+from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -245,32 +648,58 @@ from reachy.speech.realtime import (
 #: of a string. Declaring them here is also what says "these imports are a
 #: re-export, not a leftover".
 __all__ = [
+    "ARMING_CONFIG_KEY",
+    "ARMING_MODE_ONE_SHOT",
+    "DEFAULT_ITEM_MAXSIZE",
     "DEFAULT_OUTPUT_SAMPLE_RATE",
+    "DEFAULT_PLAYBACK_CHUNK_BYTES",
+    "DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES",
+    "DEFAULT_VOICE_PROMPT",
+    "ITEMS_CONFIG_KEY",
+    "ITEMS_MODE_CONTEXT_AND_HISTORY",
+    "MAX_VOICE_PROMPT_CHARS",
+    "ConversationItem",
     "Limits",
+    "PlaybackProgress",
     "PlaySink",
     "ReadAudio",
     "RealtimeDuplexSession",
+    "Reseed",
     "Response",
+    "SpokenSplit",
     "Utterance",
+    "announces_conversation_items",
+    "announces_one_shot_arming",
     "build",
     "connect_url",
+    "estimate_spoken_prefix",
     "resolve_realtime_api_key",
     "resolve_realtime_base_url",
+    "resolve_voice_prompt",
+    "split_spoken",
     # configuration env names (owned by reachy.speech.realtime)
     "OPENAI_API_KEY_ENV",
     "OPENAI_URL_BASE_ENV",
     "REALTIME_API_KEY_ENV",
     "REALTIME_URL_ENV",
+    # configuration env names — this module's own
+    "ENV_VOICE_PROMPT",
     # named drop reasons — this module's own, and the shared ones
     "REASON_CONNECT_FAILED",
     "REASON_EMPTY_TRANSCRIPT",
     "REASON_HANDSHAKE_REFUSED",
+    "REASON_ITEM_INVALID",
+    "REASON_ITEM_QUEUE_FULL",
+    "REASON_ITEMS_UNSUPPORTED",
     "REASON_LANE_UNAVAILABLE",
     "REASON_MALFORMED_AUDIO_DELTA",
     "REASON_MALFORMED_EVENT",
     "REASON_NO_PLAYBACK_SINK",
+    "REASON_ONE_SHOT_ARMING_UNSUPPORTED",
+    "REASON_PLAYBACK_CANCELLED",
     "REASON_PLAYBACK_FAILED",
     "REASON_PLAYBACK_QUEUE_FULL",
+    "REASON_RESEED_FAILED",
     "REASON_RESPONSE_INTERRUPTED",
     "REASON_RESPONSE_QUEUE_FULL",
     "REASON_RESPONSE_TOO_LONG",
@@ -282,6 +711,7 @@ __all__ = [
     "REASON_STT_FORWARD_FAILED",
     "REASON_UTTERANCE_QUEUE_FULL",
     "REASON_VAD_UNAVAILABLE",
+    "REASON_VOICE_PROMPT_INVALID",
 ]
 
 logger = logging.getLogger(__name__)
@@ -295,6 +725,110 @@ SOURCE = "embody"
 #: Thread names, exported so a test (and a stack dump) can name them.
 WORKER_THREAD_NAME = "realtime-duplex-session"
 PLAYBACK_THREAD_NAME = "realtime-duplex-mouth"
+
+# --------------------------------------------------------------------------- #
+# Connect-time voice conventions (issue #151/#153, spec c10, honesty h8) —     #
+# see the module docstring's own section for the full reasoning.              #
+# --------------------------------------------------------------------------- #
+
+#: Process-scoped override for the connect-time ``system_prompt``
+#: (persona/reply-length) instructions. Same scoping as
+#: :data:`reachy.embody.engine.ENV_WORKER_MODEL` and neighbours, and the same
+#: reason: see :func:`resolve_voice_prompt`.
+ENV_VOICE_PROMPT = "REACHY_EMBODY_VOICE_PROMPT"
+
+#: Refused, never truncated, past this length — the same fail-closed idiom
+#: :data:`reachy.behavior.rules.MAX_SAY_CHARS` and
+#: :data:`reachy.embody.engine.DEFAULT_SUMMARY_MAX_CHARS` use, and the same
+#: number as the latter: a persona/style prompt is the same order of
+#: magnitude as a rolling conversation summary, not a single spoken utterance.
+MAX_VOICE_PROMPT_CHARS = 2000
+
+#: This module's own recommended connect-time ``system_prompt`` — see the
+#: module docstring's "Connect-time voice conventions" section for what it
+#: asks for and why, and :func:`resolve_voice_prompt`'s docstring for why
+#: this constant is NOT applied automatically by that function.
+DEFAULT_VOICE_PROMPT = (
+    "You are Reachy Mini, a small expressive desk robot, speaking your "
+    "replies aloud through a text-to-speech voice — never write markdown, "
+    "bullet points, code fences or emoji; say only the words you would "
+    "actually speak aloud. Answer at whatever length the question deserves: "
+    "a longer answer is welcome, composed as a sequence of short, complete, "
+    "sentence-shaped thoughts a listener can follow one at a time, since it "
+    "may reach the room as a few spoken chunks with a brief pause between "
+    "them rather than one unbroken run-on sentence."
+)
+
+
+def resolve_voice_prompt(
+    explicit: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    default: str | None = None,
+) -> str | None:
+    """Resolve the connect-time ``system_prompt`` override (issue #151/#153, spec c10).
+
+    Precedence: *explicit* argument, then :data:`ENV_VOICE_PROMPT`, then
+    *default* — but *default* fills in ONLY for a genuine absence (see
+    below), never for a rejected attempt. *env* defaults to ``os.environ`` —
+    the PROCESS environment, read once per call and never written, and never
+    a file — mirroring
+    :func:`reachy.embody.engine.resolve_attention_window_s`'s scoping and its
+    reasoning: an operator who wants a different voice sets
+    :data:`ENV_VOICE_PROMPT` in the LAYER PROCESS's own environment, never an
+    ``environment.d`` drop-in.
+
+    **``default`` is opt-in, and its absence is what keeps this function's
+    own contract unchanged.** Called bare (*default* omitted, ``None``), this
+    function's "nothing configured" case does not substitute a value of its
+    own — the same conservative shape it has always had: an absent override
+    is not a fault, and there is no "wrong" fallback for a pure resolver to
+    protect against. **The PRODUCTION composition root asks for one anyway**
+    — ``reachy/cli/_commands/agent.py``'s ``_compose_embody_seam`` calls this
+    function with ``default=``:data:`DEFAULT_VOICE_PROMPT`, which is the
+    deliberate decision this task ships: on the deployed robot, "nothing
+    configured" resolves to this module's own chunk-friendly text, not to
+    silence — see the module docstring's "Connect-time voice conventions"
+    section for the reasoning and the reachability argument (a capability
+    built and never wired is indistinguishable from a missing one).
+
+    A resolved override that is BLANK (after stripping) or longer than
+    :data:`MAX_VOICE_PROMPT_CHARS` is a malformed configuration and resolves
+    to ``None`` regardless of *default* — a rejected attempt is never
+    silently repaired into someone else's opinion of what should have been
+    sent. Chatterbox reads the reply aloud verbatim, so a blank
+    ``system_prompt`` is not merely useless but ACTIVELY HARMFUL: lobes-cli's
+    own ``_settings.py`` ``default_system_prompt`` field comment makes
+    exactly this point, and the mechanics prove it — ``Session.system_prompt``
+    treats an explicit ``""`` as ``is not None``, so it would be used
+    VERBATIM instead of falling through to the gateway's default (see the
+    module docstring for the full citation). Refused, never truncated, the
+    same fail-closed idiom :data:`reachy.behavior.rules.MAX_SAY_CHARS` uses.
+    This is also, consequently, how an operator reaches the bare gateway
+    default DELIBERATELY even once composition asks for a *default*: set
+    :data:`ENV_VOICE_PROMPT` to a blank string (present, but empty) — an
+    explicit, if blunt, "I want nothing here", distinguishable from an
+    unset key by the very check this function makes (``raw is None`` only
+    when the key is genuinely absent).
+
+    This function is PURE and reports nothing on its own — it never touches
+    :mod:`reachy.senselog`, so it is safe to call from a test with no logging
+    side effect. :class:`RealtimeDuplexSession` is what turns a REJECTED
+    attempt (a non-``None`` input that resolves to ``None``) into a named,
+    counted :data:`REASON_VOICE_PROMPT_INVALID` drop at construction time —
+    the same discipline every other named failure in this module follows.
+    The ordinary unconfigured case (nothing given at all) is not a failure
+    and is never logged, whether or not a *default* filled in for it.
+    """
+    source = env if env is not None else os.environ
+    raw = explicit if explicit is not None else source.get(ENV_VOICE_PROMPT)
+    if raw is None:
+        return default
+    text = raw.strip()
+    if not text or len(text) > MAX_VOICE_PROMPT_CHARS:
+        return None
+    return text
+
 
 # --------------------------------------------------------------------------- #
 # The response.* half of the wire (the runtime session ignores all of these)   #
@@ -317,20 +851,58 @@ REASON_LANE_UNAVAILABLE = "realtime-lane-unavailable"
 REASON_MALFORMED_AUDIO_DELTA = "malformed-audio-delta"
 #: One reply's audio exceeded ``max_response_bytes``; the tail is discarded.
 REASON_RESPONSE_TOO_LONG = "response-too-long"
-#: A barge-in cut the reply short, so it is never spoken (see the handler).
+#: A barge-in cut the reply short: whatever had not reached the speaker yet is
+#: skipped, and the line says how much was heard before the cut.
 REASON_RESPONSE_INTERRUPTED = "response-interrupted"
 #: A reply arrived faster than the caller drained it (oldest evicted).
 REASON_RESPONSE_QUEUE_FULL = "response-queue-full"
 #: There is audio to speak and no ``play`` sink was injected.
 REASON_NO_PLAYBACK_SINK = "no-playback-sink"
-#: The mouth is still busy with an earlier reply.
+#: A caller cut the mouth off (:meth:`RealtimeDuplexSession.cancel_playback`)
+#: and audio the server had already produced is deliberately never spoken.
+REASON_PLAYBACK_CANCELLED = "playback-cancelled"
+#: The mouth queue is full: the REST of that reply is refused rather than one
+#: chunk being dropped out of its middle (a truncation is honest, a hole is a
+#: defect), so speech stops early instead of skipping.
 REASON_PLAYBACK_QUEUE_FULL = "playback-queue-full"
 #: The injected ``play`` raised, or the speaker is gone.
 REASON_PLAYBACK_FAILED = "playback-failed"
 #: ``read_audio`` raised. Latched: a broken source costs one line, not one per read.
 REASON_SOURCE_FAILED = "audio-source-failed"
+#: ``arm_per_utterance`` was asked for and the gateway announced no one-shot
+#: arming, so this session armed ONCE at connect and the server will answer
+#: every committed utterance (issue #149's defect, degraded to on purpose — see
+#: the module docstring's arming section and honesty condition h9). Latched per
+#: session, and the latch clears the moment a session DOES announce support, so
+#: a gateway upgraded (or downgraded) under a long-lived client still says so.
+REASON_ONE_SHOT_ARMING_UNSUPPORTED = "one-shot-arming-unsupported"
+#: An item was offered and the gateway announced no conversation-item support,
+#: so nothing was sent and the layer keeps only the connect-time
+#: ``system_prompt`` context (spec claim c44, decision c28 — see the module
+#: docstring's items section and honesty h29). Latched per session, and the
+#: latch clears the moment a session DOES announce support, exactly like
+#: :data:`REASON_ONE_SHOT_ARMING_UNSUPPORTED`: this is the same
+#: never-half-deploy shape, against the same unshipped upstream issue.
+REASON_ITEMS_UNSUPPORTED = "items-unsupported"
+#: An item whose role, disposition or text the wire builder refuses. Fail
+#: closed, never coerce: guessing a disposition is the duplicate-and-drift
+#: failure the disposition key exists to prevent.
+REASON_ITEM_INVALID = "item-invalid"
+#: The caller-thread item queue is full (oldest evicted). Latched per episode.
+REASON_ITEM_QUEUE_FULL = "item-queue-full"
+#: The injected ``reseed`` seam raised. The session arms anyway — a broken
+#: mind must not cost the robot its voice — but the floor starts this session
+#: with no history, which is precisely what claim c40 warns about, so it is
+#: named rather than swallowed.
+REASON_RESEED_FAILED = "reseed-failed"
 #: ``mute_during_playback`` is on and the mouth is busy — the AEC fallback.
 REASON_SELF_MUTE = "self-mute"
+#: An explicit or ``REACHY_EMBODY_VOICE_PROMPT`` ``system_prompt`` override was
+#: blank (after stripping) or over :data:`MAX_VOICE_PROMPT_CHARS`, so it was
+#: never placed on the connect URL — see the module docstring's "Connect-time
+#: voice conventions" section. NEVER logged for the ordinary unconfigured
+#: case (nothing attempted is not a failure); only a REJECTED attempt.
+REASON_VOICE_PROMPT_INVALID = "voice-prompt-invalid"
 
 # --------------------------------------------------------------------------- #
 # Defaults                                                                    #
@@ -347,13 +919,31 @@ DEFAULT_OUTPUT_SAMPLE_RATE = 24000
 #: than a fresh one, so the OLDEST is evicted on overflow.
 DEFAULT_UTTERANCE_MAXSIZE = 8
 DEFAULT_RESPONSE_MAXSIZE = 8
-#: The mouth queue. Depth 2 (the ``SpeechActuator`` figure): one playing, one
-#: waiting; a third means the layer is talking far faster than it can speak.
-DEFAULT_PLAYBACK_MAXSIZE = 2
+
+#: One second of PCM16 at 24 kHz: the unit the mouth speaks, and the unit a
+#: cancel skips. It is therefore the WORST-CASE cut latency an interjection
+#: pays — the room keeps hearing at most this much after the human speaks —
+#: traded against a daemon ``/media/play`` round trip per chunk and the seam
+#: between chunks. Unmeasured on the deployed stack (plan task t1 measures the
+#: per-chunk round trip and may retune this); see the module docstring's
+#: chunked-playback section for the full tradeoff.
+DEFAULT_PLAYBACK_CHUNK_BYTES = DEFAULT_OUTPUT_SAMPLE_RATE * 2
+#: The FIRST chunk of a reply is smaller, so the robot starts speaking sooner
+#: (time-to-first-audio is a full chunk otherwise). Smaller than the steady
+#: chunk, and still long enough that the next chunk's round trip has somewhere
+#: to hide. 0.4 s.
+DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES = DEFAULT_OUTPUT_SAMPLE_RATE * 2 * 2 // 5
 
 #: One reply's accumulated audio cap: 60 s of PCM16 at 24 kHz. A runaway
 #: server cannot make this process grow without bound.
 DEFAULT_MAX_RESPONSE_BYTES = DEFAULT_OUTPUT_SAMPLE_RATE * 2 * 60
+
+#: The mouth queue, in CHUNKS. Deep enough to hold one capped reply
+#: (``DEFAULT_MAX_RESPONSE_BYTES`` / ``DEFAULT_PLAYBACK_CHUNK_BYTES`` = 60)
+#: plus slack, because the gateway streams a reply's deltas far faster than
+#: the speaker plays them: a shallow queue would refuse the tail of every long
+#: answer. It was depth 2 while a whole reply was ONE item.
+DEFAULT_PLAYBACK_MAXSIZE = 64
 
 #: How many chunks the connect-time backlog drain may discard (~1.3 s at 20 ms
 #: chunks). It stops early the moment the source says "nothing ready", so a
@@ -361,6 +951,36 @@ DEFAULT_MAX_RESPONSE_BYTES = DEFAULT_OUTPUT_SAMPLE_RATE * 2 * 60
 DEFAULT_STALE_DRAIN_MAX_CHUNKS = 64
 #: Chunks sent per pump iteration, so the send side cannot starve the read side.
 _MAX_CHUNKS_PER_PUMP = 8
+
+#: The ``session.created`` ``config`` key a gateway announces its arming MODE
+#: in, and the one value that means "one ``response.create`` buys exactly one
+#: reply, and ``armed`` clears at that reply's completion".
+#:
+#: PROVISIONAL, and the module docstring says why at length: lobes has not
+#: shipped one-shot arming (agentculture/lobes-cli#170 item 1), so this pair is
+#: this repo's guess at a contract that does not exist yet. It is safe because
+#: :func:`announces_one_shot_arming` fails closed — a gateway that says nothing,
+#: or says something else, gets today's arm-once behaviour and a named drop.
+ARMING_CONFIG_KEY = "arming"
+ARMING_MODE_ONE_SHOT = "one_shot"
+
+#: The ``session.created`` ``config`` key a gateway announces conversation-item
+#: support in, and the one value that means "``conversation.item.create`` is
+#: accepted AND an ephemeral context item is distinguished from a history
+#: turn". The SECOND provisional contract in this module (decision c28,
+#: agentculture/lobes-cli#170 item 2) and, like the arming pair above, safe
+#: because :func:`announces_conversation_items` fails closed: a gateway that
+#: says nothing, or says something else, receives no item at all.
+ITEMS_CONFIG_KEY = "items"
+ITEMS_MODE_CONTEXT_AND_HISTORY = "context_and_history"
+
+#: The caller-thread item queue's depth. Deep enough for a turn's worth of
+#: pushed context (a scope, a perception snapshot, a summary update) to survive
+#: a slow pump, small enough that a producer looping on a dead session cannot
+#: grow this process. The RE-SEED does not pass through it — those items are
+#: sent synchronously on the session worker, which is what orders them before
+#: the arm (claim c40).
+DEFAULT_ITEM_MAXSIZE = 32
 
 DEFAULT_CONNECT_TIMEOUT_S = 5.0
 DEFAULT_FRAME_TIMEOUT_S = 5.0
@@ -392,6 +1012,11 @@ class Limits:
     module already keeps), and every field here simply carries that same
     constant forward unchanged, so the refactor cannot silently change a
     number while moving it.
+
+    The two playback CHUNK bounds arrived later (task t6) and were never bare
+    parameters, but they follow the same rule for the same reason: they are the
+    numbers a measured per-chunk daemon round trip will retune, and a bound
+    with two homes is a bound that drifts.
     """
 
     #: Bounded queue depths — see :data:`DEFAULT_UTTERANCE_MAXSIZE` and
@@ -399,6 +1024,15 @@ class Limits:
     utterance_maxsize: int = DEFAULT_UTTERANCE_MAXSIZE
     response_maxsize: int = DEFAULT_RESPONSE_MAXSIZE
     playback_maxsize: int = DEFAULT_PLAYBACK_MAXSIZE
+    #: The caller-thread conversation-item queue — see
+    #: :data:`DEFAULT_ITEM_MAXSIZE`. The one bound this module owns about
+    #: items: their CONTENT is bounded by whoever produced it.
+    item_maxsize: int = DEFAULT_ITEM_MAXSIZE
+    #: How much audio one ``play`` call speaks — hence the worst-case cut
+    #: latency of an interjection. See :data:`DEFAULT_PLAYBACK_CHUNK_BYTES`.
+    playback_chunk_bytes: int = DEFAULT_PLAYBACK_CHUNK_BYTES
+    #: The first chunk of each reply, smaller so speech starts sooner.
+    playback_first_chunk_bytes: int = DEFAULT_PLAYBACK_FIRST_CHUNK_BYTES
     #: Cap on ONE reply's accumulated audio.
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
     #: Connect-time backlog drain bound.
@@ -413,6 +1047,142 @@ class Limits:
     stable_after_s: float = DEFAULT_STABLE_AFTER_S
     #: Bounded thread join at :meth:`RealtimeDuplexSession.close`.
     join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S
+
+
+def _even(value: object) -> int:
+    """At least one PCM16 sample, and a whole number of them."""
+    return max(2, int(value) & ~1)
+
+
+def announces_one_shot_arming(event: dict | None) -> bool:
+    """Does this ``session.created`` event announce ONE-SHOT arming?
+
+    The whole capability check, as one pure predicate over one event, so the
+    single provisional guess this arc makes about an unshipped upstream feature
+    has exactly one home (see :data:`ARMING_CONFIG_KEY`). It answers ``True``
+    only for an explicit affirmative — ``config.arming == "one_shot"`` — and
+    ``False`` for everything else including a missing config, a non-mapping
+    config, a different value and a right value in the wrong place.
+
+    Failing closed is the point, not caution for its own sake: ``False`` means
+    the session arms once at connect and the server answers every utterance,
+    which is precisely what it does today. A wrong guess therefore costs the
+    politeness fix, never the robot's voice.
+    """
+    if not isinstance(event, dict):
+        return False
+    config = event.get("config")
+    if not isinstance(config, dict):
+        return False
+    # The isinstance is not redundant with the comparison: a gateway sending a
+    # bare `arming: true` means "some arming mode I have not named", which is
+    # not an announcement of THIS one.
+    announced = config.get(ARMING_CONFIG_KEY)
+    return isinstance(announced, str) and announced == ARMING_MODE_ONE_SHOT
+
+
+def announces_conversation_items(event: dict | None) -> bool:
+    """Does this ``session.created`` event announce CONVERSATION-ITEM support?
+
+    The second capability check this client makes, written as the first one
+    (:func:`announces_one_shot_arming`) is: one pure predicate over one event,
+    so the single provisional guess about an unshipped upstream feature has
+    exactly one home (see :data:`ITEMS_CONFIG_KEY`). It answers ``True`` only
+    for an explicit affirmative — ``config.items == "context_and_history"`` —
+    and ``False`` for everything else, including a missing config, a non-mapping
+    config, a bare ``items: true``, a list of supported dispositions and the
+    right value in the wrong place.
+
+    Failing closed matters MORE here than it does for arming. A wrong guess
+    about arming costs the politeness fix; a wrong guess here would put frames
+    on the wire against a schema nobody upstream has agreed to, at a gateway
+    that never said it could parse them. ``False`` means the layer keeps the
+    connect-time ``system_prompt`` context it already had (task t9) and names
+    the degrade once — the h29 outcome.
+    """
+    if not isinstance(event, dict):
+        return False
+    config = event.get("config")
+    if not isinstance(config, dict):
+        return False
+    # The isinstance is not redundant with the comparison, for the same reason
+    # it is not in the arming probe: `items: true` announces SOME item support
+    # this client cannot characterise, which is not an announcement of THIS
+    # contract — and the context/history distinction is the contract.
+    announced = config.get(ITEMS_CONFIG_KEY)
+    return isinstance(announced, str) and announced == ITEMS_MODE_CONTEXT_AND_HISTORY
+
+
+@dataclass(frozen=True)
+class ConversationItem:
+    """ONE item for the ``conversation.item.create`` channel (decision c28).
+
+    Deliberately a plain, frozen, module-level value rather than anything the
+    embodiment layer owns: this module sits BELOW the layer and imports nothing
+    from it (see the module docstring's seam section), so the item a caller
+    hands over has to be expressible here.
+
+    Args:
+        role: ``system`` / ``user`` / ``assistant`` — the same roles the floor
+            itself appends.
+        text: carried VERBATIM and bounded by nothing here — whoever produced
+            it already owns its bound (a cognition scope's
+            :class:`~reachy.embody.scope.ScopeLimits`, a summary's
+            ``Limits.summary_max_chars``). A second copy of a bound is a second
+            number to drift.
+        disposition: ``context`` for an ephemeral item that participates in the
+            next generate call and never enters history, ``history`` for a
+            curated history turn. The distinction is the whole reason this
+            channel needed an upstream ask (lobes-cli#170 item 2) — see the
+            module docstring.
+
+    :meth:`context` and :meth:`history` are the two constructors a caller
+    should reach for; the raw one exists so an invalid item is REPRESENTABLE
+    and can be refused by name rather than crashing at the wire.
+    """
+
+    role: str
+    text: str
+    disposition: str
+
+    @classmethod
+    def context(cls, text: str, *, role: str = wire.ITEM_ROLE_SYSTEM) -> "ConversationItem":
+        """An EPHEMERAL context item — a scope, a snapshot, a summary update."""
+        return cls(role=role, text=text, disposition=wire.ITEM_DISPOSITION_CONTEXT)
+
+    @classmethod
+    def history(cls, role: str, text: str) -> "ConversationItem":
+        """One curated HISTORY turn — what a reconnect re-seeds the floor with."""
+        return cls(role=role, text=text, disposition=wire.ITEM_DISPOSITION_HISTORY)
+
+    @property
+    def valid(self) -> bool:
+        """Whether this item can legally become a frame. Never raises.
+
+        Checked on the CALLER's thread so an invalid item costs one named
+        :data:`REASON_ITEM_INVALID` drop instead of a ``ValueError`` out of an
+        O(1), non-raising method — the same fail-closed-and-name-it discipline
+        every other refusal in this module follows.
+        """
+        return (
+            self.role in wire.ITEM_ROLES
+            and self.disposition in wire.ITEM_DISPOSITIONS
+            and isinstance(self.text, str)
+            and bool(self.text.strip())
+        )
+
+
+class Reseed(Protocol):
+    """The re-seed seam: ``() -> Sequence[ConversationItem]``.
+
+    Called ONCE PER SESSION, on the session worker thread, immediately after
+    ``session.created`` and BEFORE the session arms (spec claim c40). WHAT it
+    returns — Gemma's m-window plus the Qwen-maintained summary — is the
+    layer's business; this module only guarantees the ordering and that a
+    raising seam is a named drop rather than a dead session.
+    """
+
+    def __call__(self) -> "list[ConversationItem]": ...  # pragma: no cover
 
 
 class PlaySink(Protocol):
@@ -456,15 +1226,235 @@ class Response:
     session_id: str | None = None
 
 
+@dataclass(frozen=True)
+class PlaybackProgress:
+    """What the ROOM heard of one reply — measured at the sink, not assumed.
+
+    Returned by :meth:`RealtimeDuplexSession.playback_progress` and by
+    :meth:`RealtimeDuplexSession.cancel_playback`, which is what makes a cut
+    *reportable*: the caller that stopped the robot mid-sentence learns, in the
+    same call, how much of the sentence the room actually got.
+
+    The split between *played_bytes* and *in_flight_bytes* is the honest one
+    and it is deliberate: a chunk inside ``play`` cannot be recalled and cannot
+    be confirmed either, so it is reported as its own quantity rather than
+    guessed into one bucket or the other. The said/unsaid text split one level
+    up (task t7) is therefore EXACT to the chunk boundary and estimated only
+    inside the boundary chunk.
+
+    Attributes:
+        response_id: the reply this describes, or ``None``.
+        queued_bytes: audio handed to the mouth for this reply.
+        played_bytes: audio the sink RETURNED from — heard, as far as anything
+            in this process can know. A failed ``play`` is never counted here.
+        in_flight_bytes: the boundary chunk: inside ``play`` right now,
+            neither confirmed nor recallable.
+        skipped_bytes: audio queued and then skipped by a cancel, or dropped by
+            a failed ``play`` — produced by the server, never heard.
+        cancelled: whether a cut reached this reply.
+        total_bytes: the WHOLE reply's audio, as the server produced it — the
+            denominator :func:`split_spoken` divides the text by. ``0`` until
+            the reply completes, which is deliberate rather than lazy: while
+            deltas are still arriving there is no honest total, and dividing
+            the full text by a fraction of its audio would overstate what the
+            room heard. :meth:`RealtimeDuplexSession.spoken_split` withholds a
+            split until this is real.
+    """
+
+    response_id: str | None
+    queued_bytes: int
+    played_bytes: int
+    in_flight_bytes: int
+    skipped_bytes: int
+    cancelled: bool
+    total_bytes: int = 0
+
+
+@dataclass
+class _PlaybackLedger:
+    """The mutable half of :class:`PlaybackProgress`, one per reply.
+
+    It carries two things the snapshot does not: the reply's TEXT (so the
+    said/unsaid split needs nothing but a response id) and whether the reply
+    has COMPLETED (so a split is never computed against a partial total).
+    """
+
+    response_id: str | None
+    queued_bytes: int = 0
+    played_bytes: int = 0
+    in_flight_bytes: int = 0
+    skipped_bytes: int = 0
+    cancelled: bool = False
+    total_bytes: int = 0
+    text: str = ""
+    complete: bool = False
+
+    def snapshot(self) -> PlaybackProgress:
+        return PlaybackProgress(
+            response_id=self.response_id,
+            queued_bytes=self.queued_bytes,
+            played_bytes=self.played_bytes,
+            in_flight_bytes=self.in_flight_bytes,
+            skipped_bytes=self.skipped_bytes,
+            cancelled=self.cancelled,
+            total_bytes=self.total_bytes,
+        )
+
+
+@dataclass(frozen=True)
+class SpokenSplit:
+    """One reply cut in two at the measured boundary: what was said, what was not.
+
+    The layer's canonical record of an interrupted reply (spec claim c34).
+    Produced by :func:`split_spoken` and reached through
+    :meth:`RealtimeDuplexSession.spoken_split`; see the module docstring's
+    "Said and unsaid" section for the donor citation, the measured-vs-estimated
+    boundary, and the phase-1 divergence from the server's own history.
+
+    *said* and *unsaid* PARTITION *text*: nothing is discarded silently and
+    nothing is recorded as spoken twice over. ``said`` is always a prefix of
+    ``text``, ends on a word boundary, and never runs past the measured
+    ``played_bytes``.
+
+    It deliberately carries **no field about the server's record**. This client
+    knows what its own sink did; what the floor wrote into its history after a
+    client-local cut is something it cannot see and does not claim.
+
+    Attributes:
+        response_id: the reply this describes, or ``None``.
+        text: the whole reply text, exactly as the server produced it.
+        said: the measured prefix the room heard.
+        unsaid: the remainder — kept, never spoken, never recorded as said.
+        played_bytes / in_flight_bytes / total_bytes: the measurement behind
+            the split (see :class:`PlaybackProgress`).
+        cut: whether a cancel or a barge-in reached this reply.
+    """
+
+    response_id: str | None
+    text: str
+    said: str
+    unsaid: str
+    played_bytes: int
+    in_flight_bytes: int
+    total_bytes: int
+    cut: bool
+
+    @property
+    def complete(self) -> bool:
+        """Whether the whole reply reached the room (nothing left unsaid)."""
+        return not self.unsaid
+
+
+def estimate_spoken_prefix(text: str, played_bytes: int, total_bytes: int) -> str:
+    """The part of *text* the room plausibly heard, given the audio it got.
+
+    **Cited, not imported**, from lobes-cli's ``lobes/realtime/_floor.py``:323
+    ``estimate_spoken_prefix`` — same arithmetic, same bias, a different (and
+    better) input. The donor cuts the text proportionally to the audio
+    DELIVERED on the wire and then backs up to the previous word boundary,
+    because Chatterbox returns audio with no word timings; its docstring states
+    the principle this whole path rests on — *"recording the full text as if it
+    had been heard is a worse lie than recording a slightly-off prefix"*. This
+    copy is fed MEASURED played bytes from :class:`PlaybackProgress` instead of
+    a wire estimate, so the same arithmetic runs over a better number.
+
+    It is an ESTIMATE and stays one: a proportional cut assumes speech rate is
+    uniform across a reply, which it is not. The word-boundary back-up is what
+    makes the error land on the unsaid side — the prefix is always short of the
+    proportional cut, never past it.
+
+    Two branches are the donor's and are kept verbatim because callers depend
+    on them: no total (or more played than exists) answers with the FULL text —
+    "I have no measurement, assume it all played" — and nothing played answers
+    with ``""``. The first is exactly wrong for a cut that landed before any
+    audio existed, which is why :func:`split_spoken` carries the donor's own
+    caller-side guard (``lobes/realtime/_conversation.py``
+    ``_record_interrupted_reply``'s ``delivered_bytes <= 0``).
+    """
+    if not text:
+        return ""
+    if total_bytes <= 0 or played_bytes >= total_bytes:
+        return text
+    if played_bytes <= 0:
+        return ""
+    cut = max(1, len(text) * played_bytes // total_bytes)
+    prefix = text[:cut]
+    boundary = prefix.rfind(" ")
+    return prefix[:boundary] if boundary > 0 else prefix
+
+
+def split_spoken(text: str, progress: PlaybackProgress) -> SpokenSplit:
+    """Split one reply into what the room heard and what it never did.
+
+    Pure, total and never raising: a measurement in, a record out. The guard on
+    ``total_bytes <= 0`` is the donor's caller's (see
+    :func:`estimate_spoken_prefix`) and says the same thing in this module's
+    terms — a cut with nothing measured means NOTHING was said, never the whole
+    reply.
+
+    The boundary chunk (``in_flight_bytes``) is not counted as said. It cannot
+    be confirmed (the sink has not returned) and it cannot be recalled (a
+    daemon-HTTP upload-then-play has no stop handle), so its words go into
+    *unsaid*, where the worst case is the mind offering to repeat something the
+    room half-heard.
+    """
+    reply = text or ""
+    said = (
+        ""
+        if progress.total_bytes <= 0
+        else estimate_spoken_prefix(reply, progress.played_bytes, progress.total_bytes)
+    )
+    return SpokenSplit(
+        response_id=progress.response_id,
+        text=reply,
+        said=said,
+        unsaid=reply[len(said) :].strip(),
+        played_bytes=progress.played_bytes,
+        in_flight_bytes=progress.in_flight_bytes,
+        total_bytes=progress.total_bytes,
+        cut=progress.cancelled,
+    )
+
+
+@dataclass(frozen=True)
+class _PlaybackChunk:
+    """One unit of speech on the mouth queue, stamped with its cut generation.
+
+    The stamp is what makes a cancel work without reaching into the queue's
+    internals or racing the mouth: bumping the session's generation makes every
+    chunk carrying an older one stale, wherever it happens to be — still
+    queued, or already dequeued and one instruction away from ``play``.
+    """
+
+    response_id: str | None
+    generation: int
+    pcm: bytes
+
+
 @dataclass
 class _PendingResponse:
-    """One in-flight reply being accumulated across ``response.*`` events."""
+    """One in-flight reply being accumulated across ``response.*`` events.
+
+    *audio* is the whole reply (the record); *flushed* is how much of it has
+    been handed to the mouth, so the two never disagree and no second buffer
+    can drift from the first.
+    """
 
     response_id: str | None
     item_id: str | None = None
     text: str = ""
     audio: bytearray = field(default_factory=bytearray)
     overflowed: bool = False
+    #: The cut generation this reply was created under. A cancel bumps the
+    #: session's, which is what stops chunks that have not ARRIVED yet.
+    generation: int = 0
+    #: Bytes of *audio* already handed to the mouth.
+    flushed: int = 0
+    #: Chunks handed over so far (the first one has its own size).
+    chunks: int = 0
+    #: The mouth queue refused a chunk, so the rest of this reply is refused
+    #: too — a truncation, never a hole.
+    truncated: bool = False
 
 
 class RealtimeDuplexSession(_SessionObservables):
@@ -490,8 +1480,44 @@ class RealtimeDuplexSession(_SessionObservables):
             module docstring; flipping it is configuration, not code.
         url / api_key: explicit endpoint + bearer, else the shared
             ``REACHY_REALTIME_*`` / ``REACHY_OPENAI_*`` precedence.
+        system_prompt: the connect-time persona/reply-length override (issue
+            #151/#153, spec c10). This constructor does its OWN resolution
+            when given a bare string or ``None`` — via
+            :func:`resolve_voice_prompt` with no *default* (explicit
+            argument, then :data:`ENV_VOICE_PROMPT` from the process env,
+            then ``None``) — so a value already invalid re-validates the same
+            way regardless of who computed it. ``None`` in means "nothing
+            configured or a rejected attempt", and omits ``system_prompt``
+            from the connect URL entirely, plus one named
+            :data:`REASON_VOICE_PROMPT_INVALID` drop for a REJECTED (as
+            opposed to absent) attempt. The PRODUCTION composition root
+            (``_compose_embody_seam``) does not rely on this class's own
+            "nothing configured" fallback — it resolves
+            :data:`DEFAULT_VOICE_PROMPT` itself first and passes the result
+            in, which is what makes the deployed robot ship the layer's own
+            chunk-friendly voice by default rather than silence. See the
+            module docstring's "Connect-time voice conventions" section.
         arm_on_connect: send ``response.create`` on ``session.created``.
-        limits: the session's numeric bounds — the three queue depths, the
+        arm_per_utterance: opt into per-ADMITTED-utterance arming (issue
+            #149). ``False`` — the default — is the historical shape and every
+            existing caller's behaviour, byte for byte. ``True`` says "I will
+            call :meth:`arm_once` for the utterances that deserve an answer",
+            and this session then arms nothing at connect **if the gateway
+            announced one-shot arming**; against a gateway that did not, it
+            degrades to arming once and names it. It is opt-in rather than the
+            class default because the class ships a MECHANISM: the layer's
+            composition root owns the policy and is the one that asks for it.
+        reseed: the re-seed seam (spec claim c40) — ``() ->
+            list[ConversationItem]``, consulted once per session immediately
+            after ``session.created`` and BEFORE arming, so a reconnect can
+            never leave the floor answering out of an empty history. ``None``
+            (the default) re-seeds nothing, which is every pre-t10 caller's
+            behaviour byte for byte. Against a gateway that announced no item
+            support the items are refused as one named
+            :data:`REASON_ITEMS_UNSUPPORTED` drop and the session keeps only
+            its connect-time ``system_prompt`` context — see the module
+            docstring's conversation-items section.
+        limits: the session's numeric bounds — the queue depths, the
             reply-audio cap, the connect-time stale-drain bound, the socket
             timeouts and the reconnect/backoff policy — grouped into one
             frozen :class:`Limits` (issue #141/``python:S107``). Every field
@@ -499,6 +1525,13 @@ class RealtimeDuplexSession(_SessionObservables):
             :class:`Limits` for what each one bounds.
         on_utterance / on_response: optional taps, fired on the WORKER thread
             and guarded — a raising callback is logged and swallowed.
+        on_speech_started: the VAD tap (task t16) — fired with the raw
+            ``input_audio_buffer.speech_started`` event, on the WORKER thread,
+            guarded like the other two. It is the ONLY interruption evidence
+            this client offers a caller, and it is deliberately the server's
+            (spec claim c35). What a caller does with it — typically
+            :attr:`playback_pending` then :meth:`cancel_playback` — is policy
+            and lives one level up; this module still acts on nothing.
         clock: injectable monotonic clock.
 
     Attributes:
@@ -516,22 +1549,40 @@ class RealtimeDuplexSession(_SessionObservables):
         mute_during_playback: bool = False,
         url: str | None = None,
         api_key: str | None = None,
+        system_prompt: str | None = None,
         arm_on_connect: bool = True,
+        arm_per_utterance: bool = False,
+        reseed: Reseed | None = None,
         limits: Limits | None = None,
         on_utterance: Callable[[Utterance], None] | None = None,
         on_response: Callable[[Response], None] | None = None,
+        on_speech_started: Callable[[dict], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.url = resolve_realtime_base_url(url)
         self._api_key = resolve_realtime_api_key(api_key)
+        # An attempt that resolves to a REJECTED (None) prompt is a named
+        # drop; nothing configured at all is not — see resolve_voice_prompt's
+        # docstring. `_state` does not exist yet, so the drop (if any) is
+        # logged just below, once `_state` is constructed.
+        _voice_prompt_attempted = (
+            system_prompt if system_prompt is not None else os.environ.get(ENV_VOICE_PROMPT)
+        )
+        self._system_prompt = resolve_voice_prompt(system_prompt)
         self._read_audio = read_audio
         self._play = play
         self._sample_rate = max(1, int(sample_rate))
         self._output_sample_rate = max(1, int(output_sample_rate))
         self._mute_during_playback = bool(mute_during_playback)
         self._arm_on_connect = bool(arm_on_connect)
+        self._arm_per_utterance = bool(arm_per_utterance)
+        self._reseed = reseed
         self._limits = limits if limits is not None else Limits()
         self._max_response_bytes = max(0, int(self._limits.max_response_bytes))
+        # Chunk sizes are forced EVEN: a chunk boundary inside a PCM16 sample
+        # would split it across two ``play`` calls and click.
+        self._chunk_bytes = _even(self._limits.playback_chunk_bytes)
+        self._first_chunk_bytes = _even(self._limits.playback_first_chunk_bytes)
         self._stale_drain_max_chunks = max(0, int(self._limits.stale_drain_max_chunks))
         self._connect_timeout_s = max(0.1, float(self._limits.connect_timeout_s))
         self._frame_timeout_s = max(0.1, float(self._limits.frame_timeout_s))
@@ -540,6 +1591,7 @@ class RealtimeDuplexSession(_SessionObservables):
         self._join_timeout_s = max(0.0, float(self._limits.join_timeout_s))
         self._on_utterance = on_utterance
         self._on_response = on_response
+        self._on_speech_started = on_speech_started
         self._clock = clock
 
         self._utterances: queue.Queue = queue.Queue(
@@ -551,6 +1603,9 @@ class RealtimeDuplexSession(_SessionObservables):
         self._playback: queue.Queue = queue.Queue(
             maxsize=max(1, int(self._limits.playback_maxsize))
         )
+        #: Caller-thread conversation items awaiting the next pump. The RE-SEED
+        #: never passes through here — see :meth:`_reseed_session`.
+        self._items: queue.Queue = queue.Queue(maxsize=max(1, int(self._limits.item_maxsize)))
 
         self.worker: threading.Thread | None = None
         self.mouth: threading.Thread | None = None
@@ -566,6 +1621,12 @@ class RealtimeDuplexSession(_SessionObservables):
             backoff_initial_s=self._limits.backoff_initial_s,
             backoff_max_s=self._limits.backoff_max_s,
         )
+        if _voice_prompt_attempted is not None and self._system_prompt is None:
+            self._state.drop(
+                REASON_VOICE_PROMPT_INVALID,
+                f"{len(_voice_prompt_attempted)} chars, blank or over the "
+                f"{MAX_VOICE_PROMPT_CHARS}-char cap — connecting with no system_prompt override",
+            )
 
         # --- worker-thread state ------------------------------------------- #
         self._sock: socket.socket | None = None
@@ -583,8 +1644,35 @@ class RealtimeDuplexSession(_SessionObservables):
         #: summary exists to avoid (69,696 lines measured, once).
         self._overflow_logged: set[str] = set()
 
+        # --- the mouth's shared state (worker + playback thread) ------------ #
+        #: Guards the cut generation, the per-reply ledgers and the id of the
+        #: reply the mouth is on. Held for a handful of integer updates and
+        #: never across ``play`` or a queue wait, so it cannot serialise
+        #: anything that matters.
+        self._playback_lock = threading.Lock()
+        #: Bumped by every cut. A chunk (or a reply) stamped with an older one
+        #: is skipped — see :class:`_PlaybackChunk`.
+        self._generation = 0
+        #: Chunks a cut would still WITHHOLD: queued, plus the one the mouth
+        #: has taken but not yet committed to ``play``. Deliberately wider than
+        #: the queue's own occupancy — see :attr:`playback_pending`.
+        self._withholdable = 0
+        self._ledgers: "OrderedDict[str, _PlaybackLedger]" = OrderedDict()
+        self._current_response_id: str | None = None
+
         # --- cross-thread flags (single writer each; plain reads are atomic) - #
         self._arm_pending = False
+        #: What the LIVE session announced (issue #149). Learned on every
+        #: ``session.created`` and cleared on every connect, so a capability can
+        #: never be inherited from a session that is already gone.
+        self._one_shot_arming = False
+        self._one_shot_unsupported_logged = False
+        #: What the LIVE session announced about conversation items (decision
+        #: c28). Learned on every ``session.created`` and cleared on every
+        #: connect, for the same reason the arming capability is: a capability
+        #: belongs to the session that announced it, never to the process.
+        self._items_supported = False
+        self._items_unsupported_logged = False
         self._speaking = False
         self._muted_logged = False
         self._no_sink_logged = False
@@ -598,10 +1686,32 @@ class RealtimeDuplexSession(_SessionObservables):
         self.responses = 0
         self.response_audio_bytes = 0
         self.arms_sent = 0
+        #: :meth:`arm_once` calls the gateway could not honour — the degraded
+        #: path is counted as well as named, because "how often did the layer
+        #: ask for something this gateway cannot do" is the question an
+        #: operator asks once the drop line has scrolled away.
+        self.arms_declined = 0
+        #: Conversation items that reached the wire, items this gateway could
+        #: not take (the c44 degrade), and re-seeds performed. The sent/declined
+        #: pair mirrors arming's, for the same reason: "the layer thought it had
+        #: told the floor something" is a question an operator asks once the
+        #: drop line has scrolled away.
+        self.items_sent = 0
+        self.items_declined = 0
+        self.reseeds = 0
         self.ignored_events = 0
         self.muted_chunks = 0
         self.stale_chunks_discarded = 0
+        #: Chunks handed to the mouth, chunks the sink returned from, and the
+        #: bytes behind the second figure. ``played`` counts CHUNKS since t6
+        #: (it counted whole replies while a reply was one ``play`` call).
+        self.chunks_queued = 0
         self.played = 0
+        self.played_bytes = 0
+        #: Chunks a cut skipped, and the audio behind them — produced by the
+        #: server, deliberately never spoken.
+        self.chunks_cancelled = 0
+        self.cancelled_bytes = 0
         self.playback_failures = 0
 
     # ------------------------------------------------------------------ #
@@ -662,10 +1772,95 @@ class RealtimeDuplexSession(_SessionObservables):
 
         Arming is idempotent server-side, so this is always safe; the worker
         sends it on its next pump. Sessions arm themselves on
-        ``session.created`` unless ``arm_on_connect=False``.
+        ``session.created`` unless ``arm_on_connect=False`` or per-utterance
+        arming is live (see :meth:`arm_once`).
         """
         self._arm_pending = True
         self._state.wake()
+
+    def arm_once(self) -> bool:
+        """Ask for ONE spoken reply — the per-utterance arming mechanism (#149).
+
+        Called by whoever decided this particular utterance deserves an answer;
+        this module has no opinion about that and deliberately cannot form one
+        (see the UNGATED section of the module docstring). O(1), safe from any
+        thread, never raises — like :meth:`arm`, it only sets a flag the worker
+        acts on at its next pump, which is what keeps the decision off the
+        socket thread's critical path.
+
+        Returns whether a ``response.create`` was actually requested. ``False``
+        means the gateway announced no one-shot arming, so this session already
+        armed itself at connect and the server answers on its own: the h9
+        degrade, named once by :data:`REASON_ONE_SHOT_ARMING_UNSUPPORTED` and
+        counted in :attr:`arms_declined`. Sending the frame anyway would be
+        worse than useless — upstream's ``arm()`` answers any pending transcript
+        on the spot, so a redundant arm against a latched session risks a
+        duplicate reply to a turn that was already being answered.
+        """
+        if not self._one_shot_arming:
+            self.arms_declined += 1
+            return False
+        self.arm()
+        return True
+
+    def send_item(self, item: ConversationItem) -> bool:
+        """Push ONE conversation item to the floor (decision c28). Never raises.
+
+        The per-turn context channel: a cognition scope, a perception snapshot,
+        a rolling summary update — whatever the layer decided the floor's next
+        generate call should know. O(1) and safe from any thread, like
+        :meth:`arm`: it validates, enqueues, and lets the worker put the frame
+        on the socket at its next pump.
+
+        Returns whether the item was ACCEPTED for sending. ``False`` has two
+        meanings, both named in the journal and counted in
+        :attr:`items_declined`:
+
+        * this gateway announced no conversation-item support, so nothing is
+          sent and the session keeps only its connect-time ``system_prompt``
+          context (spec claim c44 — one latched
+          :data:`REASON_ITEMS_UNSUPPORTED` line per session, however many items
+          are declined);
+        * the item itself is invalid (:data:`REASON_ITEM_INVALID`) — refused,
+          never coerced, because guessing a disposition is exactly the
+          duplicate-and-drift failure that key exists to prevent.
+
+        A caller that gets ``False`` knows its context did NOT reach the floor
+        and can say so on the export feed, rather than reasoning as if it had.
+        """
+        if not item.valid:
+            self.items_declined += 1
+            self._state.drop(
+                REASON_ITEM_INVALID,
+                f"role={item.role!r} disposition={item.disposition!r} "
+                f"chars={len(item.text) if isinstance(item.text, str) else 0}",
+            )
+            return False
+        if not self._items_supported:
+            self._note_items_unsupported()
+            return False
+        accepted = self._offer(self._items, item, REASON_ITEM_QUEUE_FULL)
+        self._state.wake()
+        return accepted
+
+    def _note_items_unsupported(self) -> None:
+        """Count a declined item and name the degrade ONCE per session.
+
+        The #99 journal-flood discipline: a layer pushing context every turn
+        against a gateway that cannot take it would otherwise write one line per
+        turn forever. The count is what stays honest about how much was
+        declined.
+        """
+        self.items_declined += 1
+        if self._items_unsupported_logged:
+            return
+        self._items_unsupported_logged = True
+        self._state.drop(
+            REASON_ITEMS_UNSUPPORTED,
+            "the gateway announced no conversation-item support, so the layer's "
+            "context reaches it only as the connect-time system_prompt "
+            "(lobes-cli#170 item 2)",
+        )
 
     def take_utterance(self) -> Utterance | None:
         """Pop the oldest heard utterance, or ``None``. **Ungated** — see c4."""
@@ -681,6 +1876,84 @@ class RealtimeDuplexSession(_SessionObservables):
         except queue.Empty:
             return None
 
+    def cancel_playback(self) -> PlaybackProgress:
+        """Stop talking NOW, and report how much of the reply the room got.
+
+        The interjection primitive (issue #151 item 3). Skips every chunk still
+        queued AND every chunk of the cut reply still to arrive, so the cut
+        lands within one chunk boundary — the chunk already inside ``play``
+        finishes, because a daemon-HTTP upload-then-play has no stop handle.
+        Anything the server produced and the room never heard is a NAMED drop.
+
+        Safe from any thread, before :meth:`start` and after :meth:`close`,
+        O(1)-ish (a bounded queue drain and a few counters), and never raises.
+        A cancel with nothing to cut is silent — it withheld nothing.
+
+        The returned :class:`PlaybackProgress` describes the reply that was
+        cut, measured at the sink; :meth:`playback_progress` re-reads it later.
+        What that measurement MEANS for the conversation — which words the room
+        got and which it never did — is :meth:`spoken_split`, and it is the
+        call a caller that cut the robot off owes the mind: it answers once the
+        reply has completed, whether the cut landed before or after that.
+        """
+        cut = self._skip_remaining()
+        if cut.skipped_bytes:
+            self._state.drop(
+                REASON_PLAYBACK_CANCELLED,
+                f"cut after {cut.played_bytes}B spoken; {cut.skipped_bytes}B not spoken",
+            )
+        elif cut.in_flight_bytes:
+            # Nothing withheld: the cut landed on the last chunk, which the
+            # speaker is already committed to. Still worth one line — it is the
+            # moment the robot was told to stop.
+            self._state.note(
+                f"playback cut after {cut.played_bytes}B spoken (last chunk in flight)"
+            )
+        return cut
+
+    def playback_progress(self, response_id: str | None = None) -> PlaybackProgress | None:
+        """What the room heard of *response_id* (default: the reply being spoken).
+
+        ``None`` when this session has no record of that reply at all — every
+        reply it has SEEN has a progress record, zeroed until the mouth touches
+        it, so a zeroed record and ``None`` are different answers.
+        """
+        with self._playback_lock:
+            ledger = self._ledger_of(response_id)
+            return ledger.snapshot() if ledger is not None else None
+
+    def spoken_split(self, response_id: str | None = None) -> SpokenSplit | None:
+        """The said/unsaid split of *response_id* (default: the reply being spoken).
+
+        The measured half of spec claim c34: what the room actually heard of a
+        reply, and what it never did. Safe from any thread, O(1), never raises.
+
+        ``None`` has exactly two meanings, and both are "not yet a fact":
+        this session has no record of that reply, or the reply has not
+        COMPLETED. The second is the important one — while deltas are still
+        arriving the reply's total audio is unknown, and splitting the full
+        text against a fraction of its audio would report MORE as said than the
+        room heard, which is the one direction c34 forbids. A cut taken
+        mid-reply is therefore recorded when ``response.done`` lands; a cut
+        taken after it is readable immediately.
+        """
+        with self._playback_lock:
+            ledger = self._ledger_of(response_id)
+            if ledger is None or not ledger.complete:
+                return None
+            return split_spoken(ledger.text, ledger.snapshot())
+
+    def _ledger_of(self, response_id: str | None) -> "_PlaybackLedger | None":
+        """The existing record for *response_id*, or the current reply's. No creation.
+
+        Caller holds ``_playback_lock``. Distinct from :meth:`_ledger_for`,
+        which CREATES: a reader asking about a reply this session never saw
+        must get ``None`` rather than a zeroed record that says "heard nothing"
+        about a reply that never existed.
+        """
+        key = response_id if response_id is not None else self._current_response_id
+        return self._ledgers.get(key or "")
+
     @property
     def sample_rate(self) -> int:
         """The rate carried into the session config."""
@@ -693,8 +1966,14 @@ class RealtimeDuplexSession(_SessionObservables):
 
     @property
     def connect_url(self) -> str:
-        """The full ws(s) URL this client connects to, sample rate included."""
-        return connect_url(self.url, self._sample_rate)
+        """The full ws(s) URL this client connects to.
+
+        Sample rate always rides it; ``system_prompt`` rides it too whenever
+        :func:`resolve_voice_prompt` resolved one at construction (see the
+        module docstring's "Connect-time voice conventions" section) — never
+        a second frame, never a follow-up message.
+        """
+        return connect_url(self.url, self._sample_rate, system_prompt=self._system_prompt)
 
     @property
     def lane_unavailable(self) -> bool:
@@ -702,9 +1981,68 @@ class RealtimeDuplexSession(_SessionObservables):
         return self._lane_unavailable
 
     @property
+    def supports_one_shot_arming(self) -> bool:
+        """Whether the LIVE session announced one-shot arming (issue #149).
+
+        ``False`` before the first ``session.created``, after a disconnect, and
+        against every gateway shipping today — which is exactly the degraded
+        state :meth:`arm_once` reports on. A caller uses it to explain itself
+        ("the robot answers everything because this gateway cannot do
+        otherwise"), never to decide whether to ask: asking is always safe.
+        """
+        return self._one_shot_arming
+
+    @property
+    def supports_conversation_items(self) -> bool:
+        """Whether the LIVE session announced conversation items (decision c28).
+
+        ``False`` before the first ``session.created``, after a disconnect, and
+        against every gateway shipping today — parity is parked upstream
+        (lobes-cli#170 item 2). A caller uses it to explain itself ("the floor
+        knows only what the connect-time prompt told it"), never to decide
+        whether to ask: :meth:`send_item` is always safe and answers the same
+        question.
+        """
+        return self._items_supported
+
+    @property
     def speaking(self) -> bool:
         """Whether the mouth is busy right now (what the mute seam keys on)."""
         return self._speaking
+
+    @property
+    def playback_pending(self) -> bool:
+        """Whether a cut right now would actually WITHHOLD audio (task t16).
+
+        ``True`` while chunks are queued for the mouth and have not been taken
+        yet — the audio :meth:`cancel_playback` would skip. Safe from any
+        thread, O(1), never raises.
+
+        The chunk already inside ``play`` is deliberately NOT counted. It
+        cannot be recalled (a daemon-HTTP upload-then-play has no stop handle),
+        so a cut taken with the queue empty withholds nothing while still
+        marking the reply as cut and pushing that chunk's words into the
+        remainder — a reply the room heard in full, recorded as truncated. A
+        caller wanting "is the mouth busy at all" wants :attr:`speaking`; a
+        caller deciding whether to CUT wants this.
+
+        **Not ``self._playback.empty()``, and the difference is a missed cut.**
+        A chunk the mouth has already ``get``-ed but not yet committed to
+        ``play`` is OUT of the queue and STILL cancellable — :meth:`_skip_
+        remaining` bumps the generation and :meth:`_begin_chunk` re-checks it
+        immediately before speaking. So the queue's emptiness is a strictly
+        NARROWER predicate than what a cut can actually withhold, and a
+        ``speech_started`` landing in that window would read "nothing to cut"
+        about a chunk a cut would in fact have skipped — losing exactly the one
+        chunk boundary the chunk size buys. The counter is maintained under
+        ``_playback_lock`` at the two points that change the answer (enqueue,
+        and adoption-or-skip in :meth:`_begin_chunk`), so it tracks
+        :meth:`cancel_playback`'s real reach rather than the queue's occupancy.
+        Reported by Qodo on PR #158, via a different mechanism than the one
+        that turned out to be there.
+        """
+        with self._playback_lock:
+            return self._withholdable > 0
 
     @property
     def muted(self) -> bool:
@@ -773,7 +2111,23 @@ class RealtimeDuplexSession(_SessionObservables):
         self._reader = handshake.reader
         self._connected_at = self._clock()
         self._lane_unavailable = False
+        # A capability belongs to the session that announced it: the next
+        # `session.created` re-establishes it, and until then this client knows
+        # nothing about the gateway it just reached. BOTH capabilities, for the
+        # same reason — a reconnect can land on an upgraded or a rolled-back
+        # gateway.
+        self._one_shot_arming = False
+        self._items_supported = False
         self._pending.clear()
+        # A reply whose session died mid-sentence is dead with it: speaking its
+        # queued tail seconds later, into a new session, is the outbound twin of
+        # the stale-audio hazard `_drain_stale_source` handles below.
+        stale = self._skip_remaining()
+        if stale.skipped_bytes:
+            self._state.drop(
+                REASON_PLAYBACK_CANCELLED,
+                f"{stale.skipped_bytes}B from the previous session are not spoken",
+            )
         self._drain_stale_source()
         self._state.mark_up(event, url)
         return True
@@ -818,7 +2172,14 @@ class RealtimeDuplexSession(_SessionObservables):
     # --- pump ---------------------------------------------------------- #
 
     def _pump(self) -> None:
-        """One send/receive iteration. Raises :class:`_SessionLost` on any fault."""
+        """One send/receive iteration. Raises :class:`_SessionLost` on any fault.
+
+        Items go out BEFORE the arm within an iteration — the caller-thread
+        half of the same ordering the re-seed path guarantees structurally
+        (claim c40): context the layer pushed alongside an arm request must
+        reach the floor before the reply it is meant to inform.
+        """
+        self._send_pending_items()
         self._send_pending_arm()
         self._pump_audio()
         self._read_frames()
@@ -830,6 +2191,36 @@ class RealtimeDuplexSession(_SessionObservables):
         _ws_send(self._sock, wire.OPCODE_TEXT, wire.build_response_create_event().encode("utf-8"))
         self.arms_sent += 1
         self._state.note("armed (response.create)")
+
+    def _send_pending_items(self) -> None:
+        """Drain the caller-thread item queue onto the socket."""
+        while True:
+            try:
+                item = self._items.get_nowait()
+            except queue.Empty:
+                return
+            self._send_item_frame(item)
+
+    def _send_item_frame(self, item: ConversationItem) -> None:
+        """Put ONE validated item on the wire. Raises only :class:`_SessionLost`.
+
+        The ``ValueError`` guard is belt-and-braces rather than the primary
+        gate: :meth:`send_item` and :meth:`_reseed_session` both check
+        :attr:`ConversationItem.valid` on the way in, so an item reaching here
+        invalid means the two definitions of "valid" have drifted apart — which
+        is precisely the moment a silent ``raise`` on the session worker would
+        take the session down and reconnect into the same fault.
+        """
+        try:
+            payload = wire.build_conversation_item_create_event(
+                item.text, role=item.role, disposition=item.disposition
+            )
+        except ValueError as err:  # pragma: no cover - defensive, see the docstring
+            self.items_declined += 1
+            self._state.drop(REASON_ITEM_INVALID, str(err))
+            return
+        _ws_send(self._sock, wire.OPCODE_TEXT, payload.encode("utf-8"))
+        self.items_sent += 1
 
     def _pump_audio(self) -> None:
         """Pull from the source and append to the session. Bounded per iteration."""
@@ -899,6 +2290,12 @@ class RealtimeDuplexSession(_SessionObservables):
             self._on_session_created(event)
         elif kind in (SPEECH_STARTED, SPEECH_STOPPED):
             self._state.note(_vad_stage_line(kind, event))
+            if kind == SPEECH_STARTED:
+                # The ONLY interruption evidence this client hands out, and it
+                # is the server's VAD rather than anything measured here (spec
+                # c35). Publishing it changes nothing on its own — see the
+                # module docstring's TAIL WINDOW section.
+                self._tap(self._on_speech_started, event, "on_speech_started")
         elif kind == ERROR_EVENT:
             reason, detail = _server_error(event)
             self._state.drop(reason, detail)
@@ -907,10 +2304,76 @@ class RealtimeDuplexSession(_SessionObservables):
             logger.debug("duplex: unhandled event type %r", kind)
 
     def _on_session_created(self, event: dict) -> None:
+        """Adopt the new session, RE-SEED it, and decide how this one arms.
+
+        Both capabilities are re-read on EVERY session rather than once per
+        process: a reconnect can land on a restarted (upgraded, or rolled back)
+        gateway, and a client that cached the answer would either keep waiting
+        for one-shot arming it no longer has — a permanently mute robot — or
+        keep arming per utterance against a gateway that latches.
+
+        **The re-seed happens HERE, and that placement is the c40 guarantee.**
+        A session close wipes the floor's ephemeral history, so a reconnect
+        that armed first would let the gateway answer the next turn out of an
+        empty one. Re-seeding inside this handler puts the items on the socket
+        on this same worker turn, while arming is only a FLAG the next pump
+        sends — so the ordering is structural, not a convention someone has to
+        remember. Moving the arm into this method would break it, which is what
+        the offline suite's ordering pin exists to catch.
+        """
         self._session_id = _as_str(event.get("session_id"))
         self._state.note(_session_created_line(event))
+        self._one_shot_arming = announces_one_shot_arming(event)
+        self._items_supported = announces_conversation_items(event)
+        if self._items_supported:
+            self._items_unsupported_logged = False
+        self._reseed_session()
+        if self._arm_per_utterance and self._one_shot_arming:
+            # Nobody has asked for a reply yet, so nothing is armed. Every
+            # `arm_once` from here on buys exactly one.
+            self._one_shot_unsupported_logged = False
+            self._state.note("arming per admitted utterance (gateway announced one-shot)")
+            return
+        if self._arm_per_utterance and not self._one_shot_unsupported_logged:
+            self._one_shot_unsupported_logged = True
+            self._state.drop(
+                REASON_ONE_SHOT_ARMING_UNSUPPORTED,
+                "the gateway announced no one-shot arming, so this session arms "
+                "once and it will answer every utterance (lobes-cli#170 item 1)",
+            )
         if self._arm_on_connect:
             self._arm_pending = True
+
+    def _reseed_session(self) -> None:
+        """Ask the seam what this new session must know, and send it. Before arming.
+
+        Total by construction: a raising seam, a seam returning something that
+        is not a sequence of items, an invalid item inside a good sequence, and
+        a gateway that cannot take items at all each resolve to a NAMED drop
+        and a session that still arms. The one exception it deliberately lets
+        through is :class:`_SessionLost` from the send itself, which is the
+        socket dying — the reconnect that follows re-seeds again.
+        """
+        if self._reseed is None:
+            return
+        try:
+            items = list(self._reseed())
+        except Exception:  # a broken mind must not cost the robot its voice
+            self._state.drop(REASON_RESEED_FAILED, "the reseed seam raised")
+            logger.warning("duplex: reseed seam raised", exc_info=True)
+            return
+        if not items:
+            return
+        self.reseeds += 1
+        for item in items:
+            if not isinstance(item, ConversationItem) or not item.valid:
+                self.items_declined += 1
+                self._state.drop(REASON_ITEM_INVALID, f"reseed offered {item!r}")
+                continue
+            if not self._items_supported:
+                self._note_items_unsupported()
+                continue
+            self._send_item_frame(item)
 
     def _publish_utterance(self, event: dict) -> None:
         """Publish one heard utterance. **No engagement gate** (spec claim c4)."""
@@ -933,18 +2396,35 @@ class RealtimeDuplexSession(_SessionObservables):
         Keyed by ``response_id`` and tolerant of its absence: a delta that
         arrives before (or without) ``response.created`` still lands in the
         right place rather than being dropped for a missing envelope field.
+
+        The reply is stamped with the CURRENT cut generation here, once: a
+        cancel bumps the session's, and from that moment every chunk this reply
+        would still have produced is refused. A reply created AFTER the cut
+        gets the new generation and speaks normally — cutting a sentence must
+        not mute the answer to the interruption.
         """
         response_id = _as_str(event.get("response_id"))
         pending = self._pending.get(response_id or "")
         if pending is None:
-            pending = _PendingResponse(response_id=response_id)
+            with self._playback_lock:
+                generation = self._generation
+                self._ledger_for(response_id)
+            pending = _PendingResponse(response_id=response_id, generation=generation)
             self._pending[response_id or ""] = pending
         if pending.item_id is None:
             pending.item_id = _as_str(event.get("item_id"))
         return pending
 
     def _accumulate_audio(self, event: dict) -> None:
-        """Append one base64 PCM16 delta to its reply, bounded."""
+        """Append one base64 PCM16 delta to its reply, bounded — and SPEAK it.
+
+        The delta is appended to the reply's record and then whatever complete
+        chunk groups that made available are handed straight to the mouth, so
+        the robot starts talking while the reply is still arriving. This is the
+        half of chunked playback that makes a cut possible at all: by the time
+        ``response.done`` lands, most of a long answer is already spoken or
+        queued, and a cut has something to skip.
+        """
         pending = self._pending_for(event)
         raw = event.get("delta")
         if not isinstance(raw, str) or not raw:
@@ -961,12 +2441,24 @@ class RealtimeDuplexSession(_SessionObservables):
                 self._state.drop(REASON_RESPONSE_TOO_LONG, f"over {self._max_response_bytes} bytes")
             return
         pending.audio.extend(pcm)
+        self._flush_chunks(pending, final=False)
 
     def _finish_response(self, event: dict, *, interrupted: bool) -> None:
-        """Complete one reply: publish it, and speak it unless it was cut short."""
+        """Complete one reply: publish it, and finish (or cut) speaking it."""
         pending = self._pending_for(event)
         self._pending.pop(pending.response_id or "", None)
+        if not interrupted:
+            # The tail: whatever is left below one chunk group.
+            self._flush_chunks(pending, final=True)
         audio = bytes(pending.audio)
+        # Seal the measurement record BEFORE anything else can read it: the
+        # text and the total the said/unsaid split divides by are both final
+        # exactly here, and `on_response` fires from the bottom of this method.
+        with self._playback_lock:
+            ledger = self._ledger_for(pending.response_id)
+            ledger.text = pending.text
+            ledger.total_bytes = len(audio)
+            ledger.complete = True
         response = Response(
             response_id=pending.response_id,
             text=pending.text,
@@ -986,29 +2478,133 @@ class RealtimeDuplexSession(_SessionObservables):
             f"id={pending.response_id} chars={len(pending.text)} audio={len(audio)}B"
         )
         if interrupted:
-            # A barge-in means the human started talking again. Speaking the
-            # truncated reply now would talk over them, so it is deliberately
-            # never played — the record still carries the audio and says why.
-            self._state.drop(REASON_RESPONSE_INTERRUPTED, "truncated reply is not spoken")
-        elif audio:
-            self._enqueue_playback(audio)
+            # A barge-in means the human started talking again, so everything
+            # not yet in the speaker is skipped — the queued chunks AND the
+            # tail this reply never flushed. What the room already heard is
+            # measured and named; the record still carries the whole reply.
+            cut = self._skip_remaining(pending.response_id or "")
+            self._state.drop(
+                REASON_RESPONSE_INTERRUPTED,
+                f"cut after {cut.played_bytes}B spoken; "
+                f"{max(0, len(audio) - cut.played_bytes)}B not spoken",
+            )
         self._tap(self._on_response, response, "on_response")
 
-    def _enqueue_playback(self, audio: bytes) -> None:
-        """Hand one finished reply to the mouth. O(1); never blocks the session."""
+    # --- feeding the mouth ---------------------------------------------- #
+
+    def _flush_chunks(self, pending: _PendingResponse, *, final: bool) -> None:
+        """Hand every complete chunk group of *pending* to the mouth.
+
+        With ``final=True`` (``response.done``) the remainder goes too, however
+        short — chunking must never eat a reply's tail.
+
+        Runs on the session worker and stays O(1)-ish per delta: a slice, a
+        ``put_nowait`` and a couple of counters. No socket, no encoding, no
+        blocking call — the pump is what keeps the ears open.
+        """
+        while not pending.truncated:
+            available = len(pending.audio) - pending.flushed
+            if available <= 0:
+                return
+            target = self._first_chunk_bytes if pending.chunks == 0 else self._chunk_bytes
+            if available < target:
+                if not final:
+                    return
+                target = available
+            chunk = bytes(pending.audio[pending.flushed : pending.flushed + target])
+            if not self._offer_chunk(pending, chunk):
+                return
+            pending.flushed += target
+            pending.chunks += 1
+
+    def _offer_chunk(self, pending: _PendingResponse, chunk: bytes) -> bool:
+        """Queue one chunk. Returns whether feeding this reply may continue."""
         if self._play is None:
             if not self._no_sink_logged:
                 self._no_sink_logged = True
-                self._state.drop(REASON_NO_PLAYBACK_SINK, f"{len(audio)} bytes not spoken")
-            return
+                self._state.drop(REASON_NO_PLAYBACK_SINK, f"{len(chunk)} bytes not spoken")
+            return False
+        with self._playback_lock:
+            if pending.generation != self._generation:
+                return False  # this reply was cut; its remainder is not spoken
+            item = _PlaybackChunk(pending.response_id, self._generation, chunk)
         try:
-            self._playback.put_nowait(audio)
+            self._playback.put_nowait(item)
         except queue.Full:
+            # Refuse the REST of this reply rather than dropping one chunk out
+            # of its middle: speech that stops early is honest, speech with a
+            # hole in it is a defect.
+            pending.truncated = True
             if not self._playback_full_logged:
                 self._playback_full_logged = True
-                self._state.drop(REASON_PLAYBACK_QUEUE_FULL, f"{len(audio)} bytes not spoken")
-            return
+                self._state.drop(
+                    REASON_PLAYBACK_QUEUE_FULL,
+                    f"the mouth is {self._playback.maxsize} chunks behind; "
+                    f"the rest of this reply is not spoken",
+                )
+            return False
         self._playback_full_logged = False
+        self.chunks_queued += 1
+        with self._playback_lock:
+            self._withholdable += 1
+            self._ledger_for(pending.response_id).queued_bytes += len(chunk)
+        return True
+
+    # --- cutting the mouth off ------------------------------------------ #
+
+    def _skip_remaining(self, key: str | None = None) -> PlaybackProgress:
+        """Bump the cut generation and drain the mouth queue. Never raises.
+
+        Everything drained is counted as SKIPPED against its reply, and a chunk
+        the mouth had already dequeued is skipped too — it re-checks the
+        generation immediately before ``play``. Only a chunk already inside
+        ``play`` survives a cut, which is exactly the one-chunk boundary the
+        chunk size buys.
+
+        *key* names the reply to REPORT on when the caller already knows it
+        (``response.interrupted`` does). Left out — an operator-driven cut,
+        which knows only "stop talking" — the reply reported is the next one
+        that would have been spoken, or the one in the speaker if the queue was
+        already empty.
+        """
+        with self._playback_lock:
+            self._generation += 1
+        drained: list[_PlaybackChunk] = []
+        while True:
+            try:
+                drained.append(self._playback.get_nowait())
+            except queue.Empty:
+                break
+        with self._playback_lock:
+            self._withholdable = max(0, self._withholdable - len(drained))
+            for item in drained:
+                ledger = self._ledger_for(item.response_id)
+                ledger.skipped_bytes += len(item.pcm)
+                ledger.cancelled = True
+                self.chunks_cancelled += 1
+                self.cancelled_bytes += len(item.pcm)
+            if key is None:
+                key = drained[0].response_id if drained else self._current_response_id
+            cut = self._ledger_for(key or None)
+            cut.cancelled = True
+            return cut.snapshot()
+
+    def _ledger_for(self, response_id: str | None) -> _PlaybackLedger:
+        """This reply's measurement record. Caller holds ``_playback_lock``.
+
+        Bounded like every other per-reply structure here: the oldest record
+        goes when a long-lived session has seen more replies than the response
+        queue is deep. A cut is read immediately by whoever made it, so the
+        history a caller can still ask about is deliberately short.
+        """
+        key = response_id or ""
+        ledger = self._ledgers.get(key)
+        if ledger is None:
+            ledger = _PlaybackLedger(response_id=response_id)
+            self._ledgers[key] = ledger
+            while len(self._ledgers) > max(1, int(self._limits.response_maxsize)):
+                self._ledgers.popitem(last=False)
+        return ledger
 
     # --- the mouth ------------------------------------------------------ #
 
@@ -1022,29 +2618,63 @@ class RealtimeDuplexSession(_SessionObservables):
         """
         while not self._closed:
             try:
-                audio = self._playback.get(timeout=_PLAYBACK_POLL_S)
+                item = self._playback.get(timeout=_PLAYBACK_POLL_S)
             except queue.Empty:
                 continue
-            self._speak(audio)
+            if self._begin_chunk(item):
+                self._speak(item)
 
-    def _speak(self, audio: bytes) -> None:
+    def _begin_chunk(self, item: _PlaybackChunk) -> bool:
+        """Adopt one chunk, unless a cut overtook it between queue and speaker.
+
+        This is where a chunk stops being withholdable, in BOTH branches — it
+        either becomes uncancellable audio inside ``play`` or is skipped
+        outright — so it is where :attr:`playback_pending`'s counter is
+        released, under the same lock that decides its fate.
+        """
+        with self._playback_lock:
+            self._withholdable = max(0, self._withholdable - 1)
+            ledger = self._ledger_for(item.response_id)
+            if item.generation != self._generation:
+                ledger.skipped_bytes += len(item.pcm)
+                ledger.cancelled = True
+                self.chunks_cancelled += 1
+                self.cancelled_bytes += len(item.pcm)
+                return False
+            self._current_response_id = item.response_id
+            ledger.in_flight_bytes = len(item.pcm)
+        return True
+
+    def _speak(self, item: _PlaybackChunk) -> None:
         play = self._play
         if play is None:  # pragma: no cover - never enqueued without a sink
             return
         self._speaking = True
+        spoken = False
         try:
-            play(audio, samplerate=self._output_sample_rate)
+            play(item.pcm, samplerate=self._output_sample_rate)
         except Exception:  # a dead speaker must not end the session
             self.playback_failures += 1
             if not self._playback_failed_logged:
                 self._playback_failed_logged = True
-                self._state.drop(REASON_PLAYBACK_FAILED, f"{len(audio)} bytes")
+                self._state.drop(REASON_PLAYBACK_FAILED, f"{len(item.pcm)} bytes")
                 logger.warning("duplex: playback sink raised", exc_info=True)
         else:
+            spoken = True
             self.played += 1
+            self.played_bytes += len(item.pcm)
             self._playback_failed_logged = False
         finally:
             self._speaking = False
+            with self._playback_lock:
+                ledger = self._ledger_for(item.response_id)
+                ledger.in_flight_bytes = 0
+                # Confirmed by the sink, or not heard at all: a failed play is
+                # never counted as spoken.
+                if spoken:
+                    ledger.played_bytes += len(item.pcm)
+                else:
+                    ledger.skipped_bytes += len(item.pcm)
 
     # --- small helpers -------------------------------------------------- #
 

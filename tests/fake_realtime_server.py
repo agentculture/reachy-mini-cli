@@ -38,8 +38,10 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   SPECIFIC token is required and only a mismatching/missing one 401s.
 - ``CLOSE_MID_STREAM`` — emits ``session.created``, waits (bounded by
   ``wait_timeout``) until it has received at least ``close_after_frames``
-  frames from the client, then drops the TCP connection with **no** WebSocket
-  CLOSE frame — an abrupt disconnect, not a clean shutdown.
+  frames from the client **on this connection**, then drops the TCP connection
+  with **no** WebSocket CLOSE frame — an abrupt disconnect, not a clean
+  shutdown. The count is per-connection so a reconnecting client meets the same
+  target again rather than being dropped the instant it reopens.
 - ``PING_EXPECT_PONG`` — emits ``session.created``, sends one PING frame,
   waits (bounded by ``pong_wait_s``) for a PONG to come back (recorded via
   :attr:`FakeRealtimeServer.pong_count` / :meth:`wait_for_pong`), then
@@ -63,6 +65,41 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   ``response_chunk_bytes``-sized slice of ``response_audio`` (multiple
   chunks by default, so a test can prove the reassembled audio is
   CONTIGUOUS) -> ``response.done``, then a graceful close.
+- ``RESPONSE_HOLD_BEFORE_DONE`` (foreground-Gemma plan, task t6) — the same
+  arm-and-wait and the same audio deltas as ``RESPONSE_HAPPY_PATH``, but it
+  then **HOLDS** the reply open: it waits (bounded by ``wait_timeout``) for
+  :meth:`FakeRealtimeServer.release_response_done` before sending
+  ``response.done`` and closing. Two things become testable that
+  ``RESPONSE_HAPPY_PATH`` cannot express, because that scenario's whole script
+  finishes within a millisecond of the handshake:
+
+  * **playback happens as the deltas arrive, not at ``response.done``** — a
+    client that accumulates the whole reply first has spoken NOTHING while
+    this scenario holds, and one that plays chunk groups has already spoken
+    the lot;
+  * **a busy mouth starves neither the pump nor the keepalive** — the hold
+    sends one PING every ``hold_ping_interval_s`` (default 0.1 s, counted in
+    ``ping_sent_count``) for as long as it lasts, so a test that blocks the
+    client's playback sink can watch ``pong_count`` keep RISING while it is
+    blocked, and can watch its own ``input_audio_buffer.append`` frames keep
+    landing in ``append_payloads``.
+
+  ``release_response_done`` is idempotent and safe to call from a test's
+  ``finally``, including when the hold already timed out on its own.
+- ``RESPONSE_TAIL_INTERJECTION`` (foreground-Gemma plan, task t16) — the same
+  arm-and-wait and the same audio deltas as ``RESPONSE_HAPPY_PATH``, then
+  ``response.done``, and only THEN — after waiting (bounded by
+  ``wait_timeout``, PINGing throughout exactly as the hold above does) for
+  :meth:`FakeRealtimeServer.release_interjection` — one
+  ``input_audio_buffer.speech_started``, after which the session is held OPEN
+  until the test tears it down. It scripts the one window
+  ``RESPONSE_INTERRUPTED`` cannot express: the floor has finished the reply
+  and returned to LISTENING while the client's own playback queue is still
+  draining, so a human talking over that tail produces a VAD onset and NO
+  ``response.interrupted``. The release gate is what makes the test
+  deterministic — it lets a test wait until a known number of chunks have
+  reached its sink before the interjection lands, so the measured said/unsaid
+  split is a fixed number rather than a race.
 - ``RESPONSE_INTERRUPTED`` — the same arm-and-wait as ``RESPONSE_HAPPY_PATH``,
   then ``response.created`` -> ``response.text.done`` -> exactly ONE
   (partial) ``response.audio.delta`` -> ``response.interrupted``
@@ -75,6 +112,45 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   well-formed frame but not valid JSON — the malformedness lives one level
   deeper, in the field content, mirroring how ``malformed_append_count``
   above already covers the inbound direction), then a graceful close.
+- ``ONE_SHOT_ARMING`` (foreground-Gemma plan, task t8) — a SCRIPT of several
+  transcripts on one session (``transcripts=[...]``), each one answered only
+  if the client has asked for a reply. Models the upstream ask filed as
+  agentculture/lobes-cli#170 item 1, and its absence, with ONE selector:
+
+  * ``announce_one_shot_arming=True`` — ``session.created``'s ``config``
+    carries ``arming: "one_shot"``, and the server behaves accordingly: one
+    ``response.create`` buys exactly ONE reply, and ``armed`` clears at that
+    reply's **completion** (``response.done`` or ``response.interrupted``),
+    never when the ``response.create`` frame is consumed. That distinction is
+    spec claim c46 and it is load-bearing rather than pedantic: every floor
+    call upstream sits behind ``if self.armed``
+    (``lobes/realtime/_conversation.py``:450), so a gateway that cleared
+    ``armed`` on consumption would silently lose mid-synthesis barge-in. A
+    test can watch :attr:`FakeRealtimeServer.is_armed` stay ``True`` for the
+    whole of a held reply and go ``False`` only once it ends.
+  * ``announce_one_shot_arming=False`` (the default) — the SAME script against
+    a gateway that announces nothing and latches ``armed`` on the first
+    ``response.create`` forever, which is what lobes ships **today**
+    (``ConversationBridge.arm()`` sets ``armed = True`` and nothing clears it).
+    Every transcript after the first arm is answered. This is the baseline a
+    client's capability check has to degrade to.
+
+  Each transcript is emitted as ``speech_started`` -> ``speech_stopped`` ->
+  ``transcription.completed``, after which the server waits up to
+  ``arm_grace_s`` for a ``response.create`` it has not already consumed —
+  bounded, so an utterance the client deliberately declines to answer costs
+  the test a fraction of a second rather than a ``wait_timeout``. The reply
+  itself may be held open (``hold_response=True``, released by
+  :meth:`release_response_done`) and/or cut short
+  (``interrupt_response=True``, ending in ``response.interrupted`` rather than
+  ``response.done``), so "still interruptible while armed" is expressible.
+
+  The harness SERIALISES what the real gateway does concurrently: it emits the
+  next transcript only after the previous one has been answered or declined.
+  Upstream keeps exactly one pending transcript
+  (``ConversationBridge._remember_pending``), so a real gateway receiving two
+  transcripts before the client's arm frame lands would answer the LATER one —
+  a timing bound worth knowing about, deliberately not modelled here.
 - ``DUPLEX_HAPPY_PATH`` (embodiment-layer plan, task t9) — the FULL duplex
   sequence on ONE socket, which is what the layer's own client
   (``reachy/speech/realtime_duplex.py``) has to prove: ``session.created`` ->
@@ -88,6 +164,21 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   (``transcription.completed`` at t=30.228, ``response.created`` 10 ms later
   on the same session). It exists because neither half alone can show that
   words IN and audio OUT share one socket.
+- ``DROP_AFTER_ARM`` (foreground-Gemma plan, task t10) — emits
+  ``session.created``, waits (bounded by ``wait_timeout``) until the client has
+  armed **on this connection**, then drops the TCP connection abruptly with no
+  CLOSE frame. The client reconnects and the whole cycle repeats, so a test
+  gets as many complete connect-and-drop cycles as it waits for.
+
+  Deliberately keyed on the ARM rather than on a raw frame count, which is what
+  makes it deterministic: ``response.create`` is the LAST thing a session sends
+  while coming up, so everything the client sends BEFORE arming — its whole
+  re-seed (spec claim c40) — has provably arrived by the time the trigger
+  fires. ``CLOSE_MID_STREAM`` with a frame target expresses "drop mid-session",
+  but a target the client reaches only by sending N frames couples the drop to
+  a count a test then has to keep in step with the client's startup sequence,
+  and a client starved by a loaded box can miss it entirely and pay a whole
+  ``wait_timeout`` before the drop.
 - ``ROLE_INFEASIBLE`` (embodiment-layer plan, task t9) — refuses the
   handshake with **404**, the gateway's answer when its ``stt`` lane is
   declared infeasible (``lobes-cli``'s ``site/src/scripts/
@@ -97,6 +188,48 @@ connection (pass it as ``FakeRealtimeServer(scenario=...)``):
   404 here is a CONFIGURATION verdict an operator must act on, not the
   transient outage a generic refusal implies, and a client is expected to
   name it separately while still reconnecting.
+
+Conversation items — the fourth frame kind (foreground-Gemma plan, task t10)
+-----------------------------------------------------------------------------
+``conversation.item.create`` is accepted by EVERY scenario rather than being a
+scenario of its own, because it is a channel a client uses *while* something
+else is going on (a re-seed at ``session.created``, a scope pushed mid-turn),
+not a script the server plays. Two constructor flags select the gateway's
+posture, and the default is the gateway shipping TODAY:
+
+* ``announce_conversation_items=False`` (default) — ``session.created`` says
+  nothing about items, which is what a real lobes gateway does: conversation-
+  item parity is explicitly PARKED upstream (``lobes/realtime/_conversation.py``
+  adopted ``response.create`` "for its SHAPE only"), and the ask is
+  agentculture/lobes-cli#170 item 2. A client is expected to send NO item at
+  all here and to degrade to the connect-time ``system_prompt`` context.
+* ``announce_conversation_items=True`` — ``session.created``'s ``config``
+  carries ``items: "context_and_history"`` and the server sorts arriving items
+  by their ``disposition``: :attr:`FakeRealtimeServer.context_items`
+  (ephemeral — they would participate in the next generate call and never
+  enter history) and :attr:`FakeRealtimeServer.history_items` (the client's
+  curated record). That split is the whole point of the ask: the floor already
+  auto-appends both roles (``_conversation.py``:489/523 user, :647/:680
+  assistant), so items landing beside those auto-appends would duplicate and
+  drift.
+* ``reject_items=True`` — the server ANSWERS each item with a named ``error``
+  event (``code="item_rejected"``) rather than accepting it, which is how a
+  version-skewed or stricter gateway would refuse one. A client must survive
+  that as a named drop and keep its session; the scenario it rides on is what
+  keeps the socket open long enough for "the session outlived the refusal" to
+  be observable.
+
+An item is RECORDED whatever this server announced, and that is deliberate:
+"no item reached a gateway that never announced one" is only provable if the
+harness would have recorded one that did. A server that quietly ignored
+unannounced items would make the client's own degrade test vacuous — it would
+pass for a client that sends items to everybody.
+
+Like ``arming: "one_shot"``, the ``items`` announcement and the item schema are
+ONE provisional guess at a contract upstream has not shipped, and both ends of
+it — this file and
+``reachy/speech/realtime_wire.build_conversation_item_create_event`` — change
+together if #170 item 2 lands differently.
 
 Two failure modes are deliberately NOT separate ``Scenario`` members, because
 they are properties of the REQUEST, not a server mood the harness picks:
@@ -142,7 +275,17 @@ event carries ``type``/``session_id``/``event_id``/``timestamp_ms`` plus:
   ``input_sample_rate`` — echoed from the connect URL's own
   ``?input_sample_rate=`` query param, exactly as the real session config rides
   the connect URL per ``realtime_wire``'s own docstring —, ``channels``,
-  ``turn_detection``, ``aec_mode``, ``system_prompt``).
+  ``turn_detection``, ``aec_mode``, ``system_prompt``), plus ``arming:
+  "one_shot"`` when ``announce_one_shot_arming=True``. That one key is the
+  exception to "hand-mirrored, not guessed": lobes has NOT shipped one-shot
+  arming (the ask is agentculture/lobes-cli#170 item 1), so both ends of it
+  here — this announcement and
+  :func:`reachy.speech.realtime_duplex.announces_one_shot_arming` — implement
+  ONE provisional guess at a contract that does not exist yet. It is safe
+  because it fails CLOSED: a gateway that announces a different shape, or
+  nothing, reads as "no one-shot arming" and the client degrades to today's
+  arm-once behaviour. If upstream ships a different name, this literal and that
+  predicate change together.
 - ``input_audio_buffer.speech_started`` / ``..._stopped``: ``item_id``,
   ``at_ms`` (an audio-stream-time integer), and (stopped only) ``reason``.
 - ``conversation.item.input_audio_transcription.completed``: ``item_id``,
@@ -201,6 +344,20 @@ Observability (thread-safe reads, populated by the reader thread)
   well-formed ``response.create`` frames arrived, and a blocking wait for the
   next one (embodiment-layer plan, task t3) — the arm-and-wait scenarios above
   poll this the same way ``CLOSE_MID_STREAM`` polls ``received_frames``.
+- ``received_event_types`` — every well-formed inbound EVENT type, in arrival
+  order and across reconnects. The ordering view: it is what proves a re-seed
+  landed BEFORE the ``response.create`` that follows it (spec claim c40),
+  which no per-kind counter can express.
+- ``items_received`` / ``context_items`` / ``history_items`` /
+  ``rejected_items`` — every ``conversation.item.create`` item object the
+  client sent, then the same items split by ``disposition`` as
+  ``(role, text)`` pairs (or collected as refusals under ``reject_items``).
+  ``wait_for_item(timeout)`` blocks for the next one.
+- ``is_armed`` / ``arms_consumed`` / ``answered_texts`` / ``unanswered_texts``
+  (and their ``answered_transcripts`` / ``unanswered_transcripts`` counts) —
+  the ``ONE_SHOT_ARMING`` script's bookkeeping: whether the server would answer
+  right now, how many arms it has taken up, and WHICH scripted transcripts got
+  a spoken reply versus went by in silence.
 - ``ping_sent_count``, ``connections_accepted``, ``handshake_headers``
   (lowercased dict from the most recently accepted handshake), ``request_path``,
   ``sent_events`` (every event this server sent, for debugging), ``refusals``
@@ -239,7 +396,38 @@ _DEFAULT_ACCEPT_TIMEOUT = 5.0
 _DEFAULT_IO_TIMEOUT = 0.2
 _DEFAULT_WAIT_TIMEOUT = 5.0
 _DEFAULT_PONG_WAIT_S = 2.0
+#: How often ``RESPONSE_HOLD_BEFORE_DONE`` PINGs while it holds the reply open.
+#: Small enough that a test blocking the client's mouth sees ``pong_count``
+#: rise promptly, large enough that a held session is not a busy loop.
+_DEFAULT_HOLD_PING_INTERVAL_S = 0.1
+#: How long ``ONE_SHOT_ARMING`` waits for a ``response.create`` after a
+#: transcript before deciding the client is not going to answer this one. It is
+#: deliberately NOT ``wait_timeout``: a DECLINED utterance is the expected
+#: outcome of half those tests, so this bound is paid on the happy path and has
+#: to stay small — while staying far above the client's own decision path,
+#: which is a few synchronous calls on the session worker thread.
+_DEFAULT_ARM_GRACE_S = 0.5
 _MAX_HEAD_BYTES = 64 * 1024
+
+#: ``session.created``'s ``config`` key that announces the gateway's arming
+#: MODE, and the one value that means one-shot. See the module docstring's
+#: event-shape section: this is a provisional contract for an upstream feature
+#: that has not shipped (lobes-cli#170 item 1), paired with
+#: :func:`reachy.speech.realtime_duplex.announces_one_shot_arming`.
+ARMING_CONFIG_KEY = "arming"
+ARMING_MODE_ONE_SHOT = "one_shot"
+
+#: ``session.created``'s ``config`` key that announces conversation-item
+#: support, and the one value that means "``conversation.item.create`` is
+#: accepted AND ephemeral context items are distinguished from history turns".
+#: The second provisional contract in this file (lobes-cli#170 item 2, decision
+#: c28), paired with
+#: :func:`reachy.speech.realtime_duplex.announces_conversation_items`.
+ITEMS_CONFIG_KEY = "items"
+ITEMS_MODE_CONTEXT_AND_HISTORY = "context_and_history"
+
+#: The ``error`` code this harness refuses an item with under ``reject_items``.
+ITEM_REJECTED_CODE = "item_rejected"
 
 
 class Scenario(str, Enum):
@@ -253,9 +441,13 @@ class Scenario(str, Enum):
     ERROR_VAD_UNAVAILABLE = "error_vad_unavailable"
     ERROR_STT_FORWARD_FAILED = "error_stt_forward_failed"
     RESPONSE_HAPPY_PATH = "response_happy_path"
+    RESPONSE_HOLD_BEFORE_DONE = "response_hold_before_done"
+    RESPONSE_TAIL_INTERJECTION = "response_tail_interjection"
     RESPONSE_INTERRUPTED = "response_interrupted"
     RESPONSE_AUDIO_DELTA_MALFORMED = "response_audio_delta_malformed"
     DUPLEX_HAPPY_PATH = "duplex_happy_path"
+    ONE_SHOT_ARMING = "one_shot_arming"
+    DROP_AFTER_ARM = "drop_after_arm"
     ROLE_INFEASIBLE = "role_infeasible"
 
 
@@ -375,9 +567,17 @@ class FakeRealtimeServer:
         close_after_frames: int = 1,
         ping_payload: bytes = b"keepalive",
         pong_wait_s: float = _DEFAULT_PONG_WAIT_S,
+        hold_ping_interval_s: float = _DEFAULT_HOLD_PING_INTERVAL_S,
         wait_timeout: float = _DEFAULT_WAIT_TIMEOUT,
         accept_timeout: float = _DEFAULT_ACCEPT_TIMEOUT,
         io_timeout: float = _DEFAULT_IO_TIMEOUT,
+        transcripts: "list[str] | tuple[str, ...] | None" = None,
+        announce_one_shot_arming: bool = False,
+        arm_grace_s: float = _DEFAULT_ARM_GRACE_S,
+        hold_response: bool = False,
+        interrupt_response: bool = False,
+        announce_conversation_items: bool = False,
+        reject_items: bool = False,
     ) -> None:
         self._scenario = Scenario(scenario)
         self._host = host
@@ -389,14 +589,30 @@ class FakeRealtimeServer:
         self._close_after_frames = close_after_frames
         self._ping_payload = ping_payload
         self._pong_wait_s = pong_wait_s
+        self._hold_ping_interval_s = max(0.001, float(hold_ping_interval_s))
         self._wait_timeout = wait_timeout
         self._accept_timeout = accept_timeout
         self._io_timeout = io_timeout
+        self._transcripts = tuple(transcripts) if transcripts is not None else (transcript,)
+        self._announce_one_shot_arming = bool(announce_one_shot_arming)
+        self._arm_grace_s = max(0.0, float(arm_grace_s))
+        self._hold_response = bool(hold_response)
+        self._interrupt_response = bool(interrupt_response)
+        self._announce_conversation_items = bool(announce_conversation_items)
+        self._reject_items = bool(reject_items)
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._pong_event = threading.Event()
         self._response_create_event = threading.Event()
+        self._item_event = threading.Event()
+        self._release_done_event = threading.Event()
+        #: ``RESPONSE_TAIL_INTERJECTION``'s own gate. Deliberately NOT the
+        #: ``_release_done_event`` above: that one releases a reply the server
+        #: is still holding, this one releases a VAD onset AFTER the reply
+        #: finished, and a test that needs both would otherwise have one lever
+        #: for two moments.
+        self._release_interjection_event = threading.Event()
 
         self._sock: socket.socket | None = None
         self._port = 0
@@ -405,7 +621,14 @@ class FakeRealtimeServer:
         self._live_sockets: list[socket.socket] = []
 
         self._received_frames: list[tuple[int, bytes]] = []
+        self._received_event_types: list[str] = []
         self._append_payloads: list[bytes] = []
+        #: Conversation items (the fourth frame kind), whole and then split by
+        #: ``disposition`` — see the module docstring's own section.
+        self._items_received: list[dict] = []
+        self._context_items: list[tuple[str, str]] = []
+        self._history_items: list[tuple[str, str]] = []
+        self._rejected_items: list[dict] = []
         self._malformed_append_count = 0
         self._pong_count = 0
         self._ping_sent_count = 0
@@ -419,6 +642,15 @@ class FakeRealtimeServer:
         self._last_item_id: str | None = None
         self._last_response_id: str | None = None
         self._last_input_sample_rate: int | None = None
+        #: ``ONE_SHOT_ARMING`` bookkeeping — see that scenario in the module
+        #: docstring. ``_armed`` is the server's own conversation state, NOT a
+        #: count of frames received: it goes True when an unconsumed
+        #: ``response.create`` is taken up and False again at the answered
+        #: reply's COMPLETION (one-shot mode only).
+        self._armed = False
+        self._arms_consumed = 0
+        self._answered_texts: list[str] = []
+        self._unanswered_texts: list[str] = []
 
     # --- lifecycle ----------------------------------------------------------
 
@@ -496,9 +728,47 @@ class FakeRealtimeServer:
             return [opcode for opcode, _payload in self._received_frames]
 
     @property
+    def received_event_types(self) -> list[str]:
+        """Every inbound EVENT type, in arrival order and ACROSS reconnects.
+
+        The one view that can express an ORDERING claim: "the re-seed items
+        preceded the arm" (spec claim c40) is a statement about the sequence,
+        and a per-kind counter cannot make it however many counters there are.
+        Spanning reconnects is deliberate — the claim is about what happens
+        after a session DROPS, so the interesting sequence starts on the second
+        connection.
+        """
+        with self._lock:
+            return list(self._received_event_types)
+
+    @property
     def append_payloads(self) -> list[bytes]:
         with self._lock:
             return list(self._append_payloads)
+
+    @property
+    def items_received(self) -> list[dict]:
+        """Every ``conversation.item.create`` item object the client sent, in order."""
+        with self._lock:
+            return list(self._items_received)
+
+    @property
+    def context_items(self) -> list[tuple[str, str]]:
+        """``(role, text)`` for every EPHEMERAL context item accepted."""
+        with self._lock:
+            return list(self._context_items)
+
+    @property
+    def history_items(self) -> list[tuple[str, str]]:
+        """``(role, text)`` for every curated HISTORY turn accepted."""
+        with self._lock:
+            return list(self._history_items)
+
+    @property
+    def rejected_items(self) -> list[dict]:
+        """Items this server refused (``reject_items=True``), rather than accepted."""
+        with self._lock:
+            return list(self._rejected_items)
 
     @property
     def malformed_append_count(self) -> int:
@@ -565,6 +835,55 @@ class FakeRealtimeServer:
         with self._lock:
             return self._last_input_sample_rate
 
+    @property
+    def is_armed(self) -> bool:
+        """Whether the ``ONE_SHOT_ARMING`` script would answer a turn right now.
+
+        Read it DURING a held reply to prove the c46 property: one-shot arming
+        clears at the reply's completion, not when the ``response.create``
+        frame is consumed, so the floor stays interruptible mid-synthesis.
+        """
+        with self._lock:
+            return self._armed
+
+    @property
+    def arms_consumed(self) -> int:
+        """How many ``response.create`` frames the script has taken up."""
+        with self._lock:
+            return self._arms_consumed
+
+    @property
+    def answered_texts(self) -> list[str]:
+        """The scripted transcripts that got a spoken reply, in order.
+
+        The TEXTS and not merely a count, because the counts alone cannot tell
+        "answered the one it was asked about" from "answered the other one" —
+        and a per-utterance arming test that cannot tell those apart passes for
+        an arc that got the wiring exactly backwards.
+        """
+        with self._lock:
+            return list(self._answered_texts)
+
+    @property
+    def unanswered_texts(self) -> list[str]:
+        """The scripted transcripts the client declined to have answered.
+
+        The list that matters for issue #149: the utterances the room said, the
+        robot heard, and nobody answered out loud.
+        """
+        with self._lock:
+            return list(self._unanswered_texts)
+
+    @property
+    def answered_transcripts(self) -> int:
+        """How many scripted transcripts got a spoken reply."""
+        return len(self.answered_texts)
+
+    @property
+    def unanswered_transcripts(self) -> int:
+        """How many scripted transcripts went by unanswered."""
+        return len(self.unanswered_texts)
+
     def wait_for_pong(self, timeout: float | None = None) -> bool:
         """Block until a PONG has arrived (or *timeout* elapses). Returns whether one has."""
         return self._pong_event.wait(timeout=timeout)
@@ -577,6 +896,28 @@ class FakeRealtimeServer:
         same event internally rather than polling.
         """
         return self._response_create_event.wait(timeout=timeout)
+
+    def wait_for_item(self, timeout: float | None = None) -> bool:
+        """Block until a well-formed ``conversation.item.create`` has arrived."""
+        return self._item_event.wait(timeout=timeout)
+
+    def release_response_done(self) -> None:
+        """Let ``RESPONSE_HOLD_BEFORE_DONE`` finish the reply it is holding open.
+
+        Idempotent and safe from any thread — call it from a test's ``finally``
+        whether or not the hold is still running, and whether or not it already
+        timed out on its own.
+        """
+        self._release_done_event.set()
+
+    def release_interjection(self) -> None:
+        """Let ``RESPONSE_TAIL_INTERJECTION`` send the VAD onset it is holding back.
+
+        Idempotent and safe from any thread, exactly like
+        :meth:`release_response_done` — and separate from it on purpose, so a
+        test can hold a reply open AND time the interjection independently.
+        """
+        self._release_interjection_event.set()
 
     # --- accept loop --------------------------------------------------------------
 
@@ -796,7 +1137,7 @@ class FakeRealtimeServer:
                 with self._lock:
                     self._received_frames.append((opcode, payload))
                 if opcode == wire.OPCODE_TEXT:
-                    self._record_text_frame(payload)
+                    self._record_text_frame(payload, conn, send_lock)
                 elif opcode == wire.OPCODE_PING:
                     self._send_frame(conn, send_lock, wire.OPCODE_PONG, payload)
                 elif opcode == wire.OPCODE_PONG:
@@ -810,17 +1151,69 @@ class FakeRealtimeServer:
         finally:
             done.set()
 
-    def _record_text_frame(self, payload: bytes) -> None:
+    def _record_text_frame(
+        self, payload: bytes, conn: socket.socket, send_lock: threading.Lock
+    ) -> None:
         event = wire.decode_event(payload)
         if event is None:
             return
         event_type = event.get("type")
+        with self._lock:
+            if isinstance(event_type, str):
+                self._received_event_types.append(event_type)
         if event_type == wire.APPEND_EVENT_TYPE:
             self._record_append_event(event)
         elif event_type == wire.RESPONSE_CREATE_EVENT_TYPE:
             with self._lock:
                 self._response_create_count += 1
             self._response_create_event.set()
+        elif event_type == wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE:
+            self._record_conversation_item(event, conn, send_lock)
+
+    def _record_conversation_item(
+        self, event: dict, conn: socket.socket, send_lock: threading.Lock
+    ) -> None:
+        """Accept (and SORT) one item, or refuse it under ``reject_items``.
+
+        The sort is the whole ask (lobes-cli#170 item 2): an item's
+        ``disposition`` says whether it is ephemeral CONTEXT for the next
+        generate call or a curated HISTORY turn, and a harness that lumped them
+        together could not tell a client that got the distinction right from one
+        that never made it.
+        """
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return
+        role = item.get("role")
+        content = item.get("content")
+        text = ""
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            text = str(content[0].get("text", ""))
+        with self._lock:
+            self._items_received.append(item)
+        self._item_event.set()
+
+        if self._reject_items:
+            with self._lock:
+                self._rejected_items.append(item)
+                session_id = self._last_session_id or ""
+            self._send_event(
+                conn,
+                send_lock,
+                self._event_error(
+                    session_id,
+                    ITEM_REJECTED_CODE,
+                    "this gateway does not accept conversation items",
+                ),
+            )
+            return
+
+        pair = (str(role), text)
+        with self._lock:
+            if item.get("disposition") == wire.ITEM_DISPOSITION_HISTORY:
+                self._history_items.append(pair)
+            else:
+                self._context_items.append(pair)
 
     def _record_append_event(self, event: dict) -> None:
         audio_field = event.get("audio")
@@ -893,19 +1286,30 @@ class FakeRealtimeServer:
     # --- event builders (hand-mirrored from lobes-cli's _session.py schema) --------
 
     def _event_session_created(self, session_id: str, input_sample_rate: int) -> dict:
+        config: dict = {
+            "input_audio_format": "pcm16",
+            "input_sample_rate": input_sample_rate,
+            "channels": 1,
+            "turn_detection": "server_vad",
+            "aec_mode": "none",
+            "system_prompt": None,
+        }
+        if self._announce_one_shot_arming:
+            # One of the TWO provisional keys in this file — see the module
+            # docstring. A gateway that does not announce it says NOTHING here,
+            # which is what makes the client's check fail closed.
+            config[ARMING_CONFIG_KEY] = ARMING_MODE_ONE_SHOT
+        if self._announce_conversation_items:
+            # The other one (lobes-cli#170 item 2, decision c28). Same
+            # discipline: silence is the honest default, because silence is
+            # what every gateway shipping today says about items.
+            config[ITEMS_CONFIG_KEY] = ITEMS_MODE_CONTEXT_AND_HISTORY
         return {
             "type": "session.created",
             "session_id": session_id,
             "event_id": _gen_id("event"),
             "timestamp_ms": _timestamp_ms(),
-            "config": {
-                "input_audio_format": "pcm16",
-                "input_sample_rate": input_sample_rate,
-                "channels": 1,
-                "turn_detection": "server_vad",
-                "aec_mode": "none",
-                "system_prompt": None,
-            },
+            "config": config,
         }
 
     def _event_speech_started(self, session_id: str, item_id: str, at_ms: int = 0) -> dict:
@@ -931,14 +1335,16 @@ class FakeRealtimeServer:
             "reason": reason,
         }
 
-    def _event_transcription_completed(self, session_id: str, item_id: str) -> dict:
+    def _event_transcription_completed(
+        self, session_id: str, item_id: str, text: str | None = None
+    ) -> dict:
         return {
             "type": "conversation.item.input_audio_transcription.completed",
             "session_id": session_id,
             "event_id": _gen_id("event"),
             "timestamp_ms": _timestamp_ms(),
             "item_id": item_id,
-            "text": self._transcript,
+            "text": self._transcript if text is None else text,
         }
 
     def _event_error(
@@ -1079,7 +1485,15 @@ class FakeRealtimeServer:
 
         if scenario is Scenario.CLOSE_MID_STREAM:
             deadline = time.monotonic() + self._wait_timeout
-            target = self._close_after_frames
+            # PER-CONNECTION, not cumulative: a client that reconnects must meet
+            # the same frame target again, or the second connection would die
+            # the instant it opened (the first one's frames already satisfy a
+            # global count) and every reconnect test would be racing a socket
+            # closing under it. The "target it can never reach" idiom is
+            # unaffected, and a test that offers a frame per poll — which every
+            # reconnect test here does — reaches a small target on each
+            # connection exactly as it did before.
+            target = len(self.received_frames) + self._close_after_frames
             while time.monotonic() < deadline:
                 # ``_stop_event`` is checked so a test may hold a session open
                 # with a LONG ``wait_timeout`` (the "frame target it can never
@@ -1089,6 +1503,16 @@ class FakeRealtimeServer:
                 if len(self.received_frames) >= target or self._stop_event.is_set():
                     break
                 time.sleep(0.02)
+            self._abrupt_close(conn)
+            return
+
+        if scenario is Scenario.DROP_AFTER_ARM:
+            deadline = time.monotonic() + self._wait_timeout
+            armed_before = self.response_create_count
+            while time.monotonic() < deadline:
+                if self.response_create_count > armed_before or self._stop_event.is_set():
+                    break
+                time.sleep(0.01)
             self._abrupt_close(conn)
             return
 
@@ -1110,10 +1534,16 @@ class FakeRealtimeServer:
 
         if scenario in (
             Scenario.RESPONSE_HAPPY_PATH,
+            Scenario.RESPONSE_HOLD_BEFORE_DONE,
+            Scenario.RESPONSE_TAIL_INTERJECTION,
             Scenario.RESPONSE_INTERRUPTED,
             Scenario.RESPONSE_AUDIO_DELTA_MALFORMED,
         ):
             self._run_response_scenario(conn, send_lock, session_id, item_id, scenario)
+            return
+
+        if scenario is Scenario.ONE_SHOT_ARMING:
+            self._run_one_shot_scenario(conn, send_lock, session_id)
             return
 
         if scenario is Scenario.DUPLEX_HAPPY_PATH:
@@ -1218,5 +1648,163 @@ class FakeRealtimeServer:
             self._send_event(
                 conn, send_lock, self._event_response_audio_delta(session_id, response_id, chunk)
             )
+        if scenario is Scenario.RESPONSE_HOLD_BEFORE_DONE:
+            self._hold_reply_open(conn, send_lock)
         self._send_event(conn, send_lock, self._event_response_done(session_id, response_id))
+        if scenario is Scenario.RESPONSE_TAIL_INTERJECTION:
+            # The floor has finished and is LISTENING again — and the client's
+            # own playback queue is still draining. This is the ONE window a
+            # `response.interrupted` can never appear in.
+            self._hold_until(conn, send_lock, self._release_interjection_event)
+            self._send_event(conn, send_lock, self._event_speech_started(session_id, item_id))
+            self._idle_until_stopped()
         self._graceful_close(conn, send_lock)
+
+    # --- the ONE_SHOT_ARMING script (foreground-Gemma plan, task t8) ---------------
+
+    def _run_one_shot_scenario(
+        self, conn: socket.socket, send_lock: threading.Lock, session_id: str
+    ) -> None:
+        """Emit each scripted transcript and answer only the ones asked about.
+
+        The whole point of the scenario, in one loop: a transcript is emitted,
+        the server waits a BOUNDED grace for a ``response.create`` it has not
+        already consumed, and only then does it speak. With
+        ``announce_one_shot_arming`` the arm is spent by that one reply
+        (cleared at COMPLETION — see the class's :attr:`is_armed`); without it
+        the arm latches forever, which is what lobes ships today.
+        """
+        one_shot = self._announce_one_shot_arming
+        with self._lock:
+            # A new session starts DISARMED, whatever the previous one ended
+            # as — a reconnect must not inherit a latched gateway's armed state.
+            self._armed = False
+        for text in self._transcripts:
+            item_id = _gen_id("item")
+            with self._lock:
+                self._last_item_id = item_id
+            self._send_event(conn, send_lock, self._event_speech_started(session_id, item_id))
+            self._send_event(conn, send_lock, self._event_speech_stopped(session_id, item_id))
+            self._send_event(
+                conn, send_lock, self._event_transcription_completed(session_id, item_id, text)
+            )
+            self._take_arm()
+            if not self.is_armed:
+                with self._lock:
+                    self._unanswered_texts.append(text)
+                continue
+            self._emit_one_reply(conn, send_lock, session_id, item_id)
+            with self._lock:
+                self._answered_texts.append(text)
+                if one_shot:
+                    # CLEARED AT COMPLETION, never at consumption (spec c46).
+                    self._armed = False
+        self._idle_until_stopped()
+        self._graceful_close(conn, send_lock)
+
+    def _take_arm(self) -> None:
+        """Wait out the arm grace and take up one unconsumed ``response.create``.
+
+        "Unconsumed" is the cumulative frame count minus the arms already taken
+        up, never a per-loop counter: an arm that lands BEFORE this method runs
+        (the racing-client hazard :meth:`_run_response_scenario` documents) must
+        not be missed, and the arithmetic has to survive a reconnect that
+        re-runs the whole script. An already-armed server — the latching
+        gateway, which is every gateway shipping today — skips the wait
+        entirely.
+        """
+        if not self.is_armed and self._arm_grace_s > 0.0:
+            deadline = time.monotonic() + self._arm_grace_s
+            while time.monotonic() < deadline and not self._has_unconsumed_arm():
+                if self._stop_event.is_set():
+                    break
+                time.sleep(0.01)
+        if self._has_unconsumed_arm():
+            with self._lock:
+                self._armed = True
+                self._arms_consumed += 1
+
+    def _has_unconsumed_arm(self) -> bool:
+        with self._lock:
+            return self._response_create_count > self._arms_consumed
+
+    def _idle_until_stopped(self) -> None:
+        """Hold the finished session OPEN until the test tears it down.
+
+        Every other scenario closes the moment its script ends, which is fine
+        when the assertion is about what the server SENT. This one asserts what
+        the client did NOT send, and a closed socket makes the client reconnect
+        and replay the whole script — so "exactly one ``response.create``"
+        would silently become "one per reconnect". Worse, an arm WAKES a client
+        parked in its reconnect backoff, so an armed session skips the backoff
+        it would otherwise have waited out: measured, 30 connections in 1.3 s.
+        Bounded by ``wait_timeout`` and interrupted by :meth:`stop`, so it costs
+        teardown nothing.
+        """
+        deadline = time.monotonic() + self._wait_timeout
+        while time.monotonic() < deadline and not self._stop_event.is_set():
+            self._stop_event.wait(timeout=0.02)
+
+    def _emit_one_reply(
+        self, conn: socket.socket, send_lock: threading.Lock, session_id: str, item_id: str
+    ) -> None:
+        """One complete spoken reply: created -> text -> deltas -> done/interrupted."""
+        response_id = _gen_id("resp")
+        with self._lock:
+            self._last_response_id = response_id
+        self._send_event(
+            conn, send_lock, self._event_response_created(session_id, response_id, item_id)
+        )
+        self._send_event(
+            conn,
+            send_lock,
+            self._event_response_text_done(session_id, response_id, self._response_text),
+        )
+        chunk_bytes = self._response_chunk_bytes
+        for start in range(0, len(self._response_audio), chunk_bytes):
+            self._send_event(
+                conn,
+                send_lock,
+                self._event_response_audio_delta(
+                    session_id, response_id, self._response_audio[start : start + chunk_bytes]
+                ),
+            )
+        if self._hold_response:
+            self._release_done_event.clear()
+            self._hold_reply_open(conn, send_lock)
+        if self._interrupt_response:
+            self._send_event(
+                conn, send_lock, self._event_response_interrupted(session_id, response_id)
+            )
+        else:
+            self._send_event(conn, send_lock, self._event_response_done(session_id, response_id))
+
+    def _hold_reply_open(self, conn: socket.socket, send_lock: threading.Lock) -> None:
+        """Keep a reply un-``done`` until released, PINGing throughout.
+
+        The PINGs are the point, not decoration: they are what lets a test
+        prove the client's session pump and keepalive survive a BLOCKED
+        playback sink — ``pong_count`` must keep rising while the mouth is
+        stuck. Bounded by ``wait_timeout`` so a test that forgets to release
+        still terminates (the same "make the wait observable, never hang the
+        suite" posture every other wait in this file takes).
+        """
+        self._hold_until(conn, send_lock, self._release_done_event)
+
+    def _hold_until(
+        self, conn: socket.socket, send_lock: threading.Lock, released: threading.Event
+    ) -> None:
+        """PING until *released* is set, the server stops, or ``wait_timeout`` elapses.
+
+        The shared body behind :meth:`_hold_reply_open` and
+        ``RESPONSE_TAIL_INTERJECTION``'s post-``response.done`` gate: two
+        different moments a test needs to time, one keepalive-preserving wait.
+        """
+        deadline = time.monotonic() + self._wait_timeout
+        while time.monotonic() < deadline:
+            if released.is_set() or self._stop_event.is_set():
+                return
+            self._send_frame(conn, send_lock, wire.OPCODE_PING, self._ping_payload)
+            with self._lock:
+                self._ping_sent_count += 1
+            released.wait(timeout=self._hold_ping_interval_s)

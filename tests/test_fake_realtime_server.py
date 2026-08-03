@@ -130,6 +130,18 @@ class _TestClient:
     def send_response_create(self) -> None:
         self.send_frame(wire.OPCODE_TEXT, wire.build_response_create_event().encode("utf-8"))
 
+    def send_conversation_item(
+        self,
+        text: str,
+        *,
+        role: str = wire.ITEM_ROLE_SYSTEM,
+        disposition: str = wire.ITEM_DISPOSITION_CONTEXT,
+    ) -> None:
+        payload = wire.build_conversation_item_create_event(
+            text, role=role, disposition=disposition
+        )
+        self.send_frame(wire.OPCODE_TEXT, payload.encode("utf-8"))
+
     def close(self) -> None:
         """Drain any pending inbound bytes (e.g. the server's own trailing WS
         CLOSE frame this test didn't explicitly read) before closing the fd.
@@ -717,6 +729,61 @@ def test_response_audio_delta_malformed_scenario_decodes_the_envelope_but_not_th
         client.close()
 
 
+def test_response_hold_before_done_withholds_done_until_released_and_pings_meanwhile() -> None:
+    """The hold scenario's two promises (foreground-Gemma plan, task t6).
+
+    Every audio delta arrives BEFORE ``response.done`` is even sent — which is
+    what lets a duplex client prove it speaks chunk groups as they arrive
+    rather than accumulating the whole reply — and the hold keeps PINGing
+    throughout, which is what lets that same client prove a blocked playback
+    sink never starves its keepalive.
+    """
+    with FakeRealtimeServer(
+        Scenario.RESPONSE_HOLD_BEFORE_DONE,
+        response_audio=bytes(range(24)),
+        response_chunk_bytes=8,
+        hold_ping_interval_s=0.02,
+    ) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        client.send_response_create()
+        client.read_event()  # response.created
+        client.read_event()  # response.text.done
+
+        deltas = []
+        pings = 0
+        for _ in range(3):
+            deltas.append(client.read_event())
+        assert [event["type"] for event in deltas] == ["response.audio.delta"] * 3
+
+        # response.done is NOT here yet: the next frames are keepalive PINGs.
+        while pings < 2:
+            _fin, opcode, _payload = client.read_frame()
+            assert opcode == wire.OPCODE_PING, "response.done arrived before the release"
+            pings += 1
+
+        server.release_response_done()
+        event = client.read_frame()
+        while event[1] == wire.OPCODE_PING:
+            event = client.read_frame()
+        decoded = wire.decode_event(event[2])
+        assert decoded is not None
+        assert decoded["type"] == "response.done"
+        client.close()
+
+    assert server.ping_sent_count >= 2
+    assembled = b"".join(base64.b64decode(delta["delta"]) for delta in deltas)
+    assert assembled == bytes(range(24))
+
+
+def test_release_response_done_is_idempotent_and_safe_before_the_hold_runs() -> None:
+    server = FakeRealtimeServer(Scenario.RESPONSE_HOLD_BEFORE_DONE)
+    server.release_response_done()
+    server.release_response_done()  # idempotent, and safe with nothing started
+    server.stop(timeout=1.0)
+
+
 def test_response_create_count_and_wait_for_response_create_observability() -> None:
     with FakeRealtimeServer(Scenario.RESPONSE_HAPPY_PATH) as server:
         client, status, _headers = _connect(server)
@@ -752,17 +819,22 @@ def test_last_response_id_is_populated_and_opaque() -> None:
 # --- the client-side send surface, over a LIVE round trip (h13) -------------------
 
 
-def test_the_live_send_surface_is_exactly_append_and_response_create() -> None:
+def test_the_live_send_surface_is_append_response_create_and_conversation_item() -> None:
     """Complements the AST-level pin in ``test_realtime_wire.py``
-    (``test_the_wire_modules_outbound_frame_type_family_is_exactly_two_members``):
-    drives a real client through BOTH outbound frame kinds against the fake
-    server and checks the server only ever decoded those two ``type`` values —
-    a live wire-level pin alongside the static source-level one."""
-    with FakeRealtimeServer(Scenario.RESPONSE_HAPPY_PATH) as server:
-        client, status, _headers = _connect(server)
+    (``test_the_wire_modules_outbound_frame_type_family_is_exactly_three_members``):
+    drives a real client through ALL THREE outbound frame kinds against the fake
+    server and checks the server only ever decoded those three ``type`` values —
+    a live wire-level pin alongside the static source-level one.
+
+    It widened from two kinds to three with the change that landed
+    ``conversation.item.create`` (decision c28, honesty h20).
+    """
+    with FakeRealtimeServer(Scenario.RESPONSE_HAPPY_PATH, announce_conversation_items=True) as srv:
+        client, status, _headers = _connect(srv)
         assert status == 101
         client.read_event()  # session.created
         client.send_append(b"\x01\x02\x03\x04")
+        client.send_conversation_item("the operator is at the desk")
         client.send_response_create()
         event = client.read_event()
         while event["type"] != "response.done":
@@ -770,10 +842,171 @@ def test_the_live_send_surface_is_exactly_append_and_response_create() -> None:
         client.close()
 
     seen_types: set[str] = set()
-    for opcode, payload in server.received_frames:
+    for opcode, payload in srv.received_frames:
         if opcode != wire.OPCODE_TEXT:
             continue
         decoded = wire.decode_event(payload)
         if decoded is not None:
             seen_types.add(decoded["type"])
-    assert seen_types == {wire.APPEND_EVENT_TYPE, wire.RESPONSE_CREATE_EVENT_TYPE}
+    assert seen_types == {
+        wire.APPEND_EVENT_TYPE,
+        wire.RESPONSE_CREATE_EVENT_TYPE,
+        wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE,
+    }
+
+
+# --- conversation items: the fourth frame kind (task t10, decision c28) ----------
+
+
+def test_session_created_announces_conversation_items_only_when_asked() -> None:
+    """The provisional capability key, present or absent — nothing in between.
+
+    Absent is the DEFAULT because absent is what every gateway shipping today
+    says: conversation-item parity is parked upstream (lobes-cli#170 item 2).
+    """
+    with FakeRealtimeServer(Scenario.HAPPY_PATH) as server:
+        client, _status, _headers = _connect(server)
+        silent = client.read_event()
+        client.close()
+    assert "items" not in silent["config"]
+
+    with FakeRealtimeServer(Scenario.HAPPY_PATH, announce_conversation_items=True) as server:
+        client, _status, _headers = _connect(server)
+        announced = client.read_event()
+        client.close()
+    assert announced["config"]["items"] == "context_and_history"
+
+
+def test_items_are_sorted_by_disposition_into_context_and_history() -> None:
+    """The distinction the whole upstream ask is about, recorded separately."""
+    with FakeRealtimeServer(
+        Scenario.CLOSE_MID_STREAM,
+        announce_conversation_items=True,
+        close_after_frames=10_000,
+        wait_timeout=1.0,
+    ) as server:
+        client, _status, _headers = _connect(server)
+        client.read_event()  # session.created
+        client.send_conversation_item("a rolling summary")
+        client.send_conversation_item(
+            "and what about tomorrow?",
+            role=wire.ITEM_ROLE_USER,
+            disposition=wire.ITEM_DISPOSITION_HISTORY,
+        )
+        assert _wait_until(lambda: len(server.items_received) >= 2)
+        client.close()
+
+    assert server.context_items == [("system", "a rolling summary")]
+    assert server.history_items == [("user", "and what about tomorrow?")]
+
+
+def test_an_item_is_recorded_even_when_this_gateway_announced_no_support() -> None:
+    """Deliberate, and load-bearing for the client's own c44 test.
+
+    "No item may reach a gateway that never announced one" is only provable if
+    the harness would have RECORDED one that did. A server that quietly ignored
+    unannounced items would make that assertion vacuous — it would pass for a
+    client that sends items to everybody.
+    """
+    with FakeRealtimeServer(
+        Scenario.CLOSE_MID_STREAM, close_after_frames=10_000, wait_timeout=1.0
+    ) as server:
+        client, _status, _headers = _connect(server)
+        client.read_event()  # session.created
+        client.send_conversation_item("sent to a gateway that never asked for it")
+        assert _wait_until(lambda: len(server.items_received) >= 1)
+        client.close()
+
+    assert server.context_items == [("system", "sent to a gateway that never asked for it")]
+
+
+def test_reject_items_answers_each_item_with_a_named_error_event() -> None:
+    """A version-skewed gateway's refusal — an answer, not a disconnect."""
+    with FakeRealtimeServer(
+        Scenario.CLOSE_MID_STREAM,
+        announce_conversation_items=True,
+        reject_items=True,
+        close_after_frames=10_000,
+        wait_timeout=1.0,
+    ) as server:
+        client, _status, _headers = _connect(server)
+        client.read_event()  # session.created
+        client.send_conversation_item("a scope the gateway will refuse")
+        error = client.read_event()
+        client.close()
+
+    assert error["type"] == "error"
+    assert error["code"] == "item_rejected"
+    assert server.rejected_items
+    assert server.context_items == []
+
+
+def test_received_event_types_records_every_inbound_event_in_order() -> None:
+    """The ordering view — the only one that can express "before"."""
+    with FakeRealtimeServer(
+        Scenario.CLOSE_MID_STREAM,
+        announce_conversation_items=True,
+        close_after_frames=10_000,
+        wait_timeout=1.0,
+    ) as server:
+        client, _status, _headers = _connect(server)
+        client.read_event()  # session.created
+        client.send_conversation_item("first")
+        client.send_response_create()
+        client.send_append(b"\x00\x01")
+        assert _wait_until(lambda: len(server.received_event_types) >= 3)
+        client.close()
+
+    assert server.received_event_types[:3] == [
+        wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE,
+        wire.RESPONSE_CREATE_EVENT_TYPE,
+        wire.APPEND_EVENT_TYPE,
+    ]
+
+
+def test_drop_after_arm_drops_the_connection_once_the_client_has_armed() -> None:
+    """The reconnect trigger keyed on the ARM, not on a frame count.
+
+    Deterministic where a count is not: everything sent BEFORE the arm has
+    provably arrived when the drop fires, which is exactly what a re-seed
+    ordering test needs (spec claim c40).
+    """
+    with FakeRealtimeServer(Scenario.DROP_AFTER_ARM, wait_timeout=2.0) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+        client.send_conversation_item("seeded before the arm")
+        client.send_response_create()
+
+        def drain_until_dead() -> None:
+            for _ in range(5):
+                client.read_frame()
+
+        with pytest.raises((wire.FrameReadError, ConnectionError, OSError)):
+            drain_until_dead()
+        client.close()
+
+    assert server.response_create_count == 1
+    assert server.received_event_types == [
+        wire.CONVERSATION_ITEM_CREATE_EVENT_TYPE,
+        wire.RESPONSE_CREATE_EVENT_TYPE,
+    ]
+
+
+def test_drop_after_arm_gives_up_on_its_own_when_the_client_never_arms() -> None:
+    """Bounded like every other wait here: an unarmed client costs one
+    ``wait_timeout``, never a hung suite."""
+    with FakeRealtimeServer(Scenario.DROP_AFTER_ARM, wait_timeout=0.2) as server:
+        client, status, _headers = _connect(server)
+        assert status == 101
+        client.read_event()  # session.created
+
+        def drain_until_dead() -> None:
+            for _ in range(5):
+                client.read_frame()
+
+        with pytest.raises((wire.FrameReadError, ConnectionError, OSError)):
+            drain_until_dead()
+        client.close()
+
+    assert server.response_create_count == 0

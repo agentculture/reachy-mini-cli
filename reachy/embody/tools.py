@@ -19,9 +19,9 @@ tool                    the sanctioned surface it wraps
 ``run_behavior``        :class:`reachy.behavior.intents.IntentDriver`'s
                         ``run_behavior`` kind (library-name + param checks,
                         the unbounded-lifetime refusal) + the same spool
-``speak`` /             the injected say / harmonics seams — the same
-``harmonics``           ``synthesize`` + ``play_audio`` pair ``agent
-                        attach`` injects — bounded by the ONE shared
+``speak`` /             :class:`reachy.embody.interjection.
+``harmonics``           InterjectionPolicy` — a PROPOSAL, not playback (see
+                        below) — bounded by the ONE shared
                         :data:`reachy.behavior.rules.MAX_SAY_CHARS`
 ``create_rule``         the rules overlay
                         (:func:`reachy.behavior.rules.overlay_rules_path`,
@@ -52,7 +52,36 @@ in the layer is a bound an operator using the CLI does not get. So this module
   :data:`reachy.behavior.rules.MAX_SAY_CHARS` — importing the constant, never
   restating the number — exactly as
   :class:`reachy.behavior.speech_act.SpeechActuator` does, "because a rule is
-  not its only caller".
+  not its only caller", and then hand the utterance to the interjection policy,
+  which owns every remaining question about it.
+
+The voice tools are PROPOSALS, and that is the whole of issue #155's c2
+-------------------------------------------------------------------------
+Until task t12 these two tools reached an injected ``synthesize`` +
+``play_audio`` pair directly: the background model wrote a sentence and the
+room heard it. The two-tempo architecture forbids exactly that — **Gemma is the
+foreground voice and Qwen never owns the mouth** — so the tool NAMES are kept
+(a model that has learned to call ``speak`` keeps working) and their EFFECT is
+now an INTERJECTION governed by :class:`reachy.embody.interjection.
+InterjectionPolicy`:
+
+* refused (the shipped default is OFF) -> a NAMED refusal, returned as the tool
+  result so the model can read it. A refusal the model cannot see is not a
+  refusal, it is a silence the model reads as success and repeats;
+* admitted -> a typed, inspectable :class:`~reachy.embody.interjection.
+  Interjection` handed to the injected ``on_interjection`` seam, which the
+  composition root binds to
+  :meth:`reachy.embody.engine.EmbodyTurnEngine.note_interjection`. It reaches
+  the foreground as a ``speakable`` cognition scope — a suggestion Gemma may
+  re-word or decline.
+
+**This registry therefore holds no audio seam at all.** That is structural, not
+configured: the constructor has no parameter for one and this module imports no
+synthesis and no playback, so there is no code path — authorized or not —
+from a tool call to a speaker (spec honesty condition h1, pinned in
+``tests/test_embody_governed_voice.py``). The layer still has a mouth; it
+belongs to the realtime floor, and the sink is reached only by
+:mod:`reachy.speech.realtime_duplex` playing the FOREGROUND voice's own reply.
 
 The two policies this module *does* own
 --------------------------------------
@@ -81,14 +110,17 @@ available — there is no other owner.
 Import boundary
 ---------------
 Follows :mod:`reachy.speech.intent_tools` — this module imports that module's
-public ``Tool`` / ``function_tool`` shapes from :mod:`reachy.speech.tools` and
-the behavior package's spool/rules/validator surfaces, and **nothing else**. It
-never imports :mod:`reachy.speech.tts` / :mod:`~reachy.speech.playback` /
-:mod:`~reachy.speech.voice` (the audio stack arrives as two injected
-callables), never imports :mod:`reachy.daemon` (state-dir resolution arrives
-under the spool and the rules loader), never imports ``reachy_mini``, and
-contains no ``subprocess``, no ``os.system``, and no ``eval``/``exec``.
-``tests/test_embody_redteam.py`` asserts every one of those by AST.
+public ``Tool`` / ``function_tool`` shapes from :mod:`reachy.speech.tools`, the
+behavior package's spool/rules/validator surfaces, the interjection policy that
+governs the voice tools, and **nothing else**. It never imports
+:mod:`reachy.speech.tts` / :mod:`~reachy.speech.playback` /
+:mod:`~reachy.speech.voice` — there is no audio stack here at all any more, by
+construction rather than by injection — never imports :mod:`reachy.daemon`
+(state-dir resolution arrives under the spool and the rules loader), never
+imports ``reachy_mini``, and contains no ``subprocess``, no ``os.system``, and
+no ``eval``/``exec``. ``tests/test_embody_redteam.py`` asserts every one of
+those by AST, and ``tests/test_embody_governed_voice.py`` asserts the audio
+absence over this module's own surface.
 """
 
 from __future__ import annotations
@@ -110,6 +142,8 @@ from reachy.behavior.goto_intent import GOTO, MAX_DURATION_S, make_goto_handler
 from reachy.behavior.intents import INTENT_NAMESPACE, RUN_BEHAVIOR, IntentDriver
 from reachy.behavior.rules import MAX_SAY_CHARS
 from reachy.cli._errors import CliError
+from reachy.embody.interjection import REFUSALS as INTERJECTION_REFUSALS
+from reachy.embody.interjection import Interjection, InterjectionPolicy
 from reachy.speech.tools import Tool, function_tool
 
 logger = logging.getLogger(__name__)
@@ -125,6 +159,13 @@ STAGE = "action"
 SPEAK = "speak"
 HARMONICS = "harmonics"
 CREATE_RULE = "create_rule"
+
+#: The provenance a proposal made through THIS registry's voice tools carries
+#: into :meth:`reachy.embody.interjection.InterjectionPolicy.admit`. The policy
+#: is route-agnostic on purpose — a mesh peer's typed event and the worker's own
+#: tool call differ only in this name — so the operator authorizes "the worker"
+#: rather than "the tool route", and one allow-list covers every door.
+TOOL_SOURCE = "worker"
 
 #: The layer's ENTIRE action set, in publication order. Pinned by equality in
 #: ``tests/test_embody_tools.py`` — a sixth tool is a deliberate widening of the
@@ -146,8 +187,14 @@ SANCTIONED_SURFACES: dict[str, tuple[str, ...]] = {
         "reachy.behavior.intents.IntentDriver",
         "reachy.behavior.control.submit",
     ),
-    SPEAK: ("reachy.behavior.rules.MAX_SAY_CHARS",),
-    HARMONICS: ("reachy.behavior.rules.MAX_SAY_CHARS",),
+    SPEAK: (
+        "reachy.behavior.rules.MAX_SAY_CHARS",
+        "reachy.embody.interjection.InterjectionPolicy",
+    ),
+    HARMONICS: (
+        "reachy.behavior.rules.MAX_SAY_CHARS",
+        "reachy.embody.interjection.InterjectionPolicy",
+    ),
     CREATE_RULE: (
         "reachy.behavior.rules.load_rules",
         "reachy.behavior.rules.overlay_rules_path",
@@ -186,7 +233,10 @@ REFUSAL_GOTO = "goto-refused"
 #: The ``run_behavior`` kind refused it (unknown behavior, unknown/non-numeric
 #: param, or the unbounded ``looping``-with-no-``duration`` lifetime).
 REFUSAL_BEHAVIOR = "behavior-refused"
-#: The utterance was empty or over :data:`reachy.behavior.rules.MAX_SAY_CHARS`.
+#: The proposed utterance was empty or over
+#: :data:`reachy.behavior.rules.MAX_SAY_CHARS`. Checked BEFORE the interjection
+#: policy sees it, so the shared bound stays the shared bound whatever the
+#: policy would have said.
 REFUSAL_SAY = "say-refused"
 #: :meth:`reachy.behavior.rules.RulesConfig.from_dict` refused the authored rule
 #: (a field outside the declarative schema, an unbounded lifetime, a say over
@@ -194,7 +244,11 @@ REFUSAL_SAY = "say-refused"
 REFUSAL_RULE = "rule-refused"
 #: The rule id was missing, malformed, or outside the ``embody-`` namespace.
 REFUSAL_RULE_NAMESPACE = "rule-namespace-refused"
-#: No voice seam was injected at composition, so the layer has no mouth.
+#: No interjection route was injected at composition, so an admitted proposal
+#: would reach nobody. Refused BEFORE the policy is asked — telling the model
+#: ``ok: true`` for a proposal that went nowhere is the mirror image of the
+#: unseen refusal this module refuses to ship, and it would spend the source's
+#: rate budget on a proposal that could never land.
 REFUSAL_NO_VOICE = "no-voice-seam"
 #: A handler raised something unexpected. Named rather than propagated, so a
 #: bad tool call can never kill the turn loop.
@@ -216,10 +270,22 @@ REFUSALS: frozenset[str] = frozenset(
     }
 )
 
-#: A voice seam: ``speak(text) -> object``. Composition binds it to the same
-#: ``synthesize`` + ``play_audio`` pair ``agent attach`` uses; this module never
-#: imports either, so it cannot open an audio device on its own.
-SoundSeam = Callable[[str], object]
+#: The refusals a VOICE tool can additionally return: the interjection policy's
+#: own vocabulary, IMPORTED rather than restated, so the policy stays the single
+#: owner of what it may say no to.
+VOICE_REFUSALS: frozenset[str] = INTERJECTION_REFUSALS
+
+#: Every refusal any tool in this registry can produce, from either owner. A
+#: consumer checking "was this a named refusal?" wants this set; the two halves
+#: stay separate above so each module's vocabulary test still pins its own.
+ALL_REFUSALS: frozenset[str] = REFUSALS | VOICE_REFUSALS
+
+#: The interjection route: ``publish(interjection) -> object``. Composition
+#: binds it to :meth:`reachy.embody.engine.EmbodyTurnEngine.note_interjection`,
+#: which parks the proposal as a ``speakable`` cognition scope for the
+#: FOREGROUND voice to weigh. Deliberately not an audio seam — see the module
+#: docstring's "The voice tools are PROPOSALS".
+InterjectionSeam = Callable[[Interjection], object]
 #: A reload seam: ``reload(timeout) -> dict | None`` — submit a rules reload and
 #: report what (if anything) the engine said. Defaults to the real spool.
 ReloadSeam = Callable[[float], "dict | None"]
@@ -615,16 +681,41 @@ def _make_run_behavior_handler(
     return handler
 
 
-def _make_voice_handler(seam: SoundSeam | None, name: str) -> Callable[[dict], str]:
+def _make_voice_handler(
+    policy: InterjectionPolicy,
+    publish: InterjectionSeam | None,
+    name: str,
+    source: str,
+) -> Callable[[dict], str]:
+    """Turn a proposed utterance into a governed interjection. Never into audio.
+
+    Three gates in one order, and the order is load-bearing:
+
+    1. the SHARED say cap (:func:`_require_text`), because that bound belongs to
+       :data:`reachy.behavior.rules.MAX_SAY_CHARS` whatever the policy thinks;
+    2. the presence of a route, because spending the source's rate budget on a
+       proposal that can reach nobody costs it a later one it could have landed;
+    3. the policy itself, which owns default-deny, the per-source allow-list,
+       attention and the rate bound — and which names its own drop, so this
+       function returns that verdict verbatim rather than paraphrasing it into
+       a second vocabulary.
+    """
+
     def handler(arguments: dict) -> str:
         text = _require_text(arguments)
-        if seam is None:
+        if publish is None:
             raise Refusal(
                 REFUSAL_NO_VOICE,
-                f"{name} is unavailable: no voice seam was injected at composition",
+                f"{name} is unavailable: no interjection route was injected at "
+                "composition, so a proposal would reach nobody",
             )
-        seam(text)
-        return json.dumps({"ok": True, "voice": name, "chars": len(text)})
+        verdict = policy.admit(text, source=source)
+        if not verdict.admitted:
+            # The policy has already named the drop; the model sees the same
+            # word in its own result.
+            return json.dumps({**verdict.as_result(), "voice": name})
+        publish(verdict.interjection)
+        return json.dumps({**verdict.as_result(), "voice": name, "chars": len(text)})
 
     return handler
 
@@ -739,7 +830,13 @@ def _run_behavior_tool(spool_root: Path | None, timeout: float, catalog: Mapping
     )
 
 
-def _voice_tool(name: str, description: str, seam: SoundSeam | None) -> Tool:
+def _voice_tool(
+    name: str,
+    description: str,
+    policy: InterjectionPolicy,
+    publish: InterjectionSeam | None,
+    source: str,
+) -> Tool:
     return function_tool(
         name=name,
         description=description,
@@ -748,12 +845,14 @@ def _voice_tool(name: str, description: str, seam: SoundSeam | None) -> Tool:
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": f"What to say (at most {MAX_SAY_CHARS} characters).",
+                    "description": (
+                        f"What you propose saying (at most {MAX_SAY_CHARS} characters)."
+                    ),
                 }
             },
             "required": ["text"],
         },
-        handler=_make_voice_handler(seam, name),
+        handler=_make_voice_handler(policy, publish, name, source),
     )
 
 
@@ -828,13 +927,21 @@ class EmbodyToolRegistry:
 
     Parameters
     ----------
-    speak / harmonics:
-        The two voice seams, ``seam(text) -> object`` (composition binds them to
-        the same ``synthesize`` + ``play_audio`` pair ``agent attach`` uses).
-        ``None`` leaves the tool ADVERTISED but refusing with a named
-        :data:`REFUSAL_NO_VOICE` — the layer's tool set must not change shape
-        with the box's audio configuration, or the model learns a different
-        robot on every start.
+    interjection:
+        The :class:`reachy.embody.interjection.InterjectionPolicy` governing the
+        two voice tools. ``None`` builds the CLOSED shipped state, which is the
+        point: a registry nobody configured proposes nothing, and every
+        ``speak`` call resolves to a named refusal the model can read.
+    on_interjection:
+        Where an ADMITTED proposal goes: ``publish(interjection) -> object``,
+        bound at composition to :meth:`reachy.embody.engine.EmbodyTurnEngine.
+        note_interjection`. ``None`` leaves the tools ADVERTISED but refusing
+        with a named :data:`REFUSAL_NO_VOICE` — the layer's tool set must not
+        change shape with the box's configuration, or the model learns a
+        different robot on every start.
+    source:
+        The provenance the voice tools' proposals carry into the policy
+        (default :data:`TOOL_SOURCE`).
     spool_root:
         Overrides the state-dir root the intents spool writes under (mainly test
         isolation), exactly like
@@ -857,8 +964,9 @@ class EmbodyToolRegistry:
     def __init__(
         self,
         *,
-        speak: SoundSeam | None = None,
-        harmonics: SoundSeam | None = None,
+        interjection: InterjectionPolicy | None = None,
+        on_interjection: InterjectionSeam | None = None,
+        source: str = TOOL_SOURCE,
         spool_root: Path | None = None,
         rules_path: Path | None = None,
         await_timeout: float = DEFAULT_AWAIT_TIMEOUT,
@@ -867,14 +975,28 @@ class EmbodyToolRegistry:
     ) -> None:
         lib = catalog if catalog is not None else behavior_library.LIBRARY
         reload_fn = reload_seam if reload_seam is not None else _default_reload_seam
+        policy = interjection if interjection is not None else InterjectionPolicy()
         tools = (
             _goto_tool(spool_root, await_timeout),
-            _voice_tool(SPEAK, "Speak text aloud in Reachy's spoken (TTS) voice.", speak),
+            _voice_tool(
+                SPEAK,
+                "Propose something for Reachy to say aloud in its spoken (TTS) voice. "
+                "This does NOT speak by itself: the proposal reaches the voice that "
+                "actually talks to the room, which decides the wording and whether to "
+                "say anything at all. It is refused unless an operator has authorized "
+                "you to interject.",
+                policy,
+                on_interjection,
+                source,
+            ),
             _voice_tool(
                 HARMONICS,
-                "Render text as a short melodic phrase in Reachy's harmonic voice "
-                "(chirp/sing) — an expressive, non-speech vocalization.",
-                harmonics,
+                "Propose a short melodic phrase in Reachy's harmonic voice (chirp/sing) "
+                "— an expressive, non-speech vocalization. Like 'speak' this is a "
+                "proposal, not playback: the voice that talks to the room decides.",
+                policy,
+                on_interjection,
+                source,
             ),
             _run_behavior_tool(spool_root, await_timeout, lib),
             _create_rule_tool(rules_path, reload_fn, await_timeout, lib),

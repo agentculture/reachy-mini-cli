@@ -170,3 +170,149 @@ def test_doctor_json_shape_includes_sense_extras_id(
     check = _find(payload["checks"], "sense_extras")
     assert isinstance(check["passed"], bool)
     assert check["severity"] == "warning"
+
+
+# --------------------------------------------------------------------------- #
+# The model-pair check (task t14, spec assumption c47)                        #
+#                                                                             #
+# Gemma is named in TWO configs and only one of them lives in this repo: the  #
+# realtime service's own ``OPENAI_MODEL`` decides which model SPEAKS, and     #
+# ``REACHY_EMBODY_SENSES_MODEL`` decides which model answers the layer's      #
+# perception questions. They are a documented pair; the worker lane is the    #
+# BACKGROUND mind and is expected to be a different model entirely, which is  #
+# why it is named but never compared.                                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_model_pair_check_is_present_and_names_both_halves_of_the_pair() -> None:
+    report = _diagnose(env={})
+    check = _find(report["checks"], "model_pair")
+
+    assert check["severity"] == "warning"
+    assert doctor_module.ENV_VOICE_MODEL in str(check["message"])
+    assert doctor_module.ENV_SENSES_MODEL in str(check["message"])
+
+
+def test_model_pair_passes_when_nothing_is_configured() -> None:
+    """The state every box is in today: the gateway holds its own OPENAI_MODEL
+    and the layer resolves the `senses` ROLE. Additive means additive — a
+    healthy box must not become unhealthy just because this check landed."""
+    report = _diagnose(env={}, cv2_probe=lambda: True)
+
+    assert _find(report["checks"], "model_pair")["passed"] is True
+    assert report["healthy"] is True
+
+
+def test_model_pair_warns_when_the_voice_and_senses_models_diverge() -> None:
+    report = _diagnose(
+        env={
+            "OPENAI_MODEL": "coolthor/gemma-4-12B-it-NVFP4A16",
+            "REACHY_EMBODY_SENSES_MODEL": "qwen3",
+        }
+    )
+    check = _find(report["checks"], "model_pair")
+
+    assert check["passed"] is False
+    assert "coolthor/gemma-4-12B-it-NVFP4A16" in str(check["message"])
+    assert "qwen3" in str(check["message"])
+    assert check["remediation"]
+
+
+def test_model_pair_passes_when_both_name_the_same_model() -> None:
+    report = _diagnose(
+        env={
+            "OPENAI_MODEL": "coolthor/gemma-4-12B-it-NVFP4A16",
+            "REACHY_EMBODY_SENSES_MODEL": "coolthor/gemma-4-12B-it-NVFP4A16",
+        }
+    )
+
+    assert _find(report["checks"], "model_pair")["passed"] is True
+
+
+def test_a_role_alias_is_never_read_as_a_divergent_model_name() -> None:
+    """`senses` is a ROUTING ALIAS the gateway resolves, not a served model id.
+    Comparing it as a string against a served id would warn on the one
+    configuration the layer documents as correct."""
+    report = _diagnose(
+        env={
+            "OPENAI_MODEL": "coolthor/gemma-4-12B-it-NVFP4A16",
+            "REACHY_EMBODY_SENSES_MODEL": "senses",
+        }
+    )
+
+    assert _find(report["checks"], "model_pair")["passed"] is True
+
+
+def test_the_worker_lane_is_named_but_never_compared() -> None:
+    """The two-tempo split means the BACKGROUND model differs on purpose
+    (Qwen thinks, Gemma speaks). A check that flagged that would be telling
+    the operator to undo the architecture."""
+    report = _diagnose(
+        env={
+            "OPENAI_MODEL": "gemma",
+            "REACHY_EMBODY_SENSES_MODEL": "gemma",
+            "REACHY_EMBODY_WORKER_MODEL": "qwen3",
+        }
+    )
+    check = _find(report["checks"], "model_pair")
+
+    assert check["passed"] is True
+    assert "qwen3" in str(check["message"])
+
+
+def test_model_pair_reads_the_injected_env_not_the_process_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_MODEL", "from-the-process")
+    monkeypatch.setenv("REACHY_EMBODY_SENSES_MODEL", "something-else")
+
+    assert _find(_diagnose(env={})["checks"], "model_pair")["passed"] is True
+
+
+def test_doctor_json_shape_includes_model_pair_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["doctor", "--json"])
+
+    assert rc in (0, 1)
+    payload = json.loads(capsys.readouterr().out)
+    check = _find(payload["checks"], "model_pair")
+    assert isinstance(check["passed"], bool)
+    assert check["severity"] == "warning"
+
+
+# --------------------------------------------------------------------------- #
+# Drift guard — doctor may not import the layer, so it restates two names     #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_layer_env_names_doctor_restates_match_the_layers_own() -> None:
+    """`doctor` is imported by `_build_parser()`, and `reachy.embody.engine`
+    reaches `reachy.speech.llm` — so importing the engine here would put the
+    LLM client in the import path of `--help`
+    (`tests/test_zero_llm_boundary.py::test_building_the_cli_parser_loads_no_
+    cognition_module`). The names are therefore restated as literals, and this
+    pins them equal to their one real home, the way
+    `DEFAULT_PERCEPTION_STALE_AFTER_S` is pinned to `DEFAULT_CLIP_STALE_
+    AFTER_S`."""
+    from reachy.embody import engine as embody_engine
+
+    assert doctor_module.ENV_SENSES_MODEL == embody_engine.ENV_SENSES_MODEL
+    assert doctor_module.ENV_WORKER_MODEL == embody_engine.ENV_WORKER_MODEL
+    assert doctor_module.MODEL_ROLE_ALIASES == embody_engine.ROLES
+
+
+def test_doctor_does_not_import_the_embody_layer_at_module_scope() -> None:
+    """The reason the names above are restated at all."""
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path(doctor_module.__file__).read_text(encoding="utf-8"))
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.col_offset == 0:
+            imported.append(node.module or "")
+        elif isinstance(node, ast.Import) and node.col_offset == 0:
+            imported.extend(alias.name for alias in node.names)
+
+    assert not [name for name in imported if name.startswith("reachy.embody")], imported

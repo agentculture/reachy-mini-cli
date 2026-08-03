@@ -90,6 +90,7 @@ from __future__ import annotations
 import argparse
 import base64
 import functools
+import json
 import logging
 import os
 import sys
@@ -97,7 +98,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -636,14 +637,41 @@ def cmd_agent_attach(
 # connected the two ends. So the wirings here are stated, not implied:
 #
 #   media.source.read   -> duplex read_audio      (the layer's EARS)
-#   media.sink.play     -> duplex play            (the layer's MOUTH)
-#   media.sink.play     -> the speak/harmonics tools' render leg
+#   media.sink.play     -> duplex play            (the layer's ONLY MOUTH: the
+#                          FOREGROUND voice's own reply — c2. The speak /
+#                          harmonics tools used to render here too and no
+#                          longer do; see "The interjection route" below)
+#   speak / harmonics   -> InterjectionPolicy.admit -> engine.note_interjection
+#                          (a PROPOSAL: refused by name, or parked as a
+#                          speakable cognition scope. Never audio — c2/h1)
+#   interjection line   -> InterjectionPolicy.admit_event -> the same, with
+#                          alert=True (an EXTERNAL proposal may wake the mind)
 #   duplex on_utterance -> engine.submit_utterance   (a TRIGGER, if attention
 #                          admits it: the name opens the window — #148)
+#                       -> session.arm_once          (ONE spoken reply, and
+#                          only for an utterance attention admitted — #149;
+#                          the same verdict governs the mind AND the mouth)
 #   duplex on_response  -> engine.note_spoken        (CONTEXT, never a trigger;
 #                          extends a live attention window, never opens one)
-#   runtime feed line   -> classified_cues_for_line -> engine.submit_cues
+#                       -> engine.note_interrupted_reply  (for a CUT reply: the
+#                          measured said half as spoken, the remainder kept as
+#                          a wanted-to-say artifact the next turn reads — c34)
+#                       -> engine.floor_correction -> session.send_item  (and
+#                          the floor is TOLD what the room actually heard, as a
+#                          history item — c39's phase-1 overstatement closing)
+#   duplex on_speech_started -> session.cancel_playback + the same
+#                          note_interrupted_reply  (the TAIL cut: after
+#                          response.done the floor can no longer interrupt
+#                          anything, and our queue is still draining — c34/c35;
+#                          attention deliberately does NOT gate it)
+#   duplex reseed       -> engine.floor_reseed       (on EVERY session.created,
+#                          BEFORE the arm: the layer curates the canonical
+#                          history and pushes a projection of it, so the floor's
+#                          own history is what the layer put there — c27/c40)
+#   runtime feed line   -> classified_cues_for_runtime_event -> submit_cues
 #                          (a rule FIRE triggers; every other cue parks — #143)
+#   the shared history  -> SummaryProducer -> engine.update_summary (ONE
+#                          summary, Qwen's, on its own thread — c30)
 #   engine + every layer failure -> the shared --export cognition feed
 #
 # IMPORT BOUNDARY (h15). Every import of the layer, the realtime client and the
@@ -665,23 +693,39 @@ def cmd_agent_attach(
 #: ``duplex`` and the tools' ``action`` so one journal can be split by layer.
 EMBODY_STAGE = "embody"
 
-EMBODY_SOURCE_VOICE = "voice"
 EMBODY_SOURCE_SESSION = "session"
 EMBODY_SOURCE_CUES = "cue-reader"
 EMBODY_SOURCE_SHUTDOWN = "shutdown"
 #: The clip -> ``ask()`` perception lane (task t11, issue #139's h9 blocker).
 EMBODY_SOURCE_CLIP = "clip"
 
-#: A voice engine would not resolve at composition, so that tool refuses for the
-#: life of the process rather than the tool set changing shape per box.
-REASON_VOICE_UNAVAILABLE = "voice-unavailable"
-#: Synthesis or playback raised — a wedged TTS, a dead speaker, a refused
-#: daemon route. The model is told (a named refusal) and the feed shows it.
-REASON_SPEAK_FAILED = "speak-failed"
 #: The duplex session refused to start; the layer is deaf and mute but alive.
 REASON_SESSION_START_FAILED = "session-start-failed"
 #: The runtime line source raised mid-stream (the feed went away, the bus died).
 REASON_CUE_SOURCE_FAILED = "cue-source-failed"
+#: Asking the session for ONE spoken reply raised (issue #149). The utterance
+#: was admitted and the room will now hear nothing back, so it cannot be a
+#: swallowed exception: the tap runs on the session's own worker thread, where
+#: a raise is caught and logged as an anonymous warning at best.
+REASON_ARM_FAILED = "arm-failed"
+#: Cutting the mouth off raised (task t16). The tap runs on the session's own
+#: worker thread, where a raise is an anonymous warning at best — and the room
+#: is still hearing a reply someone just talked over, so it cannot be silent.
+REASON_TAIL_CUT_FAILED = "tail-cut-failed"
+#: Asking the session what the room actually heard of a reply raised (task t7).
+#: The tap falls back to the pre-measurement answer — the reply is recorded as
+#: spoken unless the server itself said it was interrupted — so the mind is
+#: never left with NO record of its own voice; the drop says the record is the
+#: coarse one.
+REASON_SPLIT_UNAVAILABLE = "cut-split-unavailable"
+#: Pushing the layer's canonical record to the floor RAISED (task t11, decision
+#: c27). ``send_item`` never raises and answers ``False`` for a gateway that
+#: announced no item support — naming that degrade itself, once per session — so
+#: this is the socket dying under a correction, not the ordinary no-items
+#: gateway. Named because the tap runs on the session's own worker thread, and
+#: because a floor left holding an overstated reply is a fact about the
+#: conversation the operator should be able to see.
+REASON_FLOOR_PUSH_FAILED = "floor-push-failed"
 #: Closing a held resource raised. Named, never propagated — a fault in teardown
 #: must not mask the reason the layer was stopping.
 REASON_SHUTDOWN_FAILED = "shutdown-failed"
@@ -702,6 +746,14 @@ REASON_CLIP_ASK_FAILED = "clip-ask-failed"
 #: ``ask()`` returned no usable answer (an empty/blank stream) — nothing worth
 #: parking as context.
 REASON_CLIP_ASK_EMPTY = "clip-ask-empty"
+#: The senses lane answered, but :func:`parse_perception_answer` could not
+#: find the requested ``{"summary": ..., "entities": [...], "confidence":
+#: ...}`` shape in it (task t13, issue #155 c7). NOT a lost observation: the
+#: raw answer text still becomes a summary-only snapshot — this reason names
+#: the DEGRADE, never the drop of the whole update. The senses lane is a
+#: cheap model answering in free text; assume it will sometimes ignore the
+#: requested format.
+REASON_CLIP_ANSWER_UNSTRUCTURED = "clip-answer-unstructured"
 
 #: Every failure this composition root can name, in one place so the journal,
 #: the export feed, the operator docs and the tests share ONE vocabulary — the
@@ -709,21 +761,21 @@ REASON_CLIP_ASK_EMPTY = "clip-ask-empty"
 #: each keep for their own layer.
 EMBODY_REASONS: frozenset[str] = frozenset(
     {
-        REASON_VOICE_UNAVAILABLE,
-        REASON_SPEAK_FAILED,
         REASON_SESSION_START_FAILED,
         REASON_CUE_SOURCE_FAILED,
+        REASON_ARM_FAILED,
+        REASON_TAIL_CUT_FAILED,
+        REASON_SPLIT_UNAVAILABLE,
+        REASON_FLOOR_PUSH_FAILED,
         REASON_SHUTDOWN_FAILED,
         REASON_CLIP_UNAVAILABLE,
         REASON_CLIP_STALE,
         REASON_CLIP_UNREADABLE,
         REASON_CLIP_ASK_FAILED,
         REASON_CLIP_ASK_EMPTY,
+        REASON_CLIP_ANSWER_UNSTRUCTURED,
     }
 )
-
-#: The two voices the layer composes, by :mod:`reachy.speech.voice` engine name.
-_EMBODY_VOICES = ("tts", "harmonic")
 
 EMBODY_READER_THREAD_NAME = "embody-cue-reader"
 EMBODY_CLIP_THREAD_NAME = "embody-clip-asker"
@@ -762,6 +814,20 @@ DEFAULT_CLIP_STALE_AFTER_S = 30.0
 #: sibling supervisor's ``DEFAULT_STOP_TIMEOUT`` (10.0) is already independently
 #: defined three times over (sleep/vision/behavior).
 EMBODY_DEFAULT_STOP_TIMEOUT = 10.0
+
+#: Mirrors :data:`reachy.embody.attention.DEFAULT_ATTENTION_WINDOW_S` and
+#: :data:`reachy.embody.engine.ENV_ATTENTION_WINDOW_S` by VALUE, not by import
+#: — for the SAME reason ``DEFAULT_TURN_INTERVAL``/``EMBODY_DEFAULT_STOP_
+#: TIMEOUT`` above are independently defined here rather than imported: a
+#: command module registering this noun's CLI flags must not import
+#: :mod:`reachy.embody` at module scope (it pulls in ``reachy.speech.llm``,
+#: forbidden in ``_build_parser()``'s import closure by
+#: ``tests/test_zero_llm_boundary.py``). Used only to spell out the default in
+#: the flag's own help text; resolution against the real default happens in
+#: :func:`reachy.embody.engine.resolve_attention_window_s`, imported
+#: function-locally where composition actually needs it.
+DEFAULT_ATTENTION_WINDOW_S = 45.0
+ENV_ATTENTION_WINDOW_S = "REACHY_EMBODY_ATTENTION_WINDOW"
 
 
 def _embody_drop(export: object, source: str, reason: str, detail: str = "") -> None:
@@ -802,89 +868,82 @@ def _embody_drop(export: object, source: str, reason: str, detail: str = "") -> 
 
 
 # ---------------------------------------------------------------------------
-# The voice seams — the layer's mouth for its own DELIBERATE utterances
+# The interjection route — where a PROPOSED utterance goes (issue #155, c2)
 # ---------------------------------------------------------------------------
 #
-# Distinct from the duplex session's mouth: that one plays the SERVER's spoken
-# reply, this one renders a ``speak`` / ``harmonics`` tool call. Both end at the
-# same :class:`~reachy.embody.media.EmbodySink`, which is what keeps the
-# profile decision (daemon-http on the robot, monitor speakers on the bench) in
-# exactly one place.
+# There is no voice seam here any more, and its absence is the feature. Until
+# task t12 this section built a ``synthesize`` + ``play_audio`` pair and handed
+# it to the tool registry, so the WORKER model's text reached the speaker
+# directly. The two-tempo architecture forbids exactly that: Gemma, rendered by
+# the realtime floor, is the only voice the room hears (spec claim c2), and
+# Qwen influences the conversation only through explicit typed events.
+#
+# So the layer's one remaining mouth is the duplex session's own playback leg
+# (``resolved_media.sink.play``, passed to ``RealtimeDuplexSession``), and a
+# ``speak``/``harmonics`` tool call becomes an INTERJECTION: governed by
+# ``reachy.embody.interjection.InterjectionPolicy`` (default OFF, per-source
+# default-deny, rate-bounded) and, if admitted, parked as a ``speakable``
+# cognition scope the foreground voice may use or decline.
 
 
-def _voice_seam(
-    name: str,
-    synthesize: Callable[[str], bytes],
-    samplerate: int,
-    sink: object,
-    *,
-    export: object,
-) -> Callable[[str], str]:
-    """Build ``seam(text) -> str``: synthesize, play through *sink*, or name it.
+class _LateAttention:
+    """The attention gate, reachable before the engine that owns it exists.
 
-    A failure is named with the layer's own precise reason AND re-raised as the
-    tool layer's :class:`~reachy.embody.tools.Refusal`, so the model is told in
-    the same turn that its mouth did not work. A failure the model cannot see is
-    not a failure — it is a robot that believes it spoke.
+    The interjection policy needs the gate; the gate belongs to the engine; the
+    engine is built from the registry the policy configures. Rather than break
+    that circle by giving the policy a second gate — two state machines
+    answering "is a conversation live?" is exactly how the two would come to
+    disagree — this forwards to the ONE gate through the same one-slot box
+    :func:`_compose_embody_seam` already uses for the session.
+
+    Fail-closed while the slot is empty: no engine yet reads as COLD, so an
+    interjection arriving before composition finishes is refused rather than
+    admitted on a technicality.
     """
 
-    def _speak(text: str) -> str:
-        from reachy.embody.tools import REFUSAL_TOOL_ERROR, Refusal
+    def __init__(self, engine_of: Callable[[], object | None]) -> None:
+        self._engine_of = engine_of
 
-        try:
-            pcm = synthesize(text)
-            sink.play(pcm, samplerate=samplerate)
-        except Exception as err:  # every voice fault is NAMED, never raw
-            _embody_drop(
-                export,
-                EMBODY_SOURCE_VOICE,
-                REASON_SPEAK_FAILED,
-                f"{name}: {type(err).__name__}: {err}",
-            )
-            raise Refusal(REFUSAL_TOOL_ERROR, f"the {name} voice failed: {err}") from err
-        return f"{len(pcm)} bytes at {samplerate} Hz"
+    def _gate(self) -> object | None:
+        engine = self._engine_of()
+        return getattr(engine, "attention", None) if engine is not None else None
 
-    return _speak
+    # ``now`` is FORWARDED, not decoration: this adapter stands in front of a
+    # real :class:`~reachy.embody.attention.AttentionGate` whose own
+    # ``is_warm``/``note_spoken`` honour an injected clock. Accepting the
+    # argument and dropping it would make a caller's clock silently
+    # ineffective — the adapter would answer from wall time while the caller
+    # believed it had pinned the moment. (Sonar python:S1172 flagged the
+    # unused parameter; forwarding is the fix, removing it would break the
+    # seam's shape.)
+
+    def is_warm(self, now: float | None = None) -> bool:
+        gate = self._gate()
+        return bool(gate.is_warm(now)) if gate is not None else False
+
+    def note_spoken(self, now: float | None = None) -> bool:
+        gate = self._gate()
+        return bool(gate.note_spoken(now)) if gate is not None else False
 
 
-def _build_voice_seams(
-    sink: object,
-    *,
-    export: object,
-    synthesize: Mapping[str, Callable[[str], bytes]] | None = None,
-) -> tuple[Callable[[str], str] | None, Callable[[str], str] | None]:
-    """The ``(speak, harmonics)`` pair for :class:`EmbodyToolRegistry`.
+def _interjection_publisher(
+    engine_of: Callable[[], object | None], *, alert: bool
+) -> Callable[[object], None]:
+    """``publish(interjection)`` -> the engine's own record of it.
 
-    Both legs reuse :func:`reachy.speech.voice.resolve_voice_engine` — the same
-    registry ``say`` and the runtime's ``SpeechActuator`` resolve through — so
-    the layer inherits their synthesis and their sample rates rather than
-    inventing a third pair. ``synthesize`` overrides the callable per engine
-    name (tests only); the rate always comes from the resolved engine.
-
-    A voice that will not resolve yields ``None``, which leaves the tool
-    ADVERTISED but refusing by name — the layer's action set must not change
-    shape with the box's audio configuration, or the model learns a different
-    robot on every start (``reachy/embody/tools.py``'s own reasoning).
+    *alert* is the one thing that differs between the two admission routes, and
+    it is decided HERE, at composition, because only the composition knows
+    which door an interjection came through: an external proposal off the wire
+    is worth waking the mind for, the worker's own tool call is not (see
+    :meth:`~reachy.embody.engine.EmbodyTurnEngine.note_interjection`).
     """
-    from reachy.speech.voice import resolve_voice_engine
 
-    overrides = dict(synthesize or {})
-    seams: dict[str, Callable[[str], str] | None] = {}
-    for name in _EMBODY_VOICES:
-        try:
-            engine = resolve_voice_engine(name)
-        except Exception as err:  # a missing voice is not a dead layer
-            _embody_drop(export, EMBODY_SOURCE_VOICE, REASON_VOICE_UNAVAILABLE, f"{name}: {err}")
-            seams[name] = None
-            continue
-        seams[name] = _voice_seam(
-            name,
-            overrides.get(name, engine.synthesize),
-            engine.samplerate,
-            sink,
-            export=export,
-        )
-    return seams["tts"], seams["harmonic"]
+    def _publish(interjection: object) -> None:
+        engine = engine_of()
+        if engine is not None:
+            engine.note_interjection(interjection, alert=alert)
+
+    return _publish
 
 
 # ---------------------------------------------------------------------------
@@ -902,12 +961,24 @@ class _CueReader:
     runtime a deaf layer. Daemon, so a blocked read can never hold up
     interpreter exit.
 
-    The line is mapped through
-    :func:`~reachy.embody.cues.classified_cues_for_line`, not the bare
-    ``cues_for_line``, so each cue reaches the engine carrying the #143 class
+    The line is parsed by :func:`~reachy.embody.cues.parse_runtime_line` and
+    the resulting event mapped through
+    :func:`~reachy.embody.cues.classified_cues_for_runtime_event`, not the bare
+    ``cues_for_runtime_event``, so each cue reaches the engine carrying the #143 class
     its runtime event decided: a rule FIRE is an ALERT and triggers a turn,
     everything else parks. Erasing the class here is precisely the defect that
     turned 187 cues into 23 turns — the mapper always knew which was which.
+
+    **Interjection lines are routed BEFORE the mapper (issue #155).**
+    :mod:`reachy.embody.cues` recognises the layer's own ``interjection``
+    family and REFUSES it by name, deliberately: a pure mapper holds no policy
+    state, so it cannot decide whether an external source may put words in the
+    robot's mouth, and falling through to "unrecognised" would hide the family
+    behind a generic drop. The policy lives here, at the composition root, and
+    this is the one place it is consulted for the wire route —
+    ``policy.admit_event`` first, the mapper only for everything else. Without
+    an injected policy the line still reaches the mapper and is still refused
+    by name, so forgetting to wire this is loud rather than permissive.
 
     Everything it touches is O(1) and non-raising:
     :meth:`~reachy.embody.engine.EmbodyTurnEngine.submit_cues` routes into a
@@ -921,11 +992,13 @@ class _CueReader:
         *,
         export: object = None,
         max_events: int | None = None,
+        interjections: object = None,
     ) -> None:
         self._lines = lines
         self._engine = engine
         self._export = export
         self._max_events = max_events
+        self._interjections = interjections
         self._stop = threading.Event()
         self.thread: threading.Thread | None = None
         self.events = 0
@@ -950,14 +1023,16 @@ class _CueReader:
         self._stop.set()
 
     def _run(self) -> None:
-        from reachy.embody.cues import classified_cues_for_line
+        from reachy.embody.cues import classified_cues_for_runtime_event, parse_runtime_line
 
         try:
             for line in self._lines:
                 if self._stop.is_set():
                     break
                 self.events += 1
-                self.cues += self._engine.submit_cues(classified_cues_for_line(line))
+                event = parse_runtime_line(line)
+                if event is not None and not self._routed_interjection(event):
+                    self.cues += self._engine.submit_cues(classified_cues_for_runtime_event(event))
                 if self._max_events is not None and self.events >= self._max_events:
                     break
         except Exception as err:  # a dead feed must not kill the conversation
@@ -970,6 +1045,24 @@ class _CueReader:
         finally:
             self.done = True
 
+    def _routed_interjection(self, event: dict) -> bool:
+        """Hand an ``interjection`` line to the policy. ``True`` if it was handled.
+
+        ``False`` for every other line type AND for an interjection when no
+        policy was injected — in which case the mapper's own named refusal
+        (``interjection-requires-policy``) is exactly the right outcome. The
+        policy names its own drop for a refusal, so a rejected proposal is
+        never silent on either path.
+        """
+        from reachy import runtime_cues
+
+        if self._interjections is None or event.get("t") != runtime_cues.LINE_INTERJECTION:
+            return False
+        verdict = self._interjections.admit_event(event)
+        if verdict.admitted and verdict.interjection is not None:
+            self._engine.note_interjection(verdict.interjection, alert=True)
+        return True
+
 
 # ---------------------------------------------------------------------------
 # The clip -> ask() perception lane (task t11, issue #139's h9 blocker)
@@ -979,12 +1072,20 @@ class _CueReader:
 #: runtime's own rolling clip (issue #139's h9: "ask the worker model where it
 #: is"). Framed as a single perception question, matching
 #: :meth:`~reachy.embody.engine.EmbodyTurnEngine.ask`'s own contract — the
-#: answer becomes a CONTEXT cue for the next TRIGGERED turn, never a reply
-#: spoken on its own.
+#: answer becomes a structured :class:`~reachy.embody.engine.
+#: PerceptionSnapshot` for the next TRIGGERED turn (task t13, issue #155
+#: c7), never a reply spoken on its own. Requests ONE JSON object so
+#: :func:`parse_perception_answer` has a fixed shape to look for; the senses
+#: lane is a cheap model and will sometimes ignore this, which is exactly
+#: what that function's degrade path is for.
 DEFAULT_CLIP_PROMPT = (
-    "You are shown a short recent clip from your own camera. In one or two "
-    "plain sentences, describe where you appear to be and what is happening "
-    "in view right now."
+    "You are shown a short recent clip from your own camera. Reply with "
+    "exactly one JSON object and nothing else, in this shape: "
+    '{"summary": "<one or two plain sentences: where you appear to be and '
+    'what is happening right now>", "entities": ["<a person, object, or '
+    'place you notice>", ...], "confidence": <a number from 0.0 to 1.0 for '
+    "how sure you are of this description>}. Use an empty list for "
+    '"entities" if nothing stands out.'
 )
 
 
@@ -1024,6 +1125,101 @@ def build_clip_question(path: str | Path, prompt: str = DEFAULT_CLIP_PROMPT) -> 
     ]
 
 
+#: :func:`parse_perception_answer`'s expected JSON keys (task t13, spec c7).
+_PERCEPTION_SUMMARY_KEY = "summary"
+_PERCEPTION_ENTITIES_KEY = "entities"
+_PERCEPTION_CONFIDENCE_KEY = "confidence"
+
+
+def _normalized_perception_keys(payload: dict) -> dict:
+    """Re-key one parsed clip answer so a REFORMATTED key still resolves.
+
+    The deployed senses model renders our own requested shape back with the
+    key padded — ``{" summary": ...}`` — even though
+    :data:`DEFAULT_CLIP_PROMPT` asks for ``{"summary": ...}``. Task t15's
+    live acceptance caught it: three consecutive clip asks on the deployed
+    gateway were dropped :data:`REASON_CLIP_ANSWER_UNSTRUCTURED` while every
+    answer was in fact good
+    (``docs/evidence/2026-08-03-t15-155-live-acceptance.md``).
+
+    Whitespace and case are the two ways a model re-renders a key it is
+    copying, so both are stripped here — and NOTHING else is. A genuinely
+    different key (``description``) still misses, because tolerating a
+    sloppy rendering of our contract is not the same as guessing at a
+    synonym for it: the first keeps the parser honest about what the model
+    said, the second would let it invent one. A padded key that collides
+    with a clean one after normalisation loses to the clean one, so a
+    well-formed answer is never degraded by this pass.
+    """
+    normalized: dict = {}
+    for key, value in payload.items():
+        if not isinstance(key, str):
+            continue
+        clean = key.strip().casefold()
+        if clean not in normalized or key == clean:
+            normalized[clean] = value
+    return normalized
+
+
+def parse_perception_answer(raw: str) -> tuple[str, tuple[str, ...], float | None] | None:
+    """Parse the senses lane's structured clip answer, or ``None`` if it isn't one.
+
+    :data:`DEFAULT_CLIP_PROMPT` asks for one JSON object
+    (``{"summary": ..., "entities": [...], "confidence": ...}``), but the
+    senses lane is a CHEAP model answering in free text — assume it will
+    sometimes wrap the object in a sentence or a code fence, or ignore the
+    shape entirely. So this is tolerant, not strict: it looks for the FIRST
+    ``{...}`` span in *raw* rather than requiring the whole reply to be JSON,
+    and returns ``None`` — never raises — the moment anything about that span
+    fails to yield a non-blank ``summary`` string. The caller
+    (:meth:`_ClipAsker._ask_about`) is what turns a ``None`` here into the
+    documented degrade: a summary-only snapshot plus one named drop
+    (:data:`REASON_CLIP_ANSWER_UNSTRUCTURED`) — this function names no drop
+    of its own, so it stays trivially unit-testable with no export sink at
+    all, exactly like :func:`build_clip_question`.
+
+    ``entities`` is coerced to a tuple of non-blank strings, silently
+    dropping anything that is not a JSON string/number (never a whole-answer
+    failure just because one list entry is the wrong shape) and defaulting
+    to ``()`` when the key is missing or not a list. ``confidence`` is
+    accepted only as a plain number — ``bool`` is explicitly excluded,
+    because ``json`` parses ``true``/``false`` as :class:`bool`, a subtype of
+    :class:`int` in Python, which would otherwise silently read as 0.0/1.0 —
+    and clamped to ``[0.0, 1.0]``; anything else becomes ``None``, because
+    "the model did not say how sure it was" is honest and a fabricated
+    number is not.
+    """
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        payload = json.loads(raw[start : end + 1])
+    except ValueError:  # json.JSONDecodeError IS a ValueError (Sonar python:S5713)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload = _normalized_perception_keys(payload)
+    summary = payload.get(_PERCEPTION_SUMMARY_KEY)
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    entities_raw = payload.get(_PERCEPTION_ENTITIES_KEY)
+    entities: tuple[str, ...] = ()
+    if isinstance(entities_raw, list):
+        entities = tuple(
+            str(item).strip()
+            for item in entities_raw
+            if isinstance(item, (str, int, float))
+            and not isinstance(item, bool)
+            and str(item).strip()
+        )
+    confidence_raw = payload.get(_PERCEPTION_CONFIDENCE_KEY)
+    confidence: float | None = None
+    if isinstance(confidence_raw, (int, float)) and not isinstance(confidence_raw, bool):
+        confidence = max(0.0, min(1.0, float(confidence_raw)))
+    return summary.strip(), entities, confidence
+
+
 class _ClipAsker:
     """Poll the runtime's clip reference and turn it into perception CONTEXT.
 
@@ -1034,8 +1230,14 @@ class _ClipAsker:
     where it is"). This class is its first real caller: it reads
     ``state.json``'s ``clip`` key (:mod:`reachy.behavior.clip_rider`'s path
     reference), and when it names a fresh clip, asks about it and parks the
-    answer as CONTEXT the next TRIGGERED turn drains (issue #143's policy) —
-    never a trigger of its own.
+    answer as a structured :class:`~reachy.embody.engine.PerceptionSnapshot`
+    (task t13, issue #155 c7) — never a trigger of its own. Since t13 the
+    slot the answer lands in PERSISTS across turns (:meth:`~reachy.embody.
+    engine.EmbodyTurnEngine._live_perception`) until a later poll supersedes
+    it or it goes stale, rather than being drained by the one turn that
+    happens to run right after a poll (issue #143's turn-drain policy still
+    applies to the closed cue vocabulary — see the engine module docstring's
+    "A state PERSISTS" section for why perception is the one exception).
 
     A background THREAD, for the same reason :class:`_CueReader` is one — but
     the constraint here is sharper than "must not block on I/O": ``ask()`` is
@@ -1069,6 +1271,11 @@ class _ClipAsker:
     state (mirroring :meth:`~reachy.behavior.clip_rider.ClipRider._report`) so
     a box with no clip ever published (no ``[vision]`` extra, the http-remote
     profile, a fresh boot) logs ONE line, not one every poll cycle forever.
+    One outcome is a DEGRADE rather than a negative path:
+    :data:`REASON_CLIP_ANSWER_UNSTRUCTURED` names an answer that reached the
+    park anyway, as a summary-only snapshot, when it did not parse as the
+    requested JSON shape (task t13) — the observation is never lost, only its
+    structure.
     """
 
     def __init__(
@@ -1140,11 +1347,21 @@ class _ClipAsker:
             self._report(REASON_CLIP_STALE, f"age={age:.1f}s > {self._stale_after_s:g}s")
             return
         self._last_ts = ts
-        self._ask_about(str(path))
+        self._ask_about(str(path), float(ts))
 
-    def _ask_about(self, path: str) -> None:
-        """Turn *path* into a question, ask it, and park the answer as CONTEXT."""
-        from reachy.embody.cues import CueClass
+    def _ask_about(self, path: str, ts: float) -> None:
+        """Turn *path* into a question, ask it, and park the answer as a snapshot.
+
+        *ts* is the clip's OWN monotonic capture time — already validated
+        fresh enough by :meth:`poll_once`'s own staleness check — carried
+        straight through as the resulting :class:`~reachy.embody.engine.
+        PerceptionSnapshot`'s ``captured_at``. This is the freshness
+        discipline the engine module docstring's "A state PERSISTS" section
+        describes: a snapshot that sits unread in the park is judged by the
+        true age of the FRAME it describes, not by when this call happened
+        to run.
+        """
+        from reachy.embody.engine import PerceptionSnapshot
 
         try:
             content = build_clip_question(path, self._prompt or DEFAULT_CLIP_PROMPT)
@@ -1162,10 +1379,30 @@ class _ClipAsker:
             return
         self._last_report = None  # the lane recovered; the next failure reports fresh
         self.asks += 1
-        # CONTEXT, explicitly — never a trigger (t7/#143's policy): a clip
-        # answer is a perception the NEXT triggered turn reads, exactly like
-        # any other sense cue, never a reason to run one by itself.
-        self._engine.submit_cue(f"camera view: {answer}", cue_class=CueClass.CONTEXT)
+        parsed = parse_perception_answer(answer)
+        if parsed is None:
+            # Degrade, never drop: the raw answer still becomes a
+            # summary-only snapshot (task t13) — only the STRUCTURE was
+            # lost, not the observation.
+            self._report(REASON_CLIP_ANSWER_UNSTRUCTURED, answer[:120])
+            summary, entities, confidence = answer, (), None
+        else:
+            summary, entities, confidence = parsed
+        # A structured PERCEPTION snapshot, explicitly — never a trigger
+        # (t7/#143's policy): a clip answer is a perception the NEXT
+        # triggered turn reads, exactly like any other sense cue, never a
+        # reason to run one by itself. Unlike a cue, this slot PERSISTS
+        # across turns (:meth:`~reachy.embody.engine.EmbodyTurnEngine.
+        # _live_perception`) until superseded or stale.
+        self._engine.submit_perception(
+            PerceptionSnapshot(
+                summary=summary,
+                entities=entities,
+                confidence=confidence,
+                captured_at=ts,
+                frame_ref=path,
+            )
+        )
 
     def _report(self, reason: str, detail: str) -> None:
         key = (reason, detail)
@@ -1194,6 +1431,7 @@ class _EmbodyLayer:
         engine: object,
         reader: _CueReader,
         clip_asker: _ClipAsker | None = None,
+        summary: object = None,
         export: object = None,
     ) -> None:
         self.profile = profile
@@ -1203,6 +1441,11 @@ class _EmbodyLayer:
         self.engine = engine
         self.reader = reader
         self.clip_asker = clip_asker
+        #: Qwen's rolling-summary maintenance pass
+        #: (:class:`reachy.embody.summary.SummaryProducer`), on its own thread
+        #: for the same reason the clip asker is: a whole gateway round trip
+        #: charged to the turn loop would pause the robot mid-conversation.
+        self.summary = summary
         self._export = export
         self._stop = threading.Event()
         self._closed = False
@@ -1227,6 +1470,8 @@ class _EmbodyLayer:
         self.reader.start()
         if self.clip_asker is not None:
             self.clip_asker.start()
+        if self.summary is not None:
+            self.summary.start()
 
     def request_stop(self) -> None:
         """Ask the run loop to finish after the current turn. Safe from any thread."""
@@ -1256,6 +1501,8 @@ class _EmbodyLayer:
         self.reader.stop()
         if self.clip_asker is not None:
             self.clip_asker.stop()
+        if self.summary is not None:
+            self.summary.stop()
         for label, closer in (("session", self.session.close), ("media", self.media.close)):
             try:
                 closer()
@@ -1268,23 +1515,82 @@ class _EmbodyLayer:
                 )
 
 
-def _utterance_tap(engine: object) -> Callable[[object], None]:
-    """duplex ``on_utterance`` -> a candidate TRIGGER.
+def _utterance_tap(
+    engine: object,
+    session_of: Callable[[], object | None],
+    *,
+    export: object = None,
+) -> Callable[[object], None]:
+    """duplex ``on_utterance`` -> a candidate TRIGGER, and the ROBOT'S VOICE.
 
     The SESSION is ungated — it hears everyone in the room, and its own
     boundary tests pin that — but the ENGINE decides whether what it heard is
     worth waking a mind for: while attention is cold only the robot's name
-    admits an utterance (issue #148, :mod:`reachy.embody.attention`). The tap
-    stays a plain forward, so that decision has exactly one home.
+    admits an utterance (issue #148, :mod:`reachy.embody.attention`). This tap
+    is where that ONE decision reaches BOTH of the things it should govern.
+
+    **Attention gates the voice too (issue #149).** Until this task it gated
+    only cognition, and the room got a spoken reply to every sentence anyway:
+    the duplex session armed itself once at ``session.created`` and the gateway
+    then answered every committed turn, so a conversation the robot had been
+    told to ignore was answered — thoughtlessly — out loud. A robot butting
+    into a conversation it was explicitly excluded from is worse than one that
+    answers everything, so ignore has to mean ignore SILENTLY. An admitted
+    utterance therefore also asks the session for exactly one reply
+    (:meth:`~reachy.speech.realtime_duplex.RealtimeDuplexSession.arm_once`),
+    and a refused one asks for nothing.
+
+    **The policy lives here, and the mechanism lives in the wire.** The duplex
+    module reaches no gate and must not (three structural pins in
+    ``tests/test_realtime_duplex.py`` say so); it knows only that *someone*
+    asked for a reply. Which someone, and on what grounds, is this function.
+
+    **Why the admission is read from the gate's own counter rather than from
+    ``submit_utterance``'s return.** That return is ``False`` for two unrelated
+    reasons: the robot was not addressed, and the robot WAS addressed but the
+    turn engine's trigger queue is full. Only the first is a reason to stay
+    silent. The engine's own docstring is explicit that the admission stands
+    through a full queue — "a fact about the room, not about how full a queue
+    happened to be" — and the voice belongs to the realtime floor, not to this
+    queue, so a saturated mind must not mute a robot mid-conversation.
+    ``unaddressed_utterances`` moves on exactly the refusal, and nothing else.
+
+    *session_of* is a late-bound accessor because the session is built WITH
+    this tap: see :func:`_compose_embody_seam`. It yields ``None`` only before
+    composition finishes, which is before the worker thread that fires the tap
+    exists.
     """
 
     def _heard(utterance: object) -> None:
-        engine.submit_utterance(getattr(utterance, "text", "") or "")
+        text = (getattr(utterance, "text", "") or "").strip()
+        if not text:
+            return
+        ignored_before = int(getattr(engine, "unaddressed_utterances", 0) or 0)
+        engine.submit_utterance(text)
+        if int(getattr(engine, "unaddressed_utterances", 0) or 0) != ignored_before:
+            return  # attention refused it: the room hears nothing back
+        session = session_of()
+        if session is None:  # pragma: no cover - composition fills the slot first
+            return
+        try:
+            session.arm_once()
+        except Exception as err:  # this runs on the session's own worker thread
+            _embody_drop(
+                export,
+                EMBODY_SOURCE_SESSION,
+                REASON_ARM_FAILED,
+                f"{type(err).__name__}: {err}",
+            )
 
     return _heard
 
 
-def _response_tap(engine: object) -> Callable[[object], None]:
+def _response_tap(
+    engine: object,
+    session_of: Callable[[], object | None],
+    *,
+    export: object = None,
+) -> Callable[[object], None]:
     """duplex ``on_response`` -> already-said CONTEXT, never a trigger.
 
     The duplex session answers speech on its own, server-side, so without this
@@ -1292,25 +1598,254 @@ def _response_tap(engine: object) -> Callable[[object], None]:
     would cheerfully call ``speak`` to say it again (the wiring t10's docstring
     singles out as the one this composition could miss).
 
-    An INTERRUPTED reply is deliberately excluded. ``_finish_response``
-    publishes it like any other — the record carries the audio and says why —
-    but never PLAYS it, because a barge-in means the human started talking
-    again. Recording it as spoken would leave the mind believing it had
-    answered when the room heard nothing.
+    **A CUT reply is recorded as what the room heard, not as nothing and not as
+    everything (task t7, spec c34).** Since chunked playback landed, a reply a
+    human talked over has usually been PARTLY spoken — so the session is asked
+    for its measured said/unsaid split and the engine records both halves: the
+    prefix as spoken, the remainder as a kept wanted-to-say artifact the next
+    turn can weigh. Only when there is no measurement at all
+    (:meth:`~reachy.speech.realtime_duplex.RealtimeDuplexSession.spoken_split`
+    yields ``None`` — a reply this session never saw, or one still arriving)
+    does an interrupted reply fall back to the conservative pre-t7 answer of
+    recording nothing: the mind believing it had answered when the room heard
+    nothing is the worse of the two errors.
 
     It is also the second half of the attention window (issue #148): an answer
     the layer actually spoke EXTENDS a live conversation, so a long reply never
     times the human out. It cannot OPEN one — the server answers ambient
     utterances the gate refused, and a robot that could wake itself with its
     own voice would never go quiet again.
+
+    *session_of* is the same late-bound accessor :func:`_utterance_tap` takes,
+    for the same reason: the session is built WITH this tap.
     """
 
     def _spoke(response: object) -> None:
+        session = session_of()
+        split = _measured_split(session, response, export=export)
+        if split is not None and getattr(split, "cut", False):
+            _record_cut(engine, session, split, export=export)
+            return
         if getattr(response, "interrupted", False):
             return
         engine.note_spoken(getattr(response, "text", "") or "")
 
     return _spoke
+
+
+def _tail_cut_tap(
+    engine: object,
+    session_of: Callable[[], object | None],
+    *,
+    export: object = None,
+) -> Callable[[object], None]:
+    """duplex ``on_speech_started`` -> stop talking, and record what was said.
+
+    **This closes the TAIL only, and that is the whole design.** Upstream
+    already paces its audio delivery to track the playhead (lobes-cli's
+    ``lobes/realtime/_conversation.py``, ``delivery_pause_ms`` /
+    ``DELIVERY_LEAD_MS``) precisely so a human can barge in mid-reply and the
+    floor can see it; that path arrives as ``response.interrupted``, task t6
+    wired it, and :func:`_response_tap` records it. What upstream cannot see is
+    the lag THIS client adds after receipt — up to one playback chunk of
+    accumulation plus the daemon's upload-then-play round trip — which lands
+    AFTER ``response.done``. In that window the floor has returned to LISTENING
+    while the room is still hearing audio, so the moment a listener is most
+    likely to object (having now heard enough to object TO) produces no
+    ``response.interrupted`` at all and the queued chunks play on.
+
+    **VAD-verified speech only (spec claim c35).** The trigger is the server's
+    own ``input_audio_buffer.speech_started``, not a loudness reading: an
+    energy predicate is a LOCATOR, never a content filter, and a cough or a
+    door slam must not be able to cut the robot off mid-sentence. This is the
+    same evidence the floor itself would have acted on a second earlier.
+
+    **Attention does NOT gate this, deliberately.** Being ignored for THINKING
+    (issue #148) is not the same as being unable to stop the robot talking:
+    anyone in the room may interrupt, and "anyone" reads as any external
+    interlocutor — a peer robot or an automated system included (spec decision
+    c36). Cutting also opens no attention window; it is not an address.
+
+    **Two paths, one record.** Nothing here guards against double-recording
+    with a flag, because the session's own drain semantics already make it
+    impossible: a cut empties the mouth queue AND stamps the reply stale so
+    none of it can be re-queued, and ``_finish_response`` drains that same
+    queue before publishing a server-driven interrupt. So a second onset over
+    the same reply finds ``playback_pending`` false and withholds nothing, and
+    a server barge-in leaves nothing for this tap to cut. The one case that
+    DOES reach the engine twice — a reply recorded whole at ``response.done``
+    and then cut — is exactly what t7's ``_correct_spoken`` narrows: one entry
+    replaced, never a second one added.
+
+    **Why the pending check rather than "is there a split to record".** Every
+    reply this session spoke has a measurement, so recording on measurement
+    alone would file a reply the room heard in FULL as truncated. The question
+    is whether a cut would WITHHOLD anything, which is what
+    :attr:`~reachy.speech.realtime_duplex.RealtimeDuplexSession.
+    playback_pending` answers — and it excludes the chunk already inside
+    ``play``, which cannot be recalled.
+
+    A split of ``None`` means the reply has not completed (the cut landed
+    mid-reply, where there is no honest total to divide by). Nothing is
+    recorded here then, on purpose: the ledger carries the cancellation, and
+    :func:`_response_tap` records the measured split when ``response.done`` or
+    ``response.interrupted`` finally lands.
+    """
+
+    def _started(_event: object) -> None:
+        session = session_of()
+        if session is None:  # pragma: no cover - composition fills the slot first
+            return
+        try:
+            if not session.playback_pending:
+                return  # nothing queued: a cut here would withhold nothing
+            progress = session.cancel_playback()
+        except Exception as err:  # this runs on the session's own worker thread
+            _embody_drop(
+                export,
+                EMBODY_SOURCE_SESSION,
+                REASON_TAIL_CUT_FAILED,
+                f"{type(err).__name__}: {err}",
+            )
+            return
+        split = _measured_split(session, progress, export=export)
+        if split is not None and getattr(split, "cut", False):
+            _record_cut(engine, session, split, export=export)
+
+    return _started
+
+
+def _record_cut(
+    engine: object, session: object | None, split: object, *, export: object = None
+) -> None:
+    """ONE cut, recorded in both places it belongs: our record, and the floor's.
+
+    The two cut paths (:func:`_response_tap`'s server-driven interrupt and
+    :func:`_tail_cut_tap`'s client-side tail cut) share this so they cannot
+    drift into telling the conversation two different stories — the same reason
+    :func:`_measured_split` is one accessor for both.
+
+    * The LAYER's record narrows here: :meth:`~reachy.embody.engine.
+      EmbodyTurnEngine.note_interrupted_reply` records the measured said half as
+      spoken and keeps the remainder as a wanted-to-say artifact (spec c34).
+    * The FLOOR's record is CORRECTED here: the server saw a reply delivered at
+      wire speed and appended it whole, so its history overstates what the room
+      heard after every client-local cut (spec claim c39). The correction goes
+      out as a ``history`` conversation item — ephemeral context would let the
+      overstatement return on the next generate call.
+
+    Where the gateway announced no item support the push is declined by
+    ``send_item`` itself, which names the degrade once per session (c44/h29):
+    the layer's own record is still right, the floor's is still overstated, and
+    neither is dressed up as the other.
+    """
+    engine.note_interrupted_reply(split)
+    _push_floor_item(session, engine.floor_correction(split), export=export)
+
+
+def _push_floor_item(session: object | None, item: object | None, *, export: object = None) -> bool:
+    """Send ONE projection of the canonical history to the floor. Never raises.
+
+    Returns whether the floor took it. ``False`` is the ordinary answer today —
+    conversation-item parity is parked upstream (agentculture/lobes-cli#170 item
+    2), so ``send_item`` declines and names that degrade itself, once per
+    session. Only a RAISE is named here: ``send_item`` promises not to, this
+    runs on the session's own worker thread where an escaping exception is an
+    anonymous warning at best, and a floor left holding an overstated reply is
+    something the operator should be able to see.
+    """
+    if item is None:
+        # Nothing to correct: the room heard the whole reply, so the floor's own
+        # record is already true and a "correction" would only add noise.
+        return False
+    if session is None:  # pragma: no cover - composition fills the slot first
+        return False
+    try:
+        return bool(session.send_item(_as_conversation_item(item)))
+    except Exception as err:
+        _embody_drop(
+            export,
+            EMBODY_SOURCE_SESSION,
+            REASON_FLOOR_PUSH_FAILED,
+            f"{type(err).__name__}: {err}",
+        )
+        return False
+
+
+def _as_conversation_item(item: object) -> object:
+    """Join the engine's :class:`~reachy.embody.engine.FloorItem` to the wire's own type.
+
+    The two are structurally identical and deliberately distinct classes: the
+    dependency runs ONE way (the engine must not import the WebSocket client, as
+    its ``_SpokenSplitLike`` docstring records for the value travelling the
+    other way), so joining them is this composition root's job. A mechanical
+    1:1 field copy, and the wire re-validates every value on the way out, so a
+    drift in either vocabulary fails closed at the frame instead of quietly
+    mislabelling an item's disposition.
+    """
+    from reachy.speech.realtime_duplex import ConversationItem
+
+    return ConversationItem(
+        role=item.role,
+        text=item.text,
+        disposition=item.disposition,
+    )
+
+
+def _reseed_tap(engine: object) -> Callable[[], list[object]]:
+    """duplex ``reseed`` -> the canonical history, projected onto a NEW session.
+
+    Decision **c27**: the layer curates the conversation record and pushes
+    projections to the floor, so lobes' server-side history is what the layer
+    put there. This is the seam that does the pushing, and the ORDERING it
+    depends on is the wire's: the client consults it inside ``session.created``
+    handling, before it arms, because a session close wipes the floor's
+    ephemeral history and a reconnect that armed first would answer out of an
+    empty one — Gemma silently reset to amnesia (spec claim c40).
+
+    WHAT to send is :meth:`~reachy.embody.engine.EmbodyTurnEngine.floor_reseed`
+    — Gemma's ``m``-window as curated history turns plus Qwen's rolling summary
+    as one ephemeral context item, both bounded where those bounds already live.
+    This function adds no policy of its own; it is the type join, and it exists
+    as a named function rather than a lambda so a test can pin that composition
+    hands the session a real one.
+    """
+
+    def _seed() -> list[object]:
+        return [_as_conversation_item(item) for item in engine.floor_reseed()]
+
+    return _seed
+
+
+def _measured_split(session: object | None, response: object, *, export: object = None) -> object:
+    """Ask the session what the room heard of *response*. Never raises.
+
+    *response* is anything carrying a ``response_id`` — the published
+    :class:`~reachy.speech.realtime_duplex.Response` from
+    :func:`_response_tap`, or the :class:`~reachy.speech.realtime_duplex.
+    PlaybackProgress` a cut returns to :func:`_tail_cut_tap`. One accessor for
+    both, so the two cut paths cannot ask the session two different questions.
+
+    This runs on the session's own worker thread, where an escaping exception
+    is logged as an anonymous warning at best — so a session that cannot answer
+    is a NAMED drop and a ``None``, and the caller falls back to the coarse
+    record rather than losing the reply entirely.
+    """
+    if session is None:  # pragma: no cover - composition fills the slot first
+        return None
+    try:
+        # ``or ""`` on purpose: an id-less reply asks for the ANONYMOUS record,
+        # never for "whatever is playing right now", which is what a bare
+        # ``None`` would mean to the session and could name a different reply.
+        return session.spoken_split(getattr(response, "response_id", None) or "")
+    except Exception as err:
+        _embody_drop(
+            export,
+            EMBODY_SOURCE_SESSION,
+            REASON_SPLIT_UNAVAILABLE,
+            f"{type(err).__name__}: {err}",
+        )
+        return None
 
 
 def _require_readable_feed(feed: str) -> None:
@@ -1369,11 +1904,12 @@ def _compose_embody_seam(
     registry_factory: Callable[..., object] | None = None,
     engine_factory: Callable[..., object] | None = None,
     turn_fn: object | None = None,
-    synthesize: Mapping[str, Callable[[str], bytes]] | None = None,
+    interjection_limits: object | None = None,
     lines: Iterable[str] | None = None,
     stdin: TextIO | None = None,
     clip_reader: Callable[[], dict | None] | None = None,
     clip_poll_interval: float | None = None,
+    summary_producer: object | None = None,
 ) -> _EmbodyLayer:
     """Build the whole layer — the ONE place the wave-1/2/3 seams meet.
 
@@ -1382,30 +1918,49 @@ def _compose_embody_seam(
     defaults are the real thing.
 
     Order matters in one place only: the media profile is built FIRST, because
-    its sink is shared by three consumers (the duplex mouth, and both voice
-    tools) and its source is the duplex ears. Building it twice would give the
-    layer two mouths and, on the robot profile, two readers contending for one
-    tee socket.
+    its sink is the duplex mouth and its source the duplex ears. Building it
+    twice would give the layer two mouths and, on the robot profile, two
+    readers contending for one tee socket. Since task t12 the sink has exactly
+    ONE consumer — the realtime floor's own reply — because the worker's voice
+    tools are proposals rather than playback (spec claim c2).
     """
     from reachy.embody.cues import open_runtime_lines
-    from reachy.embody.engine import EmbodyTurnEngine, Limits
+    from reachy.embody.engine import EmbodyTurnEngine, Limits, resolve_attention_window_s
+    from reachy.embody.interjection import InterjectionPolicy
     from reachy.embody.media import build_media
+    from reachy.embody.summary import SummaryProducer
     from reachy.embody.tools import EmbodyToolRegistry
-    from reachy.speech.realtime_duplex import RealtimeDuplexSession
+    from reachy.speech.realtime_duplex import (
+        DEFAULT_VOICE_PROMPT,
+        RealtimeDuplexSession,
+        resolve_voice_prompt,
+    )
 
     resolved_media = (
         media if media is not None else build_media(getattr(args, "media_profile", None))
     )
 
-    speak_seam, harmonic_seam = _build_voice_seams(
-        resolved_media.sink, export=export, synthesize=synthesize
+    # The engine is built FROM the registry, and the policy the registry needs
+    # wants the engine's attention gate — one slot closes that circle, exactly
+    # as ``session_slot`` closes the session's, and for the same reason: the
+    # slot is filled long before any thread that can read it exists.
+    # Only the LIMITS are injectable, never the whole policy: the attention
+    # wiring is this function's job and must not be something a caller can
+    # forget, or an interjection would be judged against a gate nobody warms.
+    engine_slot: list[object] = []
+    policy = InterjectionPolicy(
+        limits=interjection_limits,
+        attention=_LateAttention(lambda: engine_slot[0] if engine_slot else None),
     )
 
     spool_root = _resolve_spool_dir(args)
     build_registry = registry_factory if registry_factory is not None else EmbodyToolRegistry
     registry = build_registry(
-        speak=speak_seam,
-        harmonics=harmonic_seam,
+        interjection=policy,
+        # alert=False: the worker's own proposal must not wake the worker.
+        on_interjection=_interjection_publisher(
+            lambda: engine_slot[0] if engine_slot else None, alert=False
+        ),
         spool_root=spool_root,
         await_timeout=float(getattr(args, "await_timeout", 1.0)),
     )
@@ -1415,25 +1970,73 @@ def _compose_embody_seam(
         "registry": registry,
         "export": export,
         # issue #141/S107: the engine's bounds live in one frozen Limits now;
-        # this composition root only ever overrides turn_interval, so every
-        # other field takes the engine's own documented default.
+        # this composition root overrides turn_interval and attention_window_s
+        # (issue #150, resolved explicit-flag > env > default), so every other
+        # field takes the engine's own documented default.
         "limits": Limits(
-            turn_interval=float(getattr(args, "turn_interval", DEFAULT_TURN_INTERVAL))
+            turn_interval=float(getattr(args, "turn_interval", DEFAULT_TURN_INTERVAL)),
+            attention_window_s=resolve_attention_window_s(getattr(args, "attention_window", None)),
         ),
     }
     if turn_fn is not None:
         engine_kwargs["turn_fn"] = turn_fn
     engine = build_engine(**engine_kwargs)
+    engine_slot.append(engine)
 
     build_session = session_factory if session_factory is not None else RealtimeDuplexSession
+    # The utterance tap has to reach the session that is being built WITH it
+    # (issue #149: an admitted utterance arms one reply). A one-slot box closes
+    # that circle without a post-hoc attribute poke, and it is safe by
+    # construction: the tap only ever fires on the session's worker thread,
+    # which `start()` spawns — long after this function has returned.
+    session_slot: list[object] = []
     session = build_session(
         read_audio=resolved_media.source.read,
         sample_rate=resolved_media.source.sample_rate,
         play=resolved_media.sink.play,
         mute_during_playback=bool(getattr(args, "mute_during_playback", False)),
-        on_utterance=_utterance_tap(engine),
-        on_response=_response_tap(engine),
+        # Connect-time voice conventions (issue #151/#153, spec c10, honesty
+        # h8, task t9): no CLI flag yet, so this is env-var-then-default —
+        # REACHY_EMBODY_VOICE_PROMPT if set (and valid), else this module's
+        # own chunk-friendly, longer-answer-permitting text. Passing `default=`
+        # HERE, at the one production construction site, is the fix for the
+        # capability having shipped with no caller: resolve_voice_prompt's own
+        # bare-call contract stays "nothing configured -> None" (an absent
+        # override is not a fault for a pure resolver), but on the deployed
+        # robot "nothing configured" must not mean "silently inherit the
+        # gateway's bare default" -- that is the whole point of this arc. A
+        # REJECTED attempt (blank or over-long) still resolves to None here,
+        # never to DEFAULT_VOICE_PROMPT -- see resolve_voice_prompt's
+        # docstring for why a rejected override is never silently repaired.
+        system_prompt=resolve_voice_prompt(default=DEFAULT_VOICE_PROMPT),
+        # Opt in to per-ADMITTED-utterance arming. The wire's own default is
+        # still arm-once, and against a gateway that cannot do one-shot arming
+        # this degrades back to exactly that, with one named drop (h9).
+        arm_per_utterance=True,
+        on_utterance=_utterance_tap(
+            engine, lambda: session_slot[0] if session_slot else None, export=export
+        ),
+        # Same late-bound accessor, same reason (task t7): the response tap
+        # asks the session what the room actually heard of the reply it is
+        # being handed.
+        on_response=_response_tap(
+            engine, lambda: session_slot[0] if session_slot else None, export=export
+        ),
+        # The tail cut (task t16): the server's own VAD onset stops the mouth
+        # in the window AFTER ``response.done``, where the floor is listening
+        # again and can no longer interrupt anything itself.
+        on_speech_started=_tail_cut_tap(
+            engine, lambda: session_slot[0] if session_slot else None, export=export
+        ),
+        # The canonical history's projection onto every NEW session (task t11,
+        # decision c27). Task t10 built the whole items mechanism and left the
+        # CONTENT to the layer, which is here: without this keyword the channel
+        # ships built and unreachable, the exact shape t6's ``cancel_playback``
+        # and t9's voice prompt each hit earlier in this arc. No late-bound slot
+        # is needed — the seam reads the ENGINE, which already exists.
+        reseed=_reseed_tap(engine),
     )
+    session_slot.append(session)
 
     feed_lines = (
         lines
@@ -1441,7 +2044,13 @@ def _compose_embody_seam(
         else open_runtime_lines(feed=getattr(args, "feed", "-"), stdin=stdin)
     )
     reader = _CueReader(
-        feed_lines, engine, export=export, max_events=getattr(args, "max_events", None)
+        feed_lines,
+        engine,
+        export=export,
+        max_events=getattr(args, "max_events", None),
+        # The wire route reaches the SAME policy the tool route does: one
+        # decision point, one place to get default-deny right.
+        interjections=policy,
     )
 
     clip_asker_kwargs: dict[str, object] = {
@@ -1452,6 +2061,10 @@ def _compose_embody_seam(
         clip_asker_kwargs["poll_interval"] = clip_poll_interval
     clip_asker = _ClipAsker(engine, **clip_asker_kwargs)
 
+    # ONE summary, Qwen's, never regenerated per lane (issue #154 decision
+    # c30): this is the repo's only production caller of ``update_summary``.
+    summary = summary_producer if summary_producer is not None else SummaryProducer(engine)
+
     return _EmbodyLayer(
         profile=getattr(resolved_media, "profile", "unknown"),
         media=resolved_media,
@@ -1460,6 +2073,7 @@ def _compose_embody_seam(
         engine=engine,
         reader=reader,
         clip_asker=clip_asker,
+        summary=summary,
         export=export,
     )
 
@@ -1562,6 +2176,7 @@ def cmd_agent_embody_start(args: argparse.Namespace) -> int:
         await_timeout=args.await_timeout,
         turn_interval=args.turn_interval,
         mute_during_playback=args.mute_during_playback,
+        attention_window=args.attention_window,
     )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
@@ -1593,6 +2208,7 @@ def cmd_agent_embody_restart(args: argparse.Namespace) -> int:
         await_timeout=args.await_timeout,
         turn_interval=args.turn_interval,
         mute_during_playback=args.mute_during_playback,
+        attention_window=args.attention_window,
     )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
@@ -1769,6 +2385,20 @@ def _add_embody_operating_args(parser: argparse.ArgumentParser, *, inherit: bool
         "Reachy has hardware AEC against its own speakers, so the layer keeps "
         "hearing while it talks (which is what makes barge-in possible). This is "
         "the one-flip fallback if live AEC proves insufficient.",
+    )
+    parser.add_argument(
+        "--attention-window",
+        type=float,
+        default=_default(None),
+        dest="attention_window",
+        metavar="SECONDS",
+        help="Seconds attention stays open after the last utterance heard or answer "
+        "spoken; 0 means name-only forever (issue #150). Precedence: this flag, "
+        f"then {ENV_ATTENTION_WINDOW_S} in the process environment, then the "
+        f"layer's own default ({DEFAULT_ATTENTION_WINDOW_S:g}s). Like every other "
+        f"flag in this group, unspecified here falls through to "
+        f"{ENV_ATTENTION_WINDOW_S} at composition time, in THIS process (the "
+        "foreground layer) or the spawned child (start/restart) alike.",
     )
 
 

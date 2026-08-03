@@ -26,12 +26,23 @@ Plus the three acceptance criteria the plan names:
 * **h22** — every named failure mode reaches the journal AND the export feed,
   and killing the export consumer mid-run leaves the layer alive.
 
-Nothing here opens a socket, a gateway, a broker, a robot or an audio device:
-the media profile is the real :class:`~reachy.embody.media.EmbodySource` /
+Nothing here opens a gateway, a broker, a robot or an audio device: the media
+profile is the real :class:`~reachy.embody.media.EmbodySource` /
 :class:`~reachy.embody.media.EmbodySink` wrappers over recording backends, the
 duplex session is a double, and the turn engine is the REAL
 :class:`~reachy.embody.engine.EmbodyTurnEngine` driven by a scripted
 ``turn_fn``.
+
+**One deliberate exception**, added by the foreground-Gemma arc's task t8
+(issue #149): the per-utterance arming section at the end drives the REAL
+:class:`~reachy.speech.realtime_duplex.RealtimeDuplexSession` over a loopback
+socket against :class:`tests.fake_realtime_server.FakeRealtimeServer`. That
+join spans three pieces — the attention gate's verdict, the composition root's
+policy, and the wire's arming mechanism — and it is exactly the shape of join
+this module's own preamble warns about: with a session double on one side and a
+fake server on the other, both halves can pass while nothing asks the gateway
+for a reply. The socket is loopback, ephemeral-port, and torn down by the
+harness's context manager.
 """
 
 from __future__ import annotations
@@ -48,6 +59,7 @@ import textwrap
 import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -59,8 +71,18 @@ from reachy.embody.tools import SPEAK
 from reachy.explain.catalog import ENTRIES
 from reachy.export.exporter import ExportHook
 from reachy.speech.llm import ToolCall, TurnResult
-from reachy.speech.realtime_duplex import Response, Utterance
+from reachy.speech.realtime_duplex import (
+    DEFAULT_VOICE_PROMPT,
+    ENV_VOICE_PROMPT,
+)
+from reachy.speech.realtime_duplex import Limits as DuplexLimits
+from reachy.speech.realtime_duplex import (
+    RealtimeDuplexSession,
+    Response,
+    Utterance,
+)
 from tests.conftest import WAIT_BUDGET_S
+from tests.fake_realtime_server import FakeRealtimeServer, Scenario
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PKG_ROOT = _REPO_ROOT / "reachy"
@@ -91,28 +113,53 @@ class _SourceBackend:
 
 
 class _SinkBackend:
-    """A media sink backend recording every (pcm, samplerate) it is handed."""
+    """A media sink backend recording every (pcm, samplerate) it is handed.
 
-    def __init__(self, fail: BaseException | None = None) -> None:
+    ``block`` / ``block_after`` wedge the speaker after N confirmed chunks, so
+    a test can hold the mouth mid-reply and know EXACTLY how much the room
+    heard before an interjection lands (task t16's measured split).
+    """
+
+    def __init__(
+        self,
+        fail: BaseException | None = None,
+        *,
+        block: threading.Event | None = None,
+        block_after: int = 0,
+    ) -> None:
         self.played: list[tuple[bytes, int]] = []
         self.closed = 0
         self._fail = fail
+        self._block = block
+        self._block_after = max(0, int(block_after))
+        self._started = 0
 
     def play(self, pcm16_bytes: bytes, *, samplerate: int) -> None:
         if self._fail is not None:
             raise self._fail
+        self._started += 1
+        if self._block is not None and self._started > self._block_after:
+            self._block.wait(timeout=WAIT_BUDGET_S)
         self.played.append((pcm16_bytes, samplerate))
 
     def close(self) -> None:
         self.closed += 1
 
 
-def _media(*, sink_fails: BaseException | None = None, rate: int = 16000) -> EmbodyMedia:
+def _media(
+    *,
+    sink_fails: BaseException | None = None,
+    rate: int = 16000,
+    sink_blocks: threading.Event | None = None,
+    sink_block_after: int = 0,
+) -> EmbodyMedia:
     """The REAL profile-agnostic wrappers over recording backends."""
     return EmbodyMedia(
         profile="bench",
         source=EmbodySource(_SourceBackend(), target_sample_rate=rate),
-        sink=EmbodySink(_SinkBackend(fail=sink_fails)),
+        sink=EmbodySink(
+            _SinkBackend(fail=sink_fails, block=sink_blocks, block_after=sink_block_after)
+        ),
     )
 
 
@@ -124,12 +171,52 @@ class _FakeSession:
     a test can fire them the way the session worker thread would.
     """
 
-    def __init__(self, *, start_error: BaseException | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        *,
+        start_error: BaseException | None = None,
+        arm_error: BaseException | None = None,
+        split_error: BaseException | None = None,
+        cancel_error: BaseException | None = None,
+        playback_pending: bool = False,
+        items_supported: bool = False,
+        item_error: BaseException | None = None,
+        **kwargs,
+    ) -> None:
         self.kwargs = kwargs
         self.started = 0
         self.closed = 0
         self.utterances = 0
+        #: Per-utterance arming (issue #149): how many times the composition
+        #: root asked the gateway for ONE spoken reply.
+        self.arms = 0
         self._start_error = start_error
+        self._arm_error = arm_error
+        #: The measured said/unsaid split of the last reply (task t7). ``None``
+        #: is the honest default — a session that never cut anything has no
+        #: split to report, and the composition root must record the reply
+        #: exactly as it did before.
+        self.split: object | None = None
+        self._split_error = split_error
+        #: The tail cut (task t16). ``playback_pending`` models the REAL
+        #: session's own drain semantics rather than a free variable: a cut
+        #: empties the mouth queue and the cut reply can never re-queue, so it
+        #: goes False the moment ``cancel_playback`` is called. Modelling that
+        #: is what makes "the same reply is never cut twice" testable here at
+        #: all — a double that stayed pending would be describing a session
+        #: that does not exist.
+        self.playback_pending = bool(playback_pending)
+        self.cancels = 0
+        self._cancel_error = cancel_error
+        #: Conversation items the composition root pushed (task t11, decision
+        #: c27). The default is a gateway that announced NO item support,
+        #: because that is the gateway shipping today — parity is parked
+        #: upstream on lobes-cli#170 item 2 — so a test that wants the channel
+        #: has to ask for it, exactly as production has to feature-detect it.
+        self.items_supported = bool(items_supported)
+        self.items: list[object] = []
+        self.items_declined = 0
+        self._item_error = item_error
 
     def start(self) -> None:
         if self._start_error is not None:
@@ -139,12 +226,66 @@ class _FakeSession:
     def close(self) -> None:
         self.closed += 1
 
-    # -- the two taps, fired the way the session worker would ---------------- #
+    def arm_once(self) -> bool:
+        if self._arm_error is not None:
+            raise self._arm_error
+        self.arms += 1
+        return True
+
+    def cancel_playback(self) -> object:
+        if self._cancel_error is not None:
+            raise self._cancel_error
+        self.cancels += 1
+        self.playback_pending = False
+        return _progress_of(self.split)
+
+    def send_item(self, item: object) -> bool:
+        """Mirrors the real ``send_item``: accepted, or a counted decline.
+
+        The real method never raises and answers ``False`` for a gateway that
+        announced nothing — naming the degrade itself, once per session. So the
+        composition root reads the RETURN for "did the floor learn this", never
+        an exception, and this double models both halves.
+        """
+        if self._item_error is not None:
+            raise self._item_error
+        if not self.items_supported:
+            self.items_declined += 1
+            return False
+        self.items.append(item)
+        return True
+
+    @property
+    def supports_conversation_items(self) -> bool:
+        return self.items_supported
+
+    # -- the three taps, fired the way the session worker would -------------- #
 
     def hear(self, text: str) -> None:
         self.kwargs["on_utterance"](Utterance(text=text, t=1.0))
 
-    def reply(self, text: str, *, interrupted: bool = False) -> None:
+    def speech_started(self, item_id: str = "item_1") -> None:
+        """Fire the VAD tap the way the session worker dispatches it (task t16)."""
+        self.kwargs["on_speech_started"](
+            {"type": "input_audio_buffer.speech_started", "item_id": item_id}
+        )
+
+    def spoken_split(self, response_id: str | None = None) -> object | None:
+        if self._split_error is not None:
+            raise self._split_error
+        return self.split
+
+    def reply(self, text: str, *, interrupted: bool = False, split: object | None = None) -> None:
+        if split is not None:
+            self.split = split
+        if interrupted:
+            # ``RealtimeDuplexSession._finish_response`` drains the mouth queue
+            # (``_skip_remaining``) BEFORE it fires ``on_response``, so by the
+            # time a server-driven barge-in reaches a tap there is nothing left
+            # for a client-side cut to withhold. Modelled here rather than
+            # poked by hand in a test, because it is the whole reason the two
+            # cut paths cannot double-record one reply.
+            self.playback_pending = False
         self.kwargs["on_response"](
             Response(
                 response_id="r1",
@@ -155,6 +296,30 @@ class _FakeSession:
                 interrupted=interrupted,
             )
         )
+
+
+def _progress_of(split: object | None):
+    """The REAL ``PlaybackProgress`` a ``cancel_playback`` would return for *split*.
+
+    The composition root reads only ``response_id`` off it, but building the
+    genuine record is the same discipline :func:`_measured_split` follows: the
+    join under test is exactly the kind where a double taking ``**kwargs`` on
+    one side hides a shape disagreement on the other.
+    """
+    from reachy.speech.realtime_duplex import PlaybackProgress
+
+    total = int(getattr(split, "total_bytes", 0) or 0)
+    played = int(getattr(split, "played_bytes", 0) or 0)
+    in_flight = int(getattr(split, "in_flight_bytes", 0) or 0)
+    return PlaybackProgress(
+        response_id=getattr(split, "response_id", None) or "r1",
+        queued_bytes=total,
+        played_bytes=played,
+        in_flight_bytes=in_flight,
+        skipped_bytes=max(0, total - played - in_flight),
+        cancelled=True,
+        total_bytes=total,
+    )
 
 
 class _SessionFactory:
@@ -262,6 +427,22 @@ def _speak_turn(text: str) -> TurnResult:
         ],
         finish_reason="tool_calls",
     )
+
+
+def _open_interjection_limits():
+    """Interjection limits an operator has deliberately opened for the worker.
+
+    The SHIPPED limits are closed (issue #155 c22), which is right and is
+    pinned elsewhere; a test about something else entirely — a broken export
+    consumer, an import boundary — needs the open ones, or the thing it means
+    to observe never happens for an unrelated reason. Only the LIMITS are
+    injectable: ``_compose_embody_seam`` always builds the policy itself, so
+    the attention wiring cannot be forgotten by a caller.
+    """
+    from reachy.embody.interjection import Authorization, InterjectionLimits
+    from reachy.embody.tools import TOOL_SOURCE
+
+    return InterjectionLimits(authorization=Authorization.PROACTIVE, sources=(TOOL_SOURCE,))
 
 
 def _wait_for(predicate, *, budget: float = WAIT_BUDGET_S) -> None:
@@ -486,13 +667,15 @@ def test_a_spoken_reply_is_recorded_as_already_said_never_as_a_trigger():
         layer.close()
 
 
-def test_an_interrupted_reply_is_never_recorded_as_spoken():
-    """A barge-in truncated reply is deliberately NOT played, so it was not said.
+def test_an_interrupted_reply_with_no_measurement_is_never_recorded_as_spoken():
+    """No measured split means nothing provable reached the room, so nothing is said.
 
     ``RealtimeDuplexSession._finish_response`` publishes an interrupted reply
     through ``on_response`` like any other (the record carries the audio and
-    says why) but never speaks it. Recording it as already-said would make the
-    mind believe it had answered when the human heard nothing.
+    says why). Since task t7 the tap asks the session what the room actually
+    heard; a session reporting no split at all (this double's default) falls
+    back to the conservative pre-t7 answer — recording it as already-said would
+    make the mind believe it had answered when the human heard nothing.
     """
     factory = _SessionFactory()
     sink = _Sink()
@@ -594,23 +777,24 @@ def test_the_mute_during_playback_seam_is_one_flag_away():
         layer.close()
 
 
-def test_the_voice_tools_render_through_the_same_profile_sink():
-    """``speak`` synthesises and plays through the profile's sink, not a new one."""
+def test_the_profile_sink_has_exactly_one_consumer_the_foreground_voice():
+    """Since task t12 the sink is the realtime floor's, and nobody else's.
+
+    This test used to assert the opposite — that a ``speak`` tool call
+    synthesised and played through this sink. Issue #155's claim c2 retired
+    that path: the worker model's text may not reach a speaker by any route, so
+    the voice tools became PROPOSALS and the sink kept one consumer, the duplex
+    session playing the FOREGROUND voice's own reply.
+    ``tests/test_embody_governed_voice.py`` pins the retired half in full.
+    """
     media = _media()
-    layer, _args, _sink = _compose(
-        media=media,
-        session_factory=_SessionFactory(),
-        lines=iter(()),
-        synthesize={"tts": lambda text: b"\x01\x02" * len(text)},
-    )
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=media, session_factory=factory, lines=iter(()))
     try:
+        assert factory.last.kwargs["play"] == media.sink.play
         result = layer.registry.dispatch(SPEAK, json.dumps({"text": "hi"}), "call_1")
-        assert json.loads(result["content"])["ok"] is True
-        played = media.sink._backend.played
-        assert len(played) == 1
-        pcm, rate = played[0]
-        assert pcm == b"\x01\x02" * 2
-        assert rate == 24000, "the tts leg's PCM16 rate must travel with the audio"
+        assert json.loads(result["content"])["ok"] is False
+        assert media.sink._backend.played == []
     finally:
         layer.close()
 
@@ -781,8 +965,8 @@ def test_composing_the_whole_layer_never_pulls_reachy_mini_into_sys_modules(tmp_
             def start(self): pass
             def close(self): pass
 
-        def _silent(_text):
-            return b"\\x00\\x00"
+        from reachy.embody.interjection import Authorization, InterjectionLimits
+        from reachy.embody.tools import TOOL_SOURCE
 
         args = _build_parser().parse_args(["agent", "embody"])
         layer = agent._compose_embody_seam(
@@ -790,7 +974,11 @@ def test_composing_the_whole_layer_never_pulls_reachy_mini_into_sys_modules(tmp_
             export=None,
             session_factory=lambda **kw: FakeSession(**kw),
             lines=iter(()),
-            synthesize={{"tts": _silent, "harmonic": _silent}},
+            # Deliberately OPEN: a refused proposal would prove nothing about
+            # which import legs an ADMITTED one takes.
+            interjection_limits=InterjectionLimits(
+                authorization=Authorization.PROACTIVE, sources=(TOOL_SOURCE,)
+            ),
         )
         layer.registry.dispatch("speak", '{{"text": "hello"}}', "c1")
         layer.registry.dispatch("harmonics", '{{"text": "hello"}}', "c2")
@@ -890,48 +1078,19 @@ def test_every_named_failure_reaches_the_journal_and_the_export_feed(reason, cap
 def test_a_drop_without_an_export_hook_is_still_a_named_journal_line(caplog):
     """The feed is optional; the journal is not."""
     with caplog.at_level(logging.INFO, logger="reachy"):
-        agent_mod._embody_drop(None, "layer", agent_mod.REASON_SPEAK_FAILED, "")
-    assert agent_mod.REASON_SPEAK_FAILED in "\n".join(r.getMessage() for r in caplog.records)
-
-
-def test_a_dead_speaker_is_a_named_drop_on_the_feed_and_a_refusal_to_the_model():
-    """A wedged sink must not vanish: the model is told, and the feed shows it."""
-    sink = _Sink()
-    layer, _args, _sink = _compose(
-        media=_media(sink_fails=RuntimeError("no such device")),
-        session_factory=_SessionFactory(),
-        lines=iter(()),
-        sink=sink,
+        agent_mod._embody_drop(None, "layer", agent_mod.REASON_SESSION_START_FAILED, "")
+    assert agent_mod.REASON_SESSION_START_FAILED in "\n".join(
+        r.getMessage() for r in caplog.records
     )
-    try:
-        result = layer.registry.dispatch(SPEAK, json.dumps({"text": "hello"}), "c1")
-        payload = json.loads(result["content"])
-        assert payload["ok"] is False
-        assert any(agent_mod.REASON_SPEAK_FAILED in text for text in sink.texts("thinking"))
-    finally:
-        layer.close()
 
 
-def test_a_synthesis_failure_is_a_named_drop_not_a_crash():
-    """A wedged TTS resolves the same way a wedged speaker does."""
-    sink = _Sink()
-
-    def _boom(_text: str) -> bytes:
-        raise RuntimeError("tts is down")
-
-    layer, _args, _sink = _compose(
-        media=_media(),
-        session_factory=_SessionFactory(),
-        lines=iter(()),
-        synthesize={"tts": _boom},
-        sink=sink,
-    )
-    try:
-        result = layer.registry.dispatch(SPEAK, json.dumps({"text": "hello"}), "c1")
-        assert json.loads(result["content"])["ok"] is False
-        assert any(agent_mod.REASON_SPEAK_FAILED in text for text in sink.texts("thinking"))
-    finally:
-        layer.close()
+# The two tests that used to sit here — a dead speaker and a wedged TTS, each
+# surfacing as a named ``speak-failed`` drop — went with the code they covered.
+# The layer no longer synthesises or plays the worker model's text at all
+# (issue #155 claim c2), so there is no synthesis leg left to wedge and no
+# speaker for a tool call to find dead. What replaced them is a structural
+# claim rather than a failure mode: ``tests/test_embody_governed_voice.py``
+# proves no code path reaches either.
 
 
 def test_a_cue_source_that_dies_mid_stream_is_a_named_drop_not_a_crash():
@@ -954,20 +1113,17 @@ def test_a_cue_source_that_dies_mid_stream_is_a_named_drop_not_a_crash():
         layer.close()
 
 
-def test_a_voice_that_will_not_resolve_leaves_the_tool_advertised_but_refusing(monkeypatch):
-    """The action set must not change SHAPE with the box's audio configuration.
+def test_a_closed_interjection_policy_leaves_the_tool_advertised_but_refusing():
+    """The action set must not change SHAPE with the box's configuration.
 
     A model that finds a different tool list on every start learns a different
-    robot every time, so an unresolvable voice engine yields an advertised tool
-    that refuses by name — never a missing tool.
+    robot every time. That argument outlived the voice pipe it was written for:
+    the shipped interjection policy is CLOSED, and what a ``speak`` call gets
+    is an advertised tool returning a named refusal — never a missing tool.
     """
-    from reachy.embody.tools import ACTION_SET, REFUSAL_NO_VOICE
-    from reachy.speech import voice as voice_mod
+    from reachy.embody.interjection import REFUSAL_UNAUTHORIZED
+    from reachy.embody.tools import ACTION_SET
 
-    def _no_voice(_name=None):
-        raise CliError(code=1, message="no such engine", remediation="install one")
-
-    monkeypatch.setattr(voice_mod, "resolve_voice_engine", _no_voice)
     sink = _Sink()
     layer, _args, _sink = _compose(
         media=_media(), session_factory=_SessionFactory(), lines=iter(()), sink=sink
@@ -975,10 +1131,45 @@ def test_a_voice_that_will_not_resolve_leaves_the_tool_advertised_but_refusing(m
     try:
         assert tuple(layer.registry.names()) == ACTION_SET
         result = layer.registry.dispatch(SPEAK, json.dumps({"text": "hello"}), "c1")
-        assert json.loads(result["content"])["refusal"] == REFUSAL_NO_VOICE
-        assert any(agent_mod.REASON_VOICE_UNAVAILABLE in text for text in sink.texts("thinking"))
+        assert json.loads(result["content"])["refusal"] == REFUSAL_UNAUTHORIZED
     finally:
         layer.close()
+
+
+def test_the_late_attention_adapter_forwards_an_injected_clock():
+    """Accepting ``now`` and dropping it is a silently wrong answer.
+
+    ``_LateAttention`` stands in front of a real ``AttentionGate`` whose
+    ``is_warm``/``note_spoken`` both honour an injected clock. When the adapter
+    took ``now`` and ignored it, a caller that had pinned the moment got an
+    answer computed from wall time instead — and nothing said so. Sonar
+    (python:S1172) flagged it as an unused parameter; the fix is to FORWARD it,
+    not to delete it, because the parameter is the seam's shape.
+    """
+    seen: list[float | None] = []
+
+    class _Gate:
+        def is_warm(self, now=None):
+            seen.append(now)
+            return True
+
+        def note_spoken(self, now=None):
+            seen.append(now)
+            return True
+
+    class _Engine:
+        attention = _Gate()
+
+    adapter = agent_mod._LateAttention(lambda: _Engine())
+    assert adapter.is_warm(1234.5) is True
+    assert adapter.note_spoken(6789.0) is True
+    assert seen == [1234.5, 6789.0], "the adapter dropped the caller's clock"
+
+    # And it still answers safely before the engine exists — the whole reason
+    # the adapter is 'late' in the first place.
+    absent = agent_mod._LateAttention(lambda: None)
+    assert absent.is_warm(1234.5) is False
+    assert absent.note_spoken(1234.5) is False
 
 
 def test_a_resource_that_refuses_to_close_is_a_named_drop_not_a_raise():
@@ -1009,8 +1200,10 @@ def test_an_export_sink_that_raises_never_takes_the_drop_path_down(caplog):
 
     hook = ExportHook(emit=_hostile, pose_resolver={}.get, time_fn=lambda: 0.0)
     with caplog.at_level(logging.INFO, logger="reachy"):
-        agent_mod._embody_drop(hook, "layer", agent_mod.REASON_SPEAK_FAILED, "detail")
-    assert agent_mod.REASON_SPEAK_FAILED in "\n".join(r.getMessage() for r in caplog.records)
+        agent_mod._embody_drop(hook, "layer", agent_mod.REASON_SESSION_START_FAILED, "detail")
+    assert agent_mod.REASON_SESSION_START_FAILED in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
 
 
 def test_max_events_bounds_the_cue_reader(tmp_path):
@@ -1145,24 +1338,39 @@ def test_killing_the_export_consumer_mid_run_leaves_the_layer_alive(tmp_path, ca
     turn = _ScriptedTurn(_speak_turn("hi"), TurnResult(content="done", finish_reason="stop"))
     factory = _SessionFactory()
     media = _media()
+    # An OPEN policy, so "the layer kept acting" is observable: the turn's own
+    # ``speak`` call still reaches the interjection route after the feed breaks.
+    # (Before task t12 this test watched the profile sink instead; the worker's
+    # text no longer reaches a speaker by any route — issue #155 claim c2.)
+    limits = _open_interjection_limits()
+    layer_box: list = []
 
-    code = agent_mod.cmd_agent_embody(
-        _parse(f"--feed={feed}", "--export=-", "--max-turns=3", "--turn-interval=0.001"),
-        stream=stream,
-        compose=lambda args, *, export: agent_mod._compose_embody_seam(
+    def _compose_seam(args, *, export):
+        layer = agent_mod._compose_embody_seam(
             args,
             export=export,
             media=media,
             session_factory=factory,
             turn_fn=turn,
-            synthesize={"tts": lambda text: b"\x00\x00"},
-        ),
+            interjection_limits=limits,
+        )
+        layer_box.append(layer)
+        return layer
+
+    code = agent_mod.cmd_agent_embody(
+        _parse(f"--feed={feed}", "--export=-", "--max-turns=3", "--turn-interval=0.001"),
+        stream=stream,
+        compose=_compose_seam,
     )
 
     assert code == 0, "the layer died when its export consumer went away"
     assert stream.attempts > 1, "the exporter never tried to write past the break"
     assert len(turn.calls) >= 1, "no turn ran at all"
-    assert media.sink._backend.played, "the layer stopped speaking when the feed broke"
+    scopes = layer_box[0].engine.scopes
+    assert [s.suggested_next_step for s in scopes] == [
+        "hi"
+    ], "the layer stopped acting when the feed broke"
+    assert media.sink._backend.played == [], "the worker's text reached the speaker"
 
 
 # =========================================================================== #
@@ -1194,14 +1402,14 @@ class _FakeAskEngine:
     def __init__(self, ask_fn=None) -> None:
         self._ask_fn = ask_fn if ask_fn is not None else (lambda prompt, **kw: "")
         self.ask_calls: list[object] = []
-        self.submitted: list[tuple[str, object]] = []
+        self.perceptions: list[tuple[object, str]] = []
 
     def ask(self, prompt, **kwargs):
         self.ask_calls.append(prompt)
         return self._ask_fn(prompt, **kwargs)
 
-    def submit_cue(self, text: str, *, cue_class=None) -> bool:
-        self.submitted.append((text, cue_class))
+    def submit_perception(self, snapshot, *, source: str = "vision") -> bool:
+        self.perceptions.append((snapshot, source))
         return True
 
 
@@ -1256,7 +1464,7 @@ def test_a_missing_clip_block_is_a_named_drop_never_a_call_to_ask():
     asker.poll_once()
 
     assert engine.ask_calls == [], "no clip reference means nothing to ask about"
-    assert engine.submitted == []
+    assert engine.perceptions == []
     assert any(agent_mod.REASON_CLIP_UNAVAILABLE in t for t in sink.texts("thinking"))
 
 
@@ -1347,7 +1555,7 @@ def test_ask_raising_is_a_named_drop_never_a_raised_exception(tmp_path):
 
     asker.poll_once()  # must not raise
 
-    assert engine.submitted == [], "a failed ask must never reach context"
+    assert engine.perceptions == [], "a failed ask must never reach context"
     assert any(agent_mod.REASON_CLIP_ASK_FAILED in t for t in sink.texts("thinking"))
 
 
@@ -1363,28 +1571,153 @@ def test_an_empty_answer_is_a_named_drop_never_context(tmp_path):
 
     asker.poll_once()
 
-    assert engine.submitted == []
+    assert engine.perceptions == []
     assert any(agent_mod.REASON_CLIP_ASK_EMPTY in t for t in sink.texts("thinking"))
 
 
-def test_a_fresh_clip_reaches_ask_and_the_answer_lands_as_context(tmp_path):
+def test_a_fresh_clip_reaches_ask_and_the_unstructured_answer_degrades_to_a_summary(tmp_path):
+    """Task t13: a cheap model's free-text reply still lands as a snapshot, degraded and named."""
     clip = _clip_file(tmp_path)
     engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen, someone is cooking")
+    sink = _Sink()
     asker = agent_mod._ClipAsker(
-        engine, read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)}
+        engine,
+        read_clip=lambda: {"available": True, "ts": time.monotonic(), "path": str(clip)},
+        export=sink.hook(),
     )
 
     asker.poll_once()
 
     assert len(engine.ask_calls) == 1
     assert asker.asks == 1
-    assert engine.submitted, "the answer never reached the engine as context"
-    text, cue_class = engine.submitted[0]
-    assert "a kitchen" in text
+    assert engine.perceptions, "the answer never reached the engine as a snapshot"
+    snapshot, source = engine.perceptions[0]
+    assert snapshot.summary == "a kitchen, someone is cooking"
+    assert snapshot.entities == ()
+    assert snapshot.confidence is None
+    assert source == "vision"
+    assert any(agent_mod.REASON_CLIP_ANSWER_UNSTRUCTURED in t for t in sink.texts("thinking"))
 
-    from reachy.embody.cues import CueClass
 
-    assert cue_class is CueClass.CONTEXT, "the answer must land as CONTEXT, never a trigger"
+def test_a_fresh_clip_with_a_structured_json_answer_produces_a_full_snapshot(tmp_path):
+    """Task t13: when the senses lane follows the requested shape, every field lands."""
+    clip = _clip_file(tmp_path)
+    raw = (
+        '{"summary": "a kitchen, someone is cooking", '
+        '"entities": ["person", "stove"], "confidence": 0.87}'
+    )
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: raw)
+    ts = time.monotonic()
+    asker = agent_mod._ClipAsker(
+        engine, read_clip=lambda: {"available": True, "ts": ts, "path": str(clip)}
+    )
+
+    asker.poll_once()
+
+    assert engine.perceptions, "the answer never reached the engine as a snapshot"
+    snapshot, source = engine.perceptions[0]
+    assert snapshot.summary == "a kitchen, someone is cooking"
+    assert snapshot.entities == ("person", "stove")
+    assert snapshot.confidence == 0.87
+    assert snapshot.captured_at == ts, "the clip's OWN monotonic ts, never a re-stamp"
+    assert snapshot.frame_ref == str(clip)
+    assert source == "vision"
+
+
+# --------------------------------------------------------------------------- #
+# parse_perception_answer — the tolerant JSON extractor (task t13, spec c7)   #
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_perception_answer_extracts_a_well_formed_object():
+    parsed = agent_mod.parse_perception_answer(
+        '{"summary": "a kitchen", "entities": ["stove"], "confidence": 0.5}'
+    )
+    assert parsed == ("a kitchen", ("stove",), 0.5)
+
+
+def test_parse_perception_answer_is_tolerant_of_surrounding_prose():
+    """The senses lane is a cheap model — it will sometimes wrap the JSON in text."""
+    parsed = agent_mod.parse_perception_answer(
+        'Sure, here it is:\n```json\n{"summary": "a kitchen"}\n```\nHope that helps!'
+    )
+    assert parsed == ("a kitchen", (), None)
+
+
+def test_parse_perception_answer_tolerates_a_reformatted_key(caplog):
+    """The deployed senses model pads its keys — ``{" summary": ...}``, live.
+
+    Found by t15's live acceptance, not offline: every clip ask on the
+    deployed gateway was dropped ``clip-answer-unstructured`` while the
+    ANSWER was perfectly good, because Gemma emits the key with a leading
+    space inside the quotes even though :data:`DEFAULT_CLIP_PROMPT` asks for
+    ``{"summary": ...}``. Three consecutive real drops, verbatim from the
+    journal:
+
+        dropped reason=clip-answer-unstructured (```json
+        {" summary": "The camera is positioned in a room, capturing a view
+        of a desk, a chair, and a window.", "entities
+
+    A padded or differently-cased key is the model reformatting OUR shape,
+    not the model ignoring it — so it belongs on the tolerant side of this
+    parser's documented contract, exactly like the surrounding-prose case
+    above. Evidence: ``docs/evidence/2026-08-03-t15-155-live-acceptance.md``.
+    """
+    parsed = agent_mod.parse_perception_answer(
+        '```json\n{" summary": "a room with a desk", "entities ": ["desk"], '
+        '"Confidence": 0.8}\n```'
+    )
+    assert parsed == ("a room with a desk", ("desk",), 0.8)
+
+
+def test_parse_perception_answer_still_refuses_a_genuinely_different_key():
+    """Tolerating whitespace/case must NOT slide into guessing at a synonym.
+
+    ``description`` is not a reformatting of ``summary``; it is a different
+    key, and a parser that accepted it would be inventing the contract rather
+    than tolerating a sloppy rendering of it.
+    """
+    assert agent_mod.parse_perception_answer('{"description": "a room"}') is None
+
+
+def test_parse_perception_answer_returns_none_for_free_prose():
+    assert agent_mod.parse_perception_answer("I am in a kitchen, someone is cooking.") is None
+
+
+def test_parse_perception_answer_returns_none_for_a_blank_summary():
+    assert agent_mod.parse_perception_answer('{"summary": "   "}') is None
+
+
+def test_parse_perception_answer_returns_none_when_summary_is_missing():
+    assert agent_mod.parse_perception_answer('{"entities": ["a"], "confidence": 0.4}') is None
+
+
+def test_parse_perception_answer_drops_non_string_entities_without_failing():
+    parsed = agent_mod.parse_perception_answer(
+        '{"summary": "a kitchen", "entities": ["stove", null, 3, {"a": 1}, "  "]}'
+    )
+    assert parsed == ("a kitchen", ("stove", "3"), None)
+
+
+def test_parse_perception_answer_ignores_a_non_list_entities_value():
+    parsed = agent_mod.parse_perception_answer('{"summary": "a kitchen", "entities": "stove"}')
+    assert parsed == ("a kitchen", (), None)
+
+
+def test_parse_perception_answer_clamps_confidence_to_the_unit_interval():
+    assert agent_mod.parse_perception_answer('{"summary": "a", "confidence": 4.2}')[2] == 1.0
+    assert agent_mod.parse_perception_answer('{"summary": "a", "confidence": -1.0}')[2] == 0.0
+
+
+def test_parse_perception_answer_rejects_a_boolean_confidence():
+    """``json`` parses ``true``/``false`` as a ``bool``, an ``int`` subtype — never read as 0/1."""
+    parsed = agent_mod.parse_perception_answer('{"summary": "a", "confidence": true}')
+    assert parsed == ("a", (), None)
+
+
+def test_parse_perception_answer_ignores_a_non_numeric_confidence():
+    parsed = agent_mod.parse_perception_answer('{"summary": "a", "confidence": "very sure"}')
+    assert parsed == ("a", (), None)
 
 
 def test_ask_is_called_with_the_probed_multimodal_wire_shape(tmp_path):
@@ -1465,7 +1798,9 @@ def test_recovery_after_a_failure_reports_a_fresh_drop_on_the_next_one(tmp_path)
     """The dedup latch resets on success, so a LATER distinct failure still reports."""
     clip = _clip_file(tmp_path)
     state = {"ts": 1.0, "available": True}
-    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: "a kitchen")
+    # Well-formed JSON, so this poll degrades nothing — the recovery this
+    # test pins is about the FAILURE-mode dedup latch, not the parser.
+    engine = _FakeAskEngine(ask_fn=lambda prompt, **kw: '{"summary": "a kitchen"}')
     sink = _Sink()
 
     def _read():
@@ -1651,7 +1986,6 @@ def test_embody_runs_turns_over_a_feed_and_publishes_its_own_cognition_feed(tmp_
             media=_media(),
             session_factory=_SessionFactory(),
             turn_fn=turn,
-            synthesize={"tts": lambda text: b"\x00\x00"},
         )
         layer_box.append(layer)
         return layer
@@ -1687,7 +2021,6 @@ def test_embody_summary_goes_to_stdout_as_json_when_not_exporting(tmp_path, caps
             media=_media(),
             session_factory=_SessionFactory(),
             turn_fn=turn,
-            synthesize={"tts": lambda text: b"\x00\x00"},
         ),
     )
     assert code == 0
@@ -1789,3 +2122,1005 @@ def test_embody_operating_defaults_still_apply_when_nothing_is_given() -> None:
     assert args.feed == "-"
     assert args.media_profile is None
     assert args.mute_during_playback is False
+    assert args.attention_window is None
+
+
+# --------------------------------------------------------------------------- #
+# --attention-window / REACHY_EMBODY_ATTENTION_WINDOW — issue #150            #
+# --------------------------------------------------------------------------- #
+
+
+def test_attention_window_flag_survives_operand_order_the_147_defect_class() -> None:
+    """``--attention-window`` reaches start/restart from EITHER side of the verb.
+
+    Exactly the shape ``test_embody_operating_flags_survive_being_written_
+    before_the_subcommand`` pins for ``--feed``/``--media-profile`` above: the
+    #147 defect was a flag that parsed fine on its own but was silently reset
+    to the sub-parser's own default once a subcommand followed it.
+    """
+    from reachy.cli import _build_parser
+
+    parser = _build_parser()
+    for verb in ("start", "restart"):
+        before = parser.parse_args(["agent", "embody", "--attention-window", "12", verb])
+        after = parser.parse_args(["agent", "embody", verb, "--attention-window", "12"])
+        assert (
+            before.attention_window == after.attention_window == 12.0
+        ), f"{verb}: --attention-window did not survive"
+
+
+def test_attention_window_subcommand_flag_wins_over_the_parent() -> None:
+    from reachy.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        ["agent", "embody", "--attention-window", "12", "start", "--attention-window", "7"]
+    )
+    assert args.attention_window == 7.0
+
+
+def test_attention_window_flag_accepts_zero_without_being_swallowed_as_falsy() -> None:
+    """0 must parse and survive on the CLI (AC 3, issue #150) — see also
+    ``reachy.embody.engine``'s ``resolve_attention_window_s`` unit tests for
+    the falsy-zero hazard this guards against downstream.
+    """
+    from reachy.cli import _build_parser
+
+    args = _build_parser().parse_args(["agent", "embody", "start", "--attention-window", "0"])
+    assert args.attention_window == 0.0
+
+
+def test_compose_resolves_the_attention_window_from_the_explicit_flag() -> None:
+    layer, _args, _sink = _compose(
+        ["--attention-window", "12"],
+        media=_media(),
+        session_factory=_SessionFactory(),
+        lines=iter(()),
+    )
+    try:
+        assert layer.engine.attention.window_s == 12.0
+    finally:
+        layer.close()
+
+
+def test_compose_resolves_the_attention_window_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("REACHY_EMBODY_ATTENTION_WINDOW", "9")
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=_SessionFactory(), lines=iter(())
+    )
+    try:
+        assert layer.engine.attention.window_s == 9.0
+    finally:
+        layer.close()
+
+
+def test_compose_explicit_attention_window_wins_over_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("REACHY_EMBODY_ATTENTION_WINDOW", "9")
+    layer, _args, _sink = _compose(
+        ["--attention-window", "12"],
+        media=_media(),
+        session_factory=_SessionFactory(),
+        lines=iter(()),
+    )
+    try:
+        assert layer.engine.attention.window_s == 12.0
+    finally:
+        layer.close()
+
+
+def test_compose_defaults_the_attention_window_when_nothing_is_given() -> None:
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=_SessionFactory(), lines=iter(())
+    )
+    try:
+        assert layer.engine.attention.window_s == agent_mod.DEFAULT_ATTENTION_WINDOW_S
+    finally:
+        layer.close()
+
+
+def test_compose_a_zero_attention_window_reaches_the_engine_as_name_only_forever() -> None:
+    """The clamp AttentionGate already has for ``0`` (AC 3) survives composition."""
+    layer, _args, _sink = _compose(
+        ["--attention-window", "0"],
+        media=_media(),
+        session_factory=_SessionFactory(),
+        lines=iter(()),
+    )
+    try:
+        assert layer.engine.attention.window_s == 0.0
+    finally:
+        layer.close()
+
+
+def test_the_command_modules_local_attention_window_constants_match_the_real_ones() -> None:
+    """A drift canary for the by-VALUE duplication ``DEFAULT_ATTENTION_WINDOW_S``/
+    ``ENV_ATTENTION_WINDOW_S`` need in this module (h15: no module-scope
+    ``reachy.embody`` import) — mirrors ``test_the_layer_answers_to_the_same_
+    names_the_runtime_gate_does``'s tuple-equality pin in
+    ``tests/test_embody_attention.py`` for the same reason.
+    """
+    from reachy.embody.attention import DEFAULT_ATTENTION_WINDOW_S as REAL_DEFAULT
+    from reachy.embody.engine import ENV_ATTENTION_WINDOW_S as REAL_ENV
+
+    assert agent_mod.DEFAULT_ATTENTION_WINDOW_S == REAL_DEFAULT
+    assert agent_mod.ENV_ATTENTION_WINDOW_S == REAL_ENV
+
+
+def test_the_clip_and_perception_staleness_bounds_stay_equal() -> None:
+    """The second by-VALUE mirror, pinned for the same reason as the first.
+
+    ``_ClipAsker`` refuses to ASK about a clip older than
+    ``DEFAULT_CLIP_STALE_AFTER_S``; the engine evicts a parked snapshot older
+    than ``DEFAULT_PERCEPTION_STALE_AFTER_S``. Both are measured against the
+    SAME quantity — the age of the frame the snapshot describes — so they are
+    one decision expressed twice, and task t13's docstrings justify the second
+    by pointing at the first. Nothing enforced that, which is what a drift
+    canary is for: raising the ask bound alone would let the asker spend a
+    ~2 400-token clip question (measured, task t1) on a frame the engine then
+    evicts on the very next read.
+    """
+    from reachy.embody.engine import DEFAULT_PERCEPTION_STALE_AFTER_S
+
+    assert agent_mod.DEFAULT_CLIP_STALE_AFTER_S == DEFAULT_PERCEPTION_STALE_AFTER_S
+
+
+# =========================================================================== #
+# Connect-time voice conventions reach production composition                 #
+# (issue #151/#153, spec claim c10, honesty h8, task t9)                       #
+#                                                                              #
+# resolve_voice_prompt/DEFAULT_VOICE_PROMPT existed after this task's first    #
+# pass but had NO production caller: _compose_embody_seam's build_session      #
+# call never passed system_prompt=, so the shipped robot still inherited the   #
+# gateway's bare default -- a capability built and never wired is             #
+# indistinguishable from a missing one (the exact shape task t6's own          #
+# cancel_playback hit earlier in this arc, per issue #151's own retrospective).#
+# These tests pin the ONE production construction site so this cannot         #
+# silently regress to unwired again.                                          #
+# =========================================================================== #
+
+
+def test_compose_ships_the_default_voice_prompt_when_nothing_is_configured() -> None:
+    """The point of the task: "nothing configured" ships DEFAULT_VOICE_PROMPT,
+    not silence -- composition asks resolve_voice_prompt for a `default=`,
+    which the bare function never substitutes on its own."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["system_prompt"] == DEFAULT_VOICE_PROMPT
+    finally:
+        layer.close()
+
+
+def test_compose_resolves_the_voice_prompt_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv(ENV_VOICE_PROMPT, "Speak like a lighthouse keeper.")
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["system_prompt"] == "Speak like a lighthouse keeper."
+    finally:
+        layer.close()
+
+
+def test_compose_a_present_but_blank_env_override_opts_out_to_no_override(
+    monkeypatch,
+) -> None:
+    """A PRESENT but BLANK REACHY_EMBODY_VOICE_PROMPT is how an operator reaches
+    the bare gateway default even once composition asks for DEFAULT_VOICE_PROMPT
+    -- distinguishable from an unset key, and never silently repaired into the
+    layer's own recommendation (resolve_voice_prompt's own docstring)."""
+    monkeypatch.setenv(ENV_VOICE_PROMPT, "   ")
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["system_prompt"] is None
+    finally:
+        layer.close()
+
+
+def test_compose_an_over_long_env_override_opts_out_to_no_override(monkeypatch) -> None:
+    from reachy.speech.realtime_duplex import MAX_VOICE_PROMPT_CHARS
+
+    monkeypatch.setenv(ENV_VOICE_PROMPT, "x" * (MAX_VOICE_PROMPT_CHARS + 1))
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["system_prompt"] is None
+    finally:
+        layer.close()
+
+
+def test_the_shipped_default_actually_reaches_the_connect_url() -> None:
+    """The end-to-end proof the coordinator asked for: through composition,
+    into the REAL session class, onto the connect URL -- not merely a kwarg
+    captured by a double. Never starts the session (no socket, no thread);
+    ``connect_url`` is a pure property."""
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=RealtimeDuplexSession, lines=iter(())
+    )
+    try:
+        query = parse_qs(urlsplit(layer.session.connect_url).query)
+        assert query.get("system_prompt") == [DEFAULT_VOICE_PROMPT]
+    finally:
+        layer.close()
+
+
+def test_a_custom_env_configured_voice_prompt_reaches_the_real_connect_url(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_VOICE_PROMPT, "Speak like a lighthouse keeper.")
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=RealtimeDuplexSession, lines=iter(())
+    )
+    try:
+        query = parse_qs(urlsplit(layer.session.connect_url).query)
+        assert query.get("system_prompt") == ["Speak like a lighthouse keeper."]
+    finally:
+        layer.close()
+
+
+# =========================================================================== #
+# 9. Attention gates the VOICE, not only the mind (issue #149, task t8)       #
+#                                                                            #
+# The gate stopped an ambient utterance from running a TURN (#148) and the    #
+# robot answered it out loud anyway, because arming was a decision taken once #
+# at ``session.created``. The fix is a policy — arm per ADMITTED utterance —   #
+# and the policy lives HERE, at the composition layer, reading the gate. The  #
+# wire only gained a mechanism (``arm_once``) and a capability probe; its     #
+# three structural gate-free pins are unchanged in                            #
+# ``tests/test_realtime_duplex.py``.                                          #
+# =========================================================================== #
+
+
+def test_the_composition_asks_the_session_for_per_utterance_arming() -> None:
+    """The layer opts IN: the wire's default is still arm-once for everyone else."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["arm_per_utterance"] is True
+    finally:
+        layer.close()
+
+
+def test_an_admitted_utterance_asks_the_gateway_for_exactly_one_spoken_reply() -> None:
+    """The join: ``AttentionGate`` admits -> the composition arms -> one reply."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.hear("reachy, are you listening")
+        assert factory.last.arms == 1
+    finally:
+        layer.close()
+
+
+def test_an_ambient_utterance_asks_for_no_reply_at_all_ignore_means_silently() -> None:
+    """Issue #149 stated as an assertion: a refused utterance arms NOTHING.
+
+    The robot heard it — the wire is ungated and stays so — and it neither
+    thinks about it nor answers it. Then the name opens the window and the very
+    next nameless sentence is both thought about AND answered, so what changed
+    is a STATE, not a filter on wording.
+    """
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.hear("could you pass me the salt please")
+        assert factory.last.arms == 0
+        assert layer.engine.pending == 0
+
+        factory.last.hear("reachy, are you listening")
+        factory.last.hear("and what can you see")
+        assert factory.last.arms == 3 - 1, "the name warmed the window for the next one"
+    finally:
+        layer.close()
+
+
+def test_an_addressed_utterance_is_answered_even_when_the_mind_is_saturated() -> None:
+    """The arming decision follows ATTENTION, not the trigger queue's depth.
+
+    ``submit_utterance`` returns ``False`` for two very different reasons: the
+    robot was not addressed, and the robot was addressed but the turn engine
+    already has more than it can think about. Only the first is a reason to
+    stay silent — the engine's own docstring says the admission stands either
+    way, "a fact about the room, not about how full a queue happened to be" —
+    and the voice belongs to the realtime floor rather than to this queue, so a
+    saturated mind must not mute the robot mid-conversation.
+    """
+    import dataclasses as _dc
+
+    from reachy.embody.engine import EmbodyTurnEngine
+
+    def _one_deep(**kwargs):
+        kwargs["limits"] = _dc.replace(kwargs["limits"], max_pending=1)
+        return EmbodyTurnEngine(**kwargs)
+
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), engine_factory=_one_deep
+    )
+    try:
+        factory.last.hear("reachy, first question")
+        assert layer.engine.pending == 1
+        factory.last.hear("and a second one right away")
+        assert layer.engine.pending == 1, "the trigger queue refused the second"
+        assert factory.last.arms == 2, "but the room still gets an answer"
+    finally:
+        layer.close()
+
+
+def test_an_empty_utterance_arms_nothing() -> None:
+    """A blank transcript is not an utterance; asking for a reply to it is noise."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.hear("   ")
+        assert factory.last.arms == 0
+    finally:
+        layer.close()
+
+
+def test_a_session_that_refuses_to_arm_is_a_named_drop_not_a_crash(caplog) -> None:
+    """The tap runs on the session's own worker thread: it may never raise."""
+    factory = _SessionFactory(arm_error=RuntimeError("socket gone"))
+    sink = _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), sink=sink
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="reachy"):
+            factory.last.hear("reachy, are you listening")
+        assert agent_mod.REASON_ARM_FAILED in "\n".join(r.getMessage() for r in caplog.records)
+        assert any(agent_mod.REASON_ARM_FAILED in text for text in sink.texts("thinking"))
+    finally:
+        layer.close()
+
+
+def _duplex_factory(server: FakeRealtimeServer, **limits):
+    """Build the REAL duplex session against *server* — the end-to-end seam.
+
+    An explicit ``url=`` wins over the suite-wide unreachable-gateway guard
+    (``tests/conftest.py``'s ``_no_live_realtime_gateway``), which is exactly
+    how ``tests/test_realtime_client.py`` points a real client at a fake.
+
+    *limits* overrides ride into the same frozen :class:`DuplexLimits`; the
+    shipped playback chunk is a second of speech, which no offline test should
+    have to synthesize.
+    """
+
+    def _build(**kwargs):
+        return RealtimeDuplexSession(
+            **kwargs,
+            url=server.url,
+            limits=DuplexLimits(backoff_initial_s=5.0, backoff_max_s=5.0, **limits),
+        )
+
+    return _build
+
+
+def test_c4_end_to_end_the_room_hears_no_reply_to_an_utterance_attention_refused() -> None:
+    """Criterion 1, all three pieces at once, over a real socket.
+
+    ``AttentionGate`` -> the composition root -> ``arm_once`` -> the wire ->
+    a gateway that answers only what it was asked to. The session double and
+    the fake server each prove their own half; only this proves the halves are
+    joined, and a join is what this arc keeps paying for getting wrong quietly.
+    """
+    with FakeRealtimeServer(
+        Scenario.ONE_SHOT_ARMING,
+        announce_one_shot_arming=True,
+        transcripts=["could you pass me the salt please", "reachy, are you listening"],
+        arm_grace_s=0.2,
+    ) as server:
+        layer, _args, _sink = _compose(
+            media=_media(),
+            session_factory=_duplex_factory(server),
+            lines=iter(()),
+            clip_reader=lambda: None,
+        )
+        try:
+            layer.start()
+            _wait_for(lambda: server.answered_transcripts >= 1)
+            _wait_for(lambda: int(getattr(layer.session, "utterances", 0)) >= 2)
+        finally:
+            layer.close()
+
+    assert server.response_create_count == 1, "more than one reply was asked for"
+    # WHICH one, not how many: with only counts this assertion is equally happy
+    # with a layer that answered the ambient sentence and ignored the addressed
+    # one — which is what an unwired ``arm_once`` actually produces.
+    assert server.answered_texts == ["reachy, are you listening"]
+    assert server.unanswered_texts == ["could you pass me the salt please"]
+    assert layer.engine.unaddressed_utterances == 1
+
+
+# =========================================================================== #
+# t7 — the cut reply reaches the mind as said + kept remainder (c34/h22)      #
+# =========================================================================== #
+
+
+def _measured_split(
+    said_bytes: int = 16, *, cut: bool = True, text: str = "one two three four five six"
+):
+    """A REAL :class:`~reachy.speech.realtime_duplex.SpokenSplit`, not a stand-in.
+
+    The join this section is about is exactly the kind both ends can pass
+    separately: the session measures, the engine records, and a mismatch in the
+    shape between them fails nowhere. So the split handed to the tap here is
+    the one the wire actually produces.
+    """
+    from reachy.speech.realtime_duplex import PlaybackProgress, split_spoken
+
+    total = 48
+    return split_spoken(
+        text,
+        PlaybackProgress(
+            response_id="r1",
+            queued_bytes=total,
+            played_bytes=said_bytes,
+            in_flight_bytes=0,
+            skipped_bytes=total - said_bytes,
+            cancelled=cut,
+            total_bytes=total,
+        ),
+    )
+
+
+def test_t7_a_cut_reply_reaches_the_mind_as_the_said_half_plus_a_kept_remainder():
+    """duplex ``on_response`` + the measured cut -> said as spoken, rest as artifact."""
+    factory = _SessionFactory()
+    turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    sink = _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), turn_fn=turn, sink=sink
+    )
+    try:
+        factory.last.reply("one two three four five six", interrupted=True, split=_measured_split())
+        assert layer.engine.pending == 0, "a cut reply must not trigger a turn"
+        assert [artifact.text for artifact in layer.engine.wanted_to_say] == ["three four five six"]
+        assert sink.texts("message") == ["one two"]
+
+        layer.engine.submit_utterance("reachy, sorry — go on")
+        assert layer.engine.run_turn() is True
+        content = turn.last_user_content()
+        assert '"one two"' in content
+        assert "I was interrupted before saying" in content
+        assert '"one two three four five six"' not in content
+    finally:
+        layer.close()
+
+
+def test_t7_an_uncut_reply_is_still_recorded_whole():
+    """The ordinary path is untouched: no cut, no split, no artifact."""
+    factory = _SessionFactory()
+    sink = _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), sink=sink
+    )
+    try:
+        factory.last.reply(
+            "I am right here.",
+            split=_measured_split(said_bytes=48, cut=False, text="I am right here."),
+        )
+        assert sink.texts("message") == ["I am right here."]
+        assert layer.engine.wanted_to_say == ()
+    finally:
+        layer.close()
+
+
+def test_t7_a_session_that_cannot_report_the_cut_is_a_named_drop_not_a_crash():
+    """The tap runs on the session's own worker thread: a raise there is invisible."""
+    factory = _SessionFactory(split_error=RuntimeError("ledger gone"))
+    sink = _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), sink=sink
+    )
+    try:
+        factory.last.reply("I am right here.")
+        assert any(agent_mod.REASON_SPLIT_UNAVAILABLE in text for text in sink.texts("thinking"))
+        assert sink.texts("message") == ["I am right here."], "the fallback still records it"
+    finally:
+        layer.close()
+
+
+def test_t7_end_to_end_a_cut_reply_keeps_its_remainder_through_the_real_session():
+    """The join, over a real socket: session measurement -> tap -> engine record.
+
+    The session double and the pure split each prove their own half, and this
+    module's preamble is about exactly the failure that leaves: a tap asking
+    the session a question it no longer answers, with both sides' tests green.
+    So the reply here is generated, held open and then INTERRUPTED by the
+    gateway, and the assertion is on what the layer's own record ended up
+    holding.
+
+    At the shipped chunk size this reply never reaches a chunk boundary before
+    the cut, so nothing was heard and the whole sentence is kept — the
+    partially-heard case is measured against known played offsets in
+    ``tests/test_realtime_duplex.py``.
+    """
+    with FakeRealtimeServer(
+        Scenario.ONE_SHOT_ARMING,
+        announce_one_shot_arming=True,
+        transcripts=["reachy, tell me a story"],
+        arm_grace_s=0.2,
+        hold_response=True,
+        interrupt_response=True,
+        response_text="one two three four five six",
+        wait_timeout=WAIT_BUDGET_S,
+    ) as server:
+        layer, _args, _sink = _compose(
+            media=_media(),
+            session_factory=_duplex_factory(server),
+            lines=iter(()),
+            clip_reader=lambda: None,
+        )
+        try:
+            layer.start()
+            # The hold CLEARS its own release flag as it starts, so releasing
+            # before it is up is releasing nothing; its keepalive PING is the
+            # observable "the hold is live now".
+            _wait_for(lambda: server.ping_sent_count >= 1)
+            server.release_response_done()
+            _wait_for(lambda: bool(layer.engine.wanted_to_say))
+        finally:
+            layer.close()
+
+    assert [artifact.text for artifact in layer.engine.wanted_to_say] == [
+        "one two three four five six"
+    ]
+    assert layer.engine.wanted_to_say[0].response_id, "the remainder must name its reply"
+    assert layer.engine.replies_cut == 1
+    assert layer.engine.parked == 1, "the remainder is CONTEXT — parked, never a trigger"
+    assert layer.engine.pending == 1, "the utterance woke the mind; the cut added nothing"
+
+
+# =========================================================================== #
+# t16 — the client-side TAIL cut (spec c34/c35/c36, honesty h22)              #
+#                                                                            #
+# The server-driven ``response.interrupted`` path is unchanged and still      #
+# covers the bulk of a reply — upstream paces its delivery to the playhead    #
+# (lobes ``_conversation.py``'s ``delivery_pause_ms``/``DELIVERY_LEAD_MS``)   #
+# precisely so barge-in stays live. What it cannot cover is the lag OUR       #
+# client adds after receipt, which lands AFTER ``response.done``: the floor   #
+# is LISTENING again while the room still hears queued audio, so an           #
+# interjection there produces no ``response.interrupted`` at all.             #
+#                                                                            #
+# The policy is HERE, reading two mechanisms the wire gained and acts on      #
+# neither (``on_speech_started``, ``playback_pending`` — pinned in            #
+# ``tests/test_realtime_duplex.py``, whose three gate-free pins are           #
+# unchanged). Two properties are load-bearing and each has its own test:      #
+# the trigger is VAD-VERIFIED speech and never loudness (c35), and ATTENTION  #
+# does not gate it — anyone in the room, human or not (c36), may stop the     #
+# robot talking, including someone the gate would refuse to think about.      #
+# =========================================================================== #
+
+_CUT_TEXT = "one two three four five six"
+
+
+def _tail_layer(factory: _SessionFactory, **seams):
+    """Compose the layer over *factory* with a real engine and a recording sink."""
+    sink = seams.pop("sink", None) or _Sink()
+    layer, _args, _sink = _compose(
+        media=_media(), session_factory=factory, lines=iter(()), sink=sink, **seams
+    )
+    return layer, sink
+
+
+def test_t16_a_vad_onset_over_the_tail_cuts_the_queue_and_records_the_measured_split():
+    """Criteria 1 + 2: the cut lands, and the record becomes said + kept remainder.
+
+    The ordering is the REAL tail ordering, not a convenient one: the reply
+    completed and was recorded WHOLE first (``response.done`` fired seconds
+    before the speaker finished), and only then does someone talk over the
+    audio still queued. So the correction path is the ordinary path — t7's
+    ``_correct_spoken`` narrows the entry it already wrote rather than a second
+    one appearing beside it.
+    """
+    factory = _SessionFactory(playback_pending=True)
+    turn = _ScriptedTurn(TurnResult(content="ok", finish_reason="stop"))
+    layer, sink = _tail_layer(factory, turn_fn=turn)
+    try:
+        factory.last.reply(
+            _CUT_TEXT, split=_measured_split(said_bytes=48, cut=False, text=_CUT_TEXT)
+        )
+        assert sink.texts("message") == [_CUT_TEXT], "the tail reply is recorded whole first"
+
+        factory.last.split = _measured_split(said_bytes=16, cut=True, text=_CUT_TEXT)
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 1, "the queued tail was never cut"
+        assert layer.engine.replies_cut == 1
+        assert [a.text for a in layer.engine.wanted_to_say] == ["three four five six"]
+
+        layer.engine.submit_utterance("reachy, sorry — go on")
+        assert layer.engine.run_turn() is True
+        content = turn.last_user_content()
+        assert '"one two"' in content
+        assert f'"{_CUT_TEXT}"' not in content, "the whole reply is still recorded as said"
+        assert "I was interrupted before saying" in content
+    finally:
+        layer.close()
+
+
+def test_t16_an_onset_with_nothing_queued_cuts_nothing_and_records_nothing():
+    """Criterion 1's no-op half — and it is a no-op even when a split IS available.
+
+    Every reply this session ever spoke has a measurement, so "is there a split
+    to record" is the wrong question and would file a reply the room heard in
+    full as truncated. The question is whether a cut would WITHHOLD anything.
+    """
+    factory = _SessionFactory(playback_pending=False)
+    layer, sink = _tail_layer(factory)
+    try:
+        factory.last.reply(
+            _CUT_TEXT, split=_measured_split(said_bytes=48, cut=False, text=_CUT_TEXT)
+        )
+        factory.last.split = _measured_split(said_bytes=16, cut=True, text=_CUT_TEXT)
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 0, "a cut with nothing playing is not a no-op"
+        assert layer.engine.replies_cut == 0
+        assert layer.engine.wanted_to_say == ()
+        assert sink.texts("message") == [_CUT_TEXT], "the reply stands as spoken"
+    finally:
+        layer.close()
+
+
+def test_t16_attention_never_gates_the_cut():
+    """Being ignored for THINKING is not the same as being unable to stop the robot.
+
+    Attention is COLD here — nobody has named the robot, so this speaker's own
+    words would not wake a turn (issue #148) — and the cut still lands. Anyone
+    in the room may interrupt, and "anyone" reads as any external interlocutor,
+    a peer robot or an automated system included (spec decision c36).
+    """
+    factory = _SessionFactory(playback_pending=True)
+    layer, _sink = _tail_layer(factory)
+    try:
+        assert layer.engine.attention.is_warm() is False, "the gate must start cold"
+        factory.last.split = _measured_split(said_bytes=16, cut=True, text=_CUT_TEXT)
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 1
+        assert layer.engine.replies_cut == 1
+        assert layer.engine.attention.is_warm() is False, "and cutting opens nothing"
+    finally:
+        layer.close()
+
+
+def test_t16_a_server_driven_barge_in_and_a_tail_onset_never_double_record_one_reply():
+    """Criterion 4, first direction: the server cut it, so the client finds nothing.
+
+    ``_finish_response`` drains the mouth queue before it publishes the
+    interrupted reply, so by the time a VAD onset reaches this policy there is
+    nothing left to withhold — the at-most-once property is structural, not a
+    flag someone has to remember to clear.
+    """
+    factory = _SessionFactory(playback_pending=True)
+    layer, _sink = _tail_layer(factory)
+    try:
+        factory.last.reply(
+            _CUT_TEXT, interrupted=True, split=_measured_split(said_bytes=16, text=_CUT_TEXT)
+        )
+        assert layer.engine.replies_cut == 1
+
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 0
+        assert layer.engine.replies_cut == 1, "the reply was recorded as cut twice"
+        assert [a.text for a in layer.engine.wanted_to_say] == ["three four five six"]
+    finally:
+        layer.close()
+
+
+def test_t16_two_onsets_over_one_tail_record_the_reply_cut_exactly_once():
+    """Criterion 4, second direction: a human interjecting twice is still one cut."""
+    factory = _SessionFactory(playback_pending=True)
+    layer, _sink = _tail_layer(factory)
+    try:
+        factory.last.reply(
+            _CUT_TEXT, split=_measured_split(said_bytes=48, cut=False, text=_CUT_TEXT)
+        )
+        factory.last.split = _measured_split(said_bytes=16, cut=True, text=_CUT_TEXT)
+        factory.last.speech_started()
+        factory.last.speech_started()
+
+        assert factory.last.cancels == 1
+        assert layer.engine.replies_cut == 1
+        assert len(layer.engine.wanted_to_say) == 1
+    finally:
+        layer.close()
+
+
+def test_t16_a_session_that_cannot_be_cut_is_a_named_drop_not_a_crash(caplog):
+    """The tap runs on the session's own worker thread: it may never raise."""
+    factory = _SessionFactory(playback_pending=True, cancel_error=RuntimeError("mouth gone"))
+    layer, sink = _tail_layer(factory)
+    try:
+        with caplog.at_level(logging.INFO, logger="reachy"):
+            factory.last.speech_started()
+        assert agent_mod.REASON_TAIL_CUT_FAILED in "\n".join(r.getMessage() for r in caplog.records)
+        assert any(agent_mod.REASON_TAIL_CUT_FAILED in text for text in sink.texts("thinking"))
+        assert layer.engine.replies_cut == 0
+    finally:
+        layer.close()
+
+
+def test_t16_the_composition_hands_the_session_a_vad_tap():
+    """The policy has to be WIRED, not merely written — the #143/#147 defect class."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert callable(factory.last.kwargs["on_speech_started"])
+    finally:
+        layer.close()
+
+
+def test_t16_end_to_end_a_tail_interjection_cuts_the_real_session_and_records_once():
+    """The whole join over a real socket: gateway VAD -> tap -> cut -> record.
+
+    ``RESPONSE_TAIL_INTERJECTION`` scripts the one window that matters: the
+    reply is complete and ``response.done`` has landed (so the layer has
+    already recorded it whole) while the media sink is wedged three chunks
+    behind. Only then does the gateway report a VAD onset — the interjection
+    the floor itself can no longer act on.
+    """
+    release = threading.Event()
+    audio = bytes(range(48))
+    with FakeRealtimeServer(
+        Scenario.RESPONSE_TAIL_INTERJECTION,
+        response_audio=audio,
+        response_chunk_bytes=8,
+        response_text=_CUT_TEXT,
+        wait_timeout=WAIT_BUDGET_S,
+    ) as server:
+        layer, _args, sink = _compose(
+            media=_media(sink_blocks=release, sink_block_after=2),
+            session_factory=_duplex_factory(
+                server, playback_chunk_bytes=8, playback_first_chunk_bytes=8
+            ),
+            lines=iter(()),
+            clip_reader=lambda: None,
+        )
+        try:
+            layer.start()
+            _wait_for(lambda: int(getattr(layer.session, "responses", 0)) >= 1)
+            _wait_for(lambda: int(getattr(layer.session, "played", 0)) == 2)
+            server.release_interjection()
+            _wait_for(lambda: layer.engine.replies_cut >= 1)
+        finally:
+            release.set()
+            layer.close()
+
+    assert layer.engine.replies_cut == 1
+    assert [a.text for a in layer.engine.wanted_to_say] == ["three four five six"]
+    assert layer.session.chunks_cancelled == 3, "the queued tail was never withheld"
+    assert sink.texts("message") == [_CUT_TEXT], "the whole reply was recorded at response.done"
+
+
+# =========================================================================== #
+# 11. The layer curates ONE canonical history and PUSHES it (decision c27)    #
+#                                                                             #
+# Task t10 built the whole ``conversation.item.create`` mechanism and         #
+# deliberately left it unreached, because the re-seed CONTENT belongs to the  #
+# layer. This section is the wiring half — and it is the half this arc has    #
+# now got wrong twice (t6's ``cancel_playback`` needed a whole extra task to  #
+# acquire a caller; t9 shipped a voice prompt no production path passed). A   #
+# capability with no caller does not ship, so the pins below fail the moment  #
+# ``_compose_embody_seam`` stops handing the session a ``reseed=`` or stops   #
+# pushing a correction after a cut.                                           #
+#                                                                             #
+# The PROJECTION itself — what the re-seed contains, and that it comes off    #
+# the same deque both lanes read — lives in                                   #
+# ``tests/test_embody_canonical_history.py``.                                 #
+# =========================================================================== #
+
+
+def _call_keywords(function: str, callee: str) -> set[str]:
+    """Keyword names passed to *callee* inside *function*, read from the source.
+
+    A behavioural assertion proves the seam works for the session double a
+    test happened to build; this proves the production construction site names
+    it at all, which is what "wired" means when nobody is looking.
+    """
+    tree = ast.parse(Path(agent_mod.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != function:
+            continue
+        for call in ast.walk(node):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == callee
+            ):
+                return {keyword.arg for keyword in call.keywords if keyword.arg}
+    raise AssertionError(f"{function} no longer calls {callee}")
+
+
+def test_t11_the_composition_hands_the_session_a_real_reseed_seam():
+    """The headline pin: ``reseed=`` is NAMED at the one production call site."""
+    assert "reseed" in _call_keywords("_compose_embody_seam", "build_session")
+
+
+def test_t11_the_item_channel_keeps_a_production_caller():
+    """``send_item`` is reached by production code, not only by its own tests.
+
+    Task t10's own report said it plainly: "the mechanism is fully reachable
+    but not yet reached by production code; t11 must wire it or the channel
+    ships built-and-unreachable". This is the assertion that keeps that true.
+    """
+    tree = ast.parse(Path(agent_mod.__file__).read_text(encoding="utf-8"))
+    callers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "send_item"
+    ]
+    assert callers, "no production path pushes a conversation item"
+
+
+def test_t11_the_composed_reseed_seam_projects_the_engines_canonical_history():
+    """The seam is not merely present: calling it returns the engine's own record."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        layer.engine.update_summary("earlier: the operator asked about the weather")
+        items = factory.last.kwargs["reseed"]()
+        assert [item.disposition for item in items] == ["context"]
+        assert "asked about the weather" in items[0].text
+    finally:
+        layer.close()
+
+
+def test_t11_the_composed_reseed_returns_items_the_real_wire_accepts():
+    """A projection the codec would refuse is a re-seed that silently never lands."""
+    from reachy.speech.realtime_duplex import ConversationItem
+
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        layer.engine.update_summary("earlier: something happened")
+        for item in factory.last.kwargs["reseed"]():
+            assert isinstance(item, ConversationItem)
+            assert item.valid
+    finally:
+        layer.close()
+
+
+def test_t11_a_reseed_from_an_engine_with_nothing_to_say_is_an_empty_list():
+    """A fresh conversation seeds nothing, and that is not a failure."""
+    factory = _SessionFactory()
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        assert factory.last.kwargs["reseed"]() == []
+    finally:
+        layer.close()
+
+
+def test_t11_a_cut_reply_pushes_the_measured_correction_to_the_floor():
+    """c39's phase-1 limitation closing: the floor is told what the room HEARD.
+
+    The server recorded the whole reply (a client-local cut is invisible to
+    it), so without this the two records disagree and only ours is right.
+    """
+    factory = _SessionFactory(items_supported=True)
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.reply(_CUT_TEXT, interrupted=True, split=_measured_split())
+        assert layer.engine.replies_cut == 1
+        assert len(factory.last.items) == 1
+        item = factory.last.items[0]
+        assert item.disposition == "history"
+        assert "one two" in item.text
+        assert "four five six" not in item.text
+    finally:
+        layer.close()
+
+
+def test_t11_the_tail_cut_path_pushes_the_correction_too():
+    """Both cut paths correct the floor — one record, and one place it is pushed."""
+    factory = _SessionFactory(items_supported=True, playback_pending=True)
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.split = _measured_split()
+        factory.last.speech_started()
+        assert layer.engine.replies_cut == 1
+        assert [item.disposition for item in factory.last.items] == ["history"]
+    finally:
+        layer.close()
+
+
+def test_t11_a_reply_the_room_heard_whole_pushes_nothing():
+    """Nothing was withheld, so the floor's own record is already true."""
+    factory = _SessionFactory(items_supported=True)
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.reply(_CUT_TEXT)
+        assert factory.last.items == []
+    finally:
+        layer.close()
+
+
+def test_t11_a_cut_that_withheld_nothing_pushes_no_correction():
+    """The floor's record is already true, so a "correction" would be pure noise.
+
+    A cancel can land on the last chunk, which the speaker is already committed
+    to: the reply was cut and the room still heard all of it. Recorded as a cut
+    (``replies_cut`` moves), corrected nowhere.
+    """
+    factory = _SessionFactory(items_supported=True)
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.reply(
+            _CUT_TEXT, interrupted=True, split=_measured_split(said_bytes=48, cut=True)
+        )
+        assert layer.engine.replies_cut == 1
+        assert factory.last.items == []
+        assert factory.last.items_declined == 0, "nothing was even offered"
+    finally:
+        layer.close()
+
+
+def test_t11_without_item_support_the_overstatement_stands_and_is_not_dressed_up():
+    """The c44/h29 degrade, at the correction: declined, counted, and NOT pretended.
+
+    The layer's OWN record still narrows to the measured prefix — that is the
+    half the client is authoritative for — while the floor keeps the full reply
+    it wrote. Nothing here claims the two agree.
+    """
+    factory = _SessionFactory()  # a gateway that announced no item support
+    layer, _args, _sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        factory.last.reply(_CUT_TEXT, interrupted=True, split=_measured_split())
+        assert factory.last.items == []
+        assert factory.last.items_declined == 1
+        assert layer.engine.replies_cut == 1
+        assert [a.text for a in layer.engine.wanted_to_say] == ["three four five six"]
+    finally:
+        layer.close()
+
+
+def test_t11_a_raising_send_item_is_a_named_drop_and_the_cut_is_still_recorded(caplog):
+    """The push runs on the session's worker thread, where a raise is invisible."""
+    factory = _SessionFactory(items_supported=True, item_error=RuntimeError("socket gone"))
+    layer, _args, sink = _compose(media=_media(), session_factory=factory, lines=iter(()))
+    try:
+        with caplog.at_level(logging.INFO, logger="reachy"):
+            factory.last.reply(_CUT_TEXT, interrupted=True, split=_measured_split())
+        journal = "\n".join(record.getMessage() for record in caplog.records)
+        assert agent_mod.REASON_FLOOR_PUSH_FAILED in journal
+        assert any(agent_mod.REASON_FLOOR_PUSH_FAILED in text for text in sink.texts("thinking"))
+        assert layer.engine.replies_cut == 1
+    finally:
+        layer.close()
+
+
+def test_t11_end_to_end_the_composed_layer_reseeds_a_real_gateway_before_arming():
+    """Composition -> the REAL session -> a gateway implementing the items schema.
+
+    The strongest form of the wiring claim, and the one a session double cannot
+    make: the layer's own canonical history reaches a socket, sorted by
+    ``disposition``, and every item precedes the arm (spec claim c40).
+    """
+    with FakeRealtimeServer(
+        Scenario.HAPPY_PATH,
+        announce_conversation_items=True,
+        wait_timeout=WAIT_BUDGET_S,
+    ) as server:
+        layer, _args, _sink = _compose(
+            media=_media(),
+            session_factory=_duplex_factory(server),
+            lines=iter(()),
+            clip_reader=lambda: None,
+        )
+        try:
+            layer.engine.update_summary("earlier: the operator asked about the weather")
+            layer.start()
+            _wait_for(lambda: len(server.context_items) >= 1)
+        finally:
+            layer.close()
+
+    assert [role for role, _text in server.context_items] == ["system"]
+    assert "asked about the weather" in server.context_items[0][1]
+    item_type = "conversation.item.create"
+    arm_type = "response.create"
+    sent = [kind for kind in server.received_event_types if kind in (item_type, arm_type)]
+    assert sent[0] == item_type, "the arm preceded the re-seed"

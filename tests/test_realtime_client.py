@@ -304,8 +304,13 @@ def test_this_module_cannot_construct_a_response_create_at_all() -> None:
     the moment it can build the frame.
 
     The mirror image — that the DUPLEX session's send surface, which now spans
-    both files, is still exactly append + response.create + PONG + CLOSE — is
-    pinned by the ``test_h13_*`` family in ``tests/test_realtime_duplex.py``.
+    both files, is exactly append + response.create + conversation.item.create
+    + PONG + CLOSE — is pinned by the ``test_h13_*`` / ``test_h20_*`` family in
+    ``tests/test_realtime_duplex.py``. That fourth kind (decision c28, task
+    t10) is precisely why this test matters: it lives in the DUPLEX module, and
+    this assertion is what keeps it from reaching the ears-only client through
+    the shared owner. A transcriber that could inject conversation items would
+    be putting the runtime's hearing session into a conversation it is not in.
     """
     source = _MODULE_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -782,6 +787,31 @@ def test_connect_url_sets_the_sample_rate_query_without_losing_the_path() -> Non
     assert connect_url("ws://box/v1/realtime?input_sample_rate=8000", 24000) == (
         "ws://box/v1/realtime?input_sample_rate=24000"
     )
+
+
+def test_connect_url_omits_system_prompt_by_default() -> None:
+    """The ears-only transcriber never passes ``system_prompt`` — confirm the
+    default costs it nothing: the query is byte-identical to before task t9."""
+    assert connect_url("ws://box:8001/v1/realtime", 16000) == (
+        "ws://box:8001/v1/realtime?input_sample_rate=16000"
+    )
+    assert connect_url("ws://box:8001/v1/realtime", 16000, system_prompt=None) == (
+        "ws://box:8001/v1/realtime?input_sample_rate=16000"
+    )
+
+
+def test_connect_url_carries_a_given_system_prompt_after_the_sample_rate() -> None:
+    url = connect_url("ws://box:8001/v1/realtime", 16000, system_prompt="Be brief.")
+    assert url == "ws://box:8001/v1/realtime?input_sample_rate=16000&system_prompt=Be+brief."
+
+
+def test_connect_url_replaces_rather_than_duplicates_an_existing_system_prompt() -> None:
+    url = connect_url(
+        "ws://box/v1/realtime?system_prompt=stale",
+        24000,
+        system_prompt="fresh",
+    )
+    assert url == "ws://box/v1/realtime?input_sample_rate=24000&system_prompt=fresh"
 
 
 # --------------------------------------------------------------------------- #

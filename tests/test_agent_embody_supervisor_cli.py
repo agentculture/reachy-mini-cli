@@ -198,6 +198,47 @@ def test_restart_forwards_mute_during_playback_end_to_end(monkeypatch, tmp_path)
     assert "--mute-during-playback" in procs[0].cmd
 
 
+def test_start_forwards_attention_window_end_to_end(monkeypatch, tmp_path) -> None:
+    """Issue #150 — the #147 defect class, pinned the same way ``--turn-interval``
+    is above: a flag that parses correctly is not proof it reached the CHILD
+    process's own argv."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    procs: list = []
+    monkeypatch.setattr("subprocess.Popen", _spy_popen(procs))
+
+    rc = main(["agent", "embody", "start", "--attention-window", "12"])
+    assert rc == 0
+    cmd = procs[0].cmd
+    assert cmd[cmd.index("--attention-window") + 1] == "12.0"
+
+
+def test_restart_forwards_attention_window_end_to_end(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    procs: list = []
+    monkeypatch.setattr("subprocess.Popen", _spy_popen(procs))
+
+    rc = main(["agent", "embody", "restart", "--attention-window", "0"])
+    assert rc == 0
+    cmd = procs[0].cmd
+    assert cmd[cmd.index("--attention-window") + 1] == "0.0"
+
+
+def test_start_attention_window_absent_from_argv_when_not_given_end_to_end(
+    monkeypatch, tmp_path
+) -> None:
+    """No flag on the CLI must mean no flag reaches the child's argv, so the
+    child resolves REACHY_EMBODY_ATTENTION_WINDOW (inherited via normal
+    subprocess env inheritance) or the default for itself, rather than the
+    parent baking in a resolved value."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    procs: list = []
+    monkeypatch.setattr("subprocess.Popen", _spy_popen(procs))
+
+    rc = main(["agent", "embody", "start"])
+    assert rc == 0
+    assert "--attention-window" not in procs[0].cmd
+
+
 def test_stop_timeout_flag_reaches_the_supervisor(monkeypatch, tmp_path) -> None:
     from reachy.embody import supervisor as embody_supervisor
 
