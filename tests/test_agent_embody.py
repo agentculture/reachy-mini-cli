@@ -1608,6 +1608,42 @@ def test_parse_perception_answer_is_tolerant_of_surrounding_prose():
     assert parsed == ("a kitchen", (), None)
 
 
+def test_parse_perception_answer_tolerates_a_reformatted_key(caplog):
+    """The deployed senses model pads its keys — ``{" summary": ...}``, live.
+
+    Found by t15's live acceptance, not offline: every clip ask on the
+    deployed gateway was dropped ``clip-answer-unstructured`` while the
+    ANSWER was perfectly good, because Gemma emits the key with a leading
+    space inside the quotes even though :data:`DEFAULT_CLIP_PROMPT` asks for
+    ``{"summary": ...}``. Three consecutive real drops, verbatim from the
+    journal:
+
+        dropped reason=clip-answer-unstructured (```json
+        {" summary": "The camera is positioned in a room, capturing a view
+        of a desk, a chair, and a window.", "entities
+
+    A padded or differently-cased key is the model reformatting OUR shape,
+    not the model ignoring it — so it belongs on the tolerant side of this
+    parser's documented contract, exactly like the surrounding-prose case
+    above. Evidence: ``docs/evidence/2026-08-03-t15-155-live-acceptance.md``.
+    """
+    parsed = agent_mod.parse_perception_answer(
+        '```json\n{" summary": "a room with a desk", "entities ": ["desk"], '
+        '"Confidence": 0.8}\n```'
+    )
+    assert parsed == ("a room with a desk", ("desk",), 0.8)
+
+
+def test_parse_perception_answer_still_refuses_a_genuinely_different_key():
+    """Tolerating whitespace/case must NOT slide into guessing at a synonym.
+
+    ``description`` is not a reformatting of ``summary``; it is a different
+    key, and a parser that accepted it would be inventing the contract rather
+    than tolerating a sloppy rendering of it.
+    """
+    assert agent_mod.parse_perception_answer('{"description": "a room"}') is None
+
+
 def test_parse_perception_answer_returns_none_for_free_prose():
     assert agent_mod.parse_perception_answer("I am in a kitchen, someone is cooking.") is None
 

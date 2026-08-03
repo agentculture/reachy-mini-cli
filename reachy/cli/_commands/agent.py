@@ -1122,6 +1122,36 @@ _PERCEPTION_ENTITIES_KEY = "entities"
 _PERCEPTION_CONFIDENCE_KEY = "confidence"
 
 
+def _normalized_perception_keys(payload: dict) -> dict:
+    """Re-key one parsed clip answer so a REFORMATTED key still resolves.
+
+    The deployed senses model renders our own requested shape back with the
+    key padded — ``{" summary": ...}`` — even though
+    :data:`DEFAULT_CLIP_PROMPT` asks for ``{"summary": ...}``. Task t15's
+    live acceptance caught it: three consecutive clip asks on the deployed
+    gateway were dropped :data:`REASON_CLIP_ANSWER_UNSTRUCTURED` while every
+    answer was in fact good
+    (``docs/evidence/2026-08-03-t15-155-live-acceptance.md``).
+
+    Whitespace and case are the two ways a model re-renders a key it is
+    copying, so both are stripped here — and NOTHING else is. A genuinely
+    different key (``description``) still misses, because tolerating a
+    sloppy rendering of our contract is not the same as guessing at a
+    synonym for it: the first keeps the parser honest about what the model
+    said, the second would let it invent one. A padded key that collides
+    with a clean one after normalisation loses to the clean one, so a
+    well-formed answer is never degraded by this pass.
+    """
+    normalized: dict = {}
+    for key, value in payload.items():
+        if not isinstance(key, str):
+            continue
+        clean = key.strip().casefold()
+        if clean not in normalized or key == clean:
+            normalized[clean] = value
+    return normalized
+
+
 def parse_perception_answer(raw: str) -> tuple[str, tuple[str, ...], float | None] | None:
     """Parse the senses lane's structured clip answer, or ``None`` if it isn't one.
 
@@ -1160,6 +1190,7 @@ def parse_perception_answer(raw: str) -> tuple[str, tuple[str, ...], float | Non
         return None
     if not isinstance(payload, dict):
         return None
+    payload = _normalized_perception_keys(payload)
     summary = payload.get(_PERCEPTION_SUMMARY_KEY)
     if not isinstance(summary, str) or not summary.strip():
         return None
