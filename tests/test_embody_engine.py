@@ -1338,7 +1338,8 @@ def test_t7_a_reply_cut_before_a_word_was_heard_is_never_recorded_as_spoken() ->
     engine.submit_utterance("hello?")
     engine.run_turn()
 
-    assert artifact is not None and artifact.text == _CUT_TEXT
+    assert artifact is not None
+    assert artifact.text == _CUT_TEXT
     assert "I have already said out loud" not in _last_user(turn)
     assert artifact.render() in _last_user(turn)
 
@@ -1411,7 +1412,8 @@ def test_t7_the_engine_consumes_the_real_duplex_split_type() -> None:
 
     assert (split.said, split.unsaid) == (_CUT_SAID, _CUT_UNSAID)
     artifact = engine.note_interrupted_reply(split)
-    assert artifact is not None and artifact.response_id == "resp_cut"
+    assert artifact is not None
+    assert artifact.response_id == "resp_cut"
 
 
 def test_t7_a_reply_that_played_whole_is_recorded_exactly_as_before() -> None:
@@ -1434,7 +1436,8 @@ def test_t7_a_cut_that_heard_nothing_removes_the_record_it_had_already_made() ->
     engine.submit_utterance("hello?")
     engine.run_turn()
 
-    assert artifact is not None and artifact.text == _CUT_TEXT
+    assert artifact is not None
+    assert artifact.text == _CUT_TEXT
     assert "I have already said out loud" not in _last_user(turn)
     assert artifact.render() in _last_user(turn)
 
