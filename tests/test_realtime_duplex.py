@@ -2308,7 +2308,8 @@ def test_t7_the_session_splits_a_reply_cut_mid_playback_at_the_measured_boundary
     # The RECORD is unchanged by the split: what the server said and what the
     # room heard are two different facts (t6's own pin, restated here).
     response = client.take_response()
-    assert response is not None and response.audio == _LONG_REPLY
+    assert response is not None
+    assert response.audio == _LONG_REPLY
     assert response.text == _SPLIT_TEXT
 
 
@@ -2377,7 +2378,8 @@ def test_t7_a_client_side_cut_sends_nothing_to_the_server_and_claims_no_agreemen
         wire.RESPONSE_CREATE_EVENT_TYPE,
     }, "the cut must not correct the floor's history behind the layer's back"
     split = client.spoken_split()
-    assert split is not None and split.cut is True
+    assert split is not None
+    assert split.cut is True
     assert not any(
         field.name in {"server_said", "server_history", "floor_agrees"}
         for field in dataclasses.fields(duplex.SpokenSplit)
