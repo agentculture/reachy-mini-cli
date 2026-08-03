@@ -290,7 +290,8 @@ def test_the_voice_handlers_only_route_is_through_the_policy() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert "admit" in calls, "the voice handler must ask the policy"
-    assert "play" not in calls and "play_audio" not in calls
+    assert "play" not in calls
+    assert "play_audio" not in calls
 
 
 def test_no_layer_module_hands_the_registry_a_playing_callable() -> None:
@@ -513,7 +514,8 @@ def test_the_composed_layer_owns_exactly_one_summary_producer(
     try:
         assert isinstance(layer.summary, SummaryProducer)
         layer.start()
-        assert layer.summary.thread is not None and layer.summary.thread.is_alive()
+        assert layer.summary.thread is not None
+        assert layer.summary.thread.is_alive()
     finally:
         layer.close()
     layer.summary.thread.join(timeout=5.0)

@@ -606,7 +606,8 @@ def test_the_correction_survives_a_cut_recorded_through_the_ordinary_path() -> N
     said_section = turn.last_messages()[-1]["content"]
     assert f'"{_CUT_SAID}"' in said_section
     assert f'"{_CUT_TEXT}"' not in said_section
-    assert item is not None and _CUT_SAID in item.text
+    assert item is not None
+    assert _CUT_SAID in item.text
 
 
 def test_floor_correction_reads_the_split_structurally_and_never_raises() -> None:
