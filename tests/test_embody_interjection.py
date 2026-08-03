@@ -590,7 +590,8 @@ def test_ac3_the_shipped_rate_bound_has_the_documented_defaults() -> None:
         DEFAULT_MAX_PER_WINDOW,
         DEFAULT_RATE_WINDOW_S,
     )
-    assert DEFAULT_MAX_PER_WINDOW > 0 and DEFAULT_RATE_WINDOW_S > 0
+    assert DEFAULT_MAX_PER_WINDOW > 0
+    assert DEFAULT_RATE_WINDOW_S > 0
 
 
 def test_ac3_an_admission_is_announced_on_the_senselog_with_its_source(caplog) -> None:
