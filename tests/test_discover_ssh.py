@@ -186,6 +186,27 @@ def test_a_user_that_could_be_read_as_an_ssh_option_is_refused() -> None:
     assert excinfo.value.remediation
 
 
+@pytest.mark.parametrize("account", ["rooté", "пользователь", "ро11еn", "admın"])
+def test_a_non_ascii_account_is_refused_so_re_ascii_stays_load_bearing(account: str) -> None:
+    """``_USER_TOKEN`` uses ``\\w`` + ``re.ASCII``; the flag is NOT cosmetic.
+
+    Sonar's S6353 asks for ``\\w`` in place of ``[A-Za-z0-9_]``, but on a ``str``
+    pattern Python's ``\\w`` is Unicode-aware by default and would widen this
+    fail-closed validator to every letter in every script — including
+    homoglyphs like ``ро11еn`` (Cyrillic ``р``/``о``/``е``) and ``admın``
+    (dotless ``ı``), which read as an expected account to a human skimming a
+    command line but are a different string entirely.
+
+    Dropping ``re.ASCII`` therefore silently re-widens an argv validator, and
+    the S6353 fix would become a security regression that no other test would
+    notice. This pins it.
+    """
+    with pytest.raises(CliError) as excinfo:
+        ssh_argv(LIVE_ADDRESS, user=account, env={})
+    assert excinfo.value.code == EXIT_USER_ERROR
+    assert excinfo.value.remediation
+
+
 # ---------------------------------------------------------------------------
 # Criterion 2 — HostKeyAlias always rides along, with no pin and no privilege
 # ---------------------------------------------------------------------------
