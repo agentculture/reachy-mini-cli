@@ -61,7 +61,18 @@ replaces the stale address rather than appending a second line.
 :func:`unpin` removes the block and leaves everything else untouched.
 
 The hosts path is a **parameter** (defaulting to :data:`DEFAULT_HOSTS_PATH`)
-precisely so the test suite never touches the real ``/etc/hosts``.
+precisely so the test suite never touches the real ``/etc/hosts`` — and it is
+also a documented operator flag (``--hosts-path``) for a box whose hosts file
+lives somewhere else.
+
+That makes it **operator-controlled data reaching the filesystem**, so it goes
+through ONE boundary before any ``open``/``write``/``rename`` sees it:
+:func:`_safe_hosts_path`. Every public entry point that takes ``path=``
+(:func:`pin`, :func:`unpin`, :func:`pinned_address`, :func:`write_document`,
+:func:`backup_path`) funnels through it, and everything downstream — the
+staged temp file, the backup, the rollback — is derived from the value the
+validator RETURNED, never from the caller's raw argument. One boundary, not a
+check per call site: a second check is a second thing to forget.
 
 Stdlib only.
 """
@@ -116,6 +127,129 @@ _ALIAS_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
 #: RFC 1035's limit on a full domain name.
 _MAX_ALIAS_LEN = 253
 
+#: The charset a single component of the hosts path may hold, applied with
+#: :meth:`re.Pattern.fullmatch` to every component of the RESOLVED path. An
+#: allow-list rather than a deny-list, and deliberately narrow: it admits the
+#: shapes a real hosts path takes (``/etc/hosts``, a ``tmp_path`` stand-in, a
+#: home-relative path once expanded) and refuses quoting, globbing and
+#: shell-metacharacter payloads outright. A path this rejects is refused, never
+#: escaped or repaired.
+_PATH_COMPONENT_RE = re.compile(r"[A-Za-z0-9._+@~,=: -]{1,255}")
+
+#: Components that must never survive normalisation. :meth:`Path.resolve`
+#: already collapses them; re-checking is cheap and makes the refusal explicit
+#: rather than a property of a stdlib call someone could later swap out.
+_TRAVERSAL_COMPONENTS = frozenset({".", ".."})
+
+#: The one remediation every path refusal points at.
+_PATH_HINT = (
+    "pass --hosts-path an absolute path to an EXISTING regular hosts file, e.g. "
+    "--hosts-path /etc/hosts — this tool edits a hosts file in place and never creates one"
+)
+
+
+def _safe_hosts_path(path: Path | str | None) -> Path:
+    """The ONE boundary an operator-supplied hosts path crosses. Fail-closed.
+
+    ``--hosts-path`` (and the ``path=`` parameter behind it) is operator input
+    that ends up in :func:`open`, :meth:`Path.write_bytes`, :func:`os.replace`
+    and :func:`tempfile.mkstemp`. Rather than sprinkling checks over those call
+    sites, every entry point normalises through here FIRST and then uses only
+    the returned value.
+
+    What the returned path is guaranteed to be:
+
+    * **absolute and symlink-free** — ``expanduser()`` then ``resolve()``, so a
+      relative path, a ``~`` prefix, a ``..`` segment and a symlinked directory
+      are all collapsed BEFORE anything is opened, and what is checked is
+      exactly what is later written;
+    * **rebuilt from validated components** — each component of the resolved
+      path is matched against :data:`_PATH_COMPONENT_RE` and the path is
+      reassembled from the MATCHED text, so a NUL byte, a newline, a quote or a
+      shell metacharacter cannot reach a filesystem call;
+    * **an existing regular file inside an existing directory** — a directory,
+      a FIFO, a device node, a dangling symlink and a missing file are all
+      refused. This module edits a hosts file in place; it never creates one,
+      and it must not be pointed at something that only looks like one.
+
+    ``None`` means "the default", :data:`DEFAULT_HOSTS_PATH`, which is a module
+    constant and not operator input — it is returned as-is on purpose, so the
+    production path is not gated on ``/etc/hosts`` passing an existence probe
+    twice.
+
+    Exit codes follow the module's existing split: a path that is malformed as
+    INPUT is an exit-1 user error (like :func:`_validated_address`), while a
+    well-formed path naming something absent or wrong on this box is an exit-2
+    environment error (like :func:`_read_text`).
+    """
+    if path is None:
+        return DEFAULT_HOSTS_PATH
+    if not isinstance(path, (str, Path)):
+        raise CliError(
+            EXIT_USER_ERROR,
+            f"{path!r} is not a filesystem path",
+            _PATH_HINT,
+        )
+
+    raw = str(path)
+    if not raw.strip():
+        raise CliError(EXIT_USER_ERROR, "the hosts path is empty", _PATH_HINT)
+    if any(ord(char) < 0x20 or char == "\x7f" for char in raw):
+        # NUL, newline, tab, DEL: none of them belong in a hosts path, and a
+        # NUL in particular truncates the name every C-level open() sees.
+        raise CliError(
+            EXIT_USER_ERROR,
+            "the hosts path holds a control character",
+            _PATH_HINT,
+        )
+
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError) as err:
+        # A symlink loop (ELOOP) or an un-expandable '~'.
+        raise CliError(
+            EXIT_ENV_ERROR,
+            f"the hosts path {raw!r} could not be resolved: {err}",
+            _PATH_HINT,
+        ) from err
+
+    parts = resolved.parts
+    if not parts or not resolved.anchor:  # pragma: no cover - resolve() absolutises
+        raise CliError(EXIT_USER_ERROR, f"{raw!r} is not an absolute path", _PATH_HINT)
+
+    safe = Path(parts[0])
+    for part in parts[1:]:
+        match = _PATH_COMPONENT_RE.fullmatch(part)
+        if match is None or match.group(0) in _TRAVERSAL_COMPONENTS:
+            raise CliError(
+                EXIT_USER_ERROR,
+                f"{part!r} is not a usable component of a hosts path",
+                _PATH_HINT,
+            )
+        # Rebuilt from the MATCH, not from the caller's string: what continues
+        # downstream is the validator's own output.
+        safe = safe / match.group(0)
+
+    if not safe.parent.is_dir():
+        raise CliError(
+            EXIT_ENV_ERROR,
+            f"{safe.parent} is not an existing directory",
+            _PATH_HINT,
+        )
+    if not safe.exists():
+        raise CliError(
+            EXIT_ENV_ERROR,
+            f"{safe} does not exist",
+            _PATH_HINT,
+        )
+    if not safe.is_file():
+        raise CliError(
+            EXIT_ENV_ERROR,
+            f"{safe} is not a regular file",
+            _PATH_HINT,
+        )
+    return safe
+
 
 def _replace(src: str, dst: Path) -> None:
     """Indirection over :func:`os.replace`.
@@ -128,8 +262,14 @@ def _replace(src: str, dst: Path) -> None:
 
 
 def backup_path(path: Path | str) -> Path:
-    """``<hosts>.reachy-mini-cli.bak`` beside *path*."""
-    p = Path(path)
+    """``<hosts>.reachy-mini-cli.bak`` beside *path*.
+
+    Derived from the VALIDATED path, never from the raw argument: the backup is
+    written and the rollback is read through this name, so it has to be exactly
+    as constrained as the file it protects — and it has to agree, byte for byte
+    in its string form, with what :func:`write_document` computes internally.
+    """
+    p = _safe_hosts_path(path)
     return p.with_name(p.name + BACKUP_SUFFIX)
 
 
@@ -426,8 +566,12 @@ def write_document(path: Path | str, text: str) -> None:
     *text* is NOT pre-checked, on purpose. The post-write re-read is the real
     safety net — it catches a torn rename, a filesystem that lied, and a
     concurrent third-party rewrite, none of which a pre-check can see.
+
+    *path* IS pre-checked: it crosses :func:`_safe_hosts_path` here, and every
+    filesystem call below — the read, the backup, the staged temp file, the
+    rename, the re-read and the rollback — uses the validated result.
     """
-    p = Path(path)
+    p = _safe_hosts_path(path)
     original_text = _read_text(p)
     if not document_is_safe(original_text):
         raise CliError(
@@ -489,10 +633,6 @@ def write_document(path: Path | str, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_path(path: Path | str | None) -> Path:
-    return DEFAULT_HOSTS_PATH if path is None else Path(path)
-
-
 def pin(
     address: str,
     *,
@@ -506,7 +646,7 @@ def pin(
     rename — and ``False`` comes back. A unit that MOVED replaces the stale
     address in place rather than appending a second line.
     """
-    target = _resolve_path(path)
+    target = _safe_hosts_path(path)
     normalised = _validated_address(address)
     names = _validated_aliases(aliases)
 
@@ -526,7 +666,7 @@ def pin(
 
 def unpin(*, path: Path | str | None = None) -> bool:
     """Remove the managed block. Returns "changed?"; every other byte survives."""
-    target = _resolve_path(path)
+    target = _safe_hosts_path(path)
     current = _read_text(target)
     before, block, after = split_document(current)
     if block is None:
@@ -537,7 +677,7 @@ def unpin(*, path: Path | str | None = None) -> bool:
 
 def pinned_address(*, path: Path | str | None = None) -> str | None:
     """The address currently pinned in the managed block, or ``None``."""
-    target = _resolve_path(path)
+    target = _safe_hosts_path(path)
     block = managed_block(_read_text(target))
     if not block:
         return None

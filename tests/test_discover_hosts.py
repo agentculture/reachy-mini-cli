@@ -571,3 +571,211 @@ def test_document_is_safe_requires_both_parseability_and_localhost():
 
 def test_the_default_path_is_etc_hosts_but_is_only_ever_a_default():
     assert hosts.DEFAULT_HOSTS_PATH == Path("/etc/hosts")
+
+
+# ---------------------------------------------------------------------------
+# the path boundary — `--hosts-path` is operator input reaching the filesystem
+# ---------------------------------------------------------------------------
+
+
+def test_the_validator_returns_an_absolute_symlink_free_path(tmp_path: Path, monkeypatch):
+    """A relative path is resolved ONCE, at the boundary, before anything opens it."""
+    (tmp_path / "hosts").write_text(BOX_HOSTS, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    resolved = hosts._safe_hosts_path("hosts")
+
+    assert resolved.is_absolute()
+    assert resolved == (tmp_path / "hosts").resolve()
+
+
+def test_a_relative_path_still_pins_and_backs_up_beside_the_resolved_file(
+    tmp_path: Path, monkeypatch
+):
+    (tmp_path / "hosts").write_text(BOX_HOSTS, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert hosts.pin("192.168.1.162", path="hosts") is True
+
+    assert "192.168.1.162 reachy-mini" in (tmp_path / "hosts").read_text(encoding="utf-8")
+    # The backup landed beside the RESOLVED file, and backup_path agrees with
+    # what write_document computed internally.
+    assert hosts.backup_path("hosts") == (tmp_path / "hosts.reachy-mini-cli.bak").resolve()
+    assert hosts.backup_path("hosts").read_bytes() == BOX_HOSTS.encode("utf-8")
+
+
+def test_the_validator_follows_a_symlink_and_the_symlink_survives_the_write(tmp_path: Path):
+    """The symlink is resolved at the boundary, so os.replace lands on the target.
+
+    A naive implementation renames a temp file onto the LINK, silently
+    replacing it with a regular file and detaching every other reader.
+    """
+    real = tmp_path / "real-hosts"
+    real.write_text(BOX_HOSTS, encoding="utf-8")
+    link = tmp_path / "hosts"
+    link.symlink_to(real)
+
+    assert hosts._safe_hosts_path(link) == real.resolve()
+    assert hosts.pin("192.168.1.162", path=link) is True
+
+    assert link.is_symlink()
+    assert "192.168.1.162 reachy-mini" in real.read_text(encoding="utf-8")
+    assert hosts.backup_path(link) == (tmp_path / "real-hosts.reachy-mini-cli.bak").resolve()
+
+
+def test_a_traversal_segment_is_collapsed_before_anything_is_opened(tmp_path: Path):
+    (tmp_path / "hosts").write_text(BOX_HOSTS, encoding="utf-8")
+    (tmp_path / "sub").mkdir()
+
+    resolved = hosts._safe_hosts_path(tmp_path / "sub" / ".." / "hosts")
+
+    assert ".." not in resolved.parts
+    assert resolved == (tmp_path / "hosts").resolve()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "/etc/hosts\x00/../../evil",
+        "/etc/hosts\n1.2.3.4 evil",
+        "/etc/\thosts",
+    ],
+)
+def test_a_control_character_in_the_path_is_refused(bad: str):
+    with pytest.raises(CliError) as excinfo:
+        hosts._safe_hosts_path(bad)
+    assert excinfo.value.code == EXIT_USER_ERROR
+
+
+@pytest.mark.parametrize(
+    "component",
+    ["ho$(id)sts", "hosts;rm -rf /", "ho*sts", "hosts'", 'hosts"', "ho|sts", "ho`id`sts"],
+)
+def test_a_hostile_path_component_is_refused_never_escaped(tmp_path: Path, component: str):
+    target = tmp_path / component
+    target.write_text(BOX_HOSTS, encoding="utf-8")
+
+    with pytest.raises(CliError) as excinfo:
+        hosts._safe_hosts_path(target)
+
+    assert excinfo.value.code == EXIT_USER_ERROR
+    assert "--hosts-path" in excinfo.value.remediation
+    # Refused, not repaired: the file is still exactly as it was.
+    assert target.read_text(encoding="utf-8") == BOX_HOSTS
+
+
+@pytest.mark.parametrize("bad", ["", "   "])
+def test_an_empty_path_is_refused(bad: str):
+    with pytest.raises(CliError) as excinfo:
+        hosts._safe_hosts_path(bad)
+    assert excinfo.value.code == EXIT_USER_ERROR
+
+
+def test_a_non_path_object_is_refused():
+    with pytest.raises(CliError) as excinfo:
+        hosts._safe_hosts_path(7)  # type: ignore[arg-type]
+    assert excinfo.value.code == EXIT_USER_ERROR
+
+
+def test_a_directory_is_refused_as_a_hosts_path(tmp_path: Path):
+    with pytest.raises(CliError) as excinfo:
+        hosts._safe_hosts_path(tmp_path)
+    assert excinfo.value.code == EXIT_ENV_ERROR
+    assert "regular file" in excinfo.value.message
+
+
+def test_a_fifo_is_refused_as_a_hosts_path(tmp_path: Path):
+    fifo = tmp_path / "hosts"
+    os.mkfifo(fifo)
+
+    with pytest.raises(CliError) as excinfo:
+        hosts._safe_hosts_path(fifo)
+
+    assert excinfo.value.code == EXIT_ENV_ERROR
+    assert "regular file" in excinfo.value.message
+
+
+def test_a_path_whose_parent_does_not_exist_is_refused(tmp_path: Path):
+    with pytest.raises(CliError) as excinfo:
+        hosts.pin("192.168.1.162", path=tmp_path / "nope" / "hosts")
+
+    assert excinfo.value.code == EXIT_ENV_ERROR
+    assert not (tmp_path / "nope").exists()
+
+
+def test_a_dangling_symlink_is_refused(tmp_path: Path):
+    link = tmp_path / "hosts"
+    link.symlink_to(tmp_path / "gone")
+
+    with pytest.raises(CliError) as excinfo:
+        hosts._safe_hosts_path(link)
+
+    assert excinfo.value.code == EXIT_ENV_ERROR
+    assert "does not exist" in excinfo.value.message
+    assert not (tmp_path / "gone").exists()
+
+
+def test_none_means_the_module_default_and_probes_nothing():
+    # The default is a module constant, not operator input — it is returned
+    # as-is, which is also why this test cannot touch the real /etc/hosts.
+    assert hosts._safe_hosts_path(None) == hosts.DEFAULT_HOSTS_PATH
+
+
+def test_a_file_that_vanishes_after_validation_is_still_a_clean_exit_2(tmp_path: Path):
+    """The read keeps its own refusal: validation is a boundary, not a lock."""
+    with pytest.raises(CliError) as excinfo:
+        hosts._read_text(tmp_path / "hosts")
+
+    assert excinfo.value.code == EXIT_ENV_ERROR
+    assert "does not exist" in excinfo.value.message
+
+
+def test_every_entry_point_taking_a_raw_path_funnels_through_the_validator():
+    """Structural: one boundary, not a check per call site.
+
+    Any module-level function whose ``path`` parameter accepts a raw ``str``
+    is an entry point for operator-controlled data, and must call
+    :func:`hosts._safe_hosts_path`. Adding a sixth entry point without routing
+    it through the boundary fails here rather than in a SonarCloud report.
+    """
+    tree = ast.parse(Path(hosts.__file__).read_text(encoding="utf-8"))
+    entry_points: dict[str, bool] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        args = [*node.args.args, *node.args.kwonlyargs]
+        takes_raw_path = any(
+            arg.arg == "path"
+            and arg.annotation is not None
+            and "str" in ast.unparse(arg.annotation)
+            for arg in args
+        )
+        if not takes_raw_path or node.name == "_safe_hosts_path":
+            continue
+        entry_points[node.name] = any(
+            isinstance(inner, ast.Call) and getattr(inner.func, "id", "") == "_safe_hosts_path"
+            for inner in ast.walk(node)
+        )
+
+    assert set(entry_points) == {"backup_path", "write_document", "pin", "unpin", "pinned_address"}
+    assert all(
+        entry_points.values()
+    ), f"not funnelled: {sorted(n for n, ok in entry_points.items() if not ok)}"
+
+
+def test_no_entry_point_re_materialises_the_raw_path_argument():
+    """``Path(path)`` is gone from the module: only the validator's output flows on.
+
+    The validator parses its own local copy (``Path(raw).expanduser()``); an
+    entry point that rebuilt ``Path(path)`` would hand a filesystem call the
+    caller's string again, which is precisely the taint S2083 reports.
+    """
+    tree = ast.parse(Path(hosts.__file__).read_text(encoding="utf-8"))
+    offenders = [
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "Path"
+        and any(getattr(arg, "id", "") == "path" for arg in node.args)
+    ]
+    assert offenders == []
