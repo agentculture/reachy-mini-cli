@@ -407,7 +407,16 @@ class TestTheInterfaceSourceSeam:
         assert reachy.discover.sweep is sweep_mod
         assert "sweep" not in getattr(reachy.discover, "__all__", ())
 
-    def test_read_interfaces_is_a_module_level_callable(self):
+    def test_read_interfaces_is_a_module_level_callable(self, monkeypatch):
+        """Asserts a structural fact about the UNGUARDED module.
+
+        Task t6's autouse ``_no_live_lan_sweep`` guard patches this exact
+        attribute by default on every test, this one included — so
+        ``monkeypatch.undo()`` first, reverting every patch registered on this
+        test's (shared, function-scoped) ``monkeypatch`` instance so far, to
+        see the real binding rather than the guard's stand-in.
+        """
+        monkeypatch.undo()
         assert callable(sweep_mod.read_interfaces)
         assert sweep_mod.read_interfaces is read_interfaces
 

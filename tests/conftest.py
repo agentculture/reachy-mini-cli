@@ -299,6 +299,52 @@ def _no_live_audio_tee_socket(monkeypatch: pytest.MonkeyPatch, tmp_path_factory)
 
 
 @pytest.fixture(autouse=True)
+def _no_live_lan_sweep(monkeypatch: pytest.MonkeyPatch):
+    """No test may enumerate the REAL box's network interfaces or sweep the LAN.
+
+    The sixth sibling of the guards above, filed BEFORE it could do the damage
+    they each did — the finding that motivated it, not an incident report.
+    ``reachy/discover/sweep.py``'s ``enumerate_hosts`` (and ``sweep`` in turn)
+    resolves its interface source from the module-level ``read_interfaces`` — an
+    ioctl-based reader with no injected default, because it is deliberately the
+    ONE seam in the package that touches the real machine (see that module's own
+    docstring). A discovery test that forgets to fake it enumerates this box's
+    REAL NICs, which on the developer box this feature was specified against
+    include a real ``/24`` carrying a real Reachy Mini Wireless at
+    192.168.1.162: an unguarded suite run would sweep that subnet and probe the
+    actual robot. This is the exact defect class the events-cli incident above
+    already cost this repo once (``CLAUDE.md``'s "Hard constraints" section
+    records it: "the first full run after the dep landed published the suite's
+    synthetic ticks onto the deployed robot's own tree") — same shape, new door.
+
+    So ``read_interfaces`` is patched to return ``()`` process-wide. Empty is
+    LOUD ENOUGH, and deliberately not a raise: ``enumerate_hosts``/``sweep`` both
+    catch any exception their interface source raises and fold it into the very
+    same empty result anyway (their own docstrings document this), so a stub
+    that raises would be silently swallowed on the one call path this guard
+    exists to protect — it would only additionally break ``read_interfaces``'s
+    own documented "NEVER raises; () on failure" contract for a test that calls
+    it directly, buying no extra safety for the price of a violated contract.
+    Zero interfaces gives zero sweepable networks gives zero candidate hosts
+    gives zero probes issued: a ``SweepResult`` with ``hosts_total == 0`` and
+    ``hosts_probed == 0`` is a stark, immediately assertable "nothing happened"
+    — any test whose assertions expect a real sweep to have found something
+    fails loudly and instantly against it, rather than passing quietly on
+    whatever the live LAN happened to answer with.
+
+    Tests that DO want to exercise real enumeration re-patch this same module
+    attribute with their own function-scoped ``monkeypatch.setattr(sweep_mod,
+    "read_interfaces", ...)`` — exactly what ``tests/test_discover_sweep.py``'s
+    49 tests already do — which wins over this one and is undone at teardown,
+    the same escape hatch every guard above offers.
+    """
+    from reachy.discover import sweep as _sweep_mod
+
+    monkeypatch.setattr(_sweep_mod, "read_interfaces", lambda: ())
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_reachy_logging():
     """Never let one test's installed log handler outlive it.
 
