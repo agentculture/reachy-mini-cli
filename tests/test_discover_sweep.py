@@ -19,6 +19,7 @@ fake ``probe_fn``, so nothing here opens a socket.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import threading
 import time
@@ -372,7 +373,7 @@ class TestBoundedSweep:
     def test_the_result_is_a_frozen_dataclass(self):
         result = sweep(hosts=())
         assert isinstance(result, SweepResult)
-        with pytest.raises(Exception):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             result.units = ()  # type: ignore[misc]
 
     def test_the_default_worker_cap_is_bounded(self):

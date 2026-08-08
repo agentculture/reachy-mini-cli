@@ -353,5 +353,6 @@ def test_no_discover_module_imports_a_forbidden_accelerator_or_the_sdk() -> None
 def test_every_forbidden_package_has_a_named_reason() -> None:
     """Guard the guard: an entry with no reason string is not a documented rejection."""
     for package, reason in _FORBIDDEN_PACKAGES.items():
-        assert reason and isinstance(reason, str), package
+        assert reason, package
+        assert isinstance(reason, str), package
         assert len(reason) > 20, f"{package}'s reason reads as a placeholder: {reason!r}"

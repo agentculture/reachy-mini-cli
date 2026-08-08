@@ -576,7 +576,8 @@ def test_authorize_prompt_names_the_hardware_id(monkeypatch, prober) -> None:
     monkeypatch.setattr(wireless, "_RUN_SSH", FakeRunner())
     monkeypatch.setattr(wireless, "_read_answer", lambda prompt: (prompts.append(prompt), "n")[1])
     main(["wireless", "authorize"])
-    assert prompts and WIRELESS.hardware_id in prompts[0]
+    assert prompts
+    assert WIRELESS.hardware_id in prompts[0]
 
 
 def test_authorize_yes_pushes_the_key(
@@ -653,7 +654,8 @@ def test_pin_writes_both_aliases_into_a_managed_block(
     payload = json.loads(capsys.readouterr().out)
     body = hosts.read_text(encoding="utf-8")
     assert payload["changed"] is True
-    assert BEGIN_MARKER in body and END_MARKER in body
+    assert BEGIN_MARKER in body
+    assert END_MARKER in body
     assert f"192.168.1.162 {PRIMARY_ALIAS} {LOCAL_ALIAS}" in body
     assert "127.0.0.1 localhost" in body
 

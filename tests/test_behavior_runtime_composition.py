@@ -175,12 +175,29 @@ def test_pat_sense_flows_into_the_feed_via_the_composed_stack(_isolated, monkeyp
     # The composed driver's boot warmup and stillness gate are both real-clock
     # windows (15 s and 0.5 s); this 8-tick run spans 0.4 s of injected clock, so
     # neutralise both test-side — each has its own dedicated coverage elsewhere
-    # (tests/test_behavior_pat_sense{,_hardware}.py).
+    # (tests/test_behavior_pat_sense{,_hardware}.py). There is a THIRD real-clock
+    # window: ``max_observation_gap_s`` (default 0.2 s,
+    # ``DEFAULT_MAX_OBSERVATION_GAP_S`` in ``reachy/behavior/pat_sense.py``).
+    # This test drives the full CLI (``main([...])``), so ``ctx.now`` is the
+    # engine's REAL ``time.monotonic()``, not an injected test clock — unlike the
+    # warmup/stillness windows, this one is not something the test controls the
+    # pacing of. Each of the 8 ticks is nominally ~20 ms apart (50 Hz), but on a
+    # loaded runner (this suite's own parallel workers included) a single tick can
+    # take longer than the 0.2 s gap to come around. When it does,
+    # ``_observation_clock_gapped`` reads the stall as the interaction having gone
+    # quiet and clears it via ``_blocked_edge`` — dropping the scripted pat before
+    # this test ever gets to observe it. Neutralise it the same way as the other
+    # two (0.0 disables the check in ``_observation_clock_gapped``), leaving
+    # ``hp_tau`` untouched: it is a high-pass TIME CONSTANT, not a pacing window,
+    # and CLAUDE.md is explicit that it must never be overridden downward — a
+    # sensitivity knob, not a source of this flake.
     from reachy.behavior.pat_sense import PatSenseDriver as _RealDriver
 
     monkeypatch.setattr(
         "reachy.cli._commands.behavior.PatSenseDriver",
-        lambda **kw: _RealDriver(**{**kw, "warmup_s": 0.0, "still_hold_s": 0.0}),
+        lambda **kw: _RealDriver(
+            **{**kw, "warmup_s": 0.0, "still_hold_s": 0.0, "max_observation_gap_s": 0.0}
+        ),
     )
 
     rc = main(["behavior", "engine", "run", "--no-base-layer", "--max-ticks", "8", "--export", "-"])

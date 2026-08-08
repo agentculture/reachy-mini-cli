@@ -383,15 +383,18 @@ def test_every_refusal_this_module_can_return_is_a_named_member_of_the_vocabular
     assert REFUSAL_CONFIRMATION_DECLINED in REFUSALS
     assert REFUSAL_MISSING_HARDWARE_ID in REFUSALS
     for name in REFUSALS:
-        assert name and name == name.lower() and " " not in name
+        assert name
+        assert name == name.lower()
+        assert " " not in name
 
 
 def test_a_missing_ssh_copy_id_binary_is_a_clean_exit_two_and_never_asks_first() -> None:
     runner = _RunRecorder()
     confirmed: list[str] = []
+    target = _target()
     with pytest.raises(CliError) as excinfo:
         authorize(
-            _target(),
+            target,
             confirm=lambda prompt: bool(confirmed.append(prompt)) or True,
             env={},
             run=runner,
@@ -414,8 +417,9 @@ def test_a_missing_ssh_binary_is_a_clean_exit_two_from_the_shell_path_too() -> N
 
 def test_the_default_binary_lookup_is_shutil_which() -> None:
     """With ``shutil.which`` patched to find nothing, the default seam reports it."""
+    recorder = _ExecRecorder()
     with pytest.raises(CliError) as excinfo:
-        open_shell(LIVE_ADDRESS, env={}, exec_fn=_ExecRecorder())
+        open_shell(LIVE_ADDRESS, env={}, exec_fn=recorder)
     assert excinfo.value.code == EXIT_ENV_ERROR
 
 
@@ -479,7 +483,9 @@ def _call_graph() -> dict[str, set[str]]:
 def test_the_call_graph_walk_is_not_vacuous() -> None:
     """Guard the guard: the same walk DOES find authorize's own edges."""
     graph = _call_graph()
-    assert "authorize" in graph and "open_shell" in graph and "ssh_argv" in graph
+    assert "authorize" in graph
+    assert "open_shell" in graph
+    assert "ssh_argv" in graph
     from_authorize = _reachable({"authorize"}, graph)
     assert "ssh_argv" in from_authorize, from_authorize
     assert "ssh_copy_id_argv" in from_authorize, from_authorize
@@ -560,7 +566,8 @@ def test_a_key_that_is_already_installed_is_reported_plainly_and_pushes_nothing(
     assert result.already_installed is True
     assert result.refusal is None
     assert runner.copy_id_calls == [], "nothing to install — ssh-copy-id must not run"
-    assert result.detail and "already" in result.detail.lower()
+    assert result.detail
+    assert "already" in result.detail.lower()
 
 
 def test_a_fresh_unit_gets_exactly_one_ssh_copy_id_invocation() -> None:
