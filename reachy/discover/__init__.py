@@ -10,21 +10,28 @@ later test walks its AST to enforce this.
 Public API so far::
 
     from reachy.discover.probe import UnitRecord, probe
+    from reachy.discover.registry import RegistryRecord, UnitRegistry, lookup_mac
 
 :func:`~reachy.discover.probe.probe` is the one building block every later
 piece in this package composes on top of: a single, side-effect-free
-``GET /api/daemon/status`` that never raises. Later modules layer bounded
-concurrent LAN sweeping (``sweep.py``), a per-user remembered-unit registry
-(``registry.py``), a recoverable ``/etc/hosts`` pin (``hosts.py``), and the
-SSH login/authorize path (``ssh.py``) on top of it — none of them exist yet in
-this package.
+``GET /api/daemon/status`` that never raises. :class:`~reachy.discover.registry.UnitRegistry`
+persists probed units to a per-user ``state_dir()/units.json``, keyed by
+``hardware_id``, with the same never-raise degrade-to-empty discipline as
+:class:`reachy.stash.store.StashStore`. Later modules layer bounded concurrent
+LAN sweeping (``sweep.py``), a recoverable ``/etc/hosts`` pin (``hosts.py``),
+and the SSH login/authorize path (``ssh.py``) on top of these — none of them
+exist yet in this package.
 """
 
 from __future__ import annotations
 
 from reachy.discover.probe import UnitRecord, probe
+from reachy.discover.registry import RegistryRecord, UnitRegistry, lookup_mac
 
 __all__ = [
     "UnitRecord",
     "probe",
+    "RegistryRecord",
+    "UnitRegistry",
+    "lookup_mac",
 ]
