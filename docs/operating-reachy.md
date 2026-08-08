@@ -366,10 +366,18 @@ documented command) resolve the name; it is not what makes this noun's ssh work.
 
 The write itself is recoverable rather than merely careful: only the block
 between `# BEGIN reachy-mini-cli` and `# END reachy-mini-cli` is ever rewritten,
-every byte outside it is preserved verbatim, a `.reachy-mini-cli.bak` backup
-holding the exact pre-write bytes is taken before the first modification, and
-the landed file is re-read and re-verified afterwards — with an automatic
-restore if anything fails. That care is proportionate: this box's entire
+and every byte outside it is preserved verbatim — the sole exception being the
+single line terminator an appended block needs on a file that did not end in
+one, which `unpin` takes back, so `pin` followed by `unpin` leaves the file
+byte-identical. A `.reachy-mini-cli.bak` backup holding the exact pre-write
+bytes is taken before every modification, and the landed file is re-read and
+re-verified afterwards — with an automatic restore if anything fails.
+
+`pin` also refuses, before touching anything, any file that does not already
+parse as a hosts document resolving `localhost`. Pointed at `/etc/shadow` or an
+`authorized_keys`, it exits 2 and writes nothing — not even a backup — which is
+what keeps `--hosts-path` an operator convenience rather than an arbitrary-write
+primitive when the command is run under `sudo`. That care is proportionate: this box's entire
 `/etc/hosts` is two lines, and losing the `localhost` line breaks name
 resolution box-wide.
 

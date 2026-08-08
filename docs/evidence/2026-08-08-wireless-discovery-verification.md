@@ -118,6 +118,25 @@ double-space included:
 - Second pin: `changed: false`, still 6 lines — idempotent, no duplicate.
 - `unpin`: result **byte-identical** to the original, verified by `diff`.
 
+**Correction — this check had a blind spot, found in review, not by these
+tests.** The fixture above ends in a newline, as this box's real `/etc/hosts`
+does. A Qodo review of PR #161 found that `pin` appended a separator newline to
+a file **not** ending in one, and `unpin` removed only the block — leaving that
+byte behind. So the byte-identical guarantee held for the file measured here and
+was false in general, and all 53 hosts tests at the time shared the blind spot.
+Fixed by making the managed block carry the document's own final-newline
+property, with a parametrized round-trip property now covering ten body shapes
+(no trailing newline, CRLF without a final CRLF, bare-CR terminators,
+whitespace-only, trailing blank lines, …), all asserted on `read_bytes()`. The
+claim above is now true as stated for the round trip.
+
+**Arbitrary-write refusal (measured 2026-08-08).** `pin --hosts-path` pointed at
+a shadow-format file and at an `authorized_keys` was refused in both cases with
+exit 2, `does not parse as a hosts file, or does not resolve 'localhost', before
+any change — refusing to modify it`. Both files were byte-unchanged and **no
+backup was written** — the refusal precedes every write. This is what bounds
+`--hosts-path` under `sudo`.
+
 ## Limitation — the live `/etc/hosts` pin was NOT executed
 
 `/etc/hosts` is `root:root 0644` and `sudo -n` returns

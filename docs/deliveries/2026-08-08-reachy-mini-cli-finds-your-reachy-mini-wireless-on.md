@@ -90,6 +90,8 @@ captured directly.
 | `t3` | Shipped with a procfs fallback that evaded a structural guard by string concatenation; removed post-merge rather than kept | acceptable |
 | `t1` | Shipped a `probe` re-export that had already broken the module injection seam; corrected during the `t2` merge | acceptable |
 | `t10` | Shipped failing `black` and `flake8 E501`, which CI would have blocked; fixed at integration (`ebaa53b`) | acceptable |
+| `t4` | Shipped a byte-identical guarantee that was **false for any hosts file not ending in a newline** — `pin` inserted a separator newline that `unpin` never removed. All 53 tests, and the live check reported in the evidence doc, used a fixture ending in `\n` and shared the blind spot. Found by Qodo review on PR #161, not by this plan's own verification. Fixed by making the block carry the document's final-newline property; +33 tests over ten body shapes | needs-follow-up |
+| `t1` | Shipped a `probe()` that never bracketed IPv6 literals, so a remembered v6 `last_ip` produced an unparseable URL and silently degraded to "not found" — `wireless ssh`/`authorize`/`pin` were unusable for a v6-only unit. Found by Qodo review, not by this plan's verification (v6 is a documented out-of-scope boundary, but the code accepted and persisted v6 addresses regardless). Fixed in `probe()`, the single chokepoint; +19 tests | needs-follow-up |
 
 ## Evidence
 
@@ -117,7 +119,8 @@ captured directly.
 | Ambiguity is refused, never guessed | high | reproduced live with two real units · `tests/test_discover_resolve.py` (22) |
 | The suite can never sweep a live LAN | high | `tests/test_discover_sweep_guard.py` (4); reverting the guard made the suite enumerate 254 real hosts |
 | `reachy/discover/` adds no dependency | high | `tests/test_discover_boundary.py` (7), non-vacuity proven by injecting `import zeroconf` |
-| The `/etc/hosts` block is idempotent and fully reversible | medium | verified against a fixture reproducing the real file byte-for-byte; **not** exercised against the real `/etc/hosts` |
+| The `/etc/hosts` block is idempotent and fully reversible | medium | round-trip property over ten body shapes incl. no-trailing-newline, CRLF and bare-CR · `tests/test_discover_hosts.py` (111). **This claim was overstated until review** — see Drift `t4` |
+| `pin` refuses any file that is not already a hosts document | high | measured: a shadow-format file and an `authorized_keys` both refused exit-2, byte-unchanged, no backup written — evidence doc, "Arbitrary-write refusal" |
 | `authorize` cannot be reached from the shell path | high | AST call-graph walk with non-vacuity guard · `tests/test_discover_ssh.py` (44) |
 | The noun works on a bare install with no extras | high | subprocess test in a fresh interpreter asserting `reachy_mini` never enters `sys.modules` |
 | `ssh pollen@reachy-mini` resolves and opens a shell | **unverified** | the pin never ran (sudo password unavailable) — not claimed done |
