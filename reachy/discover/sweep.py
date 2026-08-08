@@ -31,10 +31,16 @@ there, and each one alone would be insufficient:
   excluded by address, because that is ordinary RFC 1918 space and many real
   corporate LANs live there.
 * **Address class.** Loopback, link-local, multicast, reserved and unspecified
-  networks carry no unit to find. Carrier-grade NAT (``100.64.0.0/10``) joins
-  them as a named, belt-and-braces exclusion of the Tailscale range — the
-  ``/32`` rule above already covers today's ``tailscale0``, and this covers a
-  future tailnet that presents a narrower prefix.
+  networks carry no unit to find. Beyond those, the network must be **private**
+  — a positive test, derived from :mod:`ipaddress` rather than a list of
+  excluded literals. That one predicate covers both cases a bare exclusion list
+  used to name: RFC 6598 shared address space, where Tailscale and carrier NAT
+  live and which is the only range that is neither private nor global (the
+  ``/32`` rule already covers today's ``tailscale0``; this also covers a future
+  tailnet presenting a narrower prefix), and every publicly-routable range,
+  which no robot is on and which this tool has no business probing. RFC 1122
+  "this network" is rejected by its leading zero octet, since an interface with
+  no address assigned reports ``SIOCGIFADDR`` as all-zero.
 * **Deduplication.** Two NICs on one subnet (this box: ``192.168.1.157`` and
   ``192.168.1.118``) enumerate that subnet exactly **once**, and a unit that
   answers at two addresses is folded to one record on ``hardware_id``.
@@ -110,24 +116,6 @@ MAX_HOSTS = 1024
 #: bridges (``docker0`` and the ``br-<hex>`` ones compose creates), libvirt's,
 #: and container veth pairs. Matched case-insensitively as a prefix.
 EXCLUDED_INTERFACE_PREFIXES = ("lo", "docker", "br-", "virbr", "veth")
-
-#: RFC 6598 shared address space (CGNAT) — Tailscale and carrier NAT live
-#: here. Excluded here as well as by the ``/32`` width rule above, so a
-#: future tailnet presenting a narrower prefix does not silently become a
-#: sweep target. Named as its own constant (SonarCloud python:S1313) so the
-#: literal reads as a documented policy entry, not an unexplained magic IP.
-CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
-
-#: RFC 1122 "this network" (``0.0.0.0/8``). :attr:`IPv4Network.is_unspecified`
-#: is only true of ``0.0.0.0/32``, so a ``0.0.0.0/24`` row would otherwise
-#: expand to 254 meaningless hosts.
-THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")  # nosec B104 - an exclusion, not a bind
-
-#: Address ranges no LAN unit can live on, named rather than inferred. Loopback,
-#: link-local, multicast and reserved space are covered by the :mod:`ipaddress`
-#: predicates in :func:`_network_of` instead — these two are the ranges that
-#: predicate set does not already reject.
-NEVER_SWEPT_NETWORKS = (CGNAT_NETWORK, THIS_NETWORK)
 
 #: Hard cap on concurrent probes. With :data:`DEFAULT_PROBE_TIMEOUT`, a fully
 #: blackholing ``/24`` costs ``ceil(254 / 64) * 0.5 s ~= 2 s`` — inside the
@@ -217,8 +205,31 @@ def _ipv4_of(sock: socket.socket, name: str) -> tuple[str, int]:
     """Return ``(address, prefixlen)`` for one interface, or raise ``OSError``."""
     address = _ioctl_ipv4(sock, name, _SIOCGIFADDR)
     netmask = _ioctl_ipv4(sock, name, _SIOCGIFNETMASK)
-    prefixlen = ipaddress.ip_network(f"0.0.0.0/{netmask}").prefixlen  # nosec B104
-    return address, prefixlen
+    return address, _prefixlen_of(netmask)
+
+
+def _prefixlen_of(netmask: str) -> int:
+    """Prefix length for a dotted-quad *netmask*, or ``ValueError`` if malformed.
+
+    Reads the mask as bits and takes the leading run of ones. The idiomatic
+    alternative builds a throwaway network from an all-zero address, which
+    means "any" but reads as a hardcoded IP to a reviewer (and to SonarCloud);
+    this says what a prefix length IS with no address literal involved.
+
+    The contiguity check is not decoration — it is what the discarded form gave
+    for free. ``ipaddress`` rejects a non-contiguous mask like ``255.0.255.0``,
+    and :func:`read_interfaces` turns that raise into "skip this interface". A
+    bare population count would instead accept it and return a prefix length
+    that describes no real network, so the mask is required to be ones followed
+    by zeros, and the raise is preserved.
+    """
+    bits = f"{int(ipaddress.IPv4Address(netmask)):032b}"
+    prefixlen = bits.find("0")
+    if prefixlen < 0:
+        return len(bits)
+    if "1" in bits[prefixlen:]:
+        raise ValueError(f"{netmask} is not a contiguous netmask")
+    return prefixlen
 
 
 def read_interfaces() -> tuple[Interface, ...]:
@@ -290,7 +301,19 @@ def _network_of(iface: Interface) -> ipaddress.IPv4Network | None:
         or network.is_multicast
         or network.is_reserved
         or network.is_unspecified
-        or any(network.subnet_of(excluded) for excluded in NEVER_SWEPT_NETWORKS)
+        # A LAN unit lives on a PRIVATE address, so require one rather than
+        # naming the ranges that are not. This is derived, not hardcoded, and
+        # it is strictly stronger than the two literals it replaced: it rejects
+        # RFC 6598 shared address space (100.64.0.0/10 — where Tailscale and
+        # carrier NAT live, and the only range that is neither private nor
+        # global) AND every publicly-routable range, which no robot is on and
+        # which this tool has no business probing.
+        or not network.is_private
+        # RFC 1122 "this network". `is_unspecified` is only true of the /32, so
+        # an interface with no address assigned (SIOCGIFADDR yields 0.0.0.0)
+        # paired with a real netmask would otherwise expand to 254 meaningless
+        # hosts. Tested by leading octet so no address literal is needed.
+        or network.network_address.packed[0] == 0
     ):
         return None
     return network

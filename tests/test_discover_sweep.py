@@ -103,6 +103,64 @@ class TestPrefixWidthIsRejectedByConstruction:
         hosts = enumerate_hosts(source=table(*THIS_BOX))
         assert not [h for h in hosts if h.startswith("100.")]
 
+    @pytest.mark.parametrize("address", ["100.64.0.1", "100.99.5.7", "100.127.255.1"])
+    def test_shared_address_space_is_refused_at_a_sweepable_width(self, address):
+        """RFC 6598 stays out even when the width rule would have let it in.
+
+        ``tailscale0`` is a ``/32`` today, so the width rule alone hides this.
+        A tailnet presenting a ``/24`` would not be hidden — and the rule that
+        catches it is derived (``is_private`` is False for shared address
+        space, the only range that is neither private nor global) rather than a
+        hardcoded ``100.64.0.0/10`` literal.
+        """
+        iface = Interface(name="tailscale0", address=address, prefixlen=24)
+        assert sweepable_networks([iface]) == ()
+        assert enumerate_hosts(source=table(iface)) == ()
+
+    @pytest.mark.parametrize("address", ["8.8.8.8", "1.1.1.1", "93.184.216.34"])
+    def test_a_publicly_routable_range_is_never_swept(self, address):
+        """No robot is on public space, and probing it is not this tool's business.
+
+        Gained for free by requiring a PRIVATE network rather than listing the
+        ranges that are not — the previous exclusion list would have swept this.
+        """
+        iface = Interface(name="eth0", address=address, prefixlen=24)
+        assert sweepable_networks([iface]) == ()
+
+    def test_an_interface_with_no_address_assigned_contributes_nothing(self):
+        """RFC 1122 'this network' — ``SIOCGIFADDR`` is all-zero on an unconfigured NIC.
+
+        ``is_unspecified`` is only true of the ``/32``, so paired with a real
+        netmask this would otherwise expand to 254 meaningless hosts.
+        """
+        iface = Interface(name="eth0", address="0.0.0.0", prefixlen=24)  # nosec B104
+        assert sweepable_networks([iface]) == ()
+
+    @pytest.mark.parametrize(
+        "netmask,expected",
+        [
+            ("255.255.255.0", 24),
+            ("255.255.0.0", 16),
+            ("255.255.255.255", 32),
+            ("255.255.255.252", 30),
+            ("255.128.0.0", 9),
+            ("0.0.0.0", 0),  # nosec B104
+        ],
+    )
+    def test_prefixlen_of_a_netmask(self, netmask, expected):
+        assert sweep_mod._prefixlen_of(netmask) == expected
+
+    @pytest.mark.parametrize("netmask", ["255.0.255.0", "0.255.0.0", "255.255.0.255"])
+    def test_a_non_contiguous_netmask_is_refused(self, netmask):
+        """The discarded ``ip_network`` form rejected these for free.
+
+        ``read_interfaces`` turns the raise into "skip this interface"; a bare
+        population count would have accepted the row and returned a prefix
+        length describing no real network.
+        """
+        with pytest.raises(ValueError):
+            sweep_mod._prefixlen_of(netmask)
+
     def test_enumeration_of_this_box_stays_tiny_not_459k(self):
         # The whole point: seven /16s naively expanded are ~459 000 hosts.
         assert len(enumerate_hosts(source=table(*THIS_BOX))) == 254
