@@ -79,6 +79,19 @@ _JSON_HELP = "Emit structured JSON."
 #: Selects a remembered unit without a flag, for a box that always drives one.
 UNIT_ENV = "REACHY_WIRELESS_UNIT"
 
+#: The scheme every ``base_url`` this noun hands back is built from.
+#:
+#: It is ``http`` because that is what the daemon SPEAKS, not a choice made
+#: here: ``reachy-mini-daemon`` exposes one plain-HTTP listener and no TLS
+#: listener at all, which is why ``reachy/robot/transport.py`` already ships
+#: ``DEFAULT_BASE_URL = "http://localhost:8000"``. Discovery only reaches it
+#: over loopback or a trusted LAN — the same trusted-network assumption the
+#: overview's "Costs and cautions" section states out loud, since the status
+#: route the sweep probes is unauthenticated regardless of scheme. Naming the
+#: scheme here keeps that decision stated once, where it can be revisited if
+#: the daemon ever grows a TLS endpoint, instead of inlined at the format site.
+DAEMON_URL_SCHEME = "http"
+
 _VERBS = [
     "wireless find — sweep the LAN (or one --address) for Reachy daemons and remember them",
     "wireless list — the remembered units, from the registry alone (no network)",
@@ -174,7 +187,7 @@ def _base_url(address: str, port: int) -> str:
     host = address
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    return f"http://{host}:{port}"
+    return f"{DAEMON_URL_SCHEME}://{host}:{port}"
 
 
 def _probe_address(address: str, port: int, timeout: float) -> probe_mod.UnitRecord | None:
@@ -408,25 +421,28 @@ def cmd_wireless_ssh(args: argparse.Namespace) -> int:
     }
     if args.dry_run:
         emit_payload(payload, json_mode=json_mode)
-        return 0
-    if json_mode:
-        # Emitted BEFORE the exec: this process is about to be replaced, so an
-        # agent's structured result has to leave the pipe first.
-        emit_payload(payload, json_mode=True)
     else:
-        emit_diagnostic(
-            f"connecting to {unit.robot_name} ({unit.hardware_id}) at {unit.address} "
-            f"as {payload['user']} ..."
+        if json_mode:
+            # Emitted BEFORE the exec: this process is about to be replaced, so
+            # an agent's structured result has to leave the pipe first.
+            emit_payload(payload, json_mode=True)
+        else:
+            emit_diagnostic(
+                f"connecting to {unit.robot_name} ({unit.hardware_id}) at {unit.address} "
+                f"as {payload['user']} ..."
+            )
+        # Never returns in production: os.execvp replaces this process, so ssh
+        # owns the operator's terminal from here on.
+        ssh_mod.open_shell(
+            unit.address,
+            user=args.user,
+            alias=alias,
+            exec_fn=_EXEC_SSH,
+            which=_WHICH,
         )
-    # Never returns in production: os.execvp replaces this process, so ssh owns
-    # the operator's terminal from here on.
-    ssh_mod.open_shell(
-        unit.address,
-        user=args.user,
-        alias=alias,
-        exec_fn=_EXEC_SSH,
-        which=_WHICH,
-    )
+    # The ONE terminus, and the only exit code this handler can produce: every
+    # failure left by raising CliError (the repo-wide contract in
+    # reachy/cli/_errors.py), and in production the exec path never gets here.
     return 0
 
 
@@ -543,7 +559,7 @@ def cmd_wireless_overview(args: argparse.Namespace) -> int:
                 f"registry: {registry_mod.default_registry_path()} (keyed by hardware_id)",
                 f"hosts block: {hosts_mod.BEGIN_MARKER} ... {hosts_mod.END_MARKER} "
                 f"in {hosts_mod.DEFAULT_HOSTS_PATH}",
-                f"ssh account: {ssh_mod.DEFAULT_SSH_USER} " f"(--user, or ${ssh_mod.SSH_USER_ENV})",
+                f"ssh account: {ssh_mod.DEFAULT_SSH_USER} (--user, or ${ssh_mod.SSH_USER_ENV})",
                 f"host-key alias: {ssh_mod.DEFAULT_HOST_KEY_ALIAS} "
                 "(passed as -o HostKeyAlias, so it needs no /etc/hosts pin and no privilege)",
                 f"unit selector: --unit <hardware_id-or-alias>, or ${UNIT_ENV}",
@@ -720,7 +736,7 @@ def register(sub: argparse._SubParsersAction) -> None:
         action="append",
         default=None,
         metavar="NAME",
-        help="Alias to pin (repeatable; default: " f"{' '.join(hosts_mod.DEFAULT_ALIASES)}).",
+        help=f"Alias to pin (repeatable; default: {' '.join(hosts_mod.DEFAULT_ALIASES)}).",
     )
     pin.add_argument(
         "--hosts-path",
