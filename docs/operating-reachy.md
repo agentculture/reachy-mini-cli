@@ -174,9 +174,11 @@ You have two correct patterns, and one hard refusal:
 
 Two profiles, because the SDK's transitive stack (pycairo / gstreamer /
 pyaudio) needs system libraries a bare box or CI lacks — so `reachy-mini` is an
-**extra**, not a base dependency. There are exactly two base runtime deps, both
-pure wheels: `numpy` and `harmonics-cli` (the offline harmonic voice), so even
-the bare profile can speak.
+**extra**, not a base dependency. There are exactly three base runtime deps, all
+pure wheels: `numpy`, `harmonics-cli` (the offline harmonic voice, so even the
+bare profile can speak) and `events-cli` (the nervous-system bus client, which
+joined on 2026-07-24). Discovery added none — `reachy/discover/` is stdlib-only
+and a test walks its AST to keep it that way.
 
 | Profile | Install | Use it for |
 |---|---|---|
@@ -203,6 +205,261 @@ warning rather than crashing anything.
 layer's shipped `robot` profile hears through a unix socket and speaks through
 `urllib`, both stdlib. (`[gpu]` exists as a generic compute-class pin for
 future GPU features; it bundles no model.)
+
+---
+
+## Find the robot on the network — `wireless`
+
+Every robot session starts with *where is it*. The `wireless` noun answers that
+once, remembers the answer across DHCP moves, and hands you a shell — so the
+address stops being something a human retypes.
+
+```bash
+reachy-mini-cli wireless find          # sweep the LAN, report + remember what answered
+reachy-mini-cli wireless list          # what is remembered (registry only, no network)
+reachy-mini-cli wireless ssh           # open a shell on it — no address typed
+sudo reachy-mini-cli wireless pin      # pin its address to a stable /etc/hosts alias
+reachy-mini-cli wireless authorize     # one-time SSH key install (asks first, always)
+reachy-mini-cli wireless unpin         # remove that managed /etc/hosts block
+reachy-mini-cli wireless forget        # drop a remembered unit
+reachy-mini-cli wireless overview      # the whole surface, including the caveats below
+```
+
+Every verb takes `--json`, and every `find` result carries a ready-made
+`base_url`, so an agent can pass it straight to `--base-url` /
+`REACHY_BASE_URL` without reformatting anything. The noun needs **no extras**:
+it speaks plain HTTP to a candidate daemon, plus `/etc/hosts` and `ssh` for the
+two side-effecting verbs, so it works in full on the bare **HTTP remote**
+profile — which is exactly its audience, someone driving a robot their box is
+not hosting.
+
+### Why pinning the alias is load-bearing, not a nicety
+
+Pollen's own documentation tells you to run `ssh pollen@reachy-mini`. On the
+development box this feature was built against, that command **fails** —
+`reachy-mini` and `reachy-mini.local` both fail to resolve, and only
+`reachy-mini-2.local` resolves, to `192.168.1.162`. So the documented command
+dies with `Could not resolve hostname` before it ever reaches the robot.
+
+The `-2` suffix is the reason. This box hosts a **Reachy Mini Lite** of its own,
+and the Lite claimed the base mDNS name first — so avahi handed the Wireless
+unit the collision suffix. That suffix is not the unit's property: it can
+**move** if the Lite is powered off at boot, or if the claim order flips. A name
+that can change hands is not an identity.
+
+Two consequences run through the whole design:
+
+- **Identity is the daemon-reported `hardware_id`**, never a name, never an IP,
+  never a MAC. It arrives over plain HTTP, so it works off-subnet, through a
+  router, and on a box with no ARP table at all. MAC is stored *alongside* as
+  opportunistic enrichment when the unit shares an L2 segment (live, this box
+  enriched the Wireless unit with `88:a2:9e:8c:fa:bf`) — a record is fully
+  valid and fully identifiable without one.
+- **The alias is operator-chosen, not harvested.** `wireless pin` writes
+  `reachy-mini` (and `reachy-mini.local` as an extra convenience), which is the
+  name Pollen's docs already tell you to type. It is deliberately *not* derived
+  from the daemon's own `robot_name` field — that reports the underscore
+  spelling `reachy_mini`, and munging it back into a hyphenated hostname would
+  regenerate exactly the name the Lite already holds in mDNS.
+
+Note that the plain `reachy-mini` is the primary name. The `.local` form is a
+convenience only: `.local` is the mDNS domain, and some `nsswitch.conf`
+configurations route it exclusively to mDNS, bypassing `/etc/hosts` entirely.
+Never build anything that depends on the `.local` form resolving through files.
+
+### What a find actually costs
+
+Measured on that box, against the live unit, with its seven Docker bridge
+networks present:
+
+| Path | Measured |
+|---|---|
+| **Cold** — empty registry, full LAN sweep | **3.663 s** wall clock. The sweep itself reported `elapsed_s=3.395`, **254 hosts probed**, `deadline_reached=false`, and found one wireless unit |
+| **Warm** — resolve from the registry | **0.225 s** wall clock: one bounded probe of the remembered address, no sweep at all |
+
+The cold path's target was under 5 s and its hard bound is 10 s (`--deadline`);
+when that deadline expires the sweep cancels what is outstanding, returns what
+it has, and *says so* — `deadline_reached: true` in the payload plus a
+diagnostic on stderr, never a quietly short list.
+
+The warm path is genuinely the registry short-circuit and not a faster sweep:
+the remembered `last_ip` is probed first, its `hardware_id` is checked against
+the record, and only a match returns. A remembered address that now answers as a
+**different** unit — DHCP handed it to someone else — is rejected, escalates to
+the sweep, and the record is re-pinned to the new address. Staleness is
+corrected, not tolerated.
+
+### The sweep's edges — say what it actually does
+
+- **IPv4, and the default daemon port only.** A unit reachable only over IPv6,
+  on another subnet, or on a non-default port stays fully usable by explicit
+  address: `wireless find --address <ip>` accepts an IPv6 literal, and `--port`
+  moves the port.
+- **`/24` or narrower, by construction.** Anything wider is refused before a
+  single host is materialised — this box's seven Docker bridges are `/16`s, and
+  naively expanding them is roughly 459 000 hosts and a CLI that appears to hang
+  forever. Docker/bridge/veth interfaces are additionally excluded by name, and
+  a `/31` or `/32` (Tailscale's interface is a `/32`) is excluded too: a
+  point-to-point link and a host route have no other machines on them to find.
+- **Loopback is excluded.** Be precise about what that means here: the
+  co-resident **Lite answers on `127.0.0.1`**, so it is **not discoverable by
+  sweeping at all**. It is reachable only by asking for it —
+  `wireless find --address 127.0.0.1 --all`. The sweep does not distinguish the
+  two robots; it simply never looks where the Lite lives.
+- **`find` filters to `wireless_version=true` by default.** Ask for the Lite
+  explicitly and the default filter refuses it, with a hint naming `--all` — a
+  Lite tethered to *another* box on the LAN is genuinely discoverable and
+  genuinely not wireless, so the noun's name describes the default, not a limit
+  of the mechanism.
+- **Two NICs on one subnet enumerate it once.** This box has two, and a unit
+  answering on both folds to one record on `hardware_id`.
+
+### Ambiguity is refused, never guessed
+
+With both units remembered — the Wireless (`hardware_id=a89063c05ae79779`, at
+`192.168.1.162`, daemon `1.9.0`) and the Lite (`hardware_id=37a38ce3a26e0727`,
+at `127.0.0.1`) — a verb that acts on *one* unit refuses and names **both**
+candidates rather than picking one. Both robots report `robot_name=reachy_mini`,
+so "more than one match" is the normal case on this box, not a corner case.
+
+Pick one with `--unit <hardware_id-or-alias>`, or set `REACHY_WIRELESS_UNIT` in
+the environment for a box that always drives the same robot.
+
+### Discovery is safe beside a live runtime
+
+**The [single-SDK-owner model](#the-single-sdk-owner-model) does not apply to
+this noun.** Discovery is a read-only `GET /api/daemon/status` — one request per
+candidate host and nothing else. It arms no motors, claims no media session,
+opens no `ReachyMini` client, and touches no motion queue. Running
+`wireless find` beside a live `behavior engine run` is safe, and so is running
+it beside `agent embody`, `demo-mode`, or anything else. The conflict matrix in
+that section has no row for `wireless` because there is nothing to conflict
+over.
+
+### What needs sudo — and what emphatically does not
+
+Exactly one verb needs privilege: **`wireless pin`** (and its `unpin`), because
+it writes `/etc/hosts`. Everything else — `find`, `list`, `ssh`, `authorize`,
+`forget`, `overview` — is fully unprivileged. A non-writable hosts file is a
+clean exit-2 error naming `sudo`, never a traceback and never a silent no-op.
+
+One wrinkle worth knowing before you type it: **`sudo` may not see the registry
+you built.** The remembered units live under *your* state dir, and depending on
+this box's `sudoers` settings a `sudo` invocation can run with root's `HOME` and
+therefore root's (empty) registry — in which case `pin` re-sweeps and remembers
+the unit as root instead of resolving yours. The deterministic form is to pass
+the address `find` just printed:
+
+```bash
+sudo reachy-mini-cli wireless pin --address 192.168.1.162
+```
+
+`pin --address` skips unit resolution entirely, so it neither reads nor writes a
+registry.
+
+**Stable SSH host-key identity does not depend on the pin.** Every `ssh` this
+noun builds passes `-o HostKeyAlias=reachy-mini` alongside the resolved IP, so
+`known_hosts` keys on the stable alias whether or not `/etc/hosts` was ever
+touched — a DHCP move never produces a host-key mismatch, with no privilege
+involved. The pin is what makes *other* tools on the box (and Pollen's own
+documented command) resolve the name; it is not what makes this noun's ssh work.
+
+The write itself is recoverable rather than merely careful: only the block
+between `# BEGIN reachy-mini-cli` and `# END reachy-mini-cli` is ever rewritten,
+and every byte outside it is preserved verbatim — the sole exception being the
+single line terminator an appended block needs on a file that did not end in
+one, which `unpin` takes back, so `pin` followed by `unpin` leaves the file
+byte-identical. A `.reachy-mini-cli.bak` backup holding the exact pre-write
+bytes is taken before every modification, and the landed file is re-read and
+re-verified afterwards — with an automatic restore if anything fails.
+
+`pin` also refuses, before touching anything, any file that does not already
+parse as a hosts document resolving `localhost`. Pointed at `/etc/shadow` or an
+`authorized_keys`, it exits 2 and writes nothing — not even a backup — which is
+what keeps `--hosts-path` an operator convenience rather than an arbitrary-write
+primitive when the command is run under `sudo`. That care is proportionate: this box's entire
+`/etc/hosts` is two lines, and losing the `localhost` line breaks name
+resolution box-wide.
+
+### The trusted-network assumption — and the password
+
+State this plainly, because discovery makes it matter more:
+
+- The daemon's `/api/daemon/status` route is **unauthenticated**. Anyone on the
+  LAN can read a unit's full identity, and a sweep on a shared network — a lab,
+  an office, a conference — will find, and offer to remember, pin and log into,
+  a Reachy that is not yours. Nothing in the protocol distinguishes *my robot*
+  from *a robot* on first contact.
+- The unit ships with the **factory-default password `root`** for the `pollen`
+  account. So the assumption is stronger than "the status endpoint is open":
+  anyone who can reach the robot on the LAN can also *log into* it, with a
+  published default credential.
+
+**Changing that password is the operator's first move.** Discovery does not
+create the exposure, but it does make the robot trivially easy to find — so run
+`wireless find`, then `wireless ssh`, then `passwd`, in that order, before the
+unit spends any time on a network you do not fully control.
+
+Key install is kept deliberately separate for the same reason: `authorize` is
+**never** a side effect of `find` or `ssh`. It names the resolved target and its
+`hardware_id`, asks for an explicit confirmation (a non-interactive stdin counts
+as a decline, never an accidental yes), and only then invokes `ssh-copy-id`,
+which appends to `authorized_keys` and never truncates it. The first run hits
+the unit's interactive password prompt — `ssh-copy-id` owns that prompt end to
+end, so no typed secret ever passes through this CLI.
+
+### A worked walkthrough
+
+```bash
+# 1. Cold. Nothing is remembered; sweep the local /24 and remember what answered.
+reachy-mini-cli wireless find --json
+# {"units": [{"hardware_id": "a89063c05ae79779", "robot_name": "reachy_mini",
+#             "model": "Reachy Mini Wireless", "wireless": true, "version": "1.9.0",
+#             "address": "192.168.1.162", "port": 8000,
+#             "base_url": "http://192.168.1.162:8000"}],
+#  "count": 1, "hosts_probed": 254, "deadline_reached": false, "elapsed_s": 3.395,
+#  "remembered": ["a89063c05ae79779"]}
+
+# 2. Warm. Same answer, from the registry, without touching the LAN.
+reachy-mini-cli wireless list
+
+# 3. Drive the robot's daemon from here — the base_url needs no reformatting.
+REACHY_BASE_URL=http://192.168.1.162:8000 reachy-mini-cli device status --transport http
+
+# 4. Make Pollen's documented command work on this box (the one sudo step).
+#    Pass the address explicitly: under sudo the registry may be root's, not yours.
+sudo reachy-mini-cli wireless pin --address 192.168.1.162
+ssh pollen@reachy-mini          # resolves now; before the pin it did not
+
+# 5. Log in without typing an address at all, then change the password.
+reachy-mini-cli wireless ssh
+#   pollen@reachy-mini:~$ passwd
+
+# 6. One-time key install so later logins are passwordless. Asks first.
+reachy-mini-cli wireless authorize
+
+# 7. Ask about the Lite on loopback explicitly — the sweep never looks there,
+#    and the default wireless-only filter refuses it with a hint naming --all.
+reachy-mini-cli wireless find --address 127.0.0.1 --all
+```
+
+If a later session finds the unit has moved, just run `wireless find` again: the
+record is re-pinned to the freshly-verified address, and `wireless pin` refreshes
+the `/etc/hosts` block to match. `wireless forget --unit <id>` (or `--all`) drops
+a unit you no longer want remembered; the registry itself lives under the state
+dir as `units.json` and is never committed anywhere.
+
+### For agents — the `find-reachy` skill
+
+An agent that needs the robot's address before it can drive anything reaches the
+same discovery through `.claude/skills/find-reachy/`. Invoked bare it runs
+`wireless find --json`; any other argument is forwarded verbatim, so every verb
+above is reachable. The script holds **no discovery logic of its own** — it
+resolves the CLI (installed `reachy`, else `uv run reachy` inside a checkout,
+else an install hint) and shells out. That is deliberate: discovery lives in one
+place, so the skill cannot drift from the tool it wraps, and a test names each
+forbidden mechanism (`ip`, `arp`, `avahi-browse`, `nmap`, raw sockets, a direct
+`curl` of the daemon) so a breach says exactly which rule broke.
 
 ---
 
@@ -467,6 +724,8 @@ vars override the built-in default.
 | `REACHY_STATE_DIR` | `$XDG_STATE_HOME/reachy` → `~/.local/state/reachy` | Where PID + log files for daemon/`demo-mode`/`vision`/`sleep`/`behavior` live (plus `rules.toml`, the intents spool, the stash and forge trees) | `daemon.py` |
 | `XDG_STATE_HOME` | `~/.local/state` | Base for the state dir when `REACHY_STATE_DIR` is unset | `daemon.py` |
 | `XDG_CONFIG_HOME` | `~/.config` | Base for config (`<…>/reachy/demo-mode.json`) | `demo_config.py` |
+| `REACHY_WIRELESS_UNIT` | (unset) | Which remembered unit `wireless ssh`/`authorize`/`pin`/`forget` act on, by `hardware_id` or alias, on a box that always drives the same robot. `--unit` wins; with two units remembered and neither set, the verb refuses and names both | `cli/_commands/wireless.py` |
+| `REACHY_WIRELESS_SSH_USER` | `pollen` | SSH login account for `wireless ssh` / `wireless authorize` (Pollen's own documented default). `--user` wins | `discover/ssh.py` |
 | `REACHY_TTS_URL` | `http://localhost:9000` | Chatterbox-style TTS HTTP endpoint (the `chatterbox` route) | `speech/tts.py` (`say`, the runtime's voice) |
 | `REACHY_TTS_VOICE` | `Magpie-Multilingual.EN-US.Mia.Calm` | TTS voice identifier | `speech/tts.py` |
 | `REACHY_TTS_ROUTE` | `chatterbox` | Which TTS wire protocol to speak: `chatterbox` (`{REACHY_TTS_URL}/v1/audio/synthesize`) or `openai` (`{REACHY_OPENAI_URL_BASE}/v1/audio/speech`). The generated `runtime` unit bakes `openai` in as an `Environment=` directive | `speech/tts.py`, `service/units.py` |
@@ -3348,6 +3607,9 @@ The CLI never leaks a Python traceback — every failure is a structured
 | `error: the reachy_mini SDK is not installed` (exit 2) | You ran an `sdk`-transport noun on a bare install | `pip install 'reachy-mini-cli[sdk]'` (or `[daemon]`), or use `--transport http` |
 | `error: cannot reach the Reachy daemon at http://localhost:8000 (…)` (exit 2) | No daemon reachable on the `http` transport | `reachy-mini-cli daemon start`, or set `REACHY_BASE_URL` / `--base-url` to a running daemon |
 | `error: 'reachy-mini-daemon' not found on PATH` (exit 2) | The `[daemon]` extra (which ships the daemon binary) isn't installed | `pip install 'reachy-mini-cli[daemon]'`, or point `--daemon-cmd` / `REACHY_DAEMON_CMD` at the binary |
+| `ssh: Could not resolve hostname reachy-mini` | Pollen's documented name is not resolvable here: a co-resident Lite holds the base mDNS name, so the Wireless unit answers as `reachy-mini-2.local` | `reachy-mini-cli wireless find`, then `sudo reachy-mini-cli wireless pin` — see [Find the robot on the network](#find-the-robot-on-the-network--wireless) |
+| `error: no Reachy Mini unit answered on this network` (exit 1) | The sweep covers IPv4 `/24`-or-narrower subnets on the default daemon port only — loopback, bridges and wider prefixes are excluded by construction | Pass `--address` (and `--port`) explicitly for an IPv6-only unit, another subnet, or the co-resident Lite on `127.0.0.1` |
+| `error: N Reachy daemon(s) answered, but none reports wireless_version=true` (exit 1) | `wireless find` filters to wireless units by default | Re-run with `--all` — the hint already lists what did answer |
 | The runtime / `sleep` runs but the robot never reacts to sound | `No Reachy Mini Audio Source card found` — mic not exposed as an ALSA source | The [`~/.asoundrc` gotcha](#the-asoundrc-mic-array-gotcha): pin `reachymini_audio_src`, restart the daemon |
 | `error: 'pat run' refused: a behavior engine is already driving the head` (exit 1) | The single-head invariant: a foreground sense verb refuses to join a live engine | Stop the engine first (`systemctl --user stop reachy-runtime.service`, `behavior engine stop`, or Ctrl-C the foreground run) — or just use the runtime's own pat sense instead of `pat run` |
 | A second sense noun is sluggish or feels dead | Two `sdk`-sense processes contending for the single-consumer SDK client (throttled ~1 Hz) | Run **one** `sdk` sense owner — the `behavior` runtime is the way to have several senses at once — or put the second on `--transport http`. See [the conflict matrix](#what-this-means-the-conflict-matrix) |
@@ -3375,6 +3637,7 @@ implementation map.
 
 | Noun | Does | Sense in | Motion out | Transport |
 |---|---|---|---|---|
+| [`wireless`](#find-the-robot-on-the-network--wireless) | find a Reachy daemon on the LAN, remember it by `hardware_id`, pin a stable `/etc/hosts` alias, open a shell on it | read-only `GET /api/daemon/status` per candidate host | — | none (plain HTTP + `/etc/hosts` + `ssh`; no extras needed) |
 | `daemon` | start/stop/status the local `reachy-mini-daemon` OS process (PID/log under the state dir, health-poll) | — | — | none (manages the process) |
 | `device` | daemon + live robot state (`status`, `state`) | — | — | `http` (default) |
 | `app` | list / start / stop daemon apps | — | — | `http` |

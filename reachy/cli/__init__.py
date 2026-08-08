@@ -81,6 +81,7 @@ def _build_parser() -> argparse.ArgumentParser:
     from reachy.cli._commands import sleep as _sleep_group
     from reachy.cli._commands import vision as _vision_group
     from reachy.cli._commands import whoami as _whoami_cmd
+    from reachy.cli._commands import wireless as _wireless_group
 
     parser = _CliArgumentParser(
         prog="reachy-mini-cli",
@@ -110,6 +111,9 @@ def _build_parser() -> argparse.ArgumentParser:
     _overview_cmd.register(sub)
     _doctor_cmd.register(sub)
     _cli_group.register(sub)
+    # Find the robot before talking to it: LAN discovery, the remembered-unit
+    # registry, the /etc/hosts pin and the ssh login. No transport, no extras.
+    _wireless_group.register(sub)
     # Robot noun groups (daemon lifecycle, device setup, app mgmt, runtime ops).
     _daemon_group.register(sub)
     _device_group.register(sub)

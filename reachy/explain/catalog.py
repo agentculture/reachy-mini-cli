@@ -34,6 +34,8 @@ quickstart` for the install-and-start-real-mode sequence.
 
 ## Robot nouns
 
+- `reachy-mini-cli wireless <verb>` — find a Reachy Mini on the LAN, remember
+  which unit is yours, pin it to a stable name, and log in.
 - `reachy-mini-cli daemon <verb>` — start/stop/check the local daemon process.
 - `reachy-mini-cli device <verb>` — daemon/robot status and live state.
 - `reachy-mini-cli app <verb>` — list/start/stop Reachy Mini apps.
@@ -1147,6 +1149,118 @@ stays exactly that closed pair either way.
   process)
 """
 
+_WIRELESS = """\
+# reachy-mini-cli wireless
+
+Find a Reachy Mini on the local network, remember which unit is yours across IP
+changes, pin it to a stable name, and log in — so the address stops being
+something a human retypes every session.
+
+Unlike `device`/`app`/`move` there is **no transport flag**. This noun speaks
+plain HTTP to a *candidate* daemon's `/api/daemon/status` route, plus
+`/etc/hosts` and `ssh`, so it works on a bare install with neither the `[sdk]`
+nor the `[daemon]` extra present.
+
+## Verbs
+
+- `reachy-mini-cli wireless find` — sweep the local IPv4 subnets (or probe one
+  `--address`) and report every unit found, remembering each one.
+- `reachy-mini-cli wireless list` — the remembered units, from the registry
+  alone. No network.
+- `reachy-mini-cli wireless ssh` — resolve one unit and open a shell on it.
+- `reachy-mini-cli wireless authorize` — the separate, explicitly-confirmed
+  one-time SSH key install (`ssh-copy-id`).
+- `reachy-mini-cli wireless pin` / `unpin` — add or remove a delimited managed
+  block in `/etc/hosts` pinning `<ip> reachy-mini reachy-mini.local`. Needs
+  sudo; everything else needs no privilege.
+- `reachy-mini-cli wireless forget` — drop a remembered unit (`--unit`) or all
+  of them (`--all`). No network.
+- `reachy-mini-cli wireless overview` — this summary.
+
+## The name describes the DEFAULT, not a limit
+
+`find` filters to units reporting `wireless_version=true`, because that is the
+only field observed to reliably tell a Wireless from a Lite. But the same sweep
+also finds a **Lite tethered to another box** on the LAN — discoverable, and not
+wireless — so `--all` reveals every Reachy daemon the sweep answered for, each
+labelled with its `wireless` flag. Nothing is silently discarded.
+
+## Scope: IPv4 and the default port
+
+The sweep covers local **IPv4** `/24`-or-narrower subnets on port **8000**
+only. Wider prefixes, loopback and docker/bridge interfaces are excluded by
+construction (this box carries seven `172.x/16` bridges — expanding those is
+~459 000 hosts).
+
+A unit on **IPv6**, on another subnet, or on a non-default port stays usable by
+explicit address:
+
+    reachy-mini-cli wireless find --address 2a0d:6fc2:4:1::756b --json
+    reachy-mini-cli wireless find --address 192.168.1.162 --port 8123
+
+`--address` accepts an IPv6 literal and brackets it for the URL itself.
+
+## Feeding the address onward
+
+Every `find` result carries a ready-made `base_url`, so an agent passes it
+straight to `--base-url` or `REACHY_BASE_URL` with no reformatting:
+
+    reachy-mini-cli wireless find --json
+    {"units": [{"hardware_id": "...", "address": "192.168.1.162",
+                "base_url": "http://192.168.1.162:8000", ...}], ...}
+
+Discovery does not move any existing default: `DEFAULT_BASE_URL` is still
+`http://localhost:8000` and the transport contract is untouched.
+
+## Which unit? Ambiguity is refused, never guessed
+
+A remembered unit is tried FIRST at its last-known IP and returned as soon as
+its `hardware_id` matches — no sweep at all. A dark or reassigned address
+escalates to the sweep and the record is re-pinned to the new address.
+
+With more than one unit known (the normal case on a box that also hosts a
+Lite — both report `robot_name=reachy_mini`), a verb that needs exactly one
+exits non-zero and names every candidate rather than picking one. Choose with
+`--unit <hardware_id-or-alias>` or `REACHY_WIRELESS_UNIT`.
+
+## Login and keys
+
+`ssh` passes `-o HostKeyAlias=reachy-mini`, so `known_hosts` keys on a stable
+name whether or not `/etc/hosts` was ever pinned — stable host-key identity
+never depends on privilege. The account resolves as `--user` >
+`REACHY_WIRELESS_SSH_USER` > `pollen` (the documented Pollen default).
+
+`authorize` is **never** a side effect of `find` or `ssh`: the target was chosen
+by scanning an unauthenticated LAN service, so it names the alias, the address
+and the `hardware_id` and requires an explicit affirmative (`--yes` confirms up
+front) before running `ssh-copy-id`, which appends to `authorized_keys` and
+never truncates it. It reports plainly when a key was already installed.
+
+## Costs to know
+
+- Discovery assumes a **trusted network**. The daemon's status route is
+  unauthenticated, so on a shared LAN a sweep finds robots that are not yours.
+- The unit ships with a **factory-default password** for the `pollen` account.
+  Discovery makes the robot easier to find, so changing that password is the
+  operator's first move.
+- `pin`/`unpin` rewrite `/etc/hosts`. The write is confined to a marked block,
+  backed up first, verified after (the file must still parse and still resolve
+  `localhost`) and rolled back if it does not. A non-writable file is a clean
+  exit-2 error naming sudo, never a traceback.
+
+## State
+
+- registry: `<state_dir>/units.json`, keyed by `hardware_id`
+- hosts block: `# BEGIN reachy-mini-cli` ... `# END reachy-mini-cli`
+
+## Exit codes
+
+- `0` success
+- `1` user-input error (nothing found, an ambiguous registry, a declined
+  confirmation, an unknown unit)
+- `2` environment error (unwritable `/etc/hosts`, missing OpenSSH client)
+"""
+
 
 ENTRIES: dict[tuple[str, ...], str] = {
     (): _ROOT,
@@ -1244,6 +1358,15 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("service", "status"): _SERVICE,
     ("service", "install"): _SERVICE,
     ("service", "uninstall"): _SERVICE,
+    ("wireless",): _WIRELESS,
+    ("wireless", "overview"): _WIRELESS,
+    ("wireless", "find"): _WIRELESS,
+    ("wireless", "list"): _WIRELESS,
+    ("wireless", "ssh"): _WIRELESS,
+    ("wireless", "authorize"): _WIRELESS,
+    ("wireless", "pin"): _WIRELESS,
+    ("wireless", "unpin"): _WIRELESS,
+    ("wireless", "forget"): _WIRELESS,
     ("agent",): _AGENT,
     ("agent", "overview"): _AGENT,
     ("agent", "attach"): _AGENT,
