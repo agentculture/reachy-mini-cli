@@ -21,6 +21,7 @@ top of a probed record without needing to change this dataclass.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import urllib.error
 import urllib.request
@@ -69,6 +70,44 @@ class UnitRecord:
     version: str
     wlan_ip: str | None
     address: str
+
+
+def _url_host(host: str) -> str:
+    """Return *host* in the form a URL authority needs — IPv6 literals BRACKETED.
+
+    ``f"http://{host}:{port}"`` is only a parseable URL when an IPv6 literal is
+    wrapped in brackets (RFC 3986 §3.2.2): without them
+    ``http://2a0d:6fc2::756b:8000`` has a port indistinguishable from another
+    hextet, and :func:`urllib.parse.urlsplit` refuses to cast it. This lives
+    HERE, in :func:`probe`'s one URL-formatting site, rather than at each call
+    site, because every path into the probe crosses it — the
+    :mod:`reachy.discover.resolve` fast path (which passes a registry
+    ``last_ip`` back in), the :mod:`reachy.discover.sweep` fan-out, and the
+    CLI's own ``--address`` — so a future caller cannot reintroduce the bug by
+    forgetting to bracket. The bare form is deliberately what the registry
+    stores (``reachy/cli/_commands/wireless.py`` reports the unbracketed
+    literal so ``wlan_ip``-style values stay clean), which is exactly why the
+    fast path used to hand this function an unbracketed literal.
+
+    Detection is :func:`ipaddress.ip_address`, never a scan for colons: a bare
+    ``::1`` has colons and a hostname does not, but a bracketed literal must be
+    unwrapped before the question can even be asked. Idempotent by
+    construction — an already-bracketed ``[::1]`` is unwrapped, recognised and
+    re-bracketed, never doubled.
+
+    Anything :mod:`ipaddress` does not recognise (a hostname; a scoped
+    link-local like ``fe80::1%eth0``, which needs percent-encoding this
+    version does not attempt) is returned untouched: this function's job is to
+    make a literal usable, not to validate — ``probe`` degrades every bad host
+    to ``None`` anyway.
+    """
+    text = host.strip()
+    inner = text[1:-1] if text.startswith("[") and text.endswith("]") else text
+    try:
+        parsed = ipaddress.ip_address(inner)
+    except ValueError:
+        return host
+    return f"[{inner}]" if parsed.version == 6 else inner
 
 
 def _model_for(wireless: bool) -> str:
@@ -140,9 +179,17 @@ def probe(
 ) -> UnitRecord | None:
     """GET ``http://<host>:<port>/api/daemon/status`` and parse it into a UnitRecord.
 
-    Stdlib-only (:mod:`urllib`). Issues exactly ONE GET request — no follow-up
-    call, no other route — so it is safe to run against an arbitrary address on
-    the LAN: it neither arms motors nor opens a media session.
+    Stdlib-only (:mod:`urllib` + :mod:`ipaddress`). Issues exactly ONE GET
+    request — no follow-up call, no other route — so it is safe to run against
+    an arbitrary address on the LAN: it neither arms motors nor opens a media
+    session.
+
+    *host* may be a hostname, an IPv4 literal, or an IPv6 literal in EITHER
+    form — bare (``::1``, which is what the registry's ``last_ip`` holds) or
+    already bracketed (``[::1]``). :func:`_url_host` normalises it, so no
+    caller has to know that ``http://<ipv6>:<port>`` needs brackets.
+    ``UnitRecord.address`` still reports *host* exactly as it was passed in,
+    so a bare literal round-trips through the registry unchanged.
 
     Every failure degrades to ``None`` and is NEVER raised to the caller:
 
@@ -157,7 +204,7 @@ def probe(
       deliberate: a probe run against an arbitrary LAN host must never be the
       thing that crashes a sweep.
     """
-    url = f"{HTTP_SCHEME}://{host}:{port}{STATUS_PATH}"
+    url = f"{HTTP_SCHEME}://{_url_host(host)}:{port}{STATUS_PATH}"
     try:
         raw = _fetch_status(url, timeout)
     except Exception:

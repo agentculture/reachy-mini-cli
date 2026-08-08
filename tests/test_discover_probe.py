@@ -10,6 +10,10 @@ Acceptance criteria covered (one section each):
 3. The probe issues exactly ONE GET to /api/daemon/status and no other
    request, asserted against a recording stub -- proving it neither arms
    motors nor opens a media session.
+4. The URL is well-formed for EVERY host shape the probe can be handed --
+   in particular an IPv6 literal is bracketed (a Qodo finding on PR #161:
+   the fast path hands back the registry's BARE ``last_ip``, and
+   ``http://2a0d::756b:8000`` is not a parseable URL).
 
 Every test here monkeypatches ``urllib.request.urlopen`` directly (mirroring
 ``tests/test_stt.py``'s pattern for the sibling stdlib-urllib client) so the
@@ -21,6 +25,7 @@ from __future__ import annotations
 import json
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import FrozenInstanceError
 
@@ -290,6 +295,124 @@ class TestProbeIssuesExactlyOneRequest:
 
         assert all(STATUS_PATH in url for url in calls)
         assert not any("/api/move" in url or "/api/media" in url for url in calls)
+
+
+# ---------------------------------------------------------------------------
+# Criterion 4 -- the URL is well-formed for every host shape, IPv6 included
+# ---------------------------------------------------------------------------
+
+
+#: A real-world-shaped global IPv6 literal, in the BARE form the registry
+#: stores (reachy/cli/_commands/wireless.py deliberately records the
+#: unbracketed literal so wlan_ip-style values stay clean).
+BARE_V6 = "2a0d:6fc2:5150:c400::756b"
+
+
+class TestIpv6HostsAreBracketedInTheUrl:
+    """Regression cover for the Qodo finding "Ipv6 probe url malformed" (PR #161).
+
+    ``probe()`` formatted ``f"http://{host}:{port}"`` verbatim, so a remembered
+    IPv6 ``last_ip`` -- which ``reachy.discover.resolve``'s fast path passes
+    straight back in -- produced ``http://2a0d:6fc2:5150:c400::756b:8000``,
+    where the port is indistinguishable from another hextet. The probe then
+    failed, degraded to ``None`` (it never raises), and the unit could not be
+    resolved at all: ``wireless ssh`` / ``authorize`` / ``pin`` all fail for an
+    IPv6-only unit. Every assertion below is on the URL the recording stub
+    ACTUALLY received, not merely on "it did not raise" -- the old code did not
+    raise either.
+    """
+
+    @staticmethod
+    def _record(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        calls: list[str] = []
+
+        def _recording_urlopen(req, *a, **k):
+            calls.append(req.full_url)
+            return _FakeResp(body=json.dumps(LIVE_DAEMON_STATUS).encode())
+
+        monkeypatch.setattr(urllib.request, "urlopen", _recording_urlopen)
+        return calls
+
+    def test_a_bare_ipv6_literal_is_bracketed(self, monkeypatch):
+        calls = self._record(monkeypatch)
+
+        assert probe(BARE_V6) is not None
+
+        assert calls == [f"http://[{BARE_V6}]:{DEFAULT_PORT}{STATUS_PATH}"]
+
+    def test_an_already_bracketed_literal_is_not_double_bracketed(self, monkeypatch):
+        calls = self._record(monkeypatch)
+
+        assert probe(f"[{BARE_V6}]") is not None
+
+        assert calls == [f"http://[{BARE_V6}]:{DEFAULT_PORT}{STATUS_PATH}"]
+        assert "[[" not in calls[0]
+
+    def test_loopback_v6_is_bracketed_in_both_forms(self, monkeypatch):
+        calls = self._record(monkeypatch)
+
+        probe("::1")
+        probe("[::1]")
+
+        assert calls == [f"http://[::1]:{DEFAULT_PORT}{STATUS_PATH}"] * 2
+
+    @pytest.mark.parametrize("host", ["192.168.1.162", "127.0.0.1", "reachy.local", "localhost"])
+    def test_ipv4_and_hostnames_pass_through_untouched(self, monkeypatch, host):
+        """No stray brackets for the shapes that were already correct."""
+        calls = self._record(monkeypatch)
+
+        probe(host)
+
+        assert calls == [f"http://{host}:{DEFAULT_PORT}{STATUS_PATH}"]
+        assert "[" not in calls[0] and "]" not in calls[0]
+
+    def test_a_custom_port_stays_recoverable_on_a_v6_host(self, monkeypatch):
+        calls = self._record(monkeypatch)
+
+        probe(BARE_V6, port=8123)
+
+        assert calls == [f"http://[{BARE_V6}]:8123{STATUS_PATH}"]
+
+    @pytest.mark.parametrize("host", [BARE_V6, f"[{BARE_V6}]", "::1", "192.168.1.162", "localhost"])
+    @pytest.mark.parametrize("port", [DEFAULT_PORT, 8123])
+    def test_the_url_parses_and_its_port_is_recoverable(self, monkeypatch, host, port):
+        """The round trip that mirrors the real failure.
+
+        ``urlsplit(...).port`` RAISED ``ValueError`` on the unbracketed v6 URL
+        the old code built -- the port really was unrecoverable, not merely
+        ugly. Asserting on ``.hostname`` too pins that the authority was split
+        at the right colon: ``urlsplit`` lowercases and strips the brackets, so
+        a correctly-built URL yields the bare literal back.
+        """
+        calls = self._record(monkeypatch)
+
+        probe(host, port=port)
+
+        split = urllib.parse.urlsplit(calls[0])
+        assert split.port == port
+        assert split.hostname == host.strip("[]").lower()
+        assert split.path == STATUS_PATH
+
+    def test_the_bare_literal_round_trips_through_the_recorded_address(self, monkeypatch):
+        """address stays as passed in, so registry -> fast path is a fixpoint.
+
+        ``resolve._touch`` persists ``probed.address`` as ``last_ip`` and the
+        fast path feeds it straight back to ``probe``. Bracketing must NOT leak
+        into the recorded address, or the registry would accumulate a form the
+        CLI deliberately keeps bare -- and it must not need to, because
+        ``probe`` now accepts both forms.
+        """
+        self._record(monkeypatch)
+
+        first = probe(BARE_V6)
+
+        assert first is not None
+        assert first.address == BARE_V6  # bare in, bare out -- no brackets stored
+
+        second = probe(first.address)  # exactly what resolve()'s fast path does
+
+        assert second is not None
+        assert second.address == BARE_V6
 
 
 # ---------------------------------------------------------------------------
