@@ -39,6 +39,7 @@ The complete robot surface. Every noun supports `--json`; run
 
 | Noun | What it does | Transport |
 |------|--------------|-----------|
+| [`wireless`](docs/operating-reachy.md#find-the-robot-on-the-network--wireless) | Find a Reachy on the LAN, remember which unit is yours, pin a stable name, log in | none (HTTP probe + `/etc/hosts` + `ssh`) |
 | [`daemon`](docs/operating-reachy.md#bring-reachy-up-live) | Start/stop/status the local `reachy-mini-daemon` process | none (manages the process) |
 | `device` | Daemon + live robot state (`status`, `state`) | `http` (default) |
 | `app` | List / start / stop daemon apps | `http` |
@@ -83,10 +84,40 @@ description, the rolling video clip), `[cpu]` (on-box `openwakeword`), and
 `[bench]` (`sounddevice`, needed **only** for the embodiment layer's bench media
 profile — the deployed robot path uses a unix socket and `urllib`, both stdlib).
 
+## Find your robot
+
+Driving a robot your box is not hosting? You need its address first — and DHCP
+moves it. `wireless` answers *where is it* once and then remembers:
+
+```bash
+reachy-mini-cli wireless find     # sweep the LAN; report + remember what answered
+reachy-mini-cli wireless list     # what's remembered (registry only, no network)
+reachy-mini-cli wireless ssh      # open a shell on it — no address typed, ever
+sudo reachy-mini-cli wireless pin # pin it to a stable /etc/hosts alias (the one sudo step)
+```
+
+**It needs no extras at all.** Discovery is stdlib-only — a read-only
+`GET /api/daemon/status` fanned out over the local IPv4 `/24`s — so the whole
+noun works on the bare **HTTP remote** profile with neither `[sdk]` nor
+`[daemon]` installed. It never opens an SDK client or a media session either,
+so it is safe to run beside a live runtime. Every verb takes `--json`, and
+every result carries a ready-made `base_url` an agent can pass straight to
+`--base-url` / `REACHY_BASE_URL`.
+
+Units are remembered by the daemon-reported `hardware_id`, never by name or IP,
+so a unit that moves address is still found and re-pinned with no manual step.
+
+> ⚠️ The daemon's status route is **unauthenticated** and the unit ships with a
+> **factory-default password**, so anyone who can reach it on the LAN can log
+> into it. Discovery makes it easier to find — **changing that password is your
+> first move.** See
+> [Find the robot on the network](docs/operating-reachy.md#find-the-robot-on-the-network--wireless).
+
 ## Operating Reachy live
 
 The full operating guide is **[`docs/operating-reachy.md`](docs/operating-reachy.md)**:
 
+- [Find the robot on the network](docs/operating-reachy.md#find-the-robot-on-the-network--wireless) — `wireless` discovery: measured cold/warm timings, the sudo cost, the trusted-network assumption
 - [Bring Reachy up live](docs/operating-reachy.md#bring-reachy-up-live) — install → daemon → verify → behavior
 - [The single-SDK-owner model](docs/operating-reachy.md#the-single-sdk-owner-model) — the conflict matrix + how to compose behaviors
 - [Transports — `sdk` vs `http`](docs/operating-reachy.md#transports--sdk-vs-http)
