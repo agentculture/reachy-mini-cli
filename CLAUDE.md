@@ -1819,15 +1819,37 @@ disables only the tool; cognition keeps running.
 
 ## Skills (`.claude/skills/`)
 
-Vendored **cite-don't-import** from `guildmaster` (provenance + re-sync
-procedure in `docs/skill-sources.md`). **Do not edit skill script bodies** — only
-the consumer-identifying prose in `SKILL.md` is adapted; lift real changes
-upstream into guildmaster and re-vendor. Most relevant for day-to-day work:
+Most skills here are vendored **cite-don't-import** from `guildmaster`
+(provenance + re-sync procedure in `docs/skill-sources.md`). For those,
+**do not edit skill script bodies** — only the consumer-identifying prose in
+`SKILL.md` is adapted; lift real changes upstream into guildmaster and
+re-vendor. A vendored copy that diverges silently is the failure mode that rule
+exists to prevent.
+
+**That rule governs VENDORED skills, not first-party ones.** A skill whose
+subject is this repo's own CLI cannot come from guildmaster — there is nothing
+upstream to lift it into, and re-vendoring it would mean guildmaster owning a
+wrapper for a tool it does not ship. Two skills here are first-party and are
+authored in this repo: **`ask-colleague`** (origin `colleague`, landed in
+v0.21.0 — the one non-guildmaster vendored skill) and **`find-reachy`** (origin
+*here*; it wraps `reachy wireless`, so this repo is its only possible home).
+Adding or editing scripts under a first-party skill directory is normal work.
+When you add one, say so in this list — the distinction is what keeps the
+vendored-skill rule enforceable, since "never touch a script under
+`.claude/skills/`" and "this skill is ours" are otherwise indistinguishable to
+a reviewer.
+
+Most relevant for day-to-day work:
 
 - **`cicd`** — the PR lane (create PR, handle review feedback, poll CI/Sonar
   status). Requires `agex` on PATH.
 - **`communicate`** — cross-repo issues + Culture mesh messages. Requires
   `agtag` on PATH. Issue posts auto-sign `- reachy-mini-cli (Claude)`.
+- **`find-reachy`** (first-party) — the agent-facing front for `reachy
+  wireless`: finds the robot on the LAN and hands back its `base_url`. Its
+  script holds **no discovery logic**, only CLI resolution and a shell-out, and
+  `tests/test_find_reachy_skill.py` names each forbidden mechanism so a breach
+  says which rule broke.
 - **`version-bump`**, **`run-tests`**, **`sonarclaude`**, **`pypi-maintainer`**,
   **`agent-config`**, and the devague chain (`scope` → `think` → `challenge` →
   `spec-to-plan` → `assign-to-workforce` → `summarize-delivery`, with `deviate`
