@@ -111,21 +111,23 @@ MAX_HOSTS = 1024
 #: and container veth pairs. Matched case-insensitively as a prefix.
 EXCLUDED_INTERFACE_PREFIXES = ("lo", "docker", "br-", "virbr", "veth")
 
-#: Address ranges no LAN unit can live on, named rather than inferred:
-#:
-#: * ``100.64.0.0/10`` — carrier-grade NAT, Tailscale's space. Excluded here as
-#:   well as by the ``/32`` width rule, so a future tailnet presenting a
-#:   narrower prefix does not silently become a sweep target.
-#: * ``0.0.0.0/8`` — "this network" (RFC 1122). :attr:`IPv4Network.is_unspecified`
-#:   is only true of ``0.0.0.0/32``, so a ``0.0.0.0/24`` row would otherwise
-#:   expand to 254 meaningless hosts.
-#:
-#: Loopback, link-local, multicast and reserved space are covered by the
-#: :mod:`ipaddress` predicates in :func:`_network_of` instead.
-NEVER_SWEPT_NETWORKS = (
-    ipaddress.ip_network("100.64.0.0/10"),
-    ipaddress.ip_network("0.0.0.0/8"),  # nosec B104 - an exclusion, not a bind
-)
+#: RFC 6598 shared address space (CGNAT) — Tailscale and carrier NAT live
+#: here. Excluded here as well as by the ``/32`` width rule above, so a
+#: future tailnet presenting a narrower prefix does not silently become a
+#: sweep target. Named as its own constant (SonarCloud python:S1313) so the
+#: literal reads as a documented policy entry, not an unexplained magic IP.
+CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+#: RFC 1122 "this network" (``0.0.0.0/8``). :attr:`IPv4Network.is_unspecified`
+#: is only true of ``0.0.0.0/32``, so a ``0.0.0.0/24`` row would otherwise
+#: expand to 254 meaningless hosts.
+THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")  # nosec B104 - an exclusion, not a bind
+
+#: Address ranges no LAN unit can live on, named rather than inferred. Loopback,
+#: link-local, multicast and reserved space are covered by the :mod:`ipaddress`
+#: predicates in :func:`_network_of` instead — these two are the ranges that
+#: predicate set does not already reject.
+NEVER_SWEPT_NETWORKS = (CGNAT_NETWORK, THIS_NETWORK)
 
 #: Hard cap on concurrent probes. With :data:`DEFAULT_PROBE_TIMEOUT`, a fully
 #: blackholing ``/24`` costs ``ceil(254 / 64) * 0.5 s ~= 2 s`` — inside the

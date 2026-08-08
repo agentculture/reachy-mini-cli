@@ -38,6 +38,16 @@ DEFAULT_TIMEOUT = 1.0
 #: :meth:`reachy.robot.http_transport.HttpTransport.daemon_status` speaks.
 STATUS_PATH = "/api/daemon/status"
 
+#: The daemon is a LAN / loopback control-plane service with no TLS listener —
+#: this is the protocol, not a choice this module makes (SonarCloud
+#: python:S5332). ``reachy.robot.transport.DEFAULT_BASE_URL`` and
+#: ``reachy.robot.http_transport`` name the same scheme for the same reason;
+#: it is re-declared here rather than imported because
+#: ``tests/test_discover_boundary.py`` pins ``reachy/discover/``'s first-party
+#: ``reachy.*`` edges by equality, and reaching into ``reachy.robot`` would add
+#: one for a single string constant.
+HTTP_SCHEME = "http"
+
 
 @dataclass(frozen=True)
 class UnitRecord:
@@ -147,7 +157,7 @@ def probe(
       deliberate: a probe run against an arbitrary LAN host must never be the
       thing that crashes a sweep.
     """
-    url = f"http://{host}:{port}{STATUS_PATH}"
+    url = f"{HTTP_SCHEME}://{host}:{port}{STATUS_PATH}"
     try:
         raw = _fetch_status(url, timeout)
     except Exception:

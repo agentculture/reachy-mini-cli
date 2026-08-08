@@ -128,8 +128,16 @@ REFUSALS = frozenset(
 #: as an option), no ``@`` (which would re-split the login target).
 _HOST_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
-#: A login account token, on the same fail-closed principle.
-_USER_TOKEN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+#: A login account token, on the same fail-closed principle. ``\w`` is
+#: Unicode-aware on a ``str`` pattern by default (it would admit accented
+#: letters and other scripts' digits into an SSH login account), so
+#: ``re.ASCII`` is required, not cosmetic — it restricts ``\w`` to exactly
+#: ``[a-zA-Z0-9_]``, matching the original ``[A-Za-z0-9_][A-Za-z0-9._-]*``
+#: character classes byte for byte (SonarCloud python:S6353). A non-ASCII
+#: identifier (e.g. an accented or Cyrillic login) must stay REJECTED — pin
+#: that in ``tests/test_discover_ssh.py`` alongside the existing token tests
+#: so a future edit dropping ``re.ASCII`` fails loudly.
+_USER_TOKEN = re.compile(r"^\w[\w.-]*$", re.ASCII)
 
 
 def _validated(value: str, pattern: re.Pattern[str], what: str) -> str:
