@@ -364,7 +364,8 @@ class TestIpv6HostsAreBracketedInTheUrl:
         probe(host)
 
         assert calls == [f"http://{host}:{DEFAULT_PORT}{STATUS_PATH}"]
-        assert "[" not in calls[0] and "]" not in calls[0]
+        assert "[" not in calls[0]
+        assert "]" not in calls[0]
 
     def test_a_custom_port_stays_recoverable_on_a_v6_host(self, monkeypatch):
         calls = self._record(monkeypatch)
