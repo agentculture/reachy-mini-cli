@@ -174,9 +174,11 @@ You have two correct patterns, and one hard refusal:
 
 Two profiles, because the SDK's transitive stack (pycairo / gstreamer /
 pyaudio) needs system libraries a bare box or CI lacks — so `reachy-mini` is an
-**extra**, not a base dependency. There are exactly two base runtime deps, both
-pure wheels: `numpy` and `harmonics-cli` (the offline harmonic voice), so even
-the bare profile can speak.
+**extra**, not a base dependency. There are exactly three base runtime deps, all
+pure wheels: `numpy`, `harmonics-cli` (the offline harmonic voice, so even the
+bare profile can speak) and `events-cli` (the nervous-system bus client, which
+joined on 2026-07-24). Discovery added none — `reachy/discover/` is stdlib-only
+and a test walks its AST to keep it that way.
 
 | Profile | Install | Use it for |
 |---|---|---|
@@ -438,6 +440,18 @@ record is re-pinned to the freshly-verified address, and `wireless pin` refreshe
 the `/etc/hosts` block to match. `wireless forget --unit <id>` (or `--all`) drops
 a unit you no longer want remembered; the registry itself lives under the state
 dir as `units.json` and is never committed anywhere.
+
+### For agents — the `find-reachy` skill
+
+An agent that needs the robot's address before it can drive anything reaches the
+same discovery through `.claude/skills/find-reachy/`. Invoked bare it runs
+`wireless find --json`; any other argument is forwarded verbatim, so every verb
+above is reachable. The script holds **no discovery logic of its own** — it
+resolves the CLI (installed `reachy`, else `uv run reachy` inside a checkout,
+else an install hint) and shells out. That is deliberate: discovery lives in one
+place, so the skill cannot drift from the tool it wraps, and a test names each
+forbidden mechanism (`ip`, `arp`, `avahi-browse`, `nmap`, raw sockets, a direct
+`curl` of the daemon) so a breach says exactly which rule broke.
 
 ---
 
