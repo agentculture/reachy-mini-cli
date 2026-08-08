@@ -56,7 +56,6 @@ read by ``ssh`` itself and never passes through Python:
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import ipaddress
 import os
 from collections.abc import Sequence
@@ -159,14 +158,19 @@ def _now_iso() -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _validated_address(address: str) -> tuple[str, str]:
-    """Return ``(bare, host)`` for *address*, or raise an exit-1 :class:`CliError`.
+def _validated_address(address: str) -> str:
+    """Return the canonical bare literal for *address*, or raise an exit-1 :class:`CliError`.
 
-    ``bare`` is the canonical literal to record and display; ``host`` is what a
-    URL needs — the same string for IPv4, and BRACKETED for IPv6, because
-    ``http://2a0d::1:8000/`` is not a parseable URL. A hostname is refused:
-    this verb takes an address, and a name that silently fails to resolve would
-    be reported as "nothing answered there".
+    A hostname is refused: this verb takes an address, and a name that silently
+    fails to resolve would be reported as "nothing answered there".
+
+    This used to also return a URL-ready (bracketed for IPv6) spelling, because
+    ``http://2a0d::1:8000/`` is not a parseable URL. That second value is gone:
+    :func:`reachy.discover.probe.probe` now brackets IPv6 itself, at the ONE
+    site that formats the URL, so every caller is correct rather than each
+    remembering to pre-bracket. Bracketing here as well meant probing a
+    bracketed host and then undoing it so the bare form reached the registry —
+    a round trip whose only purpose was to survive the missing fix.
     """
     text = (address or "").strip().strip("[]")
     try:
@@ -178,8 +182,7 @@ def _validated_address(address: str) -> tuple[str, str]:
             "pass the unit's address, e.g. --address 192.168.1.162 (IPv6 literals are "
             "accepted too) — 'reachy-mini-cli wireless find' discovers it for you",
         ) from err
-    bare = str(parsed)
-    return bare, (f"[{bare}]" if parsed.version == 6 else bare)
+    return str(parsed)
 
 
 def _base_url(address: str, port: int) -> str:
@@ -192,11 +195,7 @@ def _base_url(address: str, port: int) -> str:
 
 def _probe_address(address: str, port: int, timeout: float) -> probe_mod.UnitRecord | None:
     """Probe ONE explicit address, reporting it back in its bare (unbracketed) form."""
-    bare, host = _validated_address(address)
-    record = _probe(host, port, timeout)
-    if record is not None and record.address != bare:
-        record = dataclasses.replace(record, address=bare)
-    return record
+    return _probe(_validated_address(address), port, timeout)
 
 
 def _unit_payload(record: probe_mod.UnitRecord, port: int) -> dict[str, Any]:
@@ -501,7 +500,7 @@ def cmd_wireless_authorize(args: argparse.Namespace) -> int:
 def cmd_wireless_pin(args: argparse.Namespace) -> int:
     hardware_id: str | None = None
     if args.address:
-        address, _host = _validated_address(args.address)
+        address = _validated_address(args.address)
     else:
         resolved = _resolved(args)
         address = resolved.unit.address

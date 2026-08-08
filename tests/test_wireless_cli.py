@@ -71,6 +71,10 @@ LITE = UnitRecord(
 #: stay usable by EXPLICIT address (spec: "the IPv4 boundary is visible").
 V6_ADDRESS = "2a0d:6fc2:4:1::756b"
 
+#: The v6 unit as ``probe()`` now reports it — the BARE literal, so it is a
+#: fixpoint through the registry and back into the fast path.
+WIRELESS_V6 = dataclasses.replace(WIRELESS, address=V6_ADDRESS, wlan_ip=V6_ADDRESS)
+
 
 class FakeSweep:
     """Records every call and serves a canned :class:`SweepResult`."""
@@ -404,15 +408,25 @@ def test_find_with_an_explicit_address_never_sweeps(
 def test_an_ipv6_only_unit_stays_usable_by_explicit_address(
     prober, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """v6 sweeping is out of scope; a v6 unit is still reachable by address."""
-    v6_unit = dataclasses.replace(WIRELESS, address=f"[{V6_ADDRESS}]")
-    fake = prober(**{f"[{V6_ADDRESS}]": v6_unit})
+    """v6 sweeping is out of scope; a v6 unit is still reachable by address.
+
+    The probe is now asked for the BARE literal. Bracketing moved down into
+    :func:`reachy.discover.probe.probe`, at the one site that formats the URL,
+    after a Qodo review on PR #161 found the old split silently broke the
+    registry fast path: this noun bracketed for the probe but persisted the
+    bare form, so ``resolve()`` later fed ``probe()`` a bare literal and built
+    ``http://2a0d::1:8000`` — an unparseable URL whose port is just another
+    hextet. Every caller is correct now instead of each remembering to
+    pre-bracket, so the bare literal is a fixpoint from here to the registry
+    and back.
+    """
+    fake = prober(**{V6_ADDRESS: WIRELESS_V6})
     assert main(["wireless", "find", "--address", V6_ADDRESS, "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    # The probe is asked for the BRACKETED host (a bare v6 literal would make an
-    # unparseable URL), while the reported address stays the bare literal.
-    assert fake.hosts == [f"[{V6_ADDRESS}]"]
+    assert fake.hosts == [V6_ADDRESS]
     assert payload["units"][0]["address"] == V6_ADDRESS
+    # base_url still brackets: it is handed to an operator and to
+    # reachy.robot.http_transport, neither of which goes through probe().
     assert payload["units"][0]["base_url"] == f"http://[{V6_ADDRESS}]:8000"
 
 
