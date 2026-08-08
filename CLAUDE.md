@@ -18,7 +18,8 @@ that composes every sense onto one 50 Hz tick (`behavior engine run`), the
 standalone single-sense verbs (`vision`, `pat`, `sleep`), speech (`say`), boot
 persistence (`service`), the external agent client (`agent attach`), the
 detachable **embodiment layer** that gives the robot ears, a voice and a
-conversational mind beside the runtime (`agent embody`), and the
+conversational mind beside the runtime (`agent embody`), LAN discovery of the
+robot itself (`wireless`), and the
 runtime's two JSONL feeds (`behavior engine run --export` and `agent attach
 --export`). When you build a new robot feature you are extending a
 working agent — follow the existing nouns as the model, summarized in the
@@ -226,6 +227,7 @@ transport. Deep notes for the non-trivial nouns follow in
 | `pat` | `_commands/pat.py` | `reachy/motion/{pat,pat_reaction,pat_signal}.py` | `sdk` only |
 | `sleep` | `_commands/sleep.py` | `reachy/sleep/{state,stimulus,wake,patwake,wakeword,supervisor}.py`, `reachy/motion/{sleep,sleep_signal}.py` | `sdk` default |
 | `service` | `_commands/service.py` | `reachy/service/{units,manager}.py` (`ServiceManager`, systemd `--user`) | none (systemd) |
+| `wireless` | `_commands/wireless.py` | `reachy/discover/{probe,sweep,registry,resolve,hosts,ssh}.py` — stdlib-only LAN discovery: one read-only `GET /api/daemon/status` (`probe.py`), fanned out over the local `/24`-or-narrower subnets under a worker cap and one deadline (`sweep.py`), remembered by `hardware_id` in `state_dir()/units.json` (`registry.py`), composed into the fast-path-then-escalate lookup (`resolve.py`), plus the recoverable `/etc/hosts` managed block (`hosts.py`) and the argv-only login + explicit key install (`ssh.py`) | **none** (plain HTTP + `/etc/hosts` + `ssh`) |
 | `agent attach` | `_commands/agent.py` | `reachy/speech/{agent_turn,tools,intent_tools,events}.py` + `reachy/forge/*`, over `--feed` + the intents spool | none (feeds + spool) |
 | `agent embody` (+ `start`/`stop`/`restart`/`status`) | `_commands/agent.py` (`_compose_embody_seam`, `cmd_agent_embody*`) | `reachy/embody/{media,tools,cues,engine,attention,interjection,scope,summary,supervisor}.py` + `reachy/speech/realtime_duplex.py` + the two layer-authored line types in `reachy/runtime_cues.py`, consuming the runtime's `behavior/{audio_tee,clip_rider}.py` legs | none (tee socket, feed/bus, spools, daemon `http`) |
 
@@ -1475,6 +1477,125 @@ use a transport: it talks to **systemd** (`systemctl --user`), so it never calls
   invalid mode is an exit-1 user error. Every verb supports `--json`. Boot at
   machine power-on (vs. first login) needs `loginctl enable-linger`; a true
   reboot check is a manual on-robot step.
+
+### `wireless` noun — stdlib-only LAN discovery, keyed on `hardware_id`
+
+`reachy/cli/_commands/wireless.py` exposes `find` / `list` / `ssh` /
+`authorize` / `pin` / `unpin` / `forget` / `overview` over the
+`reachy/discover/` package. Like `daemon` and `service` it uses **no
+transport**: it never calls `_robot.get_transport` / `_robot.noun_overview`,
+has no `--transport` flag, and its `overview` is hand-built (`emit_overview`
+with its own sections, so it can state the IPv4-and-default-port boundary and
+the trusted-network cost that `noun_overview`'s boilerplate has no room for).
+It speaks plain HTTP to a *candidate* daemon plus `/etc/hosts` and `ssh`, so
+the whole noun works on the bare HTTP profile with neither `[sdk]` nor
+`[daemon]` installed — which is the audience: someone driving a robot their box
+is not hosting. Operator-facing walkthrough: [the operating
+guide](docs/operating-reachy.md#find-the-robot-on-the-network--wireless).
+
+**Stdlib-only, and machine-checked.** `reachy/discover/` imports `urllib` /
+`socket` / `fcntl` / `ipaddress` / `concurrent.futures` / `subprocess` /
+`tempfile` and nothing else third-party — no `zeroconf`, no `netifaces`, no
+`psutil`, no `requests`, no `reachy_mini`. `tests/test_discover_boundary.py`
+walks the package's AST in the style of `test_zero_llm_boundary.py` and pins
+this two ways: every import resolves to the standard library, and the set of
+first-party `reachy.*` edges out of the package is pinned by **equality** —
+exactly `reachy.cli._errors` (the shared exit-code contract) and
+`reachy.daemon` (`state_dir()`, the same per-user directory the stash already
+uses), each with its reason, plus a companion dead-entry test. The obvious
+future breaches are named and refused rather than left implicit: `zeroconf`
+(the mDNS accelerator is explicitly PARKED — the unit's TXT record timed out
+twice live while the HTTP probe answered first attempt), `netifaces`,
+`psutil`, `requests`/`httpx`. Interfaces are
+therefore read with `socket.if_nameindex` + two `SIOCGIF*` ioctls rather than a
+dependency or a `subprocess` fork of `ip -4 addr` — an ioctl is answered by the
+kernel from memory and cannot hang. The accepted cost: only each interface's
+PRIMARY IPv4 address is visible, so a secondary `ip addr add` alias is not
+swept (pass `--address`).
+
+**The `/24`-or-narrower bound is the whole point of `sweep.py`, and it is a
+construction, not a cap.** The dev box carries **seven Docker bridge networks
+on 172.x `/16`** (`docker0` plus six `br-*`); naively expanding those is
+~459 000 hosts and a CLI that appears to hang forever. So
+`sweepable_networks()` rejects `prefixlen < 24` **before a single host is
+materialised** — never a downstream truncation of the damage. Three more
+filters sit beside it and none is redundant: `prefixlen > 30` (a `/31` is
+point-to-point, a `/32` is a host route — Tailscale's interface is a `/32`),
+interface NAME prefixes (`docker*`/`br-*`/`virbr*`/`veth*`/`lo`, because a
+Docker network CAN be created on a `/24`), and named address classes
+(loopback/link-local/multicast/reserved plus `100.64.0.0/10` and `0.0.0.0/8`).
+Deliberately NOT done: blanket-excluding `172.16.0.0/12` by address — that is
+ordinary RFC 1918 space many corporate LANs live on. Two NICs on one subnet
+dedupe to one network at enumeration, and a unit answering twice folds to one
+record on `hardware_id`.
+
+**Identity is `hardware_id`; MAC is opportunistic enrichment; a name is never
+an identity.** `hardware_id` arrives over plain HTTP, so it works off-subnet,
+through a router, and on a box whose Tailscale peers have no neighbour-table
+entry at all. `registry.lookup_mac` shells `ip neigh show <ip>` and returns
+`None` on anything at all going wrong — there is **no procfs ARP fallback**, on
+purpose: a second module-local read under the procfs root is exactly what
+`tests/test_procsup.py` exists to catch. A record stays fully valid and
+identifiable with no MAC. Names are worse still: the co-resident Lite claimed
+the base mDNS name first, so the Wireless unit carries avahi's `-2` suffix, and
+that suffix MOVES if the Lite is absent at boot. Hence two spellings that must
+never be conflated — the operator-chosen alias `reachy-mini` (HYPHEN, Pollen's
+own documented name, a literal constant in `hosts.py`/`ssh.py`) versus the
+daemon's `robot_name` field, which reports `reachy_mini` (UNDERSCORE).
+Deriving one from the other regenerates the exact name the Lite already holds.
+
+**`read_interfaces` is THE seam, and the sixth autouse conftest guard
+neutralises it suite-wide.** It is the one function in the package that touches
+the real machine, which is why it is a plain module-level name resolved at CALL
+time (`enumerate_hosts` reads the module attribute; a default ARGUMENT would
+capture the original at import and make patching a no-op).
+`tests/conftest.py`'s `_no_live_lan_sweep` patches it to `lambda: ()`
+process-wide, joining the five existing guards — filed BEFORE it could do
+damage rather than after: the dev box's real `/24` carries the actual robot at
+192.168.1.162, so an unguarded suite run would probe it, the same defect class
+as the events-cli incident recorded in [Hard
+constraints](#hard-constraints). Empty (not raising) is deliberate:
+`enumerate_hosts`/`sweep` fold any source exception into the same empty result
+anyway, so a raising stub would be silently swallowed on the one path the guard
+protects, while breaking `read_interfaces`'s own "NEVER raises" contract.
+`hosts_total == 0` / `hosts_probed == 0` is a stark, assertable "nothing
+happened". A test that WANTS real enumeration re-patches the same attribute
+function-scoped.
+
+**Never re-export a symbol whose name matches a submodule.** `probe.py` holds a
+function also called `probe`; `sweep.py` holds one called `sweep`.
+Re-exporting either from `reachy/discover/__init__.py` REBINDS the package
+attribute from the MODULE to the FUNCTION, because `import
+reachy.discover.probe as m` resolves via `getattr(package, "probe")` before it
+consults `sys.modules`. Every module-level injection seam then breaks — the
+autouse guard's `monkeypatch.setattr(sweep_mod, "read_interfaces", …)` receives
+a function and dies with `AttributeError`. **Both spellings were written that
+way once and both were caught**; `tests/test_discover_sweep.py` and
+`tests/test_discover_probe.py` pin the module identity. Import those two
+callables from their own modules.
+
+**The rest, briefly.** `resolve.py` orders the lookup fast-path → verify
+`hardware_id` → escalate → re-pin, and REFUSES ambiguity with a `CliError`
+naming every candidate (both robots report `robot_name=reachy_mini`, so
+"more than one match" is this box's normal case); its `FAST_PATH_TIMEOUT`
+is `probe.DEFAULT_TIMEOUT` reused rather than a second number that could
+drift. `registry.py` mirrors `stash/store.py`'s degrade-to-empty discipline
+but departs from its write mechanism on purpose — `tempfile.mkstemp` for a
+unique-per-call temp name before the `os.replace`, because a human shell and a
+mesh agent can both run discovery at once and `StashStore`'s fixed
+`"<name>.tmp"` is safe for one writer only. `hosts.py` rewrites ONLY the
+`# BEGIN reachy-mini-cli` / `# END reachy-mini-cli` block, backs up the exact
+pre-write bytes, re-reads and re-verifies the landed file, and restores on any
+failure (this box's whole `/etc/hosts` is two lines; losing `localhost` breaks
+name resolution box-wide). `ssh.py` builds argv only and always passes
+`-o HostKeyAlias=reachy-mini`, so **stable host-key identity needs no
+`/etc/hosts` pin and no privilege** — the pin needs sudo and a feature that
+half-works unprivileged would break the bare-profile promise. `authorize` is
+structurally unreachable from the shell-opening path (asserted by an AST call-
+graph walk) and demands an explicit confirming callback; the unit's
+factory-default password prompt is owned end to end by `ssh-copy-id`, so no
+password parameter, reader, logger or stdio redirection exists in that module
+at all.
 
 ### `reachy/stash/` package — behavior stash (not yet a noun)
 
