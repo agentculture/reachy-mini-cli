@@ -481,11 +481,18 @@ def test_h9_no_new_media_audio_or_get_frame_caller_appears() -> None:
 #: session client: it dials the lobes gateway exactly as
 #: ``reachy/speech/realtime.py`` has since #115 and, like it, never binds.
 #: See :data:`_LOCAL_IPC_LISTENERS` for the price of the one bind exemption.
+#: ``reachy/discover/sweep.py`` (the wireless-discovery arc, t2) is the fifth and
+#: the only non-runtime one: it enumerates the box's OWN IPv4 interfaces via
+#: ``socket.if_nameindex`` plus two ``SIOCGIF*`` ioctls, because the alternatives
+#: were a new base dependency or a subprocess. Still a CLIENT of the kernel — no
+#: bind, no listen, no accept, which the unconditional ``_SERVER_TOKENS`` scan
+#: below already proves for it.
 _SOCKET_IMPORTERS = {
     "reachy/speech/realtime.py",
     "reachy/speech/realtime_duplex.py",
     "reachy/behavior/audio_tee.py",
     "reachy/embody/media.py",
+    "reachy/discover/sweep.py",
 }
 
 #: The ONE file allowed to ``bind``/``listen``. The claim h10 stands for is "no
