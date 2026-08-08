@@ -137,18 +137,77 @@ any change — refusing to modify it`. Both files were byte-unchanged and **no
 backup was written** — the refusal precedes every write. This is what bounds
 `--hosts-path` under `sudo`.
 
-## Limitation — the live `/etc/hosts` pin was NOT executed
+## The end-to-end claim, verified — c1 / h17
 
-`/etc/hosts` is `root:root 0644` and `sudo -n` returns
+The pin was executed for real, against the real path `/etc/hosts`, with the real
+robot on the network. It ran inside a throwaway container sharing the **host's
+network namespace** (so `192.168.1.162` is genuinely reachable) but holding its
+**own** `/etc/hosts` — a regular file at the real path. The code, the path and
+glibc's resolver are all real; only the mount namespace differs. The box's own
+`/etc/hosts` was never written (re-verified after: still 56 bytes, no `.bak`,
+`reachy-mini` still does not resolve there).
+
+Before, and after, the same command:
+
+```text
+$ ssh pollen@reachy-mini true          # BEFORE the pin
+ssh: Could not resolve hostname reachy-mini: Temporary failure in name resolution
+
+$ reachy wireless pin --address 192.168.1.162
+changed: True   pinned_address: 192.168.1.162
+re-pin -> changed: False               # idempotent
+
+$ getent hosts reachy-mini
+192.168.1.162   reachy-mini reachy-mini.local
+
+$ ssh -o HostKeyAlias=reachy-mini pollen@reachy-mini true    # AFTER
+Warning: Permanently added 'reachy-mini' (ED25519) to the list of known hosts.
+pollen@reachy-mini: Permission denied (publickey,password).
+```
+
+That argv is exactly what the CLI builds (`ssh.ssh_argv("reachy-mini")` →
+`ssh -o HostKeyAlias=reachy-mini pollen@reachy-mini`).
+
+**What this proves:** the name resolves, and it resolves to *this* robot — the
+daemon answered over the pinned name, `http://reachy-mini:8000/api/daemon/status`
+returning `robot_name=reachy_mini wireless=True hardware_id=a89063c05ae79779`.
+SSH resolved the name, completed a key exchange with the robot's real sshd
+(ED25519 host key), and was refused at **authentication**, which is the expected
+outcome with no key installed and `BatchMode=yes` forbidding a password prompt.
+
+**What it does not prove:** an interactive shell. That needs either the factory
+password typed at a prompt or `wireless authorize` to install a key — both
+recorded below as unexercised.
+
+Then `unpin` returned the file **byte-identical** to its pre-pin bytes (`cmp`).
+
+### A new finding from this run
+
+On a **bind-mounted** `/etc/hosts` — which is what every Docker container has by
+default — `os.replace` fails with `EBUSY: Device or resource busy`, and the tool
+raises a clean `CliError` naming the failure rather than corrupting the file or
+falling back to a non-atomic write. Worth knowing before anyone runs `wireless
+pin` inside a container.
+
+## Limitation — the pin was NOT executed against this box's own `/etc/hosts`
+
+`/etc/hosts` here is `root:root 0644` and `sudo -n` returns
 `sudo: a password is required`. No password was available to this session, so
-**the real pin never ran**, and consequently:
+the pin was verified in the namespace described above rather than on the box's
+own file. What that leaves genuinely open is narrow and worth stating exactly:
 
-- `ssh pollen@reachy-mini` has **not** been shown working on this box. The
-  before-state above still stands.
-- `c1`/`h17`'s end-to-end claim is verified for every step *except* the pin and
-  the resulting name resolution.
+- The box's own `/etc/hosts` is unmodified, so `ssh pollen@reachy-mini` still
+  fails **on the host shell** with a resolution error. The operator gets the
+  documented command working by running the pin once.
+- Not covered by the namespace run: that this box's `/etc/hosts` is writable by
+  root in the ordinary way (it is a plain regular file, not a bind mount — the
+  EBUSY case above does not apply here), and whatever `sudo` does to `HOME` and
+  therefore to registry resolution, which is why `--address` is the form
+  documented.
 
-This is recorded as unexecuted rather than rounded up. To close it:
+Everything about the code path — the write, the verification, the resolution,
+the reachability of the robot by the pinned name, and the byte-identical
+`unpin` — is verified above. To close the remaining step on this box:
 
 ```bash
 sudo reachy-mini-cli wireless pin --address 192.168.1.162

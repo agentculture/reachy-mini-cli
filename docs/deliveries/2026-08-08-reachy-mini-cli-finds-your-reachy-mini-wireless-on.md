@@ -43,7 +43,7 @@ Quoted verbatim from the `devague summary` skeleton:
 | `t9` | delivered | `reachy/cli/_commands/wireless.py`; 78 tests. Eight verbs, catalog entries, `teken --strict` green |
 | `t10` | delivered | `.claude/skills/find-reachy/`; 24 tests. Script holds no discovery logic; `shellcheck` clean |
 | `t11` | delivered | Operating guide, `CLAUDE.md`, `README.md`; version `0.48.0` + CHANGELOG + refreshed `uv.lock` |
-| `t12` | **partial** | Cold/warm timings, 20-run disambiguation, filter, ambiguity, ssh argv and pin/unpin all verified live. **The real `/etc/hosts` pin was NOT executed** — see Drift |
+| `t12` | **partial** | Cold/warm timings, 20-run disambiguation, filter, ambiguity, ssh argv, pin/unpin and the **full end-to-end name→robot path** verified live. Not run: the pin against *this box's own* `/etc/hosts` (sudo password unavailable), and an interactive shell (no key installed) — see Drift |
 
 ## Mid-work Decisions
 
@@ -86,7 +86,7 @@ captured directly.
 
 | Plan item | Reason for divergence | Classification |
 |-----------|-----------------------|----------------|
-| `t12` | The live `/etc/hosts` pin was not executed. `/etc/hosts` is `root:root 0644` and `sudo -n` returns `sudo: a password is required`; no password was available to this session. Consequently `ssh pollen@reachy-mini` has not been demonstrated working, so `c1`/`h17`'s end-to-end claim is verified for every step *except* the pin and the name resolution it produces | needs-follow-up |
+| `t12` | The pin was not executed against *this box's own* `/etc/hosts` — it is `root:root 0644` and `sudo -n` returns `sudo: a password is required`. It WAS executed for real against the real `/etc/hosts` path in a host-networked namespace, proving resolution, reachability of this robot by the pinned name, and a byte-identical `unpin`. What remains unverified is narrower than first recorded: the host's own file, and an interactive shell (ssh reached the robot's sshd and was refused at authentication, having no key) | needs-follow-up |
 | `t3` | Shipped with a procfs fallback that evaded a structural guard by string concatenation; removed post-merge rather than kept | acceptable |
 | `t1` | Shipped a `probe` re-export that had already broken the module injection seam; corrected during the `t2` merge | acceptable |
 | `t10` | Shipped failing `black` and `flake8 E501`, which CI would have blocked; fixed at integration (`ebaa53b`) | acceptable |
@@ -123,7 +123,9 @@ captured directly.
 | `pin` refuses any file that is not already a hosts document | high | measured: a shadow-format file and an `authorized_keys` both refused exit-2, byte-unchanged, no backup written — evidence doc, "Arbitrary-write refusal" |
 | `authorize` cannot be reached from the shell path | high | AST call-graph walk with non-vacuity guard · `tests/test_discover_ssh.py` (44) |
 | The noun works on a bare install with no extras | high | subprocess test in a fresh interpreter asserting `reachy_mini` never enters `sys.modules` |
-| `ssh pollen@reachy-mini` resolves and opens a shell | **unverified** | the pin never ran (sudo password unavailable) — not claimed done |
+| `ssh pollen@reachy-mini` resolves and reaches this robot | high | pin run for real against the real `/etc/hosts` path in a host-networked namespace: before = `Could not resolve hostname`; after = `getent` → 192.168.1.162, `http://reachy-mini:8000` returned `hardware_id=a89063c05ae79779`, ssh completed an ED25519 key exchange with the robot's sshd — evidence doc, "The end-to-end claim" |
+| An interactive shell opens over that name | **unverified** | ssh was refused at *authentication* (`publickey,password`) with no key installed — needs `authorize` or the factory password |
+| The box's OWN `/etc/hosts` is pinned | **unverified** | sudo password unavailable; the host file is deliberately unmodified (still 56 bytes, no `.bak`) |
 | `wireless authorize` installs a key on the real robot | **unverified** | not run unattended against the live unit — offline tests only |
 
 ## Remaining Work / Follow-up
