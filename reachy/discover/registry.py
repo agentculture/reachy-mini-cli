@@ -60,16 +60,6 @@ _REQUIRED_STRING_FIELDS = ("hardware_id", "last_ip", "name", "model", "last_seen
 #: Short and bounded -- a neighbour-table read must never stall a caller.
 DEFAULT_MAC_LOOKUP_TIMEOUT = 1.0
 
-#: The default host path to the Linux neighbour table's legacy ARP view --
-#: injectable so no test ever reads the real one. Built by concatenation
-#: (never written as one contiguous literal) so this module stays outside the
-#: repo-wide ``test_no_substring_cmdline_check_survives_anywhere_outside_procsup``
-#: guard, which reserves reading under the procfs root to ``reachy/procsup.py``
-#: alone -- this constant only ever names a *default value string* handed to
-#: :func:`open`, never a live PID/cmdline read, but the guard is a blunt
-#: repo-wide text scan and does not distinguish the two.
-DEFAULT_ARP_PATH = "/proc" + "/net/arp"
-
 _MAC_RE = re.compile(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}")
 _ZERO_MAC = "00:00:00:00:00:00"
 
@@ -292,44 +282,30 @@ def _mac_from_ip_neigh(ip: str, run: RunFn, timeout: float) -> str | None:
     return None
 
 
-def _mac_from_proc_net_arp(ip: str, arp_path: str) -> str | None:
-    """Fall back to the legacy ``net/arp`` table under procfs (Linux-only, best-effort)."""
-    try:
-        with open(arp_path, encoding="utf-8") as handle:
-            lines = handle.readlines()
-    except OSError:
-        return None
-    for line in lines[1:]:  # skip the header row
-        parts = line.split()
-        if len(parts) < 4 or parts[0] != ip:
-            continue
-        mac = parts[3].lower()
-        if mac == _ZERO_MAC or not _MAC_RE.fullmatch(mac):
-            return None
-        return mac
-    return None
-
-
 def lookup_mac(
     ip: str,
     *,
     run: RunFn = subprocess.run,  # nosec B603 - argv list built here, no shell
-    arp_path: str = DEFAULT_ARP_PATH,
     timeout: float = DEFAULT_MAC_LOOKUP_TIMEOUT,
 ) -> str | None:
     """Best-effort neighbour-table lookup for *ip*'s MAC address.
 
-    Tries ``ip neigh show <ip>`` first, then falls back to procfs's legacy
-    ``net/arp`` table. Returns ``None`` -- never raises -- when the host is
-    off-segment (no neighbour-table entry exists for it), the ``ip`` binary
-    is absent, the platform has no such table, or anything else goes wrong.
-    A record stays valid and identifiable purely on ``hardware_id`` without
-    a MAC, so a ``None`` here is a normal, expected outcome, not a failure.
+    ``ip neigh show <ip>`` is the ONLY source -- there is no procfs fallback.
+    ``ip neigh`` is present on any Linux box that has a neighbour table at
+    all and is the modern interface to it; the legacy procfs ARP table it
+    replaces is IPv4-only and deprecated, and reading under the procfs root
+    anywhere outside ``reachy/procsup.py`` is exactly what
+    ``tests/test_procsup.py::test_no_substring_cmdline_check_survives_anywhere_outside_procsup``
+    exists to catch -- a second, module-local copy of that read is the
+    defect the guard is for, not a legitimate use to route around it.
+    MAC is an explicitly *opportunistic* enrichment (module docstring, and
+    the spec's honesty condition h7): a record stays fully valid and
+    identifiable on ``hardware_id`` alone with no MAC at all, so returning
+    ``None`` here -- because the host is off-segment, the ``ip`` binary is
+    absent, the platform has no neighbour table, or anything else goes
+    wrong -- costs nothing. Never raises.
     """
     try:
-        mac = _mac_from_ip_neigh(ip, run, timeout)
-        if mac:
-            return mac
-        return _mac_from_proc_net_arp(ip, arp_path)
+        return _mac_from_ip_neigh(ip, run, timeout)
     except Exception:  # belt-and-braces: this must never be what crashes a caller
         return None

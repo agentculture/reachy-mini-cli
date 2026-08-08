@@ -10,17 +10,22 @@ Acceptance criteria covered (one section each):
    writer's complete state, never a truncated or merged file.
 4. MAC enrichment returns None when the neighbour table is unavailable or the
    host is off-segment, and the record remains valid and identifiable without
-   it.
+   it. ``ip neigh show <ip>`` is the ONLY source -- there is no procfs
+   fallback (see ``reachy/discover/registry.py``'s ``lookup_mac`` docstring
+   for why that is sufficient, and ``tests/test_procsup.py``'s
+   ``test_no_substring_cmdline_check_survives_anywhere_outside_procsup`` for
+   the structural guard a procfs fallback would have evaded).
 
 Every test is isolated via ``tmp_path`` (injected ``path=``) or
 ``REACHY_STATE_DIR`` (for the default-path test) so the suite never touches a
-developer's real state dir, and MAC lookup tests inject a fake ``run``/
-``arp_path`` seam so the suite never shells out to a real ``ip neigh``.
+developer's real state dir, and MAC lookup tests inject a fake ``run`` seam so
+the suite never shells out to a real ``ip neigh``.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 from dataclasses import FrozenInstanceError
@@ -403,48 +408,37 @@ class TestMacEnrichment:
 
         assert mac == "88:a2:9e:8c:fa:bf"
 
-    def test_ip_neigh_miss_falls_back_to_proc_net_arp(self, tmp_path):
+    def test_host_off_segment_returns_none(self):
+        # An off-segment host has no neighbour-table entry at all: `ip neigh
+        # show` succeeds but produces no matching `lladdr` line.
         def fake_run(*args, **kwargs):
             return _CompletedProcess(returncode=0, stdout="")
 
-        arp_path = tmp_path / "arp"
-        arp_path.write_text(
-            "IP address       HW type     Flags       HW address            Mask     Device\n"
-            "192.168.1.162    0x1         0x2         88:a2:9e:8c:fa:bf     *        wlP9s9\n",
-            encoding="utf-8",
-        )
+        mac = lookup_mac("10.99.99.99", run=fake_run)
 
-        mac = lookup_mac("192.168.1.162", run=fake_run, arp_path=str(arp_path))
+        assert mac is None
 
-        assert mac == "88:a2:9e:8c:fa:bf"
-
-    def test_neighbour_table_unavailable_returns_none(self, tmp_path):
+    def test_ip_binary_absent_returns_none_not_raises(self):
         def fake_run(*args, **kwargs):
             raise FileNotFoundError("ip: command not found")
 
-        mac = lookup_mac("192.168.1.162", run=fake_run, arp_path=str(tmp_path / "does-not-exist"))
+        mac = lookup_mac("192.168.1.162", run=fake_run)
 
         assert mac is None
 
-    def test_host_off_segment_returns_none(self, tmp_path):
-        def fake_run(*args, **kwargs):
-            return _CompletedProcess(returncode=0, stdout="")
-
-        arp_path = tmp_path / "arp"
-        arp_path.write_text(
-            "IP address       HW type     Flags       HW address            Mask     Device\n",
-            encoding="utf-8",
-        )
-
-        mac = lookup_mac("10.99.99.99", run=fake_run, arp_path=str(arp_path))
-
-        assert mac is None
-
-    def test_ip_neigh_nonzero_return_code_falls_back_not_raises(self, tmp_path):
+    def test_ip_neigh_nonzero_return_code_returns_none_not_raises(self):
         def fake_run(*args, **kwargs):
             return _CompletedProcess(returncode=1, stdout="")
 
-        mac = lookup_mac("192.168.1.162", run=fake_run, arp_path=str(tmp_path / "missing"))
+        mac = lookup_mac("192.168.1.162", run=fake_run)
+
+        assert mac is None
+
+    def test_ip_neigh_timeout_returns_none_not_raises(self):
+        def fake_run(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=["ip", "neigh", "show"], timeout=1.0)
+
+        mac = lookup_mac("192.168.1.162", run=fake_run)
 
         assert mac is None
 
@@ -452,7 +446,7 @@ class TestMacEnrichment:
         def fake_run(*args, **kwargs):
             return _CompletedProcess(returncode=0, stdout="garbage output with no mac here\n")
 
-        mac = lookup_mac("192.168.1.162", run=fake_run, arp_path="/nonexistent/arp")
+        mac = lookup_mac("192.168.1.162", run=fake_run)
 
         assert mac is None
 
@@ -460,22 +454,18 @@ class TestMacEnrichment:
         def fake_run(*args, **kwargs):
             raise RuntimeError("something the subprocess layer never documented")
 
-        mac = lookup_mac("192.168.1.162", run=fake_run, arp_path="/nonexistent/arp")
+        mac = lookup_mac("192.168.1.162", run=fake_run)
 
         assert mac is None
 
-    def test_incomplete_arp_entry_all_zero_mac_returns_none(self, tmp_path):
+    def test_incomplete_neighbour_entry_all_zero_mac_returns_none(self):
         def fake_run(*args, **kwargs):
-            return _CompletedProcess(returncode=0, stdout="")
+            return _CompletedProcess(
+                returncode=0,
+                stdout="192.168.1.162 dev wlP9s9 lladdr 00:00:00:00:00:00 STALE\n",
+            )
 
-        arp_path = tmp_path / "arp"
-        arp_path.write_text(
-            "IP address       HW type     Flags       HW address            Mask     Device\n"
-            "192.168.1.162    0x1         0x0         00:00:00:00:00:00     *        wlP9s9\n",
-            encoding="utf-8",
-        )
-
-        mac = lookup_mac("192.168.1.162", run=fake_run, arp_path=str(arp_path))
+        mac = lookup_mac("192.168.1.162", run=fake_run)
 
         assert mac is None
 
@@ -500,7 +490,7 @@ class TestMacEnrichment:
             calls.append(args)
             return _CompletedProcess(returncode=1, stdout="")
 
-        lookup_mac("192.168.1.1", run=fake_run, arp_path="/nonexistent/arp")
+        lookup_mac("192.168.1.1", run=fake_run)
 
         assert len(calls) == 1
 
