@@ -257,6 +257,181 @@ def test_unpin_on_an_unpinned_file_changes_nothing(hosts_file: Path):
 
 
 # ---------------------------------------------------------------------------
+# acceptance 4, restated as ONE property — pin -> unpin is byte-identical for
+# ANY input shape (the Qodo finding on PR #161, "Unpin not byte-identical")
+#
+# Every test above runs against a document that ENDS IN A NEWLINE: BOX_HOSTS
+# does, and CRLF_HOSTS (which does not) was only ever pinned, never unpinned.
+# So the one path where pin has to INSERT a byte outside the block — the line
+# terminator an appended block needs — was never round-tripped, and unpin left
+# that inserted newline behind. A guarantee that holds only for files ending in
+# '\n' is not the guarantee the module docstring states, so the property is
+# asserted here over a SET of realistic bodies rather than one fixture.
+# ---------------------------------------------------------------------------
+
+#: Hosts-file bodies a real box produces. Every one of them must resolve
+#: ``localhost``: a document that does not is refused before any write, which
+#: is a different property with its own tests (see the two refusal tests just
+#: below, and ``test_a_hosts_file_that_already_lacks_localhost_is_refused``).
+ROUND_TRIP_BODIES = {
+    "this box, trailing spaces and a trailing blank line": BOX_HOSTS,
+    "no trailing newline": "127.0.0.1 localhost",
+    "no trailing newline, trailing spaces": "127.0.0.1\tlocalhost  ",
+    "crlf, no final crlf": CRLF_HOSTS,
+    "crlf, terminated": CRLF_HOSTS + "\r\n",
+    "bare CR line endings, unterminated": "127.0.0.1 localhost\r10.0.0.5 nas",
+    "bare CR terminator": "127.0.0.1 localhost\r",
+    "several trailing blank lines": BOX_HOSTS + "\n\n",
+    "ipv6 loopback only, unterminated": "::1 localhost ip6-localhost",
+    "a comment as the last, unterminated line": "127.0.0.1 localhost\n# end of file",
+}
+
+
+@pytest.mark.parametrize("body", ROUND_TRIP_BODIES.values(), ids=list(ROUND_TRIP_BODIES))
+def test_pin_then_unpin_returns_the_file_byte_identical(tmp_path: Path, body: str):
+    """The guarantee in one assertion, over every shape a hosts file takes."""
+    path = tmp_path / "hosts"
+    path.write_bytes(body.encode("utf-8"))
+    original = path.read_bytes()
+
+    assert hosts.pin("192.168.1.162", path=path) is True
+    assert hosts.unpin(path=path) is True
+
+    # read_bytes, never read_text: universal-newline mode rewrites '\r\n' to
+    # '\n' inside the assertion itself, which is how the blind spot survived.
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("body", ROUND_TRIP_BODIES.values(), ids=list(ROUND_TRIP_BODIES))
+def test_a_pinned_file_keeps_its_own_final_newline_property(tmp_path: Path, body: str):
+    """The pinned state is where unpin's knowledge comes from — no sidecar state.
+
+    A document that did not end in a newline still does not end in one while
+    pinned, and one that did still does. That single property is the whole
+    record: unpin reads it back off the bytes in front of it, so it stays
+    correct in a later process, with the ``.bak`` stale or long deleted.
+    """
+    path = tmp_path / "hosts"
+    path.write_bytes(body.encode("utf-8"))
+
+    hosts.pin("192.168.1.162", path=path)
+
+    landed = path.read_bytes().decode("utf-8")
+    assert landed.endswith("\n") is body.endswith("\n")
+    # And the file is still a working hosts file whichever way that fell.
+    assert hosts.document_is_safe(landed) is True
+
+
+def test_the_only_byte_pin_inserts_is_the_terminator_the_appended_block_needs(tmp_path: Path):
+    """Honest about the one insertion that DOES happen while the block is present.
+
+    A line cannot be appended to an unterminated document without terminating
+    it. So while pinned, the operator's last line carries a newline it did not
+    have — and that is exactly the byte unpin takes back off again.
+    """
+    path = tmp_path / "hosts"
+    path.write_bytes(b"127.0.0.1 localhost")
+
+    hosts.pin("192.168.1.162", path=path)
+
+    landed = path.read_bytes().decode("utf-8")
+    assert _outside_the_block(landed) == "127.0.0.1 localhost\n"
+
+    hosts.unpin(path=path)
+    assert path.read_bytes() == b"127.0.0.1 localhost"
+
+
+def test_pinning_twice_writes_nothing_on_a_file_with_no_trailing_newline(tmp_path: Path):
+    """Idempotency survives the terminator bookkeeping — the block still compares equal."""
+    path = tmp_path / "hosts"
+    path.write_bytes(CRLF_HOSTS.encode("utf-8"))
+
+    assert hosts.pin("192.168.1.162", path=path) is True
+    after_first = path.read_bytes()
+    hosts.backup_path(path).unlink()
+
+    assert hosts.pin("192.168.1.162", path=path) is False
+
+    assert path.read_bytes() == after_first
+    assert not hosts.backup_path(path).exists()
+
+
+def test_repinning_a_moved_unit_on_an_unterminated_file_still_round_trips(tmp_path: Path):
+    path = tmp_path / "hosts"
+    path.write_bytes(CRLF_HOSTS.encode("utf-8"))
+    original = path.read_bytes()
+
+    hosts.pin("192.168.1.162", path=path)
+    assert hosts.pin("192.168.1.77", path=path) is True
+
+    landed = path.read_bytes().decode("utf-8")
+    assert "192.168.1.77 reachy-mini reachy-mini.local" in landed
+    assert "192.168.1.162" not in landed
+    assert landed.endswith("\n") is False
+
+    assert hosts.unpin(path=path) is True
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("tail", ["\n", "\n\n", "\n\n\n"])
+def test_unpin_never_eats_a_newline_the_operator_wrote(tmp_path: Path, tail: str):
+    """The strip is gated on the block's OWN terminator, not on 'the block was last'.
+
+    A terminated block at the end of the file means the document ended in a
+    newline before it was pinned, so every one of the operator's trailing blank
+    lines survives.
+    """
+    path = tmp_path / "hosts"
+    body = "127.0.0.1 localhost" + tail
+    path.write_bytes((body + hosts.render_block("1.2.3.4", ("reachy-mini",))).encode("utf-8"))
+
+    assert hosts.unpin(path=path) is True
+
+    assert path.read_bytes() == body.encode("utf-8")
+
+
+def test_an_unterminated_block_not_preceded_by_a_newline_is_left_alone(tmp_path: Path):
+    """Defensive: a hand-written block pin did not append loses no operator byte.
+
+    ``before`` here ends in a bare CR, so there is no inserted '\\n' to take
+    back — and unpin removes the block only.
+    """
+    path = tmp_path / "hosts"
+    handmade = "127.0.0.1 localhost\r" + hosts.render_block("1.2.3.4", ("reachy-mini",))[:-1]
+    path.write_bytes(handmade.encode("utf-8"))
+
+    assert hosts.unpin(path=path) is True
+
+    assert path.read_bytes() == b"127.0.0.1 localhost\r"
+
+
+@pytest.mark.parametrize("body", [b"", b"   ", b"\n\n", b"  \n\t\n"])
+def test_an_empty_or_whitespace_only_file_is_refused_untouched(tmp_path: Path, body: bytes):
+    """It resolves no ``localhost``, so it is refused before the backup, not repaired."""
+    path = tmp_path / "hosts"
+    path.write_bytes(body)
+
+    with pytest.raises(CliError) as excinfo:
+        hosts.pin("192.168.1.162", path=path)
+
+    assert excinfo.value.code == EXIT_ENV_ERROR
+    assert path.read_bytes() == body
+    assert not hosts.backup_path(path).exists()
+
+
+@pytest.mark.parametrize("body", [b"", b"   "])
+def test_unpin_on_an_empty_or_whitespace_only_file_changes_nothing(tmp_path: Path, body: bytes):
+    """There is no block, so unpin returns before the write refusal can fire."""
+    path = tmp_path / "hosts"
+    path.write_bytes(body)
+
+    assert hosts.unpin(path=path) is False
+
+    assert path.read_bytes() == body
+    assert not hosts.backup_path(path).exists()
+
+
+# ---------------------------------------------------------------------------
 # acceptance 6 — the backup, and the post-write verification
 # ---------------------------------------------------------------------------
 

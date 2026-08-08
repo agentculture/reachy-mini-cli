@@ -58,7 +58,27 @@ rewritten; every byte outside it is preserved verbatim, trailing whitespace,
 CRLF endings and a missing final newline included. :func:`pin` is idempotent —
 re-pinning the same address writes nothing at all, and re-pinning a MOVED unit
 replaces the stale address rather than appending a second line.
-:func:`unpin` removes the block and leaves everything else untouched.
+:func:`unpin` removes the block and leaves everything else untouched, so
+``pin`` followed by ``unpin`` returns the file **byte-identical** to what it
+was, whatever shape it had.
+
+The one insertion, and how it is taken back
+-------------------------------------------
+
+A block appended to a document that does **not** end in a newline needs one:
+you cannot put a line after an unterminated line. That inserted byte is the
+single thing standing between this module and the round trip above, so it is
+recorded — in the file itself, not beside it. The managed block simply carries
+the document's own final-newline property: appended to an unterminated
+document the block is written **without** its own trailing newline, so the file
+still does not end in one, and :func:`unpin` reads that back off the bytes in
+front of it and removes the newline immediately before the block.
+
+That is deliberately not the ``.bak``'s job even though the backup holds the
+exact pre-write bytes: ``unpin`` routinely runs long after ``pin``, from
+another process and another day, by which time the backup is stale (it tracks
+the *immediately* preceding write) or gone. State that lives anywhere but in
+the file being edited is state that can disagree with it.
 
 The hosts path is a **parameter** (defaulting to :data:`DEFAULT_HOSTS_PATH`)
 precisely so the test suite never touches the real ``/etc/hosts`` — and it is
@@ -397,10 +417,22 @@ def managed_block(text: str) -> str | None:
     return block
 
 
-def render_block(address: str, aliases: tuple[str, ...] | list[str]) -> str:
-    """Render the managed block for *address*. Always ends with a newline."""
+def render_block(
+    address: str,
+    aliases: tuple[str, ...] | list[str],
+    *,
+    terminated: bool = True,
+) -> str:
+    """Render the managed block for *address*. Ends with a newline by default.
+
+    ``terminated=False`` renders the block WITHOUT its trailing newline, which
+    is how a block appended to a document that did not end in one records that
+    fact (see the module docstring). Only :func:`pin` passes it: a caller that
+    just wants the canonical block gets the canonical, newline-terminated one.
+    """
     names = " ".join(aliases)
-    return f"{BEGIN_MARKER}\n{MANAGED_NOTE}\n{address} {names}\n{END_MARKER}\n"
+    block = f"{BEGIN_MARKER}\n{MANAGED_NOTE}\n{address} {names}\n{END_MARKER}\n"
+    return block if terminated else block[: -len("\n")]
 
 
 def _validated_address(address: str) -> str:
@@ -645,6 +677,12 @@ def pin(
     exactly this, the file is not written AT ALL — no backup, no temp file, no
     rename — and ``False`` comes back. A unit that MOVED replaces the stale
     address in place rather than appending a second line.
+
+    The document's final-newline property survives either way: a file that did
+    not end in a newline still does not end in one once pinned, because the
+    block it gained is written unterminated. That is not cosmetic — it is the
+    record :func:`unpin` reads to undo the newline this function had to insert
+    in front of the block (see the module docstring).
     """
     target = _safe_hosts_path(path)
     normalised = _validated_address(address)
@@ -652,26 +690,58 @@ def pin(
 
     current = _read_text(target)
     before, block, after = split_document(current)
-    wanted = render_block(normalised, names)
-    if block == wanted:
-        return False
     if block is None:
-        separator = "" if (not before or before.endswith("\n")) else "\n"
-        updated = before + separator + wanted
+        # A NEW block is appended, so the document's own terminator decides
+        # both whether a separator is needed and how the block is rendered.
+        terminated = not before or before.endswith("\n")
+        separator = "" if terminated else "\n"
+        updated = before + separator + render_block(normalised, names, terminated=terminated)
     else:
+        # Re-pinning keeps whatever terminator the block already carries, so a
+        # moved unit does not quietly newline-terminate the file — and so an
+        # unchanged pin still compares equal below and writes nothing.
+        wanted = render_block(normalised, names, terminated=block.endswith("\n"))
+        if block == wanted:
+            return False
         updated = before + wanted + after
     write_document(target, updated)
     return True
 
 
+def _without_the_block(before: str, block: str, after: str) -> str:
+    """The document with the managed block — and :func:`pin`'s insertion — removed.
+
+    An UNTERMINATED block is one :func:`pin` appended to a document that did
+    not end in a newline: it can only be the last thing in the file, and the
+    newline right in front of it is the one ``pin`` inserted. Exactly one byte
+    is taken back, because exactly one was ever put in.
+
+    A block that ends in a newline says the document already ended in one, so
+    every operator byte — including a run of trailing blank lines — is left
+    alone. So is a hand-written unterminated block that no ``pin`` appended,
+    which is why the ``before`` side is checked too rather than assumed.
+    """
+    if block.endswith("\n") or not before.endswith("\n"):
+        return before + after
+    return before[: -len("\n")] + after
+
+
 def unpin(*, path: Path | str | None = None) -> bool:
-    """Remove the managed block. Returns "changed?"; every other byte survives."""
+    """Remove the managed block. Returns "changed?"; every other byte survives.
+
+    Including the byte :func:`pin` had to insert in front of the block, so the
+    file comes back byte-identical to its pre-pin content — a document with no
+    final newline still has none afterwards. Nothing outside the file is
+    consulted to know that: the backup would be the wrong authority, since
+    ``unpin`` typically runs in a later process where the ``.bak`` is stale or
+    already deleted.
+    """
     target = _safe_hosts_path(path)
     current = _read_text(target)
     before, block, after = split_document(current)
     if block is None:
         return False
-    write_document(target, before + after)
+    write_document(target, _without_the_block(before, block, after))
     return True
 
 
