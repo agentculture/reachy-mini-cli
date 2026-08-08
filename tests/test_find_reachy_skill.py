@@ -202,7 +202,16 @@ def test_find_sh_never_imports_or_execs_a_second_cli():
     }
     # A light heuristic: collect bareword tokens that look like invoked
     # commands (start of a statement) and ensure none names a network tool.
-    forbidden_commands = {"ip", "arp", "nmap", "curl", "wget", "avahi-browse", "avahi-resolve", "nc"}
+    forbidden_commands = {
+        "ip",
+        "arp",
+        "nmap",
+        "curl",
+        "wget",
+        "avahi-browse",
+        "avahi-resolve",
+        "nc",
+    }
     tokens = set(re.findall(r"(?m)^\s*([a-zA-Z][\w.-]*)\b", body))
     overlap = tokens & forbidden_commands
     assert not overlap, f"find.sh invokes forbidden command(s) as a statement: {overlap}"
@@ -245,9 +254,9 @@ def test_find_sh_execs_never_backgrounds():
     """Mirrors think.sh: the CLI invocation is `exec`'d, replacing this
     process rather than being spawned as a child the wrapper then parses."""
     body = FIND_SH.read_text(encoding="utf-8")
-    assert re.search(r'exec\s+"\$\{REACHY\[@\]\}"', body), (
-        "find.sh should exec the resolved CLI, not merely call it"
-    )
+    assert re.search(
+        r'exec\s+"\$\{REACHY\[@\]\}"', body
+    ), "find.sh should exec the resolved CLI, not merely call it"
 
 
 # --------------------------------------------------------------------------- #
