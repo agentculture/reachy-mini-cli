@@ -547,6 +547,18 @@ class HeldMediaClient:
             )
             return
 
+        # The wireless daemon boots with motor_control_mode=disabled (the USB
+        # daemon boots enabled, so no caller ever noticed): without torque the
+        # engine ticks, owns channels, and moves nothing. Best-effort — an SDK
+        # without the method or a refusing daemon must not cost the session.
+        try:
+            enable = getattr(client, "enable_motors", None)
+            if enable is not None:
+                enable()
+                self._log_transition("motors enabled (torque on)")
+        except Exception as err:  # noqa: BLE001 - motion-less beats dead
+            logger.warning("HeldMediaClient: enable_motors failed (%s)", err)
+
         self._client = client
         self._media = media
         self._samplerate = samplerate
