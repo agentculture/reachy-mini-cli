@@ -349,6 +349,17 @@ class SdkTransport(Transport):
             acquire = getattr(mini, "acquire_media", None)
             if acquire is not None:
                 acquire()
+        # The wireless daemon boots with motor_control_mode=disabled (observed
+        # on ReachyMiniOS v0.2.3 / daemon 1.9.0), while the USB daemon boots
+        # enabled — which is why no caller ever needed this before. Torque-on
+        # is best-effort: an SDK without the method, or a daemon that refuses,
+        # must not cost us the session we just opened.
+        try:
+            enable = getattr(mini, "enable_motors", None)
+            if enable is not None:
+                enable()
+        except Exception:  # noqa: BLE001 - motion-less beats dead
+            pass
         return mini, mini.media
 
     def get_frame(self) -> "np.ndarray | None":
