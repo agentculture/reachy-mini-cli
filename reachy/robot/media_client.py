@@ -559,6 +559,25 @@ class HeldMediaClient:
         except Exception as err:  # noqa: BLE001 - motion-less beats dead
             logger.warning("HeldMediaClient: enable_motors failed (%s)", err)
 
+        # The wireless daemon also launches with --no-wake-up-on-start: the
+        # head sits in its sleep operation mode and ignores position targets
+        # until something plays wake_up (the dashboard app flow did this
+        # implicitly; a seams-attached runtime never did — root-caused live
+        # 2026-08-11: torque on + wake_up is what restores head motion).
+        # Plain daemon HTTP so no extra SDK surface is touched.
+        try:
+            import urllib.request
+
+            wake = urllib.request.Request(
+                "http://localhost:8000/api/move/play/wake_up",
+                data=b"",
+                method="POST",
+            )
+            urllib.request.urlopen(wake, timeout=5.0)
+            self._log_transition("wake_up played (head out of sleep mode)")
+        except Exception as err:  # noqa: BLE001
+            logger.warning("HeldMediaClient: wake_up failed (%s)", err)
+
         self._client = client
         self._media = media
         self._samplerate = samplerate
