@@ -1647,6 +1647,10 @@ def test_gate_builds_the_documented_daemon_requests(monkeypatch) -> None:
         ("GET", _BASE + MEDIA_STATUS_PATH, 1.0),
         ("POST", _BASE + MEDIA_ACQUIRE_PATH, 1.0),
         ("GET", _BASE + MEDIA_STATUS_PATH, 1.0),
+        # The wireless daemon boots with --no-wake-up-on-start: after a
+        # successful construction the holder plays wake_up so the head leaves
+        # its sleep operation mode (the 2026-08-11 dead-head root cause).
+        ("POST", _BASE + "/api/move/play/wake_up", 5.0),
         ("POST", _BASE + MEDIA_RELEASE_PATH, 1.0),
     ]
 

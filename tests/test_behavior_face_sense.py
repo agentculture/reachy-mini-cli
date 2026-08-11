@@ -1041,3 +1041,50 @@ def test_a_disconnected_client_is_never_reported_as_a_dead_stream(caplog) -> Non
     assert not _drop_messages(
         caplog, FS.REASON_STREAM_ENDED
     ), "a merely disconnected client was mislabelled as a dead camera stream"
+
+
+# --------------------------------------------------------------------------- #
+# enroll_current — the enrollment seam (issue #166)                           #
+# --------------------------------------------------------------------------- #
+
+
+class _EnrollStore:
+    def __init__(self) -> None:
+        self.enrolled: list[tuple[str, object]] = []
+
+    def enroll(self, name, embedding):
+        self.enrolled.append((name, embedding))
+        return "face_1"
+
+
+def test_enroll_current_without_a_store_is_vision_unavailable() -> None:
+    driver = FaceSenseDriver(media=_FakeMedia([None]), start_worker=False)
+    assert driver.enroll_current("Ori") == {"ok": False, "error": "vision-unavailable"}
+
+
+def test_enroll_current_with_nothing_held_is_no_recent_unknown_face() -> None:
+    driver = FaceSenseDriver(
+        media=_FakeMedia([None]), engine=object(), store=_EnrollStore(), start_worker=False
+    )
+    assert driver.enroll_current("Ori") == {"ok": False, "error": "no-recent-unknown-face"}
+
+
+def test_enroll_current_binds_and_consumes_the_held_unknown_face() -> None:
+    store = _EnrollStore()
+    driver = FaceSenseDriver(
+        media=_FakeMedia([None]), engine=object(), store=store, start_worker=False
+    )
+    driver._last_unknown = ([0.1, 0.2], float(driver._clock()))
+    result = driver.enroll_current("Ori")
+    assert result == {"ok": True, "id": "face_1", "name": "Ori"}
+    assert store.enrolled == [("Ori", [0.1, 0.2])]
+    # consumed: a second bind must not enroll the same face twice
+    assert driver.enroll_current("Ori") == {"ok": False, "error": "no-recent-unknown-face"}
+
+
+def test_enroll_current_refuses_a_stale_unknown_face() -> None:
+    driver = FaceSenseDriver(
+        media=_FakeMedia([None]), engine=object(), store=_EnrollStore(), start_worker=False
+    )
+    driver._last_unknown = ([0.1], float(driver._clock()) - 120.0)
+    assert driver.enroll_current("Ori") == {"ok": False, "error": "no-recent-unknown-face"}

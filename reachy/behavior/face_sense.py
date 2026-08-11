@@ -191,6 +191,11 @@ SOURCE = "face"
 #: and matches the retired ``listen_face.DEFAULT_DETECT_INTERVAL``.
 DEFAULT_DETECT_INTERVAL: float = 0.5
 
+#: How long the latest UNKNOWN face stays bindable by the ``enroll`` intent
+#: (issue #166). Long enough for "who are you?" → "I'm Ori" → the tool round
+#: trip; short enough that a face from minutes ago cannot be mis-bound.
+ENROLL_TTL_S: float = 60.0
+
 #: Per-name re-announce cooldown (seconds): the same name latches into ``face``
 #: at most once per this window. Without it, a face that simply stays in view
 #: would re-fire its rule every detection cycle.
@@ -486,6 +491,10 @@ class FaceSenseDriver:
         self._last_announced: dict[str, float] = {}
         #: The ONE-TICK ``face`` latch (see the module docstring).
         self._face: str | None = None
+        #: The latest unknown face seen: ``(embedding, seen_at)`` — the enroll
+        #: seam's bind target (worker writes, tick thread reads; see
+        #: :meth:`_note_unknown` / :meth:`enroll_current`).
+        self._last_unknown: tuple | None = None
         #: The TTL-held ``frame_available`` condition and its freshness anchor.
         self._frame_available = False
         self._last_frame_at: float | None = None
@@ -800,11 +809,29 @@ class FaceSenseDriver:
             logger.warning("FaceSenseDriver store match raised; skipping frame", exc_info=True)
             return None
         if match is None:
+            self._note_unknown(detection)
             return None
         name = getattr(match, "name", None)
         if not name or not str(name).strip():
+            self._note_unknown(detection)
             return None  # unknown / unnamed face — never announced by name
         return str(name).strip()
+
+    def _note_unknown(self, detection: object) -> None:
+        """Hold the latest UNKNOWN face's embedding so a name can bind to it.
+
+        Worker-thread writer; :meth:`enroll_current` (tick thread) reads the
+        one tuple — a single attribute assignment, so no lock is needed. Held
+        driver-side rather than through the store's temporary tier so the 2 s
+        detect cadence does not mint an unbounded stream of temp ids.
+        """
+        embedding = getattr(detection, "embedding", None)
+        if embedding is None:
+            return
+        now = self._clock()
+        if now is None:
+            return
+        self._last_unknown = (embedding, float(now))
 
     # ------------------------------------------------------------------ #
     # provider seams                                                     #
@@ -825,6 +852,36 @@ class FaceSenseDriver:
     def as_frame_available_provider(self) -> Callable[[], bool]:
         """The zero-arg ``frame_available`` provider callable."""
         return self.peek_frame_available
+
+    # ------------------------------------------------------------------ #
+    # enrollment seam (issue #166)                                       #
+    # ------------------------------------------------------------------ #
+
+    def enroll_current(self, name: str) -> dict:
+        """Bind *name* to the most recently seen UNKNOWN face, TTL-bound.
+
+        The ``enroll`` intent kind's injected seam
+        (:class:`reachy.behavior.intents.IntentDriver`). Total — every outcome
+        is a typed dict, never a raise: ``vision-unavailable`` (no store
+        composed), ``no-recent-unknown-face`` (nothing unknown seen within
+        :data:`ENROLL_TTL_S`), ``enroll-failed`` (the store raised), or
+        ``{"ok": True, "id": ..., "name": ...}``. A successful bind consumes
+        the held face so one press of "I'm Ori" cannot enroll twice.
+        """
+        store = self._store
+        if store is None:
+            return {"ok": False, "error": "vision-unavailable"}
+        held = self._last_unknown
+        now = self._clock()
+        if held is None or now is None or (float(now) - held[1]) > ENROLL_TTL_S:
+            return {"ok": False, "error": "no-recent-unknown-face"}
+        try:
+            face_id = store.enroll(str(name), held[0])
+        except Exception as err:  # the seam is total; the store must not raise out
+            logger.warning("FaceSenseDriver enroll raised", exc_info=True)
+            return {"ok": False, "error": f"enroll-failed ({type(err).__name__}: {err})"}
+        self._last_unknown = None
+        return {"ok": True, "id": str(face_id), "name": str(name)}
 
     # ------------------------------------------------------------------ #
     # lifecycle                                                          #

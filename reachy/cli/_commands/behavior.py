@@ -2410,6 +2410,10 @@ def _compose_run_seam(
             mode_setter=rules_driver.set_active_mode if rules_driver is not None else None,
             known_modes=rules_driver.known_modes if rules_driver is not None else None,
             main_control=main_control,
+            # The enroll seam (issue #166): a spoken name binds to the face
+            # sense's most recent unknown face. A vision-less box composes
+            # None and the kind answers with the vision-unavailable refusal.
+            enroll_face=face_driver.enroll_current if face_driver is not None else None,
         )
         # Register the GOTO kind into the intent driver's OWN registry (which already
         # carries the four intent defaults) so all five kinds share one registry.

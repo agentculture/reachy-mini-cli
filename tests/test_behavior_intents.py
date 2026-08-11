@@ -901,3 +901,50 @@ def test_goal_re_admission_survives_an_external_eviction_over_a_real_run() -> No
     )
 
     assert "nod" in {ab.behavior.name for ab in eng.active}
+
+
+# --------------------------------------------------------------------------- #
+# enroll — the face-naming kind (issue #166)                                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_enroll_binds_a_name_through_the_injected_seam(tmp_path) -> None:
+    seen: list[str] = []
+
+    def seam(name: str) -> dict:
+        seen.append(name)
+        return {"ok": True, "id": "abc123", "name": name}
+
+    driver = IntentDriver(root=tmp_path, enroll_face=seam)
+    result = driver.registry.dispatch({"op": "enroll", "name": "  Ori  ", "cmd_id": "x"}, None)
+    assert result == {"ok": True, "id": "abc123", "name": "Ori", "op": "enroll"}
+    assert seen == ["Ori"]
+
+
+def test_enroll_without_a_seam_is_the_vision_unavailable_refusal(tmp_path) -> None:
+    driver = IntentDriver(root=tmp_path)
+    result = driver.registry.dispatch({"op": "enroll", "name": "Ori", "cmd_id": "x"}, None)
+    assert result == {"ok": False, "op": "enroll", "error": "vision-unavailable"}
+
+
+def test_enroll_refuses_a_bad_name_before_touching_the_seam(tmp_path) -> None:
+    seen: list[str] = []
+    driver = IntentDriver(root=tmp_path, enroll_face=lambda n: seen.append(n))
+    for bad in ({"op": "enroll", "cmd_id": "x"},
+                {"op": "enroll", "name": "   ", "cmd_id": "x"},
+                {"op": "enroll", "name": 7, "cmd_id": "x"},
+                {"op": "enroll", "name": "n" * 65, "cmd_id": "x"}):
+        result = driver.registry.dispatch(bad, None)
+        assert result["ok"] is False
+        assert "name" in result["error"]
+    assert seen == []
+
+
+def test_enroll_turns_a_raising_seam_into_a_typed_refusal(tmp_path) -> None:
+    def seam(name: str) -> dict:
+        raise RuntimeError("store on fire")
+
+    driver = IntentDriver(root=tmp_path, enroll_face=seam)
+    result = driver.registry.dispatch({"op": "enroll", "name": "Ori", "cmd_id": "x"}, None)
+    assert result["ok"] is False
+    assert result["error"].startswith("enroll-failed")

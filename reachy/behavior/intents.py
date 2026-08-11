@@ -115,6 +115,7 @@ RUN_BEHAVIOR = "run_behavior"
 DECLARE_GOAL = "declare_goal"
 SET_MODE = "set_mode"
 SET_INHIBITION = "set_inhibition"
+ENROLL = "enroll"
 
 #: Structured event ``type`` values published through ``ctx.emit``.
 EVENT_APPLIED = "intent.applied"
@@ -256,12 +257,14 @@ class IntentDriver:
         mode_setter: Callable[[str | None], None] | None = None,
         known_modes: Callable[[], Iterable[str]] | None = None,
         registry: control_mod.KindRegistry | None = None,
+        enroll_face: Callable[[str], dict] | None = None,
     ) -> None:
         self._spool = intent_control or control_mod.CommandSpool(namespace=namespace, root=root)
         self._main = main_control or control_mod.CommandSpool(root=root)
         self._lib = lib if lib is not None else behavior_library
         self._mode_setter = mode_setter
         self._known_modes = known_modes
+        self._enroll_face = enroll_face
         self._goal: dict | None = None  # {"name": str, "params": dict}
         self._inhibitions: frozenset[str] = frozenset()
         self._mode: str | None = None
@@ -285,6 +288,7 @@ class IntentDriver:
         self.registry.register(DECLARE_GOAL, self._apply_declare_goal)
         self.registry.register(SET_MODE, self._apply_set_mode)
         self.registry.register(SET_INHIBITION, self._apply_set_inhibition)
+        self.registry.register(ENROLL, self._apply_enroll)
 
     # -- read-only introspection (tests + state view) ----------------------- #
 
@@ -411,6 +415,31 @@ class IntentDriver:
             names.add(item)
         self._inhibitions = frozenset(names)
         return {"ok": True, "op": SET_INHIBITION, "behaviors": sorted(self._inhibitions)}
+
+    def _apply_enroll(self, payload: dict, ctx) -> dict:  # ctx unused
+        """Bind a spoken name to the most recently seen unknown face (issue #166).
+
+        The face machinery is an injected seam (``enroll_face``, wired from the
+        composed :class:`~reachy.behavior.face_sense.FaceSenseDriver`); a box
+        with no vision extra has ``None`` here and answers with the same named
+        refusal the sense-availability surface uses.
+        """
+        name = payload.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 64:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message="enroll requires a non-empty string 'name' of at most 64 chars",
+            )
+        if self._enroll_face is None:
+            return {"ok": False, "op": ENROLL, "error": "vision-unavailable"}
+        try:
+            result = self._enroll_face(name.strip())
+        except Exception as err:  # a raising seam resolves to a typed refusal
+            return {"ok": False, "op": ENROLL, "error": f"enroll-failed ({type(err).__name__}: {err})"}
+        if not isinstance(result, dict):
+            return {"ok": False, "op": ENROLL, "error": "enroll-seam-returned-non-dict"}
+        result.setdefault("op", ENROLL)
+        return result
 
     # -- continuous enforcement (every tick, no spool command needed) -------- #
 
