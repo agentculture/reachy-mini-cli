@@ -236,7 +236,7 @@ DEFAULT_RELEASE_THRESHOLD = 0.2
 
 #: The STILLNESS GATE (issue #80). Detection runs only while the COMMANDED head
 #: pose has been constant for :data:`DEFAULT_STILL_HOLD_S` seconds, judged with a
-#: :data:`DEFAULT_STILL_EPS` tolerance per axis. Measured on the real robot (four
+#: :data:`DEFAULT_STILL_EPS_DEG_S` tolerance per axis. Measured on the real robot (four
 #: 30-50 s recordings, untouched vs petted, all six DOF):
 #:
 #:   head HELD STILL : untouched residual p99 0.07-0.11 deg, petting p90 0.85-1.90
@@ -253,28 +253,40 @@ DEFAULT_RELEASE_THRESHOLD = 0.2
 #: uncorrelated with commanded velocity). So stillness is a PRECONDITION for the
 #: sense, not a tuning knob: gating on it makes ghost fires structurally impossible
 #: while leaving a still robot fully pettable.
-#: Tolerance for "the commanded pose did not change" (degrees, per tick, per
-#: axis) — really a per-tick VELOCITY threshold, so the gate opens after
-#: :data:`DEFAULT_STILL_HOLD_S` below it. It was always a sustained-SLOW gate;
-#: it merely looked like a stillness gate while the idle behaviour froze.
+#: Tolerance for "the commanded pose did not change" — a per-axis VELOCITY
+#: threshold, so the gate opens after :data:`DEFAULT_STILL_HOLD_S` below it. It
+#: was always a sustained-SLOW gate; it merely looked like a stillness gate
+#: while the idle behaviour froze.
 #:
-#: RAISED 0.01 -> 0.035 and the hold 0.5 -> 1.0 (2026-07-20). The reasoning
-#: above this line was written for the FROZEN idle and inverts under v0.40.0's
-#: swinging ``feel-alive``: that commit measured the old 0.01 as opening the
-#: gate **0.0% of the time** under continuous motion at a 1.0 s hold, i.e. a
-#: robot that can never feel anything at all. It was deployed as a box-local
-#: systemd drop-in for months; shipping it makes a fresh box work unconfigured.
+#: RAISED (as a per-tick figure) 0.01 -> 0.035 and the hold 0.5 -> 1.0
+#: (2026-07-20). The reasoning above this line was written for the FROZEN idle
+#: and inverts under v0.40.0's swinging ``feel-alive``: that commit measured
+#: the old 0.01 as opening the gate **0.0% of the time** under continuous
+#: motion at a 1.0 s hold, i.e. a robot that can never feel anything at all. It
+#: was deployed as a box-local systemd drop-in for months; shipping it makes a
+#: fresh box work unconfigured.
 #:
-#: 0.035 deg/tick sits inside the swing's decelerate-pause-accelerate window
-#: (~10-15% of the time) where the plant has stopped ringing. The old warning
-#: that this range "creeps open at the wander's turning points" was true of the
-#: WANDER, whose zero crossings are instantaneous; the swing's extremes hold a
-#: genuine ~3.4 s slow window, which is the whole point of #82. Measured there:
-#: untouched residual 0.70 deg vs petted 2.52 deg, hence the 1.2 press below.
+#: 0.035 deg/tick (at the engine's 50 Hz design cadence) sits inside the
+#: swing's decelerate-pause-accelerate window (~10-15% of the time) where the
+#: plant has stopped ringing. The old warning that this range "creeps open at
+#: the wander's turning points" was true of the WANDER, whose zero crossings
+#: are instantaneous; the swing's extremes hold a genuine ~3.4 s slow window,
+#: which is the whole point of #82. Measured there: untouched residual 0.70
+#: deg vs petted 2.52 deg, hence the 1.2 press below.
 #:
 #: The longer 1.0 s hold is what buys the "plant has stopped ringing" part —
 #: shortening it back toward 0.5 s re-admits the ring at this looser tolerance.
-DEFAULT_STILL_EPS = 0.035
+#:
+#: DT-NORMALIZED to degrees per SECOND (issue #168). A per-tick tolerance makes
+#: the gate's open-fraction a function of tick cadence: on the Reachy Wireless
+#: the runtime ticks at ~6.8 Hz instead of the 50 Hz design point, so per-tick
+#: deltas run ~7x design there and the old 0.035 deg/tick gate never opened at
+#: all. 0.035 deg/tick at 50 Hz is 1.75 deg/s; the shipped default below is
+#: 1.25 deg/s — slightly tighter (0.025 deg/tick at a clean 50 Hz) — chosen
+#: because it keeps the wander ghost class fully closed (0 events, ~0% open on
+#: both wander fixtures) while the swing still opens (~6.3% of 0.92 s windows),
+#: preserving both properties this gate exists for across tick rate.
+DEFAULT_STILL_EPS_DEG_S = 1.25
 DEFAULT_STILL_HOLD_S = 1.0  # commanded must be quiet this long before sensing
 
 #: Longest interval between logical observation ticks that can preserve an
@@ -345,7 +357,7 @@ class PatSenseDriver:
         lag_tau: float = DEFAULT_LAG_TAU,
         hp_tau: float = DEFAULT_HP_TAU,
         warmup_s: float = DEFAULT_WARMUP_S,
-        still_eps: float = DEFAULT_STILL_EPS,
+        eps_deg_s: float = DEFAULT_STILL_EPS_DEG_S,
         still_hold_s: float = DEFAULT_STILL_HOLD_S,
         max_observation_gap_s: float = DEFAULT_MAX_OBSERVATION_GAP_S,
         enough_after_fn: Callable[[], float] | None = None,
@@ -373,15 +385,21 @@ class PatSenseDriver:
         #: settled post-gesture offset can never read as a step).
         self._dev_lp: tuple[float, float] | None = (0.0, 0.0)
         self._hp_last_now: float | None = None
-        #: Stillness gate (issue #80): commanded-change tolerance and the quiet
-        #: hold required before sensing resumes. ``still_hold_s <= 0`` disables.
-        self._still_eps = max(0.0, float(still_eps))
+        #: Stillness gate (issue #80): commanded-change VELOCITY tolerance (deg/s,
+        #: dt-normalized — issue #168) and the quiet hold required before sensing
+        #: resumes. ``still_hold_s <= 0`` disables.
+        self._eps_deg_s = max(0.0, float(eps_deg_s))
         self._still_hold_s = max(0.0, float(still_hold_s))
         self._max_observation_gap_s = max(0.0, float(max_observation_gap_s))
         self._last_observation_at: float | None = None
         #: Last commanded (pitch, yaw) and the clock reading when it last moved.
         self._last_cmd: tuple[float, ...] | None = None
         self._last_motion_t: float | None = None
+        #: DEDICATED previous-clock stash for the stillness gate's dt (issue
+        #: #168) — never shared with ``_last_now``/``_hp_last_now``, so a
+        #: detection gap can never compute a velocity across itself; cleared in
+        #: :meth:`_rearm_stillness_hold`.
+        self._still_last_now: float | None = None
         self._last_owners: tuple[object, object, object] | None = None
         #: Boot calibration-mute window (s); ``0`` disables (see d1 fix).
         self._warmup_s = max(0.0, float(warmup_s))
@@ -625,9 +643,13 @@ class PatSenseDriver:
         """Force the stillness gate to re-earn its quiet window.
 
         See :meth:`_reseed_after_gap` for the matching conditioning reset.
+        Clearing ``_still_last_now`` here (issue #168) is what makes a
+        detection gap never compute a velocity across itself: the next sample
+        after re-arming is treated as a fresh first sample, not a huge-dt jump.
         """
         self._last_cmd = None
         self._last_motion_t = None
+        self._still_last_now = None
 
     def _reseed_after_gap(self) -> None:
         """Reseed conditioning when a detection gap becomes safe again.
@@ -933,22 +955,47 @@ class PatSenseDriver:
     def _commanded_still(self, commanded: tuple[float, ...], now: float | None) -> bool:
         """Whether the COMMANDED pose has been constant long enough to sense.
 
-        Any per-axis change beyond ``still_eps`` restamps the motion clock; the
-        gate opens only once ``still_hold_s`` has elapsed with no such change.
-        Disabled (always open) when ``still_hold_s <= 0``. With no clock the gate
-        stays open — conditioning and ownership-edge re-baselining still apply.
+        Any per-axis VELOCITY beyond ``eps_deg_s`` (max |delta| / dt, issue
+        #168 — dt-normalized so the gate's behavior is cadence-invariant)
+        restamps the motion clock; the gate opens only once ``still_hold_s``
+        has elapsed with no such change. Disabled (always open) when
+        ``still_hold_s <= 0``. With no clock the gate stays open — conditioning
+        and ownership-edge re-baselining still apply, and the dedicated dt
+        stash is dropped so a resumed clock starts from a fresh first sample
+        rather than a stale ``prev_now``.
+
+        ``dt`` comes from consecutive ``now`` readings against a DEDICATED
+        stash (``_still_last_now`` — never ``_last_now``/``_hp_last_now``, so a
+        detection gap can never compute a velocity across itself; cleared in
+        :meth:`_rearm_stillness_hold`), clamped to ``[0, 0.2]`` s exactly like
+        :meth:`_lag_filtered` / :meth:`_highpassed`. The first sample (no
+        previous commanded pose, or no previous clock reading) has no dt to
+        derive a velocity from and counts as "moved" — it merely restamps the
+        motion clock, matching the pre-#168 first-sample behavior.
         """
         if self._still_hold_s <= 0.0:
             return True
         prev = self._last_cmd
         self._last_cmd = commanded
         if now is None:
+            self._still_last_now = None
             return True
-        if (
-            prev is None
-            or max(abs(current - previous) for current, previous in zip(commanded, prev))
-            > self._still_eps
-        ):
+        prev_now = self._still_last_now
+        self._still_last_now = now
+        if prev is None or prev_now is None:
+            self._last_motion_t = now
+            return False
+        dt = min(max(now - prev_now, 0.0), 0.2)
+        if dt <= 0.0:
+            # No time elapsed since the last sample: any nonzero delta is an
+            # instantaneous jump (infinite velocity -> moved); zero delta is
+            # trivially still.
+            velocity = 0.0 if commanded == prev else float("inf")
+        else:
+            velocity = (
+                max(abs(current - previous) for current, previous in zip(commanded, prev)) / dt
+            )
+        if velocity > self._eps_deg_s:
             self._last_motion_t = now
             return False
         if self._last_motion_t is None:

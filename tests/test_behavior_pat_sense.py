@@ -243,8 +243,11 @@ def test_detector_not_advanced_while_complete_command_moves() -> None:
     reader = _Reader(value=(-3.0, 0.0))
     detector = _fixed_detector()
     driver = PatSenseDriver(reader=reader, still_hold_s=0.5, detector=detector, warmup_s=0.0)
+    # pitch step 0.5 deg/tick at DT(0.1) = 5.0 deg/s -- comfortably past the
+    # shipped 1.25 deg/s default (issue #168's dt-normalized gate), so every
+    # tick registers as motion and the gate never opens across this run.
     for i in range(10):
-        driver(_ctx(now=T0 + i * DT, owner=GESTURE_OWNER, pitch=0.05 * i))
+        driver(_ctx(now=T0 + i * DT, owner=GESTURE_OWNER, pitch=0.5 * i))
     assert len(detector.deviation_history) == 0  # update() never ran
     assert reader.calls == 0
 
@@ -559,7 +562,7 @@ def test_continuous_wander_clears_once_on_entry_not_every_tick() -> None:
     """Continuous command motion clears once at its first blocked edge.
 
     The stillness gate stays CLOSED for the entire run (each tick's commanded
-    pitch moves well past ``still_eps``), so the sense never detects at all --
+    pitch moves well past ``eps_deg_s``), so the sense never detects at all --
     ownership is constant, so the same gap remains open for the whole trace.
     Interaction clear therefore runs once, not once per moving tick."""
     reader = _Reader()
@@ -568,8 +571,10 @@ def test_continuous_wander_clears_once_on_entry_not_every_tick() -> None:
     driver = PatSenseDriver(reader=reader, detector=detector, warmup_s=0.0)
 
     now = T0
+    # pitch step 0.5 deg/tick at DT(0.1) = 5.0 deg/s -- comfortably past the
+    # shipped 1.25 deg/s default (issue #168's dt-normalized gate).
     for i in range(200):
-        _drive(driver, reader, (0.0, 0.0), now, owner=BASE_OWNER, pitch=0.05 * i)
+        _drive(driver, reader, (0.0, 0.0), now, owner=BASE_OWNER, pitch=0.5 * i)
         now += DT
 
     assert detector.clear_presses_calls == 1
@@ -583,8 +588,10 @@ def test_stillness_gap_clears_on_entry_and_not_again_on_unblock() -> None:
     """A stillness gap clears on entry; recovery only reseeds conditioning."""
     reader = _Reader()
     detector = _CountingDetector()
+    # eps_deg_s = 0.01 / DT(0.1) = 0.1 deg/s -- the equivalent of the old
+    # 0.01 deg/tick tolerance at this test's tick cadence (issue #168).
     driver = PatSenseDriver(
-        reader=reader, still_hold_s=0.5, still_eps=0.01, detector=detector, warmup_s=0.0
+        reader=reader, still_hold_s=0.5, eps_deg_s=0.1, detector=detector, warmup_s=0.0
     )
 
     now = T0
