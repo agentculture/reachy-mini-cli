@@ -211,6 +211,7 @@ def test_pat_sense_flows_into_the_feed_via_the_composed_stack(_isolated, monkeyp
     state = detected["pat_state"]
     assert {key: value for key, value in state.items() if not key.endswith("_at")} == {
         "availability": "available",
+        "blocked_reason": None,
         "contact": True,
         "touch_type": "scratch",
         "level": "level1",
