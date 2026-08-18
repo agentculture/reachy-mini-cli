@@ -73,7 +73,6 @@ from reachy.behavior.pat_sense import (
     DEFAULT_HP_TAU,
     DEFAULT_PRESS_THRESHOLD,
     DEFAULT_RELEASE_THRESHOLD,
-    DEFAULT_STILL_EPS,
     DEFAULT_STILL_HOLD_S,
     RELEASE_AFTER_S,
     PatSenseDriver,
@@ -1022,18 +1021,23 @@ def _pat_sense_enabled() -> bool:
     return value not in _PAT_SENSE_FALSEY
 
 
-#: Env vars exposing the pat-sense stillness gate's tuning without editing
-#: source (t2, "no-freeze pat sense" — a runnable experiment surface). Each is
-#: read directly at composition time, mirroring ``REACHY_PAT_SENSE`` right
-#: above rather than threading through ``EngineConfig``/``supervisor``'s
+#: Env var exposing the pat-sense stillness gate's hold tuning without editing
+#: source (t2, "no-freeze pat sense" — a runnable experiment surface). Read
+#: directly at composition time, mirroring ``REACHY_PAT_SENSE`` right above
+#: rather than threading through ``EngineConfig``/``supervisor``'s
 #: background-spawn argv: those exist for tuning that must survive `behavior
-#: engine start`'s detached re-spawn, while this pair is a bench/experiment
-#: knob for the foreground `_compose_run_seam` call the on/off switch beside
-#: it already reads the same way. Unset -> the shipped defaults from
-#: :mod:`reachy.behavior.pat_sense`, so a box that never sets either var
-#: composes a byte-identical driver.
+#: engine start`'s detached re-spawn, while this is a bench/experiment knob
+#: for the foreground `_compose_run_seam` call the on/off switch beside it
+#: already reads the same way. Unset -> the shipped default from
+#: :mod:`reachy.behavior.pat_sense`, so a box that never sets it composes a
+#: byte-identical driver.
+#:
+#: The eps leg (``REACHY_PAT_STILL_EPS``) was removed with the dt-normalized
+#: deg/s gate (issue #168, task t1): the driver's own ``eps_deg_s`` default
+#: (1.25) now applies unconditionally. A new env surface under the
+#: ``REACHY_PAT_STILL_EPS_DEG_S`` name — including a warn-and-ignore for the
+#: retired ``_EPS`` spelling — is a later task (t2) in the same plan.
 _STILL_HOLD_S_ENV = "REACHY_PAT_STILL_HOLD_S"
-_STILL_EPS_ENV = "REACHY_PAT_STILL_EPS"
 #: Press-threshold overrides, in degrees of conditioned deviation. Sensing
 #: through CONTINUOUS idle motion needs a far firmer press than sensing on a
 #: still head: `pat_sense`'s 0.5 deg default was measured against a quiet plant
@@ -1110,19 +1114,17 @@ def _pat_float_override(name: str, default: float) -> float | None:
     return _pat_float_env(name, default)
 
 
-def _pat_still_tuning() -> tuple[float, float]:
-    """Resolve this run's ``(still_hold_s, still_eps)`` for :class:`PatSenseDriver`.
+def _pat_still_tuning() -> float:
+    """Resolve this run's ``still_hold_s`` for :class:`PatSenseDriver`.
 
-    Both default to today's shipped values
-    (:data:`~reachy.behavior.pat_sense.DEFAULT_STILL_HOLD_S` /
-    :data:`~reachy.behavior.pat_sense.DEFAULT_STILL_EPS`) when
-    :data:`_STILL_HOLD_S_ENV` / :data:`_STILL_EPS_ENV` are unset, so an
-    operator who never touches either var gets a byte-identical driver.
+    Defaults to today's shipped value
+    (:data:`~reachy.behavior.pat_sense.DEFAULT_STILL_HOLD_S`) when
+    :data:`_STILL_HOLD_S_ENV` is unset, so an operator who never touches it
+    gets a byte-identical driver. The stillness gate's eps leg is no longer
+    resolved here (issue #168, task t1) — see the module-level comment beside
+    :data:`_STILL_HOLD_S_ENV`.
     """
-    return (
-        _pat_float_env(_STILL_HOLD_S_ENV, DEFAULT_STILL_HOLD_S),
-        _pat_float_env(_STILL_EPS_ENV, DEFAULT_STILL_EPS),
-    )
+    return _pat_float_env(_STILL_HOLD_S_ENV, DEFAULT_STILL_HOLD_S)
 
 
 def _pat_detector() -> PatDetector | None:
@@ -1930,10 +1932,9 @@ def _build_pat_sense_driver(reader) -> "PatSenseDriver":
     The *reader* is constructed by the caller, not here: it is a held SDK client,
     and the caller's failure path can only release what it already holds.
     """
-    still_hold_s, still_eps = _pat_still_tuning()
+    still_hold_s = _pat_still_tuning()
     pat_kwargs: dict = {
         "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
-        "still_eps": still_eps,  # REACHY_PAT_STILL_EPS override (t2)
     }
     override = _pat_detector()
     if override is not None:
