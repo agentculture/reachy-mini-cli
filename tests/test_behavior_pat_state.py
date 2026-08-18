@@ -42,6 +42,7 @@ def test_pat_state_is_frozen_and_event_stable() -> None:
         "phase",
         "phase_started_at",
         "last_press_at",
+        "blocked_reason",
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         first.contact = False  # type: ignore[misc]
