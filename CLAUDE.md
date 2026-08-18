@@ -404,7 +404,8 @@ a stale value makes the linter lie in one direction or the other.
   guess. The recordings live in `tests/data/pat_*.csv` and back
   `tests/test_behavior_pat_sense_hardware.py`.
 
-  **Shipped tuning is ONE operating point (v0.41.0)** — `still_eps` 0.035,
+  **Shipped tuning is ONE operating point (v0.41.0, dt-normalized v0.49.0)** —
+  `eps_deg_s` 1.25 deg/s (issue #168, cadence-invariant velocity tolerance),
   `still_hold_s` 1.0 s, press 1.2 deg, `release_after_s` 2.5 s, `hp_tau` 0.8.
   These move TOGETHER or not at all. The sensitive 0.5 deg press belongs with a
   tight gate that only opens at a dead stop (the freeze-era pairing measured
@@ -417,9 +418,18 @@ a stale value makes the linter lie in one direction or the other.
   the gentlest pats there; a caller driving a STATIC commanded pose should
   inject the sensitive detector rather than take the defaults.
 
+  The old per-tick epsilon (0.035 deg/tick at 50 Hz design cadence) is now
+  specified in deg/s (1.25 by default, slightly tighter than 0.035×50 = 1.75
+  but chosen to close the wander ghost class on Reachy Wireless and all deployed
+  tick rates. If `REACHY_PAT_STILL_EPS` is set in the environment, it is ignored
+  with a `legacy-eps-ignored` senselog line — unit names must never be silently
+  reinterpreted across variable names. Use `REACHY_PAT_STILL_EPS_DEG_S` instead.
+  This fix makes pattability cadence-robust (issue #168); the cadence itself is
+  issue #97 (open).
+
   `hp_tau` is the one value a deployed box must never override downward: it is
   a high-pass TIME CONSTANT, so 0.08 s passes only fast transients while a pet
-  is a SUSTAINED push lasting ~0.5-2 s. A box-local drop-in setting it silenced
+  is a SUSTAINED push lasting ~0.5–2 s. A box-local drop-in setting it silenced
   the sense entirely — the gate opened normally and the detector simply never
   saw the press, which reads in the journal as a bare `Pat level1!` with no
   `pat-acknowledge` fire.

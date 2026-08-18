@@ -337,6 +337,7 @@ its absence.
 | `phase`            | string           | `"idle"` / `"receptive"` / `"contentment"` / `"warning"` / `"released"` / `"enough"` / `"cooldown"` |
 | `phase_started_at` | float or `null`  | When the current phase began, or `null`               |
 | `last_press_at`    | float or `null`  | When the last press was seen, or `null`               |
+| `blocked_reason`   | string or `null` | When `availability == "blocked"`, one of `"stillness"` (commanded pose not quiet long enough), `"ownership"` (another behavior owns the head), `"clock-gap"` (logical observation interval exceeded), `"no-command"` (commanded pose missing/malformed). Always `null` otherwise (no reason needed when available or unavailable). |
 
 Example line:
 

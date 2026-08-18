@@ -780,8 +780,8 @@ exit-1 error naming the variable, never a silent fallback.
 | Variable | Default | Meaning |
 |---|---|---|
 | `REACHY_PAT_SENSE` | on | Falsey (`0`/`false`/`no`/`off`/empty) composes the runtime with no pat sense at all |
-| `REACHY_PAT_STILL_EPS` | `0.035` | Per-tick commanded-velocity tolerance the stillness gate calls "slow" |
-| `REACHY_PAT_STILL_HOLD_S` | `1.0` | How long the commanded pose must stay slow before sensing opens |
+| `REACHY_PAT_STILL_EPS_DEG_S` | `1.25` | Commanded-velocity tolerance (deg/s) the stillness gate calls "slow" — dt-normalized, so gate behavior is cadence-invariant. See issue #168 and the [stillness gate](#the-stillness-gate) section. **The legacy `REACHY_PAT_STILL_EPS` (per-tick) is ignored with a `legacy-eps-ignored` journal line if set.** |
+| `REACHY_PAT_STILL_HOLD_S` | `1.0` | How long the commanded pose must stay below `REACHY_PAT_STILL_EPS_DEG_S` before sensing opens |
 | `REACHY_PAT_PRESS_DEG` | `1.2` | Conditioned pitch deviation (deg) that counts as a press |
 | `REACHY_PAT_YAW_PRESS_DEG` | `1.2` | Same, for a sideways yaw nudge |
 | `REACHY_PAT_RELEASE_AFTER_S` | `2.5` | Quiet seconds before an interaction is declared released |
@@ -1965,6 +1965,40 @@ reachy-mini-cli behavior reload --json
 Confirm the result names one react rule and the rendered rule now maps
 `pat-acknowledge` to `thoughtful`. A rejected candidate keeps the last-good live
 configuration; correct the file and submit a new reload rather than restarting.
+
+#### The stillness gate
+
+Detection is only safe while the **commanded pose has been moving slowly**. The
+gate measures commanded-pose VELOCITY (max per-axis change rate) and holds the
+sense closed until it stays below `REACHY_PAT_STILL_EPS_DEG_S` (1.25 deg/s by
+default) for `REACHY_PAT_STILL_HOLD_S` (1.0 s by default). This is a
+**structural requirement**, not a tuning knob: the plant is quiet only while it
+is not tracking a moving target, so gating on this makes the wander ghost-class
+(false pats during idle motion) impossible by design rather than by threshold.
+
+**Why dt-normalized (issue #168).** The tolerance was originally per-tick (0.035
+deg/tick at 50 Hz design cadence), which made the gate's open-fraction
+depend on tick rate. On Reachy Wireless, whose runtime ticks at ~6.8 Hz due to
+CPU saturation, per-tick deltas run ~7x design — the old gate never opened at
+all. The gate is now specified in deg/s (velocity), so it opens consistently
+regardless of cadence; 1.25 deg/s was chosen to preserve the original ghost-free
+and still-pettable properties across tick rates. **This fixes pattability on
+Wireless units; it does NOT fix issue #97** (the cadence itself), which remains
+open for systems where the runtime cannot keep 50 Hz.
+
+Both tuning knobs move **TOGETHER or not at all**. The press threshold (1.2 deg)
+was paired with this gate in live measurement: a tighter gate only opens at a
+dead stop (0.07-0.11 deg untouched residual), which pairs with the sensitive
+0.5 deg press from the original tuning; the shipped looser gate senses inside
+the swing's decelerate window (0.70 deg untouched residual), which pairs with
+the blunter 1.2 deg press. Mixing them — loose gate with sensitive press, or
+vice versa — re-admits phantom pats or deadens the sense respectively.
+
+**The legacy `REACHY_PAT_STILL_EPS` variable is ignored.** If it is set in the
+environment, the operator's journal receives a `[SENSE stage=pat source=config
+event=REACHY_PAT_STILL_EPS] legacy-eps-ignored` line and the value is not read
+— because unit names must never be silently reinterpreted across variable names.
+Use `REACHY_PAT_STILL_EPS_DEG_S` instead.
 
 ### Bounded reactions: no more permanent holds
 
