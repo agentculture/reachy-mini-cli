@@ -492,7 +492,7 @@ class PatSenseDriver:
             if not self._stillness_blocked:
                 self._rearm_stillness_hold()
             self._stillness_blocked = True
-            self._begin_gap("blocked", now)
+            self._begin_gap("blocked", now, reason="no-command")
             return
         commanded = (commanded_full[4], commanded_full[5])
 
@@ -503,6 +503,9 @@ class PatSenseDriver:
         actual = self._read_actual()
         if actual is None:
             self._input_gap = True
+            # "unavailable" is already unambiguous on its own (issue #168):
+            # a missing reading needs no separate cause label, so this is the
+            # one blocked-family branch that never names a `reason`.
             self._begin_gap("unavailable", now)
             return
         if self._input_gap:
@@ -529,7 +532,11 @@ class PatSenseDriver:
         # release time, or cooldown time.
         self._advance_policy_clock(now)
         if self._state.phase == "cooldown":
-            self._state = replace(self._state, availability="available")
+            # This tick is an ordinary safe observation (every gate above
+            # passed), so any `blocked_reason` carried forward by
+            # `_advance_policy_clock` must be cleared here too — `replace()`
+            # otherwise keeps it (issue #168's "watch out").
+            self._state = replace(self._state, availability="available", blocked_reason=None)
             self._last_available_at = now
             return
 
@@ -542,9 +549,19 @@ class PatSenseDriver:
         self._reseed_after_gap()
         self._reseeded_this_tick = True
 
-    def _blocked_edge(self, now: float | None) -> None:
-        """Open a blocked gap and make the stillness gate re-earn its window."""
-        self._begin_gap("blocked", now)
+    def _blocked_edge(self, now: float | None, *, reason: str) -> None:
+        """Open a blocked gap and make the stillness gate re-earn its window.
+
+        The rearm below (issue #168) means the very next gate this tick's
+        `_process` checks is `_stillness_open`, which — with the gate
+        enabled — closes again immediately (a fresh rearm has no earned quiet
+        window) and OVERWRITES this ``reason`` with ``"stillness"`` before the
+        tick ends. That is the documented persist-across-gates behavior: the
+        LATEST cause label wins, never the first, so the reason a consumer
+        reads always names what is closing the gate *right now*, not what
+        first opened it.
+        """
+        self._begin_gap("blocked", now, reason=reason)
         self._rearm_stillness_hold()
         if self._still_hold_s <= 0.0:
             # With the gate disabled there is no quiet window to re-earn, so
@@ -562,9 +579,9 @@ class PatSenseDriver:
         the head. Both invalidate conditioning the same way.
         """
         if self._observation_clock_gapped(now):
-            self._blocked_edge(now)
+            self._blocked_edge(now, reason="clock-gap")
         if self._ownership_changed(ctx):
-            self._blocked_edge(now)
+            self._blocked_edge(now, reason="ownership")
 
     def _stillness_open(self, commanded_full: tuple[float, ...], now: float | None) -> bool:
         """Whether this tick's commanded pose is inside a sensing-safe still window (#80).
@@ -578,7 +595,7 @@ class PatSenseDriver:
         """
         if not self._commanded_still(commanded_full, now):
             self._stillness_blocked = True
-            self._begin_gap("blocked", now)
+            self._begin_gap("blocked", now, reason="stillness")
             return False
         if self._stillness_blocked:
             # First tick back on a still commanded pose (a genuine
@@ -664,7 +681,9 @@ class PatSenseDriver:
         self._last_now = None
         self._hp_last_now = None
 
-    def _end_interaction(self, now: float | None, *, availability: str) -> None:
+    def _end_interaction(
+        self, now: float | None, *, availability: str, reason: str | None = None
+    ) -> None:
         """Clear detector and persistent policy state at one interaction edge."""
         if self._state.phase == "enough" and self._cooldown_remaining_s is None:
             self._cooldown_remaining_s = self._cooldown_s
@@ -677,9 +696,10 @@ class PatSenseDriver:
             availability=availability,
             phase="idle",
             phase_started_at=now,
+            blocked_reason=reason,
         )
 
-    def _suspend_interaction(self, availability: str) -> None:
+    def _suspend_interaction(self, availability: str, *, reason: str | None) -> None:
         """Pause a LIVE interaction across a gap without ending it.
 
         The split from :meth:`_end_interaction` is the whole point: every
@@ -698,9 +718,11 @@ class PatSenseDriver:
         self.detector.clear_interaction()
         self._seen_press_at = None
         self._last_available_at = None
-        self._state = replace(self._state, availability=availability)
+        self._state = replace(self._state, availability=availability, blocked_reason=reason)
 
-    def _begin_gap(self, availability: str, now: float | None) -> None:
+    def _begin_gap(
+        self, availability: str, now: float | None, *, reason: str | None = None
+    ) -> None:
         """Open or update one unsafe interval without repeated clear churn.
 
         A gap means "cannot sense right now", which is NOT the same as "the
@@ -737,20 +759,25 @@ class PatSenseDriver:
             # to avoid (and would reset the escalation guard repeatedly).
             if not self._gap_active:
                 self._gap_started_at = now
-                self._suspend_interaction(availability)
+                self._suspend_interaction(availability, reason=reason)
                 self._gap_active = True
                 return
-            self._state = replace(self._state, availability=availability)
+            # Already suspended: a later edge within the same persisting gap
+            # (issue #168) updates the reason to THIS tick's cause rather than
+            # keeping the one that first opened it — see `_blocked_edge`.
+            self._state = replace(self._state, availability=availability, blocked_reason=reason)
             self._last_available_at = None
             return
         if not self._gap_active:
-            self._end_interaction(now, availability=availability)
+            self._end_interaction(now, availability=availability, reason=reason)
             self._gap_active = True
             return
+        # Already ended: same "latest cause wins" update as above.
         self._state = PatState(
             availability=availability,
             phase="idle",
             phase_started_at=self._state.phase_started_at,
+            blocked_reason=reason,
         )
         self._last_available_at = None
         self._no_fresh_since = None
@@ -762,6 +789,8 @@ class PatSenseDriver:
             if self._state.availability == "available" and self._state.phase == "idle"
             else now
         )
+        # A fresh PatState() defaults blocked_reason to None; no explicit
+        # clear needed, unlike the `replace()` calls elsewhere in this file.
         self._state = PatState(
             availability="available",
             phase="idle",
@@ -769,7 +798,15 @@ class PatSenseDriver:
         )
 
     def _advance_policy_clock(self, now: float | None) -> None:
-        """Advance cooldown using safe-observation time, pausing across gaps."""
+        """Advance cooldown using safe-observation time, pausing across gaps.
+
+        Every ``PatState`` built here carries ``availability=self._state.availability``
+        forward UNCHANGED (this method never decides availability, only the phase
+        clock), so ``blocked_reason`` is carried forward the same way — copying one
+        without the other would desynchronize the pair the instant this runs mid-tick
+        while a gap edge set earlier in the same tick (see ``_apply_observation_edges``)
+        has not yet been resolved by the caller.
+        """
         if now is None:
             return
         if self._state.phase == "enough":
@@ -785,6 +822,7 @@ class PatSenseDriver:
                     availability=self._state.availability,
                     phase="idle",
                     phase_started_at=now,
+                    blocked_reason=self._state.blocked_reason,
                 )
                 return
             self._state = PatState(
@@ -792,6 +830,7 @@ class PatSenseDriver:
                 contact=False,
                 phase="cooldown",
                 phase_started_at=now,
+                blocked_reason=self._state.blocked_reason,
             )
             return
 
@@ -808,12 +847,14 @@ class PatSenseDriver:
                     availability=self._state.availability,
                     phase="idle",
                     phase_started_at=now,
+                    blocked_reason=self._state.blocked_reason,
                 )
                 return
             self._state = PatState(
                 availability=self._state.availability,
                 phase="cooldown",
                 phase_started_at=now,
+                blocked_reason=self._state.blocked_reason,
             )
             return
 
@@ -827,6 +868,7 @@ class PatSenseDriver:
                 availability=self._state.availability,
                 phase="idle",
                 phase_started_at=now,
+                blocked_reason=self._state.blocked_reason,
             )
             return
         self._cooldown_remaining_s = remaining
@@ -837,8 +879,13 @@ class PatSenseDriver:
         A thin three-stage orchestrator: adopt this tick's evidence, then (while
         contact holds) test the release budget, then walk the contact ladder.
         """
+        # Every path below reaches an "available" tick (`_update_pat_state` runs
+        # only after `_observe` has cleared every blocking gate), so each
+        # `replace()` explicitly clears `blocked_reason` — it is never carried
+        # forward here the way `_advance_policy_clock` carries it (issue #168's
+        # "watch out": `replace()` otherwise keeps a stale reason).
         if now is None:
-            self._state = replace(self._state, availability="available")
+            self._state = replace(self._state, availability="available", blocked_reason=None)
             return
         evidence = self.detector.snapshot()
         fresh = evidence.last_press_at is not None and evidence.last_press_at != self._seen_press_at
@@ -849,7 +896,7 @@ class PatSenseDriver:
         if fresh:
             self._adopt_fresh_press(evidence, now)
         else:
-            self._state = replace(self._state, availability="available")
+            self._state = replace(self._state, availability="available", blocked_reason=None)
 
         if not self._state.contact:
             return
