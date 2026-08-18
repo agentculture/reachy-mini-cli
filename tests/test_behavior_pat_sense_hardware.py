@@ -50,8 +50,13 @@ class _Replay:
             self.rows = [{k: float(v) for k, v in row.items()} for row in csv.DictReader(fh)]
         self.reads = 0
 
-    def run(self, **driver_kw) -> int:
-        """Feed every sample through a fresh driver; return the event count."""
+    def run(self, stride: int = 1, **driver_kw) -> int:
+        """Feed samples through a fresh driver at given stride; return the event count.
+
+        Args:
+            stride: Sample every nth row (stride=1 is all, stride=2 is ~11.4 Hz,
+                stride=3 is ~7.6 Hz, stride=4 is ~5.7 Hz).
+        """
         row_holder: dict = {}
 
         def reader():
@@ -59,7 +64,7 @@ class _Replay:
             return (row_holder["a_pitch"], row_holder["a_yaw"])
 
         driver = PatSenseDriver(reader=reader, **driver_kw)
-        for row in self.rows:
+        for row in self.rows[::stride]:
             row_holder.update(row)
             driver(_Ctx(row))
         return driver.events
@@ -190,3 +195,84 @@ def test_wander_petting_is_gated_out_too() -> None:
     sense declines rather than guessing.
     """
     assert _Replay("pat_wander").run() == 0
+
+
+# --------------------------------------------------------------------------- #
+# Low-cadence stride replays — pin detector robustness at wireless cadence    #
+# (issue #168: Wireless runs at ~6.8 Hz instead of 50 Hz)                    #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("stride", [2, 3, 4])
+def test_stride_still_untouched_never_fires(stride: int) -> None:
+    """Still, untouched head must produce ZERO pat events at every low cadence.
+
+    Stride 2 ≈11.4 Hz, 3 ≈7.6 Hz, 4 ≈5.7 Hz (Wireless measured ~6.8 Hz).
+    The no-ghost guarantee must hold even when samples are sparse.
+    """
+    assert _Replay("base_still").run(stride=stride, warmup_s=0.0) == 0
+
+
+@pytest.mark.parametrize("stride", [2, 3, 4])
+@pytest.mark.parametrize("level2_threshold", [5.0, 6.0, 7.0])
+@pytest.mark.parametrize("enough_after", [WARNING_AFTER_S, ENOUGH_MAX_S])
+def test_stride_still_petting_fires_repeatedly(
+    stride: int, level2_threshold: float, enough_after: float
+) -> None:
+    """Real petting on a still head must be detected at every low cadence.
+
+    Stride 2 ≈11.4 Hz, 3 ≈7.6 Hz, 4 ≈5.7 Hz (Wireless measured ~6.8 Hz).
+    Both random seams are injected (see test_still_petting_fires_repeatedly).
+    Petting must be clearly detected (>= 3 events) even at the lowest cadence.
+    """
+    events = _Replay("pat_still").run(
+        stride=stride,
+        warmup_s=0.0,
+        detector=PatDetector(level2_threshold_fn=lambda: level2_threshold),
+        enough_after_fn=lambda: enough_after,
+    )
+    assert events >= 3, (
+        f"only {events} pats detected at stride={stride} over 50 s of continuous "
+        f"petting (level2_threshold={level2_threshold}, enough_after={enough_after})"
+    )
+
+
+def test_stride_wander_untouched_never_fires_stride1() -> None:
+    """Idle motion at normal cadence (stride 1) must produce ZERO events.
+
+    Control for the low-cadence tests: the shipped 1.25 deg/s gate holds even
+    when samples arrive at full 23 Hz (stride 1 ≈ 23 Hz).
+    """
+    assert _Replay("base_wander").run(stride=1) == 0
+
+
+def test_stride_wander_petting_is_gated_out_stride1() -> None:
+    """Petting on a wandering head is not detectable at any cadence.
+
+    Control for the low-cadence tests: the deliberate tradeoff that makes pats
+    undetectable while the head wanders holds at full 23 Hz.
+    """
+    assert _Replay("pat_wander").run(stride=1) == 0
+
+
+@pytest.mark.parametrize("stride", [3])
+def test_stride_still_petting_with_warmup(stride: int) -> None:
+    """Boot-warmup gate (warmup_s=15.0) suppresses detections until 15.0 s.
+
+    Stride 3 ≈7.6 Hz (Wireless measured ~6.8 Hz). The driver's `enough_after_fn`
+    and detector threshold are seeded for determinism. The ~55 s pat_still
+    recording must yield > 0 events after the warmup closes at t=15.0 s.
+    """
+    replay = _Replay("pat_still")
+
+    # Run the full recording (which spans ~55 s) with warmup=15.0 s.
+    # Events should only fire after t >= 15.0 s (when warmup closes).
+    events = replay.run(
+        stride=stride,
+        warmup_s=15.0,
+        detector=PatDetector(level2_threshold_fn=lambda: 6.0),
+        enough_after_fn=lambda: WARNING_AFTER_S,
+    )
+
+    # After warmup closes, continuous petting should produce > 0 events.
+    assert events > 0, f"expected > 0 events after warmup closes (t >= 15.0 s), got {events}"
