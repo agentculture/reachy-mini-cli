@@ -99,6 +99,10 @@ _PAT_LEVELS = frozenset({"level1", "level2"})
 _PAT_PHASES = frozenset(
     {"idle", "receptive", "contentment", "warning", "released", "enough", "cooldown"}
 )
+#: Issue #168 — the named causes a "blocked" pat reading may carry. Always
+#: normalized to ``None`` when ``availability`` is not exactly ``"blocked"``,
+#: mirroring :class:`reachy.behavior.sense.PatState`'s own contract.
+_PAT_BLOCKED_REASONS = frozenset({"stillness", "ownership", "clock-gap", "no-command"})
 
 # ---------------------------------------------------------------------------
 # Event types
@@ -356,6 +360,16 @@ def _pat_state_payload(value: object) -> dict | None:
     availability = read("availability", "unavailable")
     if not isinstance(availability, str) or availability not in _PAT_AVAILABILITIES:
         availability = "unavailable"
+    blocked_reason = read("blocked_reason")
+    if (
+        availability != "blocked"
+        or not isinstance(blocked_reason, str)
+        or blocked_reason not in _PAT_BLOCKED_REASONS
+    ):
+        # Outside "blocked" a reason is meaningless (the field is always None
+        # there, per PatState's own contract); a malformed reason inside
+        # "blocked" degrades to None rather than poisoning the whole payload.
+        blocked_reason = None
     touch_type = read("touch_type")
     if not isinstance(touch_type, str) or touch_type not in _PAT_TOUCH_TYPES:
         touch_type = None
@@ -376,6 +390,7 @@ def _pat_state_payload(value: object) -> dict | None:
         "phase": phase,
         "phase_started_at": _optional_finite_float(read("phase_started_at")),
         "last_press_at": _optional_finite_float(read("last_press_at")),
+        "blocked_reason": blocked_reason,
     }
 
 

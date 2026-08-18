@@ -67,6 +67,24 @@ class PatState:
     ``False`` as an observed release. ``yaw_deg`` is signed robot-frame yaw in
     degrees, never a guessed physical left/right label.
 
+    ``blocked_reason`` (issue #168) names WHICH gate is closed while
+    ``availability == "blocked"``, so a live measurement of "N/N samples
+    blocked" can say which one. It is one of four wire strings —
+    ``"stillness"`` (the commanded pose has not been quiet long enough,
+    :func:`reachy.behavior.pat_sense.PatSenseDriver._stillness_open`),
+    ``"ownership"`` (another behavior took the head mid-interaction,
+    :meth:`~reachy.behavior.pat_sense.PatSenseDriver._ownership_changed`),
+    ``"clock-gap"`` (the logical observation interval exceeded its bound,
+    :meth:`~reachy.behavior.pat_sense.PatSenseDriver._observation_clock_gapped`),
+    or ``"no-command"`` (this tick's commanded pose was missing or malformed)
+    — and it is always ``None`` outside ``"blocked"``: ``None`` when
+    ``availability == "available"`` (there is nothing to name), and ``None``
+    when ``availability == "unavailable"`` (a missing reading is already
+    unambiguous on its own; giving it a reason too would just be
+    ``"unavailable"`` spelled twice). The :data:`PatAvailability` Literal
+    itself stays byte-identical — this field is purely additive, so no
+    existing consumer keyed on ``availability`` alone changes behavior.
+
     The two monotonic anchors let consumers derive recency from their own clock.
     No derived age or tick timestamp is stored, so equal interaction states stay
     equal across unchanged 50 Hz ticks and change-only exporters remain bounded.
@@ -80,6 +98,7 @@ class PatState:
     phase: PatPhase = "idle"
     phase_started_at: float | None = None
     last_press_at: float | None = None
+    blocked_reason: str | None = None
 
 
 #: Safe default for a missing, failed, or not-yet-wired pat-state provider.
