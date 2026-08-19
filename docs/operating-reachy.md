@@ -780,7 +780,7 @@ exit-1 error naming the variable, never a silent fallback.
 | Variable | Default | Meaning |
 |---|---|---|
 | `REACHY_PAT_SENSE` | on | Falsey (`0`/`false`/`no`/`off`/empty) composes the runtime with no pat sense at all |
-| `REACHY_PAT_STILL_EPS_DEG_S` | `1.25` | Commanded-velocity tolerance (deg/s) the stillness gate calls "slow" — dt-normalized, so gate behavior is cadence-invariant. See issue #168 and the [stillness gate](#the-stillness-gate) section. **The legacy `REACHY_PAT_STILL_EPS` (per-tick) is ignored with a `legacy-eps-ignored` journal line if set.** |
+| `REACHY_PAT_STILL_EPS_DEG_S` | `1.25` | Commanded-velocity tolerance (deg/s); cadence-invariant gate. See [stillness gate](#the-stillness-gate) and #168. Legacy `REACHY_PAT_STILL_EPS` ignored with `legacy-eps-ignored` journal line. |
 | `REACHY_PAT_STILL_HOLD_S` | `1.0` | How long the commanded pose must stay below `REACHY_PAT_STILL_EPS_DEG_S` before sensing opens |
 | `REACHY_PAT_PRESS_DEG` | `1.2` | Conditioned pitch deviation (deg) that counts as a press |
 | `REACHY_PAT_YAW_PRESS_DEG` | `1.2` | Same, for a sideways yaw nudge |
