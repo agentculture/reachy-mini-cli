@@ -43,10 +43,22 @@ blocked_reason: {'stillness': 5289}
 - `Pat level` / `pat-acknowledge`: 0 lines, correctly — nobody touched the
   robot during the window.
 
-## Petting round (human hand required)
+## Petting round — PASSED (2026-08-19 07:33, operator's hand)
 
-Protocol posted on #168; result to be appended when a human is at the unit:
-pet the head during a still window (they recur ~6/min for ~0.9 s plus the
-1.0 s hold lead-in); expect `Pat level1!` then
-`[SENSE stage=rule source=pat event=pat-acknowledge] fired` in
-`journalctl --user -u reachy-runtime.service`.
+Overnight control first: **7.6 h untouched** (23:55 → 07:33) with the new
+gate live — **zero pat events**, i.e. ~29 min of cumulative open-gate
+exposure with no ghost. The operator then petted the head (confirmed: every
+event below is their hand, starting at 07:33:02):
+
+```text
+07:33:02  Pat level1! type=side_pat (2 presses)  -> pat-acknowledge fired, pet-reaction ran
+07:33:32  Pat level1! type=side_pat (2 presses)  -> pat-acknowledge fired, pet-reaction ran
+07:33:34  Pat level1! type=scratch  (2 presses)  -> dropped reason=cooldown (5 s window honored)
+07:33:42  Pat level1! type=side_pat (2 presses)  -> pat-acknowledge fired (cooldown expired)
+```
+
+Detection, classification (`side_pat` and `scratch`), rule admission, the
+audible/visible reaction, and cooldown discipline — the same end-to-end
+evidence chain as the Lite's 2026-07-22 verification, now on the Wireless at
+its real ~6.8 Hz cadence. Issue #168's headline ("robot can't be petted") is
+closed by measurement.
