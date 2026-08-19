@@ -99,6 +99,10 @@ _PAT_LEVELS = frozenset({"level1", "level2"})
 _PAT_PHASES = frozenset(
     {"idle", "receptive", "contentment", "warning", "released", "enough", "cooldown"}
 )
+#: Issue #168 — the named causes a "blocked" pat reading may carry. Always
+#: normalized to ``None`` when ``availability`` is not exactly ``"blocked"``,
+#: mirroring :class:`reachy.behavior.sense.PatState`'s own contract.
+_PAT_BLOCKED_REASONS = frozenset({"stillness", "ownership", "clock-gap", "no-command"})
 
 # ---------------------------------------------------------------------------
 # Event types
@@ -327,16 +331,23 @@ def _optional_finite_float(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _pat_state_payload(value: object) -> dict | None:
-    """Normalize a PatState-like value to its stable additive wire object.
+def _vocab_str(value: object, vocabulary, default: str | None) -> str | None:
+    """*value* when it is a member of *vocabulary*, else *default*.
 
-    The export layer remains independent of :mod:`reachy.behavior`: production
-    values are duck-typed, while raw runtime events use dictionaries. Unknown
-    keys are ignored and malformed individual fields fall back conservatively,
-    so a future or damaged pat-state value cannot poison the legacy sense event.
+    The wire's enum discipline in one place: every closed string field of the
+    pat-state payload degrades to its conservative default rather than letting
+    an unknown or malformed value poison the legacy sense event.
     """
-    if value is None:
-        return None
+    return value if isinstance(value, str) and value in vocabulary else default
+
+
+def _pat_field_reader(value: object):
+    """A never-raising field reader over a dict or PatState-like value.
+
+    Returns ``None`` for a value that is neither (the payload is dropped);
+    production values are duck-typed while raw runtime events use dicts, so
+    the export layer stays independent of :mod:`reachy.behavior`.
+    """
     if isinstance(value, dict):
         raw_read = value.get
     elif hasattr(value, "availability"):
@@ -353,29 +364,42 @@ def _pat_state_payload(value: object) -> dict | None:
         except Exception:  # one bad field must not drop legacy sense
             return default
 
-    availability = read("availability", "unavailable")
-    if not isinstance(availability, str) or availability not in _PAT_AVAILABILITIES:
-        availability = "unavailable"
-    touch_type = read("touch_type")
-    if not isinstance(touch_type, str) or touch_type not in _PAT_TOUCH_TYPES:
-        touch_type = None
-    level = read("level")
-    if not isinstance(level, str) or level not in _PAT_LEVELS:
-        level = None
-    phase = read("phase", "idle")
-    if not isinstance(phase, str) or phase not in _PAT_PHASES:
-        phase = "idle"
+    return read
+
+
+def _pat_state_payload(value: object) -> dict | None:
+    """Normalize a PatState-like value to its stable additive wire object.
+
+    Unknown keys are ignored and malformed individual fields fall back
+    conservatively (see :func:`_vocab_str` / :func:`_pat_field_reader`), so a
+    future or damaged pat-state value cannot poison the legacy sense event.
+    """
+    if value is None:
+        return None
+    read = _pat_field_reader(value)
+    if read is None:
+        return None
+    availability = _vocab_str(
+        read("availability", "unavailable"), _PAT_AVAILABILITIES, "unavailable"
+    )
+    # Outside "blocked" a reason is meaningless (the field is always None
+    # there, per PatState's own contract); a malformed reason inside
+    # "blocked" degrades to None rather than poisoning the whole payload.
+    blocked_reason = None
+    if availability == "blocked":
+        blocked_reason = _vocab_str(read("blocked_reason"), _PAT_BLOCKED_REASONS, None)
     contact = read("contact", False)
 
     return {
         "availability": availability,
         "contact": contact if isinstance(contact, bool) else False,
-        "touch_type": touch_type,
-        "level": level,
+        "touch_type": _vocab_str(read("touch_type"), _PAT_TOUCH_TYPES, None),
+        "level": _vocab_str(read("level"), _PAT_LEVELS, None),
         "yaw_deg": _optional_finite_float(read("yaw_deg")),
-        "phase": phase,
+        "phase": _vocab_str(read("phase", "idle"), _PAT_PHASES, "idle"),
         "phase_started_at": _optional_finite_float(read("phase_started_at")),
         "last_press_at": _optional_finite_float(read("last_press_at")),
+        "blocked_reason": blocked_reason,
     }
 
 

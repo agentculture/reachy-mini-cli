@@ -180,6 +180,7 @@ class TestEventShapes:
             "phase": "receptive",
             "phase_started_at": 10.0,
             "last_press_at": 10.4,
+            "blocked_reason": None,
         }
 
     def test_rule_event_fire_roundtrip(self):
@@ -391,7 +392,46 @@ class TestToRuntimeEvent:
             "phase": "receptive",
             "phase_started_at": 1.0,
             "last_press_at": 1.2,
+            "blocked_reason": None,
         }
+
+    def test_blocked_reason_is_carried_beside_availability(self):
+        """Issue #168: a blocked reading's cause rides beside ``availability``."""
+        mapped = to_runtime_event(
+            {
+                "type": "sense",
+                "pat_state": {"availability": "blocked", "blocked_reason": "stillness"},
+            }
+        )
+
+        assert isinstance(mapped, SenseEvent)
+        assert mapped.pat_state["availability"] == "blocked"
+        assert mapped.pat_state["blocked_reason"] == "stillness"
+
+    @pytest.mark.parametrize("availability", ["available", "unavailable"])
+    def test_blocked_reason_is_forced_none_outside_blocked(self, availability):
+        """A reason paired with a non-``"blocked"`` availability is meaningless."""
+        mapped = to_runtime_event(
+            {
+                "type": "sense",
+                "pat_state": {"availability": availability, "blocked_reason": "ownership"},
+            }
+        )
+
+        assert mapped.pat_state["availability"] == availability
+        assert mapped.pat_state["blocked_reason"] is None
+
+    @pytest.mark.parametrize("malformed", ["not-a-reason", 9000, [], None])
+    def test_malformed_blocked_reason_degrades_to_none(self, malformed):
+        mapped = to_runtime_event(
+            {
+                "type": "sense",
+                "pat_state": {"availability": "blocked", "blocked_reason": malformed},
+            }
+        )
+
+        assert mapped.pat_state["availability"] == "blocked"
+        assert mapped.pat_state["blocked_reason"] is None
 
     @pytest.mark.parametrize("malformed", ["not-an-object", ["available"], 42])
     def test_malformed_pat_state_isolated_from_legacy_sense(self, malformed):
@@ -436,6 +476,7 @@ class TestToRuntimeEvent:
             "phase": "idle",
             "phase_started_at": None,
             "last_press_at": None,
+            "blocked_reason": None,
         }
 
     def test_unknown_type_maps_to_none(self):
@@ -621,6 +662,7 @@ class TestSenseSnapshotDriver:
             "phase": "receptive",
             "phase_started_at": 10.0,
             "last_press_at": 10.4,
+            "blocked_reason": None,
         }
 
     def test_stable_pat_hold_emits_once_across_fifty_hz_ticks(self):

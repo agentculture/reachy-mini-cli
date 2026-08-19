@@ -236,7 +236,7 @@ DEFAULT_RELEASE_THRESHOLD = 0.2
 
 #: The STILLNESS GATE (issue #80). Detection runs only while the COMMANDED head
 #: pose has been constant for :data:`DEFAULT_STILL_HOLD_S` seconds, judged with a
-#: :data:`DEFAULT_STILL_EPS` tolerance per axis. Measured on the real robot (four
+#: :data:`DEFAULT_STILL_EPS_DEG_S` tolerance per axis. Measured on the real robot (four
 #: 30-50 s recordings, untouched vs petted, all six DOF):
 #:
 #:   head HELD STILL : untouched residual p99 0.07-0.11 deg, petting p90 0.85-1.90
@@ -253,28 +253,49 @@ DEFAULT_RELEASE_THRESHOLD = 0.2
 #: uncorrelated with commanded velocity). So stillness is a PRECONDITION for the
 #: sense, not a tuning knob: gating on it makes ghost fires structurally impossible
 #: while leaving a still robot fully pettable.
-#: Tolerance for "the commanded pose did not change" (degrees, per tick, per
-#: axis) — really a per-tick VELOCITY threshold, so the gate opens after
-#: :data:`DEFAULT_STILL_HOLD_S` below it. It was always a sustained-SLOW gate;
-#: it merely looked like a stillness gate while the idle behaviour froze.
+#: Tolerance for "the commanded pose did not change" — a per-axis VELOCITY
+#: threshold, so the gate opens after :data:`DEFAULT_STILL_HOLD_S` below it. It
+#: was always a sustained-SLOW gate; it merely looked like a stillness gate
+#: while the idle behaviour froze.
 #:
-#: RAISED 0.01 -> 0.035 and the hold 0.5 -> 1.0 (2026-07-20). The reasoning
-#: above this line was written for the FROZEN idle and inverts under v0.40.0's
-#: swinging ``feel-alive``: that commit measured the old 0.01 as opening the
-#: gate **0.0% of the time** under continuous motion at a 1.0 s hold, i.e. a
-#: robot that can never feel anything at all. It was deployed as a box-local
-#: systemd drop-in for months; shipping it makes a fresh box work unconfigured.
+#: RAISED (as a per-tick figure) 0.01 -> 0.035 and the hold 0.5 -> 1.0
+#: (2026-07-20). The reasoning above this line was written for the FROZEN idle
+#: and inverts under v0.40.0's swinging ``feel-alive``: that commit measured
+#: the old 0.01 as opening the gate **0.0% of the time** under continuous
+#: motion at a 1.0 s hold, i.e. a robot that can never feel anything at all. It
+#: was deployed as a box-local systemd drop-in for months; shipping it makes a
+#: fresh box work unconfigured.
 #:
-#: 0.035 deg/tick sits inside the swing's decelerate-pause-accelerate window
-#: (~10-15% of the time) where the plant has stopped ringing. The old warning
-#: that this range "creeps open at the wander's turning points" was true of the
-#: WANDER, whose zero crossings are instantaneous; the swing's extremes hold a
-#: genuine ~3.4 s slow window, which is the whole point of #82. Measured there:
-#: untouched residual 0.70 deg vs petted 2.52 deg, hence the 1.2 press below.
+#: 0.035 deg/tick (at the engine's 50 Hz design cadence) sits inside the
+#: swing's decelerate-pause-accelerate window (~10-15% of the time) where the
+#: plant has stopped ringing. The old warning that this range "creeps open at
+#: the wander's turning points" was true of the WANDER, whose zero crossings
+#: are instantaneous; the swing's extremes hold a genuine ~3.4 s slow window,
+#: which is the whole point of #82. Measured there: untouched residual 0.70
+#: deg vs petted 2.52 deg, hence the 1.2 press below.
 #:
 #: The longer 1.0 s hold is what buys the "plant has stopped ringing" part —
 #: shortening it back toward 0.5 s re-admits the ring at this looser tolerance.
-DEFAULT_STILL_EPS = 0.035
+#:
+#: DT-NORMALIZED to degrees per SECOND (issue #168). A per-tick tolerance makes
+#: the gate's open-fraction a function of tick cadence: on the Reachy Wireless
+#: the runtime ticks at ~6.8 Hz instead of the 50 Hz design point, so per-tick
+#: deltas run ~7x design there and the old 0.035 deg/tick gate never opened at
+#: all. 0.035 deg/tick at 50 Hz is 1.75 deg/s; the shipped default below is
+#: 1.25 deg/s — slightly tighter (0.025 deg/tick at a clean 50 Hz) — chosen
+#: because it keeps the wander ghost class fully closed (0 events, ~0% open on
+#: both wander fixtures) while the swing still opens (~6.3% of 0.92 s windows),
+#: preserving both properties this gate exists for across tick rate.
+#:
+#: Safe against the UNCHANGED press/release/hp_tau/release-after pairing above
+#: (review t1, issue #168) precisely because 1.25 deg/s is TIGHTER, not looser,
+#: at the 50 Hz design point the rest of that pairing was tuned at: 1.25 deg/s
+#: is 0.025 deg/tick at a clean 50 Hz, versus the retired 0.035 deg/tick, so the
+#: gate cannot admit sensing any earlier in the swing's decelerate-pause window
+#: than the shipped 1.2 press pairing already assumes. Live-verified on both
+#: units 2026-08-19: the Wireless pets end-to-end at its native ~6.8 Hz, and the
+#: Lite's 10-minute soak at ~50 Hz logged zero ghost fires.
+DEFAULT_STILL_EPS_DEG_S = 1.25
 DEFAULT_STILL_HOLD_S = 1.0  # commanded must be quiet this long before sensing
 
 #: Longest interval between logical observation ticks that can preserve an
@@ -345,7 +366,7 @@ class PatSenseDriver:
         lag_tau: float = DEFAULT_LAG_TAU,
         hp_tau: float = DEFAULT_HP_TAU,
         warmup_s: float = DEFAULT_WARMUP_S,
-        still_eps: float = DEFAULT_STILL_EPS,
+        eps_deg_s: float = DEFAULT_STILL_EPS_DEG_S,
         still_hold_s: float = DEFAULT_STILL_HOLD_S,
         max_observation_gap_s: float = DEFAULT_MAX_OBSERVATION_GAP_S,
         enough_after_fn: Callable[[], float] | None = None,
@@ -373,15 +394,21 @@ class PatSenseDriver:
         #: settled post-gesture offset can never read as a step).
         self._dev_lp: tuple[float, float] | None = (0.0, 0.0)
         self._hp_last_now: float | None = None
-        #: Stillness gate (issue #80): commanded-change tolerance and the quiet
-        #: hold required before sensing resumes. ``still_hold_s <= 0`` disables.
-        self._still_eps = max(0.0, float(still_eps))
+        #: Stillness gate (issue #80): commanded-change VELOCITY tolerance (deg/s,
+        #: dt-normalized — issue #168) and the quiet hold required before sensing
+        #: resumes. ``still_hold_s <= 0`` disables.
+        self._eps_deg_s = max(0.0, float(eps_deg_s))
         self._still_hold_s = max(0.0, float(still_hold_s))
         self._max_observation_gap_s = max(0.0, float(max_observation_gap_s))
         self._last_observation_at: float | None = None
         #: Last commanded (pitch, yaw) and the clock reading when it last moved.
         self._last_cmd: tuple[float, ...] | None = None
         self._last_motion_t: float | None = None
+        #: DEDICATED previous-clock stash for the stillness gate's dt (issue
+        #: #168) — never shared with ``_last_now``/``_hp_last_now``, so a
+        #: detection gap can never compute a velocity across itself; cleared in
+        #: :meth:`_rearm_stillness_hold`.
+        self._still_last_now: float | None = None
         self._last_owners: tuple[object, object, object] | None = None
         #: Boot calibration-mute window (s); ``0`` disables (see d1 fix).
         self._warmup_s = max(0.0, float(warmup_s))
@@ -405,6 +432,13 @@ class PatSenseDriver:
         #: Reset at the top of every :meth:`_process`; keeps the per-tick
         #: conditioning re-seed idempotent however many edges fire at once.
         self._reseeded_this_tick = False
+        #: Reset at the top of every :meth:`_process` alongside
+        #: ``_reseeded_this_tick``. Set the first time :meth:`_begin_gap`
+        #: assigns a ``blocked_reason`` this tick; while set, later
+        #: :meth:`_begin_gap` calls in the SAME tick keep the reason already on
+        #: ``self._state`` instead of adopting their own — first cause wins
+        #: within a tick (issue #168 review t3). See :meth:`_begin_gap`.
+        self._reason_latched_this_tick = False
         #: One contiguous unsafe observation interval. Interaction state is
         #: cleared exactly once when this opens; recovery only reseeds filters.
         self._gap_active = False
@@ -464,8 +498,12 @@ class PatSenseDriver:
         now = self._now(ctx)
         # Conditioning is reseeded at most once per tick no matter how many
         # edges fire; `_reseed_once` owns that, so each gate below stays a
-        # plain guard clause.
+        # plain guard clause. `_reason_latched_this_tick` is the matching
+        # once-per-tick guard for `blocked_reason` (see `_begin_gap`): the
+        # FIRST cause a tick assigns wins, later gates in the same tick may
+        # not override it.
         self._reseeded_this_tick = False
+        self._reason_latched_this_tick = False
         self._apply_observation_edges(ctx, now)
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
@@ -474,7 +512,7 @@ class PatSenseDriver:
             if not self._stillness_blocked:
                 self._rearm_stillness_hold()
             self._stillness_blocked = True
-            self._begin_gap("blocked", now)
+            self._begin_gap("blocked", now, reason="no-command")
             return
         commanded = (commanded_full[4], commanded_full[5])
 
@@ -485,6 +523,9 @@ class PatSenseDriver:
         actual = self._read_actual()
         if actual is None:
             self._input_gap = True
+            # "unavailable" is already unambiguous on its own (issue #168):
+            # a missing reading needs no separate cause label, so this is the
+            # one blocked-family branch that never names a `reason`.
             self._begin_gap("unavailable", now)
             return
         if self._input_gap:
@@ -511,7 +552,11 @@ class PatSenseDriver:
         # release time, or cooldown time.
         self._advance_policy_clock(now)
         if self._state.phase == "cooldown":
-            self._state = replace(self._state, availability="available")
+            # This tick is an ordinary safe observation (every gate above
+            # passed), so any `blocked_reason` carried forward by
+            # `_advance_policy_clock` must be cleared here too — `replace()`
+            # otherwise keeps it (issue #168's "watch out").
+            self._state = replace(self._state, availability="available", blocked_reason=None)
             self._last_available_at = now
             return
 
@@ -524,9 +569,22 @@ class PatSenseDriver:
         self._reseed_after_gap()
         self._reseeded_this_tick = True
 
-    def _blocked_edge(self, now: float | None) -> None:
-        """Open a blocked gap and make the stillness gate re-earn its window."""
-        self._begin_gap("blocked", now)
+    def _blocked_edge(self, now: float | None, *, reason: str) -> None:
+        """Open a blocked gap and make the stillness gate re-earn its window.
+
+        The rearm below (issue #168) means the very next gate this tick's
+        `_process` checks is `_stillness_open`, which — with the gate
+        enabled — closes again immediately (a fresh rearm has no earned quiet
+        window) and would call `_begin_gap` a second time this same tick with
+        ``reason="stillness"``. `_begin_gap`'s per-tick latch (review t3)
+        keeps THIS reason instead: within one tick the FIRST cause assigned
+        wins, because the edge is the root cause and the stillness closure it
+        triggers is only a consequence of it — the edge reason must survive at
+        least one full observable tick. The tick AFTER this one, with no new
+        edge, legitimately reports ``"stillness"`` while the gate re-earns its
+        hold (the latch resets every tick — see `_process`).
+        """
+        self._begin_gap("blocked", now, reason=reason)
         self._rearm_stillness_hold()
         if self._still_hold_s <= 0.0:
             # With the gate disabled there is no quiet window to re-earn, so
@@ -544,9 +602,9 @@ class PatSenseDriver:
         the head. Both invalidate conditioning the same way.
         """
         if self._observation_clock_gapped(now):
-            self._blocked_edge(now)
+            self._blocked_edge(now, reason="clock-gap")
         if self._ownership_changed(ctx):
-            self._blocked_edge(now)
+            self._blocked_edge(now, reason="ownership")
 
     def _stillness_open(self, commanded_full: tuple[float, ...], now: float | None) -> bool:
         """Whether this tick's commanded pose is inside a sensing-safe still window (#80).
@@ -560,7 +618,7 @@ class PatSenseDriver:
         """
         if not self._commanded_still(commanded_full, now):
             self._stillness_blocked = True
-            self._begin_gap("blocked", now)
+            self._begin_gap("blocked", now, reason="stillness")
             return False
         if self._stillness_blocked:
             # First tick back on a still commanded pose (a genuine
@@ -625,9 +683,13 @@ class PatSenseDriver:
         """Force the stillness gate to re-earn its quiet window.
 
         See :meth:`_reseed_after_gap` for the matching conditioning reset.
+        Clearing ``_still_last_now`` here (issue #168) is what makes a
+        detection gap never compute a velocity across itself: the next sample
+        after re-arming is treated as a fresh first sample, not a huge-dt jump.
         """
         self._last_cmd = None
         self._last_motion_t = None
+        self._still_last_now = None
 
     def _reseed_after_gap(self) -> None:
         """Reseed conditioning when a detection gap becomes safe again.
@@ -642,7 +704,9 @@ class PatSenseDriver:
         self._last_now = None
         self._hp_last_now = None
 
-    def _end_interaction(self, now: float | None, *, availability: str) -> None:
+    def _end_interaction(
+        self, now: float | None, *, availability: str, reason: str | None = None
+    ) -> None:
         """Clear detector and persistent policy state at one interaction edge."""
         if self._state.phase == "enough" and self._cooldown_remaining_s is None:
             self._cooldown_remaining_s = self._cooldown_s
@@ -655,9 +719,10 @@ class PatSenseDriver:
             availability=availability,
             phase="idle",
             phase_started_at=now,
+            blocked_reason=reason,
         )
 
-    def _suspend_interaction(self, availability: str) -> None:
+    def _suspend_interaction(self, availability: str, *, reason: str | None) -> None:
         """Pause a LIVE interaction across a gap without ending it.
 
         The split from :meth:`_end_interaction` is the whole point: every
@@ -676,9 +741,11 @@ class PatSenseDriver:
         self.detector.clear_interaction()
         self._seen_press_at = None
         self._last_available_at = None
-        self._state = replace(self._state, availability=availability)
+        self._state = replace(self._state, availability=availability, blocked_reason=reason)
 
-    def _begin_gap(self, availability: str, now: float | None) -> None:
+    def _begin_gap(
+        self, availability: str, now: float | None, *, reason: str | None = None
+    ) -> None:
         """Open or update one unsafe interval without repeated clear churn.
 
         A gap means "cannot sense right now", which is NOT the same as "the
@@ -704,7 +771,20 @@ class PatSenseDriver:
         conservative direction — it can only end contact earlier, never invent
         it — and the arithmetic has margin: the reaction's blind window is entry
         slew + gate re-arm (~1.24 s) against a 2.5 s ``RELEASE_AFTER_S``.
+
+        First-cause-wins (review t3, issue #168): ``self._reason_latched_this_tick``
+        is a per-tick latch (reset in :meth:`_process`) — the FIRST call to this
+        method in a given tick fixes ``reason`` for every remaining call in that
+        SAME tick, including one this method makes to itself via
+        ``_end_interaction``/``_suspend_interaction``. A gate that closes as a
+        *consequence* of an edge (the stillness rearm below) must never mask the
+        edge that caused it; the next tick, with the latch reset, reports
+        whatever is closing the gate then on its own merits.
         """
+        if self._reason_latched_this_tick:
+            reason = self._state.blocked_reason
+        else:
+            self._reason_latched_this_tick = True
         # `enough` is the one live-contact phase that must still END here: it is
         # the interaction deliberately concluding, and `_end_interaction` is what
         # arms the lifecycle cooldown. Suspending it would drop that cooldown and
@@ -715,20 +795,27 @@ class PatSenseDriver:
             # to avoid (and would reset the escalation guard repeatedly).
             if not self._gap_active:
                 self._gap_started_at = now
-                self._suspend_interaction(availability)
+                self._suspend_interaction(availability, reason=reason)
                 self._gap_active = True
                 return
-            self._state = replace(self._state, availability=availability)
+            # Already suspended: a later edge within the same persisting gap
+            # (issue #168) updates ``availability`` to THIS tick's cause but
+            # keeps whichever ``reason`` the latch above resolved — the first
+            # cause this tick, never a later one (review t3; was "latest wins").
+            self._state = replace(self._state, availability=availability, blocked_reason=reason)
             self._last_available_at = None
             return
         if not self._gap_active:
-            self._end_interaction(now, availability=availability)
+            self._end_interaction(now, availability=availability, reason=reason)
             self._gap_active = True
             return
+        # Already ended: same first-cause-wins update as above (`reason` was
+        # already resolved by the latch at the top of this method).
         self._state = PatState(
             availability=availability,
             phase="idle",
             phase_started_at=self._state.phase_started_at,
+            blocked_reason=reason,
         )
         self._last_available_at = None
         self._no_fresh_since = None
@@ -740,6 +827,8 @@ class PatSenseDriver:
             if self._state.availability == "available" and self._state.phase == "idle"
             else now
         )
+        # A fresh PatState() defaults blocked_reason to None; no explicit
+        # clear needed, unlike the `replace()` calls elsewhere in this file.
         self._state = PatState(
             availability="available",
             phase="idle",
@@ -747,7 +836,15 @@ class PatSenseDriver:
         )
 
     def _advance_policy_clock(self, now: float | None) -> None:
-        """Advance cooldown using safe-observation time, pausing across gaps."""
+        """Advance cooldown using safe-observation time, pausing across gaps.
+
+        Every ``PatState`` built here carries ``availability=self._state.availability``
+        forward UNCHANGED (this method never decides availability, only the phase
+        clock), so ``blocked_reason`` is carried forward the same way — copying one
+        without the other would desynchronize the pair the instant this runs mid-tick
+        while a gap edge set earlier in the same tick (see ``_apply_observation_edges``)
+        has not yet been resolved by the caller.
+        """
         if now is None:
             return
         if self._state.phase == "enough":
@@ -763,6 +860,7 @@ class PatSenseDriver:
                     availability=self._state.availability,
                     phase="idle",
                     phase_started_at=now,
+                    blocked_reason=self._state.blocked_reason,
                 )
                 return
             self._state = PatState(
@@ -770,6 +868,7 @@ class PatSenseDriver:
                 contact=False,
                 phase="cooldown",
                 phase_started_at=now,
+                blocked_reason=self._state.blocked_reason,
             )
             return
 
@@ -786,12 +885,14 @@ class PatSenseDriver:
                     availability=self._state.availability,
                     phase="idle",
                     phase_started_at=now,
+                    blocked_reason=self._state.blocked_reason,
                 )
                 return
             self._state = PatState(
                 availability=self._state.availability,
                 phase="cooldown",
                 phase_started_at=now,
+                blocked_reason=self._state.blocked_reason,
             )
             return
 
@@ -805,6 +906,7 @@ class PatSenseDriver:
                 availability=self._state.availability,
                 phase="idle",
                 phase_started_at=now,
+                blocked_reason=self._state.blocked_reason,
             )
             return
         self._cooldown_remaining_s = remaining
@@ -815,8 +917,13 @@ class PatSenseDriver:
         A thin three-stage orchestrator: adopt this tick's evidence, then (while
         contact holds) test the release budget, then walk the contact ladder.
         """
+        # Every path below reaches an "available" tick (`_update_pat_state` runs
+        # only after `_observe` has cleared every blocking gate), so each
+        # `replace()` explicitly clears `blocked_reason` — it is never carried
+        # forward here the way `_advance_policy_clock` carries it (issue #168's
+        # "watch out": `replace()` otherwise keeps a stale reason).
         if now is None:
-            self._state = replace(self._state, availability="available")
+            self._state = replace(self._state, availability="available", blocked_reason=None)
             return
         evidence = self.detector.snapshot()
         fresh = evidence.last_press_at is not None and evidence.last_press_at != self._seen_press_at
@@ -827,7 +934,7 @@ class PatSenseDriver:
         if fresh:
             self._adopt_fresh_press(evidence, now)
         else:
-            self._state = replace(self._state, availability="available")
+            self._state = replace(self._state, availability="available", blocked_reason=None)
 
         if not self._state.contact:
             return
@@ -933,22 +1040,47 @@ class PatSenseDriver:
     def _commanded_still(self, commanded: tuple[float, ...], now: float | None) -> bool:
         """Whether the COMMANDED pose has been constant long enough to sense.
 
-        Any per-axis change beyond ``still_eps`` restamps the motion clock; the
-        gate opens only once ``still_hold_s`` has elapsed with no such change.
-        Disabled (always open) when ``still_hold_s <= 0``. With no clock the gate
-        stays open — conditioning and ownership-edge re-baselining still apply.
+        Any per-axis VELOCITY beyond ``eps_deg_s`` (max |delta| / dt, issue
+        #168 — dt-normalized so the gate's behavior is cadence-invariant)
+        restamps the motion clock; the gate opens only once ``still_hold_s``
+        has elapsed with no such change. Disabled (always open) when
+        ``still_hold_s <= 0``. With no clock the gate stays open — conditioning
+        and ownership-edge re-baselining still apply, and the dedicated dt
+        stash is dropped so a resumed clock starts from a fresh first sample
+        rather than a stale ``prev_now``.
+
+        ``dt`` comes from consecutive ``now`` readings against a DEDICATED
+        stash (``_still_last_now`` — never ``_last_now``/``_hp_last_now``, so a
+        detection gap can never compute a velocity across itself; cleared in
+        :meth:`_rearm_stillness_hold`), clamped to ``[0, 0.2]`` s exactly like
+        :meth:`_lag_filtered` / :meth:`_highpassed`. The first sample (no
+        previous commanded pose, or no previous clock reading) has no dt to
+        derive a velocity from and counts as "moved" — it merely restamps the
+        motion clock, matching the pre-#168 first-sample behavior.
         """
         if self._still_hold_s <= 0.0:
             return True
         prev = self._last_cmd
         self._last_cmd = commanded
         if now is None:
+            self._still_last_now = None
             return True
-        if (
-            prev is None
-            or max(abs(current - previous) for current, previous in zip(commanded, prev))
-            > self._still_eps
-        ):
+        prev_now = self._still_last_now
+        self._still_last_now = now
+        if prev is None or prev_now is None:
+            self._last_motion_t = now
+            return False
+        dt = min(max(now - prev_now, 0.0), 0.2)
+        if dt <= 0.0:
+            # No time elapsed since the last sample: any nonzero delta is an
+            # instantaneous jump (infinite velocity -> moved); zero delta is
+            # trivially still.
+            velocity = 0.0 if commanded == prev else float("inf")
+        else:
+            velocity = (
+                max(abs(current - previous) for current, previous in zip(commanded, prev)) / dt
+            )
+        if velocity > self._eps_deg_s:
             self._last_motion_t = now
             return False
         if self._last_motion_t is None:

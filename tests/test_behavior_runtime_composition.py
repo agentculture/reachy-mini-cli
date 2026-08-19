@@ -211,6 +211,7 @@ def test_pat_sense_flows_into_the_feed_via_the_composed_stack(_isolated, monkeyp
     state = detected["pat_state"]
     assert {key: value for key, value in state.items() if not key.endswith("_at")} == {
         "availability": "available",
+        "blocked_reason": None,
         "contact": True,
         "touch_type": "scratch",
         "level": "level1",
@@ -411,16 +412,23 @@ def test_pat_sense_enabled_env_parsing(monkeypatch, raw, expected):
 
 
 # --------------------------------------------------------------------------- #
-# 7. Stillness gate tuning surface — REACHY_PAT_STILL_HOLD_S / _EPS (t2)      #
+# 7. Stillness gate tuning surface — REACHY_PAT_STILL_HOLD_S (t2)             #
 # --------------------------------------------------------------------------- #
 #
-# t2 ("no-freeze pat sense") makes the stillness gate's ``still_hold_s`` /
-# ``still_eps`` reachable without editing source, so a bench experiment can
-# retune them. Three things are pinned here: (a) unset -> today's shipped
-# values reach PatSenseDriver's constructor unchanged; (b) an explicit
-# override actually reaches the constructor; (c) REACHY_PAT_SENSE's existing
-# on/off semantics stay authoritative — setting an override alone must never
-# turn the pat stack on.
+# t2 ("no-freeze pat sense") makes the stillness gate's ``still_hold_s``
+# reachable without editing source, so a bench experiment can retune it.
+# Three things are pinned here: (a) unset -> today's shipped value reaches
+# PatSenseDriver's constructor unchanged; (b) an explicit override actually
+# reaches the constructor; (c) REACHY_PAT_SENSE's existing on/off semantics
+# stay authoritative — setting an override alone must never turn the pat
+# stack on.
+#
+# The eps leg (``REACHY_PAT_STILL_EPS``) was retired with the dt-normalized
+# deg/s gate (issue #168, task t1): composition now passes NO eps at all, so
+# PatSenseDriver's own ``eps_deg_s`` default (1.25) applies unconditionally.
+# Task t2 restores env coverage under the new ``REACHY_PAT_STILL_EPS_DEG_S``
+# name (plus a warn-and-ignore for the retired spelling); the eps-specific
+# tests that used to live in this section are removed here, not weakened.
 
 
 def _capture_pat_sense_driver(monkeypatch):
@@ -440,17 +448,17 @@ def _capture_pat_sense_driver(monkeypatch):
 
 
 def test_compose_run_seam_default_pat_sense_uses_todays_shipped_values(_isolated, monkeypatch):
-    """Unset ``REACHY_PAT_STILL_HOLD_S`` / ``REACHY_PAT_STILL_EPS`` -> the composed
-    ``PatSenseDriver`` is constructed with exactly today's shipped defaults
-    (0.5 s / 0.01 deg), so current behavior stays byte-identical for an operator
-    who never sets either var."""
+    """Unset ``REACHY_PAT_STILL_HOLD_S`` -> the composed ``PatSenseDriver`` is
+    constructed with exactly today's shipped ``still_hold_s`` default (1.0 s),
+    so current behavior stays byte-identical for an operator who never sets
+    it. No ``still_eps``/``eps_deg_s`` kwarg is passed at all (issue #168, task
+    t1): the driver's own ``eps_deg_s`` default (1.25) applies."""
     from reachy.behavior.engine import EngineConfig
-    from reachy.behavior.pat_sense import DEFAULT_STILL_EPS, DEFAULT_STILL_HOLD_S
+    from reachy.behavior.pat_sense import DEFAULT_STILL_HOLD_S
     from reachy.cli._commands import behavior as behavior_mod
 
     monkeypatch.setenv("REACHY_PAT_SENSE", "1")
     monkeypatch.delenv("REACHY_PAT_STILL_HOLD_S", raising=False)
-    monkeypatch.delenv("REACHY_PAT_STILL_EPS", raising=False)
     monkeypatch.setattr(
         "reachy.cli._commands.behavior._make_state_reader",
         lambda: _ScriptedReader([(0.0, 0.0)]),
@@ -466,22 +474,21 @@ def test_compose_run_seam_default_pat_sense_uses_todays_shipped_values(_isolated
         reader.close()
 
     assert len(calls) == 1, "PatSenseDriver must be constructed exactly once"
-    # The literals are repeated on purpose: this is a tripwire, so a default
-    # change has to be acknowledged here rather than sliding through. Moved
-    # 0.5/0.01 -> 1.0/0.035 in v0.41.0 when the swing-era gate became shipped.
+    # The literal is repeated on purpose: this is a tripwire, so a default
+    # change has to be acknowledged here rather than sliding through.
     assert calls[0]["still_hold_s"] == DEFAULT_STILL_HOLD_S == 1.0
-    assert calls[0]["still_eps"] == DEFAULT_STILL_EPS == 0.035
+    assert "still_eps" not in calls[0]
+    assert "eps_deg_s" not in calls[0]
 
 
 def test_compose_run_seam_env_override_reaches_the_driver(_isolated, monkeypatch):
-    """``REACHY_PAT_STILL_HOLD_S`` / ``REACHY_PAT_STILL_EPS`` actually reach the
-    composed ``PatSenseDriver``'s constructor — not just a module-level default."""
+    """``REACHY_PAT_STILL_HOLD_S`` actually reaches the composed
+    ``PatSenseDriver``'s constructor — not just a module-level default."""
     from reachy.behavior.engine import EngineConfig
     from reachy.cli._commands import behavior as behavior_mod
 
     monkeypatch.setenv("REACHY_PAT_SENSE", "1")
     monkeypatch.setenv("REACHY_PAT_STILL_HOLD_S", "1.25")
-    monkeypatch.setenv("REACHY_PAT_STILL_EPS", "0.05")
     monkeypatch.setattr(
         "reachy.cli._commands.behavior._make_state_reader",
         lambda: _ScriptedReader([(0.0, 0.0)]),
@@ -498,18 +505,16 @@ def test_compose_run_seam_env_override_reaches_the_driver(_isolated, monkeypatch
 
     assert len(calls) == 1
     assert calls[0]["still_hold_s"] == pytest.approx(1.25)
-    assert calls[0]["still_eps"] == pytest.approx(0.05)
 
 
 def test_still_tuning_env_vars_do_not_enable_pat_sense_when_toggle_is_off(_isolated, monkeypatch):
     """``REACHY_PAT_SENSE``'s existing on/off semantics stay authoritative: setting
-    the stillness overrides never turns the pat stack on by themselves."""
+    the stillness override never turns the pat stack on by itself."""
     from reachy.behavior.engine import EngineConfig
     from reachy.cli._commands import behavior as behavior_mod
 
     monkeypatch.setenv("REACHY_PAT_SENSE", "0")
     monkeypatch.setenv("REACHY_PAT_STILL_HOLD_S", "9.0")
-    monkeypatch.setenv("REACHY_PAT_STILL_EPS", "9.0")
     calls = _capture_pat_sense_driver(monkeypatch)
 
     transport = _QuietTransport()
@@ -544,31 +549,176 @@ def test_pat_still_hold_s_env_parsing(monkeypatch, raw, expected):
         monkeypatch.delenv("REACHY_PAT_STILL_HOLD_S", raising=False)
     else:
         monkeypatch.setenv("REACHY_PAT_STILL_HOLD_S", raw)
-    monkeypatch.delenv("REACHY_PAT_STILL_EPS", raising=False)
 
-    still_hold_s, _still_eps = _pat_still_tuning()
+    still_hold_s = _pat_still_tuning()
     assert still_hold_s == pytest.approx(expected)
+
+
+# The eps-parsing tests that used to live here (``test_pat_still_eps_env_parsing``,
+# ``test_pat_still_eps_malformed_value_raises_clean_error``) are removed: `_pat_still_tuning`
+# no longer resolves an eps value at all (issue #168, task t1). Task t2 restores
+# equivalent env coverage under the new ``REACHY_PAT_STILL_EPS_DEG_S`` name.
+
+
+def test_pat_eps_deg_s_env_override_reaches_the_driver(_isolated, monkeypatch):
+    """``REACHY_PAT_STILL_EPS_DEG_S`` actually reaches the composed
+    ``PatSenseDriver``'s constructor — not just a module-level default."""
+    from reachy.behavior.engine import EngineConfig
+    from reachy.cli._commands import behavior as behavior_mod
+
+    monkeypatch.setenv("REACHY_PAT_SENSE", "1")
+    monkeypatch.setenv("REACHY_PAT_STILL_EPS_DEG_S", "0.8")
+    monkeypatch.setattr(
+        "reachy.cli._commands.behavior._make_state_reader",
+        lambda: _ScriptedReader([(0.0, 0.0)]),
+    )
+    calls = _capture_pat_sense_driver(monkeypatch)
+
+    transport = _QuietTransport()
+    config = EngineConfig(compose_hz=50, base_layer=False, settle=False)
+    _sense_reader, _tick_seam, reader = behavior_mod._compose_run_seam(
+        transport, config, None, None
+    )
+    if reader is not None:
+        reader.close()
+
+    assert len(calls) == 1
+    assert calls[0]["eps_deg_s"] == pytest.approx(0.8)
+
+
+def test_pat_eps_deg_s_env_unset_passes_no_eps_kwarg(_isolated, monkeypatch):
+    """Unset ``REACHY_PAT_STILL_EPS_DEG_S`` -> no eps_deg_s kwarg passed, so the
+    driver's own default (1.25 deg/s) applies."""
+    from reachy.behavior.engine import EngineConfig
+    from reachy.cli._commands import behavior as behavior_mod
+
+    monkeypatch.setenv("REACHY_PAT_SENSE", "1")
+    monkeypatch.delenv("REACHY_PAT_STILL_EPS_DEG_S", raising=False)
+    monkeypatch.setattr(
+        "reachy.cli._commands.behavior._make_state_reader",
+        lambda: _ScriptedReader([(0.0, 0.0)]),
+    )
+    calls = _capture_pat_sense_driver(monkeypatch)
+
+    transport = _QuietTransport()
+    config = EngineConfig(compose_hz=50, base_layer=False, settle=False)
+    _sense_reader, _tick_seam, reader = behavior_mod._compose_run_seam(
+        transport, config, None, None
+    )
+    if reader is not None:
+        reader.close()
+
+    assert len(calls) == 1
+    assert "eps_deg_s" not in calls[0]
+
+
+def test_legacy_reachy_pat_still_eps_emits_senselog_drop_and_is_ignored(
+    _isolated, monkeypatch, caplog
+):
+    """Legacy ``REACHY_PAT_STILL_EPS`` set alone -> no eps override AND a
+    senselog.drop line is emitted naming both the legacy and new spellings."""
+    import logging
+
+    from reachy.behavior.engine import EngineConfig
+    from reachy.cli._commands import behavior as behavior_mod
+
+    monkeypatch.setenv("REACHY_PAT_SENSE", "1")
+    monkeypatch.setenv("REACHY_PAT_STILL_EPS", "0.035")
+    monkeypatch.delenv("REACHY_PAT_STILL_EPS_DEG_S", raising=False)
+    monkeypatch.setattr(
+        "reachy.cli._commands.behavior._make_state_reader",
+        lambda: _ScriptedReader([(0.0, 0.0)]),
+    )
+    calls = _capture_pat_sense_driver(monkeypatch)
+
+    transport = _QuietTransport()
+    config = EngineConfig(compose_hz=50, base_layer=False, settle=False)
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        _sense_reader, _tick_seam, reader = behavior_mod._compose_run_seam(
+            transport, config, None, None
+        )
+        if reader is not None:
+            reader.close()
+
+    assert len(calls) == 1
+    assert "eps_deg_s" not in calls[0]
+    # The senselog line names the drop reason
+    lines = [record.getMessage() for record in caplog.records if record.name == "reachy.sense"]
+    assert any(
+        "legacy-eps-ignored" in line and "REACHY_PAT_STILL_EPS" in line for line in lines
+    ), f"Expected 'legacy-eps-ignored' drop in senselog, got: {lines}"
+
+
+def test_both_eps_env_vars_set_new_wins_and_legacy_still_warned(_isolated, monkeypatch, caplog):
+    """Both ``REACHY_PAT_STILL_EPS`` and ``REACHY_PAT_STILL_EPS_DEG_S`` set ->
+    the new var's value wins, the legacy line is still emitted."""
+    import logging
+
+    from reachy.behavior.engine import EngineConfig
+    from reachy.cli._commands import behavior as behavior_mod
+
+    monkeypatch.setenv("REACHY_PAT_SENSE", "1")
+    monkeypatch.setenv("REACHY_PAT_STILL_EPS", "0.035")  # legacy, ignored
+    monkeypatch.setenv("REACHY_PAT_STILL_EPS_DEG_S", "2.5")  # new, used
+    monkeypatch.setattr(
+        "reachy.cli._commands.behavior._make_state_reader",
+        lambda: _ScriptedReader([(0.0, 0.0)]),
+    )
+    calls = _capture_pat_sense_driver(monkeypatch)
+
+    transport = _QuietTransport()
+    config = EngineConfig(compose_hz=50, base_layer=False, settle=False)
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        _sense_reader, _tick_seam, reader = behavior_mod._compose_run_seam(
+            transport, config, None, None
+        )
+        if reader is not None:
+            reader.close()
+
+    assert len(calls) == 1
+    assert calls[0]["eps_deg_s"] == pytest.approx(2.5)  # new var value used
+    lines = [record.getMessage() for record in caplog.records if record.name == "reachy.sense"]
+    assert any(
+        "legacy-eps-ignored" in line for line in lines
+    ), f"Expected legacy drop line, got: {lines}"
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        pytest.param(None, 0.035, id="absent-default"),
-        pytest.param("0.035", 0.035, id="matches-default"),
-        pytest.param("0.25", 0.25, id="override"),
+        pytest.param(None, None, id="absent-no-override"),
+        pytest.param("1.25", 1.25, id="matches-default"),
+        pytest.param("0.8", 0.8, id="override"),
+        pytest.param("0", 0.0, id="zero-disables-gate"),
+        pytest.param("  2.0  ", 2.0, id="whitespace-trimmed"),
     ],
 )
-def test_pat_still_eps_env_parsing(monkeypatch, raw, expected):
-    from reachy.cli._commands.behavior import _pat_still_tuning
+def test_pat_eps_deg_s_env_parsing(monkeypatch, raw, expected):
+    from reachy.cli._commands.behavior import _pat_eps_deg_s_override
 
-    monkeypatch.delenv("REACHY_PAT_STILL_HOLD_S", raising=False)
     if raw is None:
-        monkeypatch.delenv("REACHY_PAT_STILL_EPS", raising=False)
+        monkeypatch.delenv("REACHY_PAT_STILL_EPS_DEG_S", raising=False)
     else:
-        monkeypatch.setenv("REACHY_PAT_STILL_EPS", raw)
+        monkeypatch.setenv("REACHY_PAT_STILL_EPS_DEG_S", raw)
 
-    _still_hold_s, still_eps = _pat_still_tuning()
-    assert still_eps == pytest.approx(expected)
+    eps_deg_s = _pat_eps_deg_s_override()
+    if expected is None:
+        assert eps_deg_s is None
+    else:
+        assert eps_deg_s == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw", ["banana", "", "  ", "1.2.3", "1,5"])
+def test_pat_eps_deg_s_malformed_value_raises_clean_error(monkeypatch, raw):
+    from reachy.cli._commands.behavior import _pat_eps_deg_s_override
+    from reachy.cli._errors import EXIT_USER_ERROR, CliError
+
+    monkeypatch.setenv("REACHY_PAT_STILL_EPS_DEG_S", raw)
+
+    with pytest.raises(CliError) as excinfo:
+        _pat_eps_deg_s_override()
+    assert excinfo.value.code == EXIT_USER_ERROR
+    assert "REACHY_PAT_STILL_EPS_DEG_S" in excinfo.value.message
 
 
 @pytest.mark.parametrize("raw", ["banana", "", "  ", "1.2.3", "1,5"])
@@ -577,26 +727,11 @@ def test_pat_still_hold_s_malformed_value_raises_clean_error(monkeypatch, raw):
     from reachy.cli._errors import EXIT_USER_ERROR, CliError
 
     monkeypatch.setenv("REACHY_PAT_STILL_HOLD_S", raw)
-    monkeypatch.delenv("REACHY_PAT_STILL_EPS", raising=False)
 
     with pytest.raises(CliError) as excinfo:
         _pat_still_tuning()
     assert excinfo.value.code == EXIT_USER_ERROR
     assert "REACHY_PAT_STILL_HOLD_S" in excinfo.value.message
-
-
-@pytest.mark.parametrize("raw", ["banana", "", "1e", "1_2_3xyz"])
-def test_pat_still_eps_malformed_value_raises_clean_error(monkeypatch, raw):
-    from reachy.cli._commands.behavior import _pat_still_tuning
-    from reachy.cli._errors import EXIT_USER_ERROR, CliError
-
-    monkeypatch.delenv("REACHY_PAT_STILL_HOLD_S", raising=False)
-    monkeypatch.setenv("REACHY_PAT_STILL_EPS", raw)
-
-    with pytest.raises(CliError) as excinfo:
-        _pat_still_tuning()
-    assert excinfo.value.code == EXIT_USER_ERROR
-    assert "REACHY_PAT_STILL_EPS" in excinfo.value.message
 
 
 def test_engine_run_cli_reports_clean_error_on_malformed_still_tuning_env(_isolated, monkeypatch):

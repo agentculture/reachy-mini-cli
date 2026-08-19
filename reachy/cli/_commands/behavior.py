@@ -73,7 +73,7 @@ from reachy.behavior.pat_sense import (
     DEFAULT_HP_TAU,
     DEFAULT_PRESS_THRESHOLD,
     DEFAULT_RELEASE_THRESHOLD,
-    DEFAULT_STILL_EPS,
+    DEFAULT_STILL_EPS_DEG_S,
     DEFAULT_STILL_HOLD_S,
     RELEASE_AFTER_S,
     PatSenseDriver,
@@ -1022,18 +1022,27 @@ def _pat_sense_enabled() -> bool:
     return value not in _PAT_SENSE_FALSEY
 
 
-#: Env vars exposing the pat-sense stillness gate's tuning without editing
-#: source (t2, "no-freeze pat sense" — a runnable experiment surface). Each is
-#: read directly at composition time, mirroring ``REACHY_PAT_SENSE`` right
-#: above rather than threading through ``EngineConfig``/``supervisor``'s
+#: Env var exposing the pat-sense stillness gate's hold tuning without editing
+#: source (t2, "no-freeze pat sense" — a runnable experiment surface). Read
+#: directly at composition time, mirroring ``REACHY_PAT_SENSE`` right above
+#: rather than threading through ``EngineConfig``/``supervisor``'s
 #: background-spawn argv: those exist for tuning that must survive `behavior
-#: engine start`'s detached re-spawn, while this pair is a bench/experiment
-#: knob for the foreground `_compose_run_seam` call the on/off switch beside
-#: it already reads the same way. Unset -> the shipped defaults from
-#: :mod:`reachy.behavior.pat_sense`, so a box that never sets either var
-#: composes a byte-identical driver.
+#: engine start`'s detached re-spawn, while this is a bench/experiment knob
+#: for the foreground `_compose_run_seam` call the on/off switch beside it
+#: already reads the same way. Unset -> the shipped default from
+#: :mod:`reachy.behavior.pat_sense`, so a box that never sets it composes a
+#: byte-identical driver.
 _STILL_HOLD_S_ENV = "REACHY_PAT_STILL_HOLD_S"
-_STILL_EPS_ENV = "REACHY_PAT_STILL_EPS"
+#: Stillness velocity gate override (deg/s, dt-normalized). Unset -> the driver's
+#: shipped default from :mod:`reachy.behavior.pat_sense` (1.25 deg/s) applies.
+#: The old per-tick spelling ``REACHY_PAT_STILL_EPS`` is now a legacy name
+#: (issue #168, task t1); a later task (t2) in the same plan warns if it is set.
+_STILL_EPS_DEG_S_ENV = "REACHY_PAT_STILL_EPS_DEG_S"
+#: Retired per-tick stillness-gate epsilon override. Any presence triggers one
+#: senselog.drop line and is otherwise ignored (the value is NOT read). Unit names
+#: must never be reinterpreted across variable names, so the legacy name never
+#: rolls into the new surface.
+_LEGACY_STILL_EPS_ENV = "REACHY_PAT_STILL_EPS"
 #: Press-threshold overrides, in degrees of conditioned deviation. Sensing
 #: through CONTINUOUS idle motion needs a far firmer press than sensing on a
 #: still head: `pat_sense`'s 0.5 deg default was measured against a quiet plant
@@ -1110,19 +1119,48 @@ def _pat_float_override(name: str, default: float) -> float | None:
     return _pat_float_env(name, default)
 
 
-def _pat_still_tuning() -> tuple[float, float]:
-    """Resolve this run's ``(still_hold_s, still_eps)`` for :class:`PatSenseDriver`.
+def _pat_still_tuning() -> float:
+    """Resolve this run's ``still_hold_s`` for :class:`PatSenseDriver`.
 
-    Both default to today's shipped values
-    (:data:`~reachy.behavior.pat_sense.DEFAULT_STILL_HOLD_S` /
-    :data:`~reachy.behavior.pat_sense.DEFAULT_STILL_EPS`) when
-    :data:`_STILL_HOLD_S_ENV` / :data:`_STILL_EPS_ENV` are unset, so an
-    operator who never touches either var gets a byte-identical driver.
+    Defaults to today's shipped value
+    (:data:`~reachy.behavior.pat_sense.DEFAULT_STILL_HOLD_S`) when
+    :data:`_STILL_HOLD_S_ENV` is unset, so an operator who never touches it
+    gets a byte-identical driver. The stillness gate's eps leg is no longer
+    resolved here (issue #168, task t1) — see the module-level comment beside
+    :data:`_STILL_HOLD_S_ENV`.
     """
-    return (
-        _pat_float_env(_STILL_HOLD_S_ENV, DEFAULT_STILL_HOLD_S),
-        _pat_float_env(_STILL_EPS_ENV, DEFAULT_STILL_EPS),
-    )
+    return _pat_float_env(_STILL_HOLD_S_ENV, DEFAULT_STILL_HOLD_S)
+
+
+def _pat_check_legacy_eps_env() -> None:
+    """Warn if the retired ``REACHY_PAT_STILL_EPS`` env var is set.
+
+    The per-tick epsilon was retired with the dt-normalized deg/s gate
+    (issue #168, task t1). A new override surface under ``REACHY_PAT_STILL_EPS_DEG_S``
+    (task t2) accepts deg/s tuning instead. This function checks for the legacy
+    name and emits a senselog.drop line naming both spellings so an operator's
+    journal shows why the old setting did nothing. The value is never read — this
+    is a warn-and-ignore surface — because unit names must never be
+    reinterpreted across variable names.
+    """
+    if os.environ.get(_LEGACY_STILL_EPS_ENV) is not None:
+        senselog.drop(
+            stage_name="pat",
+            source="config",
+            event=_LEGACY_STILL_EPS_ENV,
+            reason="legacy-eps-ignored",
+        )
+
+
+def _pat_eps_deg_s_override() -> float | None:
+    """Return the override for ``eps_deg_s``, or ``None`` when it is not set.
+
+    Presence of the env var — not inequality against the default — decides
+    whether an override exists. Unset -> the driver's shipped default
+    (:data:`~reachy.behavior.pat_sense.DEFAULT_STILL_EPS_DEG_S`) applies, so
+    an operator who never sets it gets a byte-identical driver.
+    """
+    return _pat_float_override(_STILL_EPS_DEG_S_ENV, DEFAULT_STILL_EPS_DEG_S)
 
 
 def _pat_detector() -> PatDetector | None:
@@ -1921,23 +1959,30 @@ def _attach_nervous_system(drivers: list, runtime_consumer):
 def _build_pat_sense_driver(reader) -> "PatSenseDriver":
     """Build the pat sense driver for *reader*, applying only REAL overrides.
 
-    ``detector`` and ``hp_tau`` are passed ONLY when actually overridden.
-    Occupying a keyword with its own default looks like a no-op but is not: a
-    caller injecting its own detector or high-pass (every pet-runtime
+    ``detector``, ``eps_deg_s``, and ``hp_tau`` are passed ONLY when actually
+    overridden. Occupying a keyword with its own default looks like a no-op but
+    is not: a caller injecting its own detector or high-pass (every pet-runtime
     integration test does) would collide on it. Env overrides must be additive —
     absent env leaves the driver's own defaults alone.
 
     The *reader* is constructed by the caller, not here: it is a held SDK client,
     and the caller's failure path can only release what it already holds.
+
+    The legacy ``REACHY_PAT_STILL_EPS`` env var (issue #168, task t1) is checked
+    here and warned-and-ignored via senselog.drop, so its presence is visible in
+    the journal but has no effect on composition.
     """
-    still_hold_s, still_eps = _pat_still_tuning()
+    _pat_check_legacy_eps_env()
+    still_hold_s = _pat_still_tuning()
     pat_kwargs: dict = {
-        "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override (t2)
-        "still_eps": still_eps,  # REACHY_PAT_STILL_EPS override (t2)
+        "still_hold_s": still_hold_s,  # REACHY_PAT_STILL_HOLD_S override
     }
     override = _pat_detector()
     if override is not None:
         pat_kwargs["detector"] = override  # REACHY_PAT_*_PRESS_DEG overrides
+    eps_deg_s = _pat_eps_deg_s_override()
+    if eps_deg_s is not None:
+        pat_kwargs["eps_deg_s"] = eps_deg_s  # REACHY_PAT_STILL_EPS_DEG_S override (t2)
     hp_tau = _pat_float_override(_HP_TAU_ENV, DEFAULT_HP_TAU)  # frequency gate
     if hp_tau is not None:
         pat_kwargs["hp_tau"] = hp_tau
