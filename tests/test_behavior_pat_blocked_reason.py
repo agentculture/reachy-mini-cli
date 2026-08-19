@@ -5,21 +5,27 @@
 gap) plus a fourth path (a missing/malformed commanded pose) — a live
 measurement of "N/N samples blocked" could not say WHICH gate was closing. This
 module pins the four labels :mod:`reachy.behavior.pat_sense` now threads
-through the gap machinery, the "latest cause wins" behavior chosen for a gap
-that persists across ticks or across edges within one tick, that every
-transition back to "available" clears the reason (never leaked via a stale
-``replace()``), and that the additive field survives the export round-trip.
+through the gap machinery, that every transition back to "available" clears
+the reason (never leaked via a stale ``replace()``), and that the additive
+field survives the export round-trip.
 
-Two of the four causes (``"ownership"`` / ``"clock-gap"``) are set inside
-``_apply_observation_edges``, which does not return early — the very next gate
-``_process`` checks (the stillness gate, re-armed by the same edge) closes
-again immediately and overwrites the reason with ``"stillness"`` before the
-tick ends (see ``_blocked_edge``'s docstring). So those two labels are never
-the FINAL reason a full ``driver(ctx)`` tick settles on; they are pinned by
-calling ``_apply_observation_edges`` directly, the way the rest of this test
-suite already inspects private driver state (``driver._stillness_blocked`` in
-``tests/test_behavior_pat_sense.py``) rather than only through the public
-``driver(ctx)`` surface.
+**First cause wins within a tick (review t3).** Two of the four causes
+(``"ownership"`` / ``"clock-gap"``) are set inside ``_apply_observation_edges``,
+which does not return early, and both call ``_blocked_edge`` — which re-arms
+the stillness gate before returning. So the very next gate ``_process`` checks
+(the stillness gate) closes again immediately in the SAME tick and would try
+to assign ``"stillness"`` right behind the edge's own reason. An earlier build
+let that second assignment win (`"latest cause wins"`), which meant a full
+``driver(ctx)`` tick could NEVER observe ``"ownership"`` or ``"clock-gap"`` on
+public state — every edge tick settled on ``"stillness"`` instead, masking the
+root cause a consumer most needs. ``_begin_gap`` now latches the reason once
+per tick (reset in ``_process``), so the FIRST cause assigned in a tick wins
+and later assignments in that same tick — including the stillness rearm's own
+— keep it. The tests below therefore drive full ``driver(ctx)`` ticks (never
+``_apply_observation_edges`` directly): each edge scenario asserts the edge's
+own cause survives its own tick, and that the FOLLOWING tick — with no new
+edge, while the gate is still re-earning its hold — legitimately reports
+``"stillness"`` on its own merits.
 
 Deterministic throughout: an injected fake reader, a hand-built
 ``TickContext``-shaped fake, and an explicit ``now`` per tick. No robot, SDK,
@@ -116,35 +122,93 @@ def test_reader_returning_none_is_unavailable_with_no_reason() -> None:
 
 
 def test_ownership_edge_blocked_reason_is_ownership() -> None:
-    """The ownership edge itself, isolated at its own construction site.
+    """A full tick where ownership changes reports "ownership", not "stillness".
 
-    Driven directly through ``_apply_observation_edges`` (see the module
-    docstring): a full tick's stillness re-arm would immediately overwrite this
-    label with ``"stillness"``, so this pins the CAUSE the edge attaches at the
-    moment it fires, independent of whatever gate closes next.
+    The stillness gate is ENABLED (``still_hold_s=0.2``), so the edge's own
+    ``_rearm_stillness_hold()`` call makes ``_stillness_open`` also try to
+    close the gate in this SAME tick — the exact scenario that used to let
+    ``"stillness"`` mask the edge. First-cause-wins keeps "ownership".
+
+    The FOLLOWING tick then reports "stillness" on its own merits: no new
+    edge fires, but the gate has not yet re-earned its ``still_hold_s`` quiet
+    window, so it is still the tick's own cause of being blocked.
     """
-    driver = PatSenseDriver(reader=_Reader(), still_hold_s=0.0, warmup_s=0.0)
-    # Establish a baseline owner first (an edge only fires on a CHANGE).
-    driver._apply_observation_edges(_ctx(now=T0, owner=BASE_OWNER), T0)
-    assert driver.peek_state().blocked_reason is None  # no edge yet
+    reader = _Reader()
+    driver = PatSenseDriver(reader=reader, still_hold_s=0.2, warmup_s=0.0)
 
-    driver._apply_observation_edges(_ctx(now=T0 + DT, owner=GESTURE_OWNER), T0 + DT)
+    # Warm the stillness gate open on a held-still commanded pose.
+    t = T0
+    for _ in range(10):  # 10 * 0.05 = 0.5 s, comfortably past still_hold_s=0.2
+        _drive(driver, reader, (0.0, 0.0), t, owner=BASE_OWNER)
+        t += 0.05
+    assert driver.peek_state().availability == "available"
 
-    state = driver.peek_state()
-    assert state.availability == "blocked"
-    assert state.blocked_reason == "ownership"
+    # The tick where ownership actually changes: the edge AND the stillness
+    # rearm it triggers both fire in this one tick.
+    t += 0.05
+    _drive(driver, reader, (0.0, 0.0), t, owner=GESTURE_OWNER)
+    edge_state = driver.peek_state()
+    assert edge_state.availability == "blocked"
+    assert edge_state.blocked_reason == "ownership"
+
+    # The very next tick: no new edge, but the re-armed gate has not yet
+    # re-earned its hold -> its own, uncontested cause.
+    t += 0.05
+    _drive(driver, reader, (0.0, 0.0), t, owner=GESTURE_OWNER)
+    next_state = driver.peek_state()
+    assert next_state.availability == "blocked"
+    assert next_state.blocked_reason == "stillness"
 
 
 def test_clock_gap_blocked_reason_is_clock_gap() -> None:
-    """The observation-clock-gap edge, isolated the same way as ownership above."""
+    """The same full-tick shape as the ownership test above, for a clock jump."""
+    reader = _Reader()
     driver = PatSenseDriver(
-        reader=_Reader(), still_hold_s=0.0, warmup_s=0.0, max_observation_gap_s=0.2
+        reader=reader, still_hold_s=0.2, warmup_s=0.0, max_observation_gap_s=0.2
     )
-    driver._apply_observation_edges(_ctx(now=T0), T0)  # establish the clock baseline
-    assert driver.peek_state().blocked_reason is None
 
-    # Same owner, but a jump far past max_observation_gap_s.
-    driver._apply_observation_edges(_ctx(now=T0 + 10.0), T0 + 10.0)
+    t = T0
+    for _ in range(10):
+        _drive(driver, reader, (0.0, 0.0), t)
+        t += 0.05
+    assert driver.peek_state().availability == "available"
+
+    # A clock jump far past max_observation_gap_s, and its own stillness
+    # rearm, both land in this one tick.
+    t_gap = t + 10.0
+    _drive(driver, reader, (0.0, 0.0), t_gap)
+    edge_state = driver.peek_state()
+    assert edge_state.availability == "blocked"
+    assert edge_state.blocked_reason == "clock-gap"
+
+    # The very next tick: no new gap, but the gate is still re-earning its hold.
+    t_gap += 0.05
+    _drive(driver, reader, (0.0, 0.0), t_gap)
+    next_state = driver.peek_state()
+    assert next_state.availability == "blocked"
+    assert next_state.blocked_reason == "stillness"
+
+
+def test_simultaneous_edges_the_first_checked_cause_wins() -> None:
+    """A clock gap AND an ownership change landing in one tick: order decides.
+
+    ``_apply_observation_edges`` checks the clock gap before ownership, so
+    when both edges fire in the same tick, "clock-gap" — not "ownership" and
+    not the stillness rearm either edge triggers — is what a consumer reads.
+    """
+    reader = _Reader()
+    driver = PatSenseDriver(
+        reader=reader, still_hold_s=0.2, warmup_s=0.0, max_observation_gap_s=0.2
+    )
+
+    t = T0
+    for _ in range(10):
+        _drive(driver, reader, (0.0, 0.0), t, owner=BASE_OWNER)
+        t += 0.05
+    assert driver.peek_state().availability == "available"
+
+    t_gap = t + 10.0
+    _drive(driver, reader, (0.0, 0.0), t_gap, owner=GESTURE_OWNER)
 
     state = driver.peek_state()
     assert state.availability == "blocked"
