@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.0] - 2026-08-19
+
+### Added
+
+- `REACHY_PAT_STILL_EPS_DEG_S` — the stillness gate tolerance as a commanded velocity in deg/s (default 1.25); a set legacy `REACHY_PAT_STILL_EPS` is ignored with a named `legacy-eps-ignored` senselog line, never reinterpreted
+- `PatState.blocked_reason` — named blocked causes (`stillness`/`ownership`/`clock-gap`/`no-command`) carried through the snapshot export, so a blocked pat sense is diagnosable from the feed
+- Stride-replay hardware tests (11.4/7.6/5.7 Hz) pinning low-cadence pat detection in CI, plus a deg/s-vs-per-tick equivalence-or-tighter test at clean 50 Hz
+
+### Changed
+
+- The pat sense stillness gate is dt-normalized: `still_eps` (deg per tick) is retired for `eps_deg_s` — cadence-invariant, so the Wireless's ~6.8 Hz effective tick (issue #97) no longer makes the robot unpettable. Live-verified on both units: Wireless gate open 6.4% (was 0%), petting -> pat-acknowledge -> pet-reaction end to end; Lite 10-min soak zero ghosts, petting still detects (issue #168)
+
+### Fixed
+
+- Issue #168: the Wireless could not be petted — the per-tick stillness gate never opened under feel-alive at the unit's real cadence
+
 ## [0.48.0] - 2026-08-08
 
 ### Added
