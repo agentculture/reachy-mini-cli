@@ -286,6 +286,15 @@ DEFAULT_RELEASE_THRESHOLD = 0.2
 #: because it keeps the wander ghost class fully closed (0 events, ~0% open on
 #: both wander fixtures) while the swing still opens (~6.3% of 0.92 s windows),
 #: preserving both properties this gate exists for across tick rate.
+#:
+#: Safe against the UNCHANGED press/release/hp_tau/release-after pairing above
+#: (review t1, issue #168) precisely because 1.25 deg/s is TIGHTER, not looser,
+#: at the 50 Hz design point the rest of that pairing was tuned at: 1.25 deg/s
+#: is 0.025 deg/tick at a clean 50 Hz, versus the retired 0.035 deg/tick, so the
+#: gate cannot admit sensing any earlier in the swing's decelerate-pause window
+#: than the shipped 1.2 press pairing already assumes. Live-verified on both
+#: units 2026-08-19: the Wireless pets end-to-end at its native ~6.8 Hz, and the
+#: Lite's 10-minute soak at ~50 Hz logged zero ghost fires.
 DEFAULT_STILL_EPS_DEG_S = 1.25
 DEFAULT_STILL_HOLD_S = 1.0  # commanded must be quiet this long before sensing
 
@@ -423,6 +432,13 @@ class PatSenseDriver:
         #: Reset at the top of every :meth:`_process`; keeps the per-tick
         #: conditioning re-seed idempotent however many edges fire at once.
         self._reseeded_this_tick = False
+        #: Reset at the top of every :meth:`_process` alongside
+        #: ``_reseeded_this_tick``. Set the first time :meth:`_begin_gap`
+        #: assigns a ``blocked_reason`` this tick; while set, later
+        #: :meth:`_begin_gap` calls in the SAME tick keep the reason already on
+        #: ``self._state`` instead of adopting their own — first cause wins
+        #: within a tick (issue #168 review t3). See :meth:`_begin_gap`.
+        self._reason_latched_this_tick = False
         #: One contiguous unsafe observation interval. Interaction state is
         #: cleared exactly once when this opens; recovery only reseeds filters.
         self._gap_active = False
@@ -482,8 +498,12 @@ class PatSenseDriver:
         now = self._now(ctx)
         # Conditioning is reseeded at most once per tick no matter how many
         # edges fire; `_reseed_once` owns that, so each gate below stays a
-        # plain guard clause.
+        # plain guard clause. `_reason_latched_this_tick` is the matching
+        # once-per-tick guard for `blocked_reason` (see `_begin_gap`): the
+        # FIRST cause a tick assigns wins, later gates in the same tick may
+        # not override it.
         self._reseeded_this_tick = False
+        self._reason_latched_this_tick = False
         self._apply_observation_edges(ctx, now)
 
         # --- commanded pose (this tick's streamed head offset, r1) -----
@@ -555,11 +575,14 @@ class PatSenseDriver:
         The rearm below (issue #168) means the very next gate this tick's
         `_process` checks is `_stillness_open`, which — with the gate
         enabled — closes again immediately (a fresh rearm has no earned quiet
-        window) and OVERWRITES this ``reason`` with ``"stillness"`` before the
-        tick ends. That is the documented persist-across-gates behavior: the
-        LATEST cause label wins, never the first, so the reason a consumer
-        reads always names what is closing the gate *right now*, not what
-        first opened it.
+        window) and would call `_begin_gap` a second time this same tick with
+        ``reason="stillness"``. `_begin_gap`'s per-tick latch (review t3)
+        keeps THIS reason instead: within one tick the FIRST cause assigned
+        wins, because the edge is the root cause and the stillness closure it
+        triggers is only a consequence of it — the edge reason must survive at
+        least one full observable tick. The tick AFTER this one, with no new
+        edge, legitimately reports ``"stillness"`` while the gate re-earns its
+        hold (the latch resets every tick — see `_process`).
         """
         self._begin_gap("blocked", now, reason=reason)
         self._rearm_stillness_hold()
@@ -748,7 +771,20 @@ class PatSenseDriver:
         conservative direction — it can only end contact earlier, never invent
         it — and the arithmetic has margin: the reaction's blind window is entry
         slew + gate re-arm (~1.24 s) against a 2.5 s ``RELEASE_AFTER_S``.
+
+        First-cause-wins (review t3, issue #168): ``self._reason_latched_this_tick``
+        is a per-tick latch (reset in :meth:`_process`) — the FIRST call to this
+        method in a given tick fixes ``reason`` for every remaining call in that
+        SAME tick, including one this method makes to itself via
+        ``_end_interaction``/``_suspend_interaction``. A gate that closes as a
+        *consequence* of an edge (the stillness rearm below) must never mask the
+        edge that caused it; the next tick, with the latch reset, reports
+        whatever is closing the gate then on its own merits.
         """
+        if self._reason_latched_this_tick:
+            reason = self._state.blocked_reason
+        else:
+            self._reason_latched_this_tick = True
         # `enough` is the one live-contact phase that must still END here: it is
         # the interaction deliberately concluding, and `_end_interaction` is what
         # arms the lifecycle cooldown. Suspending it would drop that cooldown and
@@ -763,8 +799,9 @@ class PatSenseDriver:
                 self._gap_active = True
                 return
             # Already suspended: a later edge within the same persisting gap
-            # (issue #168) updates the reason to THIS tick's cause rather than
-            # keeping the one that first opened it — see `_blocked_edge`.
+            # (issue #168) updates ``availability`` to THIS tick's cause but
+            # keeps whichever ``reason`` the latch above resolved — the first
+            # cause this tick, never a later one (review t3; was "latest wins").
             self._state = replace(self._state, availability=availability, blocked_reason=reason)
             self._last_available_at = None
             return
@@ -772,7 +809,8 @@ class PatSenseDriver:
             self._end_interaction(now, availability=availability, reason=reason)
             self._gap_active = True
             return
-        # Already ended: same "latest cause wins" update as above.
+        # Already ended: same first-cause-wins update as above (`reason` was
+        # already resolved by the latch at the top of this method).
         self._state = PatState(
             availability=availability,
             phase="idle",
