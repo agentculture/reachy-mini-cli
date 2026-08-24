@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.0] - 2026-08-24
+
+### Added
+
+- **`ask-colleague resume <task-id|last> [--detach]`** — pick a cut /
+  timed-out / SIGTERM'd run back up from its persisted artifact, continuing on
+  the original `colleague/<id>` work branch.
+- **Per-seat thinking effort** for `ask-colleague` (colleague#416) —
+  `--effort RUNG` (acting seat), `--seat-effort S=R` (any seat), `--role NAME`.
+
+### Changed
+
+- **`ask-colleague` re-vendored byte-verbatim from `agentculture/colleague`
+  @ 1.63.0** — all five files match
+  `diff -r ../colleague/.claude/skills/ask-colleague`.
+- **Default colleague model is now `unsloth/Qwen3.8-27B-NVFP4`** (was the
+  Qwen3.6 pin) — the lobes gateway on `:8001` no longer serves 3.6.
+- `ask-colleague review` front-loads a filtered, capped diff into the review
+  instruction so the model does not spend turns running `git diff` itself.
+- `docs/skill-sources.md`: ledger row records the 1.63.0 sync and drops the
+  now-retired re-localization step.
+
 ## [0.49.0] - 2026-08-19
 
 ### Added
