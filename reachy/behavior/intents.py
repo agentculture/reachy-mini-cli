@@ -256,12 +256,19 @@ class IntentDriver:
         mode_setter: Callable[[str | None], None] | None = None,
         known_modes: Callable[[], Iterable[str]] | None = None,
         registry: control_mod.KindRegistry | None = None,
+        inhibition_observer: Callable[[frozenset[str]], None] | None = None,
     ) -> None:
         self._spool = intent_control or control_mod.CommandSpool(namespace=namespace, root=root)
         self._main = main_control or control_mod.CommandSpool(root=root)
         self._lib = lib if lib is not None else behavior_library
         self._mode_setter = mode_setter
         self._known_modes = known_modes
+        #: Fired with the NEW set whenever ``set_inhibition`` replaces the whole
+        #: inhibited set. A plain public attribute so composition can wire it
+        #: after both parties exist (see
+        #: :meth:`reachy.behavior.face_lock.FaceLockDriver.notice_inhibition_replaced`,
+        #: the later-wins seam whose whole job is to hear this).
+        self.inhibition_observer = inhibition_observer
         self._goal: dict | None = None  # {"name": str, "params": dict}
         self._inhibitions: frozenset[str] = frozenset()
         self._mode: str | None = None
@@ -296,6 +303,23 @@ class IntentDriver:
     @property
     def inhibitions(self) -> frozenset[str]:
         """The current inhibited behavior names."""
+        return self._inhibitions
+
+    def set_inhibitions(self, names: Iterable[str]) -> frozenset[str]:
+        """Replace the inhibited set IN PROCESS, without a spool command.
+
+        The same primitive ``set_inhibition`` applies (a full replacement),
+        exposed for an in-process consumer that owns part of the set for the
+        duration of some state — today only
+        :class:`reachy.behavior.face_lock.FaceLockDriver`, which adds
+        ``feel-alive`` / ``orient-to-sound`` while a face lock is held and
+        removes exactly those again on release.
+
+        Deliberately does NOT fire :attr:`inhibition_observer`: that seam means
+        "a caller replaced the whole set", and an in-process owner adjusting its
+        own contribution is not that.
+        """
+        self._inhibitions = frozenset(names)
         return self._inhibitions
 
     @property
@@ -410,6 +434,11 @@ class IntentDriver:
             self._lib.get(item)  # raises CliError naming the problem for an unknown name
             names.add(item)
         self._inhibitions = frozenset(names)
+        if self.inhibition_observer is not None:
+            # LATER-WINS: an in-process owner of part of the set (the face lock)
+            # hears that a caller has just replaced the whole thing, and drops
+            # its own claim rather than re-imposing it behind that caller's back.
+            self.inhibition_observer(self._inhibitions)
         return {"ok": True, "op": SET_INHIBITION, "behaviors": sorted(self._inhibitions)}
 
     # -- continuous enforcement (every tick, no spool command needed) -------- #
