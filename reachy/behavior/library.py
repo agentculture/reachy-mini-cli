@@ -241,6 +241,46 @@ _BODY = frozenset({"body_yaw"})
 #: :class:`reachy.behavior.orient.OrientParams`, which itself tracks the donor
 #: ``ListenParams``. Restating a number here would let the catalog and the
 #: ladder drift apart silently, so every entry below reads it instead.
+#: Unit strings shared across entries. Named because the same knob described
+#: two ways ("deg/s" vs "deg/sec") in two entries is a documentation bug nobody
+#: notices, and because the factories below keep them in one place.
+_DEG = "deg"
+_DEG_S = "deg/s"
+_MM = "mm"
+
+
+def _yaw_clamp(default: float) -> Param:
+    """The ``max_yaw`` knob, wherever a head behavior clamps its yaw.
+
+    A factory rather than four copies: every clamp shares the same help text
+    AND the same domain (``minimum=0.0``, because a negative clamp does not
+    clamp — it forces the opposite angle; see :func:`validate_param_value`), so
+    the four cannot drift apart in either.
+    """
+    return Param(default, _DEG, "head yaw clamp", minimum=0.0)
+
+
+def _pitch_clamp(default: float) -> Param:
+    """The ``max_pitch`` knob — the vertical half of :func:`_yaw_clamp`."""
+    return Param(default, _DEG, "head pitch clamp", minimum=0.0)
+
+
+def _look_pitch(default: float = 0.0) -> Param:
+    """The signed ``pitch`` offset knob. Unbounded on purpose: it is a
+    DIRECTION (up/down), not a magnitude."""
+    return Param(default, _DEG, "vertical look angle")
+
+
+def _roll(default: float = 0.0) -> Param:
+    """The signed ``roll`` offset knob — see :func:`_look_pitch` on the domain."""
+    return Param(default, _DEG, "head roll")
+
+
+def _z_offset(default: float = 0.0) -> Param:
+    """The signed ``z`` height-offset knob — see :func:`_look_pitch`."""
+    return Param(default, _MM, "head height offset")
+
+
 _ORIENT_DEFAULTS = OrientParams()
 
 
@@ -298,8 +338,8 @@ LIBRARY: dict[str, LibraryEntry] = {
         looping=True,
         default_duration=None,
         params={
-            "max_yaw": Param(face_lock_mod.MAX_YAW_DEG, "deg", "head yaw clamp", minimum=0.0),
-            "max_pitch": Param(face_lock_mod.MAX_PITCH_DEG, "deg", "head pitch clamp", minimum=0.0),
+            "max_yaw": _yaw_clamp(face_lock_mod.MAX_YAW_DEG),
+            "max_pitch": _pitch_clamp(face_lock_mod.MAX_PITCH_DEG),
             "yaw_gain": Param(
                 face_lock_mod.YAW_GAIN_DEG,
                 "deg",
@@ -314,7 +354,7 @@ LIBRARY: dict[str, LibraryEntry] = {
             ),
             "slew": Param(
                 face_lock_mod.SLEW_DEG_S,
-                "deg/s",
+                _DEG_S,
                 "how fast the gaze chases the face",
                 minimum=0.0,
             ),
@@ -346,15 +386,19 @@ LIBRARY: dict[str, LibraryEntry] = {
             "gain": _ORIENT_PARAM(
                 "gain", "x", "scales the ~+-90 deg acoustic span onto a yaw target"
             ),
-            "max_yaw": _ORIENT_PARAM("max_yaw", "deg", "head yaw clamp"),
+            # The factory, not `_ORIENT_PARAM`: this clamp is the same knob the
+            # gaze one-shots and the face lock carry, and it gets the same
+            # non-negative domain with it. The default still comes off
+            # `OrientParams`, never retyped.
+            "max_yaw": _yaw_clamp(_ORIENT_DEFAULTS.max_yaw),
             "deadband": _ORIENT_PARAM(
                 "deadband", "deg", "ignore sound within this of the current heading"
             ),
             "hold": _ORIENT_PARAM(
                 "hold", "s", "after committing a turn, hold before reconsidering"
             ),
-            "alert_speed": _ORIENT_PARAM("alert_speed", "deg/s", "turning toward a new sound"),
-            "relax_speed": _ORIENT_PARAM("relax_speed", "deg/s", "easing back toward centre"),
+            "alert_speed": _ORIENT_PARAM("alert_speed", _DEG_S, "turning toward a new sound"),
+            "relax_speed": _ORIENT_PARAM("relax_speed", _DEG_S, "easing back toward centre"),
             "min_dur": _ORIENT_PARAM("min_dur", "s", "duration floor, so turns stay deliberate"),
             "max_dur": _ORIENT_PARAM("max_dur", "s", "duration ceiling for one turn"),
             "antenna_gain": _ORIENT_PARAM("antenna_gain", "x", "scales the antenna lean"),
@@ -362,7 +406,7 @@ LIBRARY: dict[str, LibraryEntry] = {
                 "antenna_max", "deg", "maximum near-side antenna deflection"
             ),
             "body_yaw_max": _ORIENT_PARAM("body_yaw_max", "deg", "body yaw clamp"),
-            "body_speed": _ORIENT_PARAM("body_speed", "deg/s", "body rotation speed"),
+            "body_speed": _ORIENT_PARAM("body_speed", _DEG_S, "body rotation speed"),
             "head_only_band": _ORIENT_PARAM(
                 "head_only_band", "deg", "beyond this the body turn escalates"
             ),
@@ -406,9 +450,9 @@ LIBRARY: dict[str, LibraryEntry] = {
         default_duration=5.0,
         params={
             "yaw": Param(18.0, "deg", "horizontal look angle"),
-            "pitch": Param(10.0, "deg", "vertical look angle"),
-            "roll": Param(0.0, "deg", "head roll"),
-            "z": Param(0.0, "mm", "head height offset"),
+            "pitch": _look_pitch(10.0),
+            "roll": _roll(),
+            "z": _z_offset(),
         },
         fn=_gaze_hold,
     ),
@@ -429,13 +473,13 @@ LIBRARY: dict[str, LibraryEntry] = {
                 "a DoA reading older than this refuses admission",
                 minimum=0.0,
             ),
-            "max_yaw": Param(DEFAULT_MAX_YAW, "deg", "head yaw clamp", minimum=0.0),
+            "max_yaw": _yaw_clamp(DEFAULT_MAX_YAW),
             "ease_s": Param(
                 DEFAULT_EASE_S, "s", "how long the turn takes before it holds", minimum=0.0
             ),
-            "pitch": Param(0.0, "deg", "vertical look angle"),
-            "roll": Param(0.0, "deg", "head roll"),
-            "z": Param(0.0, "mm", "head height offset"),
+            "pitch": _look_pitch(),
+            "roll": _roll(),
+            "z": _z_offset(),
         },
         fn=look_at_sound_fn,
     ),
@@ -456,13 +500,13 @@ LIBRARY: dict[str, LibraryEntry] = {
                 "a face bbox older than this refuses admission",
                 minimum=0.0,
             ),
-            "max_yaw": Param(DEFAULT_MAX_YAW_FACE, "deg", "head yaw clamp", minimum=0.0),
-            "max_pitch": Param(DEFAULT_MAX_PITCH_FACE, "deg", "head pitch clamp", minimum=0.0),
+            "max_yaw": _yaw_clamp(DEFAULT_MAX_YAW_FACE),
+            "max_pitch": _pitch_clamp(DEFAULT_MAX_PITCH_FACE),
             "ease_s": Param(
                 DEFAULT_EASE_S, "s", "how long the turn takes before it holds", minimum=0.0
             ),
-            "roll": Param(0.0, "deg", "head roll"),
-            "z": Param(0.0, "mm", "head height offset"),
+            "roll": _roll(),
+            "z": _z_offset(),
         },
         fn=look_at_face_fn,
     ),
@@ -519,7 +563,7 @@ LIBRARY: dict[str, LibraryEntry] = {
         params={
             "pitch": Param(8.0, "deg", "upward/forward tilt"),
             "yaw": Param(10.0, "deg", "gaze-aside angle"),
-            "roll": Param(5.0, "deg", "head roll"),
+            "roll": _roll(5.0),
             "rise": Param(0.6, "s", "ease-in time"),
         },
         fn=_thoughtful,

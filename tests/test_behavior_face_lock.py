@@ -180,7 +180,8 @@ def test_the_locked_behavior_holds_its_last_target_when_the_bbox_vanishes() -> N
     params = behavior_library.get(FACE_LOCK_BEHAVIOR).default_params()
     _run(fn, params, _face(cx=0.9, cy=0.2), 200)
     held = (fn.target_yaw, fn.target_pitch)
-    assert held[0] != 0.0 and held[1] != 0.0
+    assert held[0] != 0.0
+    assert held[1] != 0.0
 
     heads = _run(fn, params, EMPTY_SENSE, 200, start=4.0)
     assert (fn.target_yaw, fn.target_pitch) == held

@@ -175,7 +175,8 @@ def test_an_unmatched_face_still_yields_a_bbox_while_the_name_stays_none() -> No
     )
     assert snap.face is None
     assert snap.face_bbox == pytest.approx((0.2, 0.3, 0.4, 0.2))
-    assert snap.face_age_s is not None and snap.face_age_s >= 0.0
+    assert snap.face_age_s is not None
+    assert snap.face_age_s >= 0.0
 
 
 def test_a_recognised_face_yields_both_the_name_and_the_bbox() -> None:

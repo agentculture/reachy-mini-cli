@@ -163,9 +163,10 @@ def test_an_unknown_field_is_refused_rather_than_silently_ignored() -> None:
 def test_the_handlers_raise_a_clierror_for_an_unknown_field_off_the_registry() -> None:
     actuator, _synth, _played = _actuator()
     mute, _unmute = MI.make_mute_handlers(actuator)
+    ctx = _RecordingCtx()
 
     with pytest.raises(CliError):
-        mute({"op": MI.MUTE, "nope": 1}, _RecordingCtx())
+        mute({"op": MI.MUTE, "nope": 1}, ctx)
 
 
 # --------------------------------------------------------------------------- #
