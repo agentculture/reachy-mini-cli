@@ -2500,8 +2500,10 @@ def _compose_run_seam(
         # injected callables — which is why `face_lock.py` never imports
         # `intents.py`. `inhibition_observer` is the later-wins seam: a
         # `set_inhibition` arriving while locked replaces the whole set, and the
-        # lock surrenders its own additions rather than restoring a stale
-        # snapshot on release.
+        # lock re-snapshots around it rather than restoring a stale snapshot on
+        # release. Later-wins covers the CALLER's names only — the lock's own
+        # additions are stripped out of the new snapshot and re-asserted, since
+        # a mind echoing back the set it just read cannot tell them apart.
         #
         # It also RIDES THE TICK (it is in `drivers` below, right after
         # `intent_driver`, so a lock taken this tick is watched from the next

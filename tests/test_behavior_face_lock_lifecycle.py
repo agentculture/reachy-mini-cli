@@ -377,12 +377,31 @@ def test_a_later_set_inhibition_still_wins_over_a_lifecycle_release() -> None:
     driver, registry, intents = _wire(max_hold_s=10.0)
     ctx = _RecordingCtx(sense=_face())
     _lock(registry, ctx)
-    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["nod", "feel-alive"]}, ctx)
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["nod", "shake"]}, ctx)
+    # The lock re-asserts its own additions on top of the caller's statement.
+    assert {"feel-alive", "orient-to-sound"} <= set(intents.inhibitions)
 
     _tick(driver, ctx, now=11.0, sense=_face())
     assert driver.locked is False
-    # The later statement stands untouched — release restored nothing behind it.
-    assert set(intents.inhibitions) == {"nod", "feel-alive"}
+    # The caller's statement stands untouched — release restored nothing behind
+    # it, and took back only what the lock itself added.
+    assert set(intents.inhibitions) == {"nod", "shake"}
+
+
+def test_a_lifecycle_release_also_strips_the_locks_own_additions_from_a_replacement() -> None:
+    """The live 2026-08-26 bug on the lifecycle path: max-hold must not leave inertness."""
+    driver, registry, intents = _wire(max_hold_s=10.0)
+    ctx = _RecordingCtx(sense=_face())
+    _lock(registry, ctx)
+    # A mind echoing back what it read, plus one name of its own.
+    registry.dispatch(
+        {"op": SET_INHIBITION, "behaviors": ["feel-alive", "orient-to-sound", "speak"]}, ctx
+    )
+    assert {"feel-alive", "orient-to-sound"} <= set(intents.inhibitions)
+
+    _tick(driver, ctx, now=11.0, sense=_face())
+    assert driver.locked is False
+    assert set(intents.inhibitions) == {"speak"}
 
 
 # --------------------------------------------------------------------------- #

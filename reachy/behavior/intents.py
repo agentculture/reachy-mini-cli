@@ -499,8 +499,11 @@ class IntentDriver:
         self._inhibitions = frozenset(names)
         if self.inhibition_observer is not None:
             # LATER-WINS: an in-process owner of part of the set (the face lock)
-            # hears that a caller has just replaced the whole thing, and drops
-            # its own claim rather than re-imposing it behind that caller's back.
+            # hears that a caller has just replaced the whole thing, and adopts
+            # it as its new snapshot rather than restoring a stale one on
+            # release. It keeps only the names IT added (stripping them from
+            # that snapshot and re-asserting them), because a caller echoing
+            # back the set it just read cannot tell those apart from its own.
             self.inhibition_observer(self._inhibitions)
         return {"ok": True, "op": SET_INHIBITION, "behaviors": sorted(self._inhibitions)}
 
