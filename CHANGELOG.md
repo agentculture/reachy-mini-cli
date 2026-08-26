@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.0] - 2026-08-26
+
+### Added
+
+- Gaze one-shots look-at-sound / look-at-face (Sense.doa_age_s, Sense.face_bbox/face_age_s, biggest-face selection with near-tie preference for a recognised face)
+- lock_face / release_face intent kinds with a clamped, looping face-lock behavior, later-wins inhibition snapshot, face-lost / lock-released motion events, max-hold and mind-offline release
+- mute / unmute intent kinds gating SpeechActuator.say
+- MindPresence: retained nova/harness/state subscriber wired into the face-lock
+
+### Changed
+
+- FaceSenseDriver keeps the bbox of unmatched faces (position before the store match); FaceEngine.detect_all
+
 ## [0.49.0] - 2026-08-19
 
 ### Added
