@@ -1,0 +1,311 @@
+"""t1 — DoaPoller.age_s + the one-shot 'look-at-sound' behavior.
+
+Covers the t1 acceptance criteria:
+
+1. ``DoaPoller.age_s(now)`` — seconds since the last GOOD (angle-bearing) DoA
+   reading, ``None`` when never read, driven by an injected clock.
+2. ``run_behavior name='look-at-sound'``: refused (no reading / stale) with
+   ``{"ok": False, "error": "no recent sound direction"}`` and nothing
+   admitted; admitted as a bounded one-shot with a fresh reading, aiming yaw
+   at ``doa_angle_to_yaw(angle)`` clamped to ``max_yaw``.
+3. The name-collision guard: ``'look-at-sound'`` is a LIBRARY name, distinct
+   from the react rule id ``'look-toward-sound'`` shipped in
+   ``default_rules.toml``.
+
+Deterministic throughout: injected clocks, a duck-typed recording ``ctx``
+(mirrors ``tests/test_behavior_intents.py``'s ``_RecordingCtx``, extended with
+a ``sense`` field this module's admission path reads) and the real
+``IntentDriver`` — no robot, daemon, network, or LLM anywhere in this file.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+import pytest
+
+from reachy.behavior import control as control_mod
+from reachy.behavior import gaze
+from reachy.behavior import library as behavior_library
+from reachy.behavior.intents import INTENT_NAMESPACE, RUN_BEHAVIOR, IntentDriver
+from reachy.behavior.library import LIBRARY
+from reachy.behavior.rules import load_shipped_rules
+from reachy.behavior.sense import EMPTY_SENSE, DoaPoller, Sense, doa_angle_to_yaw
+
+# --------------------------------------------------------------------------- #
+# Harness                                                                     #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _RecordingCtx:
+    """A duck-typed TickContext (mirrors test_behavior_intents.py's fixture),
+    extended with ``sense`` — the field ``_apply_run_behavior`` reads for
+    ``look-at-sound``'s admission check."""
+
+    now: float = 0.0
+    tick: int = 0
+    sense: Sense = field(default_factory=lambda: EMPTY_SENSE)
+    admits: list = field(default_factory=list)
+    evicts: list = field(default_factory=list)
+    events: list = field(default_factory=list)
+    _active: set = field(default_factory=set)
+
+    def emit(self, event: dict) -> None:
+        self.events.append(event)
+
+    def admit(self, behavior) -> dict:
+        self.admits.append(behavior)
+        self._active.add(behavior.name)
+        return {"ok": True, "op": "add", "id": behavior.id, "name": behavior.name}
+
+    def evict(self, name: str) -> dict:
+        self.evicts.append(name)
+        was_active = name in self._active
+        self._active.discard(name)
+        return {"ok": True, "op": "stop", "target": name, "stopped": [name] if was_active else []}
+
+    def active_names(self) -> set:
+        return set(self._active)
+
+
+def _submit(root, **fields):
+    return control_mod.submit(RUN_BEHAVIOR, namespace=INTENT_NAMESPACE, root=root, **fields)
+
+
+# --------------------------------------------------------------------------- #
+# 1. DoaPoller.age_s                                                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_age_s_is_none_before_any_good_reading() -> None:
+    poller = DoaPoller(lambda: EMPTY_SENSE, period=0.2)
+    assert poller.age_s(0.0) is None
+    poller(0.0)
+    assert poller.age_s(0.0) is None  # the one read had no usable angle
+
+
+def test_age_s_tracks_time_since_the_last_good_reading() -> None:
+    poller = DoaPoller(lambda: Sense(doa_angle=1.0), period=0.2)
+    poller(10.0)  # first poll -> a good reading at t=10.0
+    assert poller.age_s(10.0) == 0.0
+    assert poller.age_s(10.5) == 0.5
+    assert poller.age_s(13.0) == 3.0
+
+
+def test_age_s_keeps_the_last_good_time_across_a_later_failure() -> None:
+    calls = {"n": 0}
+
+    def _read():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Sense(doa_angle=0.5)
+        raise RuntimeError("mic dropped")
+
+    poller = DoaPoller(_read, period=1.0)
+    poller(0.0)  # good reading at t=0.0
+    assert poller.age_s(0.0) == 0.0
+    poller(1.0)  # throttle period elapsed -> re-read -> raises -> EMPTY_SENSE
+    assert poller(1.0).doa_angle is None  # the returned snapshot IS empty now
+    assert poller.age_s(1.0) == 1.0  # but age still counts from the t=0.0 good read
+
+
+def test_call_stamps_doa_age_s_onto_the_returned_sense() -> None:
+    poller = DoaPoller(lambda: Sense(doa_angle=0.2), period=0.2)
+    s = poller(5.0)
+    assert s.doa_angle == 0.2
+    assert s.doa_age_s == 0.0
+    s2 = poller(5.05)  # within the throttle period -> cached angle, age still ticks
+    assert s2.doa_angle == 0.2
+    assert s2.doa_age_s == pytest.approx(0.05)
+
+
+def test_call_with_no_good_reading_ever_returns_empty_sense_identity() -> None:
+    """A poll that never sees a usable angle must still return the exact
+    EMPTY_SENSE singleton (never a copy) — the pre-existing failure-handling
+    contract (see tests/test_behavior.py::test_doa_poller_swallows_every_error)
+    must survive the age-stamping addition unchanged."""
+
+    def _no_mic() -> Sense:
+        raise RuntimeError("audio device not available")
+
+    poller = DoaPoller(_no_mic, period=0.2)
+    assert poller(0.0) is EMPTY_SENSE
+
+
+# --------------------------------------------------------------------------- #
+# 2. read_perception threads doa_age_s through                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_read_perception_carries_doa_age_s_from_base() -> None:
+    from reachy.behavior.sense import NO_PROVIDERS, read_perception
+
+    base = Sense(doa_angle=0.1, doa_age_s=3.5)
+    snap = read_perception(NO_PROVIDERS, base=base)
+    assert snap.doa_age_s == 3.5
+
+
+# --------------------------------------------------------------------------- #
+# 3. plan_look_at_sound — pure refusal/clamp logic                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_plan_refuses_with_no_reading() -> None:
+    assert gaze.plan_look_at_sound(EMPTY_SENSE) is None
+
+
+def test_plan_refuses_when_stale() -> None:
+    sense = Sense(doa_angle=0.5, doa_age_s=8.1)
+    assert gaze.plan_look_at_sound(sense, max_age_s=8.0) is None
+
+
+def test_plan_refuses_when_age_unknown() -> None:
+    # A usable angle but no age reading at all (e.g. hand-built Sense) refuses,
+    # same as "no reading": there is nothing to certify freshness against.
+    sense = Sense(doa_angle=0.5, doa_age_s=None)
+    assert gaze.plan_look_at_sound(sense, max_age_s=8.0) is None
+
+
+def test_plan_admits_a_fresh_reading_within_the_clamp() -> None:
+    # A bearing close to front (pi/2) yields a small yaw, well inside the clamp.
+    angle = math.pi / 2.0 - 0.2
+    sense = Sense(doa_angle=angle, doa_age_s=1.0)
+    yaw = gaze.plan_look_at_sound(sense, max_age_s=8.0, max_yaw=35.0)
+    assert yaw is not None
+    assert yaw == pytest.approx(doa_angle_to_yaw(angle, 1.0))
+    assert abs(yaw) <= 35.0
+
+
+def test_plan_clamps_an_extreme_bearing() -> None:
+    sense = Sense(doa_angle=0.0, doa_age_s=0.0)  # far left -> big raw yaw
+    yaw = gaze.plan_look_at_sound(sense, max_age_s=8.0, max_yaw=10.0)
+    assert yaw == 10.0  # clamped, not the raw ~90 deg
+
+
+def test_plan_at_exactly_max_age_s_is_still_fresh() -> None:
+    sense = Sense(doa_angle=0.3, doa_age_s=8.0)
+    assert gaze.plan_look_at_sound(sense, max_age_s=8.0) is not None
+
+
+# --------------------------------------------------------------------------- #
+# 4. run_behavior name='look-at-sound' — refusal + admission (t1 c2)         #
+# --------------------------------------------------------------------------- #
+
+
+def test_run_behavior_refuses_with_no_reading(tmp_path) -> None:
+    cmd_id = _submit(tmp_path, name="look-at-sound", params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=EMPTY_SENSE)
+
+    driver.on_tick(ctx)
+
+    assert ctx.admits == []  # nothing admitted
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is False
+    assert result["error"] == "no recent sound direction"
+
+
+def test_run_behavior_refuses_when_stale(tmp_path) -> None:
+    cmd_id = _submit(tmp_path, name="look-at-sound", params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    stale = Sense(doa_angle=0.4, doa_age_s=9.0)  # older than the 8.0s default
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=stale)
+
+    driver.on_tick(ctx)
+
+    assert ctx.admits == []
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is False
+    assert result["error"] == "no recent sound direction"
+
+
+def test_run_behavior_admits_a_one_shot_aiming_at_the_clamped_yaw(tmp_path) -> None:
+    cmd_id = _submit(tmp_path, name="look-at-sound", params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    fresh = Sense(doa_angle=math.pi / 4.0, doa_age_s=0.5)  # front-left, fresh
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=fresh)
+
+    driver.on_tick(ctx)
+
+    assert len(ctx.admits) == 1
+    beh = ctx.admits[0]
+    assert beh.name == "look-at-sound"
+    assert beh.channels == frozenset({"head"})
+    assert beh.lifetime.looping is False
+    assert beh.lifetime.duration == gaze.DEFAULT_DURATION_S
+    raw_yaw = doa_angle_to_yaw(math.pi / 4.0, 1.0)
+    expected_yaw = max(-gaze.DEFAULT_MAX_YAW, min(gaze.DEFAULT_MAX_YAW, raw_yaw))
+    assert beh.params["yaw"] == expected_yaw
+    assert abs(beh.params["yaw"]) <= gaze.DEFAULT_MAX_YAW
+
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is True
+    assert result["op"] == RUN_BEHAVIOR
+    assert result["name"] == "look-at-sound"
+
+
+def test_run_behavior_admits_with_a_custom_max_yaw_param(tmp_path) -> None:
+    _submit(
+        tmp_path,
+        name="look-at-sound",
+        params={"max_yaw": 5.0},
+        lifetime=None,
+    )
+    driver = IntentDriver(root=tmp_path)
+    # A bearing whose raw yaw is far larger than 5 deg.
+    fresh = Sense(doa_angle=0.0, doa_age_s=0.0)
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=fresh)
+
+    driver.on_tick(ctx)
+
+    assert len(ctx.admits) == 1
+    assert ctx.admits[0].params["yaw"] == 5.0
+
+
+def test_contribution_eases_then_holds_the_target_yaw() -> None:
+    """Unit-level check of the pure contribution fn, independent of admission."""
+    entry = LIBRARY[gaze.NAME]
+    params = entry.default_params()
+    params["yaw"] = 20.0
+    params["ease_s"] = 0.5
+    fn = entry.fn
+    start = fn(0.0, params, EMPTY_SENSE)
+    mid = fn(0.25, params, EMPTY_SENSE)
+    held = fn(0.5, params, EMPTY_SENSE)
+    later = fn(2.0, params, EMPTY_SENSE)  # past the ease -> still holds
+    assert start.head["yaw"] == 0.0
+    assert 0.0 < mid.head["yaw"] < 20.0
+    assert held.head["yaw"] == 20.0
+    assert later.head["yaw"] == 20.0
+
+
+# --------------------------------------------------------------------------- #
+# 5. Name-collision guard                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_look_at_sound_is_a_library_entry() -> None:
+    assert "look-at-sound" in LIBRARY
+    assert LIBRARY["look-at-sound"] is behavior_library.LIBRARY["look-at-sound"]
+
+
+def test_look_at_sound_is_not_a_shipped_rule_id() -> None:
+    rule_ids = {r.id for r in load_shipped_rules().react}
+    assert "look-at-sound" not in rule_ids
+    # the pre-existing, differently-named rule that admits the SUSTAINED
+    # sibling (orient-to-sound) is still there, unaffected:
+    assert "look-toward-sound" in rule_ids
+
+
+def test_look_at_sound_default_class_is_stoppable() -> None:
+    from reachy.behavior.model import StopClass
+
+    assert LIBRARY["look-at-sound"].default_class is StopClass.STOPPABLE

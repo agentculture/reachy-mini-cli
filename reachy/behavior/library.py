@@ -26,6 +26,16 @@ from typing import Callable
 
 from reachy.behavior import face_lock as face_lock_mod
 from reachy.behavior.feel_alive import make_feel_alive
+from reachy.behavior.gaze import (
+    DEFAULT_DURATION_S,
+    DEFAULT_EASE_S,
+    DEFAULT_MAX_AGE_S,
+    DEFAULT_MAX_YAW,
+)
+from reachy.behavior.gaze import NAME as LOOK_AT_SOUND_NAME
+from reachy.behavior.gaze import (
+    look_at_sound_fn,
+)
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass, neutral_head
 from reachy.behavior.orient import OrientParams, make_orient_to_sound
 from reachy.behavior.pet_reaction import (
@@ -336,6 +346,28 @@ LIBRARY: dict[str, LibraryEntry] = {
             "z": Param(0.0, "mm", "head height offset"),
         },
         fn=_gaze_hold,
+    ),
+    LOOK_AT_SOUND_NAME: LibraryEntry(
+        name=LOOK_AT_SOUND_NAME,
+        summary=(
+            "one-shot: turn the head toward the last live sound direction, hold, and end "
+            "(see reachy.behavior.gaze for the sustained sibling, orient-to-sound)"
+        ),
+        channels=_HEAD,
+        default_class=StopClass.STOPPABLE,  # see gaze.py's module docstring for why
+        looping=False,
+        default_duration=DEFAULT_DURATION_S,
+        params={
+            "max_age_s": Param(
+                DEFAULT_MAX_AGE_S, "s", "a DoA reading older than this refuses admission"
+            ),
+            "max_yaw": Param(DEFAULT_MAX_YAW, "deg", "head yaw clamp"),
+            "ease_s": Param(DEFAULT_EASE_S, "s", "how long the turn takes before it holds"),
+            "pitch": Param(0.0, "deg", "vertical look angle"),
+            "roll": Param(0.0, "deg", "head roll"),
+            "z": Param(0.0, "mm", "head height offset"),
+        },
+        fn=look_at_sound_fn,
     ),
     "nod": LibraryEntry(
         name="nod",
