@@ -7,9 +7,11 @@ Pins the t4 acceptance criteria:
    ``face-lock`` behavior that maps the bbox centre to a clamped yaw/pitch every
    tick, holds its last target while the bbox is momentarily absent, and adds
    ``feel-alive`` / ``orient-to-sound`` to the inhibited set.
-2. Inhibition is LATER-WINS: a ``set_inhibition`` arriving while locked replaces
-   the whole set and the lock does NOT re-impose its own additions on release.
-   With no intervening call, release restores the snapshot taken at lock time.
+2. Inhibition is LATER-WINS for the CALLER's names: a ``set_inhibition`` arriving
+   while locked becomes the lock's new snapshot MINUS its own additions (which it
+   re-asserts and still takes back on release), so a mind echoing back the set it
+   just read never leaves the presence loop inhibited. With no intervening call,
+   release restores the snapshot taken at lock time.
 3. ``release_face`` is idempotent-safe when not locked, and when locked evicts
    the behavior, restores inhibitions per (2), and emits exactly ONE raw
    ``lock-released`` event through ``ctx.emit``.
@@ -238,6 +240,111 @@ def test_a_name_the_lock_did_not_add_survives_release() -> None:
     registry.dispatch({"op": LOCK_FACE}, ctx)
     registry.dispatch({"op": RELEASE_FACE}, ctx)
     assert intents.inhibitions == frozenset({"feel-alive"})
+
+
+def test_a_replacement_never_turns_the_locks_own_additions_into_operator_held() -> None:
+    """The live 2026-08-26 inertness bug: stay_silent/end_silence around a lock.
+
+    The mind cannot tell the lock's own additions apart from its own, so its
+    ``stay_silent`` merges ``speak`` into whatever ``state.json`` currently lists
+    — which INCLUDES ``feel-alive`` / ``orient-to-sound`` the lock just added.
+    A naive later-wins read of that replacement adopts the lock's own additions
+    as operator-held, and release then leaves the presence loop inhibited: an
+    inert robot. The new snapshot is therefore ``new_set - added``.
+    """
+    intents = IntentDriver()
+    _driver, registry = _wire(intents)
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch({"op": LOCK_FACE}, ctx)  # snapshot A = {}
+    assert intents.inhibitions == frozenset(LOCK_INHIBITS)
+
+    # stay_silent: the mind echoes back what it read, plus `speak`.
+    registry.dispatch(
+        {"op": SET_INHIBITION, "behaviors": ["feel-alive", "orient-to-sound", "speak"]}, ctx
+    )
+    assert frozenset(LOCK_INHIBITS) <= intents.inhibitions  # lock still holds its own
+    assert intents.inhibitions == frozenset({"speak", *LOCK_INHIBITS})
+
+    # end_silence: `speak` drops away again.
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["feel-alive", "orient-to-sound"]}, ctx)
+    assert frozenset(LOCK_INHIBITS) <= intents.inhibitions
+
+    result = registry.dispatch({"op": RELEASE_FACE}, ctx)
+    assert intents.inhibitions == frozenset()
+    assert result["inhibitions"] == []
+
+
+def test_an_operator_name_beside_the_locks_additions_still_survives_release() -> None:
+    """Stripping the lock's additions from a replacement keeps the rest intact."""
+    intents = IntentDriver()
+    _driver, registry = _wire(intents)
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch({"op": LOCK_FACE}, ctx)  # snapshot A = {}
+    registry.dispatch(
+        {"op": SET_INHIBITION, "behaviors": ["feel-alive", "orient-to-sound", "nod"]}, ctx
+    )
+    assert intents.inhibitions == frozenset({"nod", *LOCK_INHIBITS})
+
+    result = registry.dispatch({"op": RELEASE_FACE}, ctx)
+    assert intents.inhibitions == frozenset({"nod"})
+    assert result["inhibitions"] == ["nod"]
+
+
+def test_a_replacement_reclaims_a_lock_name_the_operator_already_held() -> None:
+    """Ownership is RECOMPUTED per replacement, not frozen at acquisition.
+
+    ``feel-alive`` was operator-inhibited BEFORE the lock, so the lock never
+    "added" it. A later replacement that drops it would, with an acquisition-time
+    ownership set, leave the presence loop free to drag the head off the face
+    while the lock is still held — the lock's core invariant broken. The lock
+    reclaims it instead, and gives it back on release.
+    """
+    intents = IntentDriver()
+    _driver, registry = _wire(intents)
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["feel-alive"]}, ctx)
+    registry.dispatch({"op": LOCK_FACE}, ctx)
+
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["nod"]}, ctx)
+    assert frozenset(LOCK_INHIBITS) <= intents.inhibitions
+    assert intents.inhibitions == frozenset({"nod", *LOCK_INHIBITS})
+
+    result = registry.dispatch({"op": RELEASE_FACE}, ctx)
+    assert intents.inhibitions == frozenset({"nod"})
+    assert result["inhibitions"] == ["nod"]
+
+
+def test_a_replacement_keeping_only_some_lock_names_hands_those_to_the_caller() -> None:
+    """Keeping SOME of the lock's names is a deliberate choice, not an echo."""
+    intents = IntentDriver()
+    _driver, registry = _wire(intents)
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch({"op": LOCK_FACE}, ctx)
+
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["feel-alive"]}, ctx)
+    assert intents.inhibitions == frozenset(LOCK_INHIBITS)
+
+    result = registry.dispatch({"op": RELEASE_FACE}, ctx)
+    assert intents.inhibitions == frozenset({"feel-alive"})
+    assert result["inhibitions"] == ["feel-alive"]
+
+
+def test_the_live_set_stays_lock_complete_across_successive_replacements() -> None:
+    """Every replacement while locked leaves the live set ``new | LOCK_INHIBITS``."""
+    intents = IntentDriver()
+    _driver, registry = _wire(intents)
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["orient-to-sound"]}, ctx)
+    registry.dispatch({"op": LOCK_FACE}, ctx)
+
+    for names in (["nod"], ["speak", "feel-alive"], []):
+        registry.dispatch({"op": SET_INHIBITION, "behaviors": list(names)}, ctx)
+        assert frozenset(LOCK_INHIBITS) <= intents.inhibitions
+        assert intents.inhibitions == frozenset(names) | frozenset(LOCK_INHIBITS)
+
+    result = registry.dispatch({"op": RELEASE_FACE}, ctx)
+    assert intents.inhibitions == frozenset()
+    assert result["inhibitions"] == []
 
 
 # --------------------------------------------------------------------------- #

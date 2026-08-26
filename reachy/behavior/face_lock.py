@@ -46,11 +46,27 @@ Inhibition is LATER-WINS
 -------------------------
 ``set_inhibition`` REPLACES the whole inhibited set (see
 :mod:`reachy.behavior.intents`), so a caller that replaces it WHILE locked has
-made a deliberate, later statement about what is inhibited. The lock therefore
-forgets its own additions at that moment (:meth:`FaceLockDriver.notice_inhibition_replaced`)
-and ``release_face`` leaves the newer set exactly as it stands. With no
-intervening call, release removes precisely the names the lock ADDED — never a
-name the snapshot already carried — restoring the snapshot.
+made a deliberate, later statement about what IT holds — and
+:meth:`FaceLockDriver.notice_inhibition_replaced` takes that statement as the
+caller's set, so ``release_face`` never restores an older one behind the
+caller's back.
+
+Ownership is RECOMPUTED on every replacement, never frozen at acquisition. The
+live set is re-asserted as ``new_set | LOCK_INHIBITS``: while the lock is held,
+``feel-alive`` / ``orient-to-sound`` are inhibited no matter what the caller
+wrote — including a name that was ALREADY operator-inhibited when the lock was
+taken (so it was never "added") and that the replacement drops, which an
+acquisition-time ownership set would have let start dragging the head off the
+face under a still-held lock. What the lock then OWNS — and hands back on
+release — is every ``LOCK_INHIBITS`` name the caller did not keep, plus, when
+the replacement carries EVERY name the lock currently holds, those names too: a
+set echoing all of ours back is a mind re-writing what it read (``stay_silent``
+merging ``speak`` into ``state.json``'s list), not a statement about our claim,
+and adopting it as operator-held would leave the presence loop inhibited after
+release and the robot inert (observed live, 2026-08-26). Keeping only SOME of
+the lock's names cannot be that echo, so those are the caller's own and survive
+release. Release removes precisely the lock's CURRENT contribution — never a
+name the caller holds.
 
 Import boundary
 -----------------
@@ -437,15 +453,39 @@ class FaceLockDriver:
 
     # -- the later-wins seam ------------------------------------------------- #
 
-    def notice_inhibition_replaced(self, _names: Iterable[str] | None = None) -> None:
-        """A ``set_inhibition`` replaced the whole set: drop our own additions.
+    def notice_inhibition_replaced(self, names: Iterable[str] | None = None) -> None:
+        """A ``set_inhibition`` replaced the whole set: RECOMPUTE what this lock owns.
 
         Wired to :attr:`reachy.behavior.intents.IntentDriver.inhibition_observer`
-        at composition. The lock stays held — only its CLAIM on the inhibited set
-        is surrendered, so the later call wins and ``release_face`` restores
-        nothing behind the caller's back.
+        at composition. Ownership is recomputed on EVERY replacement, never
+        frozen at acquisition: the live set is re-asserted as
+        ``new_set | LOCK_INHIBITS`` (so a replacement can never leave a
+        head-owning behavior running under a held lock, even for a name that was
+        already operator-inhibited when the lock was taken and therefore was
+        never "added"), and the ownership this release will hand back becomes:
+
+        * every :data:`LOCK_INHIBITS` name the caller did NOT keep — the lock
+          re-claims those, and removes them again on release;
+        * plus, when the replacement carries EVERY name the lock currently holds,
+          those same names — a set that echoes back all of ours is a mind
+          re-writing what it read (``stay_silent`` merging ``speak`` into
+          ``state.json``'s list), not a statement about our claim, and adopting
+          it as operator-held would leave the presence loop inhibited after
+          release: an inert robot (observed live, 2026-08-26).
+
+        Keeping only SOME of the lock's names cannot be that echo, so those are
+        the caller's own and survive release.
         """
-        self._added = frozenset()
+        if not self._locked:
+            self._added = frozenset()
+            return
+        new_set = frozenset(names or ())
+        owned = frozenset(LOCK_INHIBITS) - new_set
+        if self._added and self._added <= new_set:
+            owned = owned | self._added
+        self._added = owned
+        if self._set_inhibitions is not None and not frozenset(LOCK_INHIBITS) <= new_set:
+            self._set_inhibitions(new_set | frozenset(LOCK_INHIBITS))
 
     # -- the tick seam ------------------------------------------------------- #
 
