@@ -577,9 +577,7 @@ class TestFaceEngineDetectAll:
 
     def test_detect_all_returns_every_face_normalised(self):
         # (x, y, w, h, ...) rows, exactly YuNet's shape, on a 200x100 frame.
-        faces = np.array(
-            [[10.0, 20.0, 40.0, 30.0], [100.0, 10.0, 20.0, 10.0]], dtype=np.float32
-        )
+        faces = np.array([[10.0, 20.0, 40.0, 30.0], [100.0, 10.0, 20.0, 10.0]], dtype=np.float32)
         engine = self._engine(faces)
 
         results = engine.detect_all(np.zeros((100, 200, 3), dtype=np.uint8))
@@ -594,9 +592,7 @@ class TestFaceEngineDetectAll:
         assert engine.detect_all(np.zeros((100, 200, 3), dtype=np.uint8)) == []
 
     def test_detect_still_returns_the_largest_face(self):
-        faces = np.array(
-            [[100.0, 10.0, 20.0, 10.0], [10.0, 20.0, 40.0, 30.0]], dtype=np.float32
-        )
+        faces = np.array([[100.0, 10.0, 20.0, 10.0], [10.0, 20.0, 40.0, 30.0]], dtype=np.float32)
         engine = self._engine(faces)
 
         result = engine.detect(np.zeros((100, 200, 3), dtype=np.uint8))

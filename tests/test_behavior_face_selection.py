@@ -199,9 +199,11 @@ def test_the_face_age_grows_with_the_tick_clock() -> None:
         face_bbox_ttl_s=10.0,
     )
     _run(driver, now=0.0)
+    # `_run` drains the observation on its second tick, at now=0.02 — that is
+    # the anchor the age counts from (the tick clock, never the worker's).
     assert driver.peek_face_age_s() == pytest.approx(0.0, abs=1e-9)
     driver(_Ctx(1.5))
-    assert driver.peek_face_age_s() == pytest.approx(1.5)
+    assert driver.peek_face_age_s() == pytest.approx(1.48)
     assert driver.peek_face_bbox() is not None
 
 

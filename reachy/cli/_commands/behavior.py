@@ -2412,6 +2412,12 @@ def _compose_run_seam(
             rms_ratio=rms_ratio_provider,
             transcript=transcript_driver.as_provider(),
             face=face_driver.as_face_provider(),
+            # The same detection's POSITION and its age (t2) — the name cue
+            # answers WHO, these two answer WHERE and HOW STALE, which is what
+            # a gaze behavior needs and what an UNRECOGNISED face can still
+            # give it.
+            face_bbox=face_driver.as_face_bbox_provider(),
+            face_age_s=face_driver.as_face_age_provider(),
             frame_available=face_driver.as_frame_available_provider(),
             self_moving=self_motion.is_moving,
         )
