@@ -9,7 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- face-lock: a set_inhibition arriving while locked no longer turns the lock's own inhibitions into operator-held ones (live 2026-08-26: release left feel-alive/orient-to-sound inhibited)
+- face-lock: a set_inhibition arriving while locked no longer turns the lock's own
+  inhibitions into operator-held ones (live 2026-08-26: release left
+  feel-alive/orient-to-sound inhibited)
+- face-lock: lock ownership of the inhibited set is recomputed on every replacement
+  instead of frozen at acquisition, so a replacement can never leave feel-alive or
+  orient-to-sound running under a still-held lock
 
 ## [0.51.0] - 2026-08-26
 
