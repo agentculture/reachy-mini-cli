@@ -5,18 +5,46 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.50.0] - 2026-08-26
+## [0.51.0] - 2026-08-26
 
 ### Added
 
-- Gaze one-shots look-at-sound / look-at-face (Sense.doa_age_s, Sense.face_bbox/face_age_s, biggest-face selection with near-tie preference for a recognised face)
-- lock_face / release_face intent kinds with a clamped, looping face-lock behavior, later-wins inhibition snapshot, face-lost / lock-released motion events, max-hold and mind-offline release
-- mute / unmute intent kinds gating SpeechActuator.say
-- MindPresence: retained nova/harness/state subscriber wired into the face-lock
+- **Gaze one-shots** `look-at-sound` / `look-at-face` — `Sense.doa_age_s`,
+  `Sense.face_bbox` / `Sense.face_age_s`, biggest-face selection with a
+  near-tie preference for a recognised face.
+- **`lock_face` / `release_face` intent kinds** — a clamped, looping face-lock
+  behavior, a later-wins inhibition snapshot, `face-lost` / `lock-released`
+  motion events, and the max-hold / mind-offline releases.
+- **`mute` / `unmute` intent kinds** gating `SpeechActuator.say`.
+- **`MindPresence`** — the retained `nova/harness/state` subscriber wired into
+  the face lock.
 
 ### Changed
 
-- FaceSenseDriver keeps the bbox of unmatched faces (position before the store match); FaceEngine.detect_all
+- `FaceSenseDriver` keeps the bbox of unmatched faces (position before the
+  store match); `FaceEngine.detect_all`.
+
+## [0.50.0] - 2026-08-24
+
+### Added
+
+- **`ask-colleague resume <task-id|last> [--detach]`** — pick a cut /
+  timed-out / SIGTERM'd run back up from its persisted artifact, continuing on
+  the original `colleague/<id>` work branch.
+- **Per-seat thinking effort** for `ask-colleague` (colleague#416) —
+  `--effort RUNG` (acting seat), `--seat-effort S=R` (any seat), `--role NAME`.
+
+### Changed
+
+- **`ask-colleague` re-vendored byte-verbatim from `agentculture/colleague`
+  @ 1.63.0** — all five files match
+  `diff -r ../colleague/.claude/skills/ask-colleague`.
+- **Default colleague model is now `unsloth/Qwen3.8-27B-NVFP4`** (was the
+  Qwen3.6 pin) — the lobes gateway on `:8001` no longer serves 3.6.
+- `ask-colleague review` front-loads a filtered, capped diff into the review
+  instruction so the model does not spend turns running `git diff` itself.
+- `docs/skill-sources.md`: ledger row records the 1.63.0 sync and drops the
+  now-retired re-localization step.
 
 ## [0.49.0] - 2026-08-19
 
