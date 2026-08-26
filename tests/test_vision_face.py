@@ -537,3 +537,65 @@ class TestFaceEngineWithCv2:
         assert result is not None
         assert result.embedding.shape == (face.EMBEDDING_DIM,)
         assert all(0.0 <= c <= 1.0 for c in result.bbox_norm)
+
+
+class TestFaceEngineDetectAll:
+    """``detect_all`` — every face in the frame, not just the largest (t2).
+
+    Runs WITHOUT cv2: ``FaceEngine._load`` short-circuits once both members are
+    set, so injecting a fake YuNet detector + SFace recognizer exercises the
+    real selection/normalisation code on any box.
+    """
+
+    class _FakeDetector:
+        def __init__(self, faces):
+            self._faces = faces
+            self.input_size = None
+
+        def setInputSize(self, size):  # noqa: N802 - mirrors cv2's camelCase API
+            self.input_size = size
+
+        def detect(self, frame):
+            return 1, self._faces
+
+    class _FakeRecognizer:
+        def __init__(self):
+            self.crops = []
+
+        def alignCrop(self, frame, face_row):  # noqa: N802 - mirrors cv2's API
+            self.crops.append(tuple(float(v) for v in face_row[:4]))
+            return frame
+
+        def feature(self, aligned):
+            return np.arange(face.EMBEDDING_DIM, dtype=float).reshape(1, -1)
+
+    def _engine(self, faces):
+        engine = face.FaceEngine()
+        engine._detector = self._FakeDetector(faces)
+        engine._recognizer = self._FakeRecognizer()
+        return engine
+
+    def test_detect_all_returns_every_face_normalised(self):
+        # (x, y, w, h, ...) rows, exactly YuNet's shape, on a 200x100 frame.
+        faces = np.array([[10.0, 20.0, 40.0, 30.0], [100.0, 10.0, 20.0, 10.0]], dtype=np.float32)
+        engine = self._engine(faces)
+
+        results = engine.detect_all(np.zeros((100, 200, 3), dtype=np.uint8))
+
+        assert len(results) == 2
+        assert results[0].bbox_norm == pytest.approx((0.05, 0.2, 0.25, 0.5))
+        assert results[1].bbox_norm == pytest.approx((0.5, 0.1, 0.6, 0.2))
+        assert all(r.embedding.shape == (face.EMBEDDING_DIM,) for r in results)
+
+    def test_detect_all_on_an_empty_frame_is_an_empty_list(self):
+        engine = self._engine(None)
+        assert engine.detect_all(np.zeros((100, 200, 3), dtype=np.uint8)) == []
+
+    def test_detect_still_returns_the_largest_face(self):
+        faces = np.array([[100.0, 10.0, 20.0, 10.0], [10.0, 20.0, 40.0, 30.0]], dtype=np.float32)
+        engine = self._engine(faces)
+
+        result = engine.detect(np.zeros((100, 200, 3), dtype=np.uint8))
+
+        assert result is not None
+        assert result.bbox_norm == pytest.approx((0.05, 0.2, 0.25, 0.5))

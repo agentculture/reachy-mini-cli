@@ -143,6 +143,19 @@ class Sense:
     - ``face`` — the name of a recognised, named face this tick (mirrors
       ``EventBuffer.feed_face(name)``), or ``None`` (no match, an unnamed
       face, or not sampled).
+    - ``face_bbox`` — WHERE the best face of the latest detection is:
+      ``(x, y, w, h)``, normalised to the frame (``0..1``, origin top-left),
+      or ``None`` when no face has been detected recently. Unlike ``face``
+      this is a HELD level, not a one-tick event, and it is deliberately
+      independent of recognition: an unknown face — a stranger looking at the
+      robot — still has a position, so ``face_bbox`` can be set while ``face``
+      is ``None``. Which face, when several are in frame, is decided by
+      :func:`reachy.behavior.face_sense.select_face` (biggest, with a
+      recognised face breaking a near tie).
+    - ``face_age_s`` — how long ago (seconds) the ``face_bbox`` detection
+      landed, or ``None`` when there is no position reading. A consumer that
+      must not act on a stale position reads this rather than guessing the
+      camera's cadence; the producer also expires the bbox on its own TTL.
     - ``frame_available`` — whether a camera frame was available to peek this
       tick. A signal only — never the frame itself, so this module never
       needs to name a frame's concrete type (numpy/cv2) and stays a
@@ -167,6 +180,8 @@ class Sense:
     rms: float | None = None
     pat_event: tuple[str, str] | None = None
     face: str | None = None
+    face_bbox: tuple[float, float, float, float] | None = None
+    face_age_s: float | None = None
     frame_available: bool = False
     pat_state: PatState = UNAVAILABLE_PAT_STATE
     transcript: str | None = None
@@ -253,6 +268,8 @@ RmsRatioProvider = Callable[[], float | None]
 PatEventProvider = Callable[[], tuple[str, str] | None]
 PatStateProvider = Callable[[], PatState | None]
 FaceProvider = Callable[[], str | None]
+FaceBboxProvider = Callable[[], tuple[float, float, float, float] | None]
+FaceAgeProvider = Callable[[], float | None]
 FrameAvailableProvider = Callable[[], bool]
 TranscriptProvider = Callable[[], str | None]
 SelfMovingProvider = Callable[[], bool]
@@ -277,6 +294,8 @@ class SenseProviders:
     rms: RmsProvider | None = None
     pat_event: PatEventProvider | None = None
     face: FaceProvider | None = None
+    face_bbox: FaceBboxProvider | None = None
+    face_age_s: FaceAgeProvider | None = None
     frame_available: FrameAvailableProvider | None = None
     pat_state: PatStateProvider | None = None
     transcript: TranscriptProvider | None = None
@@ -295,6 +314,13 @@ _ALWAYS_FED_FIELDS: frozenset[str] = frozenset({"doa", "speech"})
 
 #: Maps each optional :class:`SenseProviders` attribute to the predicate-field
 #: name it feeds once a real callable is wired into it.
+#:
+#: NOT every provider appears here: ``face_bbox`` and ``face_age_s`` are
+#: CONTINUOUS readings a motion behavior consumes off the :class:`Sense`
+#: snapshot directly, not ``rules.toml`` predicate fields (they are absent from
+#: :data:`reachy.behavior.rules.SENSE_FIELDS`, so no rule can key on them and
+#: there is nothing for ``behavior rules check`` to warn about). A provider
+#: belongs in this map only once a predicate field names it.
 _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
     "rms": "rms",
     "rms_ratio": "rms_ratio",
@@ -370,6 +396,37 @@ def _peek(provider, default):
         return default
 
 
+def _coerce_bbox(value) -> tuple[float, float, float, float] | None:
+    """Accept only a 4-tuple of finite numbers -> ``(x, y, w, h)``; else ``None``.
+
+    A malformed reading is a NON-READING, never a raise: the same degradation
+    :func:`_peek` gives a provider that blows up. Strings are rejected on
+    purpose — a 4-character string is iterable and would otherwise sneak
+    through as a "box".
+    """
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    try:
+        x, y, w, h = value  # type: ignore[misc]
+        box = (float(x), float(y), float(w), float(h))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in box):
+        return None
+    return box
+
+
+def _coerce_float(value) -> float | None:
+    """Accept a finite number -> ``float``; anything else is a non-reading."""
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def read_perception(
     providers: SenseProviders = NO_PROVIDERS,
     *,
@@ -395,6 +452,8 @@ def read_perception(
         rms_ratio=_peek(providers.rms_ratio, None),
         pat_event=_peek(providers.pat_event, None),
         face=_peek(providers.face, None),
+        face_bbox=_coerce_bbox(_peek(providers.face_bbox, None)),
+        face_age_s=_coerce_float(_peek(providers.face_age_s, None)),
         frame_available=bool(_peek(providers.frame_available, False)),
         pat_state=pat_state if isinstance(pat_state, PatState) else UNAVAILABLE_PAT_STATE,
         transcript=_peek(providers.transcript, None),

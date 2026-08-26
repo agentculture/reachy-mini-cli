@@ -16,6 +16,16 @@ The two cues are different KINDS of signal, and the module treats them that way:
   keyed on it sees the name in exactly one :class:`Sense` snapshot; the
   per-name re-announce cooldown below stops a face that merely lingers in view
   from re-firing every detection cycle.
+* ``face_bbox`` / ``face_age_s`` are the same detection's **position** — a
+  TTL-HELD level (:data:`DEFAULT_FACE_BBOX_TTL_S`), like ``frame_available``
+  and unlike the name. Three things follow from that split, and all three are
+  deliberate: the position survives the per-name re-announce cooldown (a face
+  that lingers is exactly the case a gaze behavior needs a position for); an
+  UNRECOGNISED face still has one (``face_bbox`` set while ``face`` is
+  ``None`` — before this, an unmatched detection was discarded whole and a
+  stranger looking at the robot produced no reading at all); and when several
+  faces share a frame, :func:`select_face` — pure, and unit-tested as such —
+  names which one it is: biggest, with a recognised face breaking a near tie.
 * ``frame_available`` is a **condition** — "the camera is producing frames" —
   so it is a TTL-held level, not a per-tick pulse. The camera runs slower than
   the 50 Hz tick (and a steady-state read returns ``None`` whenever nothing is
@@ -171,6 +181,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from importlib.util import find_spec as _find_spec
 from typing import Any, Callable
 
@@ -228,6 +239,22 @@ DEFAULT_STREAM_STALE_S: float = 10.0
 #: be there. DETECT ONLY — see the module docstring; nothing on this path
 #: constructs, rebuilds or restarts a media client or pipeline.
 REASON_STREAM_ENDED = "camera-stream-ended"
+
+#: How long a face POSITION reading (``face_bbox``/``face_age_s``) is held
+#: before it expires (seconds). The position is a HELD level, not a one-tick
+#: event — a gaze behavior needs it on every tick, not on the one tick a
+#: detection happened to land — but a held reading with no expiry is a lie the
+#: moment the person walks away: the robot would keep staring at where a face
+#: used to be. Several detection cycles wide (``DEFAULT_DETECT_INTERVAL`` is
+#: 0.5 s) so an ordinary missed detection never blanks it, and short enough
+#: that a departed face stops being "there" in about a second.
+DEFAULT_FACE_BBOX_TTL_S: float = 1.5
+
+#: Area band inside which two faces count as "the same size", so recognition —
+#: not a couple of pixels — decides between them. 15%: comfortably wider than
+#: the frame-to-frame jitter of one YuNet box, comfortably narrower than the
+#: area gap between two people at visibly different distances.
+AREA_TIE_RATIO: float = 0.15
 
 #: How long the worker parks between iterations when idle. Bounded so
 #: :meth:`FaceSenseDriver.close` joins promptly.
@@ -397,6 +424,98 @@ class _Slot:
             return self._value
 
 
+@dataclass(frozen=True)
+class FaceCandidate:
+    """One detected face as SELECTION sees it: where it is, and who it is.
+
+    ``bbox`` is ``(x, y, w, h)`` normalised to the frame (``None`` when the
+    detector gave no box), ``name`` the store's match for it (``None`` for an
+    unknown or unnamed face — which is a perfectly good candidate here; only
+    the ``face`` NAME cue insists on a name).
+    """
+
+    bbox: tuple[float, float, float, float] | None
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class FaceObservation:
+    """What one detection cycle publishes from the worker to the tick thread.
+
+    Carries the chosen face's ``name`` (or ``None``) AND its ``bbox`` — the
+    pair is the whole point of t2: before it, an unmatched detection was
+    discarded entirely and a stranger looking at the robot produced no reading
+    at all.
+    """
+
+    name: str | None = None
+    bbox: tuple[float, float, float, float] | None = None
+
+
+def bbox_area(bbox: tuple[float, float, float, float] | None) -> float:
+    """Normalised area of an ``(x, y, w, h)`` box; a missing/degenerate box is 0."""
+    if bbox is None:
+        return 0.0
+    return max(0.0, float(bbox[2])) * max(0.0, float(bbox[3]))
+
+
+def select_face(candidates) -> "FaceCandidate | None":
+    """Pick the one face a behavior should care about; ``None`` for none at all.
+
+    PURE — no clock, no state, no I/O — so the policy can be unit-tested over a
+    plain list and the driver just applies it.
+
+    The rule, in order:
+
+    1. **Biggest wins.** Box area is the only distance proxy the detector
+       gives, and the nearest face is the one a person expects a robot to look
+       at.
+    2. **A recognised face breaks a near tie.** Every candidate within
+       :data:`AREA_TIE_RATIO` of the largest area is a contender; if any of
+       them carries a name, the named ones alone stay in the running. Two
+       people standing side by side are a coin-flip on area and jitter would
+       otherwise make the robot's attention flick between them every cycle —
+       knowing one of them is the better tiebreak, and a stable one.
+    3. Among whatever is left, biggest again; ties resolve to the first
+       candidate the detector reported (a stable, deterministic order).
+
+    A far-larger unknown face still beats a small known one: the band in step 2
+    is deliberately narrow, so "the person right in front of me" is never
+    overruled by "someone I know across the room".
+    """
+    scored = [(candidate, bbox_area(candidate.bbox)) for candidate in candidates]
+    if not scored:
+        return None
+    best_area = max(area for _, area in scored)
+    floor = best_area * (1.0 - AREA_TIE_RATIO)
+    contenders = [pair for pair in scored if pair[1] >= floor]
+    named = [pair for pair in contenders if (pair[0].name or "").strip()]
+    pool = named or contenders
+    return max(pool, key=lambda pair: pair[1])[0]
+
+
+def to_xywh(bbox_norm) -> "tuple[float, float, float, float] | None":
+    """Corner-form ``(x1, y1, x2, y2)`` -> ``(x, y, w, h)``; junk -> ``None``.
+
+    :class:`reachy.vision.face.FaceDetection` reports CORNERS, while
+    :attr:`reachy.behavior.sense.Sense.face_bbox` carries origin + size — the
+    shape a consumer that wants a face's CENTRE (``x + w/2``) needs without
+    re-deriving it. The conversion happens once, here, so neither side has to
+    know the other's convention. A missing or malformed box is a non-reading,
+    never a raise.
+    """
+    if bbox_norm is None or isinstance(bbox_norm, (str, bytes)):
+        return None
+    try:
+        x1, y1, x2, y2 = bbox_norm
+        box = (float(x1), float(y1), float(x2) - float(x1), float(y2) - float(y1))
+    except (TypeError, ValueError):
+        return None
+    if not all(np.isfinite(value) for value in box):
+        return None
+    return box
+
+
 class FaceSenseDriver:
     """A ``TickBus`` driver feeding the ``face`` and ``frame_available`` cues.
 
@@ -431,6 +550,10 @@ class FaceSenseDriver:
     frame_ttl_s:
         How long a read frame holds ``frame_available`` true. Default
         :data:`DEFAULT_FRAME_TTL_S`.
+    face_bbox_ttl_s:
+        How long a face POSITION reading (``face_bbox``/``face_age_s``) is held
+        after its detection before it expires. Default
+        :data:`DEFAULT_FACE_BBOX_TTL_S`.
     stream_stale_s:
         How long the last usable frame may go unrefreshed, while the client
         still claims to be connected and camera-available, before a latched
@@ -458,6 +581,7 @@ class FaceSenseDriver:
         reannounce_cooldown: float = DEFAULT_REANNOUNCE_COOLDOWN,
         frame_ttl_s: float = DEFAULT_FRAME_TTL_S,
         frame_interval_s: float = DEFAULT_FRAME_INTERVAL_S,
+        face_bbox_ttl_s: float = DEFAULT_FACE_BBOX_TTL_S,
         stream_stale_s: float = DEFAULT_STREAM_STALE_S,
         clock: Callable[[], float] = time.monotonic,
         start_worker: bool = True,
@@ -469,6 +593,7 @@ class FaceSenseDriver:
         self._reannounce_cooldown = max(0.0, float(reannounce_cooldown))
         self._frame_ttl_s = max(0.0, float(frame_ttl_s))
         self._frame_interval_s = max(0.0, float(frame_interval_s))
+        self._face_bbox_ttl_s = max(0.0, float(face_bbox_ttl_s))
         self._stream_stale_s = max(0.0, float(stream_stale_s))
         self._last_read_at: float | None = None
         self._clock = clock
@@ -486,6 +611,13 @@ class FaceSenseDriver:
         self._last_announced: dict[str, float] = {}
         #: The ONE-TICK ``face`` latch (see the module docstring).
         self._face: str | None = None
+        #: The TTL-HELD face POSITION and the tick-clock reading it landed at.
+        #: Held, not pulsed: a gaze behavior needs a position on EVERY tick,
+        #: and it is kept independently of ``_face`` so the per-name
+        #: re-announce cooldown (a NAME-cue concern) can never freeze it.
+        self._face_bbox: tuple[float, float, float, float] | None = None
+        self._face_bbox_at: float | None = None
+        self._face_age_s: float | None = None
         #: The TTL-held ``frame_available`` condition and its freshness anchor.
         self._frame_available = False
         self._last_frame_at: float | None = None
@@ -529,10 +661,12 @@ class FaceSenseDriver:
         """The tick-thread body: O(1) frame publish + result drain, never detection."""
         if self._closed:
             self._frame_available = False
+            self._clear_position()
             return
         now = self._now(ctx)
         self._update_frame(now)
         self._drain_match(now)
+        self._age_position(now)
 
     # -- frame leg ------------------------------------------------------ #
 
@@ -720,11 +854,27 @@ class FaceSenseDriver:
     # -- match leg ------------------------------------------------------ #
 
     def _drain_match(self, now: float | None) -> None:
-        """Take the worker's latest name and latch it, honouring the re-announce cooldown."""
+        """Take the worker's latest observation: hold its POSITION, latch its NAME.
+
+        The two halves are deliberately independent. The position is refreshed
+        unconditionally — it is a level, and the thing a gaze behavior reads
+        every tick — while the name still obeys the per-name re-announce
+        cooldown that keeps a lingering face from re-firing its rule. Before
+        t2 the cooldown's early return dropped the whole result, which would
+        have blanked the position for the entire 30 s window on exactly the
+        case that matters most: someone standing there, being looked at.
+        """
         result = self._output.take()
         if result is None:
             return
-        name = str(result).strip()
+        observation = self._as_observation(result)
+        if observation is None:
+            return
+        if observation.bbox is not None:
+            self._face_bbox = observation.bbox
+            self._face_bbox_at = now
+            self._face_age_s = 0.0 if now is not None else None
+        name = (observation.name or "").strip()
         if not name:
             return
         if now is not None:
@@ -734,6 +884,48 @@ class FaceSenseDriver:
             self._last_announced[name] = now
         self._face = name
         self.events += 1
+
+    @staticmethod
+    def _as_observation(result: object) -> "FaceObservation | None":
+        """Normalise whatever the worker published into a :class:`FaceObservation`.
+
+        A bare string is still accepted — that is what this slot carried before
+        t2, and a name with no box is exactly what a detector that reports no
+        bbox produces — so no publisher has to be updated in lockstep.
+        """
+        if isinstance(result, FaceObservation):
+            return result
+        if isinstance(result, str):
+            name = result.strip()
+            return FaceObservation(name=name) if name else None
+        return None
+
+    def _age_position(self, now: float | None) -> None:
+        """Re-age the held position each tick and expire it past its TTL.
+
+        Age is measured on the ENGINE'S tick clock (``ctx.now``) at the moment
+        the observation was drained, never on the worker's own clock: mixing
+        two clocks in one reading is how a "seconds ago" ends up meaningless.
+        The drain happens on the tick after the detection completes, so the
+        reading is late by at most one tick — far inside anything a motion
+        behavior can act on.
+        """
+        anchor = self._face_bbox_at
+        if self._face_bbox is None or anchor is None or now is None:
+            return
+        age = now - anchor
+        if age < 0.0 or age > self._face_bbox_ttl_s:
+            # Past the TTL (or a clock that jumped backwards): a held position
+            # that is no longer true must read as NO reading, not as a stale one.
+            self._clear_position()
+            return
+        self._face_age_s = age
+
+    def _clear_position(self) -> None:
+        """Drop the held position reading — no bbox, no age."""
+        self._face_bbox = None
+        self._face_bbox_at = None
+        self._face_age_s = None
 
     # ------------------------------------------------------------------ #
     # background detection worker                                        #
@@ -776,28 +968,68 @@ class FaceSenseDriver:
         if not usable_frame(frame):
             return
         self._last_detect = now
-        name = self._detect_once(frame)
-        if name is not None:
-            self._output.publish(name)
+        observation = self._detect_once(frame)
+        if observation is not None:
+            self._output.publish(observation)
 
-    def _detect_once(self, frame: object) -> str | None:
-        """Detect + embed + match one frame -> a known name, or ``None``.
+    def _detect_once(self, frame: object) -> "FaceObservation | None":
+        """Detect + embed + match one frame -> the chosen face, or ``None``.
 
-        Every foreign call is guarded: a raise degrades to "no match" and is
-        logged, never propagated. No match, or a match with no usable name, is
-        ``None`` — only a named, matched face becomes a cue.
+        Returns the SELECTED face's position and (when the store knows it) its
+        name. An unmatched face is a real observation here — it has a position,
+        which is what a gaze behavior needs — and only the ``face`` NAME cue
+        goes on insisting on a named, matched face. ``None`` means nothing
+        usable was seen at all: no detection, or a detection with neither a box
+        nor a name.
+
+        Every foreign call is guarded: a raise degrades to "no observation" and
+        is logged, never propagated.
         """
+        detections = self._detect_faces(frame)
+        if not detections:
+            return None
+        candidates = [
+            FaceCandidate(
+                bbox=to_xywh(getattr(detection, "bbox_norm", None)),
+                name=self._match_name(detection),
+            )
+            for detection in detections
+        ]
+        chosen = select_face(candidates)
+        if chosen is None or (chosen.bbox is None and not chosen.name):
+            return None
+        return FaceObservation(name=chosen.name, bbox=chosen.bbox)
+
+    def _detect_faces(self, frame: object) -> list:
+        """Every face in *frame*, via ``detect_all`` when the engine offers it.
+
+        ``detect_all`` is what makes SELECTION possible at all — a single
+        largest-face ``detect`` cannot express "prefer the person I recognise".
+        An engine that only has ``detect`` (an older build, a test fake) still
+        works and simply yields at most one candidate.
+        """
+        engine = self._engine
+        if engine is None:
+            return []
+        detect_all = getattr(engine, "detect_all", None)
         try:
-            detection = self._engine.detect(frame)  # type: ignore[attr-defined]
+            if callable(detect_all):
+                return [d for d in (detect_all(frame) or []) if d is not None]
+            detection = engine.detect(frame)  # type: ignore[attr-defined]
         except Exception:
             logger.warning("FaceSenseDriver detection raised; skipping frame", exc_info=True)
-            return None
-        if detection is None:
+            return []
+        return [] if detection is None else [detection]
+
+    def _match_name(self, detection: object) -> str | None:
+        """The store's name for *detection*, or ``None`` — an unknown face is fine."""
+        store = self._store
+        if store is None:
             return None
         try:
-            match = self._store.match(detection.embedding)  # type: ignore[attr-defined]
+            match = store.match(getattr(detection, "embedding", None))  # type: ignore[attr-defined]
         except Exception:
-            logger.warning("FaceSenseDriver store match raised; skipping frame", exc_info=True)
+            logger.warning("FaceSenseDriver store match raised; skipping match", exc_info=True)
             return None
         if match is None:
             return None
@@ -817,6 +1049,22 @@ class FaceSenseDriver:
     def as_face_provider(self) -> Callable[[], str | None]:
         """The zero-arg ``face`` provider callable (an alias for :meth:`peek_face`)."""
         return self.peek_face
+
+    def peek_face_bbox(self) -> tuple[float, float, float, float] | None:
+        """The TTL-held face POSITION ``(x, y, w, h)`` — a non-consuming PEEK."""
+        return self._face_bbox
+
+    def as_face_bbox_provider(self) -> Callable[[], tuple[float, float, float, float] | None]:
+        """The zero-arg ``face_bbox`` provider callable."""
+        return self.peek_face_bbox
+
+    def peek_face_age_s(self) -> float | None:
+        """Seconds since the held position's detection, or ``None`` — a PEEK."""
+        return self._face_age_s
+
+    def as_face_age_provider(self) -> Callable[[], float | None]:
+        """The zero-arg ``face_age_s`` provider callable."""
+        return self.peek_face_age_s
 
     def peek_frame_available(self) -> bool:
         """The current TTL-held ``frame_available`` condition. Never raises."""
@@ -840,6 +1088,7 @@ class FaceSenseDriver:
         """
         self._closed = True
         self._face = None
+        self._clear_position()
         self._frame_available = False
         self._stop.set()
         worker = self._worker
