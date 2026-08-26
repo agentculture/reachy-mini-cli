@@ -126,6 +126,45 @@ def test_runtime_events_reach_the_bus_on_reachy_events_source_type() -> None:
     ]
 
 
+def test_face_lock_lifecycle_events_reach_the_bus_on_their_own_topics() -> None:
+    """t5's two motion actions are registered, so they are PUBLISHED, not dropped."""
+    pub, client = _live_publisher()
+    consume = pub.as_tick_consumer()
+
+    consume(
+        {
+            "type": "motion.face-lost",
+            "behavior": "face-lock",
+            "channels": ["head"],
+            "detail": {"absent_s": 3.4},
+        }
+    )
+    consume(
+        {
+            "type": "motion.lock-released",
+            "behavior": "face-lock",
+            "channels": ["head"],
+            "detail": {"reason": "mind-offline"},
+        }
+    )
+
+    event_topics = [t for t in client.topics() if t.startswith("reachy/events/")]
+    assert event_topics == [
+        "reachy/events/motion/face-lost",
+        "reachy/events/motion/lock-released",
+    ]
+    released = json.loads(client.by_topic("reachy/events/motion/lock-released")[0].payload)
+    assert released["detail"]["reason"] == "mind-offline"
+
+
+def test_an_unregistered_motion_action_still_never_reaches_the_bus() -> None:
+    """Registration is the gate: an unknown action maps to nothing on BOTH feeds."""
+    pub, client = _live_publisher()
+    client.published.clear()
+    pub.as_tick_consumer()({"type": "motion.teleport", "behavior": "face-lock"})
+    assert client.published == []
+
+
 def test_event_payload_is_the_export_schema_line_verbatim() -> None:
     """The bus payload is the SAME serializer the stdout runtime feed uses.
 
