@@ -183,6 +183,16 @@ REASON_LATCHED = "sink-latched-off"
 REASON_SYNTHESIZE = "synthesize-failed"
 REASON_PLAYBACK = "playback-failed"
 REASON_NO_AUDIO = "no-audio"
+#: The t17 quiet gate: the MIND asked the body to stop talking (``mute`` intent
+#: kind). Deliberately its own reason, never folded into
+#: :data:`REASON_LATCHED` — a latched sink is a FAULT the robot recovers from
+#: on its own, a mute is a DECISION only an ``unmute`` undoes.
+REASON_MUTED = "voice-muted"
+
+#: The senselog ``event`` the mute gate's two summary lines carry. Not an
+#: utterance id: they describe the gate itself, not one dropped utterance.
+MUTE_EVENT = "mute"
+UNMUTE_EVENT = "unmute"
 
 
 # --------------------------------------------------------------------------- #
@@ -410,6 +420,15 @@ class SpeechActuator:
         self.dropped = 0
         self.failures = 0
 
+        # The t17 quiet gate. Tick-thread state only: `mute`/`unmute` arrive as
+        # intent commands, which are drained on the tick, and `say` is the tick
+        # thread's own call — so no lock is needed and none is taken.
+        self._voice_muted = False
+        #: Utterances this MUTE dropped (reset by each :meth:`mute`), so
+        #: :meth:`unmute` can report what the quiet actually cost.
+        self.muted_drops = 0
+        self._muted_reported = False
+
     # ------------------------------------------------------------------ #
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
@@ -479,6 +498,8 @@ class SpeechActuator:
             return self._drop(event, REASON_EMPTY)
         if len(text) > MAX_SAY_CHARS:
             return self._drop(event, REASON_TOO_LONG)
+        if self._voice_muted:
+            return self._drop_muted(event)
         if self.muted:
             return self._drop(event, REASON_LATCHED)
 
@@ -498,6 +519,59 @@ class SpeechActuator:
             return self._drop(event, REASON_QUEUE_FULL)
         self.submitted += 1
         return True
+
+    # ------------------------------------------------------------------ #
+    # The quiet gate (t17)                                               #
+    # ------------------------------------------------------------------ #
+
+    def mute(self) -> bool:
+        """Stop the robot's own voice until :meth:`unmute`. Idempotent.
+
+        The gate lives HERE, in the one place every utterance passes through,
+        rather than in the rules layer: a react rule's ``say`` never travels the
+        ``speak`` library behavior (``rule_engine._speak`` hands the text
+        straight to this method), so inhibiting ``speak`` would silence only
+        rules whose ``run`` IS ``speak`` and leave every other rule talking. A
+        wrapper around this method would have the same hole in reverse — any
+        caller holding the unwrapped bound method escapes it.
+
+        Deliberately NOT the same state as :attr:`muted` (the audio sink's
+        fault latch): that is a fault the robot clears by itself after
+        ``retry_after_s``, this is a decision only :meth:`unmute` undoes.
+
+        Returns whether this call CHANGED the gate.
+        """
+        if self._voice_muted:
+            return False
+        self._voice_muted = True
+        self.muted_drops = 0
+        self._muted_reported = False
+        return True
+
+    def unmute(self) -> bool:
+        """Give the voice back, reporting what the quiet cost. Idempotent.
+
+        Emits the ONE summary line (``count=N``) that closes the latched drop
+        line :meth:`say` wrote for the first muted utterance — so a mute window
+        is exactly two greppable lines in the journal however many utterances
+        it swallowed, and never zero.
+
+        Returns whether this call CHANGED the gate.
+        """
+        if not self._voice_muted:
+            return False
+        self._voice_muted = False
+        dropped = self.muted_drops
+        if dropped:
+            senselog.stage(
+                STAGE, SOURCE, UNMUTE_EVENT, f"voice restored, {REASON_MUTED} count={dropped}"
+            )
+        return True
+
+    @property
+    def voice_muted(self) -> bool:
+        """Whether the mind has asked the body to stay quiet (t17)."""
+        return self._voice_muted
 
     def mute_until(self) -> float:
         """The monotonic instant the robot's own voice stops occupying the room.
@@ -633,6 +707,23 @@ class SpeechActuator:
     def _drop(self, event: str, reason: str) -> bool:
         self.dropped += 1
         senselog.drop(STAGE, SOURCE, event, reason)
+        return False
+
+    def _drop_muted(self, event: str) -> bool:
+        """Drop one utterance to the quiet gate — LATCHED to a single line.
+
+        A mute is typically a timed window the mind holds for minutes; a robot
+        whose rules keep firing through it would otherwise write one drop line
+        per reaction and bury everything else in the journal. So the first drop
+        names the reason and the rest are counted, with :meth:`unmute` printing
+        the total. ``dropped`` still counts every one — the counter is the
+        complete record, the log is the readable one.
+        """
+        self.dropped += 1
+        self.muted_drops += 1
+        if not self._muted_reported:
+            self._muted_reported = True
+            senselog.drop(STAGE, SOURCE, event, REASON_MUTED)
         return False
 
 

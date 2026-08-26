@@ -86,6 +86,12 @@ class FaceDetection:
     embedding: np.ndarray
 
 
+def _bbox_area(bbox_norm: tuple[float, float, float, float]) -> float:
+    """Normalised area of a corner-form ``(x1, y1, x2, y2)`` box (never negative)."""
+    x1, y1, x2, y2 = bbox_norm
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
 def _import_cv2():  # type: ignore[no-untyped-def]
     """Lazily import ``cv2``; raise a clean exit-2 CliError when it's absent."""
     try:
@@ -211,12 +217,19 @@ class FaceEngine:
         )
         self._recognizer = cv2.FaceRecognizerSF.create(str(sface_path), "")
 
-    def detect(self, frame: np.ndarray) -> FaceDetection | None:
-        """Detect the largest face in *frame* (BGR ``H x W x 3``) and embed it.
+    def detect_all(self, frame: np.ndarray) -> list[FaceDetection]:
+        """Detect and embed EVERY face in *frame* (BGR ``H x W x 3``).
 
-        Returns ``None`` when no face is found in the frame. Raises
-        :class:`CliError` (exit 2) the first time this is called without the
-        ``[vision]`` extra installed.
+        Returns ``[]`` when no face is found. Raises :class:`CliError` (exit 2)
+        the first time this is called without the ``[vision]`` extra installed.
+
+        The multi-face path exists because *which* face matters to a consumer
+        that has to look at one of them: largest-face-only selection cannot
+        express "prefer the person I recognise over the stranger standing a
+        little closer". Selection is therefore NOT made here — this returns
+        every candidate and the caller (today
+        :func:`reachy.behavior.face_sense.select_face`) decides. Detections come
+        back in the detector's own order; nothing here sorts them.
         """
         self._load()
 
@@ -224,17 +237,29 @@ class FaceEngine:
         self._detector.setInputSize((w, h))
         _, faces = self._detector.detect(frame)
         if faces is None or len(faces) == 0:
+            return []
+
+        detections: list[FaceDetection] = []
+        for row in faces:
+            bx, by, bw, bh = (float(row[i]) for i in range(4))
+            bbox_norm = (bx / w, by / h, (bx + bw) / w, (by + bh) / h)
+            aligned = self._recognizer.alignCrop(frame, row)
+            embedding = self._recognizer.feature(aligned).flatten()
+            detections.append(FaceDetection(bbox_norm=bbox_norm, embedding=embedding))
+        return detections
+
+    def detect(self, frame: np.ndarray) -> FaceDetection | None:
+        """Detect the largest face in *frame* (BGR ``H x W x 3``) and embed it.
+
+        Returns ``None`` when no face is found in the frame. Raises
+        :class:`CliError` (exit 2) the first time this is called without the
+        ``[vision]`` extra installed.
+
+        Largest-face selection (width * height), mirrors nova. Kept as the
+        single-face convenience over :meth:`detect_all` so every existing
+        caller's contract is unchanged.
+        """
+        detections = self.detect_all(frame)
+        if not detections:
             return None
-
-        # Largest-face selection (width * height), mirrors nova.
-        areas = faces[:, 2] * faces[:, 3]
-        best_idx = int(np.argmax(areas))
-        best_face = faces[best_idx]
-
-        bx, by, bw, bh = (float(best_face[i]) for i in range(4))
-        bbox_norm = (bx / w, by / h, (bx + bw) / w, (by + bh) / h)
-
-        aligned = self._recognizer.alignCrop(frame, best_face)
-        embedding = self._recognizer.feature(aligned).flatten()
-
-        return FaceDetection(bbox_norm=bbox_norm, embedding=embedding)
+        return max(detections, key=lambda d: _bbox_area(d.bbox_norm))

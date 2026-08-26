@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Literal
 
 # DoA angle is radians: 0 = left, pi/2 = front, pi = right (the daemon's
@@ -113,7 +113,15 @@ class Sense:
     ``doa_angle`` is the sound Direction of Arrival in radians (``0``=left,
     ``pi/2``=front, ``pi``=right), or ``None`` when there is no usable reading
     (no mic, daemon error, or no sound). ``speech_detected`` is the daemon's
-    speech-vs-any-sound flag for the same reading.
+    speech-vs-any-sound flag for the same reading. ``doa_age_s`` is how long
+    ago (seconds) the last GOOD (angle-bearing) DoA reading landed — the
+    :class:`DoaPoller`'s own :meth:`DoaPoller.age_s`, carried onto the snapshot
+    it returns as ``base`` to :func:`read_perception` — or ``None`` when there
+    has never been one. Deliberately Sense's OWN field, not a call-time
+    lookup: a one-shot behavior like ``look-at-sound``
+    (:mod:`reachy.behavior.gaze`) samples it once at admission and must see
+    the SAME age a concurrent rule predicate would, not a second, later clock
+    read.
 
     ``rms``, ``pat_event``, ``pat_state``, ``face``, ``frame_available``,
     ``transcript``, and ``self_moving`` extend the snapshot with the cues the
@@ -143,6 +151,19 @@ class Sense:
     - ``face`` — the name of a recognised, named face this tick (mirrors
       ``EventBuffer.feed_face(name)``), or ``None`` (no match, an unnamed
       face, or not sampled).
+    - ``face_bbox`` — WHERE the best face of the latest detection is:
+      ``(x, y, w, h)``, normalised to the frame (``0..1``, origin top-left),
+      or ``None`` when no face has been detected recently. Unlike ``face``
+      this is a HELD level, not a one-tick event, and it is deliberately
+      independent of recognition: an unknown face — a stranger looking at the
+      robot — still has a position, so ``face_bbox`` can be set while ``face``
+      is ``None``. Which face, when several are in frame, is decided by
+      :func:`reachy.behavior.face_sense.select_face` (biggest, with a
+      recognised face breaking a near tie).
+    - ``face_age_s`` — how long ago (seconds) the ``face_bbox`` detection
+      landed, or ``None`` when there is no position reading. A consumer that
+      must not act on a stale position reads this rather than guessing the
+      camera's cadence; the producer also expires the bbox on its own TTL.
     - ``frame_available`` — whether a camera frame was available to peek this
       tick. A signal only — never the frame itself, so this module never
       needs to name a frame's concrete type (numpy/cv2) and stays a
@@ -164,9 +185,12 @@ class Sense:
 
     doa_angle: float | None = None
     speech_detected: bool = False
+    doa_age_s: float | None = None
     rms: float | None = None
     pat_event: tuple[str, str] | None = None
     face: str | None = None
+    face_bbox: tuple[float, float, float, float] | None = None
+    face_age_s: float | None = None
     frame_available: bool = False
     pat_state: PatState = UNAVAILABLE_PAT_STATE
     transcript: str | None = None
@@ -220,6 +244,11 @@ class DoaPoller:
         self._now = now
         self._last: Sense = EMPTY_SENSE
         self._next_t: float | None = None
+        # The monotonic timestamp of the last read whose angle was USABLE (not
+        # every poll — a failed or angle-less poll never advances this), so
+        # `age_s` answers "how stale is the last good bearing" even across a
+        # run of subsequent failures that overwrite `_last` with EMPTY_SENSE.
+        self._last_good_t: float | None = None
 
     def __call__(self, t: float | None = None) -> Sense:
         """Return the latest snapshot, reading afresh at most once per ``period``."""
@@ -233,7 +262,28 @@ class DoaPoller:
                 self._last = self._read()
             except Exception:
                 self._last = EMPTY_SENSE
-        return self._last
+            else:
+                if self._last.doa_angle is not None:
+                    self._last_good_t = t
+        age = self.age_s(t)
+        if age is None:
+            # No good reading yet: return `_last` UNCHANGED (never a `replace`
+            # copy) so identity-sensitive callers (e.g. `poller(t) is
+            # EMPTY_SENSE`) keep working — there is nothing to stamp.
+            return self._last
+        return replace(self._last, doa_age_s=age)
+
+    def age_s(self, now: float) -> float | None:
+        """Seconds since the last GOOD (angle-bearing) DoA reading, or ``None``.
+
+        ``None`` means "never read a usable angle" — distinct from a very
+        stale one. Uses the *caller's* ``now``, not the poller's own throttled
+        clock, so a behavior can ask "how stale is this right now" between
+        polls, not only at poll time.
+        """
+        if self._last_good_t is None:
+            return None
+        return now - self._last_good_t
 
 
 #: A provider is a zero-arg callable returning its field's latest reading — a
@@ -253,6 +303,8 @@ RmsRatioProvider = Callable[[], float | None]
 PatEventProvider = Callable[[], tuple[str, str] | None]
 PatStateProvider = Callable[[], PatState | None]
 FaceProvider = Callable[[], str | None]
+FaceBboxProvider = Callable[[], tuple[float, float, float, float] | None]
+FaceAgeProvider = Callable[[], float | None]
 FrameAvailableProvider = Callable[[], bool]
 TranscriptProvider = Callable[[], str | None]
 SelfMovingProvider = Callable[[], bool]
@@ -277,6 +329,8 @@ class SenseProviders:
     rms: RmsProvider | None = None
     pat_event: PatEventProvider | None = None
     face: FaceProvider | None = None
+    face_bbox: FaceBboxProvider | None = None
+    face_age_s: FaceAgeProvider | None = None
     frame_available: FrameAvailableProvider | None = None
     pat_state: PatStateProvider | None = None
     transcript: TranscriptProvider | None = None
@@ -295,6 +349,13 @@ _ALWAYS_FED_FIELDS: frozenset[str] = frozenset({"doa", "speech"})
 
 #: Maps each optional :class:`SenseProviders` attribute to the predicate-field
 #: name it feeds once a real callable is wired into it.
+#:
+#: NOT every provider appears here: ``face_bbox`` and ``face_age_s`` are
+#: CONTINUOUS readings a motion behavior consumes off the :class:`Sense`
+#: snapshot directly, not ``rules.toml`` predicate fields (they are absent from
+#: :data:`reachy.behavior.rules.SENSE_FIELDS`, so no rule can key on them and
+#: there is nothing for ``behavior rules check`` to warn about). A provider
+#: belongs in this map only once a predicate field names it.
 _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
     "rms": "rms",
     "rms_ratio": "rms_ratio",
@@ -370,6 +431,37 @@ def _peek(provider, default):
         return default
 
 
+def _coerce_bbox(value) -> tuple[float, float, float, float] | None:
+    """Accept only a 4-tuple of finite numbers -> ``(x, y, w, h)``; else ``None``.
+
+    A malformed reading is a NON-READING, never a raise: the same degradation
+    :func:`_peek` gives a provider that blows up. Strings are rejected on
+    purpose — a 4-character string is iterable and would otherwise sneak
+    through as a "box".
+    """
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    try:
+        x, y, w, h = value  # type: ignore[misc]
+        box = (float(x), float(y), float(w), float(h))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in box):
+        return None
+    return box
+
+
+def _coerce_float(value) -> float | None:
+    """Accept a finite number -> ``float``; anything else is a non-reading."""
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def read_perception(
     providers: SenseProviders = NO_PROVIDERS,
     *,
@@ -391,10 +483,13 @@ def read_perception(
     return Sense(
         doa_angle=base.doa_angle,
         speech_detected=base.speech_detected,
+        doa_age_s=base.doa_age_s,
         rms=_peek(providers.rms, None),
         rms_ratio=_peek(providers.rms_ratio, None),
         pat_event=_peek(providers.pat_event, None),
         face=_peek(providers.face, None),
+        face_bbox=_coerce_bbox(_peek(providers.face_bbox, None)),
+        face_age_s=_coerce_float(_peek(providers.face_age_s, None)),
         frame_available=bool(_peek(providers.frame_available, False)),
         pat_state=pat_state if isinstance(pat_state, PatState) else UNAVAILABLE_PAT_STATE,
         transcript=_peek(providers.transcript, None),

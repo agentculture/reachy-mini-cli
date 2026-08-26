@@ -179,6 +179,20 @@ class EventClient(Protocol):
     def publish(self, topic: str, payload: str, *, qos: int = 0, retain: bool = False) -> None:
         """Enqueue one message. O(1); no network I/O on the calling thread."""
 
+    # -- optional: the SUBSCRIBE half (t17) --------------------------------- #
+    #
+    # Declared here so the one shape this repo expects is written down once,
+    # but deliberately OPTIONAL (see OPTIONAL_CLIENT_MEMBERS): the nervous
+    # system's job is publishing, and a client that can only publish must stay
+    # a fully valid client. Only reachy.export.mind_presence uses these, and it
+    # degrades to a permanently-unknown reading without them.
+
+    def subscribe(self, topic: str, *, qos: int = 0) -> None:
+        """Subscribe *topic*. O(1) enqueue; retained values arrive as messages."""
+
+    def set_on_message(self, callback: Callable[..., None]) -> None:
+        """Register the message callback, called ``(topic, payload)`` per message."""
+
 
 #: Members the injected client MUST expose; a client missing any of them
 #: degrades to one named drop instead of crashing the runtime.
@@ -193,7 +207,10 @@ REQUIRED_CLIENT_MEMBERS: tuple[str, ...] = (
 #: Members used when present. ``set_on_connect`` lets a reconnect be noticed the
 #: moment it happens; without it the publisher edge-detects ``connected`` on the
 #: next publish, which is a lull later but never wrong.
-OPTIONAL_CLIENT_MEMBERS: tuple[str, ...] = ("set_on_connect",)
+#: ``subscribe``/``set_on_message`` are the t17 SUBSCRIBE half, used only by
+#: :mod:`reachy.export.mind_presence`; a publish-only client keeps working and
+#: that module names the gap once.
+OPTIONAL_CLIENT_MEMBERS: tuple[str, ...] = ("set_on_connect", "subscribe", "set_on_message")
 
 
 def _exposes(client: object, name: str) -> bool:
@@ -338,6 +355,20 @@ class NervousPublisher:
         self.failed_publishes = 0
 
     # -- introspection -------------------------------------------------------
+
+    @property
+    def client(self) -> "EventClient | None":
+        """The injected client, or ``None`` when there is none / it was disabled.
+
+        Read-only, and narrow on purpose: it exists so a SECOND consumer of the
+        same broker session (today only
+        :class:`reachy.export.mind_presence.MindPresence`) can ride this one
+        client instead of opening a second connection to the same broker for
+        one retained topic. A disabled publisher reports ``None`` — its client
+        never opened a session and never will, so handing it out would only
+        move the same failure somewhere it is reported less clearly.
+        """
+        return None if self._disabled else self._client
 
     @property
     def online_topic(self) -> str:

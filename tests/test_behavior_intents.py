@@ -297,9 +297,17 @@ def test_looping_default_entries_fixture_matches_the_library() -> None:
     one-time ``run_behavior`` surface must bound it explicitly. The standing,
     indefinite ``declare_goal`` surface — exempt by design — is the documented
     way to sustain it.
+
+    ``face-lock`` (task t4) joined for the same reason: a face lock is a
+    STANDING intent ended by ``release_face``, so its library defaults are
+    looping-with-no-duration and the one-time ``run_behavior`` surface must
+    bound it explicitly. ``lock_face`` — a dedicated kind that OWNS the lock
+    state — is the exempt standing surface, exactly as ``declare_goal`` is for
+    ``orient-to-sound``.
     """
     assert _LOOPING_DEFAULT_ENTRIES == [
         "antenna-sway",
+        "face-lock",
         "feel-alive",
         "nod",
         "orient-to-sound",

@@ -24,7 +24,24 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable
 
+from reachy.behavior import face_lock as face_lock_mod
 from reachy.behavior.feel_alive import make_feel_alive
+from reachy.behavior.gaze import (
+    DEFAULT_DURATION_S,
+    DEFAULT_DURATION_S_FACE,
+    DEFAULT_EASE_S,
+    DEFAULT_MAX_AGE_S,
+    DEFAULT_MAX_AGE_S_FACE,
+    DEFAULT_MAX_PITCH_FACE,
+    DEFAULT_MAX_YAW,
+    DEFAULT_MAX_YAW_FACE,
+)
+from reachy.behavior.gaze import NAME as LOOK_AT_SOUND_NAME
+from reachy.behavior.gaze import NAME_FACE as LOOK_AT_FACE_NAME
+from reachy.behavior.gaze import (
+    look_at_face_fn,
+    look_at_sound_fn,
+)
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass, neutral_head
 from reachy.behavior.orient import OrientParams, make_orient_to_sound
 from reachy.behavior.pet_reaction import (
@@ -41,11 +58,21 @@ ContribFn = Callable[[float, dict, Sense], Contribution]
 
 @dataclass(frozen=True)
 class Param:
-    """One tunable knob of a behavior: its default value, unit, and help text."""
+    """One tunable knob of a behavior: its default value, unit, and help text.
+
+    ``minimum``/``maximum`` are the knob's DOMAIN, checked by
+    :func:`validate_param_value` on every surface that accepts an override (the
+    CLI's ``--set``, an intent's ``params`` object). ``None`` means unbounded on
+    that side — the right answer for a signed offset (``pitch``, ``roll``,
+    ``z``), and the wrong one for a magnitude: a negative clamp does not clamp,
+    it forces the opposite angle.
+    """
 
     default: float
     unit: str
     help: str
+    minimum: float | None = None
+    maximum: float | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +110,43 @@ class LibraryEntry:
                 remediation="this is a library bug — report it",
             )
         return self.fn
+
+
+#: Library entries whose LIFETIME is owned by a dedicated intent kind, mapped to
+#: the kind that owns it. Such an entry is a real, buildable behavior — it is
+#: simply not admissible from the GENERIC surfaces (``declare_goal``,
+#: ``run_behavior``, a react rule's ``run``), because those admit it without the
+#: state the kind carries.
+#:
+#: ``face-lock`` is the one entry here. ``declare_goal`` gives every goal a
+#: standing, indefinite lifetime, so a goal-declared lock would be exactly the
+#: unmanaged gaze :mod:`reachy.behavior.face_lock` exists to prevent: no
+#: fresh-face check, no inhibitions, no mind presence, no max hold, and a
+#: ``release_face`` answering ``not locked``. ``run_behavior`` and a react rule
+#: are bounded and so cannot strand a claim, but they would put a SECOND
+#: behavior of that name on the active set — which is what the lock driver's
+#: eviction watchdog reads to decide its own lock is gone. One admitter, one
+#: name.
+LIFECYCLE_OWNED: dict[str, str] = {"face-lock": "lock_face"}
+
+
+def refuse_if_lifecycle_owned(name: str, *, surface: str) -> None:
+    """Raise if *name* may only be admitted by its owning intent kind.
+
+    Called by every generic admission surface (see :data:`LIFECYCLE_OWNED`).
+    The owning kind builds its behavior itself and never calls this.
+    """
+    owner = LIFECYCLE_OWNED.get(name)
+    if owner is None:
+        return
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message=f"{surface}: {name!r} is owned by the {owner!r} intent kind",
+        remediation=(
+            f"use {owner!r} (and its release) instead — it owns the lock state, "
+            "the inhibitions and the release conditions this surface cannot"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -177,6 +241,46 @@ _BODY = frozenset({"body_yaw"})
 #: :class:`reachy.behavior.orient.OrientParams`, which itself tracks the donor
 #: ``ListenParams``. Restating a number here would let the catalog and the
 #: ladder drift apart silently, so every entry below reads it instead.
+#: Unit strings shared across entries. Named because the same knob described
+#: two ways ("deg/s" vs "deg/sec") in two entries is a documentation bug nobody
+#: notices, and because the factories below keep them in one place.
+_DEG = "deg"
+_DEG_S = "deg/s"
+_MM = "mm"
+
+
+def _yaw_clamp(default: float) -> Param:
+    """The ``max_yaw`` knob, wherever a head behavior clamps its yaw.
+
+    A factory rather than four copies: every clamp shares the same help text
+    AND the same domain (``minimum=0.0``, because a negative clamp does not
+    clamp — it forces the opposite angle; see :func:`validate_param_value`), so
+    the four cannot drift apart in either.
+    """
+    return Param(default, _DEG, "head yaw clamp", minimum=0.0)
+
+
+def _pitch_clamp(default: float) -> Param:
+    """The ``max_pitch`` knob — the vertical half of :func:`_yaw_clamp`."""
+    return Param(default, _DEG, "head pitch clamp", minimum=0.0)
+
+
+def _look_pitch(default: float = 0.0) -> Param:
+    """The signed ``pitch`` offset knob. Unbounded on purpose: it is a
+    DIRECTION (up/down), not a magnitude."""
+    return Param(default, _DEG, "vertical look angle")
+
+
+def _roll(default: float = 0.0) -> Param:
+    """The signed ``roll`` offset knob — see :func:`_look_pitch` on the domain."""
+    return Param(default, _DEG, "head roll")
+
+
+def _z_offset(default: float = 0.0) -> Param:
+    """The signed ``z`` height-offset knob — see :func:`_look_pitch`."""
+    return Param(default, _MM, "head height offset")
+
+
 _ORIENT_DEFAULTS = OrientParams()
 
 
@@ -222,6 +326,48 @@ LIBRARY: dict[str, LibraryEntry] = {
         make_fn=make_pet_reaction,
         wants_sense=True,
     ),
+    "face-lock": LibraryEntry(
+        name="face-lock",
+        summary="hold the gaze on the seen face — the behavior the lock_face intent admits",
+        channels=_HEAD,
+        default_class=StopClass.STOPPABLE,
+        # Looping with NO default duration: a face lock is a STANDING intent
+        # ended by `release_face` (or, later, a face-lost event), so it is
+        # admitted through `lock_face`'s own indefinite lifetime — a react rule
+        # or a `run_behavior` intent must still bound it explicitly.
+        looping=True,
+        default_duration=None,
+        params={
+            "max_yaw": _yaw_clamp(face_lock_mod.MAX_YAW_DEG),
+            "max_pitch": _pitch_clamp(face_lock_mod.MAX_PITCH_DEG),
+            "yaw_gain": Param(
+                face_lock_mod.YAW_GAIN_DEG,
+                "deg",
+                "yaw for a face at the frame edge (pre-clamp)",
+                minimum=0.0,
+            ),
+            "pitch_gain": Param(
+                face_lock_mod.PITCH_GAIN_DEG,
+                "deg",
+                "pitch for a face at the frame edge (pre-clamp)",
+                minimum=0.0,
+            ),
+            "slew": Param(
+                face_lock_mod.SLEW_DEG_S,
+                _DEG_S,
+                "how fast the gaze chases the face",
+                minimum=0.0,
+            ),
+            "max_age": Param(
+                face_lock_mod.MAX_FACE_AGE_S,
+                "s",
+                "ignore a face position older than this",
+                minimum=0.0,
+            ),
+        },
+        make_fn=face_lock_mod.make_face_lock,
+        wants_sense=True,
+    ),
     "orient-to-sound": LibraryEntry(
         name="orient-to-sound",
         summary=(
@@ -240,15 +386,19 @@ LIBRARY: dict[str, LibraryEntry] = {
             "gain": _ORIENT_PARAM(
                 "gain", "x", "scales the ~+-90 deg acoustic span onto a yaw target"
             ),
-            "max_yaw": _ORIENT_PARAM("max_yaw", "deg", "head yaw clamp"),
+            # The factory, not `_ORIENT_PARAM`: this clamp is the same knob the
+            # gaze one-shots and the face lock carry, and it gets the same
+            # non-negative domain with it. The default still comes off
+            # `OrientParams`, never retyped.
+            "max_yaw": _yaw_clamp(_ORIENT_DEFAULTS.max_yaw),
             "deadband": _ORIENT_PARAM(
                 "deadband", "deg", "ignore sound within this of the current heading"
             ),
             "hold": _ORIENT_PARAM(
                 "hold", "s", "after committing a turn, hold before reconsidering"
             ),
-            "alert_speed": _ORIENT_PARAM("alert_speed", "deg/s", "turning toward a new sound"),
-            "relax_speed": _ORIENT_PARAM("relax_speed", "deg/s", "easing back toward centre"),
+            "alert_speed": _ORIENT_PARAM("alert_speed", _DEG_S, "turning toward a new sound"),
+            "relax_speed": _ORIENT_PARAM("relax_speed", _DEG_S, "easing back toward centre"),
             "min_dur": _ORIENT_PARAM("min_dur", "s", "duration floor, so turns stay deliberate"),
             "max_dur": _ORIENT_PARAM("max_dur", "s", "duration ceiling for one turn"),
             "antenna_gain": _ORIENT_PARAM("antenna_gain", "x", "scales the antenna lean"),
@@ -256,7 +406,7 @@ LIBRARY: dict[str, LibraryEntry] = {
                 "antenna_max", "deg", "maximum near-side antenna deflection"
             ),
             "body_yaw_max": _ORIENT_PARAM("body_yaw_max", "deg", "body yaw clamp"),
-            "body_speed": _ORIENT_PARAM("body_speed", "deg/s", "body rotation speed"),
+            "body_speed": _ORIENT_PARAM("body_speed", _DEG_S, "body rotation speed"),
             "head_only_band": _ORIENT_PARAM(
                 "head_only_band", "deg", "beyond this the body turn escalates"
             ),
@@ -300,11 +450,65 @@ LIBRARY: dict[str, LibraryEntry] = {
         default_duration=5.0,
         params={
             "yaw": Param(18.0, "deg", "horizontal look angle"),
-            "pitch": Param(10.0, "deg", "vertical look angle"),
-            "roll": Param(0.0, "deg", "head roll"),
-            "z": Param(0.0, "mm", "head height offset"),
+            "pitch": _look_pitch(10.0),
+            "roll": _roll(),
+            "z": _z_offset(),
         },
         fn=_gaze_hold,
+    ),
+    LOOK_AT_SOUND_NAME: LibraryEntry(
+        name=LOOK_AT_SOUND_NAME,
+        summary=(
+            "one-shot: turn the head toward the last live sound direction, hold, and end "
+            "(see reachy.behavior.gaze for the sustained sibling, orient-to-sound)"
+        ),
+        channels=_HEAD,
+        default_class=StopClass.STOPPABLE,  # see gaze.py's module docstring for why
+        looping=False,
+        default_duration=DEFAULT_DURATION_S,
+        params={
+            "max_age_s": Param(
+                DEFAULT_MAX_AGE_S,
+                "s",
+                "a DoA reading older than this refuses admission",
+                minimum=0.0,
+            ),
+            "max_yaw": _yaw_clamp(DEFAULT_MAX_YAW),
+            "ease_s": Param(
+                DEFAULT_EASE_S, "s", "how long the turn takes before it holds", minimum=0.0
+            ),
+            "pitch": _look_pitch(),
+            "roll": _roll(),
+            "z": _z_offset(),
+        },
+        fn=look_at_sound_fn,
+    ),
+    LOOK_AT_FACE_NAME: LibraryEntry(
+        name=LOOK_AT_FACE_NAME,
+        summary=(
+            "one-shot: turn the head toward the last-seen face and hold "
+            "(see reachy.behavior.face_lock for the sustained sibling, face-lock)"
+        ),
+        channels=_HEAD,
+        default_class=StopClass.STOPPABLE,  # see gaze.py's module docstring for why
+        looping=False,
+        default_duration=DEFAULT_DURATION_S_FACE,
+        params={
+            "max_age_s": Param(
+                DEFAULT_MAX_AGE_S_FACE,
+                "s",
+                "a face bbox older than this refuses admission",
+                minimum=0.0,
+            ),
+            "max_yaw": _yaw_clamp(DEFAULT_MAX_YAW_FACE),
+            "max_pitch": _pitch_clamp(DEFAULT_MAX_PITCH_FACE),
+            "ease_s": Param(
+                DEFAULT_EASE_S, "s", "how long the turn takes before it holds", minimum=0.0
+            ),
+            "roll": _roll(),
+            "z": _z_offset(),
+        },
+        fn=look_at_face_fn,
     ),
     "nod": LibraryEntry(
         name="nod",
@@ -359,7 +563,7 @@ LIBRARY: dict[str, LibraryEntry] = {
         params={
             "pitch": Param(8.0, "deg", "upward/forward tilt"),
             "yaw": Param(10.0, "deg", "gaze-aside angle"),
-            "roll": Param(5.0, "deg", "head roll"),
+            "roll": _roll(5.0),
             "rise": Param(0.6, "s", "ease-in time"),
         },
         fn=_thoughtful,
@@ -410,6 +614,42 @@ def get(name: str) -> LibraryEntry:
     return entry
 
 
+def validate_param_value(entry: LibraryEntry, key: str, value: float) -> float:
+    """The ONE domain check every param surface shares. Returns *value*.
+
+    Rejects a non-finite value on every knob, and anything outside the
+    :class:`Param`'s declared domain. Both matter for the same reason: the type
+    check these surfaces already do ("is it a number?") passes ``NaN`` and
+    ``inf`` (stdlib ``json`` decodes both from a bare literal), and a ``NaN``
+    threshold does not compare false-safe — ``age > NaN`` is ``False``, so a
+    NaN freshness limit certifies ANY reading fresh, and a NaN clamp propagates
+    straight into the streamed head pose.
+    """
+    number = float(value)
+    if not math.isfinite(number):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"{entry.name}: parameter {key} must be finite (got {number!r})",
+            remediation="pass a real number — NaN and infinity are not thresholds",
+        )
+    param = entry.params.get(key)
+    if param is None:
+        return number
+    if param.minimum is not None and number < param.minimum:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"{entry.name}: parameter {key} must be >= {param.minimum} (got {number})",
+            remediation=f"{key} is a {param.unit} magnitude, not a signed offset",
+        )
+    if param.maximum is not None and number > param.maximum:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"{entry.name}: parameter {key} must be <= {param.maximum} (got {number})",
+            remediation=f"choose a {key} within the entry's declared range",
+        )
+    return number
+
+
 def resolve_params(entry: LibraryEntry, overrides: dict[str, str] | None) -> dict[str, float]:
     """Merge ``key=value`` string overrides onto the entry defaults, validating.
 
@@ -425,7 +665,7 @@ def resolve_params(entry: LibraryEntry, overrides: dict[str, str] | None) -> dic
                 remediation=f"valid params: {', '.join(entry.params) or '(none)'}",
             )
         try:
-            params[key] = float(raw)
+            params[key] = validate_param_value(entry, key, float(raw))
         except ValueError as err:
             raise CliError(
                 code=EXIT_USER_ERROR,
