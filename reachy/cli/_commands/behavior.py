@@ -64,6 +64,7 @@ from reachy.behavior.excited_motion_probe import (
     ProbeNamespaceGuard,
     SharedPoseReader,
 )
+from reachy.behavior.face_lock import FaceLockDriver
 from reachy.behavior.face_sense import FaceSenseDriver, build_face_recognition
 from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
@@ -2465,6 +2466,21 @@ def _compose_run_seam(
         # Register the GOTO kind into the intent driver's OWN registry (which already
         # carries the four intent defaults) so all five kinds share one registry.
         intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
+
+        # ... and the two face-lock kinds into the SAME registry, the same way.
+        # The lock STATE lives in this driver (not in the mind, and not in
+        # `intents.py`), and it borrows the inhibited set through the two
+        # injected callables — which is why `face_lock.py` never imports
+        # `intents.py`. `inhibition_observer` is the later-wins seam: a
+        # `set_inhibition` arriving while locked replaces the whole set, and the
+        # lock surrenders its own additions rather than restoring a stale
+        # snapshot on release.
+        face_lock_driver = FaceLockDriver(
+            inhibitions_getter=lambda: intent_driver.inhibitions,
+            inhibitions_setter=intent_driver.set_inhibitions,
+        )
+        face_lock_driver.register_into(intent_driver.registry)
+        intent_driver.inhibition_observer = face_lock_driver.notice_inhibition_replaced
 
         # Per-sense availability into the standing `state.json` (#120b). A seam
         # RIDER, not an `Engine.state()` key: which providers got wired, and

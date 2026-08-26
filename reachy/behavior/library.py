@@ -24,6 +24,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable
 
+from reachy.behavior import face_lock as face_lock_mod
 from reachy.behavior.feel_alive import make_feel_alive
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass, neutral_head
 from reachy.behavior.orient import OrientParams, make_orient_to_sound
@@ -220,6 +221,36 @@ LIBRARY: dict[str, LibraryEntry] = {
         default_duration=_PET_REACTION_BACKSTOP_S,
         params={},
         make_fn=make_pet_reaction,
+        wants_sense=True,
+    ),
+    "face-lock": LibraryEntry(
+        name="face-lock",
+        summary="hold the gaze on the seen face — the behavior the lock_face intent admits",
+        channels=_HEAD,
+        default_class=StopClass.STOPPABLE,
+        # Looping with NO default duration: a face lock is a STANDING intent
+        # ended by `release_face` (or, later, a face-lost event), so it is
+        # admitted through `lock_face`'s own indefinite lifetime — a react rule
+        # or a `run_behavior` intent must still bound it explicitly.
+        looping=True,
+        default_duration=None,
+        params={
+            "max_yaw": Param(face_lock_mod.MAX_YAW_DEG, "deg", "head yaw clamp"),
+            "max_pitch": Param(face_lock_mod.MAX_PITCH_DEG, "deg", "head pitch clamp"),
+            "yaw_gain": Param(
+                face_lock_mod.YAW_GAIN_DEG, "deg", "yaw for a face at the frame edge (pre-clamp)"
+            ),
+            "pitch_gain": Param(
+                face_lock_mod.PITCH_GAIN_DEG,
+                "deg",
+                "pitch for a face at the frame edge (pre-clamp)",
+            ),
+            "slew": Param(face_lock_mod.SLEW_DEG_S, "deg/s", "how fast the gaze chases the face"),
+            "max_age": Param(
+                face_lock_mod.MAX_FACE_AGE_S, "s", "ignore a face position older than this"
+            ),
+        },
+        make_fn=face_lock_mod.make_face_lock,
         wants_sense=True,
     ),
     "orient-to-sound": LibraryEntry(
