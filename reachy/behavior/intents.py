@@ -129,6 +129,49 @@ _ID_PREFIX = "intent"
 # --------------------------------------------------------------------------- #
 
 
+def _plan_look_at_sound(params: dict, sense) -> dict[str, float] | None:
+    """Adapt :func:`reachy.behavior.gaze.plan_look_at_sound` to the
+    ``_GAZE_PLANNERS`` shape: baked-param-dict-or-``None``."""
+    yaw = gaze.plan_look_at_sound(
+        sense,
+        max_age_s=params.get("max_age_s", gaze.DEFAULT_MAX_AGE_S),
+        max_yaw=params.get("max_yaw", gaze.DEFAULT_MAX_YAW),
+    )
+    if yaw is None:
+        return None
+    return {"yaw": yaw}
+
+
+def _plan_look_at_face(params: dict, sense) -> dict[str, float] | None:
+    """Adapt :func:`reachy.behavior.gaze.plan_look_at_face` to the
+    ``_GAZE_PLANNERS`` shape: baked-param-dict-or-``None``."""
+    target = gaze.plan_look_at_face(
+        sense,
+        max_age_s=params.get("max_age_s", gaze.DEFAULT_MAX_AGE_S_FACE),
+        max_yaw=params.get("max_yaw", gaze.DEFAULT_MAX_YAW_FACE),
+        max_pitch=params.get("max_pitch", gaze.DEFAULT_MAX_PITCH_FACE),
+    )
+    if target is None:
+        return None
+    yaw, pitch = target
+    return {"yaw": yaw, "pitch": pitch}
+
+
+#: The name-keyed branch :meth:`IntentDriver._apply_run_behavior` consults for
+#: every sensor-driven ONE-SHOT gaze behavior (``look-at-sound``,
+#: ``look-at-face``): name -> ``(planner, refusal_reason)``, where *planner*
+#: takes the tick's validated params and the live
+#: :class:`~reachy.behavior.sense.Sense` and returns either a dict of params to
+#: bake onto the admitted behavior (its clamped aim), or ``None`` to refuse.
+#: Generalised from t1's single ``look-at-sound``-only branch so a second
+#: sensor-driven one-shot (t3's ``look-at-face``) shares the same admission
+#: path instead of growing a second copy of it.
+_GAZE_PLANNERS: dict[str, tuple[Callable[[dict, object], dict | None], str]] = {
+    gaze.NAME: (_plan_look_at_sound, gaze.NO_RECENT_SOUND),
+    gaze.NAME_FACE: (_plan_look_at_face, gaze.NO_FACE_KNOWN),
+}
+
+
 def _validated_params(entry, overrides: dict | None) -> dict[str, float]:
     """Merge numeric *overrides* onto *entry*'s defaults, rejecting anything bad.
 
@@ -380,21 +423,19 @@ class IntentDriver:
                 "error": f"{name!r} is inhibited",
             }
         params = _validated_params(entry, payload.get("params"))
-        if name == gaze.NAME:
-            yaw = gaze.plan_look_at_sound(
-                ctx.sense,
-                max_age_s=params.get("max_age_s", gaze.DEFAULT_MAX_AGE_S),
-                max_yaw=params.get("max_yaw", gaze.DEFAULT_MAX_YAW),
-            )
-            if yaw is None:
-                senselog.drop(STAGE, RUN_BEHAVIOR, name, gaze.NO_RECENT_SOUND)
+        planner_entry = _GAZE_PLANNERS.get(name)
+        if planner_entry is not None:
+            planner, refusal_reason = planner_entry
+            baked = planner(params, ctx.sense)
+            if baked is None:
+                senselog.drop(STAGE, RUN_BEHAVIOR, name, refusal_reason)
                 return {
                     "ok": False,
                     "op": RUN_BEHAVIOR,
                     "name": name,
-                    "error": gaze.NO_RECENT_SOUND,
+                    "error": refusal_reason,
                 }
-            params["yaw"] = yaw
+            params.update(baked)
         lifetime = _validated_lifetime(entry, payload.get("lifetime"))
         self._seq += 1
         behavior_id = f"{_ID_PREFIX}:run:{name}:{self._seq}"

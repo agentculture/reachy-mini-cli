@@ -28,12 +28,18 @@ from reachy.behavior import face_lock as face_lock_mod
 from reachy.behavior.feel_alive import make_feel_alive
 from reachy.behavior.gaze import (
     DEFAULT_DURATION_S,
+    DEFAULT_DURATION_S_FACE,
     DEFAULT_EASE_S,
     DEFAULT_MAX_AGE_S,
+    DEFAULT_MAX_AGE_S_FACE,
+    DEFAULT_MAX_PITCH_FACE,
     DEFAULT_MAX_YAW,
+    DEFAULT_MAX_YAW_FACE,
 )
 from reachy.behavior.gaze import NAME as LOOK_AT_SOUND_NAME
+from reachy.behavior.gaze import NAME_FACE as LOOK_AT_FACE_NAME
 from reachy.behavior.gaze import (
+    look_at_face_fn,
     look_at_sound_fn,
 )
 from reachy.behavior.model import Behavior, Contribution, Lifetime, StopClass, neutral_head
@@ -368,6 +374,28 @@ LIBRARY: dict[str, LibraryEntry] = {
             "z": Param(0.0, "mm", "head height offset"),
         },
         fn=look_at_sound_fn,
+    ),
+    LOOK_AT_FACE_NAME: LibraryEntry(
+        name=LOOK_AT_FACE_NAME,
+        summary=(
+            "one-shot: turn the head toward the last-seen face and hold "
+            "(see reachy.behavior.face_lock for the sustained sibling, face-lock)"
+        ),
+        channels=_HEAD,
+        default_class=StopClass.STOPPABLE,  # see gaze.py's module docstring for why
+        looping=False,
+        default_duration=DEFAULT_DURATION_S_FACE,
+        params={
+            "max_age_s": Param(
+                DEFAULT_MAX_AGE_S_FACE, "s", "a face bbox older than this refuses admission"
+            ),
+            "max_yaw": Param(DEFAULT_MAX_YAW_FACE, "deg", "head yaw clamp"),
+            "max_pitch": Param(DEFAULT_MAX_PITCH_FACE, "deg", "head pitch clamp"),
+            "ease_s": Param(DEFAULT_EASE_S, "s", "how long the turn takes before it holds"),
+            "roll": Param(0.0, "deg", "head roll"),
+            "z": Param(0.0, "mm", "head height offset"),
+        },
+        fn=look_at_face_fn,
     ),
     "nod": LibraryEntry(
         name="nod",

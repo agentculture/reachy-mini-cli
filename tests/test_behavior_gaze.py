@@ -309,3 +309,190 @@ def test_look_at_sound_default_class_is_stoppable() -> None:
     from reachy.behavior.model import StopClass
 
     assert LIBRARY["look-at-sound"].default_class is StopClass.STOPPABLE
+
+
+# --------------------------------------------------------------------------- #
+# 6. plan_look_at_face — pure refusal/clamp logic (t3 c1)                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_face_plan_refuses_with_no_bbox() -> None:
+    assert gaze.plan_look_at_face(EMPTY_SENSE) is None
+
+
+def test_face_plan_refuses_when_stale() -> None:
+    sense = Sense(face_bbox=(0.4, 0.4, 0.2, 0.2), face_age_s=1.6)
+    assert gaze.plan_look_at_face(sense, max_age_s=1.5) is None
+
+
+def test_face_plan_refuses_when_age_unknown() -> None:
+    # A bbox with no age reading at all refuses, mirroring plan_look_at_sound's
+    # "nothing to certify freshness against" stance for its sibling one-shot.
+    sense = Sense(face_bbox=(0.4, 0.4, 0.2, 0.2), face_age_s=None)
+    assert gaze.plan_look_at_face(sense, max_age_s=1.5) is None
+
+
+def test_face_plan_at_exactly_max_age_s_is_still_fresh() -> None:
+    sense = Sense(face_bbox=(0.5, 0.5, 0.0, 0.0), face_age_s=1.5)
+    assert gaze.plan_look_at_face(sense, max_age_s=1.5) is not None
+
+
+def test_face_plan_centre_bbox_yields_no_offset() -> None:
+    sense = Sense(face_bbox=(0.5, 0.5, 0.0, 0.0), face_age_s=0.0)
+    yaw, pitch = gaze.plan_look_at_face(sense)
+    assert yaw == pytest.approx(0.0)
+    assert pitch == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "bbox, expected_yaw, expected_pitch",
+    [
+        # top-left corner (cx=0, cy=0): +yaw (left), +pitch (up), both clamped.
+        ((0.0, 0.0, 0.0, 0.0), 20.0, 12.0),
+        # top-right corner (cx=1, cy=0): -yaw (right), +pitch (up).
+        ((1.0, 0.0, 0.0, 0.0), -20.0, 12.0),
+        # bottom-left corner (cx=0, cy=1): +yaw (left), -pitch (down).
+        ((0.0, 1.0, 0.0, 0.0), 20.0, -12.0),
+        # bottom-right corner (cx=1, cy=1): -yaw (right), -pitch (down).
+        ((1.0, 1.0, 0.0, 0.0), -20.0, -12.0),
+    ],
+)
+def test_face_plan_aims_within_clamp_at_the_four_corners(
+    bbox, expected_yaw, expected_pitch
+) -> None:
+    sense = Sense(face_bbox=bbox, face_age_s=0.0)
+    yaw, pitch = gaze.plan_look_at_face(sense, max_yaw=20.0, max_pitch=12.0)
+    assert yaw == pytest.approx(expected_yaw)
+    assert pitch == pytest.approx(expected_pitch)
+    assert abs(yaw) <= 20.0
+    assert abs(pitch) <= 12.0
+
+
+# --------------------------------------------------------------------------- #
+# 7. run_behavior name='look-at-face' — refusal + admission (t3 c2)          #
+# --------------------------------------------------------------------------- #
+
+
+def test_face_run_behavior_refuses_with_no_bbox(tmp_path) -> None:
+    cmd_id = _submit(tmp_path, name="look-at-face", params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=EMPTY_SENSE)
+
+    driver.on_tick(ctx)
+
+    assert ctx.admits == []
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is False
+    assert result["error"] == "no face known"
+
+
+def test_face_run_behavior_refuses_when_stale(tmp_path) -> None:
+    cmd_id = _submit(tmp_path, name="look-at-face", params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    stale = Sense(face_bbox=(0.4, 0.4, 0.2, 0.2), face_age_s=2.0)  # > 1.5s default
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=stale)
+
+    driver.on_tick(ctx)
+
+    assert ctx.admits == []
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is False
+    assert result["error"] == "no face known"
+
+
+def test_face_run_behavior_admits_a_one_shot_aiming_at_the_clamped_target(tmp_path) -> None:
+    cmd_id = _submit(tmp_path, name="look-at-face", params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    fresh = Sense(face_bbox=(0.0, 0.0, 0.0, 0.0), face_age_s=0.2)
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=fresh)
+
+    driver.on_tick(ctx)
+
+    assert len(ctx.admits) == 1
+    beh = ctx.admits[0]
+    assert beh.name == "look-at-face"
+    assert beh.channels == frozenset({"head"})
+    assert beh.stop_class is not None
+    from reachy.behavior.model import StopClass
+
+    assert beh.stop_class is StopClass.STOPPABLE
+    assert beh.lifetime.looping is False
+    assert beh.lifetime.duration == gaze.DEFAULT_DURATION_S_FACE
+    assert beh.params["yaw"] == pytest.approx(20.0)
+    assert beh.params["pitch"] == pytest.approx(12.0)
+
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is True
+    assert result["op"] == RUN_BEHAVIOR
+    assert result["name"] == "look-at-face"
+
+
+def test_face_run_behavior_admits_with_custom_max_yaw_and_max_pitch(tmp_path) -> None:
+    _submit(
+        tmp_path,
+        name="look-at-face",
+        params={"max_yaw": 5.0, "max_pitch": 3.0},
+        lifetime=None,
+    )
+    driver = IntentDriver(root=tmp_path)
+    fresh = Sense(face_bbox=(0.0, 0.0, 0.0, 0.0), face_age_s=0.0)
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=fresh)
+
+    driver.on_tick(ctx)
+
+    assert len(ctx.admits) == 1
+    assert ctx.admits[0].params["yaw"] == pytest.approx(5.0)
+    assert ctx.admits[0].params["pitch"] == pytest.approx(3.0)
+
+
+def test_face_contribution_eases_then_holds_the_target(tmp_path) -> None:
+    """Unit-level check of the pure contribution fn, independent of admission."""
+    entry = LIBRARY[gaze.NAME_FACE]
+    params = entry.default_params()
+    params["yaw"] = 20.0
+    params["pitch"] = 12.0
+    params["ease_s"] = 0.5
+    fn = entry.fn
+    start = fn(0.0, params, EMPTY_SENSE)
+    mid = fn(0.25, params, EMPTY_SENSE)
+    held = fn(0.5, params, EMPTY_SENSE)
+    later = fn(2.0, params, EMPTY_SENSE)  # past the ease -> still holds
+    assert start.head["yaw"] == 0.0
+    assert start.head["pitch"] == 0.0
+    assert 0.0 < mid.head["yaw"] < 20.0
+    assert 0.0 < mid.head["pitch"] < 12.0
+    assert held.head["yaw"] == pytest.approx(20.0)
+    assert held.head["pitch"] == pytest.approx(12.0)
+    assert later.head["yaw"] == pytest.approx(20.0)
+    assert later.head["pitch"] == pytest.approx(12.0)
+
+
+# --------------------------------------------------------------------------- #
+# 8. Library / rule-id membership for both one-shots (t3 c3)                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_look_at_face_is_a_library_entry() -> None:
+    assert "look-at-face" in LIBRARY
+    assert LIBRARY["look-at-face"] is behavior_library.LIBRARY["look-at-face"]
+
+
+def test_look_at_face_is_not_a_shipped_rule_id() -> None:
+    rule_ids = {r.id for r in load_shipped_rules().react}
+    assert "look-at-face" not in rule_ids
+
+
+def test_look_at_face_default_class_is_stoppable() -> None:
+    from reachy.behavior.model import StopClass
+
+    assert LIBRARY["look-at-face"].default_class is StopClass.STOPPABLE
+
+
+def test_both_gaze_one_shot_names_present_in_library() -> None:
+    assert {"look-at-sound", "look-at-face"} <= set(LIBRARY)
