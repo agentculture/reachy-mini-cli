@@ -46,11 +46,20 @@ Inhibition is LATER-WINS
 -------------------------
 ``set_inhibition`` REPLACES the whole inhibited set (see
 :mod:`reachy.behavior.intents`), so a caller that replaces it WHILE locked has
-made a deliberate, later statement about what is inhibited. The lock therefore
-forgets its own additions at that moment (:meth:`FaceLockDriver.notice_inhibition_replaced`)
-and ``release_face`` leaves the newer set exactly as it stands. With no
-intervening call, release removes precisely the names the lock ADDED — never a
-name the snapshot already carried — restoring the snapshot.
+made a deliberate, later statement about what IT holds — and the lock adopts
+that as its new snapshot (:meth:`FaceLockDriver.notice_inhibition_replaced`),
+so ``release_face`` never restores an older set behind the caller's back.
+
+Later-wins applies to the CALLER's names only. The new snapshot is
+``new_set - self._added``: a name this lock itself added is never operator-held,
+however it came back. A mind cannot tell the lock's additions apart from its own
+— it reads the current set and writes it back with one name merged in
+(``stay_silent`` adding ``speak``) — so treating the echo as operator intent
+would leave ``feel-alive`` / ``orient-to-sound`` inhibited after release and the
+robot inert (observed live, 2026-08-26). The lock therefore KEEPS its claim
+across a replacement and re-asserts its additions on top, so the live set stays
+``new_set | added`` while held. Release then removes precisely the names the
+lock ADDED — never a name the caller holds — restoring the current snapshot.
 
 Import boundary
 -----------------
@@ -437,15 +446,26 @@ class FaceLockDriver:
 
     # -- the later-wins seam ------------------------------------------------- #
 
-    def notice_inhibition_replaced(self, _names: Iterable[str] | None = None) -> None:
-        """A ``set_inhibition`` replaced the whole set: drop our own additions.
+    def notice_inhibition_replaced(self, names: Iterable[str] | None = None) -> None:
+        """A ``set_inhibition`` replaced the whole set: re-snapshot around OUR additions.
 
         Wired to :attr:`reachy.behavior.intents.IntentDriver.inhibition_observer`
-        at composition. The lock stays held — only its CLAIM on the inhibited set
-        is surrendered, so the later call wins and ``release_face`` restores
-        nothing behind the caller's back.
+        at composition. Later-wins applies to what the CALLER holds: the new
+        snapshot this lock will restore on release is ``new_set - self._added``,
+        because a name this lock itself added is never operator-held — a mind
+        reading the current set and writing it back (``stay_silent`` merging
+        ``speak`` into what it read) would otherwise adopt the lock's own
+        additions and leave the presence loop inhibited after release. The lock
+        keeps its claim and RE-ASSERTS its additions on top, so the live set is
+        ``new_set | self._added`` for as long as the lock is held.
         """
-        self._added = frozenset()
+        if not self._locked or not self._added:
+            self._added = frozenset()
+            return
+        new_set = frozenset(names or ())
+        missing = self._added - new_set
+        if missing and self._set_inhibitions is not None:
+            self._set_inhibitions(new_set | self._added)
 
     # -- the tick seam ------------------------------------------------------- #
 

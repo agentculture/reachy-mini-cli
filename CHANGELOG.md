@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.1] - 2026-08-26
+
+### Fixed
+
+- face-lock: a set_inhibition arriving while locked no longer turns the lock's own inhibitions into operator-held ones (live 2026-08-26: release left feel-alive/orient-to-sound inhibited)
+
 ## [0.51.0] - 2026-08-26
 
 ### Added
