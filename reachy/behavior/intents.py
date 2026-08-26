@@ -98,6 +98,7 @@ from typing import Callable, Iterable
 
 from reachy import senselog
 from reachy.behavior import control as control_mod
+from reachy.behavior import gaze
 from reachy.behavior import library as behavior_library
 from reachy.behavior.model import Lifetime
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
@@ -355,6 +356,21 @@ class IntentDriver:
                 "error": f"{name!r} is inhibited",
             }
         params = _validated_params(entry, payload.get("params"))
+        if name == gaze.NAME:
+            yaw = gaze.plan_look_at_sound(
+                ctx.sense,
+                max_age_s=params.get("max_age_s", gaze.DEFAULT_MAX_AGE_S),
+                max_yaw=params.get("max_yaw", gaze.DEFAULT_MAX_YAW),
+            )
+            if yaw is None:
+                senselog.drop(STAGE, RUN_BEHAVIOR, name, gaze.NO_RECENT_SOUND)
+                return {
+                    "ok": False,
+                    "op": RUN_BEHAVIOR,
+                    "name": name,
+                    "error": gaze.NO_RECENT_SOUND,
+                }
+            params["yaw"] = yaw
         lifetime = _validated_lifetime(entry, payload.get("lifetime"))
         self._seq += 1
         behavior_id = f"{_ID_PREFIX}:run:{name}:{self._seq}"

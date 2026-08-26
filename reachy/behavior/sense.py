@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Literal
 
 # DoA angle is radians: 0 = left, pi/2 = front, pi = right (the daemon's
@@ -113,7 +113,15 @@ class Sense:
     ``doa_angle`` is the sound Direction of Arrival in radians (``0``=left,
     ``pi/2``=front, ``pi``=right), or ``None`` when there is no usable reading
     (no mic, daemon error, or no sound). ``speech_detected`` is the daemon's
-    speech-vs-any-sound flag for the same reading.
+    speech-vs-any-sound flag for the same reading. ``doa_age_s`` is how long
+    ago (seconds) the last GOOD (angle-bearing) DoA reading landed — the
+    :class:`DoaPoller`'s own :meth:`DoaPoller.age_s`, carried onto the snapshot
+    it returns as ``base`` to :func:`read_perception` — or ``None`` when there
+    has never been one. Deliberately Sense's OWN field, not a call-time
+    lookup: a one-shot behavior like ``look-at-sound``
+    (:mod:`reachy.behavior.gaze`) samples it once at admission and must see
+    the SAME age a concurrent rule predicate would, not a second, later clock
+    read.
 
     ``rms``, ``pat_event``, ``pat_state``, ``face``, ``frame_available``,
     ``transcript``, and ``self_moving`` extend the snapshot with the cues the
@@ -177,6 +185,7 @@ class Sense:
 
     doa_angle: float | None = None
     speech_detected: bool = False
+    doa_age_s: float | None = None
     rms: float | None = None
     pat_event: tuple[str, str] | None = None
     face: str | None = None
@@ -235,6 +244,11 @@ class DoaPoller:
         self._now = now
         self._last: Sense = EMPTY_SENSE
         self._next_t: float | None = None
+        # The monotonic timestamp of the last read whose angle was USABLE (not
+        # every poll — a failed or angle-less poll never advances this), so
+        # `age_s` answers "how stale is the last good bearing" even across a
+        # run of subsequent failures that overwrite `_last` with EMPTY_SENSE.
+        self._last_good_t: float | None = None
 
     def __call__(self, t: float | None = None) -> Sense:
         """Return the latest snapshot, reading afresh at most once per ``period``."""
@@ -248,7 +262,28 @@ class DoaPoller:
                 self._last = self._read()
             except Exception:
                 self._last = EMPTY_SENSE
-        return self._last
+            else:
+                if self._last.doa_angle is not None:
+                    self._last_good_t = t
+        age = self.age_s(t)
+        if age is None:
+            # No good reading yet: return `_last` UNCHANGED (never a `replace`
+            # copy) so identity-sensitive callers (e.g. `poller(t) is
+            # EMPTY_SENSE`) keep working — there is nothing to stamp.
+            return self._last
+        return replace(self._last, doa_age_s=age)
+
+    def age_s(self, now: float) -> float | None:
+        """Seconds since the last GOOD (angle-bearing) DoA reading, or ``None``.
+
+        ``None`` means "never read a usable angle" — distinct from a very
+        stale one. Uses the *caller's* ``now``, not the poller's own throttled
+        clock, so a behavior can ask "how stale is this right now" between
+        polls, not only at poll time.
+        """
+        if self._last_good_t is None:
+            return None
+        return now - self._last_good_t
 
 
 #: A provider is a zero-arg callable returning its field's latest reading — a
@@ -448,6 +483,7 @@ def read_perception(
     return Sense(
         doa_angle=base.doa_angle,
         speech_detected=base.speech_detected,
+        doa_age_s=base.doa_age_s,
         rms=_peek(providers.rms, None),
         rms_ratio=_peek(providers.rms_ratio, None),
         pat_event=_peek(providers.pat_event, None),
