@@ -98,6 +98,7 @@ from typing import Callable, Iterable
 
 from reachy import senselog
 from reachy.behavior import control as control_mod
+from reachy.behavior import gaze
 from reachy.behavior import library as behavior_library
 from reachy.behavior.model import Lifetime
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
@@ -128,6 +129,49 @@ _ID_PREFIX = "intent"
 # --------------------------------------------------------------------------- #
 
 
+def _plan_look_at_sound(params: dict, sense) -> dict[str, float] | None:
+    """Adapt :func:`reachy.behavior.gaze.plan_look_at_sound` to the
+    ``_GAZE_PLANNERS`` shape: baked-param-dict-or-``None``."""
+    yaw = gaze.plan_look_at_sound(
+        sense,
+        max_age_s=params.get("max_age_s", gaze.DEFAULT_MAX_AGE_S),
+        max_yaw=params.get("max_yaw", gaze.DEFAULT_MAX_YAW),
+    )
+    if yaw is None:
+        return None
+    return {"yaw": yaw}
+
+
+def _plan_look_at_face(params: dict, sense) -> dict[str, float] | None:
+    """Adapt :func:`reachy.behavior.gaze.plan_look_at_face` to the
+    ``_GAZE_PLANNERS`` shape: baked-param-dict-or-``None``."""
+    target = gaze.plan_look_at_face(
+        sense,
+        max_age_s=params.get("max_age_s", gaze.DEFAULT_MAX_AGE_S_FACE),
+        max_yaw=params.get("max_yaw", gaze.DEFAULT_MAX_YAW_FACE),
+        max_pitch=params.get("max_pitch", gaze.DEFAULT_MAX_PITCH_FACE),
+    )
+    if target is None:
+        return None
+    yaw, pitch = target
+    return {"yaw": yaw, "pitch": pitch}
+
+
+#: The name-keyed branch :meth:`IntentDriver._apply_run_behavior` consults for
+#: every sensor-driven ONE-SHOT gaze behavior (``look-at-sound``,
+#: ``look-at-face``): name -> ``(planner, refusal_reason)``, where *planner*
+#: takes the tick's validated params and the live
+#: :class:`~reachy.behavior.sense.Sense` and returns either a dict of params to
+#: bake onto the admitted behavior (its clamped aim), or ``None`` to refuse.
+#: Generalised from t1's single ``look-at-sound``-only branch so a second
+#: sensor-driven one-shot (t3's ``look-at-face``) shares the same admission
+#: path instead of growing a second copy of it.
+_GAZE_PLANNERS: dict[str, tuple[Callable[[dict, object], dict | None], str]] = {
+    gaze.NAME: (_plan_look_at_sound, gaze.NO_RECENT_SOUND),
+    gaze.NAME_FACE: (_plan_look_at_face, gaze.NO_FACE_KNOWN),
+}
+
+
 def _validated_params(entry, overrides: dict | None) -> dict[str, float]:
     """Merge numeric *overrides* onto *entry*'s defaults, rejecting anything bad.
 
@@ -147,7 +191,7 @@ def _validated_params(entry, overrides: dict | None) -> dict[str, float]:
                 code=EXIT_USER_ERROR,
                 message=f"{entry.name}: parameter {key} must be a number (got {value!r})",
             )
-        params[key] = float(value)
+        params[key] = behavior_library.validate_param_value(entry, key, float(value))
     return params
 
 
@@ -256,12 +300,19 @@ class IntentDriver:
         mode_setter: Callable[[str | None], None] | None = None,
         known_modes: Callable[[], Iterable[str]] | None = None,
         registry: control_mod.KindRegistry | None = None,
+        inhibition_observer: Callable[[frozenset[str]], None] | None = None,
     ) -> None:
         self._spool = intent_control or control_mod.CommandSpool(namespace=namespace, root=root)
         self._main = main_control or control_mod.CommandSpool(root=root)
         self._lib = lib if lib is not None else behavior_library
         self._mode_setter = mode_setter
         self._known_modes = known_modes
+        #: Fired with the NEW set whenever ``set_inhibition`` replaces the whole
+        #: inhibited set. A plain public attribute so composition can wire it
+        #: after both parties exist (see
+        #: :meth:`reachy.behavior.face_lock.FaceLockDriver.notice_inhibition_replaced`,
+        #: the later-wins seam whose whole job is to hear this).
+        self.inhibition_observer = inhibition_observer
         self._goal: dict | None = None  # {"name": str, "params": dict}
         self._inhibitions: frozenset[str] = frozenset()
         self._mode: str | None = None
@@ -296,6 +347,23 @@ class IntentDriver:
     @property
     def inhibitions(self) -> frozenset[str]:
         """The current inhibited behavior names."""
+        return self._inhibitions
+
+    def set_inhibitions(self, names: Iterable[str]) -> frozenset[str]:
+        """Replace the inhibited set IN PROCESS, without a spool command.
+
+        The same primitive ``set_inhibition`` applies (a full replacement),
+        exposed for an in-process consumer that owns part of the set for the
+        duration of some state — today only
+        :class:`reachy.behavior.face_lock.FaceLockDriver`, which adds
+        ``feel-alive`` / ``orient-to-sound`` while a face lock is held and
+        removes exactly those again on release.
+
+        Deliberately does NOT fire :attr:`inhibition_observer`: that seam means
+        "a caller replaced the whole set", and an in-process owner adjusting its
+        own contribution is not that.
+        """
+        self._inhibitions = frozenset(names)
         return self._inhibitions
 
     @property
@@ -347,6 +415,7 @@ class IntentDriver:
     def _apply_run_behavior(self, payload: dict, ctx) -> dict:
         name = payload.get("name")
         entry = self._lib.get(name)  # raises CliError naming the problem for an unknown name
+        behavior_library.refuse_if_lifecycle_owned(name, surface=RUN_BEHAVIOR)
         if name in self._inhibitions:
             return {
                 "ok": False,
@@ -355,6 +424,19 @@ class IntentDriver:
                 "error": f"{name!r} is inhibited",
             }
         params = _validated_params(entry, payload.get("params"))
+        planner_entry = _GAZE_PLANNERS.get(name)
+        if planner_entry is not None:
+            planner, refusal_reason = planner_entry
+            baked = planner(params, ctx.sense)
+            if baked is None:
+                senselog.drop(STAGE, RUN_BEHAVIOR, name, refusal_reason)
+                return {
+                    "ok": False,
+                    "op": RUN_BEHAVIOR,
+                    "name": name,
+                    "error": refusal_reason,
+                }
+            params.update(baked)
         lifetime = _validated_lifetime(entry, payload.get("lifetime"))
         self._seq += 1
         behavior_id = f"{_ID_PREFIX}:run:{name}:{self._seq}"
@@ -372,6 +454,7 @@ class IntentDriver:
                 ctx.evict(previous["name"])
             return {"ok": True, "op": DECLARE_GOAL, "goal": None, "cleared": previous}
         entry = self._lib.get(name)  # raises CliError naming the problem for an unknown name
+        behavior_library.refuse_if_lifecycle_owned(name, surface=DECLARE_GOAL)
         params = _validated_params(entry, payload.get("params"))
         previous = self._goal
         self._goal = {"name": name, "params": params}
@@ -410,6 +493,11 @@ class IntentDriver:
             self._lib.get(item)  # raises CliError naming the problem for an unknown name
             names.add(item)
         self._inhibitions = frozenset(names)
+        if self.inhibition_observer is not None:
+            # LATER-WINS: an in-process owner of part of the set (the face lock)
+            # hears that a caller has just replaced the whole thing, and drops
+            # its own claim rather than re-imposing it behind that caller's back.
+            self.inhibition_observer(self._inhibitions)
         return {"ok": True, "op": SET_INHIBITION, "behaviors": sorted(self._inhibitions)}
 
     # -- continuous enforcement (every tick, no spool command needed) -------- #

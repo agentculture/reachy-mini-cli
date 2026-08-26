@@ -598,6 +598,14 @@ def _validate_behavior_name(name: object, *, path: str) -> str:
             f"{path}: unknown behavior {name!r}",
             remediation=f"use one of: {', '.join(sorted(behavior_library.LIBRARY))}",
         )
+    owner = behavior_library.LIFECYCLE_OWNED.get(name)
+    if owner is not None:
+        # Fail-closed at LOAD, like the unbounded-lifetime refusal: a rule
+        # cannot admit a behavior whose lifetime a dedicated intent kind owns.
+        raise _error(
+            f"{path}: {name!r} is owned by the {owner!r} intent kind and cannot be run by a rule",
+            remediation=f"drive it through {owner!r} (and its release) instead",
+        )
     return name
 
 

@@ -113,6 +113,10 @@ class EventsCliClient:
         self._factory = factory
         self._client: Any | None = None
         self._will: tuple[str, str, int, bool] | None = None
+        #: A message callback registered before :meth:`connect` built the vendor
+        #: client, applied by that call. Ordering must not decide whether the
+        #: mind's retained state is ever heard.
+        self._pending_on_message: Callable[..., None] | None = None
 
     # -- the surface reachy.export.mqtt.EventClient declares -----------------
 
@@ -160,6 +164,9 @@ class EventsCliClient:
         # neither of which blocks on the network, so this stays safe to call from
         # composition without a timeout.
         self._client = factory(self._host, self._port, connect=True, **kwargs)
+        if self._pending_on_message is not None:
+            callback, self._pending_on_message = self._pending_on_message, None
+            self.set_on_message(callback)
 
     def disconnect(self) -> None:
         """Close the vendor session. Total: a failure is logged, never raised."""
@@ -191,6 +198,82 @@ class EventsCliClient:
         if not ok:
             logger.debug(
                 "events: publish to %s not accepted (%s)", topic, getattr(result, "reason", "?")
+            )
+
+    # -- the OPTIONAL subscribe half (t17) -----------------------------------
+
+    def supports_subscribe(self) -> bool:
+        """Whether the WRAPPED vendor can actually take a subscription.
+
+        This adapter always DEFINES :meth:`subscribe` and
+        :meth:`set_on_message`, so a probe of its own attributes (what
+        :func:`reachy.export.mqtt.missing_client_members` does, and what
+        :class:`reachy.export.mind_presence.MindPresence` used to rely on)
+        answers "yes" for every vendor, including the publish-only one shipped
+        today. A consumer that needs an INBOUND path must ask this instead —
+        otherwise it reports a live subscription while :meth:`subscribe`
+        quietly returns, and the mind's state reads unknown forever with no
+        drop naming why.
+
+        Answerable before :meth:`connect`: with no client built yet the vendor
+        CLASS is probed, so ordering never decides the answer. An unimportable
+        vendor is ``False`` — there is nothing to subscribe through.
+        """
+        target: Any | None = self._client
+        if target is None:
+            target = self._factory if self._factory is not None else _resolve_vendor()
+        if target is None:
+            return False
+        try:
+            return callable(getattr(target, "subscribe", None))
+        except Exception:  # a sick accessor is no capability
+            return False
+
+    def subscribe(self, topic: str, *, qos: int = 0) -> None:
+        """Subscribe *topic* on the vendor client. Total: never raises here.
+
+        The vendor's own subscribe signature is not pinned by this repo (the
+        wheel is the sibling project's), so both the keyword and the positional
+        QoS shapes are tried before giving up. A vendor with no subscribe at all
+        is not a fault — it is a publish-only client, and
+        :class:`reachy.export.mind_presence.MindPresence` reports the gap as one
+        named drop and reads UNKNOWN forever, which never releases a face lock.
+        """
+        client = self._client
+        if client is None:
+            return
+        subscribe = getattr(client, "subscribe", None)
+        if not callable(subscribe):
+            # Reachable only for a caller that did not ask `supports_subscribe`
+            # first; the one that matters (MindPresence) does.
+            logger.debug("events: the bus client exposes no subscribe(); %s unread", topic)
+            return
+        try:
+            subscribe(topic, qos=qos)
+        except TypeError:
+            subscribe(topic)
+
+    def set_on_message(self, callback: Callable[..., None]) -> None:
+        """Register *callback* for inbound messages, however the vendor spells it.
+
+        ``set_on_message(cb)`` if the vendor offers it, else a plain
+        ``on_message`` attribute (paho's convention, which the vendor wraps).
+        Neither present means inbound messages are simply never delivered — see
+        :meth:`subscribe` on why that is a degradation, not a failure.
+        """
+        client = self._client
+        if client is None:
+            self._pending_on_message = callback
+            return
+        setter = getattr(client, "set_on_message", None)
+        if callable(setter):
+            setter(callback)
+            return
+        try:
+            client.on_message = callback
+        except Exception as err:  # a read-only attribute, a slotted class, ...
+            logger.debug(
+                "events: cannot register a message callback (%s: %s)", type(err).__name__, err
             )
 
 

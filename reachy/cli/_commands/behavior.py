@@ -64,11 +64,13 @@ from reachy.behavior.excited_motion_probe import (
     ProbeNamespaceGuard,
     SharedPoseReader,
 )
+from reachy.behavior.face_lock import FaceLockDriver
 from reachy.behavior.face_sense import FaceSenseDriver, build_face_recognition
 from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
 from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
 from reachy.behavior.model import CHANNELS, StopClass
+from reachy.behavior.mute_intent import register_into as register_mute_kinds
 from reachy.behavior.pat_sense import (
     DEFAULT_HP_TAU,
     DEFAULT_PRESS_THRESHOLD,
@@ -117,6 +119,7 @@ from reachy.cli._export import add_runtime_export_args, build_runtime_export_con
 from reachy.cli._logging import add_log_level_arg, install_logging
 from reachy.cli._output import emit_diagnostic, emit_result
 from reachy.export.events_client import VENDOR_IMPORT, EventsCliClient
+from reachy.export.mind_presence import MindPresence
 from reachy.export.mqtt import NervousPublisher, broker_url
 from reachy.export.runtime import SenseSnapshotDriver
 from reachy.motion.pat import PatDetector
@@ -1852,6 +1855,7 @@ class _RuntimeResources:
         realtime=None,
         metrics=None,
         publisher=None,
+        mind_presence=None,
     ):
         self.pose_reader = pose_reader
         self.media = media
@@ -1863,6 +1867,7 @@ class _RuntimeResources:
         self.realtime = realtime
         self.metrics = metrics
         self.publisher = publisher
+        self.mind_presence = mind_presence
         self._closed = False
 
     def close(self) -> None:
@@ -1887,6 +1892,10 @@ class _RuntimeResources:
             self._release(self.media.close, "media client")
         if self.pose_reader is not None:
             self._release(self.pose_reader.close, "pose reader")
+        if self.mind_presence is not None:
+            # BEFORE the publisher, whose client it borrows: once that session
+            # is closing, a late retained replay must not still be believed.
+            self._release(self.mind_presence.stop, "mind presence")
         if self.publisher is not None:
             self._release(self.publisher.stop, "nervous publisher")
 
@@ -2178,9 +2187,10 @@ def _compose_run_seam(
 
     Act-in seams (the ONE TickBus, in driver order)
     -----------------------------------------------
-    ``[rules_driver, intent_driver, pat_driver, transcript_driver, face_driver,
-    self_motion, holder, goto_lane, availability, clip_rider]`` (with a
-    :class:`SenseSnapshotDriver` appended when exporting):
+    ``[rules_driver, intent_driver, face_lock_driver, pat_driver,
+    transcript_driver, face_driver, self_motion, holder, goto_lane,
+    availability, clip_rider]`` (with a :class:`SenseSnapshotDriver` appended
+    when exporting):
 
     * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
       decisions (admit/evict, drain the intent + goto command spools). The GOTO
@@ -2192,6 +2202,12 @@ def _compose_run_seam(
       defaults when it builds the registry itself, so GOTO is added afterward
       rather than pre-loaded into an injected (would-be-empty-of-defaults)
       registry.
+    * ``face_lock_driver`` — immediately after ``intent_driver``, because it
+      watches the lock that driver's drain may have JUST taken: one
+      ``motion.face-lost`` report per disappearance, and the two releases that
+      keep a lock from outliving its mind (``mind-offline``) or its clock
+      (``max-hold``). It only reads ``ctx.sense``/``ctx.now`` and may
+      evict/emit, so it belongs with the symbolic half of the seam.
     * ``pat_driver`` — reads THIS tick's ``ctx.pose`` (commanded head) and the
       injected reader (actual head) DIRECTLY (never via the holder), advances the
       detector, and latches a pat for the NEXT tick's sense read. It mutates no
@@ -2260,7 +2276,7 @@ def _compose_run_seam(
     # that `Restart=on-failure` never restarts. So the whole construction is
     # guarded and releases what it opened before re-raising.
     reader = media = transcript_driver = face_driver = keeper = speech = pump = None
-    realtime = publisher = tee = clip_rider = None
+    realtime = publisher = tee = clip_rider = mind_presence = None
     try:
         # The voice, first: built and STARTED here on the setup thread so no tick
         # ever pays for thread creation, and so a malformed REACHY_VOICE_ENGINE /
@@ -2412,6 +2428,12 @@ def _compose_run_seam(
             rms_ratio=rms_ratio_provider,
             transcript=transcript_driver.as_provider(),
             face=face_driver.as_face_provider(),
+            # The same detection's POSITION and its age (t2) — the name cue
+            # answers WHO, these two answer WHERE and HOW STALE, which is what
+            # a gaze behavior needs and what an UNRECOGNISED face can still
+            # give it.
+            face_bbox=face_driver.as_face_bbox_provider(),
+            face_age_s=face_driver.as_face_age_provider(),
             frame_available=face_driver.as_frame_available_provider(),
             self_moving=self_motion.is_moving,
         )
@@ -2460,6 +2482,51 @@ def _compose_run_seam(
         # carries the four intent defaults) so all five kinds share one registry.
         intent_driver.registry.register(GOTO, make_goto_handler(goto_lane))
 
+        # ... and the two QUIET kinds (t17), into that same registry. The gate
+        # they flip lives in the ACTUATOR, not here and not in the rules layer:
+        # a react rule's `say` never travels the `speak` library behavior (it
+        # goes `rule_engine._speak` -> this same `speech.say`), so
+        # `set_inhibition("speak")` would silence only rules whose `run` IS
+        # `speak` and leave every other rule talking through the mind's quiet.
+        register_mute_kinds(intent_driver.registry, speech)
+
+        # ... and the two face-lock kinds into the SAME registry, the same way.
+        # The lock STATE lives in this driver (not in the mind, and not in
+        # `intents.py`), and it borrows the inhibited set through the two
+        # injected callables — which is why `face_lock.py` never imports
+        # `intents.py`. `inhibition_observer` is the later-wins seam: a
+        # `set_inhibition` arriving while locked replaces the whole set, and the
+        # lock surrenders its own additions rather than restoring a stale
+        # snapshot on release.
+        #
+        # It also RIDES THE TICK (it is in `drivers` below, right after
+        # `intent_driver`, so a lock taken this tick is watched from the next
+        # one): a lock must not outlive its mind, nor be held forever.
+        #
+        # The `mind_online` seam is now LIVE (t17). It used to be left at its
+        # default `None` = UNKNOWN because the runtime published its nervous
+        # system and subscribed to nothing, so there was no reading of "is the
+        # harness up" to hand it and `max_hold_s` (30 min) was the only bound
+        # that bound. `MindPresence` is that reading: it subscribes the retained
+        # `nova/harness/state` topic the harness actually publishes (payload
+        # `{"status": "online"|"offline", "ts": ...}`, with a matching Last Will,
+        # so a `kill -9`'d harness flips it too) and answers True/False/None.
+        #
+        # `presence.online` is handed over as a bound callable BEFORE the client
+        # exists: the presence borrows the publisher's client, and the publisher
+        # is built further down (`_attach_nervous_system`), where `attach()` +
+        # `start()` complete the wiring. Until then — and forever, on a box with
+        # no broker — the reading is None, and unknown NEVER releases a lock, so
+        # the window is safe by construction rather than by ordering luck.
+        mind_presence = MindPresence()
+        face_lock_driver = FaceLockDriver(
+            inhibitions_getter=lambda: intent_driver.inhibitions,
+            inhibitions_setter=intent_driver.set_inhibitions,
+            mind_online=mind_presence.online,
+        )
+        face_lock_driver.register_into(intent_driver.registry)
+        intent_driver.inhibition_observer = face_lock_driver.notice_inhibition_replaced
+
         # Per-sense availability into the standing `state.json` (#120b). A seam
         # RIDER, not an `Engine.state()` key: which providers got wired, and
         # whether each one's extra is installed, is composition-time knowledge
@@ -2477,6 +2544,7 @@ def _compose_run_seam(
             for d in (
                 rules_driver,
                 intent_driver,
+                face_lock_driver,
                 pat_driver,
                 transcript_driver,
                 face_driver,
@@ -2503,6 +2571,14 @@ def _compose_run_seam(
         # session or the clock. That is why it does not appear in the driver
         # list above and why it cannot perturb the tick.
         publisher, consumers = _attach_nervous_system(drivers, runtime_consumer)
+        # The face lock's mind reading, completed now that the ONE bus client
+        # exists (see the `mind_online` note at the FaceLockDriver above). The
+        # presence borrows THIS client — a second connection to the same broker
+        # for one retained topic would be a second thing to fail. A publish-only
+        # client, or none at all, degrades to one named drop and a permanently
+        # -unknown reading, which never releases a lock.
+        mind_presence.attach(publisher.client)
+        mind_presence.start()
         bus = TickBus(drivers=drivers, consumers=consumers)
         metrics = TickMetrics(bus, budget_s=budget_from_hz(config.compose_hz))
         resources = _RuntimeResources(
@@ -2516,6 +2592,7 @@ def _compose_run_seam(
             realtime=realtime,
             metrics=metrics,
             publisher=publisher,
+            mind_presence=mind_presence,
         )
     except BaseException:
         _RuntimeResources(
@@ -2528,6 +2605,7 @@ def _compose_run_seam(
             tee=tee,
             realtime=realtime,
             publisher=publisher,
+            mind_presence=mind_presence,
         ).close()
         raise
     return sense_reader, metrics, resources

@@ -28,9 +28,12 @@ Four block types, each ``{t, ts, tick, ...payload}``:
 - ``"intent"`` — a sustained symbolic goal flowing through the intent-tools
   spool; the live producer is :class:`reachy.behavior.intents.IntentDriver`'s
   ``intent.applied``/``intent.blocked`` status emissions.
-- ``"motion"`` — a behavior admission/eviction or goto; the goto lane's
-  ``goto.admitted``/``goto.done``/``goto.cancelled`` lifecycle maps here as
-  ``action="goto"`` with ``detail.phase``.
+- ``"motion"`` — a behavior admission/eviction, a goto, or a face-lock
+  lifecycle event; the goto lane's ``goto.admitted``/``goto.done``/
+  ``goto.cancelled`` lifecycle maps here as ``action="goto"`` with
+  ``detail.phase``, and the face lock's ``motion.face-lost`` /
+  ``motion.lock-released`` map here verbatim (``detail.absent_s`` and
+  ``detail.reason`` respectively).
 
 This module never imports :mod:`reachy.behavior.rule_engine` (or any
 ``reachy.behavior`` module) — it only *interprets* the documented ``type``
@@ -88,7 +91,12 @@ _RAW_TYPE_RULE_SUPPRESS = "rule.suppress"
 _RAW_INTENT_ACTIONS = frozenset({"declare", "update", "clear"})
 #: The IntentDriver's live status emissions (``intent.applied`` / ``intent.blocked``).
 _RAW_INTENT_STATUS_ACTIONS = frozenset({"applied", "blocked"})
-_RAW_MOTION_ACTIONS = frozenset({"admit", "evict", "goto"})
+#: ``face-lost`` / ``lock-released`` are the face lock's lifecycle emissions
+#: (:mod:`reachy.behavior.face_lock`): a lock reports a face it has stopped
+#: seeing, and names the ``detail.reason`` that finally ended it. Registered
+#: here because registration IS the gate — an action absent from this table
+#: is dropped from the stdout feed and from the bus alike.
+_RAW_MOTION_ACTIONS = frozenset({"admit", "evict", "goto", "face-lost", "lock-released"})
 #: The GotoLane's per-goto lifecycle emissions (``goto.admitted`` / ``goto.done`` /
 #: ``goto.cancelled``) — surfaced as ``motion`` blocks with ``action="goto"``.
 _RAW_GOTO_PHASES = frozenset({"admitted", "done", "cancelled"})
@@ -176,11 +184,12 @@ class IntentEvent:
 
 @dataclass(frozen=True)
 class MotionEvent:
-    """A behavior admission/eviction or goto — the engine's active-set churn.
+    """A behavior admission/eviction, goto, or lock lifecycle event.
 
-    ``action`` is ``"admit"`` / ``"evict"`` / ``"goto"``; ``channels`` names the
-    claimed/released channels; ``detail`` carries action-specific extras (e.g. a
-    goto's target pose).
+    The engine's active-set churn. ``action`` is ``"admit"`` / ``"evict"`` /
+    ``"goto"`` / ``"face-lost"`` / ``"lock-released"``; ``channels`` names the
+    claimed/released channels; ``detail`` carries action-specific extras (a
+    goto's target pose, a face-lost's ``absent_s``, a release's ``reason``).
     """
 
     t: ClassVar[str] = "motion"

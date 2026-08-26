@@ -221,7 +221,7 @@ transport. Deep notes for the non-trivial nouns follow in
 | `daemon` | `_commands/daemon.py` | `reachy/daemon.py` (process mgmt, `is_robot_live`) | none |
 | `device`/`app`/`move` | `_commands/{device,app,move}.py` | `reachy/robot/*` transports | `http` default |
 | `demo-mode` | `_commands/demo_mode.py` | `reachy/alive.py`, `reachy/motion/idle.py`, `demo_config.py`, `demo_service.py` | `sdk`/`http` |
-| `behavior` | `_commands/behavior.py` | 50 Hz engine (`behavior/engine.py`) + rules/intents (`rules.py`/`rule_engine.py`/`intents.py`/`control.py`); composes the full sense stack — proprioceptive pat (`pat_sense.py` + `robot/state_reader.py`), loudness (`rms_sense.py`), heard words (`transcript_sense.py`), face + frame availability (`face_sense.py`), all reading the one held `robot/media_client.py` — a fail-closed live `goto` (`goto_intent.py` + `goto_lane.py`, seeded via `pose_feed.py`), and the background-worker voice (`speech_act.py`, reached from a rule's `say`) onto the same tick seam | `sdk`/`http` |
+| `behavior` | `_commands/behavior.py` | 50 Hz engine (`behavior/engine.py`) + rules/intents (`rules.py`/`rule_engine.py`/`intents.py`/`control.py`); composes the full sense stack — proprioceptive pat (`pat_sense.py` + `robot/state_reader.py`), loudness (`rms_sense.py`), heard words (`transcript_sense.py`), face + frame availability (`face_sense.py`), all reading the one held `robot/media_client.py` — a fail-closed live `goto` (`goto_intent.py` + `goto_lane.py`, seeded via `pose_feed.py`), the gaze one-shots (`gaze.py`), the standing face lock and its four endings (`face_lock.py`, with the mind's liveness read by `export/mind_presence.py`), the quiet gate (`mute_intent.py`), and the background-worker voice (`speech_act.py`, reached from a rule's `say`) onto the same tick seam | `sdk`/`http` |
 | `vision` | `_commands/vision.py` | pixel motion/light detectors, serial MotionQueue | `sdk` default |
 | `say` | `_commands/say.py` | `reachy/speech/{tts,harmonic,voice,playback}.py` | `sdk` default |
 | `pat` | `_commands/pat.py` | `reachy/motion/{pat,pat_reaction,pat_signal}.py` | `sdk` only |
@@ -251,9 +251,14 @@ daemon restart (fixes issue #21).
 
 `reachy/cli/_commands/behavior.py::_compose_run_seam` composes every runtime
 sense/act piece onto the engine's ONE `TickBus`: `[rules_driver,
-intent_driver, pat_driver, transcript_driver, face_driver, self_motion,
-holder, goto_lane, availability, clip_rider]` (plus a `SenseSnapshotDriver`
-when exporting). Every piece below is import-safe
+intent_driver, face_lock_driver, pat_driver, transcript_driver, face_driver,
+self_motion, holder, goto_lane, availability, clip_rider]` (plus a
+`SenseSnapshotDriver` when exporting). `face_lock_driver` sits immediately
+after `intent_driver` on purpose — it watches the lock that driver's drain may
+have JUST taken. Every kind lives in ONE registry: the merged `IntentDriver`
+auto-registers its four defaults when it builds the registry itself, then
+`goto`, `mute`/`unmute` and `lock_face`/`release_face` are registered into that
+same object afterward (see the sections below). Every piece below is import-safe
 without `reachy_mini` and composed UNCONDITIONALLY — a bare box (no `[sdk]` /
 `[vision]` extra) runs unchanged except for permanently-quiet sense fields.
 
@@ -292,13 +297,22 @@ tick thread never constructs. `_RuntimeResources` is what `cmd_engine_run`
 closes at shutdown (both clients + the worker-owning sense drivers + the
 audio pump); an unclosed client hangs the process at interpreter exit.
 
-**Sense providers — all six wired.** `SenseProviders` carries `pat_event` /
-`pat_state` (two peeks of the ONE `PatSenseDriver`), `rms`
+**Sense providers — every optional field wired.** `SenseProviders` carries
+`pat_event` / `pat_state` (two peeks of the ONE `PatSenseDriver`), `rms`
 (`behavior/rms_sense.py`), `transcript` (`behavior/transcript_sense.py`, a
 background worker streaming mic audio to the lobes `/v1/realtime` session
 (`speech/realtime.py`, server-side VAD — see below) + the #54/#56 engagement
-gate) and `face` / `frame_available` (`behavior/face_sense.py`, a background
-YuNet/SFace worker).
+gate) and `face` / `face_bbox` / `face_age_s` / `frame_available`
+(`behavior/face_sense.py`, a background YuNet/SFace worker). The bbox is
+captured BEFORE the store match, so a stranger still has a POSITION to look at;
+`select_face` is the pure policy that picks which one — biggest wins (box area
+is the only distance proxy the detector gives), with a recognised face breaking
+a NARROW near tie (`AREA_TIE_RATIO`), so two people side by side stop being a
+coin-flip the attention flicks between, while a far-larger unknown face still
+beats a small known one. `Sense.doa_age_s` is the sibling freshness field, the
+`DoaPoller`'s own last-good age carried onto the snapshot: a one-shot like
+`look-at-sound` samples it ONCE at admission and must see the same age a
+concurrent rule predicate would, not a second, later clock read.
 `rms` and the transcript driver are two consumers of ONE *consuming*
 audio read. Since #100 that read is `AudioPump.take()` — a background daemon
 thread (`behavior/audio_pump.py`) owns ALL `media.audio()` I/O, drains the
@@ -315,10 +329,18 @@ flattening that interleaves both channels into one double-length stream the WAV
 header then mislabels. `to_mono` selects `AEC_CHANNEL` (0, `reachy_nova`'s
 choice) and passes a 1-D read through untouched. Measurement over 829 archived
 uploads says the deployed box delivers 1-D today, so this is a closed
-portability hazard, not a fixed bug. **When you wire a new provider here you MUST extend
+portability hazard, not a fixed bug. **When you wire a new provider that a RULE PREDICATE can name, you MUST extend
 `reachy/behavior/sense.py`'s `_COMPOSED_PROVIDER_FIELDS` in the same change** —
 it is the one declared source of truth `behavior rules check` lints against, so
-a stale value makes the linter lie in one direction or the other.
+a stale value makes the linter lie in one direction or the other. Be exact
+about the qualifier: that set is not "every wired provider", it is every
+provider whose PREDICATE FIELD `FED_SENSE_FIELDS` should declare fed, and each
+member is looked up in `_PROVIDER_PREDICATE_FIELDS` to build it. `face_bbox` /
+`face_age_s` are continuous readings a behavior consumes off the `Sense`
+snapshot directly, absent from `rules.SENSE_FIELDS` by design (no rule can key
+on them, so there is nothing to warn about) — adding them raises `KeyError` at
+import. A reviewer will read the set's name and ask for them anyway; the answer
+is in `_PROVIDER_PREDICATE_FIELDS`' own docstring.
 
 - **Transcript sense — capture moved server-side (issue #115); the #108
   lesson survives its own machinery.** `transcript_sense.py` used to decide
@@ -519,6 +541,150 @@ See [the operating guide's pat sense](docs/operating-reachy.md#the-pat-sense),
 and [speech](docs/operating-reachy.md#speech--the-say-field-gives-a-rule-a-voice)
 sections for the operator-facing walkthrough and the deployed `rules.toml`
 example.
+
+### Gaze, face lock and the quiet gate — the runtime side of the mind's five asks
+
+Four modules landed together — the body half of `reachy_nova` issues #13-#16
+and #19. They share one shape: **the runtime owns the STATE, the mind owns the
+DECISION and its clock.** Each is a leaf that never imports
+`behavior/control.py` or `behavior/intents.py` — registering a kind into a live
+`KindRegistry` is composition's job (`_compose_run_seam`), exactly as
+`goto_intent.py` established.
+
+**`reachy/behavior/gaze.py` — two one-shot glances.** `look-at-sound` and
+`look-at-face`: ease onto a bearing, hold, end. They are the SMALL sibling of
+`orient.py`'s sustained `orient-to-sound` goal — "look at whatever just made
+that noise", not "keep watching sound forever" — and they carry none of its
+ladder/dwell/latch state. Three things are load-bearing:
+
+- **`STOPPABLE`, never `STOPPING`.** Priority-tied with `orient-to-sound`,
+  arbitration's documented "most recently admitted wins" tie-break hands the
+  head to the just-admitted one-shot WITHOUT evicting the standing goal, which
+  reclaims the head on its own when the glance ends. `STOPPING` would kill a
+  standing goal for one quick look.
+- **Refusal is at ADMISSION, not in the contribution.** `plan_look_at_sound` /
+  `plan_look_at_face` are PURE planners the intent driver calls with that
+  tick's live `Sense`; a stale or absent reading refuses the whole
+  `run_behavior` (`no recent sound direction` / `no face known`) rather than
+  admitting a behavior that then quietly aims at neutral. The planner tables
+  live in `intents.py`'s `_GAZE_PLANNERS`.
+- **The name is `look-at-sound`, not `look-toward-sound`.** The latter is an
+  existing react rule id in `default_rules.toml` (it admits `orient-to-sound`).
+  Rule ids and library names are different namespaces, so it would not have
+  collided — it would merely have been unreadable.
+
+**`reachy/behavior/face_lock.py` — a STANDING claim on the head, and its four
+endings.** `lock_face` is a dedicated kind rather than something a mind
+composes out of `run_behavior` + `set_inhibition`, because the LOCK STATE has
+to have exactly one answer no matter which agent turn asked, and releasing has
+to be one call that undoes everything the lock did. In one atomic step it
+refuses fail-closed with no fresh `face_bbox` (`no face known` — a lock with
+nothing to lock onto is a head frozen at neutral, indistinguishable from a
+wedged runtime), admits ONE looping, indefinite, self-clamped `face-lock`
+behavior (±20° yaw / ±12° pitch, slew-limited — `goto_intent.py`'s head
+envelope, cited not re-derived), and SNAPSHOTS the inhibited set before adding
+its own (`feel-alive`, `orient-to-sound` — the two behaviors that would drag
+the head off the face).
+
+- **Losing the face is a REPORT, not an ending.** One `motion.face-lost` per
+  disappearance (re-armed when the face returns); the lock persists. Vision
+  drops frames, and a person who steps out of frame has not asked to be
+  unlocked.
+- **Every ending runs ONE `_release` path**, so a lifecycle release can never
+  undo less than an explicit one, and each emits exactly one
+  `motion.lock-released` carrying its `reason`: `requested`, `mind-offline`
+  (the mind read `false` for the whole grace — nobody is left to release it),
+  `max-hold` (30 min, a liveness bound, not a safety one — the clamp is the
+  safety), and `evicted` (the behavior left the active set without this driver
+  asking; see below). Both actions are registered in `export/runtime.py`'s
+  `_RAW_MOTION_ACTIONS` — registration IS the gate, an unregistered action
+  reaches NEITHER feed.
+- **Eviction is watched, because a `behavior stop` is not a release.** The
+  driver checks `ctx.active_names()` before its other watchdogs: `behavior stop
+  face-lock` / `stop all` removes the gaze, and without this the driver stayed
+  `locked` with its inhibitions installed until the 30-minute watchdog, while
+  `lock_face` answered `already locked`. An absent or raising probe reads
+  UNKNOWN, never "gone" — a watchdog that guesses would drop a live lock off a
+  face on any seam it does not recognise.
+- **Inhibition is LATER-WINS.** `set_inhibition` REPLACES the whole set, so a
+  caller doing that while locked has made a later, deliberate statement:
+  `notice_inhibition_replaced` (wired to `IntentDriver.inhibition_observer`)
+  drops the lock's CLAIM, and release then restores nothing behind that
+  caller's back. With no intervening call, release removes precisely the names
+  the lock ADDED.
+- **`face-lock` is admissible ONLY through `lock_face`.** `library.py`'s
+  `LIFECYCLE_OWNED` + `refuse_if_lifecycle_owned` refuses it on `declare_goal`
+  (which would give it a standing indefinite lifetime with none of the state
+  above — and `release_face` would then answer `not locked`), on
+  `run_behavior`, and in a react rule's `run` (fail-closed at LOAD, beside the
+  unbounded-lifetime refusal). `run_behavior` is included even though a bounded
+  run strands nothing: a SECOND behavior of that name on the active set is
+  exactly what the eviction watchdog reads. One admitter, one name.
+
+**`reachy/behavior/mute_intent.py` — the mind's quiet, reaching the body.** Two
+kinds, `mute` / `unmute`, and deliberately **no duration**: a timer inside the
+runtime would be a second, drifting copy of the mind's own quiet window, and
+the moment the two disagree the robot is either mute with nobody left to
+un-mute it or talking through a quiet it was told to keep. A payload field the
+kind does not know (`{"op": "mute", "seconds": 30}`) is refused fail-closed for
+that exact reason. Re-issuing is `ok: true` with a `note` — a mind re-asserting
+the state it wants is behaving correctly, and answering it with an error would
+teach it to stop asserting.
+
+**The gate lives in the ACTUATOR** (`speech_act.py`'s `mute()`/`unmute()`/
+`voice_muted`), not in the rules layer, and this is the whole reason the
+feature is not `set_inhibition("speak")`: a react rule's `say` never travels
+the `speak` library behavior — `rule_engine._speak` hands the text straight to
+`SpeechActuator.say` — so inhibiting `speak` would silence only rules whose
+`run` IS `speak` and leave every other rule talking. Note the two different
+mutes: `voice_muted` is a DECISION only `unmute` undoes; `muted` is the audio
+sink's own 30 s fault latch, which the robot clears by itself. Drops to the
+quiet gate are LATCHED: the first one names the reason and `unmute` closes it
+with `count=N`, so a mute window is exactly TWO greppable lines however many
+utterances it swallowed — never zero, and never one line per suppressed
+reaction burying the journal (a mute is typically minutes long). The `dropped`
+counter still counts every one: the counter is the complete record, the log is
+the readable one.
+
+**`reachy/export/mind_presence.py` — the runtime's FIRST bus subscriber.**
+Everything on the bus until now was outbound, which is why `FaceLockDriver`
+shipped with `mind_online=None` — a documented seam with no reading behind it.
+`MindPresence` subscribes the retained `nova/harness/state` (the harness's OWN
+topic, in Nova's namespace, published retained on connect AND registered as
+that client's Last Will, so an ungraceful death flips it without the harness's
+cooperation — exactly the case a lock must survive) and answers a TRI-STATE.
+The `None` is the load-bearing value: a broker that is not up, a harness that
+never announced itself, and a runtime composed with no client all honestly
+amount to *we have no idea*, and unknown NEVER releases a lock.
+
+- **It borrows the publisher's ONE client** (`mind_presence.attach(publisher.client)`
+  at composition) — a second connection to the same broker for one retained
+  topic would be a second thing to fail. It never unsubscribes: the client is
+  the publisher's, and `stop()` only freezes the reading.
+- **Ask the ADAPTER about the VENDOR, never the adapter about itself.**
+  `export/events_client.py`'s `EventsCliClient` always DEFINES `subscribe` /
+  `set_on_message`, so `missing_client_members`-style probing passes over the
+  publish-only `events_cli.EventClient` shipped today and presence reported a
+  live subscription — logging `watching nova/harness/state for the mind` — over
+  a pipe with no inbound half. `supports_subscribe()` reports on the wrapped
+  vendor (the CLASS is probed when no client is built yet, so ordering never
+  decides the answer), and a client that cannot subscribe is one named
+  `client-incompatible` drop. A client with no such probe is taken at face
+  value, so this can never disable a working bus.
+  `test_the_installed_vendor_client_still_has_no_subscribe_capability` is the
+  live canary that starts failing the day upstream ships one — the sibling of
+  the `events-cli` `subscribe` canary in the cues/supervisor notes.
+
+**Param domains** (`library.py`'s `Param.minimum`/`maximum` +
+`validate_param_value`, called by BOTH override surfaces — the CLI's `--set`
+string path and `intents._validated_params`): a non-finite value is refused
+everywhere, and every gaze/lock clamp, gain, ease and freshness limit declares
+`minimum=0.0` while genuinely signed offsets (`pitch`/`roll`/`z`) stay
+unbounded. Both halves are needed and neither is theoretical: `float("nan")`
+parses cleanly from a `--set` string, stdlib `json` decodes a bare `NaN` from
+the spool, `age > NaN` is `False` (so a NaN freshness limit certifies ANY
+reading fresh), and `_clamp(v, -5)` returns `+5` (so a negative clamp does not
+clamp — it forces the opposite angle).
 
 ### `reachy/motion/listen.py` — the surviving `ListenProducer` (no longer a noun)
 

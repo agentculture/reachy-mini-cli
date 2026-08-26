@@ -413,7 +413,7 @@ Example line:
 {"t":"intent","ts":1718362801.0,"tick":50,"action":"declare","name":"stay-alert","payload":{"mode":"focus"}}
 ```
 
-#### `"motion"` — a behavior admission/eviction or goto
+#### `"motion"` — a behavior admission/eviction, goto, or lock lifecycle
 
 Emitted for the engine's active-set churn.
 
@@ -435,15 +435,33 @@ the intents spool — both paths run through the same fail-closed validator
 |------------|-----------------------------------|---------------------------------------|
 | `t`        | `"motion"`                        | Block-type discriminator              |
 | `ts`, `tick` | float, int                      | As above                              |
-| `action`   | `"admit"` / `"evict"` / `"goto"`  | What happened                         |
+| `action`   | `"admit"` / `"evict"` / `"goto"` / `"face-lost"` / `"lock-released"` | What happened |
 | `behavior` | string or `null`                  | The affected behavior name            |
 | `channels` | array of string                   | Claimed/released channels             |
 | `detail`   | object                            | Action-specific extras (e.g. a goto's target pose) |
 
-Example line:
+The **face lock**'s lifecycle (`reachy.behavior.face_lock`) rides this same
+block. A lock is an indefinite claim on the head taken on a mind's behalf, so
+its whole life is on the wire:
+
+| `action`         | When                                             | `detail`               |
+|------------------|--------------------------------------------------|------------------------|
+| `face-lost`      | The locked face has been absent/stale for 3 s — emitted **once** per disappearance, re-armed when the face returns. The lock **persists**: this is a report, not an ending. | `{id, absent_s}` |
+| `lock-released`  | The lock ended, whichever way                    | `{id, reason}`         |
+
+`detail.reason` is one of `requested` (an explicit `release_face`),
+`mind-offline` (the mind's liveness read `false` for the whole grace period —
+nobody is left to release it), `max-hold` (the 30-minute ceiling), or `evicted`
+(the lock's behavior left the active set without the lock driver asking — a
+`behavior stop face-lock`, or a `stop all`; the gaze is already gone, so the
+lock state and its inhibitions follow it rather than outliving it).
+
+Example lines:
 
 ```json
 {"t":"motion","ts":1718362801.2,"tick":52,"action":"admit","behavior":"nod","channels":["head"],"detail":{}}
+{"t":"motion","ts":1718362804.4,"tick":210,"action":"face-lost","behavior":"face-lock","channels":["head"],"detail":{"id":"face-lock:lock:1","absent_s":3.02}}
+{"t":"motion","ts":1718362814.6,"tick":720,"action":"lock-released","behavior":"face-lock","channels":["head"],"detail":{"id":"face-lock:lock:1","reason":"mind-offline"}}
 ```
 
 ### Reading the Runtime Feed
@@ -547,7 +565,7 @@ above) and `{type}` is that block's action:
 | `sense`    | `snapshot` (a `sense` block carries no action of its own) |
 | `rule`     | `fire`, `suppress`                                        |
 | `intent`   | `declare`, `update`, `clear`, `applied`, `blocked`         |
-| `motion`   | `admit`, `evict`, `goto`                                  |
+| `motion`   | `admit`, `evict`, `goto`, `face-lost`, `lock-released`     |
 
 The **payload is `runtime_to_jsonl(event)`'s output, verbatim** — the exact
 same serializer, byte-identical, that produces every line of the stdout

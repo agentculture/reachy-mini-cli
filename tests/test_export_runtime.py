@@ -513,6 +513,38 @@ class TestToRuntimeEvent:
     def test_unknown_motion_action_maps_to_none(self):
         assert to_runtime_event({"type": "motion.teleport", "ts": 1.0}) is None
 
+    def test_face_lost_maps_to_motion_event(self):
+        """The face-lock lifecycle's REPORT reaches the feed (t5)."""
+        raw = {
+            "type": "motion.face-lost",
+            "behavior": "face-lock",
+            "channels": ["head"],
+            "detail": {"id": "face-lock:lock:1", "absent_s": 3.2},
+            "ts": 1.0,
+            "tick": 7,
+        }
+        mapped = to_runtime_event(raw)
+        assert isinstance(mapped, MotionEvent)
+        assert mapped.action == "face-lost"
+        assert mapped.detail["absent_s"] == 3.2
+
+    def test_lock_released_maps_to_motion_event_carrying_its_reason(self):
+        """Every ending of a face lock is on the wire, with WHY it ended (t5)."""
+        for reason in ("requested", "mind-offline", "max-hold"):
+            mapped = to_runtime_event(
+                {
+                    "type": "motion.lock-released",
+                    "behavior": "face-lock",
+                    "channels": ["head"],
+                    "detail": {"id": "face-lock:lock:1", "reason": reason},
+                    "ts": 2.0,
+                    "tick": 9,
+                }
+            )
+            assert isinstance(mapped, MotionEvent)
+            assert mapped.action == "lock-released"
+            assert mapped.detail["reason"] == reason
+
 
 # --------------------------------------------------------------------------- #
 # 3. parse_runtime_blocks                                                     #
