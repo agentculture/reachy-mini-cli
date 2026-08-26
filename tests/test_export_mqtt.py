@@ -37,9 +37,12 @@ from pathlib import Path
 
 import pytest
 
+from reachy.behavior import face_lock as FL
 from reachy.behavior.control import CommandSpool
 from reachy.behavior.engine import Engine, EngineConfig
+from reachy.behavior.intents import IntentDriver
 from reachy.behavior.sense import EMPTY_SENSE
+from reachy.export import mind_presence as MP
 from reachy.export import mqtt as M
 from reachy.export.runtime import (
     RUNTIME_BLOCKS,
@@ -722,7 +725,10 @@ def test_the_declared_client_protocol_is_the_whole_requirement() -> None:
     """The Protocol is the contract handed back to events-cli#3 — pin it."""
     required = set(M.REQUIRED_CLIENT_MEMBERS)
     assert required == {"connect", "disconnect", "publish", "will_set", "connected"}
-    assert M.OPTIONAL_CLIENT_MEMBERS == ("set_on_connect",)
+    # t17 added the SUBSCRIBE half — optional on purpose: only
+    # `reachy.export.mind_presence` uses it, and a publish-only client must stay
+    # a fully valid nervous system rather than becoming an incompatible one.
+    assert M.OPTIONAL_CLIENT_MEMBERS == ("set_on_connect", "subscribe", "set_on_message")
     # A fake implementing only the required set is enough to run the publisher.
     assert M.missing_client_members(FakeEventsClient()) == ()
 
@@ -887,3 +893,293 @@ def test_a_key_accepted_once_is_still_not_republished_when_unchanged() -> None:
     client.published.clear()
     pub.publish_state(dict(state))
     assert _state_topics(client) == []
+
+
+# --------------------------------------------------------------------------- #
+# MindPresence (t17) — the runtime's FIRST subscriber                         #
+# --------------------------------------------------------------------------- #
+#
+# Until t17 the runtime published its nervous system and subscribed to nothing,
+# which is why `FaceLockDriver(mind_online=None)` was a documented seam. These
+# tests pin the small subscriber that closes it: it reads the harness's OWN
+# retained availability topic (`nova/harness/state`, payload
+# `{"status": "online"|"offline", "ts": ...}` — reachy_nova's
+# `reachy_nova/harness/bus.py:144` declares it, `:615` publishes it retained on
+# connect and `:552` sets the matching Last Will) and answers True / False /
+# None — None meaning "never heard, or no client at all", which never releases
+# a lock.
+
+
+def _mp_sense_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == SENSE_LOGGER]
+
+
+class SubscribingFakeClient(FakeEventsClient):
+    """The required surface plus the two OPTIONAL subscription members."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.subscriptions: list[tuple[str, int]] = []
+        self.message_callback = None
+        self.raise_on_subscribe: Exception | None = None
+
+    def subscribe(self, topic: str, *, qos: int = 0) -> None:
+        self.calls.append("subscribe")
+        if self.raise_on_subscribe is not None:
+            raise self.raise_on_subscribe
+        self.subscriptions.append((topic, qos))
+
+    def set_on_message(self, callback) -> None:
+        self.calls.append("set_on_message")
+        self.message_callback = callback
+
+    # -- test control --------------------------------------------------------
+
+    def deliver(self, topic: str, payload) -> None:
+        """Push one broker message into the registered callback."""
+        assert self.message_callback is not None, "nothing registered a message callback"
+        self.message_callback(topic, payload)
+
+
+def _presence(**kwargs):
+    client = SubscribingFakeClient()
+    presence = MP.MindPresence(client, **kwargs)
+    presence.start()
+    return presence, client
+
+
+def test_mind_presence_reads_unknown_before_any_payload() -> None:
+    presence, _client = _presence()
+    assert presence.online() is None
+
+
+def test_mind_presence_with_no_client_is_unknown_forever_and_names_it(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+        presence = MP.MindPresence(None)
+        presence.start()
+    assert presence.online() is None
+    assert any(f"reason={MP.REASON_NO_CLIENT}" in line for line in _mp_sense_lines(caplog))
+
+
+def test_mind_presence_subscribes_the_topic_the_harness_actually_publishes() -> None:
+    _unused, client = _presence()
+    assert client.subscriptions == [(MP.MIND_STATE_TOPIC, M.QOS)]
+    assert MP.MIND_STATE_TOPIC == "nova/harness/state"
+
+
+def test_an_online_payload_reads_true_and_an_offline_payload_reads_false() -> None:
+    presence, client = _presence()
+
+    client.deliver(MP.MIND_STATE_TOPIC, '{"status":"online","ts":1.0}')
+    assert presence.online() is True
+
+    client.deliver(MP.MIND_STATE_TOPIC, '{"status":"offline","ts":2.0}')
+    assert presence.online() is False
+
+
+def test_a_bare_boolean_payload_is_understood_too() -> None:
+    """``reachy/state/online``'s shape, so the reading survives a topic move."""
+    presence, client = _presence()
+    client.deliver(MP.MIND_STATE_TOPIC, "true")
+    assert presence.online() is True
+    client.deliver(MP.MIND_STATE_TOPIC, "false")
+    assert presence.online() is False
+
+
+def test_a_message_on_another_topic_is_ignored() -> None:
+    presence, client = _presence()
+    client.deliver(MP.MIND_STATE_TOPIC, '{"status":"online"}')
+    client.deliver("reachy/state/online", "false")
+    assert presence.online() is True
+
+
+def test_a_malformed_payload_names_a_drop_and_keeps_the_last_reading(caplog) -> None:
+    presence, client = _presence()
+    client.deliver(MP.MIND_STATE_TOPIC, '{"status":"online"}')
+
+    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+        client.deliver(MP.MIND_STATE_TOPIC, "not json at all")
+
+    assert presence.online() is True
+    assert any(f"reason={MP.REASON_BAD_PAYLOAD}" in line for line in _mp_sense_lines(caplog))
+
+
+def test_a_client_missing_the_optional_members_degrades_to_unknown(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+        presence = MP.MindPresence(FakeEventsClient())  # publish-only surface
+        presence.start()
+    assert presence.online() is None
+    assert any(
+        f"reason={MP.REASON_CLIENT_INCOMPATIBLE}" in line for line in _mp_sense_lines(caplog)
+    )
+
+
+def test_a_subscribe_that_raises_never_reaches_the_caller(caplog) -> None:
+    client = SubscribingFakeClient()
+    client.raise_on_subscribe = RuntimeError("broker said no")
+    presence = MP.MindPresence(client)
+
+    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+        presence.start()  # must not raise
+
+    assert presence.online() is None
+    assert any(f"reason={MP.REASON_SUBSCRIBE_FAILED}" in line for line in _mp_sense_lines(caplog))
+
+
+def test_the_callback_never_raises_into_the_clients_thread() -> None:
+    presence, client = _presence()
+    client.deliver(MP.MIND_STATE_TOPIC, b"\xff\xfe")  # not decodable
+    client.deliver(MP.MIND_STATE_TOPIC, None)
+    assert presence.online() is None
+
+
+def test_a_bytes_payload_is_decoded_like_paho_hands_it_over() -> None:
+    presence, client = _presence()
+    client.deliver(MP.MIND_STATE_TOPIC, b'{"status":"online","ts":1.0}')
+    assert presence.online() is True
+
+
+def test_a_message_object_with_topic_and_payload_attributes_is_accepted() -> None:
+    """paho's own callback shape hands ONE message object, not two arguments."""
+    presence, client = _presence()
+
+    class _Msg:
+        topic = MP.MIND_STATE_TOPIC
+        payload = b'{"status":"offline"}'
+
+    client.message_callback(_Msg())
+    assert presence.online() is False
+
+
+def test_stop_is_idempotent_and_freezes_the_reading() -> None:
+    presence, client = _presence()
+    client.deliver(MP.MIND_STATE_TOPIC, '{"status":"online"}')
+    presence.stop()
+    presence.stop()
+    client.deliver(MP.MIND_STATE_TOPIC, '{"status":"offline"}')
+    assert presence.online() is True
+
+
+def test_mind_presence_start_is_idempotent() -> None:
+    presence, client = _presence()
+    presence.start()
+    assert client.subscriptions == [(MP.MIND_STATE_TOPIC, M.QOS)]
+
+
+def test_attach_wires_a_client_that_did_not_exist_at_construction() -> None:
+    """The deferred wiring composition uses: the publisher owns the client."""
+    presence = MP.MindPresence()
+    assert presence.online() is None
+    client = SubscribingFakeClient()
+    presence.attach(client)
+    presence.start()
+    client.deliver(MP.MIND_STATE_TOPIC, '{"status":"online"}')
+    assert presence.online() is True
+
+
+# -- the seam it exists for: a lock cannot outlive its mind ------------------ #
+
+
+def _locked_lock_driver(mind_online, root):
+    """A held face lock wired the way ``_compose_run_seam`` wires it."""
+    intents = IntentDriver(root=root)
+    driver = FL.FaceLockDriver(
+        inhibitions_getter=lambda: intents.inhibitions,
+        inhibitions_setter=intents.set_inhibitions,
+        mind_online=mind_online,
+    )
+    driver.register_into(intents.registry)
+    ctx = _LockCtx()
+    ctx.sense = _lock_face()
+    intents.registry.dispatch({"op": FL.LOCK_FACE}, ctx)
+    assert driver.locked is True
+    return driver, ctx
+
+
+def _lock_face():
+    from reachy.behavior.sense import Sense  # noqa: PLC0415
+
+    return Sense(face_bbox=(0.4, 0.4, 0.2, 0.2), face_age_s=0.0)
+
+
+class _LockCtx:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.tick = 0
+        self.sense = EMPTY_SENSE
+        self.events: list = []
+        self.evicts: list = []
+        self._active: set = set()
+
+    def emit(self, event: dict) -> None:
+        self.events.append(event)
+
+    def admit(self, behavior) -> dict:
+        self._active.add(behavior.name)
+        return {"ok": True, "op": "add", "id": behavior.id, "name": behavior.name}
+
+    def evict(self, target: str) -> dict:
+        self.evicts.append(target)
+        self._active.discard(FL.FACE_LOCK_BEHAVIOR)
+        return {"ok": True, "op": "stop", "target": target}
+
+    def active_names(self) -> set:
+        return set(self._active)
+
+
+def _drive(driver, ctx, seconds: float, *, dt: float = 0.02) -> str | None:
+    """Tick for *seconds*; return the release reason if one happened."""
+    for _ in range(int(seconds / dt)):
+        ctx.now += dt
+        ctx.tick += 1
+        ctx.sense = _lock_face()
+        driver.on_tick(ctx, ctx.now)
+        if not driver.locked:
+            released = [e for e in ctx.events if e.get("type") == FL.EVENT_LOCK_RELEASED]
+            return released[-1]["detail"]["reason"] if released else "unknown"
+    return None
+
+
+def test_an_unknown_mind_presence_never_releases_a_face_lock(tmp_path) -> None:
+    presence, _client = _presence()
+    driver, ctx = _locked_lock_driver(presence.online, tmp_path)
+    assert _drive(driver, ctx, seconds=FL.MIND_OFFLINE_GRACE_S * 3) is None
+    assert driver.locked is True
+
+
+def test_an_offline_payload_releases_the_face_lock_after_the_grace(tmp_path) -> None:
+    presence, client = _presence()
+    driver, ctx = _locked_lock_driver(presence.online, tmp_path)
+
+    client.deliver(MP.MIND_STATE_TOPIC, '{"status":"offline","ts":1.0}')
+
+    assert _drive(driver, ctx, seconds=FL.MIND_OFFLINE_GRACE_S + 2.0) == FL.REASON_MIND_OFFLINE
+
+
+def test_a_mind_that_is_online_never_releases_the_face_lock(tmp_path) -> None:
+    presence, client = _presence()
+    driver, ctx = _locked_lock_driver(presence.online, tmp_path)
+    client.deliver(MP.MIND_STATE_TOPIC, '{"status":"online","ts":1.0}')
+
+    assert _drive(driver, ctx, seconds=FL.MIND_OFFLINE_GRACE_S * 3) is None
+
+
+def test_the_composition_site_wires_the_presence_into_the_face_lock() -> None:
+    """The seam that was documented-but-dead until t17 is now actually wired.
+
+    A source-level check, like the face lock's own composition test: the wiring
+    IS the feature (a presence nobody hands to ``FaceLockDriver`` is a lock that
+    still cannot outlive its mind), and booting the real CLI would prove it far
+    more slowly and no more precisely.
+    """
+    import inspect  # noqa: PLC0415
+
+    from reachy.cli._commands import behavior as behavior_cmd  # noqa: PLC0415
+
+    source = inspect.getsource(behavior_cmd._compose_run_seam)
+    assert "mind_presence = MindPresence()" in source
+    assert "mind_online=mind_presence.online" in source
+    # ... and it borrows the publisher's ONE client rather than opening a second.
+    assert "mind_presence.attach(publisher.client)" in source
+    assert "mind_presence.start()" in source
+    assert source.index("MindPresence()") < source.index("mind_online=mind_presence.online")
