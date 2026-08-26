@@ -2179,9 +2179,10 @@ def _compose_run_seam(
 
     Act-in seams (the ONE TickBus, in driver order)
     -----------------------------------------------
-    ``[rules_driver, intent_driver, pat_driver, transcript_driver, face_driver,
-    self_motion, holder, goto_lane, availability, clip_rider]`` (with a
-    :class:`SenseSnapshotDriver` appended when exporting):
+    ``[rules_driver, intent_driver, face_lock_driver, pat_driver,
+    transcript_driver, face_driver, self_motion, holder, goto_lane,
+    availability, clip_rider]`` (with a :class:`SenseSnapshotDriver` appended
+    when exporting):
 
     * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
       decisions (admit/evict, drain the intent + goto command spools). The GOTO
@@ -2193,6 +2194,12 @@ def _compose_run_seam(
       defaults when it builds the registry itself, so GOTO is added afterward
       rather than pre-loaded into an injected (would-be-empty-of-defaults)
       registry.
+    * ``face_lock_driver`` — immediately after ``intent_driver``, because it
+      watches the lock that driver's drain may have JUST taken: one
+      ``motion.face-lost`` report per disappearance, and the two releases that
+      keep a lock from outliving its mind (``mind-offline``) or its clock
+      (``max-hold``). It only reads ``ctx.sense``/``ctx.now`` and may
+      evict/emit, so it belongs with the symbolic half of the seam.
     * ``pat_driver`` — reads THIS tick's ``ctx.pose`` (commanded head) and the
       injected reader (actual head) DIRECTLY (never via the holder), advances the
       detector, and latches a pat for the NEXT tick's sense read. It mutates no
@@ -2475,6 +2482,18 @@ def _compose_run_seam(
         # `set_inhibition` arriving while locked replaces the whole set, and the
         # lock surrenders its own additions rather than restoring a stale
         # snapshot on release.
+        #
+        # It also RIDES THE TICK (it is in `drivers` below, right after
+        # `intent_driver`, so a lock taken this tick is watched from the next
+        # one): a lock must not outlive its mind, nor be held forever. The
+        # `mind_online` seam is left at its default `None` = UNKNOWN on purpose,
+        # and unknown NEVER releases: the runtime publishes its nervous system
+        # (`reachy/events/*`, retained `reachy/state/*`) and SUBSCRIBES to
+        # nothing, so there is no live "is the harness up" reading to hand it
+        # yet. When one lands — a retained `reachy/state/nova/online` subscriber
+        # is the obvious source — wire it as `mind_online=lambda: <probe>()`
+        # HERE; `face_lock.py` needs no change. Until then `max_hold_s` (30 min)
+        # is the bound that actually binds.
         face_lock_driver = FaceLockDriver(
             inhibitions_getter=lambda: intent_driver.inhibitions,
             inhibitions_setter=intent_driver.set_inhibitions,
@@ -2499,6 +2518,7 @@ def _compose_run_seam(
             for d in (
                 rules_driver,
                 intent_driver,
+                face_lock_driver,
                 pat_driver,
                 transcript_driver,
                 face_driver,
