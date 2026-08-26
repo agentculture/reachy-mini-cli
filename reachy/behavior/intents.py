@@ -191,7 +191,7 @@ def _validated_params(entry, overrides: dict | None) -> dict[str, float]:
                 code=EXIT_USER_ERROR,
                 message=f"{entry.name}: parameter {key} must be a number (got {value!r})",
             )
-        params[key] = float(value)
+        params[key] = behavior_library.validate_param_value(entry, key, float(value))
     return params
 
 
@@ -415,6 +415,7 @@ class IntentDriver:
     def _apply_run_behavior(self, payload: dict, ctx) -> dict:
         name = payload.get("name")
         entry = self._lib.get(name)  # raises CliError naming the problem for an unknown name
+        behavior_library.refuse_if_lifecycle_owned(name, surface=RUN_BEHAVIOR)
         if name in self._inhibitions:
             return {
                 "ok": False,
@@ -453,6 +454,7 @@ class IntentDriver:
                 ctx.evict(previous["name"])
             return {"ok": True, "op": DECLARE_GOAL, "goal": None, "cleared": previous}
         entry = self._lib.get(name)  # raises CliError naming the problem for an unknown name
+        behavior_library.refuse_if_lifecycle_owned(name, surface=DECLARE_GOAL)
         params = _validated_params(entry, payload.get("params"))
         previous = self._goal
         self._goal = {"name": name, "params": params}

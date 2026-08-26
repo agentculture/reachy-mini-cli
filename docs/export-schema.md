@@ -451,7 +451,10 @@ its whole life is on the wire:
 
 `detail.reason` is one of `requested` (an explicit `release_face`),
 `mind-offline` (the mind's liveness read `false` for the whole grace period —
-nobody is left to release it), or `max-hold` (the 30-minute ceiling).
+nobody is left to release it), `max-hold` (the 30-minute ceiling), or `evicted`
+(the lock's behavior left the active set without the lock driver asking — a
+`behavior stop face-lock`, or a `stop all`; the gaze is already gone, so the
+lock state and its inhibitions follow it rather than outliving it).
 
 Example lines:
 

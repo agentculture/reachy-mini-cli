@@ -32,7 +32,11 @@ A lock is an INDEFINITE claim on the head taken on a mind's behalf, so the two
 ways it could become a wedged robot are closed in :meth:`FaceLockDriver.on_tick`:
 ``mind_online()`` reading ``False`` for ``mind_offline_grace_s`` releases it
 (``reason: "mind-offline"`` — nobody is left to call ``release_face``), and
-``max_hold_s`` releases it regardless (``reason: "max-hold"``). Losing the FACE
+``max_hold_s`` releases it regardless (``reason: "max-hold"``). A third ending
+needs no timer at all: if the behavior leaves the active set without this driver
+asking — ``behavior stop face-lock``, or a ``stop all`` from any surface — the
+gaze is already gone, so the lock state follows it (``reason: "evicted"``)
+rather than holding inhibitions for a head it no longer drives. Losing the FACE
 is deliberately NOT one of them: that is reported and the lock persists. Every
 release — including the explicit one, ``reason: "requested"`` — runs the one
 :meth:`FaceLockDriver._release` path, so no ending can undo less than another.
@@ -100,10 +104,15 @@ EVENT_LOCK_RELEASED = f"motion.{LOCK_RELEASED_ACTION}"
 FACE_LOST_ACTION = "face-lost"
 EVENT_FACE_LOST = f"motion.{FACE_LOST_ACTION}"
 
-#: The three named causes a :data:`EVENT_LOCK_RELEASED` carries in ``detail.reason``.
+#: The four named causes a :data:`EVENT_LOCK_RELEASED` carries in ``detail.reason``.
 REASON_REQUESTED = "requested"
 REASON_MIND_OFFLINE = "mind-offline"
 REASON_MAX_HOLD = "max-hold"
+#: The lock's behavior left the active set without this driver asking — a
+#: ``behavior stop face-lock`` or a ``stop all`` from any other surface. The
+#: gaze is already gone, so the LOCK STATE must follow it rather than sit there
+#: claiming a head it no longer holds (and holding inhibitions for it).
+REASON_EVICTED = "evicted"
 
 #: How long the face must be absent/stale before the ONE ``face-lost`` report.
 #: Well above vision's own TTL (:data:`MAX_FACE_AGE_S`): a dropped frame is not
@@ -460,6 +469,9 @@ class FaceLockDriver:
         if not self._locked:
             self._mind_offline_since = None
             return
+        if self._was_evicted(ctx):
+            self._release(ctx, REASON_EVICTED)
+            return
         self._watch_face(ctx, moment)
         if self._mind_is_gone(moment):
             self._release(ctx, REASON_MIND_OFFLINE)
@@ -484,6 +496,32 @@ class FaceLockDriver:
                 EVENT_FACE_LOST,
                 {"id": self._behavior_id, "absent_s": absent_s},
             )
+
+    def _was_evicted(self, ctx) -> bool:
+        """Whether the admitted behavior has left the active set behind our back.
+
+        UNKNOWN is never "gone": a ``ctx`` with no ``active_names`` (an older
+        seam, a partial test double) and a probe that raises both read as "still
+        there", because a watchdog that guesses would drop a live lock off a
+        face on any seam it does not recognise. The name — not the id — is what
+        is checked: this driver is the ONLY admitter of ``face-lock`` (a
+        ``declare_goal`` naming it is refused in
+        :mod:`reachy.behavior.intents`), so the name is unambiguous here and
+        survives an engine that re-ids on re-admission.
+        """
+        if self._behavior_id is None:
+            return False
+        active_names = getattr(ctx, "active_names", None)
+        if not callable(active_names):
+            return False
+        try:
+            names = active_names()
+        except Exception:  # a hostile ctx is UNKNOWN, never "evicted"
+            return False
+        try:
+            return FACE_LOCK_BEHAVIOR not in names
+        except TypeError:  # not a container -> UNKNOWN
+            return False
 
     def _mind_is_gone(self, now: float) -> bool:
         """Whether the mind has read offline for the WHOLE grace period."""
@@ -573,8 +611,8 @@ class FaceLockDriver:
     def _release(self, ctx, reason: str) -> tuple[str | None, list[str]]:
         """THE release, whatever asked for it: evict, restore, emit ONE event.
 
-        One path for all four reasons, so a lifecycle release can never differ
-        from an explicit one in what it undoes.
+        One path for every reason, so a lifecycle release can never differ from
+        an explicit one in what it undoes.
         """
         behavior_id = self._behavior_id
         self._locked = False
@@ -663,6 +701,7 @@ __all__ = [
     "MAX_YAW_DEG",
     "MIND_OFFLINE_GRACE_S",
     "PITCH_GAIN_DEG",
+    "REASON_EVICTED",
     "REASON_MAX_HOLD",
     "REASON_MIND_OFFLINE",
     "REASON_REQUESTED",

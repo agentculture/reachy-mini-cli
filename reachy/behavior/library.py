@@ -58,11 +58,21 @@ ContribFn = Callable[[float, dict, Sense], Contribution]
 
 @dataclass(frozen=True)
 class Param:
-    """One tunable knob of a behavior: its default value, unit, and help text."""
+    """One tunable knob of a behavior: its default value, unit, and help text.
+
+    ``minimum``/``maximum`` are the knob's DOMAIN, checked by
+    :func:`validate_param_value` on every surface that accepts an override (the
+    CLI's ``--set``, an intent's ``params`` object). ``None`` means unbounded on
+    that side — the right answer for a signed offset (``pitch``, ``roll``,
+    ``z``), and the wrong one for a magnitude: a negative clamp does not clamp,
+    it forces the opposite angle.
+    """
 
     default: float
     unit: str
     help: str
+    minimum: float | None = None
+    maximum: float | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +110,43 @@ class LibraryEntry:
                 remediation="this is a library bug — report it",
             )
         return self.fn
+
+
+#: Library entries whose LIFETIME is owned by a dedicated intent kind, mapped to
+#: the kind that owns it. Such an entry is a real, buildable behavior — it is
+#: simply not admissible from the GENERIC surfaces (``declare_goal``,
+#: ``run_behavior``, a react rule's ``run``), because those admit it without the
+#: state the kind carries.
+#:
+#: ``face-lock`` is the one entry here. ``declare_goal`` gives every goal a
+#: standing, indefinite lifetime, so a goal-declared lock would be exactly the
+#: unmanaged gaze :mod:`reachy.behavior.face_lock` exists to prevent: no
+#: fresh-face check, no inhibitions, no mind presence, no max hold, and a
+#: ``release_face`` answering ``not locked``. ``run_behavior`` and a react rule
+#: are bounded and so cannot strand a claim, but they would put a SECOND
+#: behavior of that name on the active set — which is what the lock driver's
+#: eviction watchdog reads to decide its own lock is gone. One admitter, one
+#: name.
+LIFECYCLE_OWNED: dict[str, str] = {"face-lock": "lock_face"}
+
+
+def refuse_if_lifecycle_owned(name: str, *, surface: str) -> None:
+    """Raise if *name* may only be admitted by its owning intent kind.
+
+    Called by every generic admission surface (see :data:`LIFECYCLE_OWNED`).
+    The owning kind builds its behavior itself and never calls this.
+    """
+    owner = LIFECYCLE_OWNED.get(name)
+    if owner is None:
+        return
+    raise CliError(
+        code=EXIT_USER_ERROR,
+        message=f"{surface}: {name!r} is owned by the {owner!r} intent kind",
+        remediation=(
+            f"use {owner!r} (and its release) instead — it owns the lock state, "
+            "the inhibitions and the release conditions this surface cannot"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -251,19 +298,31 @@ LIBRARY: dict[str, LibraryEntry] = {
         looping=True,
         default_duration=None,
         params={
-            "max_yaw": Param(face_lock_mod.MAX_YAW_DEG, "deg", "head yaw clamp"),
-            "max_pitch": Param(face_lock_mod.MAX_PITCH_DEG, "deg", "head pitch clamp"),
+            "max_yaw": Param(face_lock_mod.MAX_YAW_DEG, "deg", "head yaw clamp", minimum=0.0),
+            "max_pitch": Param(face_lock_mod.MAX_PITCH_DEG, "deg", "head pitch clamp", minimum=0.0),
             "yaw_gain": Param(
-                face_lock_mod.YAW_GAIN_DEG, "deg", "yaw for a face at the frame edge (pre-clamp)"
+                face_lock_mod.YAW_GAIN_DEG,
+                "deg",
+                "yaw for a face at the frame edge (pre-clamp)",
+                minimum=0.0,
             ),
             "pitch_gain": Param(
                 face_lock_mod.PITCH_GAIN_DEG,
                 "deg",
                 "pitch for a face at the frame edge (pre-clamp)",
+                minimum=0.0,
             ),
-            "slew": Param(face_lock_mod.SLEW_DEG_S, "deg/s", "how fast the gaze chases the face"),
+            "slew": Param(
+                face_lock_mod.SLEW_DEG_S,
+                "deg/s",
+                "how fast the gaze chases the face",
+                minimum=0.0,
+            ),
             "max_age": Param(
-                face_lock_mod.MAX_FACE_AGE_S, "s", "ignore a face position older than this"
+                face_lock_mod.MAX_FACE_AGE_S,
+                "s",
+                "ignore a face position older than this",
+                minimum=0.0,
             ),
         },
         make_fn=face_lock_mod.make_face_lock,
@@ -365,10 +424,15 @@ LIBRARY: dict[str, LibraryEntry] = {
         default_duration=DEFAULT_DURATION_S,
         params={
             "max_age_s": Param(
-                DEFAULT_MAX_AGE_S, "s", "a DoA reading older than this refuses admission"
+                DEFAULT_MAX_AGE_S,
+                "s",
+                "a DoA reading older than this refuses admission",
+                minimum=0.0,
             ),
-            "max_yaw": Param(DEFAULT_MAX_YAW, "deg", "head yaw clamp"),
-            "ease_s": Param(DEFAULT_EASE_S, "s", "how long the turn takes before it holds"),
+            "max_yaw": Param(DEFAULT_MAX_YAW, "deg", "head yaw clamp", minimum=0.0),
+            "ease_s": Param(
+                DEFAULT_EASE_S, "s", "how long the turn takes before it holds", minimum=0.0
+            ),
             "pitch": Param(0.0, "deg", "vertical look angle"),
             "roll": Param(0.0, "deg", "head roll"),
             "z": Param(0.0, "mm", "head height offset"),
@@ -387,11 +451,16 @@ LIBRARY: dict[str, LibraryEntry] = {
         default_duration=DEFAULT_DURATION_S_FACE,
         params={
             "max_age_s": Param(
-                DEFAULT_MAX_AGE_S_FACE, "s", "a face bbox older than this refuses admission"
+                DEFAULT_MAX_AGE_S_FACE,
+                "s",
+                "a face bbox older than this refuses admission",
+                minimum=0.0,
             ),
-            "max_yaw": Param(DEFAULT_MAX_YAW_FACE, "deg", "head yaw clamp"),
-            "max_pitch": Param(DEFAULT_MAX_PITCH_FACE, "deg", "head pitch clamp"),
-            "ease_s": Param(DEFAULT_EASE_S, "s", "how long the turn takes before it holds"),
+            "max_yaw": Param(DEFAULT_MAX_YAW_FACE, "deg", "head yaw clamp", minimum=0.0),
+            "max_pitch": Param(DEFAULT_MAX_PITCH_FACE, "deg", "head pitch clamp", minimum=0.0),
+            "ease_s": Param(
+                DEFAULT_EASE_S, "s", "how long the turn takes before it holds", minimum=0.0
+            ),
             "roll": Param(0.0, "deg", "head roll"),
             "z": Param(0.0, "mm", "head height offset"),
         },
@@ -501,6 +570,42 @@ def get(name: str) -> LibraryEntry:
     return entry
 
 
+def validate_param_value(entry: LibraryEntry, key: str, value: float) -> float:
+    """The ONE domain check every param surface shares. Returns *value*.
+
+    Rejects a non-finite value on every knob, and anything outside the
+    :class:`Param`'s declared domain. Both matter for the same reason: the type
+    check these surfaces already do ("is it a number?") passes ``NaN`` and
+    ``inf`` (stdlib ``json`` decodes both from a bare literal), and a ``NaN``
+    threshold does not compare false-safe — ``age > NaN`` is ``False``, so a
+    NaN freshness limit certifies ANY reading fresh, and a NaN clamp propagates
+    straight into the streamed head pose.
+    """
+    number = float(value)
+    if not math.isfinite(number):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"{entry.name}: parameter {key} must be finite (got {number!r})",
+            remediation="pass a real number — NaN and infinity are not thresholds",
+        )
+    param = entry.params.get(key)
+    if param is None:
+        return number
+    if param.minimum is not None and number < param.minimum:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"{entry.name}: parameter {key} must be >= {param.minimum} (got {number})",
+            remediation=f"{key} is a {param.unit} magnitude, not a signed offset",
+        )
+    if param.maximum is not None and number > param.maximum:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"{entry.name}: parameter {key} must be <= {param.maximum} (got {number})",
+            remediation=f"choose a {key} within the entry's declared range",
+        )
+    return number
+
+
 def resolve_params(entry: LibraryEntry, overrides: dict[str, str] | None) -> dict[str, float]:
     """Merge ``key=value`` string overrides onto the entry defaults, validating.
 
@@ -516,7 +621,7 @@ def resolve_params(entry: LibraryEntry, overrides: dict[str, str] | None) -> dic
                 remediation=f"valid params: {', '.join(entry.params) or '(none)'}",
             )
         try:
-            params[key] = float(raw)
+            params[key] = validate_param_value(entry, key, float(raw))
         except ValueError as err:
             raise CliError(
                 code=EXIT_USER_ERROR,

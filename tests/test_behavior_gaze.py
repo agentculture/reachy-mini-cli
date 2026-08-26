@@ -32,6 +32,7 @@ from reachy.behavior.intents import INTENT_NAMESPACE, RUN_BEHAVIOR, IntentDriver
 from reachy.behavior.library import LIBRARY
 from reachy.behavior.rules import load_shipped_rules
 from reachy.behavior.sense import EMPTY_SENSE, DoaPoller, Sense, doa_angle_to_yaw
+from reachy.cli._errors import CliError
 
 # --------------------------------------------------------------------------- #
 # Harness                                                                     #
@@ -496,3 +497,84 @@ def test_look_at_face_default_class_is_stoppable() -> None:
 
 def test_both_gaze_one_shot_names_present_in_library() -> None:
     assert {"look-at-sound", "look-at-face"} <= set(LIBRARY)
+
+
+# --------------------------------------------------------------------------- #
+# Domain validation: NaN / inf / negative overrides (PR #172 review)           #
+# --------------------------------------------------------------------------- #
+
+
+def _refusal(tmp_path, *, name: str, params: dict) -> dict:
+    cmd_id = _submit(tmp_path, name=name, params=params, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=Sense(doa_angle=0.4, doa_age_s=9.0))
+    driver.on_tick(ctx)
+    assert ctx.admits == []
+    return control_mod.await_result(cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2)
+
+
+def test_a_nan_max_age_is_refused_rather_than_admitting_arbitrarily_stale_data(tmp_path) -> None:
+    """`age > NaN` is False, so a NaN freshness limit certifies ANY reading fresh.
+
+    stdlib `json` decodes a bare `NaN`, so this reaches the planners from the
+    intents spool — the type check ("is it a number?") passes it through.
+    """
+    result = _refusal(tmp_path, name="look-at-sound", params={"max_age_s": float("nan")})
+
+    assert result["ok"] is False
+    assert "max_age_s" in result["error"]
+    assert "finite" in result["error"]
+
+
+def test_an_infinite_max_age_is_refused_too(tmp_path) -> None:
+    result = _refusal(tmp_path, name="look-at-sound", params={"max_age_s": float("inf")})
+    assert result["ok"] is False
+    assert "max_age_s" in result["error"]
+
+
+def test_a_negative_clamp_is_refused_rather_than_inverting_the_target(tmp_path) -> None:
+    """`_clamp(v, -5)` returns `+5`: a negative clamp forces the WRONG angle."""
+    result = _refusal(tmp_path, name="look-at-sound", params={"max_yaw": -5.0})
+
+    assert result["ok"] is False
+    assert "max_yaw" in result["error"]
+
+
+def test_a_nan_clamp_never_reaches_the_head_contribution(tmp_path) -> None:
+    result = _refusal(tmp_path, name="look-at-face", params={"max_pitch": float("nan")})
+    assert result["ok"] is False
+    assert "max_pitch" in result["error"]
+
+
+def test_a_valid_override_is_still_accepted(tmp_path) -> None:
+    cmd_id = _submit(tmp_path, name="look-at-sound", params={"max_age_s": 2.0}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1, sense=Sense(doa_angle=math.pi / 4.0, doa_age_s=0.5))
+
+    driver.on_tick(ctx)
+
+    assert len(ctx.admits) == 1
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is True
+
+
+def test_the_cli_set_path_refuses_a_non_finite_value_too() -> None:
+    """`float("nan")` parses cleanly, so the string path needs the same guard."""
+    entry = LIBRARY["look-at-sound"]
+
+    with pytest.raises(CliError) as excinfo:
+        behavior_library.resolve_params(entry, {"max_age_s": "nan"})
+
+    assert "finite" in str(excinfo.value.message)
+
+
+def test_every_gaze_and_lock_clamp_declares_its_domain() -> None:
+    """The bounds live on the Param, so one validator serves every surface."""
+    for name in ("look-at-sound", "look-at-face", "face-lock"):
+        entry = LIBRARY[name]
+        for key, param in entry.params.items():
+            if key in {"pitch", "roll", "z"}:
+                continue  # signed by nature: an offset, not a magnitude
+            assert param.minimum == 0.0, f"{name}.{key} declares no lower bound"

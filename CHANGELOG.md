@@ -23,6 +23,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `FaceSenseDriver` keeps the bbox of unmatched faces (position before the
   store match); `FaceEngine.detect_all`.
+- **`face-lock` is admissible only through `lock_face`** — `declare_goal`,
+  `run_behavior` and a react rule's `run` all refuse it by name
+  (`library.LIFECYCLE_OWNED`). A goal-declared lock was a standing, indefinite
+  gaze with no fresh-face check, no inhibitions, no mind presence and no max
+  hold, which `release_face` then answered `not locked`.
+- **Behavior params declare a domain** (`Param.minimum` / `Param.maximum`,
+  checked by the one `library.validate_param_value` both override surfaces
+  call): a non-finite value is refused everywhere, and every gaze/lock clamp
+  and freshness limit is now a declared non-negative magnitude. `age > NaN` is
+  `False`, so a `NaN` `max_age_s` certified any reading fresh, and a negative
+  clamp forced the opposite angle.
+
+### Fixed
+
+- **An externally evicted face lock releases itself** (`reason: "evicted"`, the
+  fourth named ending). `behavior stop face-lock` / `stop all` removed the gaze
+  while the driver stayed `locked` with its inhibitions installed, so
+  `lock_face` answered `already locked` and `feel-alive` / `orient-to-sound`
+  stayed inhibited until the 30-minute watchdog.
+- **`MindPresence` no longer reports a subscription the bus cannot carry.**
+  `EventsCliClient` always defines `subscribe`/`set_on_message`, so the member
+  probe passed over the publish-only `events_cli.EventClient` shipped today and
+  presence logged `watching nova/harness/state for the mind` while nothing was
+  ever delivered. The adapter now answers `supports_subscribe()` about the
+  VENDOR, and a client that cannot subscribe is one named `client-incompatible`
+  drop.
 
 ## [0.50.0] - 2026-08-24
 

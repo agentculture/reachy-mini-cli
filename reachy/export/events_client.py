@@ -202,6 +202,33 @@ class EventsCliClient:
 
     # -- the OPTIONAL subscribe half (t17) -----------------------------------
 
+    def supports_subscribe(self) -> bool:
+        """Whether the WRAPPED vendor can actually take a subscription.
+
+        This adapter always DEFINES :meth:`subscribe` and
+        :meth:`set_on_message`, so a probe of its own attributes (what
+        :func:`reachy.export.mqtt.missing_client_members` does, and what
+        :class:`reachy.export.mind_presence.MindPresence` used to rely on)
+        answers "yes" for every vendor, including the publish-only one shipped
+        today. A consumer that needs an INBOUND path must ask this instead —
+        otherwise it reports a live subscription while :meth:`subscribe`
+        quietly returns, and the mind's state reads unknown forever with no
+        drop naming why.
+
+        Answerable before :meth:`connect`: with no client built yet the vendor
+        CLASS is probed, so ordering never decides the answer. An unimportable
+        vendor is ``False`` — there is nothing to subscribe through.
+        """
+        target: Any | None = self._client
+        if target is None:
+            target = self._factory if self._factory is not None else _resolve_vendor()
+        if target is None:
+            return False
+        try:
+            return callable(getattr(target, "subscribe", None))
+        except Exception:  # a sick accessor is no capability
+            return False
+
     def subscribe(self, topic: str, *, qos: int = 0) -> None:
         """Subscribe *topic* on the vendor client. Total: never raises here.
 
@@ -217,6 +244,8 @@ class EventsCliClient:
             return
         subscribe = getattr(client, "subscribe", None)
         if not callable(subscribe):
+            # Reachable only for a caller that did not ask `supports_subscribe`
+            # first; the one that matters (MindPresence) does.
             logger.debug("events: the bus client exposes no subscribe(); %s unread", topic)
             return
         try:

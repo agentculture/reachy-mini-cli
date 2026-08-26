@@ -296,3 +296,110 @@ def test_a_publisher_on_a_dead_broker_degrades_to_one_named_drop(caplog):
     publisher.stop()
     assert M.REASON_BROKER_UNREACHABLE in caplog.text
     assert M.REASON_CLIENT_INCOMPATIBLE not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# The adapter must not ADVERTISE a capability the vendor does not have         #
+# (PR #172 review)                                                             #
+# --------------------------------------------------------------------------- #
+
+
+class _PublishOnlyVendor:
+    """The vendor as it actually ships today: publish, connect, close. No more."""
+
+    def __init__(self, host, port, *, connect=False, **kwargs) -> None:
+        self.host, self.port = host, port
+        self.is_connected = False
+        self.published: list[tuple] = []
+
+    def publish(self, topic, payload, qos=0, retain=False):
+        self.published.append((topic, payload, qos, retain))
+        return type("R", (), {"ok": True})()
+
+    def close(self) -> None:
+        self.is_connected = False
+
+
+class _SubscribingVendor(_PublishOnlyVendor):
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        self.subscriptions: list[tuple] = []
+        self.on_message = None
+
+    def subscribe(self, topic, qos=0):
+        self.subscriptions.append((topic, qos))
+
+
+def test_the_installed_vendor_client_still_has_no_subscribe_capability():
+    """The live canary, restated where the adapter can act on it.
+
+    ``events_cli.EventClient`` ships publish/connect/close only. The day
+    upstream adds ``subscribe`` this test starts failing — and the adapter
+    below should then start reporting the capability as PRESENT.
+    """
+    vendor = pytest.importorskip("events_cli")
+    assert not hasattr(vendor.EventClient, "subscribe")
+
+
+def test_an_adapter_over_a_publish_only_vendor_reports_no_subscribe_support():
+    adapter = EC.EventsCliClient("127.0.0.1:1", factory=_PublishOnlyVendor)
+    adapter.connect()
+    try:
+        assert adapter.supports_subscribe() is False
+    finally:
+        adapter.disconnect()
+
+
+def test_an_adapter_over_a_subscribing_vendor_reports_support():
+    adapter = EC.EventsCliClient("127.0.0.1:1", factory=_SubscribingVendor)
+    adapter.connect()
+    try:
+        assert adapter.supports_subscribe() is True
+    finally:
+        adapter.disconnect()
+
+
+def test_capability_is_read_from_the_class_before_the_client_is_built():
+    """`MindPresence.start()` must get a truthful answer whenever it asks."""
+    assert EC.EventsCliClient("h:1", factory=_PublishOnlyVendor).supports_subscribe() is False
+    assert EC.EventsCliClient("h:1", factory=_SubscribingVendor).supports_subscribe() is True
+
+
+def test_mind_presence_over_a_publish_only_vendor_names_client_incompatible(caplog):
+    """The whole point: no inbound path must never look like a live subscription.
+
+    The adapter always DEFINES `subscribe`/`set_on_message`, so a probe of the
+    adapter's own attributes passes while the vendor underneath has nowhere to
+    put the subscription. Presence then reported success, logged "watching
+    ... for the mind", and read UNKNOWN forever with no drop naming why — which
+    is exactly the invisible degradation the drop vocabulary exists to prevent.
+    """
+    from reachy.export import mind_presence as MP
+
+    adapter = EC.EventsCliClient("127.0.0.1:1", factory=_PublishOnlyVendor)
+    adapter.connect()
+    presence = MP.MindPresence(adapter)
+
+    with caplog.at_level("INFO"):
+        started = presence.start()
+
+    try:
+        assert started is False
+        assert presence.subscribed is False
+        assert presence.online() is None
+        assert MP.REASON_CLIENT_INCOMPATIBLE in caplog.text
+    finally:
+        adapter.disconnect()
+
+
+def test_mind_presence_over_a_subscribing_vendor_still_subscribes():
+    from reachy.export import mind_presence as MP
+
+    adapter = EC.EventsCliClient("127.0.0.1:1", factory=_SubscribingVendor)
+    adapter.connect()
+    presence = MP.MindPresence(adapter)
+    try:
+        assert presence.start() is True
+        assert adapter._client.subscriptions == [(MP.MIND_STATE_TOPIC, M.QOS)]
+    finally:
+        adapter.disconnect()

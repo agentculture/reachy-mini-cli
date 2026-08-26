@@ -43,15 +43,22 @@ from reachy.behavior.face_lock import (
     LOCK_INHIBITS,
     LOCK_RELEASED_ACTION,
     MAX_FACE_AGE_S,
+    REASON_EVICTED,
     REASON_MAX_HOLD,
     REASON_MIND_OFFLINE,
     REASON_REQUESTED,
     RELEASE_FACE,
     FaceLockDriver,
 )
-from reachy.behavior.intents import SET_INHIBITION, IntentDriver
+from reachy.behavior.intents import (
+    DECLARE_GOAL,
+    RUN_BEHAVIOR,
+    SET_INHIBITION,
+    IntentDriver,
+)
 from reachy.behavior.sense import EMPTY_SENSE, Sense
 from reachy.cli._commands import behavior as behavior_cmd
+from reachy.cli._errors import CliError
 from reachy.export.runtime import MotionEvent, to_runtime_event
 
 # --------------------------------------------------------------------------- #
@@ -427,3 +434,163 @@ def test_the_composition_site_rides_the_lock_driver_on_the_tick_bus() -> None:
     assert "face_lock_driver" in drivers_block
     # ... and it is constructed there too, with the mind seam left explicit.
     assert "FaceLockDriver(" in head
+
+
+# --------------------------------------------------------------------------- #
+# 4. An externally EVICTED lock is not a locked lock (PR #172 review)          #
+# --------------------------------------------------------------------------- #
+
+
+def test_an_external_stop_of_the_behavior_releases_the_lock_state() -> None:
+    """``behavior stop face-lock`` removes the gaze; the state must follow it.
+
+    The driver watched face, mind and clock only, so an eviction it did not ask
+    for left ``locked`` true and the inhibitions installed: the head was free
+    again while ``lock_face`` still answered ``already locked`` and
+    ``feel-alive``/``orient-to-sound`` stayed inhibited until the 30-minute
+    watchdog. Eviction is a fourth ending, and it runs the SAME release path.
+    """
+    driver, registry, intents = _wire()
+    ctx = _RecordingCtx(sense=_face())
+    _lock(registry, ctx)
+    assert driver.locked is True
+    assert set(LOCK_INHIBITS) <= set(intents.inhibitions)
+
+    # Somebody else stopped it — `behavior stop face-lock`, or `stop all`.
+    ctx._active.discard(FACE_LOCK_BEHAVIOR)
+
+    _tick(driver, ctx, now=1.0)
+
+    assert driver.locked is False
+    assert set(LOCK_INHIBITS) & set(intents.inhibitions) == set()
+    released = _events(ctx, EVENT_LOCK_RELEASED)
+    assert len(released) == 1
+    assert released[0]["detail"]["reason"] == REASON_EVICTED
+
+
+def test_a_re_lock_after_an_eviction_is_admitted_not_answered_already_locked() -> None:
+    driver, registry, _ = _wire()
+    ctx = _RecordingCtx(sense=_face())
+    _lock(registry, ctx)
+    ctx._active.discard(FACE_LOCK_BEHAVIOR)
+    _tick(driver, ctx, now=1.0)
+
+    again = _lock(registry, ctx)
+
+    assert again["ok"] is True
+    assert again.get("note") != "already locked"
+    assert len(ctx.admits) == 2
+
+
+def test_an_evicted_release_emits_exactly_one_event_not_one_per_tick() -> None:
+    driver, registry, _ = _wire()
+    ctx = _RecordingCtx(sense=_face())
+    _lock(registry, ctx)
+    ctx._active.discard(FACE_LOCK_BEHAVIOR)
+
+    for tick, now in enumerate((1.0, 1.02, 1.04, 1.06), start=1):
+        _tick(driver, ctx, now=now)
+
+    assert len(_events(ctx, EVENT_LOCK_RELEASED)) == 1
+
+
+def test_a_ctx_without_active_names_never_releases_the_lock() -> None:
+    """Total, like every other seam here: an absent probe is UNKNOWN, not gone."""
+
+    @dataclass
+    class _NoNamesCtx(_RecordingCtx):
+        active_names = None  # type: ignore[assignment]
+
+    driver, registry, _ = _wire()
+    ctx = _NoNamesCtx(sense=_face())
+    _lock(registry, ctx)
+
+    _tick(driver, ctx, now=1.0)
+
+    assert driver.locked is True
+
+
+def test_eviction_is_a_named_reason_on_the_lock_released_event() -> None:
+    assert REASON_EVICTED == "evicted"
+
+
+# --------------------------------------------------------------------------- #
+# 5. Only `lock_face` may admit `face-lock` (PR #172 review)                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_declare_goal_refuses_the_lifecycle_owned_face_lock() -> None:
+    """A goal is INDEFINITE by construction — exactly what the lock kind owns.
+
+    ``_apply_declare_goal`` accepts any library entry and gives it a standing,
+    unbounded lifetime with no fresh-face check, no inhibitions, no mind
+    presence and no max-hold; ``release_face`` then answers ``not locked``. That
+    is the unmanaged standing gaze ``lock_face`` exists to prevent, reachable
+    from the public intent surface.
+    """
+    _driver, registry, _ = _wire()
+    ctx = _RecordingCtx(sense=_face())
+
+    result = registry.dispatch({"op": DECLARE_GOAL, "goal": FACE_LOCK_BEHAVIOR}, ctx)
+
+    assert result["ok"] is False
+    assert LOCK_FACE in result["error"]
+    assert ctx.admits == []
+
+
+def test_run_behavior_refuses_the_lifecycle_owned_face_lock() -> None:
+    """The same refusal on the bounded surface, so ONE admitter owns the name.
+
+    A bounded ``run_behavior face-lock`` would not strand a standing claim, but
+    it would put a SECOND behavior of that name on the active set — which is
+    what the driver's eviction watchdog reads to decide the lock is gone.
+    """
+    _driver, registry, _ = _wire()
+    ctx = _RecordingCtx(sense=_face())
+
+    result = registry.dispatch(
+        {
+            "op": RUN_BEHAVIOR,
+            "name": FACE_LOCK_BEHAVIOR,
+            "lifetime": {"looping": True, "duration": 5.0},
+        },
+        ctx,
+    )
+
+    assert result["ok"] is False
+    assert LOCK_FACE in result["error"]
+    assert ctx.admits == []
+
+
+def test_a_react_rule_naming_face_lock_is_refused_at_load() -> None:
+    """Fail-closed at LOAD, like the unbounded-lifetime refusal beside it."""
+    from reachy.behavior.rules import RulesConfig
+
+    with pytest.raises(CliError) as excinfo:
+        RulesConfig.from_dict(
+            {
+                "react": [
+                    {
+                        "id": "sneak-a-lock",
+                        "when": [{"field": "face", "op": "present"}],
+                        "run": FACE_LOCK_BEHAVIOR,
+                        "duration_s": 5.0,
+                    }
+                ]
+            }
+        )
+
+    assert FACE_LOCK_BEHAVIOR in str(excinfo.value.message)
+    assert LOCK_FACE in str(excinfo.value.remediation)
+
+
+def test_the_lock_kind_itself_still_admits_the_entry() -> None:
+    """The refusal is about the GENERIC surfaces, not the entry being unusable."""
+    driver, registry, _ = _wire()
+    ctx = _RecordingCtx(sense=_face())
+
+    result = _lock(registry, ctx)
+
+    assert result["ok"] is True
+    assert driver.locked is True
+    assert [b.name for b in ctx.admits] == [FACE_LOCK_BEHAVIOR]

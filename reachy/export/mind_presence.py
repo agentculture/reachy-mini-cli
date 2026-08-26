@@ -95,6 +95,24 @@ def _missing_members(client: object) -> tuple[str, ...]:
     return tuple(missing)
 
 
+def _vendor_can_subscribe(client: object) -> bool:
+    """Whether *client* reports a usable inbound path. Unasked means UNKNOWN=yes.
+
+    A client with no ``supports_subscribe`` is taken at face value (every test
+    double here, and any future client that implements the surface directly);
+    only an explicit ``False`` — an adapter reporting on its vendor — disables.
+    A raising probe is treated the same as an absent one: this must never turn
+    a working bus into a disabled one.
+    """
+    probe = getattr(client, "supports_subscribe", None)
+    if not callable(probe):
+        return True
+    try:
+        return bool(probe())
+    except Exception:
+        return True
+
+
 def parse_presence(payload: object) -> bool | None:
     """Read one retained payload as ``True`` / ``False`` / ``None`` (unreadable).
 
@@ -216,6 +234,16 @@ class MindPresence:
         missing = _missing_members(self._client)
         if missing:
             self._disable(REASON_CLIENT_INCOMPATIBLE, f"missing={','.join(missing)}")
+            return False
+
+        if not _vendor_can_subscribe(self._client):
+            # The client that reaches here in production is
+            # `reachy.export.events_client.EventsCliClient`, an ADAPTER: it
+            # always defines `subscribe`/`set_on_message`, so the member probe
+            # above passes even over the publish-only vendor shipped today. Ask
+            # the adapter what the vendor underneath can do, or this reports a
+            # live subscription over a pipe with no inbound half.
+            self._disable(REASON_CLIENT_INCOMPATIBLE, "the bus client cannot subscribe")
             return False
 
         try:
