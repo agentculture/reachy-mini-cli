@@ -290,6 +290,63 @@ def test_an_operator_name_beside_the_locks_additions_still_survives_release() ->
     assert result["inhibitions"] == ["nod"]
 
 
+def test_a_replacement_reclaims_a_lock_name_the_operator_already_held() -> None:
+    """Ownership is RECOMPUTED per replacement, not frozen at acquisition.
+
+    ``feel-alive`` was operator-inhibited BEFORE the lock, so the lock never
+    "added" it. A later replacement that drops it would, with an acquisition-time
+    ownership set, leave the presence loop free to drag the head off the face
+    while the lock is still held — the lock's core invariant broken. The lock
+    reclaims it instead, and gives it back on release.
+    """
+    intents = IntentDriver()
+    _driver, registry = _wire(intents)
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["feel-alive"]}, ctx)
+    registry.dispatch({"op": LOCK_FACE}, ctx)
+
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["nod"]}, ctx)
+    assert frozenset(LOCK_INHIBITS) <= intents.inhibitions
+    assert intents.inhibitions == frozenset({"nod", *LOCK_INHIBITS})
+
+    result = registry.dispatch({"op": RELEASE_FACE}, ctx)
+    assert intents.inhibitions == frozenset({"nod"})
+    assert result["inhibitions"] == ["nod"]
+
+
+def test_a_replacement_keeping_only_some_lock_names_hands_those_to_the_caller() -> None:
+    """Keeping SOME of the lock's names is a deliberate choice, not an echo."""
+    intents = IntentDriver()
+    _driver, registry = _wire(intents)
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch({"op": LOCK_FACE}, ctx)
+
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["feel-alive"]}, ctx)
+    assert intents.inhibitions == frozenset(LOCK_INHIBITS)
+
+    result = registry.dispatch({"op": RELEASE_FACE}, ctx)
+    assert intents.inhibitions == frozenset({"feel-alive"})
+    assert result["inhibitions"] == ["feel-alive"]
+
+
+def test_the_live_set_stays_lock_complete_across_successive_replacements() -> None:
+    """Every replacement while locked leaves the live set ``new | LOCK_INHIBITS``."""
+    intents = IntentDriver()
+    _driver, registry = _wire(intents)
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["orient-to-sound"]}, ctx)
+    registry.dispatch({"op": LOCK_FACE}, ctx)
+
+    for names in (["nod"], ["speak", "feel-alive"], []):
+        registry.dispatch({"op": SET_INHIBITION, "behaviors": list(names)}, ctx)
+        assert frozenset(LOCK_INHIBITS) <= intents.inhibitions
+        assert intents.inhibitions == frozenset(names) | frozenset(LOCK_INHIBITS)
+
+    result = registry.dispatch({"op": RELEASE_FACE}, ctx)
+    assert intents.inhibitions == frozenset()
+    assert result["inhibitions"] == []
+
+
 # --------------------------------------------------------------------------- #
 # 3. release_face                                                             #
 # --------------------------------------------------------------------------- #
