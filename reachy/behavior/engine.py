@@ -278,9 +278,13 @@ class Engine:
     def _add_base(self, params: dict[str, float], now: float, channels: list[str] | None) -> dict:
         """Re-seed the base layer from an unbounded ``add``; a no-op while one is active.
 
-        ``channels`` is deliberately ignored: the base layer's claim is the
-        library entry's, and a re-seed that claimed something else would not be
-        the base layer any more.
+        ``channels`` AND ``params`` are deliberately ignored: the base layer's
+        claim and tuning are the engine's own (the library entry's defaults at
+        the energy the run was configured with), and a re-seed that claimed or
+        tuned something else would not be the base layer any more. This matters
+        because the CLI's ``behavior run`` fills EVERY library default into the
+        payload, so honouring ``params`` would reset a runtime started with
+        ``--energy 0.4`` back to ``energy=1.0`` on every un-stop.
         """
         for active in self.active:
             if active.is_base:
@@ -290,7 +294,6 @@ class Engine:
         entry = library.get(BASE_LAYER_NAME)
         merged = entry.default_params()
         merged["energy"] = self._base_energy
-        merged.update(params or {})
         base_id = self._seed_base(now, merged)
         beh = self.active[-1].behavior
         senselog.stage(

@@ -303,6 +303,24 @@ def test_an_unbounded_add_of_feel_alive_re_seeds_the_base_proper():
     }
 
 
+def test_the_un_stop_add_ignores_caller_params_and_keeps_the_engine_energy():
+    """The CLI fills every library default into an add payload (energy=1.0
+    included); the base re-seed must restore the run's configured energy."""
+    engine = _seeded_engine(energy=0.4)
+    engine.stop(BASE_LAYER_NAME)
+    entry_defaults = {"energy": 1.0, "breathe_z": 99.0}
+    engine.add(
+        BASE_LAYER_NAME,
+        entry_defaults,
+        StopClass.PASSIVE,
+        Lifetime(looping=True, duration=None),
+        3.0,
+    )
+    base = _base_actives(engine)[0].behavior
+    assert base.params["energy"] == pytest.approx(0.4)
+    assert base.params["breathe_z"] != 99.0
+
+
 def test_an_unbounded_add_of_feel_alive_while_a_base_is_active_is_a_noted_no_op():
     engine = _seeded_engine()
     existing = engine.active[0].behavior.id
