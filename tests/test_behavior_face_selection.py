@@ -15,10 +15,11 @@ These tests pin the two acceptance criteria:
    ago that detection landed. An unmatched detection still yields a bbox while
    ``Sense.face`` stays ``None`` — the name cue keeps its "named, matched face
    only" contract untouched.
-2. **Selection is explicit.** With several faces in one frame the biggest wins;
-   when two are within :data:`~reachy.behavior.face_sense.AREA_TIE_RATIO` of
-   each other in area, a recognised face beats an unknown one. The rule lives
-   in the pure :func:`~reachy.behavior.face_sense.select_face`, so it is
+2. **Selection is explicit.** (t16, issue #175) A recognised face wins over
+   any unrecognised face regardless of size; among faces sharing the same
+   recognition status, the biggest wins. A single unknown face still yields a
+   bbox — see issue #127 on the name-latch vs position distinction. The rule
+   lives in the pure :func:`~reachy.behavior.face_sense.select_face`, so it is
    unit-tested over plain candidate lists as well as through the driver.
 
 Everything here runs WITHOUT the ``[vision]`` extra — same discipline as
@@ -30,12 +31,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from reachy.behavior.face_sense import (
-    AREA_TIE_RATIO,
-    FaceCandidate,
-    FaceSenseDriver,
-    select_face,
-)
+from reachy.behavior.face_sense import FaceCandidate, FaceSenseDriver, select_face
 from reachy.behavior.sense import EMPTY_SENSE, Sense, SenseProviders, read_perception
 
 # --------------------------------------------------------------------------- #
@@ -291,21 +287,20 @@ def test_select_face_over_an_empty_list_is_no_reading() -> None:
     assert select_face([]) is None
 
 
-def test_the_biggest_face_wins_when_the_gap_is_wide() -> None:
-    """A larger UNKNOWN face beats a much smaller KNOWN one."""
+def test_a_smaller_recognised_face_beats_a_bigger_unknown_one() -> None:
+    """(#175) Recognition wins outright — size no longer matters at all."""
     big_unknown = FaceCandidate(bbox=(0.0, 0.0, 0.6, 0.6), name=None)
     small_known = FaceCandidate(bbox=(0.7, 0.7, 0.1, 0.1), name="ada")
-    assert select_face([small_known, big_unknown]) is big_unknown
+    assert select_face([small_known, big_unknown]) is small_known
+    assert select_face([big_unknown, small_known]) is small_known
 
 
-def test_a_recognised_face_wins_a_near_tie_in_area() -> None:
-    """Within ~15% of area, a name breaks the tie."""
-    known = FaceCandidate(bbox=(0.0, 0.0, 0.4, 0.4), name="ada")  # area 0.16
-    unknown = FaceCandidate(bbox=(0.5, 0.0, 0.42, 0.4), name=None)  # area 0.168
-    ratio = (0.4 * 0.4) / (0.42 * 0.4)
-    assert 1.0 - ratio < AREA_TIE_RATIO  # the tie is genuinely inside the band
-    assert select_face([unknown, known]) is known
-    assert select_face([known, unknown]) is known
+def test_same_recognition_status_falls_back_to_biggest() -> None:
+    """Two unrecognised faces: no name to prefer, so biggest wins."""
+    small_unknown = FaceCandidate(bbox=(0.0, 0.0, 0.4, 0.4), name=None)
+    big_unknown = FaceCandidate(bbox=(0.5, 0.0, 0.42, 0.4), name=None)
+    assert select_face([small_unknown, big_unknown]) is big_unknown
+    assert select_face([big_unknown, small_unknown]) is big_unknown
 
 
 def test_the_biggest_of_two_recognised_faces_wins() -> None:
@@ -314,13 +309,28 @@ def test_the_biggest_of_two_recognised_faces_wins() -> None:
     assert select_face([small, big]) is big
 
 
+def test_the_bigger_of_two_recognised_faces_wins_over_an_even_bigger_unknown() -> None:
+    """Three faces: two recognised at different sizes, plus a bigger stranger."""
+    small_known = FaceCandidate(bbox=(0.0, 0.0, 0.3, 0.3), name="ada")
+    big_known = FaceCandidate(bbox=(0.4, 0.0, 0.4, 0.4), name="bo")
+    biggest_unknown = FaceCandidate(bbox=(0.0, 0.4, 0.9, 0.6), name=None)
+    assert select_face([small_known, big_known, biggest_unknown]) is big_known
+    assert select_face([biggest_unknown, small_known, big_known]) is big_known
+
+
+def test_a_single_unknown_candidate_still_yields_a_bbox() -> None:
+    """ "Any face qualifies" (issue #127): a lone stranger is still selected."""
+    only_unknown = FaceCandidate(bbox=(0.2, 0.3, 0.4, 0.2), name=None)
+    assert select_face([only_unknown]) is only_unknown
+
+
 def test_a_boxless_candidate_never_beats_one_with_a_box() -> None:
     boxless = FaceCandidate(bbox=None, name="ada")
     boxed = FaceCandidate(bbox=(0.0, 0.0, 0.3, 0.3), name=None)
     assert select_face([boxless, boxed]) is boxed
 
 
-def test_the_driver_selects_the_bigger_unknown_over_a_smaller_known_face() -> None:
+def test_the_driver_selects_the_smaller_known_face_over_a_bigger_unknown_face() -> None:
     driver = FaceSenseDriver(
         media=_FakeMedia([_frame()]),
         engine=_MultiEngine(
@@ -333,11 +343,11 @@ def test_the_driver_selects_the_bigger_unknown_over_a_smaller_known_face() -> No
         start_worker=False,
     )
     _run(driver)
-    assert driver.peek_face_bbox() == pytest.approx((0.0, 0.0, 0.6, 0.6))
-    assert driver.peek_face() is None  # the CHOSEN face is nameless
+    assert driver.peek_face_bbox() == pytest.approx((0.7, 0.7, 0.1, 0.1))
+    assert driver.peek_face() == "ada"  # the CHOSEN face is the recognised one
 
 
-def test_the_driver_prefers_the_known_face_in_a_near_tie() -> None:
+def test_the_driver_prefers_the_known_face_even_when_unknown_is_bigger() -> None:
     driver = FaceSenseDriver(
         media=_FakeMedia([_frame()]),
         engine=_MultiEngine(

@@ -158,8 +158,8 @@ class Sense:
       independent of recognition: an unknown face — a stranger looking at the
       robot — still has a position, so ``face_bbox`` can be set while ``face``
       is ``None``. Which face, when several are in frame, is decided by
-      :func:`reachy.behavior.face_sense.select_face` (biggest, with a
-      recognised face breaking a near tie).
+      :func:`reachy.behavior.face_sense.select_face` (a recognised face first,
+      biggest among equals).
     - ``face_age_s`` — how long ago (seconds) the ``face_bbox`` detection
       landed, or ``None`` when there is no position reading. A consumer that
       must not act on a stale position reads this rather than guessing the
