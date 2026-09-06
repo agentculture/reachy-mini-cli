@@ -27,6 +27,34 @@ The September-6 face/lock/camera arc — six issues, one PR
   `look-at-face`.
 - Operating guide: the face lock, still-only detection, the eyes' liveness,
   the base layer stopped vs. inhibited, the WirePlumber camera boot race.
+- `REACHY_FACE_SCORE_THRESHOLD` (default 0.6, YuNet's own) — the detector's
+  confidence floor as an operator knob; the deployed Wireless runs 0.4 with
+  `REACHY_FACE_DETECT_MAX_WIDTH=0` (live deviation d5's companion).
+- `SelfMotionDriver(eps_deg_s=, eps_mm_s=, watch_antennas=)` — a per-second
+  tolerance judged against real tick time, with the antennas optionally left
+  out. The face gate's latch uses both (deviation d6); the mic's latch is unchanged.
+- `HeldMediaClient.generation` — counts warm-ups, so `FaceSenseDriver` re-arms
+  its camera-stream-ended latch on every re-warmed client (deviation d3).
+- `tests/conftest.py` `_no_live_sdk_client` autouse guard: the suite never
+  constructs a real `reachy_mini.ReachyMini` — a full run on the dev box had
+  opened 38 SDK sessions against the deployed robot in 67 s (deviation d4).
+
+### Live acceptance on the Wireless (2026-09-06)
+
+- The face gate rides its OWN self-motion latch at 20 deg/s
+  (`REACHY_FACE_GATE_EPS_DEG_S`), not the mic's 1.75 deg/s one, which the base
+  layer's ~2.7 deg/s wander kept open (deviation d2) — and that latch judges
+  deg/s against real tick time over head + body_yaw only: the shipped
+  `antenna-sway` (~38 deg/s peak) tripped a per-tick threshold on every
+  half-swing, and the deployed tick's 34-44 ms mean with 500-800 ms stalls
+  (#97) turned the wander into slew-class steps; detection was blocked most of
+  the time and every `lock_face` was refused `no face known` while YuNet found
+  the operator in 12 of 14 clip frames at score 0.9 (deviation d6).
+- `face-lock` anti-windup + recover-to-neutral: an outward push is admitted
+  only while the offset shrinks, and after 3 s of true absence the head eases
+  back to neutral at 30 deg/s — the incremental aim had run to the clamp and
+  frozen staring at a wall (deviation d5). `MAX_FACE_AGE_S` 1.5→3.0 s,
+  `DEFAULT_FACE_BBOX_TTL_S` 1.5→3.5 s for the box's 1.0 s detect cadence.
 
 ### Changed
 

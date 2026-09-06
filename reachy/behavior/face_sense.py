@@ -333,7 +333,11 @@ DEFAULT_HELD_DETECT_INTERVAL: float = 1.5
 #: ``no face known``, and the robot never looked at anyone. A wander that slow
 #: does not blur a frame; a lock's 120 deg/s slew or a goto does. So the face
 #: gate has its OWN latch at slew speed, and the mic keeps its fine one (a
-#: 2 deg/s wander is real actuator noise for a microphone).
+#: 2 deg/s wander is real actuator noise for a microphone). Judged PER SECOND
+#: against the tick's real elapsed time, over the head and body_yaw only — the
+#: antennas do not move the camera, and the deployed tick runs 2x its budget
+#: (#97), so a per-tick threshold tripped on every antenna half-swing and on
+#: every stall (deviation d6; see ``self_motion``'s camera-gate section).
 DEFAULT_GATE_EPS_DEG_S: float = 20.0
 #: Env override for :data:`DEFAULT_GATE_EPS_DEG_S`, read at composition time.
 GATE_EPS_ENV = "REACHY_FACE_GATE_EPS_DEG_S"

@@ -47,6 +47,28 @@ That is a different physical question from pat_sense's 1.0 s
 does not ring, so a 1.0 s tail would only blind the rms sense for longer than
 the noise actually lasts.
 
+The camera-gate variant — per-second eps, antennas excluded (#179)
+--------------------------------------------------------------------
+The face sense's still-only gate rides a SECOND instance of this driver, and
+it asks a different question: not "could that loudness be my actuators?" but
+"is the CAMERA moving fast enough to blur a frame?". Two things follow, both
+measured live on the Wireless (2026-09-06, the arc's deviation d6):
+
+* ``watch_antennas=False`` — the antennas do not move the camera, yet the
+  shipped ``antenna-sway`` (18 deg over a 3 s period, peaking near 38 deg/s)
+  tripped a per-tick 20 deg/s gate on every half-swing: 354 gate transitions
+  in 10 min with nothing but the base layer running, and detection blocked
+  for most of each swing. The latch judges the six head axes and body_yaw
+  only — :data:`_CAMERA_AXIS_COUNT` — and the mic's latch keeps all nine.
+* ``eps_deg_s`` / ``eps_mm_s`` — a PER-SECOND tolerance judged against the
+  tick's real elapsed time (``ctx.now`` deltas), not a per-tick one. The
+  deployed tick runs a 34-44 ms mean with 500-800 ms stalls (issue #97), so
+  a per-tick threshold derived from ``compose_hz`` was 2x too tight on the
+  mean and a stall turned the base layer's 2.7 deg/s wander into a 1.4 deg
+  step that read as a slew. Dividing by dt makes the reading cadence-
+  invariant, the same fix issue #168 applied to the pat gate. A tick with no
+  elapsed time carries no velocity evidence and is skipped.
+
 Degradation
 -----------
 Never raises out of the driver (mirroring
@@ -101,6 +123,11 @@ _HEAD_AXES = ("x", "y", "z", "roll", "pitch", "yaw")
 #: is judged with the deg tolerance.
 _MM_AXIS_COUNT = 3
 
+#: How many leading entries of the watched-pose tuple move the CAMERA: the six
+#: head axes plus body_yaw (the body rotates the whole head assembly). The two
+#: antennas come after and are dropped by a ``watch_antennas=False`` latch.
+_CAMERA_AXIS_COUNT = 7
+
 
 class SelfMotionDriver:
     """Latch "the engine is commanding motion" from per-tick ``ctx.pose`` deltas.
@@ -120,10 +147,28 @@ class SelfMotionDriver:
         eps_deg: float = DEFAULT_EPS_DEG,
         eps_mm: float = DEFAULT_EPS_MM,
         tail_s: float = DEFAULT_TAIL_S,
+        eps_deg_s: float | None = None,
+        eps_mm_s: float | None = None,
+        watch_antennas: bool = True,
     ) -> None:
-        self._eps_deg = max(0.0, float(eps_deg))
-        self._eps_mm = max(0.0, float(eps_mm))
+        # The camera-gate variant (see the module docstring): a PER-SECOND
+        # tolerance judged against the tick's real duration, so a stretched
+        # tick cannot read as a faster head. Either per-second value selects
+        # the mode; a missing mm value borrows the deg one (the same magnitude
+        # carry-over the per-tick defaults use).
+        self._per_second = eps_deg_s is not None or eps_mm_s is not None
+        if self._per_second:
+            deg_s = eps_deg_s if eps_deg_s is not None else eps_mm_s
+            mm_s = eps_mm_s if eps_mm_s is not None else eps_deg_s
+            self._eps_deg = max(0.0, float(deg_s))  # type: ignore[arg-type]
+            self._eps_mm = max(0.0, float(mm_s))  # type: ignore[arg-type]
+        else:
+            self._eps_deg = max(0.0, float(eps_deg))
+            self._eps_mm = max(0.0, float(eps_mm))
+        self._watch_antennas = bool(watch_antennas)
         self._tail_s = max(0.0, float(tail_s))
+        #: The previous valid tick's clock, for the per-second mode's dt.
+        self._last_now: float | None = None
         #: The previous tick's watched-pose tuple, or ``None`` before the first
         #: valid sample / after a degrade (so a gap-crossing step never deltas).
         self._last: tuple[float, ...] | None = None
@@ -150,12 +195,18 @@ class SelfMotionDriver:
             # cannot delta across the gap, and leave the latch as it stands
             # (erring toward suppression — see "Degradation" above).
             self._last = None
+            self._last_now = None
             return
+        if not self._watch_antennas:
+            pose = pose[:_CAMERA_AXIS_COUNT]
         previous = self._last
+        previous_now = self._last_now
         self._last = pose
+        self._last_now = now
         if previous is None:
             return  # first sample (boot or post-gap): nothing to delta against
-        if self._exceeds_eps(pose, previous):
+        dt = now - previous_now if previous_now is not None else None
+        if self._exceeds_eps(pose, previous, dt):
             self._moving = True
             self._last_motion_t = now
             return
@@ -167,10 +218,21 @@ class SelfMotionDriver:
             self._moving = False
             self._last_motion_t = None
 
-    def _exceeds_eps(self, current: tuple[float, ...], previous: tuple[float, ...]) -> bool:
+    def _exceeds_eps(
+        self,
+        current: tuple[float, ...],
+        previous: tuple[float, ...],
+        dt: float | None = None,
+    ) -> bool:
+        if self._per_second:
+            if dt is None or not math.isfinite(dt) or dt <= 0.0:
+                return False  # no elapsed time: no velocity evidence this tick
+            scale = 1.0 / dt
+        else:
+            scale = 1.0
         for index, (cur, prev) in enumerate(zip(current, previous)):
             eps = self._eps_mm if index < _MM_AXIS_COUNT else self._eps_deg
-            if abs(cur - prev) > eps:
+            if abs(cur - prev) * scale > eps:
                 return True
         return False
 
@@ -185,6 +247,16 @@ class SelfMotionDriver:
         as ``make_rms_provider``'s ``moving`` seam. Never raises.
         """
         return self._moving
+
+    @property
+    def per_second(self) -> bool:
+        """``True`` when the eps values are deg/s and mm/s judged against tick time."""
+        return self._per_second
+
+    @property
+    def watches_antennas(self) -> bool:
+        """``True`` when antenna motion can latch ``moving`` (the #95 default)."""
+        return self._watch_antennas
 
     # ------------------------------------------------------------------
     # Defensive readers of the (duck-typed) TickContext

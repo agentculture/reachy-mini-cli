@@ -517,3 +517,78 @@ class TestEnvResolution:
         driver = behavior_mod._make_self_motion()
         assert isinstance(driver, SelfMotionDriver)
         assert DEFAULT_TAIL_S == 0.25
+
+
+# --------------------------------------------------------------------------- #
+# 7. The camera-gate variant (#179, deviation d6) — per-second eps, no antennas #
+# --------------------------------------------------------------------------- #
+
+
+class TestCameraGateVariant:
+    """The face gate's latch answers "is the CAMERA moving fast enough to blur
+    a frame?", so it drops the antennas and judges velocity against real tick
+    time. Measured live on the Wireless: antenna-sway (18 deg / 3 s, ~38 deg/s
+    peak) tripped a per-tick 20 deg/s gate on every half-swing, and a 500 ms
+    tick stall turned the base layer's 2.7 deg/s wander into a slew-class step."""
+
+    def test_the_default_latch_is_per_tick_and_watches_antennas(self) -> None:
+        driver = SelfMotionDriver()
+        assert driver.per_second is False
+        assert driver.watches_antennas is True
+
+    def test_antenna_sway_never_latches_a_camera_gate(self) -> None:
+        driver = SelfMotionDriver(eps_deg_s=20.0, watch_antennas=False)
+        assert driver.watches_antennas is False
+        for i in range(150):  # 3 s of an 18 deg / 3 s sway: peak ~38 deg/s
+            t = i * _DT
+            sway = 18.0 * math.sin(2.0 * math.pi * t / 3.0)
+            _tick(driver, t, _pose(antennas=(sway, -sway)))
+            assert driver.is_moving() is False, f"antenna sway latched the camera gate at tick {i}"
+
+    def test_a_head_slew_still_latches_a_camera_gate(self) -> None:
+        driver = SelfMotionDriver(eps_deg_s=20.0, watch_antennas=False)
+        _tick(driver, 0.0, _pose())
+        _tick(driver, _DT, _pose(head={"yaw": 2.0}))  # 100 deg/s
+        assert driver.is_moving() is True
+
+    def test_body_yaw_still_latches_a_camera_gate(self) -> None:
+        # body_yaw rotates the whole head assembly, camera included.
+        driver = SelfMotionDriver(eps_deg_s=20.0, watch_antennas=False)
+        _tick(driver, 0.0, _pose())
+        _tick(driver, _DT, _pose(body_yaw=2.0))
+        assert driver.is_moving() is True
+
+    def test_a_slow_wander_over_a_stalled_tick_is_not_a_slew(self) -> None:
+        # 2.7 deg/s over a 500 ms stall is a 1.35 deg step — well past a
+        # per-tick 0.4 deg threshold, well under 20 deg/s.
+        driver = SelfMotionDriver(eps_deg_s=20.0, watch_antennas=False)
+        _tick(driver, 0.0, _pose())
+        _tick(driver, 0.5, _pose(head={"yaw": 1.35}))
+        assert driver.is_moving() is False
+
+    def test_the_same_step_inside_one_tick_is_a_slew(self) -> None:
+        driver = SelfMotionDriver(eps_deg_s=20.0, watch_antennas=False)
+        _tick(driver, 0.0, _pose())
+        _tick(driver, _DT, _pose(head={"yaw": 1.35}))  # 67 deg/s
+        assert driver.is_moving() is True
+
+    def test_a_tick_with_no_elapsed_time_carries_no_velocity_evidence(self) -> None:
+        driver = SelfMotionDriver(eps_deg_s=20.0, watch_antennas=False)
+        _tick(driver, 1.0, _pose())
+        _tick(driver, 1.0, _pose(head={"yaw": 5.0}))  # dt == 0: skipped, never a div-by-zero
+        assert driver.is_moving() is False
+
+    def test_a_degraded_tick_drops_the_clock_sample_too(self) -> None:
+        driver = SelfMotionDriver(eps_deg_s=20.0, watch_antennas=False)
+        _tick(driver, 0.0, _pose())
+        _tick(driver, 0.5, None)  # gap: both the pose and its clock are dropped
+        _tick(driver, 0.52, _pose(head={"yaw": 5.0}))  # first post-gap sample: no delta
+        assert driver.is_moving() is False
+
+    def test_a_missing_mm_value_borrows_the_deg_one(self) -> None:
+        driver = SelfMotionDriver(eps_deg_s=20.0)
+        assert driver.per_second is True
+        assert driver._eps_mm == pytest.approx(20.0)
+        _tick(driver, 0.0, _pose())
+        _tick(driver, _DT, _pose(head={"z": 1.0}))  # 50 mm/s
+        assert driver.is_moving() is True
