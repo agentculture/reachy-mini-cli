@@ -1993,7 +1993,6 @@ def _compose_embody_seam(
     clip_reader: Callable[[], dict | None] | None = None,
     clip_poll_interval: float | None = None,
     summary_producer: object | None = None,
-    rules_loader: Callable[[], object] | None = None,
 ) -> _EmbodyLayer:
     """Build the whole layer — the ONE place the wave-1/2/3 seams meet.
 
@@ -2068,7 +2067,10 @@ def _compose_embody_seam(
     engine_slot.append(engine)
     # The names the robot answers to (#177), read from the SAME rules overlay
     # the runtime's hearing gate reads, once, here.
-    _apply_attention_names(engine, _resolve_embody_names(rules_loader, export=export))
+    # The overlay loader is a MODULE-LEVEL seam resolved at call time
+    # (``_default_rules_loader``), not a fifteenth keyword: tests monkeypatch
+    # the attribute, exactly like ``reachy.discover.sweep.read_interfaces``.
+    _apply_attention_names(engine, _resolve_embody_names(export=export))
 
     build_session = session_factory if session_factory is not None else RealtimeDuplexSession
     # The utterance tap has to reach the session that is being built WITH it

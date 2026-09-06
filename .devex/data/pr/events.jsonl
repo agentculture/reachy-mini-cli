@@ -1,0 +1,6 @@
+{"ts":"2026-09-06T10:54:13.970694+00:00","type":"pr_opened","pr":182,"title":"Configurable robot names: the overlay's names table + the name_mentioned sense event (#177, v0.53.0)"}
+{"ts":"2026-09-06T10:54:15.104026+00:00","type":"pr_review_triggered","pr":182,"command":"/agentic_review"}
+{"ts":"2026-09-06T10:54:15.896652+00:00","type":"pr_webhook_posted","pr":182,"event":"pr_opened"}
+{"ts":"2026-09-06T10:55:18.940077+00:00","type":"readiness_arrived","pr":182,"waited_secs":60}
+{"ts":"2026-09-06T10:55:23.663407+00:00","type":"pr_read","pr":182,"comment_count":2,"threads_unresolved":0,"ci_state":"ok"}
+{"ts":"2026-09-06T10:57:26.771406+00:00","type":"pr_read","pr":182,"comment_count":5,"threads_unresolved":0,"ci_state":"ok"}

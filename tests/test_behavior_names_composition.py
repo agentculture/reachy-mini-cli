@@ -244,7 +244,8 @@ def test_rules_list_text_mode_shows_the_names(capsys) -> None:
     _write_overlay(CONFIGURED)
     assert main(["behavior", "rules", "list"]) == 0
     out = capsys.readouterr().out
-    assert "names" in out and CONFIGURED in out
+    assert "names" in out
+    assert CONFIGURED in out
 
 
 def test_rules_list_with_no_overlay_still_reports_the_shipped_names(capsys) -> None:
