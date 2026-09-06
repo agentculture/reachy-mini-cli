@@ -25,7 +25,7 @@ The two cues are different KINDS of signal, and the module treats them that way:
   ``None`` — before this, an unmatched detection was discarded whole and a
   stranger looking at the robot produced no reading at all); and when several
   faces share a frame, :func:`select_face` — pure, and unit-tested as such —
-  names which one it is: biggest, with a recognised face breaking a near tie.
+  names which one it is: a recognised face first, biggest among equals.
 * ``frame_available`` is a **condition** — "the camera is producing frames" —
   so it is a TTL-held level, not a per-tick pulse. The camera runs slower than
   the 50 Hz tick (and a steady-state read returns ``None`` whenever nothing is
@@ -250,12 +250,6 @@ REASON_STREAM_ENDED = "camera-stream-ended"
 #: that a departed face stops being "there" in about a second.
 DEFAULT_FACE_BBOX_TTL_S: float = 1.5
 
-#: Area band inside which two faces count as "the same size", so recognition —
-#: not a couple of pixels — decides between them. 15%: comfortably wider than
-#: the frame-to-frame jitter of one YuNet box, comfortably narrower than the
-#: area gap between two people at visibly different distances.
-AREA_TIE_RATIO: float = 0.15
-
 #: How long the worker parks between iterations when idle. Bounded so
 #: :meth:`FaceSenseDriver.close` joins promptly.
 _POLL_INTERVAL: float = 0.02
@@ -467,30 +461,26 @@ def select_face(candidates) -> "FaceCandidate | None":
 
     The rule, in order:
 
-    1. **Biggest wins.** Box area is the only distance proxy the detector
-       gives, and the nearest face is the one a person expects a robot to look
-       at.
-    2. **A recognised face breaks a near tie.** Every candidate within
-       :data:`AREA_TIE_RATIO` of the largest area is a contender; if any of
-       them carries a name, the named ones alone stay in the running. Two
-       people standing side by side are a coin-flip on area and jitter would
-       otherwise make the robot's attention flick between them every cycle —
-       knowing one of them is the better tiebreak, and a stable one.
-    3. Among whatever is left, biggest again; ties resolve to the first
-       candidate the detector reported (a stable, deterministic order).
+    1. **A recognised face wins over any unrecognised face, regardless of
+       size.** The operator decision behind issue #175: "any face qualifies,
+       but prefer an enrolled one" — a stranger standing closer to the camera
+       than a known person no longer steals the robot's attention.
+    2. **Among faces with the same recognition status, biggest wins.** Box
+       area is the only distance proxy the detector gives, and the nearest
+       face is the one a person expects a robot to look at; ties resolve to
+       the first candidate the detector reported (a stable, deterministic
+       order).
 
-    A far-larger unknown face still beats a small known one: the band in step 2
-    is deliberately narrow, so "the person right in front of me" is never
-    overruled by "someone I know across the room".
+    A candidate with no box (no position to report) never outranks one with a
+    box, named or not — see issue #127: an unnamed face still needs a
+    position, so "any face qualifies" is preserved even for a single,
+    completely unknown face in frame.
     """
     scored = [(candidate, bbox_area(candidate.bbox)) for candidate in candidates]
     if not scored:
         return None
-    best_area = max(area for _, area in scored)
-    floor = best_area * (1.0 - AREA_TIE_RATIO)
-    contenders = [pair for pair in scored if pair[1] >= floor]
-    named = [pair for pair in contenders if (pair[0].name or "").strip()]
-    pool = named or contenders
+    named = [pair for pair in scored if pair[0].bbox is not None and (pair[0].name or "").strip()]
+    pool = named or scored
     return max(pool, key=lambda pair: pair[1])[0]
 
 
