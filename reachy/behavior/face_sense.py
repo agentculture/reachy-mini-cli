@@ -349,7 +349,16 @@ GATE_EPS_ENV = "REACHY_FACE_GATE_EPS_DEG_S"
 #: any reading older than its own ``MAX_FACE_AGE_S`` (1.5 s), so a position held
 #: past that is invisible to it and would only let a stale bbox reach the gaze
 #: one-shots. Hence the derivation demands no change.
-DEFAULT_FACE_BBOX_TTL_S: float = 1.5
+DEFAULT_FACE_BBOX_TTL_S: float = 3.5
+#: 3.5 s = two held-lock cadences (``DEFAULT_HELD_DETECT_INTERVAL`` 1.5 s) plus
+#: the settle (0.5 s): the bbox must outlive the LONGEST legitimate gap between
+#: detections — one held cadence plus the detection's own latency, plus one
+#: missed cycle — or a held lock reads "no face" between two live readings.
+#: It shipped at 1.5 s and, once ages included detection latency
+#: (``captured_at``), the deployed 1.0 s detect interval on the CM4 expired the
+#: position before nearly every refresh. Wider than the lock's
+#: ``MAX_FACE_AGE_S`` (3.0 s) on purpose: the lock stops STEERING on a reading
+#: before the sense stops HOLDING it.
 
 #: How long the worker parks between iterations when idle. Bounded so
 #: :meth:`FaceSenseDriver.close` joins promptly.

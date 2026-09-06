@@ -1025,3 +1025,13 @@ def test_fov_params_refuse_an_impossible_camera_angle():
         assert entry.params[name].maximum == 180.0
         with pytest.raises(Exception):
             lib.validate_param_value(entry, name, 181.0)
+
+
+def test_a_reading_up_to_three_seconds_old_still_steers_the_lock():
+    """Live 2026-09-06: with a 1.0 s detect interval and honest capture-anchored
+    ages, a 1.5 s max_age left the lock steering on the first reading only."""
+    from reachy.behavior.face_lock import MAX_FACE_AGE_S, _is_stale
+
+    assert MAX_FACE_AGE_S == 3.0
+    assert _is_stale(2.5, None) is False
+    assert _is_stale(3.5, None) is True
