@@ -179,6 +179,7 @@ lazily only after confirming opencv is present.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -201,6 +202,11 @@ SOURCE = "face"
 #: YuNet+SFace is heavy; ~2 Hz is ample for catching a face entering the frame,
 #: and matches the retired ``listen_face.DEFAULT_DETECT_INTERVAL``.
 DEFAULT_DETECT_INTERVAL: float = 0.5
+
+#: ``REACHY_FACE_DETECT_MAX_WIDTH`` off value — no downscaling. Matches the
+#: constructor default and reads exactly like "0 pixels" would mean anything
+#: else: it is the explicit off switch, not a real width.
+DEFAULT_DETECT_MAX_WIDTH: int = 0
 
 #: Per-name re-announce cooldown (seconds): the same name latches into ``face``
 #: at most once per this window. Without it, a face that simply stays in view
@@ -390,6 +396,117 @@ def build_face_recognition(
     return (engine, store)
 
 
+def detect_interval_from_env(
+    value: str | None = None, *, default: float = DEFAULT_DETECT_INTERVAL
+) -> float:
+    """Parse ``REACHY_FACE_DETECT_INTERVAL`` into a positive seconds float.
+
+    Mirrors ``transcript_sense._env_truthy``'s style — a small, unit-testable
+    stdlib helper that never raises: unset, empty, unparsable, zero, or
+    negative all fall back to *default* (:data:`DEFAULT_DETECT_INTERVAL`) so an
+    operator who never sets the var, or sets it to garbage, gets exactly
+    today's behaviour rather than a startup crash.
+
+    *value* is the string to parse; when omitted, it is read from
+    ``os.environ["REACHY_FACE_DETECT_INTERVAL"]`` — the seam a test can bypass
+    by passing a string directly.
+    """
+    if value is None:
+        value = os.environ.get("REACHY_FACE_DETECT_INTERVAL")
+    if value is None:
+        return default
+    text = value.strip()
+    if not text:
+        return default
+    try:
+        parsed = float(text)
+    except ValueError:
+        return default
+    if parsed != parsed or abs(parsed) == float("inf") or parsed <= 0.0:
+        return default
+    return parsed
+
+
+def detect_max_width_from_env(
+    value: str | None = None, *, default: int = DEFAULT_DETECT_MAX_WIDTH
+) -> int:
+    """Parse ``REACHY_FACE_DETECT_MAX_WIDTH`` into a non-negative pixel width.
+
+    Same fail-open shape as :func:`detect_interval_from_env`: unset, empty,
+    unparsable, or negative all fall back to *default*
+    (:data:`DEFAULT_DETECT_MAX_WIDTH`, ``0`` — off, no downscaling) rather than
+    raising. ``0`` itself is a valid, meaningful setting (explicitly off), so
+    it is returned as-is rather than treated as "unset".
+
+    *value* is the string to parse; when omitted, it is read from
+    ``os.environ["REACHY_FACE_DETECT_MAX_WIDTH"]`` — the seam a test can
+    bypass by passing a string directly.
+    """
+    if value is None:
+        value = os.environ.get("REACHY_FACE_DETECT_MAX_WIDTH")
+    if value is None:
+        return default
+    text = value.strip()
+    if not text:
+        return default
+    try:
+        parsed = int(text)
+    except ValueError:
+        return default
+    if parsed < 0:
+        return default
+    return parsed
+
+
+def downscale_for_detection(frame: object, max_width: int | None) -> object:
+    """Downscale *frame* to at most *max_width* pixels wide, aspect preserved.
+
+    Returns *frame* UNCHANGED — the SAME object, no copy — whenever there is
+    nothing to do: *max_width* is falsy (``None`` or ``<= 0``, the default
+    "off" state) or the frame is already at or narrower than *max_width*.
+    Otherwise resizes with ``cv2.resize`` / ``cv2.INTER_AREA``, height scaled
+    to preserve aspect ratio.
+
+    ``cv2`` is imported LAZILY, inside this function, so the module stays
+    importable with no ``[vision]`` extra installed — exactly like
+    :func:`build_face_recognition`'s imports. If cv2 turns out to be missing
+    (or the resize itself raises), the frame passes through unscaled rather
+    than raising: this is a throughput knob, never a hard dependency.
+
+    Two consequences follow for the caller, both intentional:
+
+    * The face engine's ``bbox_norm`` is normalised to the frame it actually
+      saw, so the published ``face_bbox`` needs NO rescaling back to the
+      original frame regardless of what this helper did — a fraction of a
+      640-wide frame is the same fraction of a 1280-wide one.
+    * The face EMBEDDING is computed on the (possibly downscaled) frame handed
+      to the engine — a smaller face crop is a real recognition-quality
+      trade-off, not a free lunch, and the operator setting
+      ``REACHY_FACE_DETECT_MAX_WIDTH`` is choosing that trade explicitly.
+    """
+    if not max_width or max_width <= 0:
+        return frame
+    try:
+        shape = frame.shape  # type: ignore[attr-defined]
+        height, width = int(shape[0]), int(shape[1])
+    except Exception:
+        return frame
+    if width <= max_width:
+        return frame
+    try:
+        import importlib
+
+        cv2 = importlib.import_module("cv2")
+    except Exception:
+        return frame
+    scale = max_width / float(width)
+    new_height = max(1, int(round(height * scale)))
+    try:
+        return cv2.resize(frame, (int(max_width), new_height), interpolation=cv2.INTER_AREA)
+    except Exception:
+        return frame
+
+
 class _Slot:
     """A lock-guarded, latest-wins, consume-once value slot.
 
@@ -545,6 +662,13 @@ class FaceSenseDriver:
     detect_interval:
         Minimum seconds between two detections on the worker, measured on
         ``clock``. Default :data:`DEFAULT_DETECT_INTERVAL`.
+    detect_max_width:
+        When set (pixels) and the frame handed to the engine is wider, it is
+        downscaled first (aspect preserved) via
+        :func:`downscale_for_detection`. ``None`` or ``0`` (the default) means
+        no downscaling — the frame the engine sees is exactly the frame read
+        off the media client. See that function's docstring for the bbox / embedding
+        consequences.
     reannounce_cooldown:
         Minimum seconds between two ``face`` latches for the SAME name, measured
         on the engine's tick clock ``ctx.now``. Default
@@ -580,6 +704,7 @@ class FaceSenseDriver:
         engine: object | None = None,
         store: object | None = None,
         detect_interval: float = DEFAULT_DETECT_INTERVAL,
+        detect_max_width: int | None = None,
         reannounce_cooldown: float = DEFAULT_REANNOUNCE_COOLDOWN,
         frame_ttl_s: float = DEFAULT_FRAME_TTL_S,
         frame_interval_s: float = DEFAULT_FRAME_INTERVAL_S,
@@ -592,6 +717,7 @@ class FaceSenseDriver:
         self._engine = engine
         self._store = store
         self._detect_interval = max(0.0, float(detect_interval))
+        self._detect_max_width = int(detect_max_width) if detect_max_width else 0
         self._reannounce_cooldown = max(0.0, float(reannounce_cooldown))
         self._frame_ttl_s = max(0.0, float(frame_ttl_s))
         self._frame_interval_s = max(0.0, float(frame_interval_s))
@@ -986,7 +1112,12 @@ class FaceSenseDriver:
 
         Every foreign call is guarded: a raise degrades to "no observation" and
         is logged, never propagated.
+
+        The frame is downscaled here, ONCE, before it reaches the engine — see
+        :func:`downscale_for_detection` for why the resulting ``bbox_norm``
+        needs no rescaling and why the embedding trade-off is real.
         """
+        frame = downscale_for_detection(frame, self._detect_max_width)
         detections = self._detect_faces(frame)
         if not detections:
             return None
@@ -1120,10 +1251,14 @@ class FaceSenseDriver:
 __all__ = [
     "FaceSenseDriver",
     "build_face_recognition",
+    "detect_interval_from_env",
+    "detect_max_width_from_env",
+    "downscale_for_detection",
     "face_recognition_unavailable_reason",
     "usable_frame",
     "vision_unavailable_reason",
     "DEFAULT_DETECT_INTERVAL",
+    "DEFAULT_DETECT_MAX_WIDTH",
     "DEFAULT_FRAME_INTERVAL_S",
     "DEFAULT_FRAME_TTL_S",
     "DEFAULT_REANNOUNCE_COOLDOWN",
