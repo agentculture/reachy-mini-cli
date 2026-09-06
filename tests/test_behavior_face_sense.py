@@ -1595,3 +1595,45 @@ def test_without_a_callback_the_staleness_path_is_exactly_todays(caplog) -> None
         for now in (2.0, 5.0):
             driver(_Ctx(now))
     assert len(_drop_messages(caplog, FS.REASON_STREAM_ENDED)) == 1
+
+
+def test_the_stale_latch_re_arms_when_the_media_client_is_a_new_generation() -> None:
+    """Live on the Wireless (2026-09-06): after a drop and a re-warm the NEW client
+    died before its first frame, and the once-per-episode latch never re-armed —
+    the runtime sat on a connected-but-dead client. A new generation is a new
+    episode: the same stale timestamp trips the latch again."""
+    media = _FakeMedia([_frame(), None, None, None, None, None])
+    media.generation = 1
+    fired: list[str] = []
+    driver = FaceSenseDriver(
+        media=media,
+        stream_stale_s=1.0,
+        frame_interval_s=0.0,
+        start_worker=False,
+        on_stale=fired.append,
+    )
+    driver(_Ctx(0.0))  # one usable frame, then the fake is empty
+    driver(_Ctx(1.5))
+    assert fired == [FS.REASON_STREAM_ENDED]
+    driver(_Ctx(3.0))
+    assert fired == [FS.REASON_STREAM_ENDED], "same generation: once per episode"
+    media.generation = 2  # the keeper re-warmed a fresh client; still no frame
+    driver(_Ctx(3.1))
+    driver(_Ctx(4.6))
+    assert fired == [FS.REASON_STREAM_ENDED, FS.REASON_STREAM_ENDED]
+
+
+def test_a_media_client_without_a_generation_keeps_the_once_per_episode_latch() -> None:
+    media = _FakeMedia([_frame(), None, None, None])
+    fired: list[str] = []
+    driver = FaceSenseDriver(
+        media=media,
+        stream_stale_s=1.0,
+        frame_interval_s=0.0,
+        start_worker=False,
+        on_stale=fired.append,
+    )
+    driver(_Ctx(0.0))
+    driver(_Ctx(1.5))
+    driver(_Ctx(3.0))
+    assert fired == [FS.REASON_STREAM_ENDED]
