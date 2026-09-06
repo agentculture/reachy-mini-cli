@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.53.0] - 2026-09-06
+
+### Added
+
+- **Configurable robot names** (#177, split from #175): the overlay's top-level
+  `names = [...]` table adds to the shipped `reachy`/`robot` pair — now spelled
+  ONCE as `reachy.speech.name_match.SHIPPED_NAMES` — validated fail-closed with
+  the rest of `rules.toml` (letters only, 3+ chars, up to 8 entries; a bad
+  entry refuses the file and `RulesLoader` keeps last-good). The runtime reads
+  the names LIVE through a provider bound to the reload loader, so
+  `behavior reload` changes who the robot answers to between ticks; the
+  engagement classifier's prompt is rendered from them; `agent embody`'s
+  attention gate and `sleep`'s wake phrases (one `hey <name>` per configured
+  name except `robot`) read the same table at start.
+- **`name_mentioned` sense event**: a one-tick `Sense` field latched when the
+  transcript gate admits an utterance BY NAME (never on a `context` admission),
+  keyable from a rule (`when = { field = "name_mentioned", op = "is_true" }`),
+  carried on the snapshot export and as the cue *"someone said my name"*.
+- `behavior rules list` / `rules check` / `engine status` report the names in
+  force (`engine status` says whether they came from the running engine or from
+  disk); one `[SENSE stage=rule source=names event=in-force]` line at
+  composition and on every change.
+- `is_name_match` gains two guards for short configured names: a clitic stem
+  match (`nova's` → `nova`) and a four-letter fuzzy floor.
+- `tests/test_no_peer_name.py`: this repo hardcodes no peer's name (AST value
+  scan; provenance comments and the harness's own MQTT topic are allowed).
+  Peer prerequisite: OriNachum/reachy-nova#27.
+
 ## [0.52.0] - 2026-09-06
 
 ### Changed

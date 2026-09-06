@@ -753,8 +753,26 @@ attention. Its ONE consumer today is `reachy/behavior/transcript_sense.py`
 per driver. A transcribed utterance passes through it cheapest-first, after the
 built-in self-mute and min-utterance shortcuts:
 
+**The names are configuration, spelled once (#177).** The shipped pair `("reachy",
+"robot")` lives in exactly ONE place, `reachy/speech/name_match.py`'s
+`SHIPPED_NAMES`; `engagement.py`, `transcript_sense.py` and `embody/attention.py`
+alias it, and `rules.py` imports it to build `RulesConfig.names` — the shipped
+pair followed by the overlay's `names = [...]` additions (letters only, ≥3
+chars, ≤8 entries, refused fail-closed with the rest of the file). The runtime
+reads them LIVE: `_compose_run_seam` hands `TranscriptSenseDriver` a
+`names_provider` bound to the reload driver's `loader.current.names`, so
+`behavior reload` changes who the robot answers to between ticks; `agent embody`
+and `sleep` read the same table at start only. An admission BY NAME latches the
+one-tick `Sense.name_mentioned` (a `context` admission does not), wired through
+all five registries like any sense field. This repo hardcodes no peer's name —
+`tests/test_no_peer_name.py` greps the source for `nova` — and a peer configures
+its own; reachy_nova's overlay writer must learn the table first
+(OriNachum/reachy-nova#27). `is_name_match` carries two guards for SHORT
+configured names: a clitic stem match (`nova's` → `nova`) and a four-letter
+fuzzy floor, so `no`/`nah`/`not` never reach the fuzzy path.
+
 1. **Fuzzy name fast-path** (`is_name_match` in `reachy/speech/name_match.py`) — checks
-   every word in the utterance against the canonical names (`reachy`/`robot`) and a set
+   every word in the utterance against the canonical names and a set
    of common STT mishearings (`richie`, `reachie`, `richy`). The matcher uses a combined
    `difflib_ratio × length_ratio` score with four structural guards (prefix, superstring,
    initial-letter, and **phonetic**). The phonetic guard (#104) requires the word to share

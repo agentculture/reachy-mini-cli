@@ -479,7 +479,8 @@ toward the bearing of an addressed voice, on the same arbitrated 50 Hz loop.
   — submit a goto through the intents spool (see "Goto" below). Only the
   channels you pass end up in the payload; naming none is refused.
 - `reachy-mini-cli behavior rules` (alias `rules list`) — render the loaded
-  `rules.toml` (react/inhibit rules, modes, active mode). A missing file is
+  `rules.toml` (react/inhibit rules, modes, active mode, and the merged
+  `names` the robot answers to). A missing file is
   not an error; a malformed one is a clean exit-1 naming every reason. Reads
   the file directly — no running engine needed.
 - `reachy-mini-cli behavior rules check` — validate `rules.toml` as a linter:
@@ -502,8 +503,11 @@ toward the bearing of an addressed voice, on the same arbitrated 50 Hz loop.
 
 `behavior engine run` optionally drives the engine from a declarative
 `rules.toml` file (default: `<state dir>/behavior/rules.toml`) — `[[react]]` /
-`[[inhibit]]` rules over the live sense snapshot, plus named `[modes.<name>]`
-parameter sets. It is loaded once at boot:
+`[[inhibit]]` rules over the live sense snapshot, named `[modes.<name>]`
+parameter sets, and a top-level `names = [...]` table adding to the names the
+robot answers to (letters only, 3+ chars, up to 8 — refused fail-closed with
+the rest of the file; `behavior reload` applies it live and latches the
+`name_mentioned` sense field on an admission by name). It is loaded once at boot:
 
 - a MISSING file is fine — "no rules configured yet", the engine runs on
   `feel-alive` alone;
