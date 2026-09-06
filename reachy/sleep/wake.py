@@ -31,6 +31,7 @@ Public API (consumed by task t8 / the sleep loop)::
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -40,6 +41,7 @@ from reachy.sleep import wakeword
 from reachy.sleep.wakeword import (  # noqa: F401  (back-compat re-export)
     DEFAULT_PHRASE as _DEFAULT_PHRASE,
 )
+from reachy.speech.name_match import SHIPPED_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +61,16 @@ class WakeDetector:
         HTTP STT override).  If the backend is unavailable/unreachable, fall back
         to Tier-1 transparently — it never raises.
     phrase:
-        The wake phrase for Tier-2 (default ``"hey reachy"``).  Ignored when
-        Tier-2 is disabled.
+        An explicit wake phrase for Tier-2 — exactly one, overriding both
+        ``REACHY_STT_PHRASE`` and *names*.  ``None`` (the default) resolves the
+        phrases from *names*: one ``"hey <name>"`` per configured name except
+        the generic ones, so the shipped default is ``"hey reachy"``.  Ignored
+        when Tier-2 is disabled.
+    names:
+        The names this robot answers to (#177) — :data:`SHIPPED_NAMES` plus
+        whatever the box's rules overlay adds, threaded in by
+        :mod:`reachy.cli._commands.sleep`.  Used only when *phrase* is ``None``
+        and ``REACHY_STT_PHRASE`` is unset.
     wake_word_kind:
         Which Tier-2 backend to build (``"http"`` default, or ``"openwakeword"``).
         Forwarded to :func:`reachy.sleep.wakeword.resolve_backend`.
@@ -79,7 +89,8 @@ class WakeDetector:
         self,
         *,
         wake_word_enabled: bool = False,
-        phrase: str = _DEFAULT_PHRASE,
+        phrase: str | None = None,
+        names: Sequence[str] = SHIPPED_NAMES,
         wake_word_kind: str = wakeword.DEFAULT_KIND,
         wake_word_sample_rate: int = wakeword.DEFAULT_SAMPLE_RATE,
         snap_ratio: float = 5.0,
@@ -98,6 +109,7 @@ class WakeDetector:
         )
         self._wake_word_enabled = wake_word_enabled
         self._phrase = phrase
+        self._names = tuple(names)
 
         # Tier-2 backend (pluggable).  resolve_backend is side-effect-free: no
         # network call, no openwakeword import happens here — both are deferred
@@ -108,11 +120,22 @@ class WakeDetector:
             kind=wake_word_kind,
             phrase=phrase,
             sample_rate=wake_word_sample_rate,
+            names=self._names,
         )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def wake_phrases(self) -> tuple[str, ...]:
+        """The Tier-2 phrases in force, or ``()`` when Tier-2 is disabled.
+
+        Reads the BACKEND rather than re-resolving, so this can never disagree
+        with what actually fires — the null backend has no phrases because it
+        has nothing to hear.
+        """
+        return tuple(getattr(self._backend, "phrases", ()))
 
     def update(self, sense: Sense, audio: np.ndarray) -> bool:
         """Feed one tick's sensor snapshot and audio chunk.

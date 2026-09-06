@@ -98,7 +98,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -698,6 +698,8 @@ EMBODY_SOURCE_CUES = "cue-reader"
 EMBODY_SOURCE_SHUTDOWN = "shutdown"
 #: The clip -> ``ask()`` perception lane (task t11, issue #139's h9 blocker).
 EMBODY_SOURCE_CLIP = "clip"
+#: Resolving the names the robot answers to, at composition (#177).
+EMBODY_SOURCE_NAMES = "names"
 
 #: The duplex session refused to start; the layer is deaf and mute but alive.
 REASON_SESSION_START_FAILED = "session-start-failed"
@@ -755,6 +757,15 @@ REASON_CLIP_ASK_EMPTY = "clip-ask-empty"
 #: requested format.
 REASON_CLIP_ANSWER_UNSTRUCTURED = "clip-answer-unstructured"
 
+#: The box-local rules overlay names the robot (#177), and reading it RAISED —
+#: bad TOML, an unreadable file, a ``names`` entry the schema refuses. The layer
+#: falls back to the SHIPPED names and keeps listening: a robot that will not
+#: come up because someone mistyped a name in a config file is a worse failure
+#: than one that answers only to "reachy" until the file is fixed. Named because
+#: the fallback is otherwise indistinguishable from an overlay that simply
+#: configured nothing.
+REASON_NAMES_OVERLAY_REFUSED = "names-overlay-refused"
+
 #: Every failure this composition root can name, in one place so the journal,
 #: the export feed, the operator docs and the tests share ONE vocabulary — the
 #: same discipline :mod:`reachy.embody.tools` and :mod:`reachy.embody.engine`
@@ -774,6 +785,7 @@ EMBODY_REASONS: frozenset[str] = frozenset(
         REASON_CLIP_ASK_FAILED,
         REASON_CLIP_ASK_EMPTY,
         REASON_CLIP_ANSWER_UNSTRUCTURED,
+        REASON_NAMES_OVERLAY_REFUSED,
     }
 )
 
@@ -1895,6 +1907,77 @@ def _default_clip_reader(root: Path | None) -> Callable[[], dict | None]:
     return _read
 
 
+def _default_rules_loader() -> object:
+    """Read the box's merged rules (shipped ⊕ the operator's overlay).
+
+    FUNCTION-LOCAL import, like every other cognition-adjacent import in this
+    module: ``_build_parser()`` imports every command module, so a module-scope
+    import here would put the rules stack (and everything it reaches) in the
+    import path of ``daemon status`` and ``--help``.
+    ``test_building_the_cli_parser_loads_no_cognition_module`` pins that.
+    """
+    from reachy.behavior.rules import load_rules, overlay_rules_path
+
+    return load_rules(overlay_rules_path())
+
+
+def _resolve_embody_names(
+    rules_loader: Callable[[], object] | None = None,
+    *,
+    export: object = None,
+) -> tuple[str, ...]:
+    """The names the robot answers to, resolved ONCE at layer start (#177).
+
+    The operator configures them in ``<state_dir>/behavior/rules.toml``'s
+    ``names`` array, and the runtime's own hearing gate reads the same file, so
+    a robot cannot end up answering to one set of names through the runtime's
+    ears and another through the layer's. Hot reload is a documented non-goal:
+    a name that changed mid-conversation would mean the gate and the mind
+    disagree about who was just addressed.
+
+    A malformed overlay is NAMED and survived, never fatal — ``load_rules``
+    raises :class:`~reachy.cli._errors.CliError` on a typo, and the layer falls
+    back to :data:`~reachy.speech.name_match.SHIPPED_NAMES`. Any other
+    exception (an unreadable state dir, a permission error) takes the same
+    path: this runs before the layer has ears, so there is nothing to gain by
+    letting it kill the process.
+    """
+    from reachy.speech.name_match import SHIPPED_NAMES
+
+    loader = rules_loader if rules_loader is not None else _default_rules_loader
+    try:
+        names = tuple(str(name) for name in getattr(loader(), "names", ()))
+    except CliError as exc:
+        _embody_drop(export, EMBODY_SOURCE_NAMES, REASON_NAMES_OVERLAY_REFUSED, exc.message)
+        return SHIPPED_NAMES
+    except Exception as exc:  # never fatal — see the docstring
+        _embody_drop(export, EMBODY_SOURCE_NAMES, REASON_NAMES_OVERLAY_REFUSED, str(exc))
+        return SHIPPED_NAMES
+    return names or SHIPPED_NAMES
+
+
+def _apply_attention_names(
+    engine: object,
+    names: Sequence[str],
+) -> None:
+    """Hand the resolved names to the engine's attention gate.
+
+    ``getattr`` rather than a hard attribute read because ``engine_factory`` is
+    an injected seam: a composition test's stub engine has no gate, and the
+    layer must compose anyway.
+    """
+    gate = getattr(engine, "attention", None)
+    setter = getattr(gate, "set_names", None)
+    if callable(setter):
+        setter(tuple(names))
+        senselog.stage(
+            EMBODY_STAGE,
+            EMBODY_SOURCE_NAMES,
+            uuid.uuid4().hex[:8],
+            "answering to " + ", ".join(names),
+        )
+
+
 def _compose_embody_seam(
     args: argparse.Namespace,
     *,
@@ -1910,6 +1993,7 @@ def _compose_embody_seam(
     clip_reader: Callable[[], dict | None] | None = None,
     clip_poll_interval: float | None = None,
     summary_producer: object | None = None,
+    rules_loader: Callable[[], object] | None = None,
 ) -> _EmbodyLayer:
     """Build the whole layer — the ONE place the wave-1/2/3 seams meet.
 
@@ -1982,6 +2066,9 @@ def _compose_embody_seam(
         engine_kwargs["turn_fn"] = turn_fn
     engine = build_engine(**engine_kwargs)
     engine_slot.append(engine)
+    # The names the robot answers to (#177), read from the SAME rules overlay
+    # the runtime's hearing gate reads, once, here.
+    _apply_attention_names(engine, _resolve_embody_names(rules_loader, export=export))
 
     build_session = session_factory if session_factory is not None else RealtimeDuplexSession
     # The utterance tap has to reach the session that is being built WITH it
