@@ -120,6 +120,16 @@ taken by the operator or a task agent and is captured here directly.
   after the grep flagged dozens of provenance comments citing `reachy_nova`
   (cite-don't-import ports); the harness's own MQTT topic is an explicit,
   reasoned allow-list entry.
+- CI's `test` job failed on three consecutive heads (`25ae990`, `ca07253`,
+  `78efece`) on `tests/test_behavior_nervous_composition.py::test_h20_the_export_feed_is_identical_with_and_without_the_bus`,
+  then passed on `ecfd039` (a docs-only change) — a pre-existing clock race:
+  the snapshot driver emits on dataclass inequality and `pat_state` carries a
+  timestamp the pat sense rewrites on tick-timing-dependent paths, so a slow
+  runner can emit a `sense` line identical to its predecessor except in that
+  timestamp. Hardened test-only: consecutive scrubbed-identical `sense`
+  events are folded before the two feeds are compared; distinct events must
+  still match in order. Main's and PR #180's red `Tests` runs are the
+  SonarCloud Scan step, unrelated.
 - The shared main checkout was switched to another branch twice by a
   parallel session; the whole run was executed from
   `../.worktrees.reachy-mini-cli/names-*` worktrees plus a `names-int`
@@ -144,7 +154,7 @@ taken by the operator or a task agent and is captured here directly.
 - tests: `tests/test_behavior_rules_names.py::test_a_rule_keyed_on_name_mentioned_fires_and_only_on_that_tick` — pass
 - tests: `tests/test_transcript_name_mentioned.py` (6) · `tests/test_behavior_names_composition.py` (17) · `tests/test_no_peer_name.py` (3) — pass
 - lint: `black --check`, `isort --check-only`, `flake8`, `bandit -c pyproject.toml -r reachy`, `markdownlint-cli2 "**/*.md" …`, `teken cli doctor . --strict` — all clean on `ca07253`
-- CI on PR #182 head: test / lint / offline / version-check / test-publish / GitGuardian — pass; SonarCloud quality gate OK, 0 open issues, 0 hotspots; review threads 7/7 resolved
+- CI on PR #182 head `ecfd039`: test / lint / offline / version-check / test-publish / GitGuardian — pass (`test` was red on `25ae990`..`78efece` from the flake above); SonarCloud quality gate OK, 0 open issues, 0 hotspots; review threads 7/7 resolved
 - commits: `07187f1..ca07253` on `spec/configurable-robot-names-177` (43 files, +3102/−137 vs `main`); per-task: `c958992` `873cee5` `05bfc53` `f27fa1c` `39e8728` `15ccc07` `fe2779c` `3e76485`; review: `08d4ca1` `1d848db` `25ae990` `ca07253`
 - PRs / issues: #182 (this delivery), #177 (closed by it), #175 / #178 (origin of the split), OriNachum/reachy-nova#27 (peer prerequisite)
 - bench: PR #182 comment "Bench (plan task t8) — BLOCKED" with the journal lines; plan risk r4
