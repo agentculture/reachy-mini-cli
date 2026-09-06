@@ -251,6 +251,9 @@ class HeldMediaClient:
         self._base_url = base_url.rstrip("/") if base_url else None
         self._gate_timeout = gate_timeout
         self._media_acquired = False
+        #: Bumped on every successful warm-up: a consumer that latched a fault
+        #: against the PREVIOUS client re-arms when it sees a new number (#176).
+        self._generation = 0
         self._client: Any | None = None
         self._media: Any | None = None
         self._samplerate: int | None = None
@@ -316,6 +319,19 @@ class HeldMediaClient:
         if self._client is None:
             self._ensure_client()
         return self._client is not None
+
+    @property
+    def generation(self) -> int:
+        """How many times a client has been successfully warmed up. Never constructs.
+
+        Live on the Wireless (2026-09-06): the face sense dropped a silent camera,
+        the keeper re-warmed it, and a foreign release killed the NEW client
+        before its first frame — so the sense's once-per-episode latch stayed
+        tripped against a client that no longer existed, and the runtime sat on
+        a connected-but-dead client for good. A consumer keys its episode on
+        this number: a new client is a new episode.
+        """
+        return self._generation
 
     @property
     def connected(self) -> bool:
@@ -623,6 +639,7 @@ class HeldMediaClient:
             logger.warning("HeldMediaClient: wake_up failed (%s)", err)
 
         self._client = client
+        self._generation += 1
         self._media = media
         self._samplerate = samplerate
         self._channels = channels

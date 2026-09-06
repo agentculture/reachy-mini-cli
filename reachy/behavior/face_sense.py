@@ -921,6 +921,7 @@ class FaceSenseDriver:
         #: the moment a fresh usable frame arrives, so a LATER silent episode is
         #: reported again rather than only the first one for the process's life.
         self._stream_ended_logged = False
+        self._stream_generation: object = None
         #: Count of face cues latched this run (diagnostics / tests).
         self.events = 0
 
@@ -1066,7 +1067,19 @@ class FaceSenseDriver:
         never existed, never streamed, or is still warming up) is exempt by
         construction: there is no "stream" to have ended.
         """
-        if self._stream_ended_logged or now is None:
+        if now is None:
+            return
+        generation = getattr(self._media, "generation", None)
+        if generation != self._stream_generation:
+            # A NEW client (the keeper re-warmed after our drop, or a first
+            # warm-up landed) is a new episode: re-arm the once-per-episode
+            # latch, or a client that dies again before its first frame is never
+            # dropped a second time and the runtime sits on it for good (seen
+            # live on the Wireless, 2026-09-06, under a foreign release storm).
+            self._stream_generation = generation
+            self._stream_ended_logged = False
+            self._on_stale_failed = False
+        if self._stream_ended_logged:
             return
         last = self._last_frame_at
         if last is None:

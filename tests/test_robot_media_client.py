@@ -1922,3 +1922,20 @@ def test_warm_up_reconnects_after_a_drop_once_the_backoff_has_passed(monkeypatch
     assert len(fake_cls.instances) == 2
     assert daemon.count("POST", MEDIA_ACQUIRE_PATH) == 2
     assert holder.audio() is not None
+
+
+def test_generation_counts_successful_warm_ups_only(monkeypatch):
+    """#176 follow-through: a consumer keys its fault episode on the client generation."""
+    fake_cls = _FakeMiniCls()
+    _patch_import(monkeypatch, fake_cls)
+    clock = _FakeClock(0.0)
+    holder = HeldMediaClient(now=clock)
+    assert holder.generation == 0
+    assert holder.warm_up() is True
+    assert holder.generation == 1
+    holder.drop("media-stale")
+    assert holder.generation == 1  # a drop is not a new client
+    clock.advance(3600.0)  # well past any retry backoff
+    assert holder.warm_up() is True
+    assert holder.generation == 2
+    holder.close()
