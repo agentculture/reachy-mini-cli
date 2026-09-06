@@ -1088,3 +1088,171 @@ def test_enroll_current_refuses_a_stale_unknown_face() -> None:
     )
     driver._last_unknown = ([0.1], float(driver._clock()) - 120.0)
     assert driver.enroll_current("Ori") == {"ok": False, "error": "no-recent-unknown-face"}
+
+# REACHY_FACE_DETECT_INTERVAL / REACHY_FACE_DETECT_MAX_WIDTH                  #
+# --------------------------------------------------------------------------- #
+
+
+class _FakeDetectAllEngine:
+    """A ``detect_all``-shaped engine recording the frame's shape it saw."""
+
+    def __init__(self, bbox_norm=(0.1, 0.2, 0.6, 0.8)) -> None:
+        self._bbox_norm = bbox_norm
+        self.frames = []
+
+    def detect_all(self, frame):
+        self.frames.append(frame)
+        detection = _FakeDetection([0.1, 0.2])
+        detection.bbox_norm = self._bbox_norm
+        return [detection]
+
+
+def test_detect_interval_from_env_defaults_when_unset() -> None:
+    assert FS.detect_interval_from_env(None) == FS.DEFAULT_DETECT_INTERVAL
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("1", 1.0),
+        ("0.25", 0.25),
+        ("  2.5  ", 2.5),
+    ],
+)
+def test_detect_interval_from_env_parses_a_positive_float(raw, expected) -> None:
+    assert FS.detect_interval_from_env(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["abc", "-1", "0", "", "   ", "nan", "inf"])
+def test_detect_interval_from_env_falls_back_to_default_on_garbage(raw) -> None:
+    assert FS.detect_interval_from_env(raw) == FS.DEFAULT_DETECT_INTERVAL
+
+
+def test_detect_interval_from_env_reads_the_real_os_environ_when_unset(monkeypatch) -> None:
+    monkeypatch.delenv("REACHY_FACE_DETECT_INTERVAL", raising=False)
+    assert FS.detect_interval_from_env() == FS.DEFAULT_DETECT_INTERVAL
+    monkeypatch.setenv("REACHY_FACE_DETECT_INTERVAL", "1.0")
+    assert FS.detect_interval_from_env() == 1.0
+
+
+def test_detect_max_width_from_env_defaults_when_unset() -> None:
+    assert FS.detect_max_width_from_env(None) == FS.DEFAULT_DETECT_MAX_WIDTH == 0
+
+
+@pytest.mark.parametrize("raw,expected", [("640", 640), ("1280", 1280), ("0", 0)])
+def test_detect_max_width_from_env_parses_a_non_negative_int(raw, expected) -> None:
+    assert FS.detect_max_width_from_env(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["abc", "-1", "", "   ", "3.5"])
+def test_detect_max_width_from_env_falls_back_to_default_on_garbage(raw) -> None:
+    assert FS.detect_max_width_from_env(raw) == FS.DEFAULT_DETECT_MAX_WIDTH
+
+
+def test_downscale_for_detection_resizes_a_wide_frame() -> None:
+    pytest.importorskip("cv2")
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    scaled = FS.downscale_for_detection(frame, 640)
+    assert scaled.shape == (360, 640, 3)
+
+
+@pytest.mark.parametrize("max_width", [0, None])
+def test_downscale_for_detection_is_identity_when_off(max_width) -> None:
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    result = FS.downscale_for_detection(frame, max_width)
+    assert result is frame
+
+
+def test_downscale_for_detection_is_identity_when_already_narrow_enough() -> None:
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    result = FS.downscale_for_detection(frame, 640)
+    assert result is frame
+    result_wider_cap = FS.downscale_for_detection(frame, 1280)
+    assert result_wider_cap is frame
+
+
+def test_downscale_for_detection_without_cv2_passes_through_unscaled(monkeypatch) -> None:
+    """If cv2 is missing, the frame passes through unscaled — never a raise."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_cv2(name, *args, **kwargs):
+        if name == "cv2":
+            raise ImportError("no module named cv2")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_cv2)
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    result = FS.downscale_for_detection(frame, 640)
+    assert result is frame
+
+
+def test_driver_with_detect_max_width_hands_the_engine_a_downscaled_frame() -> None:
+    """The engine sees a 640-wide frame, and the fake's normalised bbox survives unchanged."""
+    pytest.importorskip("cv2")
+    media = _FakeMedia([np.zeros((720, 1280, 3), dtype=np.uint8)])
+    engine = _FakeDetectAllEngine(bbox_norm=(0.1, 0.2, 0.6, 0.8))
+    driver = FaceSenseDriver(
+        media=media,
+        engine=engine,
+        store=_FakeStore(match=_FakeMatch("ada")),
+        detect_max_width=640,
+        start_worker=False,
+    )
+    _drive(driver, ticks=1, start=0.0)
+    driver._worker_tick()
+    _drive(driver, ticks=1, start=0.02)
+
+    assert engine.frames, "the engine never saw a frame"
+    assert engine.frames[0].shape == (360, 640, 3)
+    # bbox_norm is normalised to whatever frame the engine saw, so it is
+    # published unchanged — no rescaling back to the original 1280-wide frame.
+    assert driver.peek_face_bbox() == pytest.approx((0.1, 0.2, 0.5, 0.6))
+
+
+def test_driver_without_detect_max_width_hands_the_engine_the_full_frame() -> None:
+    """No knob set -> the engine sees exactly the frame read off the media client."""
+    media = _FakeMedia([np.zeros((720, 1280, 3), dtype=np.uint8)])
+    engine = _FakeDetectAllEngine()
+    driver = FaceSenseDriver(
+        media=media,
+        engine=engine,
+        store=_FakeStore(match=_FakeMatch("ada")),
+        start_worker=False,
+    )
+    _drive(driver, ticks=1, start=0.0)
+    driver._worker_tick()
+
+    assert engine.frames
+    assert engine.frames[0].shape == (720, 1280, 3)
+
+
+def test_behavior_command_passes_both_knobs_from_env(monkeypatch) -> None:
+    """The composition seam: both env knobs land on the constructed driver."""
+    monkeypatch.setenv("REACHY_FACE_DETECT_INTERVAL", "1.0")
+    monkeypatch.setenv("REACHY_FACE_DETECT_MAX_WIDTH", "640")
+    from reachy.behavior.face_sense import detect_interval_from_env, detect_max_width_from_env
+
+    assert detect_interval_from_env() == 1.0
+    assert detect_max_width_from_env() == 640
+
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        detect_interval=detect_interval_from_env(),
+        detect_max_width=detect_max_width_from_env(),
+        start_worker=False,
+    )
+    assert driver._detect_interval == 1.0
+    assert driver._detect_max_width == 640
+
+
+def test_behavior_command_construction_site_passes_both_knobs() -> None:
+    """Grep-assert the call site in behavior.py wires both knobs through."""
+    import inspect
+
+    from reachy.cli._commands import behavior as behavior_module
+
+    source = inspect.getsource(behavior_module)
+    assert "detect_interval=detect_interval_from_env()" in source
+    assert "detect_max_width=detect_max_width_from_env()" in source

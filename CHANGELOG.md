@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.1] - 2026-09-06
+
+### Added
+
+- **`REACHY_FACE_DETECT_INTERVAL` / `REACHY_FACE_DETECT_MAX_WIDTH`** — two opt-in throughput knobs for `FaceSenseDriver`, both env-driven and both defaulting to today's behaviour (0.5 s detections on the full frame) so nothing changes for an operator who never sets them. `DETECT_INTERVAL` widens the gap between detections; `DETECT_MAX_WIDTH` downscales the frame handed to the engine (aspect preserved) before detection — the published `face_bbox` needs no rescaling since it is normalised to the frame the engine saw, though the embedding is computed on the smaller frame, a real recognition-quality trade-off. Live on the CM4: once the camera delivered frames, the engine's tick rate fell from ~50 Hz to ~7 Hz running full-frame detection every 0.5 s.
+
 ## [0.52.0] - 2026-09-06
 
 ### Changed
