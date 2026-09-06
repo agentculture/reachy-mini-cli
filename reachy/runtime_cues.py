@@ -108,6 +108,11 @@ LOUD_RMS_THRESHOLD: float = 0.02
 PAT_KIND_PHRASE: dict[str, str] = {"scratch": "scratch", "side_pat": "sideways nudge"}
 PAT_LEVEL_INTENSITY: dict[str, str] = {"level1": "gentle", "level2": "firm"}
 
+#: Issue #177 — the closed-vocabulary cue for the ``name_mentioned`` sense
+#: field. Emitted only when the event's ``name_mentioned`` is true; a
+#: ``context``-only admission (no name in the utterance) never produces it.
+NAME_MENTIONED_CUE: str = "someone said my name"
+
 # ---------------------------------------------------------------------------
 # The two layer-authored line types (issue #155)
 # ---------------------------------------------------------------------------
@@ -182,7 +187,7 @@ def is_number(value: object) -> bool:
 
 
 def sense_cues(event: dict) -> list[str]:
-    """The shared ``sense`` cue core: speech/loud-sound, pat, face.
+    """The shared ``sense`` cue core: speech/loud-sound, name-mentioned, pat, face.
 
     Deliberately does NOT cover ``frame_available`` — see the module
     docstring's "what stays local" section.
@@ -196,6 +201,9 @@ def sense_cues(event: dict) -> list[str]:
         cues.append(f"speech from the {direction}" if direction else "speech nearby")
     elif is_number(rms) and rms >= LOUD_RMS_THRESHOLD:
         cues.append(f"loud sound {direction}" if direction else "loud sound nearby")
+
+    if event.get("name_mentioned"):
+        cues.append(NAME_MENTIONED_CUE)
 
     pat = event.get("pat")
     if isinstance(pat, (list, tuple)) and len(pat) == 2:
