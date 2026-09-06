@@ -721,3 +721,14 @@ def test_the_block_returned_for_the_state_write_is_the_same_dict_a_retained_mirr
     assert state[STATE_KEY] == block
     assert block["frame_available"]["live"] is True
     assert block["frame_available"]["last_frame_at"] == 500.0
+
+
+def test_a_pre_upgrade_senses_block_without_liveness_keys_is_compared_not_crashed():
+    """PR #187 review: a state.json persisted by an older runtime carries only
+    available/reason; the key must tolerate it or liveness is never written."""
+    from reachy.behavior.sense_availability import SenseAvailabilityDriver
+
+    key = SenseAvailabilityDriver._key(
+        {"face": {"available": True, "reason": None}, "junk": "not-a-dict"}
+    )
+    assert key == {"face": (True, None, None)}

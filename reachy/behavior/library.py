@@ -358,12 +358,14 @@ LIBRARY: dict[str, LibraryEntry] = {
                 "deg",
                 "camera horizontal field of view",
                 minimum=1.0,
+                maximum=180.0,
             ),
             "fov_v": Param(
                 face_lock_mod.VFOV_DEG,
                 "deg",
                 "camera vertical field of view",
                 minimum=1.0,
+                maximum=180.0,
             ),
             "damping": Param(
                 face_lock_mod.DAMPING,

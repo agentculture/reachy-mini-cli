@@ -262,12 +262,6 @@ def test_ensure_base_is_a_no_op_while_a_base_is_active():
     assert [ab.behavior.name for ab in engine.active] == [BASE_LAYER_NAME]
 
 
-def test_ensure_base_on_an_engine_that_never_seeded_a_base_seeds_one():
-    engine = Engine()
-    new_id = engine.ensure_base(0.0)
-    assert new_id is not None
-    assert _state(engine)["base_layer"]["seeded"] is True
-    assert len(_base_actives(engine)) == 1
 
 
 def test_every_real_re_seed_emits_exactly_one_senselog_line(caplog):
@@ -469,3 +463,11 @@ def test_the_un_stop_add_reaches_the_engine_through_the_spool_apply_path():
     assert result["ok"] is True
     assert len(_base_actives(engine)) == 1
     assert _state(engine)["base_layer"]["stopped_by"] is None
+
+
+def test_ensure_base_never_seeds_a_base_layer_the_configuration_switched_off():
+    """A ``--no-base-layer`` engine has no base layer to restore (PR #187 review)."""
+    engine = Engine()  # never seeded: EngineConfig(base_layer=False)'s shape
+    assert engine.ensure_base(1.0) is None
+    assert _base_actives(engine) == []
+    assert _state(engine)["base_layer"]["seeded"] is False
