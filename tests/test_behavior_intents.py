@@ -26,6 +26,7 @@ daemon, network, or LLM anywhere in this file.
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass, field
 
 import pytest
@@ -34,7 +35,7 @@ from reachy.behavior import control as control_mod
 from reachy.behavior import engine as E
 from reachy.behavior import library as behavior_library
 from reachy.behavior.control import CommandSpool, KindRegistry
-from reachy.behavior.engine import Engine, EngineConfig
+from reachy.behavior.engine import BASE_LAYER_NAME, Engine, EngineConfig
 from reachy.behavior.intents import (
     DECLARE_GOAL,
     INTENT_NAMESPACE,
@@ -62,10 +63,25 @@ class _RecordingCtx:
     admits: list = field(default_factory=list)
     evicts: list = field(default_factory=list)
     events: list = field(default_factory=list)
+    base_adds: list = field(default_factory=list)
+    base_ensured: list = field(default_factory=list)
     _active: set = field(default_factory=set)
 
     def emit(self, event: dict) -> None:
         self.events.append(event)
+
+    def add_base(self) -> dict:
+        """The engine's un-stop verb (an unbounded ``add`` of the base name)."""
+        self.base_adds.append(self.tick)
+        self._active.add(BASE_LAYER_NAME)
+        return {"ok": True, "op": "add", "id": "base:1", "name": BASE_LAYER_NAME}
+
+    def ensure_base(self) -> str | None:
+        if BASE_LAYER_NAME in self._active:
+            return None
+        self.base_ensured.append(self.tick)
+        self._active.add(BASE_LAYER_NAME)
+        return "base:1"
 
     def admit(self, behavior) -> dict:
         self.admits.append(behavior)
@@ -350,9 +366,14 @@ def test_run_behavior_refusal_emits_intent_blocked_not_applied(tmp_path) -> None
     assert applied == []
 
 
-@pytest.mark.parametrize("name", _LOOPING_DEFAULT_ENTRIES)
+@pytest.mark.parametrize("name", [n for n in _LOOPING_DEFAULT_ENTRIES if n != BASE_LAYER_NAME])
 def test_run_behavior_refuses_every_looping_default_entry_with_no_lifetime(tmp_path, name) -> None:
-    """Every looping-default library entry — not just nod — is caught."""
+    """Every looping-default library entry — not just nod — is caught.
+
+    ``feel-alive`` is the ONE carve-out (t11, #183 decision c38): an unbounded
+    ``run_behavior`` of the base-layer name is the un-stop verb, not an
+    unbounded admission. See the base-layer section at the end of this file.
+    """
     cmd_id = _submit(tmp_path, RUN_BEHAVIOR, name=name, params={}, lifetime=None)
     driver = IntentDriver(root=tmp_path)
     driver.on_tick(_RecordingCtx(now=1.0, tick=1))
@@ -909,3 +930,279 @@ def test_goal_re_admission_survives_an_external_eviction_over_a_real_run() -> No
     )
 
     assert "nod" in {ab.behavior.name for ab in eng.active}
+
+
+# --------------------------------------------------------------------------- #
+# t11 (#183): the base layer's inhibition EDGE, and the un-stop carve-out      #
+#                                                                             #
+# The bug is eviction BY INHIBITION: `_enforce_inhibitions` evicts `feel-alive`
+# while it is named, and nothing used to bring it back. So the driver tracks
+# the inhibited set tick over tick and re-seeds on the edge where the base name
+# LEAVES it — and only then. A by-name `stop feel-alive` is intentional
+# stillness: it holds until an unbounded `run_behavior feel-alive` (the un-stop
+# verb, carved out of the unbounded-lifetime refusal) or an engine restart.
+# --------------------------------------------------------------------------- #
+
+SENSE_LOGGER = "reachy.sense"
+
+
+class _Fan:
+    """Compose sibling seam drivers, in order, the way `_compose_run_seam` does."""
+
+    def __init__(self, *drivers):
+        self._drivers = drivers
+
+    def __call__(self, ctx):
+        for driver in self._drivers:
+            driver(ctx)
+
+
+class _Script:
+    """Run `actions[tick](ctx)` on the matching tick — a scripted sibling driver."""
+
+    def __init__(self, actions):
+        self._actions = actions
+
+    def __call__(self, ctx):
+        action = self._actions.get(ctx.tick)
+        if action is not None:
+            action(ctx)
+
+
+def _run_engine(engine, seam, ticks=12, sense=None):
+    return E.run(
+        _FakeTransport(),
+        EngineConfig(compose_hz=50, base_layer=True, settle=False),
+        sleep=lambda *_: None,
+        now=_Clock(),
+        max_ticks=ticks,
+        engine=engine,
+        control=CommandSpool(),
+        tick_seam=seam,
+        sense=sense,
+    )
+
+
+def _sense_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == SENSE_LOGGER]
+
+
+def _re_seed_lines(caplog):
+    return [line for line in _sense_lines(caplog) if "re-seeded (inhibition cleared)" in line]
+
+
+def _base_actives(engine):
+    return [ab for ab in engine.active if ab.is_base]
+
+
+def _base_block(engine):
+    return engine.state(1.0, EngineConfig())["base_layer"]
+
+
+def _set_inhibition(*names):
+    return lambda _ctx: control_mod.submit(
+        SET_INHIBITION, namespace=INTENT_NAMESPACE, behaviors=list(names)
+    )
+
+
+def test_the_base_layer_returns_on_the_tick_an_inhibition_naming_it_clears(caplog) -> None:
+    """Acceptance (a): set_inhibition(['feel-alive']) then set_inhibition([])
+    leaves feel-alive active with is_base=True, `stop all` keeps it, and the
+    re-seed names itself exactly once."""
+    control_mod.submit(SET_INHIBITION, namespace=INTENT_NAMESPACE, behaviors=[BASE_LAYER_NAME])
+    engine = Engine()
+    driver = IntentDriver()
+    script = _Script({6: _set_inhibition()})
+
+    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+        _run_engine(engine, _Fan(script, driver))
+
+    base = _base_actives(engine)
+    assert [ab.behavior.name for ab in base] == [BASE_LAYER_NAME]
+    assert _base_block(engine) == {"seeded": True, "active": True, "stopped_by": None}
+
+    engine.stop("all")  # the re-seeded id is a base id, so `stop all` keeps it
+    assert [ab.behavior.name for ab in engine.active] == [BASE_LAYER_NAME]
+
+    lines = _re_seed_lines(caplog)
+    assert len(lines) == 1
+    assert "stage=intent" in lines[0]
+    assert "source=set_inhibition" in lines[0]
+    assert f"event={BASE_LAYER_NAME}" in lines[0]
+
+
+def test_the_edge_re_seed_emits_one_intent_applied_event() -> None:
+    """The event half of the edge, mirroring `_sustain_goal`'s re-admit emit."""
+    events: list = []
+
+    ctx = _RecordingCtx(now=1.0, tick=1)
+    ctx.events = events
+    driver = IntentDriver()
+    driver.set_inhibitions([BASE_LAYER_NAME])
+    driver.on_tick(ctx)  # tick 1: inhibited (nothing active to evict)
+    driver.set_inhibitions([])
+    ctx.tick = 2
+    driver.on_tick(ctx)  # tick 2: the clearing edge
+
+    applied = [
+        e for e in events if e["type"] == "intent.applied" and e.get("behavior") == BASE_LAYER_NAME
+    ]
+    assert len(applied) == 1
+    assert applied[0]["kind"] == SET_INHIBITION
+    assert ctx.base_ensured == [2]
+
+
+def test_a_by_name_stop_of_the_base_layer_holds_through_an_inhibition_cycle() -> None:
+    """Acceptance (b): intentional stillness is never undone by the edge — a
+    `stop feel-alive`, then an inhibition naming it, then a clear, leaves the
+    base layer stopped and still attributed to the stop."""
+    engine = Engine()
+    driver = IntentDriver()
+    script = _Script(
+        {
+            2: lambda _ctx: engine.stop(BASE_LAYER_NAME),
+            3: _set_inhibition(BASE_LAYER_NAME),
+            8: _set_inhibition(),
+        }
+    )
+
+    _run_engine(engine, _Fan(script, driver), ticks=14)
+
+    assert _base_actives(engine) == []
+    assert _base_block(engine) == {"seeded": True, "active": False, "stopped_by": "stop"}
+
+
+def test_an_unbounded_spool_run_behavior_of_the_base_name_is_the_un_stop_verb() -> None:
+    """Acceptance (c): the carve-out reaches the engine's base re-seed path, so
+    a by-name stop is undone with is_base=True and the cause cleared."""
+    engine = Engine()
+    driver = IntentDriver()
+    script = _Script(
+        {
+            2: lambda _ctx: engine.stop(BASE_LAYER_NAME),
+            3: lambda _ctx: control_mod.submit(
+                RUN_BEHAVIOR,
+                namespace=INTENT_NAMESPACE,
+                name=BASE_LAYER_NAME,
+                params={},
+                lifetime=None,
+            ),
+        }
+    )
+
+    _run_engine(engine, _Fan(script, driver), ticks=10)
+
+    assert len(_base_actives(engine)) == 1
+    assert _base_block(engine) == {"seeded": True, "active": True, "stopped_by": None}
+
+
+def test_the_base_carve_out_routes_through_add_base_never_a_plain_admit(tmp_path) -> None:
+    cmd_id = _submit(tmp_path, RUN_BEHAVIOR, name=BASE_LAYER_NAME, params={}, lifetime=None)
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1)
+
+    driver.on_tick(ctx)
+
+    assert ctx.admits == []  # never an ordinary admission beside the base layer
+    assert ctx.base_adds == [1]
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is True
+    assert result["op"] == RUN_BEHAVIOR
+    assert result["name"] == BASE_LAYER_NAME
+
+
+def test_a_bounded_run_behavior_of_the_base_name_stays_an_ordinary_admission(tmp_path) -> None:
+    """Only the UNBOUNDED shape is the un-stop verb; with a duration it is a
+    plain bounded behavior, exactly as before."""
+    _submit(tmp_path, RUN_BEHAVIOR, name=BASE_LAYER_NAME, params={}, lifetime={"duration": 2})
+    driver = IntentDriver(root=tmp_path)
+    ctx = _RecordingCtx(now=1.0, tick=1)
+
+    driver.on_tick(ctx)
+
+    assert [b.name for b in ctx.admits] == [BASE_LAYER_NAME]
+    assert ctx.admits[0].lifetime == Lifetime(looping=True, duration=2.0)
+    assert ctx.base_adds == []
+
+
+def test_a_context_without_the_base_seam_refuses_the_un_stop_rather_than_admitting(
+    tmp_path,
+) -> None:
+    """Fail-closed: with no `add_base` capability on the context the carve-out is
+    a NAMED refusal, never a plain unbounded admission slipping through."""
+
+    class _NoBaseSeamCtx:
+        """A context predating the seam: admit/evict/emit only."""
+
+        now = 1.0
+        tick = 1
+
+        def __init__(self):
+            self.admits: list = []
+
+        def emit(self, event: dict) -> None:
+            pass
+
+        def admit(self, behavior) -> dict:
+            self.admits.append(behavior)
+            return {"ok": True, "op": "add", "id": behavior.id, "name": behavior.name}
+
+        def evict(self, target: str) -> dict:
+            return {"ok": True, "op": "stop", "target": target}
+
+        def active_names(self) -> set:
+            return set()
+
+    ctx = _NoBaseSeamCtx()
+    cmd_id = _submit(tmp_path, RUN_BEHAVIOR, name=BASE_LAYER_NAME, params={}, lifetime=None)
+    IntentDriver(root=tmp_path).on_tick(ctx)
+    result = control_mod.await_result(
+        cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
+    )
+    assert result["ok"] is False
+    assert BASE_LAYER_NAME in result["error"]
+    assert ctx.admits == []
+
+
+def test_a_lock_cycle_leaves_the_base_layer_active_at_the_end() -> None:
+    """Acceptance (d): a real FaceLockDriver lock/release cycle — with a mind's
+    own set_inhibition naming the base layer in the middle — ends with the base
+    layer active and unattributed.
+
+    Deliberately driven by `set_inhibition` rather than by `LOCK_INHIBITS`'
+    contents: today the lock inhibits `feel-alive` (so the base returns on the
+    release edge), and once task t10 lands it will not (so the base is never
+    evicted at all, and the mind's own clear is the edge). Both readings satisfy
+    this assertion.
+    """
+    from reachy.behavior.face_lock import LOCK_FACE, RELEASE_FACE, FaceLockDriver
+    from reachy.behavior.sense import Sense
+
+    engine = Engine()
+    intents = IntentDriver()
+    lock = FaceLockDriver(
+        inhibitions_getter=lambda: intents.inhibitions,
+        inhibitions_setter=intents.set_inhibitions,
+    )
+    lock.register_into(intents.registry)
+    intents.inhibition_observer = lock.notice_inhibition_replaced
+
+    def _submit_kind(kind):
+        return lambda _ctx: control_mod.submit(kind, namespace=INTENT_NAMESPACE)
+
+    script = _Script(
+        {
+            2: _submit_kind(LOCK_FACE),
+            5: _set_inhibition(BASE_LAYER_NAME),
+            9: _set_inhibition(),
+            12: _submit_kind(RELEASE_FACE),
+        }
+    )
+    sense = lambda _t: Sense(face_bbox=(0.4, 0.4, 0.2, 0.2), face_age_s=0.0)  # noqa: E731
+
+    _run_engine(engine, _Fan(script, intents, lock), ticks=18, sense=sense)
+
+    assert len(_base_actives(engine)) == 1
+    assert _base_block(engine) == {"seeded": True, "active": True, "stopped_by": None}

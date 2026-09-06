@@ -184,9 +184,9 @@ def test_stop_all_keeps_the_base_layer_and_records_no_cause():
 # --------------------------------------------------------------------------- #
 
 
-def test_ensure_base_restores_the_base_layer_after_a_stop_and_clears_the_cause():
+def test_ensure_base_restores_the_base_layer_after_an_inhibition_and_clears_the_cause():
     engine = _seeded_engine(energy=0.4)
-    engine.stop(BASE_LAYER_NAME)
+    engine.evict(BASE_LAYER_NAME)
     new_id = engine.ensure_base(2.0)
     assert new_id is not None
     assert _state(engine)["base_layer"] == {
@@ -196,6 +196,44 @@ def test_ensure_base_restores_the_base_layer_after_a_stop_and_clears_the_cause()
     }
     assert len(_base_actives(engine)) == 1
     assert _base_actives(engine)[0].behavior.id == new_id
+
+
+def test_ensure_base_refuses_after_a_by_name_stop_intentional_stillness_holds():
+    """t11 (#183 decision): a by-name stop is intentional stillness — it holds
+    until an unbounded ``add`` of the base name or a restart, so the edge
+    re-seed a clearing inhibition triggers must NOT undo it."""
+    engine = _seeded_engine(energy=0.4)
+    engine.stop(BASE_LAYER_NAME)
+    assert engine.ensure_base(2.0) is None
+    assert _state(engine)["base_layer"] == {
+        "seeded": True,
+        "active": False,
+        "stopped_by": "stop",
+    }
+    assert _base_actives(engine) == []
+
+
+def test_a_refused_ensure_base_names_itself_once_not_once_per_tick(caplog):
+    engine = _seeded_engine()
+    engine.stop(BASE_LAYER_NAME)
+    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+        for i in range(5):
+            assert engine.ensure_base(2.0 + i) is None
+    lines = _sense_lines(caplog)
+    assert len(lines) == 1
+    assert "base-layer-stopped" in lines[0]
+
+
+def test_an_un_stop_add_re_arms_the_refusal_report_for_the_next_stop(caplog):
+    """The at-most-once report is per stop EPISODE, not per process."""
+    engine = _seeded_engine()
+    engine.stop(BASE_LAYER_NAME)
+    engine.ensure_base(2.0)
+    engine.add(BASE_LAYER_NAME, {}, StopClass.PASSIVE, Lifetime(looping=True, duration=None), 3.0)
+    engine.stop(BASE_LAYER_NAME)
+    with caplog.at_level(logging.INFO, logger=SENSE_LOGGER):
+        assert engine.ensure_base(4.0) is None
+    assert len(_sense_lines(caplog)) == 1
 
 
 def test_the_re_seeded_base_layer_keeps_the_original_energy():
@@ -272,6 +310,36 @@ def test_the_tick_seam_exposes_ensure_base(caplog):
     )
     assert seen and seen[0] is not None
     assert len(_base_actives(engine)) == 1
+
+
+def test_the_tick_seam_exposes_add_base_the_un_stop_verb(caplog):
+    """t11: the seam a spool ``run_behavior feel-alive`` (no lifetime) routes
+    through — an explicit engine ``add`` of the un-stop shape, so it reaches
+    ``_add_base`` and clears a by-name stop that ``ensure_base`` refuses."""
+    engine = Engine()
+    seen: list = []
+
+    def seam(ctx):
+        if ctx.tick == 1:
+            engine.stop(BASE_LAYER_NAME)
+        elif ctx.tick == 2:
+            assert ctx.ensure_base() is None  # the stop holds
+            seen.append(ctx.add_base())
+
+    clock = iter([i * 0.02 for i in range(1, 200)])
+    engine_run(
+        _FakeTransport(),
+        EngineConfig(compose_hz=50.0, base_layer=True, settle=False),
+        sleep=lambda _s: None,
+        now=lambda: next(clock),
+        max_ticks=3,
+        engine=engine,
+        tick_seam=seam,
+    )
+    assert seen and seen[0]["ok"] is True
+    assert seen[0]["name"] == BASE_LAYER_NAME
+    assert len(_base_actives(engine)) == 1
+    assert _state(engine)["base_layer"]["stopped_by"] is None
 
 
 # --------------------------------------------------------------------------- #

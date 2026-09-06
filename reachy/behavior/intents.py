@@ -60,11 +60,13 @@ Standing goal semantics
   per its lifetime" only, exactly like a plain ``behavior run``. The RESULTING
   lifetime must be BOUNDED: ``looping=True`` with ``duration=None`` — whether
   from an explicit payload or silently from a looping-default library entry's
-  own defaults (``nod``, ``shake``, ``speak``, ``antenna-sway``, ``feel-alive``)
-  — is refused with a ``CliError`` naming the entry and the fix (pass an
-  explicit ``duration``, or choose a bounded behavior), so a one-time admission
-  can never hold its channel(s) forever with no standing-intent record to undo
-  it. See :func:`_validated_lifetime`.
+  own defaults (``nod``, ``shake``, ``speak``, ``antenna-sway``) — is refused
+  with a ``CliError`` naming the entry and the fix (pass an explicit
+  ``duration``, or choose a bounded behavior), so a one-time admission can never
+  hold its channel(s) forever with no standing-intent record to undo it. The ONE
+  carve-out is ``feel-alive``: unbounded means the base layer's UN-STOP verb,
+  routed to ``ctx.add_base`` (see :func:`_validated_lifetime` and
+  :meth:`IntentDriver._un_stop_base`).
 * ``declare_goal`` — a STANDING admission: the driver remembers the (name,
   params) pair and, every tick, re-admits it (``looping=True, duration=None`` —
   indefinite) whenever it is missing from ``ctx.active_names()`` and not
@@ -75,7 +77,11 @@ Standing goal semantics
   admits it with no further agent call.
 * ``set_inhibition`` — REPLACES the full inhibited set (an empty list clears
   it). Every tick, any inhibited behavior found in ``ctx.active_names()`` (from
-  any source — a rule, a prior intent, ...) is evicted immediately.
+  any source — a rule, a prior intent, ...) is evicted immediately. And on the
+  tick where the BASE LAYER's name leaves that set, the driver calls
+  ``ctx.ensure_base()`` exactly once (#183): eviction by inhibition is the one
+  removal a clearing edge is expected to undo. See
+  :meth:`IntentDriver._check_base_layer_edge`.
 * ``set_mode`` — calls an injected ``mode_setter(name)`` callback (typically
   :meth:`reachy.behavior.rule_engine.RuleEngine.set_active_mode`); with no
   callback wired the driver still records the mode for ``state.json`` but has
@@ -85,6 +91,11 @@ Observability: every applied/blocked command emits a ``ctx.emit`` event
 (``intent.applied`` / ``intent.blocked``) for the export feed, and a
 ``[SENSE stage=intent ...]`` line via :mod:`reachy.senselog`, mirroring
 :mod:`reachy.behavior.rule_engine`'s own observability contract.
+
+The one import of :mod:`reachy.behavior.engine` is the NAME constant
+``BASE_LAYER_NAME`` — the base layer's identity is the engine's, and a second
+spelling of ``"feel-alive"`` here would be a second thing to drift. The
+dependency runs one way still (the engine imports nothing from this module).
 
 Pure standard library plus in-package imports; nothing here touches a network,
 an LLM, or ``reachy_mini``.
@@ -100,6 +111,7 @@ from reachy import senselog
 from reachy.behavior import control as control_mod
 from reachy.behavior import gaze
 from reachy.behavior import library as behavior_library
+from reachy.behavior.engine import BASE_LAYER_NAME
 from reachy.behavior.model import Lifetime
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 
@@ -212,6 +224,16 @@ def _validated_lifetime(entry, raw: dict | None) -> Lifetime:
     payload at all) — the *resulting* shape is what is checked, not its origin.
     A bounded result — ``looping=False`` with a positive duration, or
     ``looping=True`` WITH a positive duration — is admitted exactly as before.
+
+    **One carve-out: the base layer name** (#183 decision c38). An UNBOUNDED
+    ``run_behavior`` of :data:`~reachy.behavior.engine.BASE_LAYER_NAME` is not an
+    unbounded admission at all — it is the UN-STOP verb, the spool twin of
+    ``behavior run feel-alive`` with no lifetime flag, and the engine routes that
+    exact shape to its base re-seed path (:meth:`reachy.behavior.engine.Engine.add`).
+    Refusing it would leave a by-name ``stop feel-alive`` with no way back short
+    of an engine restart. Every other looping-default entry (``nod`` / ``shake``
+    / ``speak`` / ``antenna-sway`` / ``orient-to-sound`` / ``face-lock``) stays
+    refused, and ``feel-alive`` WITH a duration is an ordinary bounded run.
     """
     raw = raw or {}
     looping = raw.get("looping", entry.looping)
@@ -224,6 +246,8 @@ def _validated_lifetime(entry, raw: dict | None) -> Lifetime:
             message=f"{entry.name}: invalid lifetime: {'; '.join(problems)}",
             remediation="duration must be > 0",
         )
+    if lifetime.looping and lifetime.duration is None and entry.name == BASE_LAYER_NAME:
+        return lifetime  # the un-stop verb, not an unbounded admission
     if lifetime.looping and lifetime.duration is None:
         raise CliError(
             code=EXIT_USER_ERROR,
@@ -241,6 +265,17 @@ def _validated_lifetime(entry, raw: dict | None) -> Lifetime:
 # --------------------------------------------------------------------------- #
 # The intent driver — a per-tick seam driver                                  #
 # --------------------------------------------------------------------------- #
+
+
+def _is_base_un_stop(name: str, lifetime: Lifetime) -> bool:
+    """Whether this ``run_behavior`` is the base layer's un-stop verb.
+
+    The same predicate :meth:`reachy.behavior.engine.Engine._is_base_re_seed`
+    applies engine-side; stated here too because this module must decide which
+    seam to reach BEFORE building a behavior, and the two surfaces
+    (``behavior run feel-alive`` and a spool ``run_behavior``) must agree.
+    """
+    return name == BASE_LAYER_NAME and lifetime.looping and lifetime.duration is None
 
 
 class IntentDriver:
@@ -315,6 +350,13 @@ class IntentDriver:
         self.inhibition_observer = inhibition_observer
         self._goal: dict | None = None  # {"name": str, "params": dict}
         self._inhibitions: frozenset[str] = frozenset()
+        #: The inhibited set as of the END of the previous tick — the only state
+        #: the base-layer EDGE needs. Comparing sets per tick (rather than
+        #: hooking one command handler) means EVERY path that drops the base
+        #: name counts: a spool ``set_inhibition`` with an empty list, one with a
+        #: list that simply omits it, and the in-process
+        #: :meth:`set_inhibitions` a lock's release calls.
+        self._previous_inhibitions: frozenset[str] = frozenset()
         self._mode: str | None = None
         self._seq = 0
         self.registry = registry
@@ -438,6 +480,8 @@ class IntentDriver:
                 }
             params.update(baked)
         lifetime = _validated_lifetime(entry, payload.get("lifetime"))
+        if _is_base_un_stop(name, lifetime):
+            return self._un_stop_base(ctx)
         self._seq += 1
         behavior_id = f"{_ID_PREFIX}:run:{name}:{self._seq}"
         beh = self._lib.build(name, params, entry.default_class, lifetime, behavior_id)
@@ -506,6 +550,7 @@ class IntentDriver:
     # -- continuous enforcement (every tick, no spool command needed) -------- #
 
     def _enforce_inhibitions(self, ctx) -> None:
+        self._check_base_layer_edge(ctx)
         if not self._inhibitions:
             return
         active = ctx.active_names()
@@ -516,6 +561,65 @@ class IntentDriver:
                 self._emit(
                     ctx, EVENT_BLOCKED, kind=SET_INHIBITION, behavior=name, reason="inhibited"
                 )
+
+    def _check_base_layer_edge(self, ctx) -> None:
+        """Re-seed the base layer on the tick an inhibition naming it CLEARS.
+
+        The #183 bug is eviction BY INHIBITION: ``_enforce_inhibitions`` evicts
+        ``feel-alive`` for as long as it is named, and before this nothing put it
+        back — the robot stayed still for the life of the process. So the edge,
+        and ONLY the edge, re-seeds: while the name is still in the set the
+        eviction below is doing its job, and a by-name ``behavior stop
+        feel-alive`` is intentional stillness the engine's own
+        :meth:`reachy.behavior.engine.Engine.ensure_base` refuses to undo (this
+        driver deliberately does not second-guess that refusal — the engine owns
+        the removal cause).
+        """
+        previous, self._previous_inhibitions = self._previous_inhibitions, self._inhibitions
+        if BASE_LAYER_NAME not in previous or BASE_LAYER_NAME in self._inhibitions:
+            return
+        ensure = getattr(ctx, "ensure_base", None)
+        if ensure is None:
+            return
+        base_id = ensure()
+        if base_id is None:
+            return  # already active, or held still by a by-name stop
+        senselog.stage(STAGE, SET_INHIBITION, BASE_LAYER_NAME, "re-seeded (inhibition cleared)")
+        self._emit(
+            ctx,
+            EVENT_APPLIED,
+            kind=SET_INHIBITION,
+            behavior=BASE_LAYER_NAME,
+            reason="re-seed",
+            id=base_id,
+        )
+
+    def _un_stop_base(self, ctx) -> dict:
+        """Route an unbounded ``run_behavior feel-alive`` to the engine's base add.
+
+        NOT ``ctx.admit``: that would put an ordinary ``feel-alive`` copy BESIDE
+        the base layer (``is_base=False``, absent from the engine's ``_base_ids``,
+        so ``stop all`` would sweep it away) — a robot that looks alive until the
+        next stop-all and a base layer still reported stopped. ``ctx.add_base``
+        is the engine's own un-stop verb, the same path
+        ``behavior run feel-alive`` takes. A context predating that seam refuses
+        fail-closed rather than falling back to a plain admission.
+        """
+        add_base = getattr(ctx, "add_base", None)
+        if add_base is None:
+            return {
+                "ok": False,
+                "op": RUN_BEHAVIOR,
+                "name": BASE_LAYER_NAME,
+                "error": (
+                    f"{BASE_LAYER_NAME}: this engine exposes no base-layer seam "
+                    "(no ctx.add_base), so the un-stop cannot be applied"
+                ),
+            }
+        result = dict(add_base())
+        result["op"] = RUN_BEHAVIOR
+        result.setdefault("name", BASE_LAYER_NAME)
+        return result
 
     def _sustain_goal(self, ctx) -> None:
         if self._goal is None:
