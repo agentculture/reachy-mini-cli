@@ -320,7 +320,9 @@ def test_engine_status_json_reports_the_running_engines_names(monkeypatch, capsy
     assert payload["names"] == [*rules_mod.SHIPPED_NAMES, "mimi"]
 
 
-def test_a_stopped_engines_leftover_state_is_not_reported_as_live_names(monkeypatch, capsys) -> None:
+def test_a_stopped_engines_leftover_state_is_not_reported_as_live_names(
+    monkeypatch, capsys
+) -> None:
     """state.json outlives a stopped/crashed engine until the next run resets the
     spool — a published list is proof of nothing unless the process is alive."""
     _write_overlay(CONFIGURED)

@@ -124,9 +124,9 @@ the (separate, dependent) rules evaluator.
 
 from __future__ import annotations
 
-import re
 import logging
 import math
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field

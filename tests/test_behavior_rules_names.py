@@ -14,11 +14,14 @@ default, and nothing under ``reachy/`` spells it.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from dataclasses import field as _field
 from pathlib import Path
 
 import pytest
 
 from reachy.behavior import rules as rules_mod
+from reachy.behavior.rule_engine import RuleEngine, _field_present, _field_value
 from reachy.behavior.rules import (
     MAX_CONFIGURED_NAMES,
     MIN_NAME_LENGTH,
@@ -27,6 +30,7 @@ from reachy.behavior.rules import (
     load_rules,
     merge_rules,
 )
+from reachy.behavior.sense import Sense
 from reachy.cli._errors import CliError
 from reachy.speech.name_match import SHIPPED_NAMES
 
@@ -210,11 +214,6 @@ def test_rules_does_not_respell_the_shipped_pair() -> None:
 # Review findings on PR #182 — the field must be READ, not only declared       #
 # --------------------------------------------------------------------------- #
 
-from dataclasses import dataclass, field as _field  # noqa: E402
-
-from reachy.behavior.rule_engine import RuleEngine, _field_present, _field_value  # noqa: E402
-from reachy.behavior.sense import Sense  # noqa: E402
-
 
 @dataclass
 class _RecordingCtx:
@@ -264,7 +263,9 @@ def test_a_rule_keyed_on_name_mentioned_fires_and_only_on_that_tick() -> None:
         }
     )
     engine = RuleEngine(cfg)
-    named = _RecordingCtx(now=0.25, tick=1, sense=Sense(name_mentioned=True, transcript="reachy hi"))
+    named = _RecordingCtx(
+        now=0.25, tick=1, sense=Sense(name_mentioned=True, transcript="reachy hi")
+    )
     engine.on_tick(named)
     assert [b.name for b in named.admits] == ["thoughtful"]
 
