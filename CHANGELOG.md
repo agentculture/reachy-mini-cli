@@ -50,6 +50,13 @@ The September-6 face/lock/camera arc — six issues, one PR
   (#97) turned the wander into slew-class steps; detection was blocked most of
   the time and every `lock_face` was refused `no face known` while YuNet found
   the operator in 12 of 14 clip frames at score 0.9 (deviation d6).
+- **`face-lock` and `look-at-face` pitch sign was inverted** — `+pitch` is
+  chin-DOWN (the SDK's `create_head_pose` is scipy `from_euler("xyz")` in an
+  x-forward, z-up frame; `expressions.toml` says `+ = chin-down`), yet both
+  planners, their docstrings and their tests assumed `+pitch` was up, so a
+  face above the camera was aimed at with `pitch=+12` and the head dipped
+  AWAY from it ("it looks down when I ask it to look at me"). Flipped in both
+  planners and in the test suite's pinhole simulator (deviation d7).
 - `face-lock` anti-windup + recover-to-neutral: an outward push is admitted
   only while the offset shrinks, and after 3 s of true absence the head eases
   back to neutral at 30 deg/s — the incremental aim had run to the clamp and

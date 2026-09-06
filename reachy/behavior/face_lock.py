@@ -329,9 +329,13 @@ class FaceLockGaze:
     angle then eases toward the target at :data:`SLEW_DEG_S`. The sign
     convention is the repo's and is unchanged: ``+yaw`` is LEFT
     (:func:`reachy.behavior.sense.doa_angle_to_yaw`), so a face at large ``x``
-    (the robot's right) yields a negative yaw; ``+pitch`` is up
-    (``thoughtful``'s "upward/forward tilt"), so a face at small ``y`` yields a
-    positive pitch.
+    (the robot's right) yields a negative yaw; ``+pitch`` is CHIN-DOWN (the SDK
+    builds head poses with ``from_euler("xyz")`` in an x-forward, z-up frame,
+    and ``expressions.toml`` says ``+ = chin-down``), so a face at small ``y``
+    — above the camera axis — yields a NEGATIVE pitch. This module and
+    :mod:`reachy.behavior.gaze` shipped with that sign inverted, believing
+    ``+pitch`` was up, until the 2026-09-06 live retest caught the head dipping
+    away from every face above it (deviation d7).
 
     What this replaces, and why: the previous target was ABSOLUTE
     (``-(cx-0.5) * 2 * gain``), which is a proportional loop with gain
@@ -450,7 +454,14 @@ class FaceLockGaze:
                 base_yaw, base_pitch = self._base_at(capture)
                 cx, cy = centre
                 new_yaw = _clamp(base_yaw - (cx - 0.5) * fov_h * damping, max_yaw)
-                new_pitch = _clamp(base_pitch - (cy - 0.5) * fov_v * damping, max_pitch)
+                # +pitch is CHIN-DOWN (the SDK builds head poses with
+                # scipy `from_euler("xyz")` in an x-forward, z-up frame, so a
+                # positive rotation about y tips the nose down; expressions.toml
+                # says the same). A face LOW in the frame (cy > 0.5) therefore
+                # needs a POSITIVE pitch. Shipped inverted until the 2026-09-06
+                # live retest (deviation d7): the head dipped away from every
+                # face above it.
+                new_pitch = _clamp(base_pitch + (cy - 0.5) * fov_v * damping, max_pitch)
                 admitted = self._admit_target(new_yaw, new_pitch, cx, cy)
                 if admitted:
                     self._target_yaw = new_yaw
