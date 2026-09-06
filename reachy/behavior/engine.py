@@ -255,6 +255,12 @@ class Engine:
         restart. The refusal names itself once per stop episode rather than once
         per call, since a rider may ask on every inhibition cycle.
         """
+        if not self._base_seeded:
+            # A base layer the CONFIGURATION never seeded (`--no-base-layer`,
+            # `EngineConfig(base_layer=False)`) is not a base layer that was
+            # evicted: the inhibition edge must not conjure the motion the
+            # operator switched off. Silent — there is no episode to name.
+            return None
         if self._base_stopped_by == STOPPED_BY_STOP:
             if not self._base_stop_reported:
                 self._base_stop_reported = True

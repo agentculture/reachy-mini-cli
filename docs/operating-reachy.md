@@ -1359,9 +1359,12 @@ while the detector ran continuously, and a mid-slew frame is motion-blurred
 finishes. So the face worker now detects **only while the commanded head pose
 is still**:
 
-- Submission stops the moment the head starts moving (a peek at the same
-  self-motion latch `rms_sense`'s moving floor already consumes — no new
-  sensor), and stays stopped until `DEFAULT_STILL_SETTLE_S` (0.5 s) of
+- Submission stops the moment the head starts a slew-class move — a second
+  self-motion latch of the gate's own, tripping above
+  `DEFAULT_GATE_EPS_DEG_S` (20 °/s, env `REACHY_FACE_GATE_EPS_DEG_S`), not
+  the mic's fine 1.75 °/s one: live, sharing the mic's latch let the base
+  layer's ~2.7 °/s gaze wander starve detection for 18 s stretches and every
+  `lock_face` answered `no face known` — and stays stopped until `DEFAULT_STILL_SETTLE_S` (0.5 s) of
   stillness has passed after the slew ends. That settle time is an
   **unmeasured, defensible default** — one 30 fps camera frame's worth of
   buffer plus margin — not yet checked against the real optics on a box.

@@ -1014,3 +1014,14 @@ def test_claude_md_names_one_inhibited_behavior() -> None:
     text = (Path(__file__).resolve().parents[1] / "CLAUDE.md").read_text(encoding="utf-8")
     assert "(`feel-alive`, `orient-to-sound` — the two behaviors that would drag" not in text
     assert "the antennas keep swaying" in text
+
+
+def test_fov_params_refuse_an_impossible_camera_angle():
+    """PR #187 review: a FOV above 180 deg would scale the aim past any real lens."""
+    from reachy.behavior import library as lib
+
+    entry = lib.get("face-lock")
+    for name in ("fov_h", "fov_v"):
+        assert entry.params[name].maximum == 180.0
+        with pytest.raises(Exception):
+            lib.validate_param_value(entry, name, 181.0)

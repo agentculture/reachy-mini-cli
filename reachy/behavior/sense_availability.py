@@ -460,9 +460,14 @@ class SenseAvailabilityDriver:
     @staticmethod
     def _key(block: dict) -> dict[str, tuple]:
         """The (available, reason, live) triple per sense — see ``_last_key``."""
+        # ``.get``: a ``senses`` block persisted by a runtime from BEFORE the
+        # liveness keys existed (an upgrade over a live state.json) carries only
+        # ``available``/``reason``; indexing would raise, be swallowed by
+        # ``__call__``, and leave liveness unwritten for the whole run.
         return {
-            name: (entry["available"], entry["reason"], entry["live"])
+            name: (entry.get("available"), entry.get("reason"), entry.get("live"))
             for name, entry in block.items()
+            if isinstance(entry, dict)
         }
 
     def _publish(self) -> None:

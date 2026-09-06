@@ -66,6 +66,8 @@ from reachy.behavior.excited_motion_probe import (
 )
 from reachy.behavior.face_lock import FaceLockDriver
 from reachy.behavior.face_sense import (
+    DEFAULT_GATE_EPS_DEG_S,
+    GATE_EPS_ENV,
     FaceSenseDriver,
     build_face_recognition,
     detect_interval_from_env,
@@ -1369,6 +1371,21 @@ def _pat_detector() -> PatDetector | None:
     )
 
 
+def _make_face_motion(compose_hz: float) -> SelfMotionDriver:
+    """Build the face gate's OWN self-motion latch, at slew speed (#179).
+
+    A second :class:`SelfMotionDriver` instance, not the mic's: the mic's latch
+    trips at 1.75 deg/s so a 2 deg/s wander reads as actuator noise, while the
+    face gate must ignore exactly that wander (``feel-alive`` peaks ~2.7 deg/s)
+    and trip only on a slew-class move — see
+    :data:`~reachy.behavior.face_sense.DEFAULT_GATE_EPS_DEG_S`. The env value
+    is deg/s; the driver wants deg/tick, so it is divided by the tick rate here.
+    """
+    eps_deg_s = _pat_float_env(GATE_EPS_ENV, DEFAULT_GATE_EPS_DEG_S)
+    per_tick = max(0.0, float(eps_deg_s)) / max(1.0, float(compose_hz))
+    return SelfMotionDriver(eps_deg=per_tick, eps_mm=per_tick, tail_s=DEFAULT_TAIL_S)
+
+
 def _make_self_motion() -> SelfMotionDriver:
     """Build the self-motion latch (#95), honouring its env tuning.
 
@@ -2371,7 +2388,7 @@ def _compose_run_seam(
     Act-in seams (the ONE TickBus, in driver order)
     -----------------------------------------------
     ``[rules_driver, intent_driver, face_lock_driver, pat_driver,
-    transcript_driver, face_driver, self_motion, holder, goto_lane,
+    transcript_driver, face_driver, self_motion, face_motion, holder, goto_lane,
     availability, names_publisher, clip_rider]`` (with a
     :class:`SenseSnapshotDriver` appended when exporting):
 
@@ -2524,6 +2541,11 @@ def _compose_run_seam(
         # because two consumers peek it: the rms provider below (the moving
         # floor) and, since #179, the face driver's still-only detection gate.
         self_motion = _make_self_motion()
+        # The face gate's latch is a SECOND instance at slew speed (20 deg/s),
+        # never the mic's fine one: live, the base layer's ~2.7 deg/s wander
+        # tripped the mic's latch and starved detection (no face was ever
+        # known while the robot idled). Both read ctx.pose; both ride the bus.
+        face_motion = _make_face_motion(config.compose_hz)
         face_driver = FaceSenseDriver(
             media=media,
             engine=recognition[0] if recognition is not None else None,
@@ -2535,7 +2557,7 @@ def _compose_run_seam(
             # through its own slew instead of none (`lock_held` is late-bound:
             # the lock driver is constructed further down, and a peek before
             # then reads "no lock", never raises — `_peek` degrades).
-            moving=self_motion.is_moving,
+            moving=face_motion.is_moving,
             lock_held=lambda: bool(face_lock_driver is not None and face_lock_driver.locked),
             # #176: a camera that goes SILENT (frames stop while the client still
             # claims connected + camera-available) is handed back from the TICK
@@ -2806,6 +2828,7 @@ def _compose_run_seam(
                 transcript_driver,
                 face_driver,
                 self_motion,
+                face_motion,
                 holder,
                 goto_lane,
                 availability,
