@@ -3168,13 +3168,13 @@ def test_composition_gives_the_attention_gate_the_configured_names(monkeypatch):
 
 
 def test_a_malformed_names_overlay_falls_back_to_the_shipped_names_and_says_so(monkeypatch):
-    monkeypatch.setattr(agent_mod, "_default_rules_loader", _refuse)
     """A typo in a config file must not take the robot's ear away silently."""
     from reachy.speech.name_match import SHIPPED_NAMES
 
     def _refuse() -> object:
         raise CliError(code=1, message="'names' must be a list of strings (got 3)")
 
+    monkeypatch.setattr(agent_mod, "_default_rules_loader", _refuse)
     sink = _Sink()
     layer, _args, _sink = _compose(
         sink=sink,
