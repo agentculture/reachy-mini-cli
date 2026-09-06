@@ -593,3 +593,155 @@ class TestWindowing:
         backend.reset()  # a real wake → clear so we don't immediately re-fire on stale audio
         assert backend._transcriber._buffered == 0
         assert backend._transcriber._last_post is None
+
+
+# ---------------------------------------------------------------------------
+# #177 t6 — one "hey <name>" per configured name
+# ---------------------------------------------------------------------------
+#
+# The box configures the names ONCE, in the rules overlay, and the wake path
+# reads the same list every other ear does. "nova" is not a shipped name (it is
+# a mesh peer's); it appears here only as a value an operator configured.
+
+
+class TestConfiguredWakePhrases:
+    """Wake phrases are derived from the names, with the generic one excluded."""
+
+    def test_shipped_default_is_exactly_hey_reachy(self, monkeypatch):
+        from reachy.sleep import wakeword
+
+        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
+        assert wakeword.DEFAULT_PHRASES == ("hey reachy",)
+        assert wakeword.DEFAULT_PHRASE == "hey reachy"
+        assert wakeword._resolve_phrases() == ("hey reachy",)
+
+    def test_one_phrase_per_configured_name_except_the_generic_one(self, monkeypatch):
+        from reachy.sleep import wakeword
+
+        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
+        assert wakeword._resolve_phrases(names=("reachy", "robot", "nova")) == (
+            "hey reachy",
+            "hey nova",
+        )
+
+    def test_an_explicit_phrase_selects_exactly_one(self, monkeypatch):
+        from reachy.sleep import wakeword
+
+        monkeypatch.setenv("REACHY_STT_PHRASE", "yo robot")
+        assert wakeword._resolve_phrases("hey bob", names=("reachy", "nova")) == ("hey bob",)
+
+    def test_the_env_var_selects_exactly_one(self, monkeypatch):
+        from reachy.sleep import wakeword
+
+        monkeypatch.setenv("REACHY_STT_PHRASE", "yo robot")
+        assert wakeword._resolve_phrases(names=("reachy", "nova")) == ("yo robot",)
+
+    def test_no_usable_name_falls_back_rather_than_going_deaf(self, monkeypatch):
+        from reachy.sleep import wakeword
+
+        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
+        assert wakeword._resolve_phrases(names=()) == wakeword.DEFAULT_PHRASES
+        assert wakeword._resolve_phrases(names=("robot", "  ")) == wakeword.DEFAULT_PHRASES
+
+    def test_the_backend_matches_any_configured_phrase(self, monkeypatch):
+        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
+        backend = _nowindow(names=("reachy", "robot", "nova"))
+
+        assert backend.phrases == ("hey reachy", "hey nova")
+        assert backend.phrase == "hey reachy"  # back-compat single view
+        assert backend._matches({"text": "ok hey nova wake up"}) is True
+        assert backend._matches({"text": "hey reachy are you there"}) is True
+        assert backend._matches({"text": "hey robot over there"}) is False
+        assert backend._matches({"phrase": "hey nova"}) is True
+        assert backend._matches({"phrase": "hey robot"}) is False
+
+
+class TestWakeDetectorPhrases:
+    """The Tier-2 phrases WakeDetector actually listens for."""
+
+    def test_the_detector_wakes_to_every_configured_name_but_not_the_generic_one(self, monkeypatch):
+        from reachy.sleep.wake import WakeDetector
+
+        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
+        detector = WakeDetector(wake_word_enabled=True, names=("reachy", "robot", "nova"))
+        backend = detector._backend
+
+        assert detector.wake_phrases == ("hey reachy", "hey nova")
+        assert backend._matches({"text": "hey reachy"}) is True
+        assert backend._matches({"text": "hey nova"}) is True
+        assert backend._matches({"text": "hey robot"}) is False
+
+    def test_the_shipped_detector_listens_for_hey_reachy_only(self, monkeypatch):
+        from reachy.sleep.wake import WakeDetector
+
+        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
+        assert WakeDetector(wake_word_enabled=True).wake_phrases == ("hey reachy",)
+
+    def test_an_explicit_phrase_is_the_only_phrase(self, monkeypatch):
+        from reachy.sleep.wake import WakeDetector
+
+        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
+        detector = WakeDetector(wake_word_enabled=True, phrase="hey bob", names=("reachy", "nova"))
+
+        assert detector.wake_phrases == ("hey bob",)
+        assert detector._backend._matches({"text": "hey bob"}) is True
+        assert detector._backend._matches({"text": "hey reachy"}) is False
+
+    def test_a_disabled_tier2_has_no_phrases(self):
+        from reachy.sleep.wake import WakeDetector
+
+        assert WakeDetector().wake_phrases == ()
+
+
+class TestSleepCommandThreadsTheNames:
+    """``sleep run``'s factory reads the box's rules overlay for the names."""
+
+    def test_the_factory_threads_the_configured_names(self, monkeypatch):
+        import argparse
+
+        from reachy.cli._commands import sleep as sleep_cmd
+
+        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
+        args = argparse.Namespace(wake_word=True, wake_word_kind="http", wake_phrase=None)
+        factory = sleep_cmd._make_wake_detector_factory(
+            args,
+            rules_loader=lambda: argparse.Namespace(names=("reachy", "robot", "nova")),
+        )
+
+        assert factory().wake_phrases == ("hey reachy", "hey nova")
+
+    def test_a_refused_overlay_falls_back_to_the_shipped_names(self, monkeypatch, caplog):
+        import argparse
+        import logging
+
+        from reachy.cli._commands import sleep as sleep_cmd
+        from reachy.cli._errors import CliError
+
+        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
+
+        def _refuse():
+            raise CliError(code=1, message="'names' must be a list of strings")
+
+        args = argparse.Namespace(wake_word=True, wake_word_kind="http", wake_phrase=None)
+        with caplog.at_level(logging.INFO, logger="reachy.sense"):
+            factory = sleep_cmd._make_wake_detector_factory(args, rules_loader=_refuse)
+
+        assert factory().wake_phrases == ("hey reachy",)
+        assert "names-overlay-refused" in caplog.text
+
+    def test_no_overlay_is_read_when_tier2_is_off_or_a_phrase_is_explicit(self):
+        """``sleep demo`` needs no state dir: don't touch the overlay for nothing."""
+        import argparse
+
+        from reachy.cli._commands import sleep as sleep_cmd
+
+        def _explode():
+            raise AssertionError("the overlay must not be read here")
+
+        off = argparse.Namespace(wake_word=False, wake_word_kind="http", wake_phrase=None)
+        sleep_cmd._make_wake_detector_factory(off, rules_loader=_explode)
+
+        explicit = argparse.Namespace(wake_word=True, wake_word_kind="http", wake_phrase="hey bob")
+        assert sleep_cmd._make_wake_detector_factory(
+            explicit, rules_loader=_explode
+        )().wake_phrases == ("hey bob",)

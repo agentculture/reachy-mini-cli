@@ -421,10 +421,45 @@ def test_the_gate_uses_the_pure_name_matcher_and_no_language_model() -> None:
 
 
 def test_the_layer_answers_to_the_same_names_the_runtime_gate_does() -> None:
-    """One robot, one set of names — a drift guard, since the tuple is duplicated."""
+    """One robot, one set of names — and since #177 there is one TUPLE too.
+
+    Both names are now aliases of ``reachy.speech.name_match.SHIPPED_NAMES``,
+    the ONE place the shipped pair is spelled, so this is no longer a guard
+    against two hand-copied tuples drifting apart but a guard against either
+    one being re-hardcoded back into a copy.
+    """
     from reachy.speech.engagement import DEFAULT_NAMES as RUNTIME_NAMES
+    from reachy.speech.name_match import SHIPPED_NAMES
 
     assert DEFAULT_NAMES == RUNTIME_NAMES
+    assert DEFAULT_NAMES == SHIPPED_NAMES
+    assert RUNTIME_NAMES == SHIPPED_NAMES
+
+
+def test_the_gate_answers_to_the_operators_configured_names() -> None:
+    """A configured name is a name the gate opens on — the point of #177.
+
+    ``nova`` is NOT shipped (it is a mesh peer's name); it appears here only as
+    a value an operator configured, exactly as ``tests/test_name_match.py``
+    uses it.
+    """
+    gate = AttentionGate(window_s=20.0, clock=_Clock())
+    gate.set_names(("reachy", "robot", "nova"))
+
+    assert gate.names == ("reachy", "robot", "nova")
+    assert gate.decide("nova, are you there?").admitted
+    assert gate.decide("what time is it").admitted  # warm now
+
+
+def test_setting_no_names_leaves_the_gate_answering_to_the_shipped_pair() -> None:
+    """Fail-closed: an empty/blank names list must not make the robot deaf."""
+    gate = AttentionGate(window_s=20.0, clock=_Clock())
+
+    gate.set_names(())
+    assert gate.names == DEFAULT_NAMES
+    gate.set_names(("", "   "))
+    assert gate.names == DEFAULT_NAMES
+    assert gate.decide("reachy, hello").admitted
 
 
 # =========================================================================== #

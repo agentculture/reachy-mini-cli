@@ -3124,3 +3124,86 @@ def test_t11_end_to_end_the_composed_layer_reseeds_a_real_gateway_before_arming(
     arm_type = "response.create"
     sent = [kind for kind in server.received_event_types if kind in (item_type, arm_type)]
     assert sent[0] == item_type, "the arm preceded the re-seed"
+
+
+# =========================================================================== #
+# #177 t6 — the names the robot answers to reach the layer's attention gate    #
+# =========================================================================== #
+#
+# The operator configures the names ONCE, in the box's rules overlay, and both
+# ears read that file: the runtime's hearing gate and — since this task — the
+# embodiment layer's attention gate. A layer that kept its own hard-coded pair
+# would be a robot that answers to "nova" through one ear and ignores it
+# through the other, which is exactly the half-configured state issue #177
+# exists to remove.
+#
+# ``nova`` is NOT a shipped name (it is a mesh peer's). It appears here only as
+# a value an OPERATOR configured, the same way ``tests/test_name_match.py``
+# uses it — never as a default anywhere under ``reachy/``.
+
+
+class _RulesDouble:
+    """The one field ``_resolve_embody_names`` reads off a loaded rules config."""
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        self.names = names
+
+
+def test_composition_gives_the_attention_gate_the_configured_names():
+    layer, _args, _sink = _compose(
+        session_factory=lambda **kw: _FakeSession(**kw),
+        lines=iter(()),
+        clip_reader=lambda: None,
+        rules_loader=lambda: _RulesDouble(("reachy", "robot", "nova")),
+    )
+    try:
+        gate = layer.engine.attention
+        assert gate.names == ("reachy", "robot", "nova")
+        # Not merely stored: the configured name OPENS attention from cold.
+        assert gate.decide("nova, are you there?").admitted
+    finally:
+        layer.close()
+
+
+def test_a_malformed_names_overlay_falls_back_to_the_shipped_names_and_says_so():
+    """A typo in a config file must not take the robot's ear away silently."""
+    from reachy.speech.name_match import SHIPPED_NAMES
+
+    def _refuse() -> object:
+        raise CliError(code=1, message="'names' must be a list of strings (got 3)")
+
+    sink = _Sink()
+    layer, _args, _sink = _compose(
+        sink=sink,
+        session_factory=lambda **kw: _FakeSession(**kw),
+        lines=iter(()),
+        clip_reader=lambda: None,
+        rules_loader=_refuse,
+    )
+    try:
+        assert layer.engine.attention.names == SHIPPED_NAMES
+        assert layer.engine.attention.decide("reachy, hello").admitted
+    finally:
+        layer.close()
+
+    named = [
+        text for text in sink.texts("thinking") if agent_mod.REASON_NAMES_OVERLAY_REFUSED in text
+    ]
+    assert named, "the fallback must NAME itself on the export feed"
+
+
+def test_the_rules_loader_is_imported_function_locally():
+    """The parser imports every command module; the rules stack must not ride in.
+
+    ``test_building_the_cli_parser_loads_no_cognition_module`` pins the
+    cognition set by equality, and this is the same discipline one module over:
+    ``_default_rules_loader`` does its import inside the function body.
+    """
+    import inspect
+
+    assert "from reachy.behavior.rules import" in inspect.getsource(
+        agent_mod._default_rules_loader
+    ), "vacuity guard: the loader does import the rules stack"
+    assert "\nfrom reachy.behavior.rules import" not in inspect.getsource(
+        agent_mod
+    ), "the rules import must stay function-local"
