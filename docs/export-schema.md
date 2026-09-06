@@ -463,8 +463,8 @@ Example lines:
 
 ```json
 {"t":"motion","ts":1718362801.2,"tick":52,"action":"admit","behavior":"nod","channels":["head"],"detail":{}}
-{"t":"motion","ts":1718362804.4,"tick":210,"action":"face-lost","behavior":"face-lock","channels":["head"],"detail":{"id":"face-lock:lock:1","absent_s":3.02}}
-{"t":"motion","ts":1718362814.6,"tick":720,"action":"lock-released","behavior":"face-lock","channels":["head"],"detail":{"id":"face-lock:lock:1","reason":"mind-offline"}}
+{"t":"motion","ts":1718362804.4,"tick":210,"action":"face-lost","behavior":"face-lock","channels":["body_yaw","head"],"detail":{"id":"face-lock:lock:1","absent_s":3.02}}
+{"t":"motion","ts":1718362814.6,"tick":720,"action":"lock-released","behavior":"face-lock","channels":["body_yaw","head"],"detail":{"id":"face-lock:lock:1","reason":"mind-offline"}}
 ```
 
 ### Reading the Runtime Feed

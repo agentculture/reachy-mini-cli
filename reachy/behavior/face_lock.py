@@ -558,6 +558,21 @@ def make_face_lock() -> Callable[[float, dict, object], Contribution]:
     return FaceLockGaze()
 
 
+def _lock_channels() -> list[str]:
+    """The ``face-lock`` library entry's claimed channels, sorted; ``["head"]`` if unknown.
+
+    Imported lazily (the library imports this module for the entry's
+    ``make_fn``), and fail-open to the head alone so a feed line is never lost
+    to an import-order accident.
+    """
+    try:
+        from reachy.behavior import library as lib
+
+        return sorted(lib.get(FACE_LOCK_BEHAVIOR).channels)
+    except Exception:  # pragma: no cover - defensive: the feed line still lands
+        return ["head"]
+
+
 # --------------------------------------------------------------------------- #
 # The driver — the lock STATE and the two kind handlers                       #
 # --------------------------------------------------------------------------- #
@@ -968,7 +983,10 @@ class FaceLockDriver:
                 "ts": getattr(ctx, "now", 0.0),
                 "tick": getattr(ctx, "tick", 0),
                 "behavior": FACE_LOCK_BEHAVIOR,
-                "channels": ["head"],
+                # The channels the lock CLAIMS (#183: head + body_yaw, so the
+                # base layer keeps the antennas) — read from the library entry,
+                # never restated, so the feed cannot under-report the claim.
+                "channels": _lock_channels(),
                 "detail": dict(detail),
             }
         )

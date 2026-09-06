@@ -398,8 +398,10 @@ class IntentDriver:
         exposed for an in-process consumer that owns part of the set for the
         duration of some state — today only
         :class:`reachy.behavior.face_lock.FaceLockDriver`, which adds
-        ``feel-alive`` / ``orient-to-sound`` while a face lock is held and
-        removes exactly those again on release.
+        ``orient-to-sound`` while a face lock is held (the base layer is NOT
+        inhibited since #183 — the lock claims head + body_yaw by arbitration,
+        so the antennas keep swaying) and removes exactly that again on
+        release.
 
         Deliberately does NOT fire :attr:`inhibition_observer`: that seam means
         "a caller replaced the whole set", and an in-process owner adjusting its
