@@ -742,7 +742,7 @@ vars override the built-in default.
 | `REACHY_REALTIME_API_KEY` | (unset — falls back to `REACHY_OPENAI_API_KEY`) | Split-deployment override for the hearing session's Bearer key. **Trap:** precedence is by PRESENCE, not truthiness — setting this to `""` means "this gateway needs no auth" and does **not** fall through to `REACHY_OPENAI_API_KEY`; only *leaving it unset* falls through | `speech/realtime.py` |
 | `REACHY_ENGAGE_HEURISTIC` | (unset) | Truthy (`1`/`true`/`yes`/`on`) forces the pure-`difflib` engagement heuristic: **no LLM classifier is built at all**, giving a provably zero-LLM presence | `behavior/transcript_sense.py`, `cli/_commands/behavior.py` |
 | `REACHY_STT_URL` | `http://localhost:9002` | OpenAI-compatible STT (Parakeet) — **`sleep`'s wake-word backend only.** Since the realtime arc (issue #115) this no longer affects the runtime's hearing at all; tuning it for `behavior engine run` is a dead knob | `speech/stt.py`, `sleep/wakeword.py` |
-| `REACHY_STT_PHRASE` | `hey reachy` | Wake phrase matched against the STT transcript | `sleep/wakeword.py` |
+| `REACHY_STT_PHRASE` | one `hey <name>` per configured name except `robot` (shipped: `hey reachy`) | Wake phrase matched against the STT transcript; setting it selects exactly ONE phrase — see [the names table](#the-names-table--who-the-robot-answers-to) | `sleep/wakeword.py` |
 | `REACHY_STT_LANGUAGE` | `en` | STT language hint | `speech/stt.py`, `sleep/wakeword.py` |
 | `REACHY_STT_TIMEOUT` | `2.0` (seconds) | Per-request STT socket timeout (kept short so a transcription never stalls a loop) | `speech/stt.py`, `sleep/wakeword.py` |
 | `REACHY_LOG_LEVEL` | `INFO` | Verbosity for every `reachy.*` module logger on `behavior engine run` / `sleep run` (a `--log-level` flag wins over this) | `cli/_logging.py` |
@@ -1776,6 +1776,71 @@ fire/suppress line — is visible on stderr by default.
 > this one process is the single SDK owner rather than deferring to another.
 > `face` needs the `[vision]` extra; without it the field stays permanently
 > quiet rather than crashing the loop.
+
+#### The names table — who the robot answers to
+
+The same file carries the **names the robot answers to**. The shipped pair,
+`reachy` and `robot`, is spelled exactly once in code
+(`reachy.speech.name_match.SHIPPED_NAMES`); the overlay's top-level `names`
+table lists **additions** — it extends the pair, never replaces it:
+
+```toml
+# ~/.local/state/reachy/behavior/rules.toml
+names = ["nova"]          # the robot now also answers to "nova"
+```
+
+Then `reachy-mini-cli behavior reload`. From the next tick the transcript
+gate's name fast-path, its fallback heuristic and the single-shot classifier's
+prompt all answer to the added name — no restart, exactly the path a rule edit
+takes. `behavior rules list` and `behavior rules check` print the merged
+names, and `behavior engine status` reports the names the running engine
+answers to, so a reload that did not take is visible rather than guessed.
+
+The table is validated **fail-closed** with the rest of the file: every entry
+must be a single lower-case word of letters only, at least three characters,
+and the table holds at most eight entries. A bad entry refuses the whole file
+— `RulesLoader` keeps the last-good names in force and `behavior reload`
+returns the reason — so a typo can never take the robot's names away. Why
+three letters: a name is matched **exactly**, whole-word, before any fuzzy
+guard runs, and a one- or two-letter "name" would engage the robot on ordinary
+speech. What validation cannot judge is *which* word is safe: a configured
+name that is also a common word in the room's language will engage the robot
+whenever someone says it. That is the operator's call, deliberately.
+
+**Being named is a sense event.** When the gate admits an utterance *by
+name* (as opposed to a `context` admission — someone continuing an open
+conversation), the runtime latches `name_mentioned` for that one tick, so a
+rule can react to *"someone said my name"* without re-deriving the gate's
+decision from the transcript text:
+
+```toml
+[[react]]
+id = "look-up-when-named"
+when = { field = "name_mentioned", op = "is_true" }
+run = "nod"
+duration_s = 1.2
+cooldown_s = 8.0
+```
+
+The field reaches the snapshot export (`behavior engine run --export -`) and
+the embodiment layer's cue vocabulary (*"someone said my name"*) alongside
+`transcript`.
+
+**Two other roots read the same table, at start.** `agent embody`'s attention
+gate and `sleep`'s wake-word phrases (one `hey <name>` per configured name
+except the generic `robot`, unless `--wake-phrase` / `REACHY_STT_PHRASE`
+selects exactly one) load it when they start; they do not hot-reload — restart
+them after editing the table. A refused overlay is one named
+`names-overlay-refused` drop and the shipped pair.
+
+**If the reachy_nova harness runs on the box, land its side first.** The
+harness edits this same overlay through a managed block and validates the
+*whole* file against its own copy of the schema; until
+[OriNachum/reachy-nova#27](https://github.com/OriNachum/reachy-nova/issues/27)
+lands, a `names` table (or a rule keyed on `name_mentioned`) makes every
+harness write fail. This repo never learns a peer's name — `nova` above is an
+example of a *configured* value, and a test greps the source to keep it that
+way.
 
 ### Hearing — server-side VAD replaces local endpointing
 
