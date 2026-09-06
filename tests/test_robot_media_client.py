@@ -1727,3 +1727,194 @@ def test_status_without_a_released_key_falls_open(monkeypatch) -> None:
 
     assert holder.warm_up() is True, "a status payload with no 'released' key must fall open"
     assert daemon.count("POST", MEDIA_ACQUIRE_PATH) == 0, "nothing said media was released"
+
+
+# ---------------------------------------------------------------------------
+# ``drop(reason)`` — the caller-thread teardown a silently-dead pipeline needs
+# ---------------------------------------------------------------------------
+#
+# Issue #176 / spec claim c39. ``_HolderKeeper`` (reachy/cli/_commands/behavior.py)
+# re-warms a holder only when ``connected`` reads False, and its whole safety
+# argument is that a DISCONNECTED holder is inert on the tick thread — so the
+# keeper is the only thread mutating it. A camera that stops producing frames
+# without raising leaves the holder CONNECTED, so the keeper never acts; and
+# having the keeper re-acquire a live client would race the AudioPump thread's
+# ``audio()`` and the tick thread's ``frame()`` on a holder that documents
+# itself as not thread-safe.
+#
+# ``drop(reason)`` is the way out that keeps the keeper's argument intact: the
+# thread that READS the client (the tick thread, e.g. the face sense's staleness
+# latch) tears it down exactly as a raising read already does, and the keeper's
+# unchanged ``connected == False`` poll re-warms it off-thread. The honesty
+# condition c39 pins: no code path calls ``warm_up`` / release on a holder whose
+# ``connected`` predicate is True from any thread other than the one dropping it,
+# and the audio pump never observes a half-torn client.
+
+
+class _StrictFakeMedia(_FakeMedia):
+    """A media manager that RAISES once its client has been closed.
+
+    The concurrency test needs a client that can tell "used after teardown" from
+    "used before it" — a fake that quietly keeps answering would make a
+    half-torn read indistinguishable from a healthy one.
+    """
+
+    def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(**kwargs)
+        self.closed = False
+
+    def get_audio_sample(self):  # type: ignore[no-untyped-def]
+        if self.closed:
+            raise RuntimeError("get_audio_sample() after close")
+        return super().get_audio_sample()
+
+    def get_frame(self):  # type: ignore[no-untyped-def]
+        if self.closed:
+            raise RuntimeError("get_frame() after close")
+        return super().get_frame()
+
+
+class _CountingFakeMini:
+    """A fake client counting its own ``close()`` calls and closing its media."""
+
+    def __init__(self, media: _StrictFakeMedia | None = None) -> None:
+        self.media = _StrictFakeMedia() if media is None else media
+        self.media_released = False
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.media.closed = True
+
+
+def _sense_drop_lines(caplog) -> list[str]:  # type: ignore[no-untyped-def]
+    """Every ``[SENSE ...] dropped reason=...`` line captured so far."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _SENSE_LOGGER_NAME and "dropped reason=" in record.getMessage()
+    ]
+
+
+def test_drop_tears_the_client_down_once_and_names_the_reason(monkeypatch, caplog) -> None:
+    """The whole contract in one test: disconnected, released once, named once."""
+    daemon = _patch_daemon(monkeypatch, _FakeDaemon(status=_RELEASED))
+    fake_cls = _FakeMiniCls(mini_factory=_CountingFakeMini)
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0), base_url=_BASE, allow_inline_connect=False)
+    assert holder.warm_up() is True
+    client = fake_cls.last
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        assert holder.drop("media-stale") is True
+
+    assert holder.connected is False
+    assert client.close_calls == 1
+    assert daemon.count("POST", MEDIA_RELEASE_PATH) == 1
+    lines = _sense_drop_lines(caplog)
+    assert len(lines) == 1, lines
+    assert "dropped reason=media-stale" in lines[0]
+    assert "source=held_client" in lines[0]
+
+
+def test_a_second_drop_is_a_silent_no_op(monkeypatch, caplog) -> None:
+    """Idempotent, and quiet about it: a repeat drop releases nothing and says nothing."""
+    daemon = _patch_daemon(monkeypatch, _FakeDaemon(status=_RELEASED))
+    fake_cls = _FakeMiniCls(mini_factory=_CountingFakeMini)
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0), base_url=_BASE, allow_inline_connect=False)
+    holder.warm_up()
+    assert holder.drop("media-stale") is True
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        assert holder.drop("media-stale") is False
+
+    assert fake_cls.last.close_calls == 1
+    assert daemon.count("POST", MEDIA_RELEASE_PATH) == 1
+    assert _sense_drop_lines(caplog) == []
+
+
+def test_drop_on_a_never_connected_holder_is_a_no_op(monkeypatch, caplog) -> None:
+    """Nothing was taken, so nothing is given back — and no construction happens."""
+    daemon = _patch_daemon(monkeypatch, _FakeDaemon(status=_RELEASED))
+    fake_cls = _FakeMiniCls(mini_factory=_CountingFakeMini)
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0), base_url=_BASE, allow_inline_connect=False)
+
+    with caplog.at_level(logging.INFO, logger=_SENSE_LOGGER_NAME):
+        assert holder.drop("media-stale") is False
+
+    assert holder.connected is False
+    assert fake_cls.instances == []
+    assert daemon.count("POST", MEDIA_RELEASE_PATH) == 0
+    assert _sense_drop_lines(caplog) == []
+
+
+def test_a_concurrent_reader_never_sees_a_half_torn_client(monkeypatch) -> None:
+    """c39's honesty condition: the audio pump never observes a half-torn client.
+
+    A reader thread hammers ``audio()`` / ``frame()`` — the two reads the
+    AudioPump thread and the tick thread make — across a ``drop()`` on this
+    thread. Every read must return a reading or ``None``; not one may raise, and
+    the media subsystem must still be handed back exactly once.
+    """
+    import threading
+
+    daemon = _patch_daemon(monkeypatch, _FakeDaemon(status=_RELEASED))
+    fake_cls = _FakeMiniCls(mini_factory=_CountingFakeMini)
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=_FakeClock(0.0), base_url=_BASE, allow_inline_connect=False)
+    assert holder.warm_up() is True
+
+    errors: list[BaseException] = []
+    results: list[object] = []
+    running = threading.Event()
+    stop = threading.Event()
+
+    def _reader() -> None:
+        running.set()
+        while not stop.is_set():
+            for read in (holder.audio, holder.frame):
+                try:
+                    results.append(read())
+                except BaseException as err:  # noqa: BLE001 — the whole point
+                    errors.append(err)
+
+    thread = threading.Thread(target=_reader, name="fake-audio-pump", daemon=True)
+    thread.start()
+    running.wait(timeout=5.0)
+    for _ in range(50):  # let the reader get well into its loop first
+        holder.audio()
+    assert holder.drop("media-stale") is True
+    stop.set()
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert results, "the reader never ran"
+    assert holder.connected is False
+    assert daemon.count("POST", MEDIA_RELEASE_PATH) == 1
+    assert fake_cls.last.close_calls == 1
+
+
+def test_warm_up_reconnects_after_a_drop_once_the_backoff_has_passed(monkeypatch) -> None:
+    """The keeper's UNCHANGED poll is what recovers — throttled by the same backoff."""
+    daemon = _patch_daemon(monkeypatch, _FakeDaemon(status=_RELEASED))
+    clock = _FakeClock(0.0)
+    fake_cls = _FakeMiniCls(mini_factory=_CountingFakeMini)
+    _patch_import(monkeypatch, fake_cls)
+    holder = HeldMediaClient(now=clock, base_url=_BASE, allow_inline_connect=False)
+    holder.warm_up()
+
+    assert holder.drop("media-stale") is True
+
+    clock.advance(DEFAULT_RETRY_BACKOFF - 0.1)
+    assert holder.warm_up() is False, "the drop arms the same backoff a failed read does"
+    assert len(fake_cls.instances) == 1
+
+    clock.advance(0.2)
+    assert holder.warm_up() is True
+    assert holder.connected is True
+    assert len(fake_cls.instances) == 2
+    assert daemon.count("POST", MEDIA_ACQUIRE_PATH) == 2
+    assert holder.audio() is not None
