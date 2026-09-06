@@ -65,7 +65,12 @@ from reachy.behavior.excited_motion_probe import (
     SharedPoseReader,
 )
 from reachy.behavior.face_lock import FaceLockDriver
-from reachy.behavior.face_sense import FaceSenseDriver, build_face_recognition
+from reachy.behavior.face_sense import (
+    FaceSenseDriver,
+    build_face_recognition,
+    detect_interval_from_env,
+    detect_max_width_from_env,
+)
 from reachy.behavior.goto_intent import GOTO, make_goto_handler
 from reachy.behavior.goto_lane import GotoLane
 from reachy.behavior.intents import INTENT_NAMESPACE, IntentDriver
@@ -2510,10 +2515,16 @@ def _compose_run_seam(
         # the one mic tap lives.
         background = _rms_background()
         recognition = build_face_recognition()
+        # Two throughput knobs, both env-driven and both defaulting to today's
+        # behaviour (0.5 s / no downscaling) so nothing changes for an operator
+        # who never sets them — see REACHY_FACE_DETECT_INTERVAL /
+        # REACHY_FACE_DETECT_MAX_WIDTH in ``face_sense.py``.
         face_driver = FaceSenseDriver(
             media=media,
             engine=recognition[0] if recognition is not None else None,
             store=recognition[1] if recognition is not None else None,
+            detect_interval=detect_interval_from_env(),
+            detect_max_width=detect_max_width_from_env(),
         )
         # The rolling clip rider (spec claim c18): fed by PUSH off the SAME
         # frame `face_driver` already reads — never a second `media.frame()`
