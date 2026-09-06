@@ -226,7 +226,9 @@ class HeldMediaClient:
     thread-safe** by design. The supported split is narrow and deliberate:
     :meth:`warm_up` / :meth:`close` on the owner's thread while the loop is NOT
     running (setup and teardown), and every read on the one tick thread. Do not
-    call :meth:`warm_up` concurrently with reads.
+    call :meth:`warm_up` concurrently with reads. :meth:`drop` belongs to the
+    READING thread — it is how that thread hands a dead client back to an
+    off-thread supervisor without the supervisor ever touching a live one.
 
     :param allow_inline_connect:
         When ``False``, reads never construct — only :meth:`warm_up` does — so a
@@ -464,6 +466,48 @@ class HeldMediaClient:
     # public API — lifecycle
     # ------------------------------------------------------------------
 
+    def drop(self, reason: str) -> bool:
+        """Tear a LIVE client down deliberately, naming *reason*. Returns whether it did.
+
+        The explicit counterpart to the implicit teardown a raising read
+        performs (:meth:`audio` / :meth:`frame` — "a read that raises drops the
+        client and schedules a retry"). It exists for the failure mode a raising
+        read cannot see: a pipeline that goes SILENT — a camera that stops
+        producing frames without ever raising — leaves the holder
+        :attr:`connected` while every read simply answers ``None`` for ever.
+
+        **Who may call this: the thread that READS the client, and only that
+        thread** (in the runtime, the tick thread — e.g. the face sense's
+        stream-staleness latch). Never the ``_HolderKeeper``, and never any
+        other supervisor. That restriction IS the design, not a caution: the
+        keeper's entire thread-safety argument (see its docstring in
+        ``reachy/cli/_commands/behavior.py``) is that it touches a holder only
+        while :attr:`connected` reads ``False``, because a disconnected holder is
+        inert on the tick thread and the keeper is then its only mutator. A
+        keeper that tore down a LIVE client would race the ``AudioPump`` thread's
+        :meth:`audio` and the tick thread's :meth:`frame` on an object this class
+        documents as not thread-safe. Routing the teardown through the reader's
+        own thread keeps that argument intact and needs no new lock: the reader
+        disconnects the holder, and the keeper's UNCHANGED ``connected is False``
+        poll re-warms it off-thread on its next sweep.
+
+        Idempotent and never raises. A holder that is not currently connected —
+        never warmed, already dropped, or closed — returns ``False`` and does
+        nothing at all: no release, no log line. Otherwise the teardown is
+        exactly the one the raising-read path runs (stop the recorder, close the
+        client, hand the daemon's media subsystem back if and only if *we*
+        acquired it — the single-bit ledger, so a subsystem another consumer
+        holds is never released out from under it), the same retry backoff is
+        armed so the keeper's next :meth:`warm_up` is throttled just as it would
+        be after a read fault, and exactly ONE named ``senselog.drop`` line
+        records it — an unexplained reconnect in the journal would be
+        indistinguishable from a crash.
+        """
+        if self._client is None:
+            return False
+        self._drop_client(reason=reason, explicit=True)
+        return True
+
     def close(self) -> None:
         """Stop recording and release the held client. Idempotent.
 
@@ -692,12 +736,25 @@ class HeldMediaClient:
                 self._log_transition("camera-absent: no camera available; frames disabled")
         return self._camera is not None
 
-    def _drop_client(self, *, reason: str) -> None:
-        """A live client just failed a read: release it and schedule a retry."""
+    def _drop_client(self, *, reason: str, explicit: bool = False) -> None:
+        """Release the held client and schedule a retry. THE one teardown path.
+
+        Two callers, one behaviour: a read that just raised (``explicit=False``,
+        the implicit path) and :meth:`drop` (``explicit=True``, a caller that
+        decided the client is dead). They share the release and the backoff on
+        purpose — a deliberate drop that recovered differently from a read fault
+        would be a second lifecycle to keep honest — and differ only in how the
+        event is named in the journal: a fault is a state TRANSITION we suffered,
+        a deliberate drop is a named ``senselog.drop`` whose reason is the
+        caller's.
+        """
         self._release_client()
         self._next_attempt_t = self._now() + self._retry_backoff
         logger.warning("HeldMediaClient: %s; connection lost, will retry", reason)
-        self._log_transition(f"lost: {reason}; will retry")
+        if explicit:
+            senselog.drop(_STAGE, _SOURCE, uuid.uuid4().hex[:8], reason)
+        else:
+            self._log_transition(f"lost: {reason}; will retry")
 
     def _release_client(self) -> None:
         """Stop the recorder, then close/disconnect the held client. Never raises."""
