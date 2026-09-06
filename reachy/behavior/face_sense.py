@@ -309,6 +309,19 @@ DEFAULT_STILL_SETTLE_S: float = 0.5
 #: STEERING on a reading only in the instant before the next one lands.
 DEFAULT_HELD_DETECT_INTERVAL: float = 1.5
 
+#: The commanded head speed (deg/s) above which the still-only gate treats the
+#: head as MOVING. Live on the Wireless (2026-09-06) the gate was first wired to
+#: the mic's own self-motion latch (0.035 deg/tick = 1.75 deg/s at 50 Hz) and
+#: the ``feel-alive`` base layer's slow gaze wander — peak ~2.7 deg/s — kept it
+#: open for 18 s stretches: detection starved, every ``lock_face`` was refused
+#: ``no face known``, and the robot never looked at anyone. A wander that slow
+#: does not blur a frame; a lock's 120 deg/s slew or a goto does. So the face
+#: gate has its OWN latch at slew speed, and the mic keeps its fine one (a
+#: 2 deg/s wander is real actuator noise for a microphone).
+DEFAULT_GATE_EPS_DEG_S: float = 20.0
+#: Env override for :data:`DEFAULT_GATE_EPS_DEG_S`, read at composition time.
+GATE_EPS_ENV = "REACHY_FACE_GATE_EPS_DEG_S"
+
 #: How long a face POSITION reading (``face_bbox``/``face_age_s``) is held
 #: before it expires (seconds). The position is a HELD level, not a one-tick
 #: event — a gaze behavior needs it on every tick, not on the one tick a
@@ -1534,6 +1547,8 @@ __all__ = [
     "usable_frame",
     "vision_unavailable_reason",
     "DEFAULT_DETECT_INTERVAL",
+    "DEFAULT_GATE_EPS_DEG_S",
+    "GATE_EPS_ENV",
     "DEFAULT_DETECT_MAX_WIDTH",
     "DEFAULT_FACE_BBOX_TTL_S",
     "DEFAULT_FRAME_INTERVAL_S",

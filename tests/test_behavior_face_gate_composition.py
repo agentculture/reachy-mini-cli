@@ -4,8 +4,8 @@ Every piece below was built and unit-tested on its own branch; this file pins
 that ``_compose_run_seam`` actually WIRES them — the built-but-unwired failure
 class this repo has met four times with a green suite:
 
-* #179 — the face driver's still-only gate reads the SAME self-motion latch the
-  mic's moving floor reads, and its ``lock_held`` peek reaches the lock driver.
+* #179 — the face driver's still-only gate rides its OWN slew-speed self-motion
+  latch beside the mic's fine one, and its ``lock_held`` peek reaches the lock driver.
 * #176 — the face driver's ``on_stale`` route is the held media client's own
   ``drop``; a camera that goes silent is handed back from the TICK thread and
   the keeper's unchanged ``connected == False`` poll re-warms it, with no
@@ -161,26 +161,54 @@ def _composed(monkeypatch, media: _FakeMedia | None = None):
 
 
 # --------------------------------------------------------------------------- #
-# 1. #179 — the gate is wired to the ONE self-motion latch and to the lock      #
+# 1. #179 — the gate is wired to its own slew-speed latch and to the lock       #
 # --------------------------------------------------------------------------- #
 
 
-def test_the_face_driver_reads_the_same_self_motion_latch_as_the_moving_floor(
+def test_the_face_gate_has_its_own_slew_speed_latch_beside_the_mics_fine_one(
     _isolated, monkeypatch
 ):
+    """Live on the Wireless the gate first shared the mic's 1.75 deg/s latch and
+    the base layer's ~2.7 deg/s wander starved detection (no face ever known).
+    The face gate now rides a SECOND latch at slew speed; the mic keeps its own."""
     with _composed(monkeypatch) as (_media, drivers, _res):
         face = _only(drivers, FaceSenseDriver)
-        motion = _only(drivers, SelfMotionDriver)
+        latches = [d for d in drivers if isinstance(d, SelfMotionDriver)]
+        assert len(latches) == 2, "expected the mic's latch AND the face gate's"
         assert face._moving is not None, "the still-only gate was built but never wired (#179)"
-        # Bound method identity: the SAME latch object, not a second driver.
-        assert face._moving.__self__ is motion
+        gate_latch = face._moving.__self__
+        assert gate_latch in latches
+        fine = [d for d in latches if d is not gate_latch][0]
+        assert gate_latch._eps_deg == pytest.approx(
+            face_sense.DEFAULT_GATE_EPS_DEG_S / 50.0
+        )  # 20 deg/s at 50 Hz = 0.4 deg/tick
+        assert fine._eps_deg < gate_latch._eps_deg / 5
+
+
+def test_the_base_layers_slow_wander_never_closes_detection(_isolated, monkeypatch):
+    """feel-alive's gaze wander peaks ~2.7 deg/s (0.054 deg/tick at 50 Hz); the
+    face gate must stay CLOSED (detection running) through it."""
+    with _composed(monkeypatch) as (_media, drivers, _res):
+        face = _only(drivers, FaceSenseDriver)
+        gate_latch = face._moving.__self__
+        neutral = {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+
+        def pose(yaw: float) -> dict:
+            head = dict(neutral)
+            head["yaw"] = yaw
+            return {"head": head, "antennas": (0.0, 0.0), "body_yaw": 0.0}
+
+        for i in range(0, 200):  # 4 s of a 3 deg/s wander
+            t = i * 0.02
+            gate_latch(_Ctx(t, pose(0.06 * i)))
+            assert face._due_interval(t) == face._detect_interval, f"gate opened at tick {i}"
 
 
 def test_a_commanded_slew_closes_detection_and_stillness_reopens_it(_isolated, monkeypatch):
     """Drive the composed self-motion latch through a slew and read the gate."""
     with _composed(monkeypatch) as (_media, drivers, _res):
         face = _only(drivers, FaceSenseDriver)
-        motion = _only(drivers, SelfMotionDriver)
+        motion = face._moving.__self__  # the gate's own slew-speed latch
         neutral = {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}
 
         def pose(yaw: float) -> dict:
