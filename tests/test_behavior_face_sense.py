@@ -1306,20 +1306,29 @@ def test_bbox_ttl_expiry_anchors_on_captured_at_not_drain_time() -> None:
     would still be held at t=1.4 (only 0.9 s past that anchor); anchored on the
     true capture time (0.0), it is 1.4 s old — past a 1.0 s TTL — and expires.
     """
+    # The driver's clock and the engine's ``ctx.now`` are SEPARATE time bases
+    # by contract: the driver measures the detection's latency on its own clock
+    # (the one ``captured_at`` was read on) and applies it to ``ctx.now``. The
+    # test drives both from one variable so the latency is exactly what is set.
+    clock = [0.0]
     driver = FaceSenseDriver(
         media=_FakeMedia([_frame()]),
         face_bbox_ttl_s=1.0,
         start_worker=False,
+        clock=lambda: clock[0],
     )
     driver(_Ctx(0.0))
     driver._output.publish(
         FS.FaceObservation(name="ada", bbox=(0.1, 0.1, 0.2, 0.2), captured_at=0.0)
     )
 
-    driver(_Ctx(0.5))  # drain tick, well after the real capture time
+    clock[0] = 0.5
+    driver(_Ctx(0.5))  # drain tick, 0.5 s of latency after the real capture time
     assert driver.peek_face_bbox() is not None
+    assert driver.peek_face_age_s() == pytest.approx(0.5)
 
-    driver(_Ctx(1.4))  # now - captured_at(0.0) = 1.4 > ttl(1.0): expired
+    clock[0] = 1.4
+    driver(_Ctx(1.4))  # now - anchor(0.0) = 1.4 > ttl(1.0): expired
     assert driver.peek_face_bbox() is None
     assert driver.peek_face_age_s() is None
 

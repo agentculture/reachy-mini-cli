@@ -1011,13 +1011,23 @@ class FaceSenseDriver:
         if observation is None:
             return
         if observation.bbox is not None:
-            # Anchor on the worker's own capture-time clock read (t4 #181) when
-            # the observation carries one; an older producer/test fake with no
+            # Anchor on the frame's CAPTURE time (t4 #181), but measure the
+            # detection's latency entirely on the DRIVER's own clock — the one
+            # `captured_at` was read on — and apply that latency to the engine's
+            # `now`. The two clocks are both `time.monotonic` in production but
+            # are separate time bases by contract (a test drives `ctx.now` from
+            # 0.0 while the worker reads a real monotonic clock), and mixing a
+            # reading from one with a reading from the other is how a
+            # "seconds ago" turns into a million-second age that expires every
+            # position the tick it lands. An older producer/test fake with no
             # captured_at falls back to this drain tick, exactly as before.
-            anchor = observation.captured_at if observation.captured_at is not None else now
+            latency = 0.0
+            if observation.captured_at is not None:
+                latency = max(0.0, self._clock() - observation.captured_at)
+            anchor = (now - latency) if now is not None else None
             self._face_bbox = observation.bbox
             self._face_bbox_at = anchor
-            self._face_age_s = (now - anchor) if (now is not None and anchor is not None) else None
+            self._face_age_s = latency if now is not None else None
         name = (observation.name or "").strip()
         if not name:
             return
