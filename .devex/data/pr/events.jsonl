@@ -4,3 +4,8 @@
 {"ts":"2026-09-06T10:55:18.940077+00:00","type":"readiness_arrived","pr":182,"waited_secs":60}
 {"ts":"2026-09-06T10:55:23.663407+00:00","type":"pr_read","pr":182,"comment_count":2,"threads_unresolved":0,"ci_state":"ok"}
 {"ts":"2026-09-06T10:57:26.771406+00:00","type":"pr_read","pr":182,"comment_count":5,"threads_unresolved":0,"ci_state":"ok"}
+{"ts":"2026-09-06T16:11:57.494845+00:00","type":"pr_opened","pr":187,"title":"Face lock centres, detects only while still, sees a dead camera, keeps the antennas alive (v0.54.0; #181 #179 #176 #183 #184 #185)"}
+{"ts":"2026-09-06T16:11:58.690029+00:00","type":"pr_review_triggered","pr":187,"command":"/agentic_review"}
+{"ts":"2026-09-06T16:11:59.372254+00:00","type":"pr_webhook_posted","pr":187,"event":"pr_opened"}
+{"ts":"2026-09-06T16:13:02.266645+00:00","type":"readiness_arrived","pr":187,"waited_secs":60}
+{"ts":"2026-09-06T16:13:06.523200+00:00","type":"pr_read","pr":187,"comment_count":2,"threads_unresolved":0,"ci_state":"ok"}

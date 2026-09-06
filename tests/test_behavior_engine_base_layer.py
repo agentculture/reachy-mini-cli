@@ -262,8 +262,6 @@ def test_ensure_base_is_a_no_op_while_a_base_is_active():
     assert [ab.behavior.name for ab in engine.active] == [BASE_LAYER_NAME]
 
 
-
-
 def test_every_real_re_seed_emits_exactly_one_senselog_line(caplog):
     engine = _seeded_engine()
     engine.evict(BASE_LAYER_NAME)
