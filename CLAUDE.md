@@ -589,8 +589,22 @@ nothing to lock onto is a head frozen at neutral, indistinguishable from a
 wedged runtime), admits ONE looping, indefinite, self-clamped `face-lock`
 behavior (±20° yaw / ±12° pitch, slew-limited — `goto_intent.py`'s head
 envelope, cited not re-derived), and SNAPSHOTS the inhibited set before adding
-its own (`feel-alive`, `orient-to-sound` — the two behaviors that would drag
-the head off the face).
+its own (`orient-to-sound` — the one behavior arbitration alone cannot keep off
+the face, since it is `STOPPABLE` like the lock and a later admission would win
+the head on the recency tie-break).
+
+- **The base layer is NOT inhibited, so the antennas keep swaying** (#183). The
+  lock claims `head` **and** `body_yaw` and contributes a HELD `body_yaw` — the
+  value the engine streamed on the tick before the lock took the channel, read
+  straight off `ctx.pose` (the same live-pose seam `pose_feed.py` adapts for
+  `GotoLane`), 0.0 when no pose is reachable. Arbitration is per channel by
+  (class priority, recency) with abstention and `face-lock` is `STOPPABLE`
+  above the `PASSIVE` base layer, so the lock takes those two channels without
+  evicting anything and `feel-alive` keeps `antennas`. Inhibiting the base
+  layer instead — what shipped until #183 — stilled the antennas for the whole
+  hold, because the base layer is ONE behavior. `body_yaw` is claimed rather
+  than left alone because the body rotates the whole head assembly, and the
+  camera with it, off the face.
 
 - **Losing the face is a REPORT, not an ending.** One `motion.face-lost` per
   disappearance (re-armed when the face returns); the lock persists. Vision

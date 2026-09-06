@@ -6,7 +6,9 @@ Pins the t4 acceptance criteria:
    (``no face known``) that admits NOTHING; with a face it admits ONE looping
    ``face-lock`` behavior that maps the bbox centre to a clamped yaw/pitch every
    tick, holds its last target while the bbox is momentarily absent, and adds
-   ``feel-alive`` / ``orient-to-sound`` to the inhibited set.
+   ``orient-to-sound`` to the inhibited set (``feel-alive`` left it in #183 —
+   the lock claims ``head`` + ``body_yaw`` and leaves the antennas to the base
+   layer instead).
 2. Inhibition is LATER-WINS for the CALLER's names: a ``set_inhibition`` arriving
    while locked becomes the lock's new snapshot MINUS its own additions (which it
    re-asserts and still takes back on release), so a mind echoing back the set it
@@ -32,6 +34,7 @@ from __future__ import annotations
 import ast
 import inspect
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
@@ -39,6 +42,7 @@ from reachy.behavior import face_lock as face_lock_mod
 from reachy.behavior import intents as intents_mod
 from reachy.behavior import library as behavior_library
 from reachy.behavior.control import KindRegistry
+from reachy.behavior.engine import BASE_LAYER_NAME, Engine, EngineConfig
 from reachy.behavior.face_lock import (
     FACE_LOCK_BEHAVIOR,
     LOCK_FACE,
@@ -65,6 +69,9 @@ class _RecordingCtx:
     now: float = 0.0
     tick: int = 0
     sense: Sense = EMPTY_SENSE
+    #: The pose the engine streamed this tick (``TickContext.pose``) — the lock
+    #: reads its ``body_yaw`` to hold the body where it already was.
+    pose: dict | None = None
     admits: list = field(default_factory=list)
     evicts: list = field(default_factory=list)
     events: list = field(default_factory=list)
@@ -259,7 +266,7 @@ def test_a_replacement_never_turns_the_locks_own_additions_into_operator_held() 
 
     The mind cannot tell the lock's own additions apart from its own, so its
     ``stay_silent`` merges ``speak`` into whatever ``state.json`` currently lists
-    — which INCLUDES ``feel-alive`` / ``orient-to-sound`` the lock just added.
+    — which INCLUDES every :data:`LOCK_INHIBITS` name the lock just added.
     A naive later-wins read of that replacement adopts the lock's own additions
     as operator-held, and release then leaves the presence loop inhibited: an
     inert robot. The new snapshot is therefore ``new_set - added``.
@@ -271,14 +278,12 @@ def test_a_replacement_never_turns_the_locks_own_additions_into_operator_held() 
     assert intents.inhibitions == frozenset(LOCK_INHIBITS)
 
     # stay_silent: the mind echoes back what it read, plus `speak`.
-    registry.dispatch(
-        {"op": SET_INHIBITION, "behaviors": ["feel-alive", "orient-to-sound", "speak"]}, ctx
-    )
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": [*LOCK_INHIBITS, "speak"]}, ctx)
     assert frozenset(LOCK_INHIBITS) <= intents.inhibitions  # lock still holds its own
     assert intents.inhibitions == frozenset({"speak", *LOCK_INHIBITS})
 
     # end_silence: `speak` drops away again.
-    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["feel-alive", "orient-to-sound"]}, ctx)
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": list(LOCK_INHIBITS)}, ctx)
     assert frozenset(LOCK_INHIBITS) <= intents.inhibitions
 
     result = registry.dispatch({"op": RELEASE_FACE}, ctx)
@@ -292,9 +297,7 @@ def test_an_operator_name_beside_the_locks_additions_still_survives_release() ->
     _driver, registry = _wire(intents)
     ctx = _RecordingCtx(sense=_face())
     registry.dispatch({"op": LOCK_FACE}, ctx)  # snapshot A = {}
-    registry.dispatch(
-        {"op": SET_INHIBITION, "behaviors": ["feel-alive", "orient-to-sound", "nod"]}, ctx
-    )
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": [*LOCK_INHIBITS, "nod"]}, ctx)
     assert intents.inhibitions == frozenset({"nod", *LOCK_INHIBITS})
 
     result = registry.dispatch({"op": RELEASE_FACE}, ctx)
@@ -305,7 +308,7 @@ def test_an_operator_name_beside_the_locks_additions_still_survives_release() ->
 def test_a_replacement_reclaims_a_lock_name_the_operator_already_held() -> None:
     """Ownership is RECOMPUTED per replacement, not frozen at acquisition.
 
-    ``feel-alive`` was operator-inhibited BEFORE the lock, so the lock never
+    ``orient-to-sound`` was operator-inhibited BEFORE the lock, so the lock never
     "added" it. A later replacement that drops it would, with an acquisition-time
     ownership set, leave the presence loop free to drag the head off the face
     while the lock is still held — the lock's core invariant broken. The lock
@@ -314,7 +317,7 @@ def test_a_replacement_reclaims_a_lock_name_the_operator_already_held() -> None:
     intents = IntentDriver()
     _driver, registry = _wire(intents)
     ctx = _RecordingCtx(sense=_face())
-    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["feel-alive"]}, ctx)
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["orient-to-sound"]}, ctx)
     registry.dispatch({"op": LOCK_FACE}, ctx)
 
     registry.dispatch({"op": SET_INHIBITION, "behaviors": ["nod"]}, ctx)
@@ -326,19 +329,27 @@ def test_a_replacement_reclaims_a_lock_name_the_operator_already_held() -> None:
     assert result["inhibitions"] == ["nod"]
 
 
-def test_a_replacement_keeping_only_some_lock_names_hands_those_to_the_caller() -> None:
-    """Keeping SOME of the lock's names is a deliberate choice, not an echo."""
+def test_with_one_lock_name_a_replacement_naming_it_is_always_the_echo() -> None:
+    """Keeping SOME of the lock's names is a deliberate choice, not an echo.
+
+    With a single-name :data:`LOCK_INHIBITS` (#183) there is no proper subset to
+    keep, so any replacement naming it carries EVERY name the lock holds and is
+    therefore the echo case: the lock keeps its own addition and takes it back
+    on release. The partial-keep branch stays in the code because the set is
+    "whatever arbitration cannot handle", not "one behavior" — a second name
+    would make it reachable again.
+    """
     intents = IntentDriver()
     _driver, registry = _wire(intents)
     ctx = _RecordingCtx(sense=_face())
     registry.dispatch({"op": LOCK_FACE}, ctx)
 
-    registry.dispatch({"op": SET_INHIBITION, "behaviors": ["feel-alive"]}, ctx)
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": list(LOCK_INHIBITS)}, ctx)
     assert intents.inhibitions == frozenset(LOCK_INHIBITS)
 
     result = registry.dispatch({"op": RELEASE_FACE}, ctx)
-    assert intents.inhibitions == frozenset({"feel-alive"})
-    assert result["inhibitions"] == ["feel-alive"]
+    assert intents.inhibitions == frozenset()
+    assert result["inhibitions"] == []
 
 
 def test_the_live_set_stays_lock_complete_across_successive_replacements() -> None:
@@ -493,10 +504,11 @@ def test_both_kinds_register_into_a_kind_registry_like_goto() -> None:
     )
 
 
-def test_the_face_lock_library_entry_is_sensor_driven_and_head_only() -> None:
+def test_the_face_lock_library_entry_is_sensor_driven_and_claims_head_and_body() -> None:
     entry = behavior_library.get(FACE_LOCK_BEHAVIOR)
     assert entry.wants_sense is True
-    assert entry.channels == frozenset({"head"})
+    # `antennas` is deliberately absent: the base layer keeps it (#183).
+    assert entry.channels == frozenset({"head", "body_yaw"})
     assert entry.looping is True
     assert entry.default_duration is None
     assert entry.make_fn is not None
@@ -855,3 +867,150 @@ def test_a_negative_damping_in_a_raw_params_dict_never_steers_away() -> None:
     params = _lock_params(damping=-1.0)
     fn(0.0, params, Sense(face_bbox=_seen_bbox(15.0, 0.0, 0.0, 0.0), face_age_s=0.0))
     assert fn.target_yaw == pytest.approx(0.0, abs=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# 9. #183 — the antennas keep swaying under a lock (c28, h19, c29, h20)       #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _EngineCtx:
+    """A ``TickContext``-shaped ctx over a REAL :class:`Engine`.
+
+    The lock's handlers only need ``sense`` / ``pose`` / ``admit`` / ``evict`` /
+    ``now``, so this is the smallest honest bridge from the duck-typed ctx the
+    rest of this file uses to the engine that actually arbitrates.
+    """
+
+    engine: Engine
+    now: float = 0.0
+    tick: int = 0
+    sense: Sense = EMPTY_SENSE
+    pose: dict | None = None
+    events: list = field(default_factory=list)
+
+    def emit(self, event: dict) -> None:
+        self.events.append(event)
+
+    def admit(self, behavior) -> dict:
+        return self.engine.admit_behavior(behavior, self.now)
+
+    def evict(self, target: str) -> dict:
+        return self.engine.evict(target)
+
+    def active_names(self) -> set:
+        return {ab.behavior.name for ab in self.engine.active}
+
+
+def _owner_names(engine: Engine, tick: dict) -> dict[str, str | None]:
+    """This tick's ``{channel: owning behavior NAME}`` (ids are per-run)."""
+    by_id = {ab.behavior.id: ab.behavior.name for ab in engine.active}
+    return {channel: by_id.get(owner) for channel, owner in tick["ownership"].items()}
+
+
+def test_lock_inhibits_only_orient_to_sound() -> None:
+    """c28: feel-alive left the set — the base layer is no longer evicted."""
+    assert LOCK_INHIBITS == ("orient-to-sound",)
+
+
+def test_the_gaze_contributes_a_constant_held_body_yaw() -> None:
+    fn = make_face_lock()
+    fn.hold_body_yaw(3.25)
+    params = _lock_params()
+    sense = _face(cx=0.7)
+    values = [fn(i * 0.02, params, sense).body_yaw for i in range(50)]
+    assert values == [pytest.approx(3.25)] * 50
+
+
+def test_the_gaze_holds_zero_body_yaw_when_nothing_was_handed_to_it() -> None:
+    fn = make_face_lock()
+    assert fn(0.0, _lock_params(), _face()).body_yaw == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "x", None])
+def test_a_hostile_held_body_yaw_degrades_to_zero(bad) -> None:
+    fn = make_face_lock()
+    fn.hold_body_yaw(bad)
+    assert fn(0.0, _lock_params(), _face()).body_yaw == pytest.approx(0.0)
+
+
+def test_the_lock_holds_the_body_yaw_the_engine_streamed_on_the_previous_tick() -> None:
+    """The held value is ``ctx.pose['body_yaw']`` — the tick BEFORE the lock took it."""
+    _driver, registry = _wire()
+    ctx = _RecordingCtx(sense=_face(cx=0.7), pose={"body_yaw": -4.5})
+    registry.dispatch({"op": LOCK_FACE}, ctx)
+    beh = ctx.admits[0]
+    assert beh.channels == frozenset({"head", "body_yaw"})
+    assert beh.fn(0.0, beh.params, ctx.sense).body_yaw == pytest.approx(-4.5)
+
+
+def test_a_ctx_with_no_live_pose_holds_zero() -> None:
+    """A lock taken before any tick streamed a pose holds the neutral body yaw."""
+    _driver, registry = _wire()
+    ctx = _RecordingCtx(sense=_face(cx=0.7), pose=None)
+    registry.dispatch({"op": LOCK_FACE}, ctx)
+    beh = ctx.admits[0]
+    assert beh.fn(0.0, beh.params, ctx.sense).body_yaw == pytest.approx(0.0)
+
+
+def test_a_lock_over_the_seeded_base_layer_takes_head_and_body_yaw_only() -> None:
+    """h19: arbitration gives the antennas to feel-alive across lock, hold and release."""
+    engine = Engine()
+    engine.seed_base_layer(0.0, 1.0)
+    intents = IntentDriver()
+    driver = FaceLockDriver(
+        inhibitions_getter=lambda: intents.inhibitions,
+        inhibitions_setter=intents.set_inhibitions,
+    )
+    driver.register_into(intents.registry)
+    intents.inhibition_observer = driver.notice_inhibition_replaced
+
+    sense = _face(cx=0.7)
+    before = engine.compose_tick(0.02, sense)
+    assert set(_owner_names(engine, before).values()) == {BASE_LAYER_NAME}
+
+    ctx = _EngineCtx(engine=engine, now=0.02, sense=sense, pose=before["pose"])
+    result = intents.registry.dispatch({"op": LOCK_FACE}, ctx)
+    assert result["ok"] is True
+    assert result["inhibited"] == ["orient-to-sound"]
+
+    for i in range(1, 26):  # lock and hold
+        tick = engine.compose_tick(0.02 + i * 0.02, sense)
+        owners = _owner_names(engine, tick)
+        assert owners["head"] == FACE_LOCK_BEHAVIOR
+        assert owners["body_yaw"] == FACE_LOCK_BEHAVIOR
+        assert owners["antennas"] == BASE_LAYER_NAME
+        # The base layer is never evicted by a lock.
+        assert BASE_LAYER_NAME in {ab.behavior.name for ab in engine.active}
+
+    held = engine.compose_tick(0.54, sense)["pose"]["body_yaw"]
+    assert held == pytest.approx(before["pose"]["body_yaw"])
+
+    intents.registry.dispatch({"op": RELEASE_FACE}, ctx)
+    after = engine.compose_tick(0.56, sense)
+    assert set(_owner_names(engine, after).values()) == {BASE_LAYER_NAME}
+    # h20/#183: the lock case never stops the base layer, so it is still active.
+    assert engine.state(0.56, EngineConfig())["base_layer"]["active"] is True
+
+
+def test_orient_to_sound_stays_inhibited_so_it_never_owns_the_head() -> None:
+    """c29: same class as the lock, so only the inhibition keeps it off the face."""
+    intents = IntentDriver()
+    _driver, registry = _wire(intents)
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch({"op": LOCK_FACE}, ctx)
+    assert "orient-to-sound" in intents.inhibitions
+    refused = registry.dispatch(
+        {"op": "run_behavior", "name": "orient-to-sound", "duration_s": 1.0}, ctx
+    )
+    assert refused["ok"] is False
+    assert "inhibited" in refused["error"]
+    assert [beh.name for beh in ctx.admits] == [FACE_LOCK_BEHAVIOR]
+
+
+def test_claude_md_names_one_inhibited_behavior() -> None:
+    """The doc sentence the pair used to live in (spec target h19)."""
+    text = (Path(__file__).resolve().parents[1] / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "(`feel-alive`, `orient-to-sound` — the two behaviors that would drag" not in text
+    assert "the antennas keep swaying" in text
