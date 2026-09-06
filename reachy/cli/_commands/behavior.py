@@ -508,6 +508,12 @@ def _rules_config_payload(config: rules_mod.RulesConfig, *, path: Path, exists: 
         "react": [_rule_payload(r) for r in config.react],
         "inhibit": [_rule_payload(r) for r in config.inhibit],
         "modes": {name: dict(mode.params) for name, mode in config.modes.items()},
+        # Who this file makes the robot answer to (#177): the SHIPPED pair
+        # first, then the overlay's own additions. Reported unconditionally —
+        # an empty (or absent) `names` table is not "no names", it is the
+        # shipped pair, and an operator reading the rules deserves to see the
+        # names those rules are heard through without opening another verb.
+        "names": list(config.names),
     }
     if not exists:
         # "No overlay" stopped meaning "no rules" when the release began
@@ -672,14 +678,24 @@ def _rules_check_payload(
     try:
         config = rules_mod.load_rules(path)
     except CliError as err:
+        # A REJECTED overlay does not leave the robot nameless: the loader's
+        # fallback floor is the shipped layer, so the shipped pair is what stays
+        # in force. Reporting it here (rather than omitting the key on the
+        # failure branch) is the difference between "we could not read your
+        # file" and "we could not read your file, and here is what the robot
+        # still answers to while you fix it".
+        rejected_names = list(rules_mod.SHIPPED_NAMES)
         return {
             "ok": False,
             "path": str(path),
             "exists": exists,
             "reasons": [err.message],
             "warnings": [],
+            "names": rejected_names,
+            "summary": _names_summary(rejected_names),
         }
     warnings = _unfed_field_warnings(config) + _uncorroborated_field_warnings(config)
+    names = list(config.names)
     return {
         "ok": not warnings,
         "path": str(path),
@@ -691,6 +707,10 @@ def _rules_check_payload(
             "inhibit": len(config.inhibit),
             "modes": len(config.modes),
         },
+        "names": names,
+        # ONE line an operator can read at a glance (and grep) — the machine
+        # answer stays the `names` list beside it, so the two never disagree.
+        "summary": _names_summary(names),
     }
 
 
@@ -874,6 +894,136 @@ def _expressions_no_verb(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# the names the robot answers to — one phrasing, three surfaces (#177)        #
+# --------------------------------------------------------------------------- #
+
+
+#: ``state.json``'s key carrying the names the RUNNING engine answers to.
+#: Merged additively by :class:`_NamesPublisher`, exactly as the availability
+#: rider merges ``senses`` and the intent driver merges ``intents``.
+NAMES_STATE_KEY = "names"
+
+#: The ``event`` of the one ``[SENSE stage=rule source=names ...]`` line the
+#: runtime emits at composition and again on every CHANGE (never per tick).
+NAMES_EVENT = "in-force"
+
+#: ``engine status``'s two provenances for the names it reports. The
+#: distinction is load-bearing rather than decorative: "the file on disk says
+#: X" and "the robot currently answers to X" diverge the moment an operator
+#: edits ``rules.toml`` and has not run ``behavior reload`` — reporting the
+#: first as if it were the second is how someone ends up shouting a name the
+#: runtime has never heard of.
+NAMES_FROM_ENGINE = "engine"
+NAMES_FROM_DISK = "disk"
+
+
+def _names_summary(names) -> str:
+    """The ONE phrasing of "who this robot answers to", shared by every surface."""
+    listed = ", ".join(str(n) for n in names)
+    return f"answering to: {listed}" if listed else "answering to: (none)"
+
+
+class _NamesPublisher:
+    """Mirror the LIVE rules loader's merged ``names`` onto ``state.json``.
+
+    A seam RIDER in the shape of
+    :class:`~reachy.behavior.sense_availability.SenseAvailabilityDriver`, and
+    for the same reason: which names the runtime answers to is knowledge that
+    lives in the composition's loader, not in :meth:`Engine.state`, and it
+    changes between ticks whenever a ``behavior reload`` lands. Publishing it
+    is what lets ``behavior engine status`` answer about the RUNNING engine
+    rather than about the file on disk.
+
+    Writes are read-modify-write and CHANGE-GATED: the engine's own heartbeat
+    rewrites ``state.json`` wholesale before the seam runs, so the rider
+    republishes whenever the key is missing or stale and is otherwise a single
+    read per tick. It never raises out — a tap that crashes the loop is worse
+    than a tap that misses a tick.
+    """
+
+    def __init__(self, names_provider, *, main_control=None, root=None) -> None:
+        self._names = names_provider
+        self._main = main_control or control.CommandSpool(root=root)
+        self._published: list[str] | None = None
+
+    def announce(self) -> None:
+        """Log the names in force ONCE, at composition, and record them as said.
+
+        Called by ``_compose_run_seam`` so the journal names them from the first
+        line of a run. Recording them here is what keeps the rider's first tick
+        from repeating the identical line.
+        """
+        try:
+            self._report([str(n) for n in self._names()])
+        except Exception:  # composition must not fail over an observability line
+            logger.warning("names announce raised; skipping it", exc_info=True)
+
+    def __call__(self, ctx=None) -> None:
+        try:
+            self._publish()
+        except Exception:  # a state rider must never crash the tick
+            logger.warning("names publish raised; skipping this tick", exc_info=True)
+
+    def _publish(self) -> None:
+        names = [str(n) for n in self._names()]
+        current = self._main.read_state()
+        if not isinstance(current, dict):
+            current = {}
+        if current.get(NAMES_STATE_KEY) != names:
+            merged = dict(current)
+            merged[NAMES_STATE_KEY] = names
+            self._main.write_state(merged)
+        self._report(names)
+
+    def _report(self, names: list[str]) -> None:
+        """One line per CHANGE, never per republish.
+
+        A reload is news; the engine heartbeat clobbering the key back out of
+        ``state.json`` and this rider putting it in again is bookkeeping, and at
+        the tick rate it would bury the journal. Its ``source`` is
+        :data:`NAMES_STATE_KEY`, not ``rules``: the rules-file source is already
+        the reload/boot vocabulary, and folding a second, far more frequent
+        event into it would break every ``source=rules`` grep an operator has.
+        """
+        if self._published == names:
+            return
+        self._published = list(names)
+        senselog.stage(RULE_STAGE, NAMES_STATE_KEY, NAMES_EVENT, _names_summary(names))
+
+
+def _published_names() -> list[str] | None:
+    """The RUNNING engine's published names, or ``None`` if it published none."""
+    state = control.read_state()
+    if not isinstance(state, dict):
+        return None
+    names = state.get(NAMES_STATE_KEY)
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        return None
+    return list(names)
+
+
+def _names_provider_for(rules_driver) -> Callable[[], tuple[str, ...]]:
+    """The runtime's LIVE names seam: a closure over *rules_driver*'s loader.
+
+    Never a snapshot. ``ReloadDriver.loader.current`` is replaced wholesale by
+    an accepted ``behavior reload``, so reading it at CALL time is what makes an
+    edited ``names`` table take effect between ticks. ``None`` (no rules driver
+    — an overlay that left nothing to run) still yields the SHIPPED pair: a
+    robot that answers to nothing is never a legal outcome.
+    """
+    if rules_driver is None:
+        return lambda: rules_mod.SHIPPED_NAMES
+    return lambda: rules_driver.loader.current.names
+
+
+def _names_on_disk() -> list[str]:
+    """The merged names the rules file on disk puts in force (never raises)."""
+    loader = RulesLoader()
+    loader.reload()  # keeps its last-good (the shipped layer) on a bad overlay
+    return list(loader.current.names)
+
+
+# --------------------------------------------------------------------------- #
 # rules tick-seam composition (boot resilience)                               #
 # --------------------------------------------------------------------------- #
 
@@ -979,7 +1129,26 @@ def cmd_engine_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_engine_status(args: argparse.Namespace) -> int:
+    """Process + daemon reachability, plus the names the engine answers to (#177).
+
+    ``names`` is read from the RUNNING engine's ``state.json`` when it is
+    publishing one (:class:`_NamesPublisher`), and ``names_source`` says so.
+    With no live engine — or one from before this key existed — it falls back
+    to the merged names the rules file on disk puts in force and labels that
+    ``disk``, because an operator who edited ``rules.toml`` and has not run
+    ``behavior reload`` would otherwise read the file's answer as the robot's.
+    """
     data = supervisor.status(base_url=args.base_url, timeout=args.timeout)
+    published = _published_names()
+    names = published if published is not None else _names_on_disk()
+    data["names"] = names
+    data["names_source"] = NAMES_FROM_ENGINE if published is not None else NAMES_FROM_DISK
+    if published is None:
+        data["names_note"] = (
+            "no running engine published its names — showing the rules file on "
+            f"{NAMES_FROM_DISK}, which a live engine only answers to after "
+            "'behavior reload'"
+        )
     emit_payload(data, json_mode=bool(getattr(args, "json", False)))
     return 0
 
@@ -2189,8 +2358,8 @@ def _compose_run_seam(
     -----------------------------------------------
     ``[rules_driver, intent_driver, face_lock_driver, pat_driver,
     transcript_driver, face_driver, self_motion, holder, goto_lane,
-    availability, clip_rider]`` (with a :class:`SenseSnapshotDriver` appended
-    when exporting):
+    availability, names_publisher, clip_rider]`` (with a
+    :class:`SenseSnapshotDriver` appended when exporting):
 
     * ``rules_driver`` / ``intent_driver`` first — they make the tick's symbolic
       decisions (admit/evict, drain the intent + goto command spools). The GOTO
@@ -2235,6 +2404,12 @@ def _compose_run_seam(
       engine publishes its own snapshot BEFORE the seam runs, so a rider that
       augments the file wants to be the tick's final word. It reads nothing off
       ``ctx``, so this is ordering hygiene rather than a correctness constraint.
+    * ``names_publisher`` — the names the runtime answers to (#177), merged onto
+      the SAME ``state.json`` and change-gated, so ``behavior engine status``
+      can report what the RUNNING engine hears rather than what the file on disk
+      says. Another WRITER, ordered beside ``availability`` for the same reason,
+      and reading nothing off ``ctx`` either: its source is the composition's
+      LIVE rules loader, which a ``behavior reload`` moves between ticks.
     * ``clip_rider`` — the rolling-clip reference (spec claim c18), the same
       kind of WRITER as ``availability`` and ordered beside it for the same
       reason. It reads nothing off ``ctx`` either — its OWN frame feed arrives
@@ -2391,6 +2566,18 @@ def _compose_run_seam(
         # down, hearing is simply quiet.
         realtime = _make_realtime_client(_mic_sample_rate(audio_tap))
         realtime.start()
+        # WHO THE ROBOT ANSWERS TO (#177), bound to the LIVE loader rather than
+        # to a snapshot of it. `rules_driver` is a `ReloadDriver`, and its
+        # `loader.current` is REPLACED wholesale by an accepted `behavior
+        # reload` — so a closure reading `.loader.current.names` at call time
+        # picks up an edited `names` table between ticks, with no rebuild of the
+        # transcript driver and no restart of the runtime. Passing
+        # `names=loader.current.names` (or evaluating it here) would look
+        # identical on day one and then silently ignore every later reload,
+        # which is the whole failure mode the provider seam exists for. With no
+        # rules driver at all (a box whose overlay left nothing to run) the
+        # robot still knows the shipped pair: nameless is never a legal outcome.
+        names_provider = _names_provider_for(rules_driver)
         transcript_driver = TranscriptSenseDriver(
             media=audio_tap,  # the shared per-tick chunk, never a second mic read
             # The ONE hearing session. Injected, never constructed by the driver:
@@ -2403,6 +2590,9 @@ def _compose_run_seam(
             # rule speaks, and the robot talks to itself forever. The actuator
             # publishes the window its clip occupies; this closes the loop.
             mute_until=speech.mute_until,
+            # Resolved per UTTERANCE inside the driver, so this binding survives
+            # every reload for the life of the run (see the note above).
+            names_provider=names_provider,
         )
 
         holder = LastPoseHolder()
@@ -2427,6 +2617,12 @@ def _compose_run_seam(
             rms=rms_provider,
             rms_ratio=rms_ratio_provider,
             transcript=transcript_driver.as_provider(),
+            # The SAME driver's second one-tick latch (#177): "the utterance
+            # this tick was admitted BY NAME". A separate peek, not a re-derived
+            # one — the driver already knows which gate admitted, and asking the
+            # text again here would be a second, drifting answer to a question
+            # the engagement gate has already settled.
+            name_mentioned=transcript_driver.as_name_mentioned_provider(),
             face=face_driver.as_face_provider(),
             # The same detection's POSITION and its age (t2) — the name cue
             # answers WHO, these two answer WHERE and HOW STALE, which is what
@@ -2541,6 +2737,16 @@ def _compose_run_seam(
             ),
             main_control=main_control,
         )
+        # The names the RUNNING engine answers to, onto the SAME `state.json`
+        # (#177) — the one live channel `behavior engine status` can ask, since
+        # the loader lives in this process and a reload moves it between ticks.
+        # A WRITER, so it rides beside `availability` for the same reason.
+        names_publisher = _NamesPublisher(names_provider, main_control=main_control)
+        # ONE composition-time line naming the names in force, so the journal
+        # says who the robot answers to from the moment it starts rather than
+        # only when a reload later changes it. `announce()` also records them as
+        # published, so the rider's first tick does not repeat this same line.
+        names_publisher.announce()
         drivers = [
             d
             for d in (
@@ -2554,6 +2760,7 @@ def _compose_run_seam(
                 holder,
                 goto_lane,
                 availability,
+                names_publisher,
                 clip_rider,
             )
             if d is not None
