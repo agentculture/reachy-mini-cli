@@ -11,7 +11,7 @@ Hence the two-speed gate, and hence this file: the gate degrades to a slow
 cadence (:data:`~reachy.behavior.face_sense.DEFAULT_HELD_DETECT_INTERVAL`)
 while a lock is held, rather than to nothing, and the resulting bbox gaps are
 checked against the LOCK's own timers — ``FACE_LOST_AFTER_S`` (3.0 s) and
-``MAX_FACE_AGE_S`` (1.5 s), neither of which this arc changes.
+``MAX_FACE_AGE_S`` (3.0 s since the first live acceptance; the bbox TTL is 3.5 s).
 
 Nothing here touches a robot, a camera, a clock that sleeps, or cv2: the media
 client, the detector and the store are fakes, the gate's clock is a list, and
@@ -251,7 +251,11 @@ def test_the_bbox_ttl_matches_the_locks_own_max_face_age() -> None:
     position held longer than that is invisible to it — which is why the
     still-only gate does NOT lengthen the TTL.
     """
-    assert FS.DEFAULT_FACE_BBOX_TTL_S == MAX_FACE_AGE_S
+    assert FS.DEFAULT_FACE_BBOX_TTL_S >= MAX_FACE_AGE_S
+    assert (
+        FS.DEFAULT_FACE_BBOX_TTL_S
+        >= 2 * FS.DEFAULT_HELD_DETECT_INTERVAL + FS.DEFAULT_STILL_SETTLE_S
+    )
 
 
 def test_the_held_cadence_stays_inside_the_locks_face_lost_window() -> None:

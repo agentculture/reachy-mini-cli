@@ -128,7 +128,16 @@ LOCK_INHIBITS = ("orient-to-sound",)
 
 #: A ``face_bbox`` older than this is not a face to lock onto. Matches the
 #: producer's own TTL (``reachy.behavior.face_sense``), so the two agree.
-MAX_FACE_AGE_S = 1.5
+MAX_FACE_AGE_S = 3.0
+#: Why 3.0 and not the 1.5 it shipped with: since ``FaceObservation.captured_at``
+#: a reading's age honestly INCLUDES the detection's own latency, and the
+#: deployed Wireless detects every 1.0 s (``REACHY_FACE_DETECT_INTERVAL``) on
+#: a CM4 — so a reading was 1.0 s + latency old by the time the next one
+#: landed, past 1.5 s, and the lock ignored every reading after the first one
+#: it admitted on: live (2026-09-06) it aimed once and then held that pose for
+#: 40 s while the person moved. A late reading is not a WRONG reading — the
+#: base-angle ring anchors the aim at the frame's capture time — so the bound
+#: is ``FACE_LOST_AFTER_S``, the point at which absence is reported anyway.
 
 #: The raw event every release emits, whatever ended the lock. ``motion.`` is the
 #: prefix :mod:`reachy.export.runtime` maps onto ``MotionEvent``; both this action

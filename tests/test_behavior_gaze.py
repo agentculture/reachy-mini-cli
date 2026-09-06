@@ -392,7 +392,7 @@ def test_face_run_behavior_refuses_with_no_bbox(tmp_path) -> None:
 def test_face_run_behavior_refuses_when_stale(tmp_path) -> None:
     cmd_id = _submit(tmp_path, name="look-at-face", params={}, lifetime=None)
     driver = IntentDriver(root=tmp_path)
-    stale = Sense(face_bbox=(0.4, 0.4, 0.2, 0.2), face_age_s=2.0)  # > 1.5s default
+    stale = Sense(face_bbox=(0.4, 0.4, 0.2, 0.2), face_age_s=4.0)  # > 3.0s default
     ctx = _RecordingCtx(now=1.0, tick=1, sense=stale)
 
     driver.on_tick(ctx)
