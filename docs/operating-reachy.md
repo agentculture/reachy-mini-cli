@@ -1349,6 +1349,57 @@ history, and because their engines are still in the tree:
   composition wires that seam today, so scene description is currently
   unreachable from the CLI.
 
+### Still-only detection
+
+Face detection (YuNet + SFace) is the most expensive leg on the tick thread's
+behalf, and running it while the head is slewing was both wasteful and wrong:
+measured on the CM4, the runtime's tick rate fell from **~50 Hz to ~7 Hz**
+while the detector ran continuously, and a mid-slew frame is motion-blurred
+*and* stamped in a head frame the robot has already left by the time detection
+finishes. So the face worker now detects **only while the commanded head pose
+is still**:
+
+- Submission stops the moment the head starts moving (a peek at the same
+  self-motion latch `rms_sense`'s moving floor already consumes — no new
+  sensor), and stays stopped until `DEFAULT_STILL_SETTLE_S` (0.5 s) of
+  stillness has passed after the slew ends. That settle time is an
+  **unmeasured, defensible default** — one 30 fps camera frame's worth of
+  buffer plus margin — not yet checked against the real optics on a box.
+- One consumer moves the head *in order to see*: a held [face
+  lock](#looking-at-a-face--the-face-lock). So a second peek — whether a lock
+  is currently held — degrades the gate to a slow
+  `DEFAULT_HELD_DETECT_INTERVAL` cadence (1.5 s) instead of to silence while
+  the lock's own gaze is slewing. A blinded lock chasing a face across the
+  frame would otherwise report `face-lost` on someone it is looking straight
+  at.
+- The transition is observable exactly twice per episode — never once per
+  tick — as a named senselog line:
+
+  ```text
+  [SENSE stage=gate source=face event=self-moving] opened reason=self-moving lock_held=false
+  [SENSE stage=gate source=face event=self-moving] closed ...
+  ```
+
+A raising or missing self-motion peek degrades to "not moving" — exactly the
+behaviour before this gate existed, never a crash.
+
+Two throughput knobs tune the detector independently of the gate above, both
+env-driven and both defaulting to unchanged behaviour: `REACHY_FACE_DETECT_INTERVAL`
+(seconds between detections while running, default 0.5 s) and
+`REACHY_FACE_DETECT_MAX_WIDTH` (downscale a wide frame before detection; `0` —
+the default — means no downscaling). Both fall back to their default on a
+missing, non-numeric, zero, or negative value.
+
+A face **position** (`face_bbox`/`face_age_s`) is a held level, not a one-tick
+pulse, and it expires after `DEFAULT_FACE_BBOX_TTL_S` (1.5 s) so the robot
+never keeps aiming at where a face used to be. That TTL was re-derived, not
+changed, against the wider gaps this gate introduces: a detection right after
+a slew ends can land up to `DEFAULT_STILL_SETTLE_S` + `DEFAULT_DETECT_INTERVAL`
+(1.0 s) later, and a held lock's own slow cadence is exactly
+`DEFAULT_HELD_DETECT_INTERVAL` (1.5 s) — both stay inside the 1.5 s TTL, so
+neither widened gap ever blanks a position a gaze one-shot or the lock still
+needs.
+
 ### Installing the `[vision]` extra
 
 Face recognition and scene description need OpenCV; the pixel-only `vision`
@@ -1483,6 +1534,68 @@ needed.
 > drop-in, or a monitor priority that always favors the daemon), or in a
 > future `service` drop-in writer here. Neither exists today; this section
 > documents the manual operator repair.
+
+### The eyes' liveness — senses.live
+
+`state.json`'s `senses` block (above) answers one question — is this sense
+composed and is its software installed — and answers it once, for the life of
+the process. That is deliberately **structural**, and it stays that way:
+`available` never flaps because the camera happened to miss a frame this
+instant. Issue #176 adds a **second, orthogonal** fact beside it, for the two
+senses derived from the camera stream (`frame_available` / `face`) — a
+**reading**, not composition:
+
+```json
+{
+  "senses": {
+    "frame_available": {"available": true, "reason": null, "live": true,  "last_frame_at": 1234.5},
+    "face":            {"available": true, "reason": null, "live": true,  "last_frame_at": 1234.5},
+    "rms":             {"available": true, "reason": null, "live": null,  "last_frame_at": null}
+  }
+}
+```
+
+- **`live`** is `true` when a usable frame arrived within
+  `DEFAULT_STREAM_STALE_S` (10 s — the same threshold that already latches the
+  `camera-stream-ended` drop below, imported rather than restated so the two
+  can never disagree), `false` when the camera has gone quiet past it, and
+  `null` for any sense with no liveness provider wired (every sense except the
+  two camera-derived ones today).
+- **`last_frame_at`** is a stable timestamp — when the last usable frame
+  arrived, `null` if one never has — not a per-tick age. A live camera would
+  otherwise make this block, and the senselog line reporting it, rewrite every
+  single tick; keying the change gate on `(available, reason, live)` only means
+  a live camera for 60 s costs **zero** further `state.json` writes and exactly
+  **one** senselog line, whichever way `live` flips:
+
+  ```text
+  [SENSE stage=availability source=face event=senses] dropped reason=no-frames
+  [SENSE stage=availability source=face event=senses] frames live
+  ```
+
+**The value is also what the runtime acts on.** Before this arc, only a
+reported GStreamer pipeline error triggered a re-acquire — a pipeline that
+died *silently* (frames simply stop, with no error at all) left the camera
+"available" for as long as **1h45m** on the deployed robot before an operator
+noticed by eye. Now: when `live` reads false for `DEFAULT_STREAM_STALE_S`
+(10 s) while the held media client still claims to be connected, the face
+sense's own staleness latch (already the one thing watching this, for the
+`camera-stream-ended` drop) asks the held client to **drop itself**
+(`HeldMediaClient.drop(reason)`) — from the tick thread, the only thread
+allowed to touch a client the keeper still believes is connected. The
+background `_HolderKeeper` then re-warms it the moment its own unchanged
+`connected == False` poll notices, exactly as it does after any other
+connection loss — **no process restart**. The one measured cost is to the mic:
+the warm-up that re-acquires the camera also re-acquires the shared media
+session, so hearing goes quiet for the ~1 s the warm-up takes. Exactly one
+named senselog drop line records the whole episode
+(`reason=camera-stream-ended`); a robot with **no** camera, or one that has
+never produced a single frame yet (`last_frame_at` still `null`), is never
+touched by this path — there is no "stream" to have ended.
+
+`docs/export-schema.md` documents `live` / `last_frame_at` on the `senses`
+key of the [`reachy/state/{key}` MQTT
+mirror](export-schema.md#reachystatekey--retained-standing-state) too.
 
 ### The forge loop — the robot writes its own reaction seams
 
@@ -2301,6 +2414,198 @@ estimator behind them has two knobs of its own, both composition-time:
 `REACHY_RMS_SILENCE_FLOOR` (a denominator clamp that only ever bites on a muted
 mic).
 
+### Looking at a face — the face lock
+
+`lock_face` / `release_face` are a dedicated intent pair (reached over the
+[spool](#agent--attach-over-the-runtime-feed-and-the-intent-spool), not a
+rule): "hold the gaze on the face the robot sees right now" is a STANDING
+claim, so the lock state has to have exactly one answer no matter which agent
+turn asked, and `release_face` is one call that undoes everything the lock
+did.
+
+```json
+{"op": "lock_face"}
+```
+
+refuses fail-closed (`{"ok": false, "error": "no face known"}`) unless
+`Sense.face_bbox` is fresh (no older than `max_age`, 1.5 s below); otherwise it
+admits one looping `face-lock` behavior that maps the bbox centre to a head
+yaw/pitch target every tick.
+
+```json
+{"op": "release_face"}
+```
+
+ends it — or one of three self-protecting endings does it for you (see
+below).
+
+**The aim is incremental, and it centres in one or two detection cycles.**
+Before this arc, the mapping from a face's position in frame to a head angle
+was an ABSOLUTE target — a fixed gain divided by the camera's real field of
+view — so on the Wireless camera's own optics it settled at roughly **0.31**
+of the true bearing and never arrived; a face 30° off-axis left the head
+parked about 9° off, indefinitely. The lock now closes a *measured* angular
+error instead of guessing a gain:
+
+```text
+target_yaw   = base_yaw   - (cx - 0.5) * fov_h * damping
+target_pitch = base_pitch - (cy - 0.5) * fov_v * damping
+```
+
+where `base_yaw`/`base_pitch` is the angle the gaze was **commanding at the
+moment the frame was captured** (a small ring of recent commanded angles,
+looked up by the reading's `face_age_s`) — not the angle it commands now,
+which would double-count whatever the previous correction already moved. Each
+detection closes `damping` of the remaining error, so a face held 30° off-axis
+lands within 2° of the true bearing within **two** detection cycles and cannot
+overshoot for any `0 < damping <= 1` — every step is a fraction of an error the
+robot just measured, and the error can never change sign.
+
+| Param | Code constant | Default | Meaning |
+|---|---|---|---|
+| `fov_h` | `HFOV_DEG` | 87.0° | Camera horizontal field of view — turns a normalised bbox x-offset into a real angle |
+| `fov_v` | `VFOV_DEG` | 57.0° | Camera vertical field of view, same idea for pitch |
+| `damping` | `DAMPING` | 0.7 | Fraction of the measured error one detection closes (0..1); 1.0 aims exactly at the face and is the twitchy end |
+| `max_yaw` | `MAX_YAW_DEG` | 20.0° | Head yaw clamp |
+| `max_pitch` | `MAX_PITCH_DEG` | 12.0° | Head pitch clamp |
+| `slew` | `SLEW_DEG_S` | 120.0 deg/s | How fast the commanded angle chases its target |
+| `max_age` | `MAX_FACE_AGE_S` | 1.5 s | Ignore a face position older than this |
+
+`fov_h` (87°) / `fov_v` (57°) are the Wireless camera's own optics, derived
+from its published intrinsics (`GET /api/camera/specs`, `2*atan(cx/fx)`) —
+**not measured on a live box in this arc**; the acceptance numbers above are
+defaults exercised by the unit suite's simulated camera model. A different
+camera is a different pair of numbers — override them per lock. Live
+before/after numbers, when taken, land under `docs/evidence/`.
+
+`face_age_s` — the freshness the lock and `max_age` both key on — now measures
+from the moment the frame was **captured** (`captured_at`, the detection
+worker's own clock read *before* running the detector), not from the moment
+the detection was *published*. YuNet+SFace takes real, non-trivial time on a
+640 px frame, and a face lock that measured age from publish would apply its
+correction against a stale `base_yaw` reading — the capture-time anchor is
+what lets a lock still converge in two cycles even with a slow detection
+pass.
+
+> **Payload compatibility.** `yaw_gain` / `pitch_gain` are **gone** — the
+> library entry no longer has params by those names. A caller with an old
+> `lock_face` payload naming them gets a clean "unknown field" refusal, not a
+> silent no-op; drop them (or don't pass them) and use `fov_h` / `fov_v` /
+> `damping` instead.
+
+**The antennas keep swaying under a lock.** Before this arc, taking a lock
+also *inhibited* `feel-alive` — the base idle layer is one behavior for
+breathing, gaze wander AND antenna sway together, so silencing it to protect
+the head stilled the antennas for the whole hold. The lock now **claims**
+`head` **and** `body_yaw` as channels instead (arbitration is per-channel, and
+the lock outranks the passive base layer on any channel it claims, with no
+eviction needed), and holds `body_yaw` at whatever the engine was already
+streaming the tick before the lock was taken — because `feel-alive`'s own slow
+body wander rotates the whole head assembly, camera included, off the face.
+`antennas` is left unclaimed, so the base layer keeps that one channel and the
+antennas go on swaying for the life of the lock. `orient-to-sound` is the only
+name still inhibited (`LOCK_INHIBITS`) — it is the lock's own contention
+class for the `head` channel, so a same-priority admission could otherwise win
+the recency tie-break and drag the head off the face; arbitration alone
+cannot stop that, only the inhibition can.
+
+`behavior status` shows the split directly during a lock:
+
+```json
+{
+  "ownership": {"head": "face-lock:lock:1", "body_yaw": "face-lock:lock:1", "antennas": "feel-alive:base:1"}
+}
+```
+
+**Losing the face is a report, not an ending.** A face gone (or stale) for
+`FACE_LOST_AFTER_S` (3.0 s) emits one `motion.face-lost` and the lock
+**persists**, still holding its last target — vision drops frames, and someone
+stepping briefly out of frame has not asked to be unlocked. That 3.0 s figure
+has a derivation, not just a number: one detect interval (up to 1.0 s deployed),
+plus the post-motion settle the still-only gate adds (≤0.5 s), plus the worst
+in-clamp slew the incremental aim can command (0.33 s) — 1.83 s — plus one
+whole missed cycle on top — 2.83 s — inside 3.0 s with margin in the worst
+case.
+
+Three endings run through one release path and each names its `reason` on the
+`motion.lock-released` event:
+
+- `requested` — an explicit `release_face`.
+- `mind-offline` — the mind (`mind_online()`, MQTT-derived) has read `false`
+  continuously for 10 s: nobody is left to release it, so it releases itself.
+- `max-hold` — 30 minutes have passed regardless. Not a safety bound (the
+  behavior's own clamp is that); a liveness bound, so a forgotten lock cannot
+  outlive its usefulness.
+- `evicted` — the behavior left the active set some other way (`behavior stop
+  face-lock`, or `stop all`) without `release_face` being called; the lock
+  state follows it rather than holding inhibitions for a head it no longer
+  drives.
+
+```json
+{"t":"motion","ts":1718362804.4,"tick":210,"action":"lock-released","behavior":"face-lock","channels":["body_yaw","head"],"detail":{"id":"face-lock:lock:1","reason":"mind-offline"}}
+```
+
+### The base layer: stopped on purpose vs. inhibited
+
+`feel-alive` — the idle base layer (breathing, gaze wander, antenna sway) —
+used to have exactly one way to be gone: an inhibition naming it (a mind's
+`set_inhibition`, or the face lock's own former inhibition — see above) evicted
+it for the rest of the process, with no way back short of a restart. That was
+one bug wearing two faces, and this arc fixes both:
+
+- **Eviction-by-inhibition is now self-healing.** The base layer re-seeds
+  itself, automatically, on the exact edge where an inhibition **naming
+  `feel-alive` clears** — never on any other edge, and never for a by-name
+  stop (below). After `lock_face` then `release_face` (the lock no longer
+  inhibits `feel-alive` at all, so this path is now mostly theoretical for the
+  lock specifically), or after any `set_inhibition` that named `feel-alive` and
+  then cleared it, `feel-alive` comes back with `is_base=True` within one tick
+  — `stop all` still keeps it, exactly as if it had never left. One senselog
+  line marks a real re-seed:
+
+  ```text
+  [SENSE stage=engine source=base-layer event=re-seed] re-seeded feel-alive id=... energy=1.0 after=inhibition
+  [SENSE stage=intent source=set_inhibition event=feel-alive] re-seeded (inhibition cleared)
+  ```
+
+- **A by-name stop is intentional stillness, and it holds.** `behavior stop
+  feel-alive` is an operator (or a rule) asking for a genuinely still robot —
+  that is NOT the same fact as an inhibition eviction, and the re-seed above
+  must never undo it — a would-be re-seed while stopped by name is refused
+  once per stop episode, named:
+
+  ```text
+  [SENSE stage=engine source=base-layer event=re-seed] dropped reason=base-layer-stopped: feel-alive was stopped by name; re-seed refused until an unbounded add of feel-alive
+  ```
+
+  It holds until the un-stop verb or a restart. The un-stop verb is an
+  **unbounded** `run feel-alive` — no `--duration` / `--once` / `--loop` flag:
+
+  ```bash
+  reachy-mini-cli behavior run feel-alive       # re-seeds the base layer proper
+  ```
+
+  This re-seeds the base layer proper (`is_base=True`, recorded so `stop all`
+  keeps it too) using the engine's own `--energy`, ignoring any `--set` params
+  passed alongside it — the same call over the intent spool (`run_behavior`
+  naming `feel-alive` with no lifetime) does the same thing. Every *other*
+  looping-default library entry is still refused unbounded (see [bounded
+  reactions](#bounded-reactions-no-more-permanent-holds)) — this carve-out is
+  `feel-alive`-only.
+
+`behavior status --json` reports which state the base layer is in:
+
+```json
+{"base_layer": {"seeded": true, "active": false, "stopped_by": "stop"}}
+```
+
+`stopped_by` is `null` while active, `"stop"` after a by-name stop, or
+`"inhibition"` for the transient window between an inhibition taking
+`feel-alive` and the clearing edge re-seeding it. `docs/export-schema.md`
+documents the same key on the `reachy/state/base_layer` MQTT topic (mirrored
+1:1 from `state.json`, [as every top-level key
+is](export-schema.md#reachystatekey--retained-standing-state)).
+
 ### Speech — the `say` field gives a rule a voice
 
 A react rule can also **speak**. Add `say = "..."` and the robot says those
@@ -2565,6 +2870,23 @@ line, `t`/`ts`/`tick` always first — see
 {"t":"rule","ts":1752345678.9,"tick":1,"action":"fire","rule":"wake-sway","kind":"react","field":"doa","op":"absent_for","reason":"fired","behavior":"antenna-sway","disable":[]}
 {"t":"sense","ts":1752345678.9,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false,"pat_state":{"availability":"unavailable","contact":false,"touch_type":null,"level":null,"yaw_deg":null,"phase":"idle","phase_started_at":null,"last_press_at":null}}
 ```
+
+**A `sense` line means at least one EMITTED field genuinely changed — never a
+clock tick.** Before this arc, `SenseSnapshotDriver` compared the raw `Sense`
+snapshot for equality, and two of its fields advance every tick with nothing
+else moving: `face_age_s`/`doa_age_s` (continuous ages, while a face or a DoA
+reading is held) and, on `pat_sense.py`'s side, `pat_state.phase_started_at` /
+`last_press_at`, which several code paths rewrite to "now" with no touch-phase
+transition at all. Neither reaches the wire payload, so comparing the raw
+dataclass emitted a line every tick regardless — a face held in view or a
+steady DoA reading turned the feed into a 50 Hz heartbeat. The driver now
+compares a scrubbed view of the payload it is *about* to emit (those clock
+fields nulled) against the last one it actually sent, so a held face or a live
+DoA for 100 ticks in a row now produces exactly **one** `sense` line, not 100 —
+and the payload it does emit is unchanged shape; only the decision of whether
+to emit at all changed. For a consumer: expect far fewer `sense` lines than
+before, and never rely on one arriving at a fixed cadence — it is not a
+heartbeat.
 
 ### Agent — attach over the runtime feed and the intent spool
 
