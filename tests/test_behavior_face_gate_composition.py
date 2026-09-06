@@ -179,10 +179,16 @@ def test_the_face_gate_has_its_own_slew_speed_latch_beside_the_mics_fine_one(
         gate_latch = face._moving.__self__
         assert gate_latch in latches
         fine = [d for d in latches if d is not gate_latch][0]
-        assert gate_latch._eps_deg == pytest.approx(
-            face_sense.DEFAULT_GATE_EPS_DEG_S / 50.0
-        )  # 20 deg/s at 50 Hz = 0.4 deg/tick
-        assert fine._eps_deg < gate_latch._eps_deg / 5
+        # d6: the gate's eps is deg/s judged against real tick time — never a
+        # per-tick value derived from compose_hz (the deployed tick runs 2x its
+        # budget, #97) — and the antennas are not watched (they do not move the
+        # camera). The mic's latch keeps its per-tick, all-nine-axes shape.
+        assert gate_latch.per_second is True
+        assert gate_latch.watches_antennas is False
+        assert gate_latch._eps_deg == pytest.approx(face_sense.DEFAULT_GATE_EPS_DEG_S)
+        assert fine.per_second is False
+        assert fine.watches_antennas is True
+        assert fine._eps_deg * 50.0 < gate_latch._eps_deg / 5  # 1.75 deg/s vs 20 deg/s
 
 
 def test_the_base_layers_slow_wander_never_closes_detection(_isolated, monkeypatch):
@@ -312,3 +318,45 @@ def test_no_new_rule_visible_sense_field_appeared():
     assert "live" not in _COMPOSED_PROVIDER_FIELDS
     assert "last_frame_at" not in _COMPOSED_PROVIDER_FIELDS
     assert "self_moving" in _COMPOSED_PROVIDER_FIELDS  # the latch the gate reads, unchanged
+
+
+# --------------------------------------------------------------------------- #
+# 5. d6 — antenna sway and tick stalls never close detection                  #
+# --------------------------------------------------------------------------- #
+
+
+def _pose_with(yaw: float = 0.0, antennas: tuple[float, float] = (0.0, 0.0)) -> dict:
+    head = {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": yaw}
+    return {"head": head, "antennas": antennas, "body_yaw": 0.0}
+
+
+def test_antenna_sway_never_closes_detection(_isolated, monkeypatch):
+    """Live: the shipped antenna-sway (18 deg / 3 s, ~38 deg/s peak) opened the
+    gate on every half-swing — 354 transitions in 10 min with only the base
+    layer running — and every lock_face was refused ``no face known``."""
+    import math
+
+    with _composed(monkeypatch) as (_media, drivers, _res):
+        face = _only(drivers, FaceSenseDriver)
+        gate_latch = face._moving.__self__
+        for i in range(300):  # 6 s, two full sway periods
+            t = i * 0.02
+            sway = 18.0 * math.sin(2.0 * math.pi * t / 3.0)
+            gate_latch(_Ctx(t, _pose_with(antennas=(sway, -sway))))
+            assert face._due_interval(t) == face._detect_interval, f"gate opened at tick {i}"
+
+
+def test_a_stalled_tick_under_the_base_layers_wander_never_closes_detection(_isolated, monkeypatch):
+    """The deployed tick runs 34-44 ms mean with 500-800 ms stalls (#97): a
+    2.7 deg/s wander across a stall is a >1 deg step. Judged per second it is
+    still a wander, never a slew."""
+    with _composed(monkeypatch) as (_media, drivers, _res):
+        face = _only(drivers, FaceSenseDriver)
+        gate_latch = face._moving.__self__
+        t = 0.0
+        yaw = 0.0
+        for dt in (0.02, 0.044, 0.5, 0.8, 0.044, 0.02, 0.3):
+            t += dt
+            yaw += 2.7 * dt
+            gate_latch(_Ctx(t, _pose_with(yaw=yaw)))
+            assert face._due_interval(t) == face._detect_interval, f"gate opened after a {dt}s tick"

@@ -1371,7 +1371,7 @@ def _pat_detector() -> PatDetector | None:
     )
 
 
-def _make_face_motion(compose_hz: float) -> SelfMotionDriver:
+def _make_face_motion() -> SelfMotionDriver:
     """Build the face gate's OWN self-motion latch, at slew speed (#179).
 
     A second :class:`SelfMotionDriver` instance, not the mic's: the mic's latch
@@ -1379,11 +1379,15 @@ def _make_face_motion(compose_hz: float) -> SelfMotionDriver:
     face gate must ignore exactly that wander (``feel-alive`` peaks ~2.7 deg/s)
     and trip only on a slew-class move — see
     :data:`~reachy.behavior.face_sense.DEFAULT_GATE_EPS_DEG_S`. The env value
-    is deg/s; the driver wants deg/tick, so it is divided by the tick rate here.
+    is deg/s and is judged PER SECOND against real tick time (never divided by
+    ``compose_hz``: the deployed tick runs 2x its budget with stalls, #97), over
+    the head and body_yaw only — the antennas do not move the camera and their
+    sway tripped the gate on every half-swing (deviation d6).
     """
-    eps_deg_s = _pat_float_env(GATE_EPS_ENV, DEFAULT_GATE_EPS_DEG_S)
-    per_tick = max(0.0, float(eps_deg_s)) / max(1.0, float(compose_hz))
-    return SelfMotionDriver(eps_deg=per_tick, eps_mm=per_tick, tail_s=DEFAULT_TAIL_S)
+    eps_deg_s = max(0.0, float(_pat_float_env(GATE_EPS_ENV, DEFAULT_GATE_EPS_DEG_S)))
+    return SelfMotionDriver(
+        eps_deg_s=eps_deg_s, eps_mm_s=eps_deg_s, watch_antennas=False, tail_s=DEFAULT_TAIL_S
+    )
 
 
 def _make_self_motion() -> SelfMotionDriver:
@@ -2545,7 +2549,7 @@ def _compose_run_seam(
         # never the mic's fine one: live, the base layer's ~2.7 deg/s wander
         # tripped the mic's latch and starved detection (no face was ever
         # known while the robot idled). Both read ctx.pose; both ride the bus.
-        face_motion = _make_face_motion(config.compose_hz)
+        face_motion = _make_face_motion()
         face_driver = FaceSenseDriver(
             media=media,
             engine=recognition[0] if recognition is not None else None,

@@ -1364,7 +1364,14 @@ is still**:
   `DEFAULT_GATE_EPS_DEG_S` (20 °/s, env `REACHY_FACE_GATE_EPS_DEG_S`), not
   the mic's fine 1.75 °/s one: live, sharing the mic's latch let the base
   layer's ~2.7 °/s gaze wander starve detection for 18 s stretches and every
-  `lock_face` answered `no face known` — and stays stopped until `DEFAULT_STILL_SETTLE_S` (0.5 s) of
+  `lock_face` answered `no face known`. That latch judges **degrees per second
+  against real tick time, over the head and body_yaw only**: the antennas do
+  not move the camera, yet `antenna-sway` (~38 °/s at its peak) tripped a
+  per-tick threshold on every half-swing, and the box's tick runs about twice
+  its 20 ms budget with 500-800 ms stalls (#97), so a stall turned the wander
+  into a slew-class step — live, that blocked detection most of the time
+  while the detector itself found the operator in 12 of 14 clip frames — and
+  stays stopped until `DEFAULT_STILL_SETTLE_S` (0.5 s) of
   stillness has passed after the slew ends. That settle time is an
   **unmeasured, defensible default** — one 30 fps camera frame's worth of
   buffer plus margin — not yet checked against the real optics on a box.
