@@ -240,6 +240,16 @@ GATE_EVENT = "self-moving"
 #: and matches the retired ``listen_face.DEFAULT_DETECT_INTERVAL``.
 DEFAULT_DETECT_INTERVAL: float = 0.5
 
+#: YuNet detection score floor, and its env override. The shipped 0.6 (nova's)
+#: is right for a well-lit face on a full frame; in a dim room, at distance, or
+#: on a downscaled frame a real face can score well under it and never be
+#: detected — measured live on the Wireless (2026-09-06), a person at ~1.5 m in
+#: evening light scored ~0.22 at 640 px and ~0.55 at full 1280 px. Lowering it
+#: trades a higher false-positive risk (a printed face on a wall) for catching a
+#: dim real one; it is an OPERATING knob, not a default to move.
+DEFAULT_SCORE_THRESHOLD: float = 0.6
+SCORE_THRESHOLD_ENV = "REACHY_FACE_SCORE_THRESHOLD"
+
 #: ``REACHY_FACE_DETECT_MAX_WIDTH`` off value — no downscaling. Matches the
 #: constructor default and reads exactly like "0 pixels" would mean anything
 #: else: it is the explicit off switch, not a real width.
@@ -482,7 +492,12 @@ def build_face_recognition(
         from reachy.vision.face import FaceEngine
         from reachy.vision.face_store import FaceStore
 
-        engine = FaceEngine(models_dir=models_dir) if models_dir is not None else FaceEngine()
+        score = score_threshold_from_env()
+        engine = (
+            FaceEngine(models_dir=models_dir, score_threshold=score)
+            if models_dir is not None
+            else FaceEngine(score_threshold=score)
+        )
         store = FaceStore(base_dir=store_base_dir) if store_base_dir is not None else FaceStore()
     except Exception:  # a broken vision stack disables the cue, nothing more
         if not _VISION_WARNED:
@@ -509,6 +524,28 @@ def _peek(provider: Callable[[], bool] | None) -> bool:
         return bool(provider())
     except Exception:
         return False
+
+
+def score_threshold_from_env(
+    value: str | None = None, *, default: float = DEFAULT_SCORE_THRESHOLD
+) -> float:
+    """Parse :data:`SCORE_THRESHOLD_ENV` into a 0..1 YuNet score floor.
+
+    Never raises. Unset, empty, unparsable, or out of ``(0, 1]`` all fall back
+    to *default* — the same fail-open shape :func:`detect_interval_from_env`
+    uses, so a fat-fingered value degrades to the shipped behaviour rather than
+    disabling detection.
+    """
+    raw = value if value is not None else os.environ.get(SCORE_THRESHOLD_ENV)
+    if not raw:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return default
+    if math.isnan(parsed) or math.isinf(parsed) or not (0.0 < parsed <= 1.0):
+        return default
+    return parsed
 
 
 def detect_interval_from_env(
@@ -1570,6 +1607,8 @@ __all__ = [
     "vision_unavailable_reason",
     "DEFAULT_DETECT_INTERVAL",
     "DEFAULT_GATE_EPS_DEG_S",
+    "SCORE_THRESHOLD_ENV",
+    "score_threshold_from_env",
     "GATE_EPS_ENV",
     "DEFAULT_DETECT_MAX_WIDTH",
     "DEFAULT_FACE_BBOX_TTL_S",

@@ -1637,3 +1637,23 @@ def test_a_media_client_without_a_generation_keeps_the_once_per_episode_latch() 
     driver(_Ctx(1.5))
     driver(_Ctx(3.0))
     assert fired == [FS.REASON_STREAM_ENDED]
+
+
+# --------------------------------------------------------------------------- #
+# score_threshold_from_env (#181 live follow-up)                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_score_threshold_from_env_defaults_when_unset() -> None:
+    assert FS.score_threshold_from_env(None) == FS.DEFAULT_SCORE_THRESHOLD
+    assert FS.score_threshold_from_env("") == FS.DEFAULT_SCORE_THRESHOLD
+
+
+@pytest.mark.parametrize("raw,expected", [("0.4", 0.4), ("0.55", 0.55), ("1.0", 1.0)])
+def test_score_threshold_from_env_parses_a_valid_float(raw, expected) -> None:
+    assert FS.score_threshold_from_env(raw) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw", ["nope", "0", "-0.2", "1.5", "nan", "inf"])
+def test_score_threshold_from_env_falls_back_on_out_of_range_or_garbage(raw) -> None:
+    assert FS.score_threshold_from_env(raw) == FS.DEFAULT_SCORE_THRESHOLD
