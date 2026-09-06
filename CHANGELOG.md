@@ -7,18 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.52.0] - 2026-09-06
 
-### Added
+### Changed
 
-- The robot's canonical names gain "nova" (`name_match`, `engagement`,
-  `transcript_sense`, `attention`, the sleep wake-word default) alongside
-  "reachy"/"robot", with n-family collision guards (a Soundex phonetic guard,
-  an apostrophe/clitic stem match, and a four-letter fuzzy-match floor) so
-  "now"/"no"/"know"/"nah"/"not"/"novel"/"november"/"nowhere"/"nothing"/"never"
-  do not false-trigger the name fast-path.
-- `select_face` prefers a recognised (enrolled) face when several faces are in
-  frame — biggest among equals — so a gaze lock taken for reachy-nova's
-  conversation hold goes to the person the robot knows (#175). No other
-  face-lock gain, cadence or TTL constant changes.
+- **`select_face` prefers a recognised face** (#175, for reachy-nova #25 q2):
+  a recognised face wins over any unrecognised face regardless of size; among
+  faces of equal recognition status the biggest wins; among boxless
+  detections the named one is chosen so its name cue is not lost. The rule is
+  one sort key `(has a box, is named, area)`. `AREA_TIE_RATIO` and the near-tie
+  band are removed. No face-lock, gaze, TTL or cadence constant changes;
+  `lock_face` inherits the preference by reading `Sense.face_bbox` unchanged.
+  The robot's canonical names are untouched — see #177 for the configurable
+  override a peer harness can supply.
 
 ## [0.51.1] - 2026-08-26
 

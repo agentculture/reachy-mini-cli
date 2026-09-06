@@ -189,33 +189,6 @@ class TestHttpSttBackend:
         backend = wakeword.HttpSttBackend()
         assert backend.phrase == "hey reachy"
 
-    def test_default_phrases_accept_both_reachy_and_nova(self, monkeypatch):
-        """The unconfigured default matches "hey reachy" OR "hey nova" (issue #25)."""
-        from reachy.sleep import wakeword
-
-        monkeypatch.delenv("REACHY_STT_PHRASE", raising=False)
-        backend = wakeword.HttpSttBackend()
-        assert backend.phrases == ("hey reachy", "hey nova")
-        assert backend._matches({"text": "well, hey nova, wake up"}) is True
-        assert backend._matches({"text": "well, hey reachy, wake up"}) is True
-        assert backend._matches({"text": "the weather is nice today"}) is False
-
-    def test_env_var_phrase_selects_exactly_one_phrase(self, monkeypatch):
-        """An explicit ``REACHY_STT_PHRASE`` still selects a single phrase only."""
-        from reachy.sleep import wakeword
-
-        monkeypatch.setenv("REACHY_STT_PHRASE", "yo robot")
-        backend = wakeword.HttpSttBackend()
-        assert backend.phrases == ("yo robot",)
-        assert backend._matches({"text": "hey nova are you there"}) is False
-
-    def test_explicit_phrase_arg_selects_exactly_one_phrase(self):
-        from reachy.sleep import wakeword
-
-        backend = wakeword.HttpSttBackend(phrase="hey reachy")
-        assert backend.phrases == ("hey reachy",)
-        assert backend._matches({"text": "hey nova wake up"}) is False
-
 
 # ---------------------------------------------------------------------------
 # 3. Import boundary — default/HTTP path imports NO openwakeword

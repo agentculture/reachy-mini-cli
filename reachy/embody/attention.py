@@ -110,7 +110,7 @@ from reachy.speech.name_match import DEFAULT_THRESHOLD, is_name_match
 #: and ``tests/test_embody_attention.py`` pins the two tuples equal so the
 #: duplication cannot drift into a robot that answers to different names
 #: depending on which of its two ears heard you.
-DEFAULT_NAMES: tuple[str, ...] = ("reachy", "nova", "robot")
+DEFAULT_NAMES: tuple[str, ...] = ("reachy", "robot")
 
 #: How long attention stays open after the last thing heard or said, in seconds.
 #:

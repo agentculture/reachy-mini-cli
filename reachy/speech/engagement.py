@@ -118,7 +118,7 @@ from dataclasses import dataclass
 from reachy.speech.name_match import DEFAULT_THRESHOLD, is_name_match
 
 #: Canonical names the robot answers to.  Mirrors the listen/transcribe default.
-DEFAULT_NAMES: tuple[str, ...] = ("reachy", "nova", "robot")
+DEFAULT_NAMES: tuple[str, ...] = ("reachy", "robot")
 
 #: Tight, bounded default timeout for a single classifier call (seconds).  A
 #: classifier sits in the perception hot-loop, so a slow/dead endpoint must fail

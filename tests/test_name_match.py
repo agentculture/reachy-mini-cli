@@ -186,17 +186,6 @@ _COLLISION_TABLE: list[tuple[str, str, str]] = [
     ("route", "robot", "score 0.600"),
     ("root", "robot", "score 0.711"),
     ("robust", "robot", "score 0.606"),
-    # --- n-family: "nova" joins the canonical names (issue #25) ---
-    ("now", "nova", "phonetic code N000 (no consonant survives) != nova's N100"),
-    ("no", "nova", "too short (below the four-letter fuzzy floor) and N000 != N100"),
-    ("know", "nova", "silent 'k' — starts with 'k', not 'n' — initial guard rejects it"),
-    ("nah", "nova", "phonetic code N000 != nova's N100"),
-    ("not", "nova", "phonetic code N300 != nova's N100"),
-    ("novel", "nova", "phonetic code N140 != nova's N100"),
-    ("november", "nova", "phonetic code N151 != nova's N100"),
-    ("nowhere", "nova", "phonetic code N600 != nova's N100"),
-    ("nothing", "nova", "phonetic code N352 != nova's N100"),
-    ("never", "nova", "phonetic code N160 != nova's N100"),
 ]
 
 
@@ -241,49 +230,6 @@ def test_exact_match_always_passes_regardless_of_threshold() -> None:
     """An exact name match always returns True, even at threshold=1.0."""
     assert is_name_match("reachy", threshold=1.0) is True
     assert is_name_match("robot", threshold=1.0) is True
-    assert is_name_match("nova", threshold=1.0) is True
-
-
-# ---------------------------------------------------------------------------
-# n-family (issue #25) — "nova" as a canonical name
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "nova",
-        "NOVA",
-        "Nova, come here",
-        "hey nova",
-        "nova what time is it",
-        "nova's over here",  # plausible STT slip: name + possessive/contraction
-    ],
-)
-def test_nova_accepted(text: str) -> None:
-    """ "nova" and plausible variants match by default (issue #25)."""
-    assert is_name_match(text) is True, f"{text!r} should match the default name 'nova'"
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "now",
-        "no",
-        "know",
-        "nah",
-        "not",
-        "novel",
-        "November",
-        "nowhere",
-        "not now",
-        "nothing",
-        "never",
-    ],
-)
-def test_nova_collisions_rejected(text: str) -> None:
-    """Common n-initial English words must not false-trigger on "nova" (issue #25)."""
-    assert is_name_match(text) is False, f"{text!r} must not name-match 'nova'"
 
 
 # ---------------------------------------------------------------------------

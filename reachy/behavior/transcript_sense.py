@@ -223,7 +223,7 @@ DEFAULT_MIN_WORDS = 3
 DEFAULT_ENGAGE_WINDOW_S = 20.0
 
 #: Canonical names the robot answers to (the donor's default).
-DEFAULT_NAMES: tuple[str, ...] = ("reachy", "nova", "robot")
+DEFAULT_NAMES: tuple[str, ...] = ("reachy", "robot")
 
 #: Bound on utterances awaiting the engagement gate. Small on purpose: if the
 #: classifier is wedged, queueing more is pointless — the words are already

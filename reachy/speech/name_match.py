@@ -83,37 +83,6 @@ that "rich" (R200) and "ricky" (R200) also share "reachy"'s code, and those are
 still rejected by the similarity threshold.  Soundex says "could plausibly be
 heard as"; the score still says "is close enough to actually be".
 
-**The n-family (issue #25) — "nova" joins the canonical names**
-
-The same phonetic guard closes the n-initial collision class for "nova" almost
-for free, because Soundex ignores vowels: ``now``/``no``/``nah``/``not`` all
-collapse to ``N000`` (no consonant survives after the seeded initial), while
-``novel``/``november``/``nowhere``/``nothing``/``never`` each keep a *different*
-trailing consonant run (``N140``, ``N151``, ``N600``, ``N352``, ``N160``) —
-none of them equals "nova"'s own ``N100``.  ``"know"`` fails even earlier: it
-is spelled with a silent ``k``, so the *initial* guard (word must start with
-the name's literal first letter, ``"n"``) rejects it before the phonetic check
-ever runs.
-
-Two guards specific to "nova" (short — only four letters, one trailing
-consonant) supplement the ladder:
-
-1. *Clitic guard* — a tokenised word carrying an apostrophe suffix (STT often
-   renders a name+contraction as one token, e.g. ``"nova's"``) is matched on
-   its stem (the text before the apostrophe), so "nova's" matches "nova" the
-   same way "nova" does, instead of being scored against the literal 5-letter
-   string "novas".
-2. *Four-letter fuzzy floor* — because "nova" has only one consonant after its
-   initial letter, its Soundex code is weak evidence (a word need only share
-   that one consonant to tie it, e.g. "navy" also codes ``N100``).  A fuzzy
-   (non-exact) match is required to be at least as long as the shortest
-   canonical name involved (4, for "nova"); this was already true of every
-   accepted "reachy" mishearing (5+ letters) so it changes nothing there.  It
-   is a floor, not a full fix — a same-length, single-consonant collision
-   ("navy") is a known residual gap the phonetic guard alone cannot close;
-   none of the required n-family reject words hit it, so no further guard was
-   added for it here.
-
 **Chosen default threshold: 0.50**
 
 Empirically verified across the required accept/reject table:
@@ -149,12 +118,6 @@ _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 #: "reachy" while rejecting "rich" (score 0.400).  Callers may lower this to be
 #: more permissive or raise it to be stricter.
 DEFAULT_THRESHOLD: float = 0.50
-
-#: Minimum word length for a *fuzzy* (non-exact) match. Every accepted "reachy"
-#: mishearing is 5+ letters, so this only ever bites the short n-family words
-#: ("no", "nah", "not") — see the module docstring's "n-family (issue #25)"
-#: section for why "nova" (4 letters, one trailing consonant) needs this floor.
-_MIN_FUZZY_WORD_LEN: int = 4
 
 
 #: Soundex consonant classes.  Letters absent from this map (the vowels plus
@@ -247,41 +210,31 @@ def _word_matches_name(word: str, name: str, threshold: float) -> bool:
     score decides. Factored out of :func:`is_name_match` so the public function
     stays a flat ``any(...)`` over word/name pairs.
     """
-    # Clitic guard (#25): an STT token can fuse a name with a trailing
-    # contraction/possessive ("nova's"). Match on the stem — the tokeniser
-    # regex only ever admits an apostrophe followed by more letters, so the
-    # stem is never empty for a valid token.
-    stem = word.split("'", 1)[0]
-    if stem == name:
+    if word == name:
         return True  # exact whole-word match — always accept
-    if name.startswith(stem):
+    if name.startswith(word):
         return False  # prefix guard: "reach" is a strict prefix of "reachy" → truncation
-    if name in stem:
+    if name in word:
         return False  # superstring guard: "reachy" in "preachy" → morphological extension
     # Initial guard: a fuzzy match must share the name's first letter. STT mishearings
     # of "reachy" keep the leading phoneme ("richie", "reachie"); same-length score
     # collisions ("speech") do not. (``name[:1]`` is a safe single-char prefix — "" for
     # an empty name — so ``startswith`` never raises.)
-    if not stem.startswith(name[:1]):
-        return False
-    # Four-letter fuzzy floor (#25): below this, a short name like "nova" has too
-    # little consonant material for the phonetic guard to discriminate reliably.
-    # See the module docstring's "n-family" section.
-    if len(stem) < _MIN_FUZZY_WORD_LEN:
+    if not word.startswith(name[:1]):
         return False
     # Phonetic guard (#104): a fuzzy match must SOUND like the name, not merely
     # look like it. "really"/"reality"/"root" all clear the guards above and the
     # score, but their consonant skeletons (R400/R430/R300) differ from the
     # name's — they are ordinary words, not mis-transcriptions. See the module
     # docstring for the measured collision table this closes.
-    if _phonetic_code(stem) != _phonetic_code(name):
+    if _phonetic_code(word) != _phonetic_code(name):
         return False
-    return _combined_score(stem, name) >= threshold
+    return _combined_score(word, name) >= threshold
 
 
 def is_name_match(
     text: str,
-    names: Iterable[str] = ("reachy", "nova", "robot"),
+    names: Iterable[str] = ("reachy", "robot"),
     threshold: float = DEFAULT_THRESHOLD,
 ) -> bool:
     """Return ``True`` when *text* contains a word that plausibly names the robot.
@@ -308,8 +261,8 @@ def is_name_match(
     text:
         The utterance to check (may be a full sentence or a single word).
     names:
-        Canonical names to match against.  Defaults to
-        ``("reachy", "nova", "robot")``.  All comparisons are case-insensitive.
+        Canonical names to match against.  Defaults to ``("reachy", "robot")``.
+        All comparisons are case-insensitive.
     threshold:
         Minimum combined similarity score to accept a fuzzy match.
         Defaults to :data:`DEFAULT_THRESHOLD` (0.50).
