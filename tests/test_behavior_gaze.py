@@ -577,4 +577,9 @@ def test_every_gaze_and_lock_clamp_declares_its_domain() -> None:
         for key, param in entry.params.items():
             if key in {"pitch", "roll", "z"}:
                 continue  # signed by nature: an offset, not a magnitude
-            assert param.minimum == 0.0, f"{name}.{key} declares no lower bound"
+            assert param.minimum is not None, f"{name}.{key} declares no lower bound"
+            # 0.0 for a magnitude; a strictly-positive knob (face-lock's
+            # `fov_h`/`fov_v` — a zero field of view reads every face as dead
+            # centre) declares the smallest positive bound it can, since
+            # `Param.minimum` is inclusive.
+            assert param.minimum >= 0.0, f"{name}.{key} allows a negative"

@@ -5,11 +5,86 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.54.0] - 2026-09-06
+
+The September-6 face/lock/camera arc — six issues, one PR
+(spec: `docs/specs/2026-09-06-september-6-face-lock-camera-fixes-181-179-176-183.md`).
+
+### Added
+
+- `state.json` `senses.<name>.live` / `last_frame_at` — camera liveness beside
+  structural availability (#176); `no-frames` / `frames live` senselog lines.
+- `state.json` `base_layer: {seeded, active, stopped_by}` and
+  `TickContext.ensure_base` / `add_base`: the base layer re-seeds when an
+  inhibition naming `feel-alive` clears; a by-name `behavior stop feel-alive`
+  is intentional stillness until an unbounded `run feel-alive` (#183).
+- `HeldMediaClient.drop(reason)` — a camera that goes silent for 10 s is
+  handed back from the tick thread and re-warmed by the keeper, no restart (#176).
+- `FaceSenseDriver` still-only detection: `moving` / `lock_held` / `on_stale`
+  seams, `DEFAULT_STILL_SETTLE_S`, `DEFAULT_HELD_DETECT_INTERVAL`,
+  `[SENSE stage=gate source=face]` lines (#179); `FaceObservation.captured_at`.
+- `face-lock` params `fov_h` / `fov_v` / `damping` (#181); follow-up #186 for
+  `look-at-face`.
+- Operating guide: the face lock, still-only detection, the eyes' liveness,
+  the base layer stopped vs. inhibited, the WirePlumber camera boot race.
+
+### Changed
+
+- `face-lock` aims incrementally through the camera FOV (centres in two
+  detection cycles at damping 0.7) instead of an absolute 20°/12° gain that
+  settled at ~0.31 of the face angle (#181). `yaw_gain` / `pitch_gain` removed.
+- `face-lock` claims head + body_yaw; `feel-alive` leaves `LOCK_INHIBITS`, so
+  the antennas keep swaying under a lock and the base layer is never evicted
+  by it (#183). Its `motion.*` events report `["body_yaw","head"]`.
+- `SenseSnapshotDriver` emits a `sense` line only when the EMITTED payload
+  changed — clock-only fields (pat timestamps, face/DoA ages) no longer
+  produce lines (#184).
+- `run_behavior feel-alive` with no lifetime is the base re-seed; every other
+  looping-default entry is still refused unbounded.
+
+### Fixed
+
+- `test_a_missing_vision_extra_reports_a_named_reason_never_a_crash` states
+  its cv2 premise through the `find_spec` seam (#185).
+- `face_age_s` measures detection latency on the driver's own clock, applied
+  to the engine tick clock — the two time bases never couple.
+
+### Fixed
+
+## [0.53.1] - 2026-09-06
 ## [0.52.1] - 2026-09-06
 
 ### Added
 
 - **`REACHY_FACE_DETECT_INTERVAL` / `REACHY_FACE_DETECT_MAX_WIDTH`** — two opt-in throughput knobs for `FaceSenseDriver`, both env-driven and both defaulting to today's behaviour (0.5 s detections on the full frame) so nothing changes for an operator who never sets them. `DETECT_INTERVAL` widens the gap between detections; `DETECT_MAX_WIDTH` downscales the frame handed to the engine (aspect preserved) before detection — the published `face_bbox` needs no rescaling since it is normalised to the frame the engine saw, though the embedding is computed on the smaller frame, a real recognition-quality trade-off. Live on the CM4: once the camera delivered frames, the engine's tick rate fell from ~50 Hz to ~7 Hz running full-frame detection every 0.5 s.
+
+## [0.53.0] - 2026-09-06
+
+### Added
+
+- **Configurable robot names** (#177, split from #175): the overlay's top-level
+  `names = [...]` table adds to the shipped `reachy`/`robot` pair — now spelled
+  ONCE as `reachy.speech.name_match.SHIPPED_NAMES` — validated fail-closed with
+  the rest of `rules.toml` (letters only, 3+ chars, up to 8 entries; a bad
+  entry refuses the file and `RulesLoader` keeps last-good). The runtime reads
+  the names LIVE through a provider bound to the reload loader, so
+  `behavior reload` changes who the robot answers to between ticks; the
+  engagement classifier's prompt is rendered from them; `agent embody`'s
+  attention gate and `sleep`'s wake phrases (one `hey <name>` per configured
+  name except `robot`) read the same table at start.
+- **`name_mentioned` sense event**: a one-tick `Sense` field latched when the
+  transcript gate admits an utterance BY NAME (never on a `context` admission),
+  keyable from a rule (`when = { field = "name_mentioned", op = "is_true" }`),
+  carried on the snapshot export and as the cue *"someone said my name"*.
+- `behavior rules list` / `rules check` / `engine status` report the names in
+  force (`engine status` says whether they came from the running engine or from
+  disk); one `[SENSE stage=rule source=names event=in-force]` line at
+  composition and on every change.
+- `is_name_match` gains two guards for short configured names: a clitic stem
+  match (`nova's` → `nova`) and a four-letter fuzzy floor.
+- `tests/test_no_peer_name.py`: this repo hardcodes no peer's name (AST value
+  scan; provenance comments and the harness's own MQTT topic are allowed).
+  Peer prerequisite: OriNachum/reachy-nova#27.
 
 ## [0.52.0] - 2026-09-06
 

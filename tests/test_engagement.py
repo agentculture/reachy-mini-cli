@@ -25,12 +25,17 @@ from collections.abc import Sequence
 import pytest
 
 from reachy.speech.engagement import (
+    DEFAULT_NAMES,
+    ENGAGEMENT_PROMPT_TEMPLATE,
+    ENGAGEMENT_SYSTEM_PROMPT,
     ConversationGate,
     Decision,
     EngagementClassifier,
     decide_engagement,
+    render_engagement_prompt,
+    resolve_names,
 )
-from reachy.speech.name_match import is_name_match
+from reachy.speech.name_match import SHIPPED_NAMES, is_name_match
 from tests.fixtures.engagement_transcripts import (
     ADDRESSED_FOLLOWUP,
     AMBIENT,
@@ -307,7 +312,7 @@ def test_classifier_builds_system_and_user_messages() -> None:
     assert "user" in roles
     # System prompt encodes the addressed-vs-helpable distinction + YES/NO contract.
     system = messages[0]["content"]
-    assert "Reachy" in system
+    assert "reachy" in system  # every configured name is spelled out (#177)
     assert "YES" in system and "NO" in system
     # The user message carries the new utterance and the recent context.
     user = next(m["content"] for m in messages if m["role"] == "user")
@@ -569,3 +574,108 @@ def test_short_utterances_are_gated_even_while_warm() -> None:
     assert verdict.decision is Decision.DROP
     assert verdict.label == "not-addressed-short"
     assert classifier.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Configurable names (issue #177) — the gate FOLLOWS the names, live
+# ---------------------------------------------------------------------------
+#
+# The robot's names are configuration now, not a literal.  Two properties are
+# pinned here: the names may arrive as a zero-arg PROVIDER and are resolved at
+# USE time (so a rename reaches the very next utterance with nothing rebuilt),
+# and the classifier's system prompt NAMES every configured name (a prompt
+# still saying "Reachy" to a robot called something else is a second, silent
+# copy of the robot's identity).
+#
+# "nova" is not a shipped name — it appears here only as a CONFIGURED value.
+
+_CONFIGURED_NAMES: tuple[str, ...] = SHIPPED_NAMES + ("nova",)
+
+
+def test_default_names_is_an_alias_of_the_shipped_pair() -> None:
+    """``DEFAULT_NAMES`` is the shipped pair, not a second spelling of it."""
+    assert DEFAULT_NAMES is SHIPPED_NAMES
+
+
+def test_a_configured_name_engages_on_the_fast_path() -> None:
+    """A name the operator configured short-circuits exactly like a shipped one."""
+    classifier = _RecordingClassifier(verdict=False)
+    decision = decide_engagement(
+        "nova come here", [], classifier=classifier, names=_CONFIGURED_NAMES
+    )
+    assert decision is Decision.ENGAGE
+    assert classifier.calls == []
+
+
+def test_a_names_provider_is_resolved_at_use_time() -> None:
+    """Swapping what the provider returns takes effect on the NEXT utterance.
+
+    No gate is rebuilt and no conversation state is lost — which is the whole
+    reason the names are a callable rather than a constructor snapshot.
+    """
+    configured: list[tuple[str, ...]] = [SHIPPED_NAMES]
+    classifier = _RecordingClassifier(verdict=False)
+    gate = _gate(classifier, names=lambda: configured[0])
+
+    first = gate.decide("nova come here", now=0.0)
+    assert first.decision is Decision.DROP  # cold, and not (yet) a name
+
+    configured[0] = _CONFIGURED_NAMES
+    second = gate.decide("nova come here", now=1.0)
+    assert second.decision is Decision.ENGAGE
+    assert second.label == "name"
+    assert classifier.calls == []  # both decisions were structural
+
+
+def test_a_broken_names_provider_degrades_to_the_shipped_pair() -> None:
+    """A provider that raises or yields nothing must not silence the name path.
+
+    An empty name set takes away the ONLY thing that can open a cold
+    conversation, so a misconfigured provider would leave a robot that can
+    never be addressed again.  Degrading to the shipped pair is the direction
+    that keeps the robot reachable.
+    """
+
+    def _boom() -> tuple[str, ...]:
+        raise RuntimeError("no rules loaded")
+
+    assert resolve_names(_boom) == SHIPPED_NAMES
+    assert resolve_names(lambda: ()) == SHIPPED_NAMES
+    assert resolve_names(lambda: None) == SHIPPED_NAMES  # type: ignore[arg-type,return-value]
+    assert resolve_names(_CONFIGURED_NAMES) == _CONFIGURED_NAMES
+
+
+def test_the_rendered_prompt_names_every_configured_name() -> None:
+    """The classifier is told all the names, and no name is hardcoded."""
+    prompt = render_engagement_prompt(_CONFIGURED_NAMES)
+    for name in _CONFIGURED_NAMES:
+        assert name in prompt
+    # The shipped rendering is the template applied to the shipped pair.
+    assert ENGAGEMENT_SYSTEM_PROMPT == render_engagement_prompt(SHIPPED_NAMES)
+    # No name literal survives in the template itself.
+    assert "reachy" not in ENGAGEMENT_PROMPT_TEMPLATE.lower()
+    assert "{names}" in ENGAGEMENT_PROMPT_TEMPLATE
+
+
+def test_the_classifier_renders_its_prompt_from_a_live_provider() -> None:
+    """A classifier built with a provider re-renders per call, never once."""
+    configured: list[tuple[str, ...]] = [SHIPPED_NAMES]
+    complete = _RecordingComplete("NO")
+    clf = EngagementClassifier(complete_fn=complete, names=lambda: configured[0])
+
+    clf.judge("hello there", [])
+    assert "nova" not in complete.messages[0][0]["content"]
+
+    configured[0] = _CONFIGURED_NAMES
+    clf.judge("hello there", [])
+    assert "nova" in complete.messages[1][0]["content"]
+
+
+def test_an_explicit_system_prompt_wins_over_the_rendered_one() -> None:
+    """``system_prompt=`` is an override, and overrides are not negotiable."""
+    complete = _RecordingComplete("YES")
+    clf = EngagementClassifier(
+        complete_fn=complete, names=_CONFIGURED_NAMES, system_prompt="ANSWER YES OR NO."
+    )
+    clf.judge("hello there", [])
+    assert complete.messages[0][0]["content"] == "ANSWER YES OR NO."

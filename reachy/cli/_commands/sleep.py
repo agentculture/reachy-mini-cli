@@ -38,11 +38,13 @@ import argparse
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
 
+from reachy import senselog
 from reachy.behavior.liveness import refuse_if_engine_live
 from reachy.behavior.sense import DOA_TIMEOUT, EMPTY_SENSE, DoaPoller, Sense, read_doa
 from reachy.cli._commands._robot import emit_payload
@@ -64,6 +66,11 @@ from reachy.sleep.stimulus import is_stimulus
 from reachy.sleep.wake import WakeDetector
 
 _JSON_HELP = "Emit structured JSON."
+
+#: The box-local rules overlay names the robot (#177) and reading it raised —
+#: bad TOML, an unreadable state dir, a ``names`` entry the schema refuses. The
+#: wake path falls back to the shipped names rather than refusing to run.
+_REASON_NAMES_OVERLAY_REFUSED = "names-overlay-refused"
 
 #: Seconds between sense samples in the foreground loop.
 _DEFAULT_TICK = 0.05
@@ -555,16 +562,62 @@ def _resolve_audio_wake(args: argparse.Namespace) -> bool:
     return not no_audio
 
 
+def _configured_wake_names(
+    rules_loader: Callable[[], object] | None = None,
+) -> tuple[str, ...]:
+    """The names this robot answers to, for the wake-WORD phrases (#177).
+
+    Read from the box's rules overlay (``<state_dir>/behavior/rules.toml``'s
+    ``names`` array) — the SAME file the runtime's hearing gate and the
+    embodiment layer's attention gate read, so one robot has one set of names.
+    Both imports are FUNCTION-LOCAL: ``_build_parser()`` imports every command
+    module, and the rules stack has no business in the import path of
+    ``daemon status``.
+
+    A malformed overlay is survived, not fatal: ``load_rules`` raises
+    :class:`CliError` on a typo, and this falls back to the shipped names with
+    one named ``[SENSE ...]`` drop. A robot that refuses to sleep because a
+    name is mistyped in a config file is a worse failure than one that wakes
+    only to "hey reachy" until the file is fixed.
+    """
+    from reachy.behavior.rules import load_rules, overlay_rules_path
+    from reachy.speech.name_match import SHIPPED_NAMES
+
+    loader = rules_loader
+    if loader is None:
+
+        def loader() -> object:
+            return load_rules(overlay_rules_path())
+
+    try:
+        names = tuple(str(name) for name in getattr(loader(), "names", ()))
+    except Exception as exc:
+        senselog.drop(
+            "wake",
+            "names",
+            uuid.uuid4().hex[:8],
+            f"{_REASON_NAMES_OVERLAY_REFUSED} ({exc})",
+        )
+        return SHIPPED_NAMES
+    return names or SHIPPED_NAMES
+
+
 def _make_wake_detector_factory(
-    args: argparse.Namespace, sample_rate: int | None = None
+    args: argparse.Namespace,
+    sample_rate: int | None = None,
+    *,
+    rules_loader: Callable[[], object] | None = None,
 ) -> Callable[[], WakeDetector]:
     """Build the arc's wake-WORD detector factory from the run flags.
 
     Tier-2 wake-word is opt-in via ``--wake-word``; the resolved backend kind
     (``http`` STT default, or ``openwakeword`` on the ``[cpu]``/``[gpu]`` extra)
     and an optional phrase override are threaded to :class:`WakeDetector`, which
-    resolves the t2 backend.  Disabled by default → a null backend that never
-    fires (Tier-1 speech/snap still works via ``is_stimulus``).
+    resolves the t2 backend.  With no explicit phrase, the box's configured
+    NAMES are threaded instead (#177) — one ``"hey <name>"`` per name — so a
+    robot that answers to a second name can be woken by it.  Disabled by
+    default → a null backend that never fires (Tier-1 speech/snap still works
+    via ``is_stimulus``).
 
     ``sample_rate`` is the real mic rate from the SDK transport, carried into the
     HTTP STT backend's WAV header so Parakeet interprets the audio correctly.
@@ -572,11 +625,17 @@ def _make_wake_detector_factory(
     enabled = bool(getattr(args, "wake_word", False))
     kind = getattr(args, "wake_word_kind", None) or "http"
     phrase = getattr(args, "wake_phrase", None)
+    # Read the overlay ONLY when it can change the answer: an explicit phrase
+    # overrides the names outright, and a disabled Tier-2 has no phrase at all.
+    # ``sleep demo`` therefore still needs no state dir and no rules file.
+    names = () if (phrase or not enabled) else _configured_wake_names(rules_loader)
 
     def _factory() -> WakeDetector:
         kw: dict[str, object] = {"wake_word_enabled": enabled, "wake_word_kind": kind}
         if phrase:
             kw["phrase"] = phrase
+        if names:
+            kw["names"] = names
         if sample_rate:
             kw["wake_word_sample_rate"] = int(sample_rate)
         return WakeDetector(**kw)  # type: ignore[arg-type]

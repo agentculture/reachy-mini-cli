@@ -20,6 +20,31 @@
 # it. Put every box-local change in the overlay instead.
 #
 # ===========================================================================
+# The `names` table — the names this robot answers to
+# ===========================================================================
+#
+# A rules file may carry a top-level array of EXTRA names, one word per entry:
+#
+#     names = ["<the extra name this box answers to>"]
+#
+# It EXTENDS the shipped pair; it never replaces it. The shipped names are
+# spelled in CODE (`reachy.speech.name_match.SHIPPED_NAMES`), never in a rules
+# file, and `reachy.behavior.rules` always returns them FIRST — so no edit to
+# any TOML file, here or in the overlay, can leave a robot that no longer
+# answers to the name it came with. Both layers' additions are UNIONed (shipped
+# first, then this file's, then the overlay's) and de-duplicated silently, so
+# re-stating a name is a harmless no-op.
+#
+# Bounds, all fail-closed — a bad entry refuses the WHOLE file, naming the entry
+# and the bound it broke: at most 8 entries; each entry a single letters-only
+# word of at least 3 characters after lower-casing (no digits, spaces,
+# punctuation or blanks).
+#
+# There is deliberately NO `names` line below. The shipped layer is identical on
+# every robot, and WHICH extra name a particular box answers to is exactly the
+# kind of local fact the overlay exists for.
+#
+# ===========================================================================
 # What ships here, and why it is only three rules
 # ===========================================================================
 #

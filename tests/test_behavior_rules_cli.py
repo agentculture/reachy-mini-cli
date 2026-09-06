@@ -344,6 +344,28 @@ def test_rules_check_a_rule_keyed_on_self_moving_never_warns(capsys) -> None:
     assert payload["counts"] == {"react": 0, "inhibit": 1, "modes": 0}
 
 
+# `name_mentioned` (issue #177, t3): the field's registry entries
+# (`_PROVIDER_PREDICATE_FIELDS` / `_COMPOSED_PROVIDER_FIELDS`) land in this
+# same change, so a rule keyed on it must already be accepted with no
+# dormant-predicate warning — the composition wiring itself is a later task.
+NAME_MENTIONED_FIELD_TOML = """\
+[[inhibit]]
+id = "i-name-mentioned"
+when = { field = "name_mentioned", op = "is_true" }
+disable = ["speak"]
+"""
+
+
+def test_rules_check_a_rule_keyed_on_name_mentioned_never_warns(capsys) -> None:
+    _write_rules(NAME_MENTIONED_FIELD_TOML)
+    rc = main(["behavior", "rules", "check", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["warnings"] == []
+    assert payload["counts"] == {"react": 0, "inhibit": 1, "modes": 0}
+
+
 def test_rules_check_only_the_unfed_rule_is_flagged_in_a_mixed_file(capsys, monkeypatch) -> None:
     _simulate_unfed(monkeypatch, "face")
     _write_rules(MIXED_FIELD_TOML)

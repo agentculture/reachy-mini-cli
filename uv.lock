@@ -1965,7 +1965,7 @@ wheels = [
 
 [[package]]
 name = "reachy-mini-cli"
-version = "0.52.1"
+version = "0.54.0"
 source = { editable = "." }
 dependencies = [
     { name = "events-cli" },

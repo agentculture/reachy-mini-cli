@@ -52,11 +52,13 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Sequence
 from typing import Callable
 
 import numpy as np
 
 from reachy.behavior.sense import Sense
+from reachy.speech.name_match import SHIPPED_NAMES
 from reachy.speech.stt import Transcriber
 
 logger = logging.getLogger(__name__)
@@ -65,7 +67,24 @@ logger = logging.getLogger(__name__)
 # Configuration defaults (env-var pattern mirrors reachy.speech.tts)
 # ---------------------------------------------------------------------------
 
-DEFAULT_PHRASE = "hey reachy"
+#: Names too GENERIC to build a wake phrase from (#177). ``"robot"`` is a
+#: shipped name — the robot answers to it in conversation — but ``"hey robot"``
+#: shouted across an open-plan room is not an address to THIS robot, and a wake
+#: phrase is the one place a false fire costs a sleeping machine its sleep. So
+#: the generic half of the shipped pair is deliberately not a wake phrase,
+#: which is why the shipped default is exactly ``("hey reachy",)`` and not two
+#: phrases. An operator who wants it can still say so with ``--wake-phrase``.
+GENERIC_WAKE_NAMES: frozenset[str] = frozenset({"robot"})
+
+#: The wake phrases in force when nothing is configured — one ``"hey <name>"``
+#: per shipped, non-generic name.
+DEFAULT_PHRASES: tuple[str, ...] = tuple(
+    f"hey {name}" for name in SHIPPED_NAMES if name not in GENERIC_WAKE_NAMES
+)
+#: Back-compat single-phrase alias: the FIRST default phrase. Kept because
+#: :mod:`reachy.sleep.wake` re-exports it and an operator's script may import
+#: it; every matching path reads the plural.
+DEFAULT_PHRASE = DEFAULT_PHRASES[0]
 #: Endpoint path + per-request timeout for the STT POST. The *transcription* leg
 #: (URL / language / sample-rate / window / throttle resolution) is now owned by
 #: :class:`reachy.speech.stt.Transcriber`; only the wake-word-specific defaults
@@ -86,9 +105,36 @@ KIND_OPENWAKEWORD = "openwakeword"
 DEFAULT_KIND = KIND_HTTP
 
 
-def _resolve_phrase(override: str | None) -> str:
-    """Return the wake phrase: explicit arg > ``REACHY_STT_PHRASE`` > default."""
-    return override or os.environ.get("REACHY_STT_PHRASE") or DEFAULT_PHRASE
+def _resolve_phrases(
+    override: str | None = None,
+    *,
+    names: Sequence[str] = SHIPPED_NAMES,
+) -> tuple[str, ...]:
+    """Return the wake phrases: explicit arg > env > one per configured name.
+
+    Precedence, and why each level is exactly ONE or MANY:
+
+    * an explicit ``phrase`` argument (``--wake-phrase``) → **exactly one**.
+      An operator naming a phrase has named THE phrase; adding the configured
+      names beside it would make the flag an addition rather than an override.
+    * ``REACHY_STT_PHRASE`` → **exactly one**, for the same reason.
+    * otherwise → ``"hey <name>"`` for every configured name except the
+      :data:`GENERIC_WAKE_NAMES`, so a box that configured ``nova`` wakes to
+      "hey nova" as well as "hey reachy" with nothing else to set.
+
+    Never returns an empty tuple: a names list that is empty or entirely
+    generic falls back to :data:`DEFAULT_PHRASES`, because a wake-word backend
+    with no phrase can only ever answer ``False`` — a silently deaf Tier-2.
+    """
+    explicit = (override or "").strip() or (os.environ.get("REACHY_STT_PHRASE") or "").strip()
+    if explicit:
+        return (explicit,)
+    phrases = tuple(
+        f"hey {cleaned}"
+        for cleaned in (str(name).strip().lower() for name in names)
+        if cleaned and cleaned not in GENERIC_WAKE_NAMES
+    )
+    return phrases or DEFAULT_PHRASES
 
 
 def _resolve_stt_timeout(override: float | None) -> float:
@@ -180,8 +226,12 @@ class HttpSttBackend:
         window_seconds: float = DEFAULT_WINDOW_SECONDS,
         min_interval: float = DEFAULT_MIN_INTERVAL,
         clock: Callable[[], float] = time.monotonic,
+        names: Sequence[str] = SHIPPED_NAMES,
     ) -> None:
-        self.phrase = _resolve_phrase(phrase)
+        self.phrases = _resolve_phrases(phrase, names=names)
+        # Back-compat single-phrase view: the FIRST resolved phrase. Matching
+        # reads ``self.phrases``; this is what older callers/tests read.
+        self.phrase = self.phrases[0]
         # The transcription leg (WAV-multipart + urllib + rolling window +
         # throttle) is owned by the shared Transcriber; this backend keeps only
         # the wake-word-specific phrase matching on top of the raw JSON payload.
@@ -243,21 +293,28 @@ class HttpSttBackend:
         """Decide whether *payload* (a parsed JSON response) signals a wake-word.
 
         Honours, in order: an explicit ``detected`` boolean, a ``phrase`` field
-        that *equals* the configured wake phrase (case-insensitive — a bare echo
+        that *equals* ANY configured wake phrase (case-insensitive — a bare echo
         of some other phrase must NOT fire), then a case-insensitive substring
-        match of ``self.phrase`` in the transcript (OpenAI/Parakeet ``text``, or
-        its legacy ``transcript`` alias). Anything else → ``False``.
+        match of ANY configured phrase in the transcript (OpenAI/Parakeet
+        ``text``, or its legacy ``transcript`` alias). Anything else → ``False``.
+
+        "Any" rather than "the": a box that configured a second name has a
+        wake phrase per name (#177), and a robot that answers to a name in
+        conversation but cannot be woken by it is the kind of half-configured
+        that reads as a fault.
         """
         if not isinstance(payload, dict):
             return False
         if bool(payload.get("detected")):
             return True
-        phrase = payload.get("phrase")
-        if isinstance(phrase, str) and phrase.strip().lower() == self.phrase.lower():
+        wanted = tuple(phrase.lower() for phrase in self.phrases)
+        echoed = payload.get("phrase")
+        if isinstance(echoed, str) and echoed.strip().lower() in wanted:
             return True
         transcript = payload.get("text") or payload.get("transcript")
         if isinstance(transcript, str) and transcript:
-            return self.phrase.lower() in transcript.lower()
+            lowered = transcript.lower()
+            return any(phrase in lowered for phrase in wanted)
         return False
 
 
@@ -274,8 +331,9 @@ class OpenWakeWordBackend:
     ``False`` and never raises.
     """
 
-    def __init__(self, *, phrase: str | None = None) -> None:
-        self.phrase = _resolve_phrase(phrase)
+    def __init__(self, *, phrase: str | None = None, names: Sequence[str] = SHIPPED_NAMES) -> None:
+        self.phrases = _resolve_phrases(phrase, names=names)
+        self.phrase = self.phrases[0]
         self._engine = None
         self._engine_loaded = False
 
@@ -317,7 +375,14 @@ class OpenWakeWordBackend:
             from openwakeword.model import Model  # type: ignore[import-untyped]
 
             engine = Model(wakeword_models=[], inference_framework="tflite")
-            logger.info("[wakeword] openwakeword engine loaded, phrase=%r", self.phrase)
+            # The on-box engine fires on its BUNDLED models; a configured phrase or
+            # name steers the ``http`` backend only. Said once, at load, so a box
+            # that added a name and picked this backend is not silently deaf to it.
+            logger.warning(
+                "[wakeword] openwakeword detects its bundled models only — configured "
+                "phrases %r do not steer it (use --wake-word-kind http for those)",
+                self.phrases,
+            )
             return engine
         except ImportError:
             logger.debug("[wakeword] openwakeword not installed; Tier-2 wake-word disabled")
@@ -342,6 +407,7 @@ def resolve_backend(
     timeout: float | None = None,
     language: str | None = None,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
+    names: Sequence[str] = SHIPPED_NAMES,
 ):
     """Return a wake-word backend with ``update(sense, audio) -> bool``.
 
@@ -356,7 +422,12 @@ def resolve_backend(
         the optional on-box ``[cpu]`` engine (lazy import). An unknown kind falls
         back to the HTTP default with a warning.
     phrase:
-        Wake phrase override (else ``REACHY_STT_PHRASE`` / ``"hey reachy"``).
+        Wake phrase override — exactly one phrase (else ``REACHY_STT_PHRASE``,
+        else one ``"hey <name>"`` per configured name).
+    names:
+        The names this robot answers to (:data:`SHIPPED_NAMES` plus whatever the
+        box's rules overlay adds, #177). Used only when no explicit phrase and
+        no ``REACHY_STT_PHRASE`` is set.
     stt_url, stt_path, timeout, language, sample_rate:
         Forwarded to :class:`HttpSttBackend` for the HTTP kind. ``sample_rate``
         should be the real mic rate from the SDK transport (carried in the WAV
@@ -369,7 +440,7 @@ def resolve_backend(
         return _NullBackend()
 
     if kind == KIND_OPENWAKEWORD:
-        return OpenWakeWordBackend(phrase=phrase)
+        return OpenWakeWordBackend(phrase=phrase, names=names)
 
     if kind != KIND_HTTP:
         logger.warning("[wakeword] unknown backend kind %r; using HTTP STT default", kind)
@@ -381,4 +452,5 @@ def resolve_backend(
         timeout=timeout,
         language=language,
         sample_rate=sample_rate,
+        names=names,
     )

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from reachy.speech.name_match import DEFAULT_THRESHOLD, is_name_match
+from reachy.speech.name_match import DEFAULT_THRESHOLD, SHIPPED_NAMES, is_name_match
 
 # ---------------------------------------------------------------------------
 # Acceptance criterion 1 — required accept / reject table
@@ -230,6 +230,78 @@ def test_exact_match_always_passes_regardless_of_threshold() -> None:
     """An exact name match always returns True, even at threshold=1.0."""
     assert is_name_match("reachy", threshold=1.0) is True
     assert is_name_match("robot", threshold=1.0) is True
+
+
+def test_stem_match_on_a_shipped_name() -> None:
+    """A clitic-suffixed token still matches by its stem, on the shipped names."""
+    assert is_name_match("reachy's here") is True
+
+
+# ---------------------------------------------------------------------------
+# Configured (non-shipped) names — a name-agnostic short-name collision family
+# ---------------------------------------------------------------------------
+#
+# "nova" is NOT a shipped name (see SHIPPED_NAMES); it is used here only as a
+# stand-in CONFIGURED short name to exercise the clitic-stem and four-letter
+# fuzzy-floor guards, which must hold for any short configured name, not just
+# the shipped pair. These rows are only ever exercised against an EXPLICIT
+# `names=` fixture — never the default.
+
+_CONFIGURED_NAMES: tuple[str, ...] = SHIPPED_NAMES + ("nova",)
+
+_CONFIGURED_COLLISION_TABLE: list[tuple[str, str, str]] = [
+    ("now", "nova", "phonetic code N000 (no consonant survives) != nova's N100"),
+    ("no", "nova", "too short (below the four-letter fuzzy floor) and N000 != N100"),
+    ("know", "nova", "silent 'k' — starts with 'k', not 'n' — initial guard rejects it"),
+    ("nah", "nova", "phonetic code N000 != nova's N100"),
+    ("not", "nova", "phonetic code N300 != nova's N100"),
+    ("novel", "nova", "phonetic code N140 != nova's N100"),
+    ("november", "nova", "phonetic code N151 != nova's N100"),
+    ("nowhere", "nova", "phonetic code N600 != nova's N100"),
+    ("nothing", "nova", "phonetic code N352 != nova's N100"),
+    ("never", "nova", "phonetic code N160 != nova's N100"),
+]
+
+
+@pytest.mark.parametrize(
+    "word,name,why",
+    _CONFIGURED_COLLISION_TABLE,
+    ids=[row[0] for row in _CONFIGURED_COLLISION_TABLE],
+)
+def test_configured_name_collisions_rejected(word: str, name: str, why: str) -> None:
+    """Common n-initial English words must not false-trigger on a configured 'nova'."""
+    assert (
+        is_name_match(word, names=_CONFIGURED_NAMES) is False
+    ), f"{word!r} must not name-match {name!r} ({why})"
+
+
+@pytest.mark.parametrize("text", ["not now"])
+def test_configured_name_collision_sentences_rejected(text: str) -> None:
+    """The n-family collisions above stay rejected inside a short phrase."""
+    assert is_name_match(text, names=_CONFIGURED_NAMES) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "nova",
+        "NOVA",
+        "Nova, come here",
+        "hey nova",
+        "nova what time is it",
+        "nova's over here",  # plausible STT slip: name + possessive/contraction
+    ],
+)
+def test_configured_name_accepted(text: str) -> None:
+    """'nova' and plausible variants match when configured as a name."""
+    assert (
+        is_name_match(text, names=_CONFIGURED_NAMES) is True
+    ), f"{text!r} should match the configured name 'nova'"
+
+
+def test_unconfigured_short_name_not_matched_by_default() -> None:
+    """A name not in SHIPPED_NAMES never matches unless explicitly configured."""
+    assert is_name_match("nova") is False
 
 
 # ---------------------------------------------------------------------------

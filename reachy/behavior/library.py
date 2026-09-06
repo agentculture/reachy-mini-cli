@@ -329,7 +329,13 @@ LIBRARY: dict[str, LibraryEntry] = {
     "face-lock": LibraryEntry(
         name="face-lock",
         summary="hold the gaze on the seen face — the behavior the lock_face intent admits",
-        channels=_HEAD,
+        # Head AND body yaw (issue #183): the body rotates the whole head
+        # assembly, so `feel-alive`'s slow wander would carry the camera off
+        # the face. Claiming the channel and HOLDING it (see
+        # `reachy.behavior.face_lock.FaceLockGaze.hold_body_yaw`) is what lets
+        # the lock stop inhibiting the base layer — which keeps `antennas`, so
+        # the antennas go on swaying under a lock.
+        channels=_HEAD | _BODY,
         default_class=StopClass.STOPPABLE,
         # Looping with NO default duration: a face lock is a STANDING intent
         # ended by `release_face` (or, later, a face-lost event), so it is
@@ -340,17 +346,31 @@ LIBRARY: dict[str, LibraryEntry] = {
         params={
             "max_yaw": _yaw_clamp(face_lock_mod.MAX_YAW_DEG),
             "max_pitch": _pitch_clamp(face_lock_mod.MAX_PITCH_DEG),
-            "yaw_gain": Param(
-                face_lock_mod.YAW_GAIN_DEG,
+            # The camera's FOV turns a normalised bbox offset into an ANGLE, so
+            # the lock can close a MEASURED error instead of guessing a gain
+            # (issue #181). `minimum=1.0` rather than 0.0 because the domain is
+            # "> 0" and `Param.minimum` is INCLUSIVE: a zero FOV makes every
+            # face read as dead centre and freezes the lock, so it must be
+            # refused, and 1.0 deg is the smallest positive bound worth naming —
+            # no camera has a one-degree field of view.
+            "fov_h": Param(
+                face_lock_mod.HFOV_DEG,
                 "deg",
-                "yaw for a face at the frame edge (pre-clamp)",
-                minimum=0.0,
+                "camera horizontal field of view",
+                minimum=1.0,
             ),
-            "pitch_gain": Param(
-                face_lock_mod.PITCH_GAIN_DEG,
+            "fov_v": Param(
+                face_lock_mod.VFOV_DEG,
                 "deg",
-                "pitch for a face at the frame edge (pre-clamp)",
+                "camera vertical field of view",
+                minimum=1.0,
+            ),
+            "damping": Param(
+                face_lock_mod.DAMPING,
+                "",
+                "fraction of the measured angular error one detection closes",
                 minimum=0.0,
+                maximum=1.0,
             ),
             "slew": Param(
                 face_lock_mod.SLEW_DEG_S,

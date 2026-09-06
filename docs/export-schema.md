@@ -307,7 +307,9 @@ triggered it.
 
 Published whenever the engine's perception snapshot changes (always once, on
 the first tick, to establish a baseline) — not every tick, so a steady 50 Hz
-loop does not flood the feed with an identical reading every 20 ms.
+loop does not flood the feed with an identical reading every 20 ms. A `sense`
+line implies at least one emitted field changed since the previous `sense`
+line — a clock-only change never by itself produces a line.
 
 | Key                | Type            | Description                                        |
 |--------------------|-----------------|------------------------------------------------------|
@@ -319,6 +321,7 @@ loop does not flood the feed with an identical reading every 20 ms.
 | `pat`              | array or `null` | `[kind, level]` from a head-pat detection, or `null`  |
 | `face`             | string or `null`| A recognised face's name, or `null`                   |
 | `frame_available`  | bool            | Whether a camera frame was available to peek           |
+| `name_mentioned`   | bool            | Whether the transcript engagement gate admitted an utterance BY NAME this tick (a one-tick event, `false` on a context-only admission) |
 | `pat_state`        | object          | The event-stable pat-interaction state (see below); additive and **may be absent** |
 
 `pat_state` is an additive parallel object carrying the pat interaction's
@@ -347,7 +350,7 @@ missing or malformed).
 Example line:
 
 ```json
-{"t":"sense","ts":1718362800.0,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false,"pat_state":{"availability":"unavailable","contact":false,"touch_type":null,"level":null,"yaw_deg":null,"phase":"idle","phase_started_at":null,"last_press_at":null}}
+{"t":"sense","ts":1718362800.0,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false,"name_mentioned":false,"pat_state":{"availability":"unavailable","contact":false,"touch_type":null,"level":null,"yaw_deg":null,"phase":"idle","phase_started_at":null,"last_press_at":null}}
 ```
 
 **Not every engine sense field reaches this block.** The engine's internal
@@ -460,8 +463,8 @@ Example lines:
 
 ```json
 {"t":"motion","ts":1718362801.2,"tick":52,"action":"admit","behavior":"nod","channels":["head"],"detail":{}}
-{"t":"motion","ts":1718362804.4,"tick":210,"action":"face-lost","behavior":"face-lock","channels":["head"],"detail":{"id":"face-lock:lock:1","absent_s":3.02}}
-{"t":"motion","ts":1718362814.6,"tick":720,"action":"lock-released","behavior":"face-lock","channels":["head"],"detail":{"id":"face-lock:lock:1","reason":"mind-offline"}}
+{"t":"motion","ts":1718362804.4,"tick":210,"action":"face-lost","behavior":"face-lock","channels":["body_yaw","head"],"detail":{"id":"face-lock:lock:1","absent_s":3.02}}
+{"t":"motion","ts":1718362814.6,"tick":720,"action":"lock-released","behavior":"face-lock","channels":["body_yaw","head"],"detail":{"id":"face-lock:lock:1","reason":"mind-offline"}}
 ```
 
 ### Reading the Runtime Feed
@@ -590,7 +593,8 @@ mid-run sees nothing until the next event.
 
 One retained message per top-level key of the engine's `state.json` payload —
 today that is `updated`, `compose_hz`, `active`, `ownership`, `doa`, `intents`,
-and (since #120b) `senses`. The publisher never derives this state itself: it
+(since #120b) `senses`, and (since this arc, #183) `base_layer`. The publisher
+never derives this state itself: it
 wraps the ONE existing writer (`CommandSpool.write_state`, fed by
 `Engine.state()` and the `intents`/`senses` seam riders), so the bus is a
 transport for the same truth `behavior status` reads off disk, never a second
@@ -601,6 +605,40 @@ immediately receives the current value of every key without waiting for the
 next change. A value that fails to serialize (e.g. a stray binary field) is
 dropped by name (`reason=unserializable-payload`) without losing the other
 keys in the same snapshot.
+
+**`base_layer` (#183)** — whether the idle base behavior (`feel-alive`) is
+currently seeded and active, and, when it is not, why:
+
+```json
+{"base_layer": {"seeded": true, "active": false, "stopped_by": "stop"}}
+```
+
+`stopped_by` is `null` while `active` is `true`; `"stop"` after an explicit
+`behavior stop feel-alive` (holds until the un-stop verb or a restart);
+`"inhibition"` for the transient window between an inhibition naming
+`feel-alive` and the edge that clears it, at which point the base layer
+re-seeds itself and `active` returns to `true`. See [the operating guide's
+base-layer
+section](operating-reachy.md#the-base-layer-stopped-on-purpose-vs-inhibited)
+for the full walkthrough.
+
+**`senses` liveness fields (#176)** — beside each sense's existing structural
+`{available, reason}` verdict, the two senses derived from the camera stream
+(`frame_available`, `face`) additionally carry `live` (bool or `null`) and
+`last_frame_at` (float timestamp or `null`):
+
+```json
+{"senses": {"face": {"available": true, "reason": null, "live": true, "last_frame_at": 1234.5}}}
+```
+
+`available`/`reason` stay **structural** — composed once, at process start,
+and unchanged for the life of the run. `live`/`last_frame_at` are a
+**reading** — whether a usable frame has arrived within the last
+`DEFAULT_STREAM_STALE_S` (10 s) — and can flip at any time the camera does.
+Every other sense's `live`/`last_frame_at` stay `null`: no liveness provider is
+wired for them. See [the operating guide's liveness
+section](operating-reachy.md#the-eyes-liveness--senseslive) for the acting
+consequence (a stale camera is re-acquired, not only logged).
 
 **A key is published only when its value CHANGED** (issue #126). The engine
 rewrites `state.json` every tick, so an ungated mirror republished the whole

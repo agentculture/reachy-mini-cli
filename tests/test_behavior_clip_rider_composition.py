@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import importlib.util
 import json
 import threading
 import time
@@ -221,7 +222,32 @@ def test_the_probe_composition_carries_no_clip_rider(_isolated):
 
 
 def test_a_missing_vision_extra_reports_a_named_reason_never_a_crash(_isolated, monkeypatch):
-    """The real, un-mocked path: cv2 is genuinely absent in this environment."""
+    """Simulates the ``[vision]`` extra's absence through the SAME injectable
+    probe both ``build_clip_encoder`` and ``ClipRider.__init__`` resolve at
+    call time — ``face_sense._find_spec`` — mirroring
+    ``tests/test_behavior_face_sense.py``'s own
+    ``monkeypatch.setattr(FS, "_find_spec", lambda name: None)`` pattern. This
+    proves the composed reason regardless of whether opencv happens to be
+    installed in the runner's own environment: relying on a genuinely absent
+    cv2 (the previous version of this test) flips it from green to a crash
+    the moment ``[vision]`` is installed (issue #185), because ``ClipRider``
+    computes its own ``_reason`` from the real, un-mocked probe when
+    ``build_clip_encoder`` alone is patched instead."""
+    monkeypatch.setattr(face_sense, "_find_spec", lambda name: None)
+    state = _run_engine()
+    assert state[CR.STATE_KEY]["available"] is False
+    assert state[CR.STATE_KEY]["reason"] == CR.VISION_EXTRA_ABSENT
+    assert is_text_reference_only(state[CR.STATE_KEY])
+
+
+def test_the_real_vision_probe_on_this_environment_never_crashes(_isolated):
+    """The real, un-mocked path — only meaningful when cv2 is genuinely absent
+    here; when the ``[vision]`` extra IS installed there is nothing to probe
+    (the recognition-path tests cover that state instead), so this test
+    degrades to a skip rather than asserting on whichever state the runner
+    happens to be in."""
+    if importlib.util.find_spec("cv2") is not None:
+        pytest.skip("cv2 is installed in this environment; nothing to probe")
     state = _run_engine()
     assert state[CR.STATE_KEY]["available"] is False
     assert state[CR.STATE_KEY]["reason"] in (

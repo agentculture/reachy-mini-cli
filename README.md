@@ -118,6 +118,9 @@ so a unit that moves address is still found and re-pinned with no manual step.
 The full operating guide is **[`docs/operating-reachy.md`](docs/operating-reachy.md)**:
 
 - [Find the robot on the network](docs/operating-reachy.md#find-the-robot-on-the-network--wireless) — `wireless` discovery: measured cold/warm timings, the sudo cost, the trusted-network assumption
+- [The names table](docs/operating-reachy.md#the-names-table--who-the-robot-answers-to) —
+  who the robot answers to: an overlay `names = [...]` table, hot via
+  `behavior reload`, and the `name_mentioned` sense event
 - [Bring Reachy up live](docs/operating-reachy.md#bring-reachy-up-live) — install → daemon → verify → behavior
 - [The single-SDK-owner model](docs/operating-reachy.md#the-single-sdk-owner-model) — the conflict matrix + how to compose behaviors
 - [Transports — `sdk` vs `http`](docs/operating-reachy.md#transports--sdk-vs-http)

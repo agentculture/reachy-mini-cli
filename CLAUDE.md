@@ -589,8 +589,22 @@ nothing to lock onto is a head frozen at neutral, indistinguishable from a
 wedged runtime), admits ONE looping, indefinite, self-clamped `face-lock`
 behavior (±20° yaw / ±12° pitch, slew-limited — `goto_intent.py`'s head
 envelope, cited not re-derived), and SNAPSHOTS the inhibited set before adding
-its own (`feel-alive`, `orient-to-sound` — the two behaviors that would drag
-the head off the face).
+its own (`orient-to-sound` — the one behavior arbitration alone cannot keep off
+the face, since it is `STOPPABLE` like the lock and a later admission would win
+the head on the recency tie-break).
+
+- **The base layer is NOT inhibited, so the antennas keep swaying** (#183). The
+  lock claims `head` **and** `body_yaw` and contributes a HELD `body_yaw` — the
+  value the engine streamed on the tick before the lock took the channel, read
+  straight off `ctx.pose` (the same live-pose seam `pose_feed.py` adapts for
+  `GotoLane`), 0.0 when no pose is reachable. Arbitration is per channel by
+  (class priority, recency) with abstention and `face-lock` is `STOPPABLE`
+  above the `PASSIVE` base layer, so the lock takes those two channels without
+  evicting anything and `feel-alive` keeps `antennas`. Inhibiting the base
+  layer instead — what shipped until #183 — stilled the antennas for the whole
+  hold, because the base layer is ONE behavior. `body_yaw` is claimed rather
+  than left alone because the body rotates the whole head assembly, and the
+  camera with it, off the face.
 
 - **Losing the face is a REPORT, not an ending.** One `motion.face-lost` per
   disappearance (re-armed when the face returns); the lock persists. Vision
@@ -753,8 +767,26 @@ attention. Its ONE consumer today is `reachy/behavior/transcript_sense.py`
 per driver. A transcribed utterance passes through it cheapest-first, after the
 built-in self-mute and min-utterance shortcuts:
 
+**The names are configuration, spelled once (#177).** The shipped pair `("reachy",
+"robot")` lives in exactly ONE place, `reachy/speech/name_match.py`'s
+`SHIPPED_NAMES`; `engagement.py`, `transcript_sense.py` and `embody/attention.py`
+alias it, and `rules.py` imports it to build `RulesConfig.names` — the shipped
+pair followed by the overlay's `names = [...]` additions (letters only, ≥3
+chars, ≤8 entries, refused fail-closed with the rest of the file). The runtime
+reads them LIVE: `_compose_run_seam` hands `TranscriptSenseDriver` a
+`names_provider` bound to the reload driver's `loader.current.names`, so
+`behavior reload` changes who the robot answers to between ticks; `agent embody`
+and `sleep` read the same table at start only. An admission BY NAME latches the
+one-tick `Sense.name_mentioned` (a `context` admission does not), wired through
+all five registries like any sense field. This repo hardcodes no peer's name —
+`tests/test_no_peer_name.py` greps the source for `nova` — and a peer configures
+its own; reachy_nova's overlay writer must learn the table first
+(OriNachum/reachy-nova#27). `is_name_match` carries two guards for SHORT
+configured names: a clitic stem match (`nova's` → `nova`) and a four-letter
+fuzzy floor, so `no`/`nah`/`not` never reach the fuzzy path.
+
 1. **Fuzzy name fast-path** (`is_name_match` in `reachy/speech/name_match.py`) — checks
-   every word in the utterance against the canonical names (`reachy`/`robot`) and a set
+   every word in the utterance against the canonical names and a set
    of common STT mishearings (`richie`, `reachie`, `richy`). The matcher uses a combined
    `difflib_ratio × length_ratio` score with four structural guards (prefix, superstring,
    initial-letter, and **phonetic**). The phonetic guard (#104) requires the word to share

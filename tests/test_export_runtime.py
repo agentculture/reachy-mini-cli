@@ -139,7 +139,23 @@ class TestEventShapes:
             "pat": ["scratch", "level1"],
             "face": "ada",
             "frame_available": True,
+            "name_mentioned": False,
         }
+
+    def test_sense_event_carries_name_mentioned(self):
+        ev = SenseEvent(
+            doa=None,
+            speech=False,
+            rms=None,
+            pat=None,
+            face=None,
+            frame_available=False,
+            name_mentioned=True,
+            ts=1.0,
+            tick=1,
+        )
+        d = json.loads(runtime_to_jsonl(ev))
+        assert d["name_mentioned"] is True
 
     def test_sense_event_defaults_are_none_safe(self):
         ev = SenseEvent(
@@ -362,6 +378,39 @@ class TestToRuntimeEvent:
         encoded = json.loads(runtime_to_jsonl(mapped))
         assert "pat_state" not in encoded
         assert encoded["pat"] == ["scratch", "level1"]
+
+    def test_name_mentioned_round_trips_through_to_runtime_event(self):
+        raw = {
+            "type": "sense",
+            "doa": None,
+            "speech": False,
+            "rms": None,
+            "pat": None,
+            "face": None,
+            "frame_available": False,
+            "name_mentioned": True,
+            "ts": 3.0,
+            "tick": 4,
+        }
+        mapped = to_runtime_event(raw)
+        assert isinstance(mapped, SenseEvent)
+        assert mapped.name_mentioned is True
+
+    def test_an_older_raw_sense_shape_with_no_name_mentioned_key_defaults_false(self):
+        raw = {
+            "type": "sense",
+            "doa": None,
+            "speech": False,
+            "rms": None,
+            "pat": None,
+            "face": None,
+            "frame_available": False,
+            "ts": 3.0,
+            "tick": 4,
+        }
+        mapped = to_runtime_event(raw)
+        assert isinstance(mapped, SenseEvent)
+        assert mapped.name_mentioned is False
 
     def test_unknown_pat_state_fields_are_ignored(self):
         raw = {
@@ -638,6 +687,13 @@ class TestSenseSnapshotDriver:
         assert len(ctx.events) == 1
         assert ctx.events[0]["type"] == "sense"
         assert ctx.events[0]["doa"] is None
+        assert ctx.events[0]["name_mentioned"] is False
+
+    def test_name_mentioned_reaches_the_raw_snapshot(self):
+        driver = SenseSnapshotDriver()
+        ctx = _Ctx(now=0.1, tick=1, sense=Sense(name_mentioned=True))
+        driver(ctx)
+        assert ctx.events[0]["name_mentioned"] is True
 
     def test_unchanged_sense_does_not_re_emit(self):
         driver = SenseSnapshotDriver()
@@ -729,7 +785,13 @@ class TestSenseSnapshotDriver:
             last_press_at=1.2,
         )
         transitions = [
-            dataclasses.replace(state, last_press_at=1.5),
+            # NOTE (t2 #184): a `last_press_at`-only bump is no longer treated
+            # as meaningful on its own — `phase_started_at`/`last_press_at` are
+            # the two pure-clock PatState fields the emit-payload comparison
+            # scrubs (see SenseSnapshotDriver), so this transition pairs the
+            # bump with a real field change to keep testing "does last_press_at
+            # still reach the wire", not "does it alone trigger a re-emit".
+            dataclasses.replace(state, last_press_at=1.5, yaw_deg=-1.0),
             dataclasses.replace(state, yaw_deg=2.0),
             dataclasses.replace(state, level="level2"),
             dataclasses.replace(state, phase="contentment", phase_started_at=4.0),
