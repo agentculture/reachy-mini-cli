@@ -23,18 +23,18 @@ each summary; the full text is in the plan export):
 - `t1` — t1 name_match: SHIPPED_NAMES = ('reachy','robot') constant in
   reachy/speech/name_match.py; is_name_match's names default imports it;
   re-land the clitic stem match and the four-letter fuzzy floor
-  (_MIN_FUZZY_WORD_LEN=4) name-agnostically; tests/test_name_match.py gains
+  (`_MIN_FUZZY_WORD_LEN`=4) name-agnostically; tests/test_name_match.py gains
   the n-family rows under a CONFIGURED names fixture
 - `t2` — t2 rules schema: names table in reachy/behavior/rules.py —
-  _TOP_LEVEL_FIELDS gains 'names', RulesConfig.names: tuple[str,...]
+  `_TOP_LEVEL_FIELDS` gains 'names', RulesConfig.names: tuple[str,...]
   (default SHIPPED_NAMES, imported from name_match), from_dict validates
   fail-closed (…), merge_rules unions shipped + overlay in order;
   rules.SENSE_FIELDS gains 'name_mentioned'; default_rules.toml documents the
-  table; tests/test_zero_llm_boundary.py's _BEHAVIOR_SPEECH_ALLOW gains
+  table; tests/test_zero_llm_boundary.py's `_BEHAVIOR_SPEECH_ALLOW` gains
   reachy.speech.name_match with its justification
 - `t3` — t3 sense field: Sense.name_mentioned: bool = False in
   reachy/behavior/sense.py with a name_mentioned provider on SenseProviders,
-  added to _PROVIDER_PREDICATE_FIELDS and _COMPOSED_PROVIDER_FIELDS;
+  added to `_PROVIDER_PREDICATE_FIELDS` and `_COMPOSED_PROVIDER_FIELDS`;
   reachy/export/runtime.py's hand-listed Sense mirror gains it;
   reachy/runtime_cues.py sense_cues emits 'someone said my name' when true;
   docs/export-schema.md notes the key
@@ -42,20 +42,20 @@ each summary; the full text is in the plan export):
   DEFAULT_NAMES = SHIPPED_NAMES (import), ENGAGEMENT_SYSTEM_PROMPT becomes a
   template rendered from the names (…); ConversationGate/EngagementClassifier
   accept a zero-arg names provider; reachy/behavior/transcript_sense.py takes
-  names_provider=, its _should_engage returns (engaged, by_name), and the
+  names_provider=, its `_should_engage` returns (engaged, by_name), and the
   driver latches name_mentioned for one tick on a 'name' admission (…)
 - `t5` — t5 runtime composition + CLI observability in
-  reachy/cli/_commands/behavior.py: _compose_run_seam binds
+  reachy/cli/_commands/behavior.py: `_compose_run_seam` binds
   TranscriptSenseDriver's names_provider to the ReloadDriver's
   loader.current.names and wires the name_mentioned provider into
   SenseProviders; behavior rules list / rules check / engine status render
   the merged names (text + --json)
 - `t6` — t6 the other two roots read the same file: reachy/embody/attention.py
-  DEFAULT_NAMES = SHIPPED_NAMES (import) and _commands/agent.py builds
+  DEFAULT_NAMES = SHIPPED_NAMES (import) and `_commands`/agent.py builds
   AttentionGate with load_rules(overlay_rules_path()).names; reachy/sleep/
-  wakeword.py gains DEFAULT_PHRASES/_resolve_phrases (one 'hey <name>' per
+  wakeword.py gains DEFAULT_PHRASES/_resolve_phrases (one 'hey `<name>`' per
   configured name except 'robot'; …) and reachy/sleep/wake.py +
-  _commands/sleep.py thread the names from the same load
+  `_commands`/sleep.py thread the names from the same load
 - `t7` — t7 docs, boundary test, nova issue, release: docs/operating-reachy.md
   gains a names section (…); explain catalog + CLAUDE.md + README updated; a
   test greps reachy/ for the token 'nova' (none); file the
