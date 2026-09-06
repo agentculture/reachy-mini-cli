@@ -165,10 +165,38 @@ would flood the journal for as long as the pipeline stays dead.
 
 This is **detection only**, a deliberate boundary (spec claim c21): nobody
 has probed whether a GStreamer EOS is recoverable in-process at all, so
-:meth:`_check_stream_staleness` does nothing but read state and call
-:func:`reachy.senselog.drop` — it never touches :meth:`HeldMediaClient.warm_up`,
-never constructs a client, and never signals the composition root to rebuild
-or restart anything.
+:meth:`_check_stream_staleness` does nothing but read state, call
+:func:`reachy.senselog.drop`, and — since issue #179 — hand the same NAMED
+reason to an injected ``on_stale`` callback. It still never touches
+``warm_up``, never constructs a client, and never imports the media-client
+module: whether that reason becomes a re-acquire is the COMPOSITION root's
+decision, taken in a module that already owns the held client. With no
+callback injected the path is byte-for-byte what it was, and the callback
+rides the same once-per-silent-episode latch as the drop line — so a wedged
+pipeline asks at most once per episode, never fifty times a second. It is
+asked ONLY when a frame has actually arrived before (the ``_last_frame_at is
+None`` exemption below) and the camera still reports itself available: a
+robot with no camera, or one whose pipeline is already gone beneath it, must
+never drive a re-acquire loop.
+
+**Still-only detection (issue #179).** Detection is the expensive leg, and
+submitting it while the head is slewing is both costly and wrong: measured on
+the CM4 the runtime's tick rate fell from ~50 Hz to ~7 Hz with the detector
+running, and a mid-slew frame is motion-blurred AND stamped in a head frame
+the robot has already left. So the worker's cadence gate takes a second input
+— an injected ``moving`` peek (``SelfMotionDriver.is_moving``, the same
+:data:`~reachy.behavior.sense.SelfMovingProvider` seam
+:mod:`reachy.behavior.rms_sense`'s moving floor consumes) — and submits
+nothing while the commanded pose is moving, nor until
+:data:`DEFAULT_STILL_SETTLE_S` of stillness has passed after it stops. One
+consumer moves the head precisely in order to SEE (the face lock), so a
+second peek, ``lock_held``, degrades the gate to the slow
+:data:`DEFAULT_HELD_DETECT_INTERVAL` cadence instead of to nothing — see
+those two constants for the derivation against the lock's own timers. Like
+the rms gate, a raising or missing peek degrades to "not moving" (exactly the
+pre-#179 behaviour, never a crash), and the transition is observable once per
+OPEN and once per CLOSE as a ``[SENSE stage=gate source=face
+event=self-moving]`` line — never per tick.
 
 Stdlib plus numpy (already a base dependency, used only for the frame-shape
 guard). No cv2 at import time, no ``reachy_mini``, no transport: the engine and
@@ -183,13 +211,14 @@ import math
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.util import find_spec as _find_spec
 from typing import Any, Callable
 
 import numpy as np
 
 from reachy import senselog
+from reachy.behavior.sense import SelfMovingProvider
 
 logger = logging.getLogger(__name__)
 
@@ -199,10 +228,27 @@ STAGE = "vision"
 #: Senselog ``source`` every line from this module carries.
 SOURCE = "face"
 
+#: Senselog ``stage``/``event`` for the #179 self-motion gate's two transition
+#: lines. The stage is ``gate`` — shared with ``rms_sense``'s moving floor on
+#: purpose, so ``grep 'stage=gate'`` shows every suppression this runtime does —
+#: and the source stays :data:`SOURCE`, which is what tells the two apart.
+GATE_STAGE = "gate"
+GATE_EVENT = "self-moving"
+
 #: Minimum wall-clock gap (seconds) between two detections on the worker thread.
 #: YuNet+SFace is heavy; ~2 Hz is ample for catching a face entering the frame,
 #: and matches the retired ``listen_face.DEFAULT_DETECT_INTERVAL``.
 DEFAULT_DETECT_INTERVAL: float = 0.5
+
+#: YuNet detection score floor, and its env override. The shipped 0.6 (nova's)
+#: is right for a well-lit face on a full frame; in a dim room, at distance, or
+#: on a downscaled frame a real face can score well under it and never be
+#: detected — measured live on the Wireless (2026-09-06), a person at ~1.5 m in
+#: evening light scored ~0.22 at 640 px and ~0.55 at full 1280 px. Lowering it
+#: trades a higher false-positive risk (a printed face on a wall) for catching a
+#: dim real one; it is an OPERATING knob, not a default to move.
+DEFAULT_SCORE_THRESHOLD: float = 0.6
+SCORE_THRESHOLD_ENV = "REACHY_FACE_SCORE_THRESHOLD"
 
 #: ``REACHY_FACE_DETECT_MAX_WIDTH`` off value — no downscaling. Matches the
 #: constructor default and reads exactly like "0 pixels" would mean anything
@@ -247,6 +293,49 @@ DEFAULT_STREAM_STALE_S: float = 10.0
 #: constructs, rebuilds or restarts a media client or pipeline.
 REASON_STREAM_ENDED = "camera-stream-ended"
 
+#: How long the commanded pose must have been STILL before detection resumes
+#: (seconds) — the camera-blur / head-frame settle of the #179 gate. It is a
+#: THIRD quantity, deliberately not either of the two that look like it:
+#: ``self_motion.DEFAULT_TAIL_S`` (0.25 s) is how long the latch keeps reading
+#: "moving" after the commanded pose stops changing (actuator noise), and
+#: ``pat_sense``'s ``still_hold_s`` (1.0 s) is a SERVO settle measured against
+#: pose read-back. Neither measures how long the CAMERA keeps returning a
+#: blurred frame belonging to a head frame the robot has already left, which is
+#: what this gate waits out. **Unmeasured** — issue #179's parked unknown: 0.5 s
+#: is one 30 fps camera's worth of buffered frames plus margin, chosen between
+#: the two neighbours above and small enough that a face arriving as a slew ends
+#: is still detected within one further ``DEFAULT_DETECT_INTERVAL``. Measure it
+#: on the box before treating the number as anything but a defensible default.
+DEFAULT_STILL_SETTLE_S: float = 0.5
+
+#: Detection cadence while a face lock is HELD and the head is moving. The lock
+#: is the one consumer that moves the head in order to SEE, so the gate degrades
+#: to a slow cadence for it instead of to silence — a blinded lock would report
+#: ``face-lost`` on a person it is looking straight at. 1.5 s is chosen against
+#: the lock's own two timers, neither of which this changes: it is under half
+#: ``face_lock.FACE_LOST_AFTER_S`` (3.0 s), so a sawtooth of detections one
+#: cadence apart can never accumulate the 3 s of continuous absence that report
+#: needs; and it equals ``face_lock.MAX_FACE_AGE_S`` (1.5 s), so the lock stops
+#: STEERING on a reading only in the instant before the next one lands.
+DEFAULT_HELD_DETECT_INTERVAL: float = 1.5
+
+#: The commanded head speed (deg/s) above which the still-only gate treats the
+#: head as MOVING. Live on the Wireless (2026-09-06) the gate was first wired to
+#: the mic's own self-motion latch (0.035 deg/tick = 1.75 deg/s at 50 Hz) and
+#: the ``feel-alive`` base layer's slow gaze wander — peak ~2.7 deg/s — kept it
+#: open for 18 s stretches: detection starved, every ``lock_face`` was refused
+#: ``no face known``, and the robot never looked at anyone. A wander that slow
+#: does not blur a frame; a lock's 120 deg/s slew or a goto does. So the face
+#: gate has its OWN latch at slew speed, and the mic keeps its fine one (a
+#: 2 deg/s wander is real actuator noise for a microphone). Judged PER SECOND
+#: against the tick's real elapsed time, over the head and body_yaw only — the
+#: antennas do not move the camera, and the deployed tick runs 2x its budget
+#: (#97), so a per-tick threshold tripped on every antenna half-swing and on
+#: every stall (deviation d6; see ``self_motion``'s camera-gate section).
+DEFAULT_GATE_EPS_DEG_S: float = 20.0
+#: Env override for :data:`DEFAULT_GATE_EPS_DEG_S`, read at composition time.
+GATE_EPS_ENV = "REACHY_FACE_GATE_EPS_DEG_S"
+
 #: How long a face POSITION reading (``face_bbox``/``face_age_s``) is held
 #: before it expires (seconds). The position is a HELD level, not a one-tick
 #: event — a gaze behavior needs it on every tick, not on the one tick a
@@ -255,7 +344,30 @@ REASON_STREAM_ENDED = "camera-stream-ended"
 #: used to be. Several detection cycles wide (``DEFAULT_DETECT_INTERVAL`` is
 #: 0.5 s) so an ordinary missed detection never blanks it, and short enough
 #: that a departed face stops being "there" in about a second.
-DEFAULT_FACE_BBOX_TTL_S: float = 1.5
+#:
+#: **Re-derived for the #179 still-only gate, and deliberately UNCHANGED.** The
+#: gate widens the gap between detections in exactly two ways, and 1.5 s covers
+#: both: after a slew ends the next detection lands at worst
+#: ``DEFAULT_STILL_SETTLE_S`` + ``DEFAULT_DETECT_INTERVAL`` = 1.0 s later, which
+#: is inside the TTL, so a gaze one-shot planned right after a slew still sees a
+#: position; and while a lock is held the cadence is
+#: ``DEFAULT_HELD_DETECT_INTERVAL`` = 1.5 s, so the reading expires at most a
+#: detection's own latency before the next one arrives — a gap far under
+#: ``face_lock.FACE_LOST_AFTER_S`` (3.0 s), which is what that report keys on.
+#: Lengthening the TTL would buy the lock nothing anyway: it refuses to steer on
+#: any reading older than its own ``MAX_FACE_AGE_S`` (1.5 s), so a position held
+#: past that is invisible to it and would only let a stale bbox reach the gaze
+#: one-shots. Hence the derivation demands no change.
+DEFAULT_FACE_BBOX_TTL_S: float = 3.5
+#: 3.5 s = two held-lock cadences (``DEFAULT_HELD_DETECT_INTERVAL`` 1.5 s) plus
+#: the settle (0.5 s): the bbox must outlive the LONGEST legitimate gap between
+#: detections — one held cadence plus the detection's own latency, plus one
+#: missed cycle — or a held lock reads "no face" between two live readings.
+#: It shipped at 1.5 s and, once ages included detection latency
+#: (``captured_at``), the deployed 1.0 s detect interval on the CM4 expired the
+#: position before nearly every refresh. Wider than the lock's
+#: ``MAX_FACE_AGE_S`` (3.0 s) on purpose: the lock stops STEERING on a reading
+#: before the sense stops HOLDING it.
 
 #: How long the worker parks between iterations when idle. Bounded so
 #: :meth:`FaceSenseDriver.close` joins promptly.
@@ -384,7 +496,12 @@ def build_face_recognition(
         from reachy.vision.face import FaceEngine
         from reachy.vision.face_store import FaceStore
 
-        engine = FaceEngine(models_dir=models_dir) if models_dir is not None else FaceEngine()
+        score = score_threshold_from_env()
+        engine = (
+            FaceEngine(models_dir=models_dir, score_threshold=score)
+            if models_dir is not None
+            else FaceEngine(score_threshold=score)
+        )
         store = FaceStore(base_dir=store_base_dir) if store_base_dir is not None else FaceStore()
     except Exception:  # a broken vision stack disables the cue, nothing more
         if not _VISION_WARNED:
@@ -395,6 +512,44 @@ def build_face_recognition(
             )
         return None
     return (engine, store)
+
+
+def _peek(provider: Callable[[], bool] | None) -> bool:
+    """A boolean peek's value, tolerating absence and any failure — always ``False`` on doubt.
+
+    The same degradation :func:`reachy.behavior.rms_sense.peek_moving` makes,
+    restated rather than imported so this module keeps its narrow import
+    surface: a missing or raising peek means "not moving" / "no lock", which is
+    exactly the pre-#179 cadence and never a crash on the worker thread.
+    """
+    if provider is None:
+        return False
+    try:
+        return bool(provider())
+    except Exception:
+        return False
+
+
+def score_threshold_from_env(
+    value: str | None = None, *, default: float = DEFAULT_SCORE_THRESHOLD
+) -> float:
+    """Parse :data:`SCORE_THRESHOLD_ENV` into a 0..1 YuNet score floor.
+
+    Never raises. Unset, empty, unparsable, or out of ``(0, 1]`` all fall back
+    to *default* — the same fail-open shape :func:`detect_interval_from_env`
+    uses, so a fat-fingered value degrades to the shipped behaviour rather than
+    disabling detection.
+    """
+    raw = value if value is not None else os.environ.get(SCORE_THRESHOLD_ENV)
+    if not raw:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return default
+    if math.isnan(parsed) or math.isinf(parsed) or not (0.0 < parsed <= 1.0):
+        return default
+    return parsed
 
 
 def detect_interval_from_env(
@@ -558,10 +713,21 @@ class FaceObservation:
     pair is the whole point of t2: before it, an unmatched detection was
     discarded entirely and a stranger looking at the robot produced no reading
     at all.
+
+    ``captured_at`` (t4 #181) is the worker's own clock (``self._clock()``) read
+    at the moment the frame was TAKEN — before detection, which on the CM4
+    costs non-trivial time. It is what the tick-thread age/TTL logic anchors
+    on instead of the (later) drain/publish tick, so ``face_age_s`` reports how
+    old the detection actually is rather than under-reporting it by the
+    detection's own runtime. ``None`` (the default) is what an older producer
+    or a test fake constructing this dataclass bare still yields, and the
+    consumer falls back to the drain tick's own clock in that case — never a
+    crash, never a stale-looking reading with no anchor at all.
     """
 
     name: str | None = None
     bbox: tuple[float, float, float, float] | None = None
+    captured_at: float | None = None
 
 
 def bbox_area(bbox: tuple[float, float, float, float] | None) -> float:
@@ -688,6 +854,32 @@ class FaceSenseDriver:
         module docstring's "Camera-stream-ended staleness" section). Default
         :data:`DEFAULT_STREAM_STALE_S`. DETECT ONLY — never triggers a
         reconnect or rebuild.
+    on_stale:
+        Optional callback invoked with :data:`REASON_STREAM_ENDED` when that
+        latch trips — the #179 seam a composition root binds to its held
+        client's ``drop``. Called at most once per silent episode, only when a
+        frame has actually arrived before AND the camera still reports itself
+        available, and only ever with a NAMED reason. A raising callback is
+        contained and logged once. ``None`` (the default) is exactly the
+        pre-#179 behaviour: the drop line, and nothing else.
+    moving:
+        Optional :data:`~reachy.behavior.sense.SelfMovingProvider` peek —
+        ``SelfMotionDriver.is_moving`` in production. While it reads ``True``
+        (and for ``still_settle_s`` afterwards) the worker submits no
+        detection; see the module docstring's "Still-only detection" section.
+        ``None`` means no gate at all is built, which is the pre-#179 cadence.
+    still_settle_s:
+        How long the commanded pose must have been still before detection
+        resumes. Default :data:`DEFAULT_STILL_SETTLE_S` — its own constant, and
+        NOT ``self_motion``'s actuator-noise tail; see that constant.
+    lock_held:
+        Optional peek reading ``True`` while a face lock holds the head. While
+        it does, motion degrades the cadence to *held_detect_interval* instead
+        of suppressing detection outright, because the lock is moving the head
+        in order to see. Absent or raising reads ``False``.
+    held_detect_interval:
+        The degraded cadence used while *lock_held* reads ``True`` and the head
+        is moving. Default :data:`DEFAULT_HELD_DETECT_INTERVAL`.
     clock:
         The worker's cadence clock (default :func:`time.monotonic`). The tick
         thread uses ``ctx.now`` instead, so the driver inherits the engine's
@@ -711,6 +903,11 @@ class FaceSenseDriver:
         frame_interval_s: float = DEFAULT_FRAME_INTERVAL_S,
         face_bbox_ttl_s: float = DEFAULT_FACE_BBOX_TTL_S,
         stream_stale_s: float = DEFAULT_STREAM_STALE_S,
+        on_stale: Callable[[str], object] | None = None,
+        moving: SelfMovingProvider | None = None,
+        still_settle_s: float = DEFAULT_STILL_SETTLE_S,
+        lock_held: Callable[[], bool] | None = None,
+        held_detect_interval: float = DEFAULT_HELD_DETECT_INTERVAL,
         clock: Callable[[], float] = time.monotonic,
         start_worker: bool = True,
     ) -> None:
@@ -724,6 +921,17 @@ class FaceSenseDriver:
         self._frame_interval_s = max(0.0, float(frame_interval_s))
         self._face_bbox_ttl_s = max(0.0, float(face_bbox_ttl_s))
         self._stream_stale_s = max(0.0, float(stream_stale_s))
+        self._on_stale = on_stale
+        self._on_stale_failed = False
+        self._moving = moving
+        self._still_settle_s = max(0.0, float(still_settle_s))
+        self._lock_held = lock_held
+        self._held_detect_interval = max(0.0, float(held_detect_interval))
+        #: Worker-thread-only gate state: when the peek last read ``True``, and
+        #: whether the transition line for this motion episode has been opened.
+        self._last_moving_at: float | None = None
+        self._gate_open = False
+        self._gate_held_reads = 0
         self._last_read_at: float | None = None
         self._clock = clock
 
@@ -754,6 +962,7 @@ class FaceSenseDriver:
         #: the moment a fresh usable frame arrives, so a LATER silent episode is
         #: reported again rather than only the first one for the process's life.
         self._stream_ended_logged = False
+        self._stream_generation: object = None
         #: Count of face cues latched this run (diagnostics / tests).
         self.events = 0
 
@@ -899,7 +1108,19 @@ class FaceSenseDriver:
         never existed, never streamed, or is still warming up) is exempt by
         construction: there is no "stream" to have ended.
         """
-        if self._stream_ended_logged or now is None:
+        if now is None:
+            return
+        generation = getattr(self._media, "generation", None)
+        if generation != self._stream_generation:
+            # A NEW client (the keeper re-warmed after our drop, or a first
+            # warm-up landed) is a new episode: re-arm the once-per-episode
+            # latch, or a client that dies again before its first frame is never
+            # dropped a second time and the runtime sits on it for good (seen
+            # live on the Wireless, 2026-09-06, under a foreign release storm).
+            self._stream_generation = generation
+            self._stream_ended_logged = False
+            self._on_stale_failed = False
+        if self._stream_ended_logged:
             return
         last = self._last_frame_at
         if last is None:
@@ -908,6 +1129,35 @@ class FaceSenseDriver:
             return
         self._stream_ended_logged = True
         senselog.drop(STAGE, SOURCE, "stream", REASON_STREAM_ENDED)
+        self._ask_for_a_fresh_stream()
+
+    def _ask_for_a_fresh_stream(self) -> None:
+        """Hand :data:`REASON_STREAM_ENDED` to the injected ``on_stale`` seam, once.
+
+        The two guards are the #176 challenge's, restated here because they are
+        what keeps a detector from becoming a loop: a camera that reports itself
+        UNAVAILABLE is already gone beneath the client (there is nothing to
+        re-acquire that this driver can know is coming back), and a camera that
+        has never produced a frame is exempt one level up, in
+        :meth:`_check_stream_staleness`, which returns before reaching here.
+
+        This module decides nothing about what the reason MEANS — it neither
+        imports nor names a media client. A raising callback is a broken
+        consumer, not a sense fault: it is swallowed and logged once, and the
+        latch above has already been set, so it is never retried in a loop.
+        """
+        callback = self._on_stale
+        if callback is None or not self._camera_available():
+            return
+        try:
+            callback(REASON_STREAM_ENDED)
+        except Exception:
+            if not self._on_stale_failed:
+                self._on_stale_failed = True
+                logger.warning(
+                    "FaceSenseDriver on_stale callback raised; staleness reporting continues",
+                    exc_info=True,
+                )
 
     def _connected(self) -> bool:
         """The one FREE liveness check — and the reason it is checked FIRST.
@@ -1000,9 +1250,23 @@ class FaceSenseDriver:
         if observation is None:
             return
         if observation.bbox is not None:
+            # Anchor on the frame's CAPTURE time (t4 #181), but measure the
+            # detection's latency entirely on the DRIVER's own clock — the one
+            # `captured_at` was read on — and apply that latency to the engine's
+            # `now`. The two clocks are both `time.monotonic` in production but
+            # are separate time bases by contract (a test drives `ctx.now` from
+            # 0.0 while the worker reads a real monotonic clock), and mixing a
+            # reading from one with a reading from the other is how a
+            # "seconds ago" turns into a million-second age that expires every
+            # position the tick it lands. An older producer/test fake with no
+            # captured_at falls back to this drain tick, exactly as before.
+            latency = 0.0
+            if observation.captured_at is not None:
+                latency = max(0.0, self._clock() - observation.captured_at)
+            anchor = (now - latency) if now is not None else None
             self._face_bbox = observation.bbox
-            self._face_bbox_at = now
-            self._face_age_s = 0.0 if now is not None else None
+            self._face_bbox_at = anchor
+            self._face_age_s = latency if now is not None else None
         name = (observation.name or "").strip()
         if not name:
             return
@@ -1032,12 +1296,14 @@ class FaceSenseDriver:
     def _age_position(self, now: float | None) -> None:
         """Re-age the held position each tick and expire it past its TTL.
 
-        Age is measured on the ENGINE'S tick clock (``ctx.now``) at the moment
-        the observation was drained, never on the worker's own clock: mixing
-        two clocks in one reading is how a "seconds ago" ends up meaningless.
-        The drain happens on the tick after the detection completes, so the
-        reading is late by at most one tick — far inside anything a motion
-        behavior can act on.
+        Age is measured on the ENGINE'S tick clock (``ctx.now``) against the
+        anchor :meth:`_drain_match` set — the observation's ``captured_at``
+        (the worker's pre-detection clock read, t4 #181) when present, or the
+        drain tick itself as a fallback for an observation with none. Mixing
+        two clocks in one reading is how a "seconds ago" ends up meaningless,
+        so both anchor and ``now`` here are read on the SAME clock domain in
+        production (both default to ``time.monotonic``); a test that injects
+        one must inject the other identically.
         """
         anchor = self._face_bbox_at
         if self._face_bbox is None or anchor is None or now is None:
@@ -1090,16 +1356,83 @@ class FaceSenseDriver:
         if not self._recognizer_ready:
             return
         now = self._clock()
+        interval = self._due_interval(now)
+        if interval is None:  # the head is moving and nothing is watching a face
+            return
         last = self._last_detect
-        if last is not None and (now - last) < self._detect_interval:
+        if last is not None and (now - last) < interval:
             return
         frame = self._input.take()
         if not usable_frame(frame):
             return
         self._last_detect = now
+        captured_at = now  # the clock read BEFORE detection, per t4 #181 / h32
         observation = self._detect_once(frame)
         if observation is not None:
-            self._output.publish(observation)
+            self._output.publish(replace(observation, captured_at=captured_at))
+
+    # ------------------------------------------------------------------ #
+    # The #179 self-motion gate (worker thread)                          #
+    # ------------------------------------------------------------------ #
+
+    def _due_interval(self, now: float) -> float | None:
+        """The cadence this worker iteration must respect, or ``None`` to submit nothing.
+
+        Three answers, and each is a decision the module docstring's
+        "Still-only detection" section explains: ``detect_interval`` (the head
+        is still, or has been for :attr:`_still_settle_s`),
+        ``held_detect_interval`` (it is moving but a lock is watching a face
+        through the motion), and ``None`` (it is moving and nobody is).
+
+        With no ``moving`` peek injected there is no gate at all — the same
+        shape ``rms_sense`` uses, where the floor gate is not even constructed.
+        """
+        if self._moving is None:
+            return self._detect_interval
+
+        held = _peek(self._lock_held)
+        if _peek(self._moving):
+            self._last_moving_at = now
+            self._open_gate(held)
+            return self._held_detect_interval if held else None
+
+        last_moving = self._last_moving_at
+        if last_moving is not None and 0.0 <= now - last_moving < self._still_settle_s:
+            # Settling: the pose is still but the camera's buffered frames are
+            # not yet from this head frame.
+            return self._held_detect_interval if held else None
+
+        self._close_gate()
+        return self._detect_interval
+
+    def _open_gate(self, held: bool) -> None:
+        """One line at the START of a motion episode — never one per iteration."""
+        if self._gate_open:
+            self._gate_held_reads += 1
+            return
+        self._gate_open = True
+        self._gate_held_reads = 1
+        senselog.stage(
+            GATE_STAGE,
+            SOURCE,
+            GATE_EVENT,
+            f"opened reason=self-moving lock_held={str(held).lower()} "
+            f"settle_s={self._still_settle_s}",
+        )
+
+    def _close_gate(self) -> None:
+        """One line at the END of a motion episode, naming what it suppressed."""
+        self._last_moving_at = None
+        if not self._gate_open:
+            return
+        self._gate_open = False
+        senselog.stage(
+            GATE_STAGE,
+            SOURCE,
+            GATE_EVENT,
+            f"closed moving_reads={self._gate_held_reads}",
+        )
+        self._gate_held_reads = 0
 
     def _detect_once(self, frame: object) -> "FaceObservation | None":
         """Detect + embed + match one frame -> the chosen face, or ``None``.
@@ -1204,6 +1537,24 @@ class FaceSenseDriver:
         """The current TTL-held ``frame_available`` condition. Never raises."""
         return self._frame_available
 
+    def peek_last_frame_at(self) -> float | None:
+        """When the last USABLE frame arrived, on this driver's own clock, or ``None``.
+
+        The liveness reading the availability rider publishes as
+        ``senses.<name>.last_frame_at`` (#176): a STABLE timestamp, never an
+        age, so a rider that writes on change is not made to write every tick.
+        ``None`` means no usable frame has EVER arrived — the same value the
+        staleness detector treats as "nothing to be stale about". Pair it with
+        :attr:`clock` on the consumer side: the timestamp is meaningful only on
+        the clock it was read from.
+        """
+        return self._last_frame_at
+
+    @property
+    def clock(self) -> Callable[[], float]:
+        """The clock :meth:`peek_last_frame_at`'s reading lives on. Never raises."""
+        return self._clock
+
     def as_frame_available_provider(self) -> Callable[[], bool]:
         """The zero-arg ``frame_available`` provider callable."""
         return self.peek_frame_available
@@ -1259,9 +1610,18 @@ __all__ = [
     "usable_frame",
     "vision_unavailable_reason",
     "DEFAULT_DETECT_INTERVAL",
+    "DEFAULT_GATE_EPS_DEG_S",
+    "SCORE_THRESHOLD_ENV",
+    "score_threshold_from_env",
+    "GATE_EPS_ENV",
     "DEFAULT_DETECT_MAX_WIDTH",
+    "DEFAULT_FACE_BBOX_TTL_S",
     "DEFAULT_FRAME_INTERVAL_S",
     "DEFAULT_FRAME_TTL_S",
+    "DEFAULT_HELD_DETECT_INTERVAL",
+    "DEFAULT_STILL_SETTLE_S",
+    "GATE_EVENT",
+    "GATE_STAGE",
     "DEFAULT_REANNOUNCE_COOLDOWN",
     "DEFAULT_STREAM_STALE_S",
     "REASON_STREAM_ENDED",

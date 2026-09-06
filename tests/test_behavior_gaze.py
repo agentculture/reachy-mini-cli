@@ -348,14 +348,15 @@ def test_face_plan_centre_bbox_yields_no_offset() -> None:
 @pytest.mark.parametrize(
     "bbox, expected_yaw, expected_pitch",
     [
-        # top-left corner (cx=0, cy=0): +yaw (left), +pitch (up), both clamped.
-        ((0.0, 0.0, 0.0, 0.0), 20.0, 12.0),
-        # top-right corner (cx=1, cy=0): -yaw (right), +pitch (up).
-        ((1.0, 0.0, 0.0, 0.0), -20.0, 12.0),
-        # bottom-left corner (cx=0, cy=1): +yaw (left), -pitch (down).
-        ((0.0, 1.0, 0.0, 0.0), 20.0, -12.0),
-        # bottom-right corner (cx=1, cy=1): -yaw (right), -pitch (down).
-        ((1.0, 1.0, 0.0, 0.0), -20.0, -12.0),
+        # +pitch is chin-DOWN (SDK `from_euler("xyz")`, x-forward z-up; d7).
+        # top-left corner (cx=0, cy=0): +yaw (left), -pitch (look up), both clamped.
+        ((0.0, 0.0, 0.0, 0.0), 20.0, -12.0),
+        # top-right corner (cx=1, cy=0): -yaw (right), -pitch (look up).
+        ((1.0, 0.0, 0.0, 0.0), -20.0, -12.0),
+        # bottom-left corner (cx=0, cy=1): +yaw (left), +pitch (look down).
+        ((0.0, 1.0, 0.0, 0.0), 20.0, 12.0),
+        # bottom-right corner (cx=1, cy=1): -yaw (right), +pitch (look down).
+        ((1.0, 1.0, 0.0, 0.0), -20.0, 12.0),
     ],
 )
 def test_face_plan_aims_within_clamp_at_the_four_corners(
@@ -392,7 +393,7 @@ def test_face_run_behavior_refuses_with_no_bbox(tmp_path) -> None:
 def test_face_run_behavior_refuses_when_stale(tmp_path) -> None:
     cmd_id = _submit(tmp_path, name="look-at-face", params={}, lifetime=None)
     driver = IntentDriver(root=tmp_path)
-    stale = Sense(face_bbox=(0.4, 0.4, 0.2, 0.2), face_age_s=2.0)  # > 1.5s default
+    stale = Sense(face_bbox=(0.4, 0.4, 0.2, 0.2), face_age_s=4.0)  # > 3.0s default
     ctx = _RecordingCtx(now=1.0, tick=1, sense=stale)
 
     driver.on_tick(ctx)
@@ -424,7 +425,9 @@ def test_face_run_behavior_admits_a_one_shot_aiming_at_the_clamped_target(tmp_pa
     assert beh.lifetime.looping is False
     assert beh.lifetime.duration == gaze.DEFAULT_DURATION_S_FACE
     assert beh.params["yaw"] == pytest.approx(20.0)
-    assert beh.params["pitch"] == pytest.approx(12.0)
+    assert beh.params["pitch"] == pytest.approx(
+        -12.0
+    )  # cy=0: above the axis -> chin-up -> negative (d7)
 
     result = control_mod.await_result(
         cmd_id, namespace=INTENT_NAMESPACE, root=tmp_path, timeout=0.2
@@ -449,7 +452,7 @@ def test_face_run_behavior_admits_with_custom_max_yaw_and_max_pitch(tmp_path) ->
 
     assert len(ctx.admits) == 1
     assert ctx.admits[0].params["yaw"] == pytest.approx(5.0)
-    assert ctx.admits[0].params["pitch"] == pytest.approx(3.0)
+    assert ctx.admits[0].params["pitch"] == pytest.approx(-3.0)  # cy=0 -> look up -> negative (d7)
 
 
 def test_face_contribution_eases_then_holds_the_target(tmp_path) -> None:
@@ -577,4 +580,9 @@ def test_every_gaze_and_lock_clamp_declares_its_domain() -> None:
         for key, param in entry.params.items():
             if key in {"pitch", "roll", "z"}:
                 continue  # signed by nature: an offset, not a magnitude
-            assert param.minimum == 0.0, f"{name}.{key} declares no lower bound"
+            assert param.minimum is not None, f"{name}.{key} declares no lower bound"
+            # 0.0 for a magnitude; a strictly-positive knob (face-lock's
+            # `fov_h`/`fov_v` — a zero field of view reads every face as dead
+            # centre) declares the smallest positive bound it can, since
+            # `Param.minimum` is inclusive.
+            assert param.minimum >= 0.0, f"{name}.{key} allows a negative"

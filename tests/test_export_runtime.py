@@ -785,7 +785,13 @@ class TestSenseSnapshotDriver:
             last_press_at=1.2,
         )
         transitions = [
-            dataclasses.replace(state, last_press_at=1.5),
+            # NOTE (t2 #184): a `last_press_at`-only bump is no longer treated
+            # as meaningful on its own — `phase_started_at`/`last_press_at` are
+            # the two pure-clock PatState fields the emit-payload comparison
+            # scrubs (see SenseSnapshotDriver), so this transition pairs the
+            # bump with a real field change to keep testing "does last_press_at
+            # still reach the wire", not "does it alone trigger a re-emit".
+            dataclasses.replace(state, last_press_at=1.5, yaw_deg=-1.0),
             dataclasses.replace(state, yaw_deg=2.0),
             dataclasses.replace(state, level="level2"),
             dataclasses.replace(state, phase="contentment", phase_started_at=4.0),

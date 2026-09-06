@@ -385,3 +385,38 @@ def _isolate_reachy_logging():
         logger.handlers[:] = saved_handlers
         logger.setLevel(saved_level)
         logger.propagate = saved_propagate
+
+
+@pytest.fixture(autouse=True)
+def _no_live_sdk_client(monkeypatch: pytest.MonkeyPatch):
+    """No test may construct a REAL ``reachy_mini.ReachyMini`` — ever.
+
+    2026-09-06, Wireless: a full suite run on a dev box with the ``[sdk]`` extra
+    installed opened 38 SDK websocket sessions against the DEPLOYED robot in
+    67 s (``ReachyMini()``'s ``"auto"`` connection mode fell through to
+    ``reachy-mini.local``, this box's ``/etc/hosts`` pin for the Wireless) and
+    each connection made the daemon RELEASE its media — killing the runtime's
+    camera once per second while an operator stood in front of it. The same
+    defect class as the events-cli broker incident, one transport over.
+
+    Production code imports the class lazily inside functions and treats a
+    raising constructor as "daemon not up yet" (never raises), so replacing the
+    attribute suite-wide costs nothing and every test that wants an SDK client
+    already injects a fake class through the holders' seams. A test that
+    genuinely needs the real SDK must say so with ``@pytest.mark.live_sdk`` —
+    none does today.
+    """
+    try:
+        import reachy_mini
+    except Exception:  # the extra is absent: nothing to guard
+        yield
+        return
+
+    class _NoLiveSdkClient:
+        def __init__(self, *args, **kwargs):
+            raise ConnectionRefusedError(
+                "the test suite never constructs a real ReachyMini (see tests/conftest.py)"
+            )
+
+    monkeypatch.setattr(reachy_mini, "ReachyMini", _NoLiveSdkClient)
+    yield

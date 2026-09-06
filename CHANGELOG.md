@@ -5,6 +5,85 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.54.0] - 2026-09-06
+
+The September-6 face/lock/camera arc — six issues, one PR
+(spec: `docs/specs/2026-09-06-september-6-face-lock-camera-fixes-181-179-176-183.md`).
+
+### Added
+
+- `state.json` `senses.<name>.live` / `last_frame_at` — camera liveness beside
+  structural availability (#176); `no-frames` / `frames live` senselog lines.
+- `state.json` `base_layer: {seeded, active, stopped_by}` and
+  `TickContext.ensure_base` / `add_base`: the base layer re-seeds when an
+  inhibition naming `feel-alive` clears; a by-name `behavior stop feel-alive`
+  is intentional stillness until an unbounded `run feel-alive` (#183).
+- `HeldMediaClient.drop(reason)` — a camera that goes silent for 10 s is
+  handed back from the tick thread and re-warmed by the keeper, no restart (#176).
+- `FaceSenseDriver` still-only detection: `moving` / `lock_held` / `on_stale`
+  seams, `DEFAULT_STILL_SETTLE_S`, `DEFAULT_HELD_DETECT_INTERVAL`,
+  `[SENSE stage=gate source=face]` lines (#179); `FaceObservation.captured_at`.
+- `face-lock` params `fov_h` / `fov_v` / `damping` (#181); follow-up #186 for
+  `look-at-face`.
+- Operating guide: the face lock, still-only detection, the eyes' liveness,
+  the base layer stopped vs. inhibited, the WirePlumber camera boot race.
+- `REACHY_FACE_SCORE_THRESHOLD` (default 0.6, YuNet's own) — the detector's
+  confidence floor as an operator knob; the deployed Wireless runs 0.4 with
+  `REACHY_FACE_DETECT_MAX_WIDTH=0` (live deviation d5's companion).
+- `SelfMotionDriver(eps_deg_s=, eps_mm_s=, watch_antennas=)` — a per-second
+  tolerance judged against real tick time, with the antennas optionally left
+  out. The face gate's latch uses both (deviation d6); the mic's latch is unchanged.
+- `HeldMediaClient.generation` — counts warm-ups, so `FaceSenseDriver` re-arms
+  its camera-stream-ended latch on every re-warmed client (deviation d3).
+- `tests/conftest.py` `_no_live_sdk_client` autouse guard: the suite never
+  constructs a real `reachy_mini.ReachyMini` — a full run on the dev box had
+  opened 38 SDK sessions against the deployed robot in 67 s (deviation d4).
+
+### Live acceptance on the Wireless (2026-09-06)
+
+- The face gate rides its OWN self-motion latch at 20 deg/s
+  (`REACHY_FACE_GATE_EPS_DEG_S`), not the mic's 1.75 deg/s one, which the base
+  layer's ~2.7 deg/s wander kept open (deviation d2) — and that latch judges
+  deg/s against real tick time over head + body_yaw only: the shipped
+  `antenna-sway` (~38 deg/s peak) tripped a per-tick threshold on every
+  half-swing, and the deployed tick's 34-44 ms mean with 500-800 ms stalls
+  (#97) turned the wander into slew-class steps; detection was blocked most of
+  the time and every `lock_face` was refused `no face known` while YuNet found
+  the operator in 12 of 14 clip frames at score 0.9 (deviation d6).
+- **`face-lock` and `look-at-face` pitch sign was inverted** — `+pitch` is
+  chin-DOWN (the SDK's `create_head_pose` is scipy `from_euler("xyz")` in an
+  x-forward, z-up frame; `expressions.toml` says `+ = chin-down`), yet both
+  planners, their docstrings and their tests assumed `+pitch` was up, so a
+  face above the camera was aimed at with `pitch=+12` and the head dipped
+  AWAY from it ("it looks down when I ask it to look at me"). Flipped in both
+  planners and in the test suite's pinhole simulator (deviation d7).
+- `face-lock` anti-windup + recover-to-neutral: an outward push is admitted
+  only while the offset shrinks, and after 3 s of true absence the head eases
+  back to neutral at 30 deg/s — the incremental aim had run to the clamp and
+  frozen staring at a wall (deviation d5). `MAX_FACE_AGE_S` 1.5→3.0 s,
+  `DEFAULT_FACE_BBOX_TTL_S` 1.5→3.5 s for the box's 1.0 s detect cadence.
+
+### Changed
+
+- `face-lock` aims incrementally through the camera FOV (centres in two
+  detection cycles at damping 0.7) instead of an absolute 20°/12° gain that
+  settled at ~0.31 of the face angle (#181). `yaw_gain` / `pitch_gain` removed.
+- `face-lock` claims head + body_yaw; `feel-alive` leaves `LOCK_INHIBITS`, so
+  the antennas keep swaying under a lock and the base layer is never evicted
+  by it (#183). Its `motion.*` events report `["body_yaw","head"]`.
+- `SenseSnapshotDriver` emits a `sense` line only when the EMITTED payload
+  changed — clock-only fields (pat timestamps, face/DoA ages) no longer
+  produce lines (#184).
+- `run_behavior feel-alive` with no lifetime is the base re-seed; every other
+  looping-default entry is still refused unbounded.
+
+### Fixed
+
+- `test_a_missing_vision_extra_reports_a_named_reason_never_a_crash` states
+  its cv2 premise through the `find_spec` seam (#185).
+- `face_age_s` measures detection latency on the driver's own clock, applied
+  to the engine tick clock — the two time bases never couple.
+
 ## [0.53.1] - 2026-09-06
 
 ### Added

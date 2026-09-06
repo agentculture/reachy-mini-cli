@@ -23,8 +23,26 @@ What ``lock_face`` does, in one atomic step
    detection. A face gone for :data:`FACE_LOST_AFTER_S` is REPORTED once, as
    ``motion.face-lost``, and the lock still persists (see below).
 3. SNAPSHOTS the currently inhibited set and adds its own
-   (:data:`LOCK_INHIBITS` — ``feel-alive`` and ``orient-to-sound``, the two
-   behaviors that would otherwise keep dragging the head off the face).
+   (:data:`LOCK_INHIBITS` — ``orient-to-sound``, the one behavior arbitration
+   alone cannot keep off the face).
+
+Why only ONE name, and why the lock claims the body too (issue #183)
+---------------------------------------------------------------------
+The lock used to inhibit ``feel-alive`` as well, which stilled the ANTENNAS for
+the whole hold — the base layer is ONE behavior, so inhibiting it to protect
+the head took the sway with it. Arbitration is per CHANNEL by (class priority,
+recency) with abstention, and ``face-lock`` is ``STOPPABLE`` above the
+``PASSIVE`` base layer, so the lock wins any channel it CLAIMS without evicting
+anything. It therefore claims ``head`` AND ``body_yaw`` (see the library entry)
+and contributes a constant, HELD ``body_yaw`` — the value the engine was
+already streaming when the lock was taken — because ``feel-alive``'s slow body
+wander (amplitude 6 deg at energy 1.0) rotates the whole head assembly, and the
+camera with it, off the face. ``antennas`` is left unclaimed, so the base layer
+keeps that channel and the antennas keep swaying under a lock.
+
+``orient-to-sound`` STAYS inhibited: it is ``STOPPABLE`` like the lock, so a
+later admission would win the head on the recency tie-break. Arbitration alone
+cannot keep a same-class behavior off the face — only the inhibition can.
 
 A lock cannot outlive its mind, nor be held forever
 ----------------------------------------------------
@@ -53,7 +71,7 @@ caller's back.
 
 Ownership is RECOMPUTED on every replacement, never frozen at acquisition. The
 live set is re-asserted as ``new_set | LOCK_INHIBITS``: while the lock is held,
-``feel-alive`` / ``orient-to-sound`` are inhibited no matter what the caller
+``orient-to-sound`` is inhibited no matter what the caller
 wrote — including a name that was ALREADY operator-inhibited when the lock was
 taken (so it was never "added") and that the replacement drops, which an
 acquisition-time ownership set would have let start dragging the head off the
@@ -85,7 +103,9 @@ boundary holds.
 
 from __future__ import annotations
 
+import logging
 import math
+from collections import deque
 from typing import Callable, Iterable
 
 from reachy.behavior.model import Behavior, Contribution, Lifetime, neutral_head
@@ -96,16 +116,31 @@ from reachy.cli._errors import EXIT_USER_ERROR, CliError
 LOCK_FACE = "lock_face"
 RELEASE_FACE = "release_face"
 
+logger = logging.getLogger(__name__)
+
 #: The library entry the lock admits.
 FACE_LOCK_BEHAVIOR = "face-lock"
 
-#: What the lock adds to the inhibited set: the two behaviors that would
-#: otherwise keep commanding the head (and so keep pulling it off the face).
-LOCK_INHIBITS = ("feel-alive", "orient-to-sound")
+#: What the lock adds to the inhibited set. ONE name since #183: the base layer
+#: is handled by arbitration instead (the lock claims ``head`` + ``body_yaw``
+#: and leaves ``antennas`` to ``feel-alive``), but ``orient-to-sound`` is the
+#: lock's own contention class, so a later admission of it would win the head
+#: on the recency tie-break. The tuple shape is kept for exactly that reason —
+#: the set is "whatever arbitration cannot handle", not "one behavior".
+LOCK_INHIBITS = ("orient-to-sound",)
 
 #: A ``face_bbox`` older than this is not a face to lock onto. Matches the
 #: producer's own TTL (``reachy.behavior.face_sense``), so the two agree.
-MAX_FACE_AGE_S = 1.5
+MAX_FACE_AGE_S = 3.0
+#: Why 3.0 and not the 1.5 it shipped with: since ``FaceObservation.captured_at``
+#: a reading's age honestly INCLUDES the detection's own latency, and the
+#: deployed Wireless detects every 1.0 s (``REACHY_FACE_DETECT_INTERVAL``) on
+#: a CM4 — so a reading was 1.0 s + latency old by the time the next one
+#: landed, past 1.5 s, and the lock ignored every reading after the first one
+#: it admitted on: live (2026-09-06) it aimed once and then held that pose for
+#: 40 s while the person moved. A late reading is not a WRONG reading — the
+#: base-angle ring anchors the aim at the frame's capture time — so the bound
+#: is ``FACE_LOST_AFTER_S``, the point at which absence is reported anyway.
 
 #: The raw event every release emits, whatever ended the lock. ``motion.`` is the
 #: prefix :mod:`reachy.export.runtime` maps onto ``MotionEvent``; both this action
@@ -133,6 +168,16 @@ REASON_EVICTED = "evicted"
 #: How long the face must be absent/stale before the ONE ``face-lost`` report.
 #: Well above vision's own TTL (:data:`MAX_FACE_AGE_S`): a dropped frame is not
 #: a lost face, and this event is meant to be rare enough to mean something.
+#:
+#: Re-derived for #181/#179 against the LONGEST legitimate gap between two
+#: detections while a lock is actively re-aiming, and it still holds at 3.0 s:
+#: one detect interval (``face_sense.DEFAULT_DETECT_INTERVAL`` 0.5 s, 1.0 s as
+#: deployed on the Wireless) + the post-motion settle #179 adds to the face
+#: worker (<= 0.5 s) + the worst in-clamp slew the incremental aim can command
+#: (the full 40 deg yaw envelope at :data:`SLEW_DEG_S` = 0.33 s) = 1.83 s. One
+#: whole missed cycle on top of that is 2.83 s — inside 3.0, with ~0.2 s of
+#: margin in the worst case and ~1.3 s in the shipped 0.5 s-interval case. So
+#: the value is UNCHANGED; what changed is that it now has a derivation.
 FACE_LOST_AFTER_S = 3.0
 
 #: How long ``mind_online()`` must read ``False`` CONTINUOUSLY before the lock
@@ -161,20 +206,95 @@ MAX_YAW_DEG = 20.0
 MAX_PITCH_DEG = 12.0
 
 #: Degrees commanded for a face at the very edge of the frame, BEFORE the clamp.
-#: Equal to the clamps by default, so the mapping is linear across the frame and
-#: only saturates at the edge; raise it for a twitchier lock, and the clamp still
-#: binds.
+#: The OPEN-LOOP mapping the one-shot glance :mod:`reachy.behavior.gaze` still
+#: uses (``plan_look_at_face``): a single glance has no loop to close, so it maps
+#: the offset straight onto an absolute angle.
+#:
+#: The face LOCK no longer uses these (issue #181): an absolute map settles at
+#: ``2*gain/FOV`` of the true bearing — ~0.31 on the Wireless camera — because
+#: the offset shrinks as the head turns toward it. The lock's aim is now
+#: INCREMENTAL, off :data:`HFOV_DEG` / :data:`VFOV_DEG` / :data:`DAMPING`.
 YAW_GAIN_DEG = 20.0
 PITCH_GAIN_DEG = 12.0
+
+#: The camera's field of view in degrees, horizontal and vertical — what turns a
+#: normalised bbox offset into a real ANGLE, and the whole reason the lock can
+#: aim incrementally at all.
+#:
+#: Measured on the Reachy Mini Wireless from ``GET /api/camera/specs``'s
+#: intrinsics (fx ~2002, cx ~1906 at 3840 px wide): ``2*atan(cx/fx)`` ~ 87 deg
+#: horizontal, ~57 deg vertical. Overridable per lock as the ``fov_h`` / ``fov_v``
+#: params, because a different camera is a different number — this module is a
+#: leaf that imports no transport, so nothing reads ``/api/camera/specs`` HERE
+#: (composition may resolve it once and inject the default; see the spec's
+#: scope boundary for #181).
+HFOV_DEG = 87.0
+VFOV_DEG = 57.0
+
+#: How much of the measured angular error one detection closes, 0..1. At 0.7 a
+#: face 30 deg off-axis is within 2.7 deg after two detections and 0.8 deg after
+#: three, and the error NEVER changes sign — the loop cannot overshoot, because
+#: every step is a fraction of a measured error. 1.0 (aim exactly at the face) is
+#: reachable through the ``damping`` param and is the twitchy end; the shipped
+#: default keeps a margin for a stale or mis-centred bbox (decision c24, #181).
+DAMPING = 0.7
 
 #: How fast the commanded angle chases its target, in deg/s — specified in
 #: TIME, never per tick, so the lock behaves identically at any tick rate
 #: (the cadence-invariance lesson of issue #168).
 SLEW_DEG_S = 120.0
 
+#: Anti-windup for the incremental aim. Each new detection nudges the target by
+#: the FOV-scaled bbox offset; if that offset never SHRINKS — a face beyond the
+#: head's reach, or a false detection latched on a fixed edge (a printed face on
+#: a wall) — the nudges accumulate and march the target to the clamp, where it
+#: pins. So an OUTWARD push (one that moves the target further from neutral) is
+#: only accepted while the measured offset is still shrinking by at least this
+#: much (normalised frame units); a stalled offset freezes the target where it
+#: is rather than driving on to the corner. Live on the Wireless (2026-09-06)
+#: the un-guarded loop ran the head to its clamp and held there, staring at an
+#: empty kitchen, for 80 s. Convergence itself is unaffected: a working lock's
+#: offset shrinks ~(1-damping) each cycle, far above this floor.
+CONVERGE_EPS = 0.03
+
+#: How long the face may be genuinely ABSENT (no fresh bbox) before the lock
+#: eases the gaze back toward neutral instead of holding a possibly-runaway
+#: pose forever. A short absence is still HELD — vision drops frames, and a
+#: person who steps out for a moment has not asked to be un-looked-at — so this
+#: matches :data:`FACE_LOST_AFTER_S`. The lock is NOT released here: it stays
+#: locked and re-aims the instant a face returns; only the HEAD relaxes, so a
+#: lock that lost its face stops pointing at a wall.
+RECOVER_AFTER_S = 3.0
+
+#: How fast (deg/s) the gaze eases toward neutral once :data:`RECOVER_AFTER_S`
+#: of true absence has passed. Gentle — this is a graceful relax, not a snap.
+RECOVER_RATE_DEG_S = 30.0
+
 #: Longest gap between two calls the slew integrates over. A resumed/stalled
 #: process must not teleport the head.
 _MAX_DT_S = 0.25
+
+#: How many past ``(t, yaw, pitch)`` samples the base-pose ring keeps. The ring
+#: answers ONE question — "what was I commanding when this frame was taken?" —
+#: so it only has to reach back as far as a bbox may be old, i.e. the ``max_age``
+#: param (:data:`MAX_FACE_AGE_S`, 1.5 s) plus slack. 256 samples is ~5 s at the
+#: 50 Hz design cadence. A faster tick shortens the window rather than growing
+#: the ring; the lookup then degrades to the OLDEST sample, which is the honest
+#: answer ("this is as far back as I remember") and still much better than the
+#: current pose.
+_RING_MAXLEN = 256
+
+#: How far the capture time must advance before an unchanged bbox counts as a
+#: NEW observation. ``face_age_s`` is measured on the sense provider's clock and
+#: ``t_local`` on the engine's, so a republished (stale) reading's derived
+#: capture time jitters by microseconds between the two; 50 ms swallows that
+#: while staying far below any real detection interval (0.5-1.0 s).
+_NEW_OBSERVATION_EPS_S = 0.05
+
+#: Degrees below which a "toward neutral" move is not counted as one — keeps
+#: a re-application of the same clamped target from reading as progress and so
+#: keeping a pinned runaway alive.
+_RECOVER_ANGLE_EPS = 0.25
 
 
 def _clamp(value: float, limit: float) -> float:
@@ -197,13 +317,41 @@ class FaceLockGaze:
     entry (:class:`reachy.behavior.orient.OrientToSound` is the sibling, and the
     reference for a self-clamping continuous behavior).
 
-    Every tick it maps ``sense.face_bbox``'s centre — normalised ``0..1``,
-    origin top-left — onto a head yaw/pitch TARGET and eases the commanded angle
-    toward it at :data:`SLEW_DEG_S`. The sign convention is the repo's:
-    ``+yaw`` is LEFT (:func:`reachy.behavior.sense.doa_angle_to_yaw`), so a face
-    at large ``x`` (the robot's right) yields a negative yaw; ``+pitch`` is up
-    (``thoughtful``'s "upward/forward tilt"), so a face at small ``y`` yields a
-    positive pitch.
+    The aim is INCREMENTAL and closed-loop (issue #181). ``sense.face_bbox``'s
+    centre — normalised ``0..1``, origin top-left — is an ANGULAR ERROR once the
+    camera's field of view is known::
+
+        target_yaw   = base_yaw   - (cx - 0.5) * fov_h * damping
+        target_pitch = base_pitch - (cy - 0.5) * fov_v * damping
+
+    where ``base_*`` is the angle this gaze was COMMANDING WHEN THE FRAME WAS
+    TAKEN, not the one it commands now — see :meth:`_base_at`. The commanded
+    angle then eases toward the target at :data:`SLEW_DEG_S`. The sign
+    convention is the repo's and is unchanged: ``+yaw`` is LEFT
+    (:func:`reachy.behavior.sense.doa_angle_to_yaw`), so a face at large ``x``
+    (the robot's right) yields a negative yaw; ``+pitch`` is CHIN-DOWN (the SDK
+    builds head poses with ``from_euler("xyz")`` in an x-forward, z-up frame,
+    and ``expressions.toml`` says ``+ = chin-down``), so a face at small ``y``
+    — above the camera axis — yields a NEGATIVE pitch. This module and
+    :mod:`reachy.behavior.gaze` shipped with that sign inverted, believing
+    ``+pitch`` was up, until the 2026-09-06 live retest caught the head dipping
+    away from every face above it (deviation d7).
+
+    What this replaces, and why: the previous target was ABSOLUTE
+    (``-(cx-0.5) * 2 * gain``), which is a proportional loop with gain
+    ``2*gain/FOV`` — ~0.31 on the Wireless camera — so the head settled about a
+    third of the way to the face and never arrived. The incremental form closes
+    ``damping`` of the MEASURED error per detection instead, so it converges
+    regardless of the gain constants, and it cannot overshoot for
+    ``0 < damping <= 1`` because every step is a fraction of an error it just
+    measured.
+
+    Only a NEW observation moves the target. A bbox is republished on every tick
+    between detections (the producer holds it for its TTL), and re-applying an
+    increment from ONE reading 50 times would walk the head off the face. A
+    reading is new when its CAPTURE time — ``t_local - sense.face_age_s`` —
+    advances: a held reading's age grows exactly as fast as the clock, so its
+    capture time is constant. See :meth:`_is_new_observation`.
 
     The clamp is its OWN, applied to both the target and the command, so no
     ``params`` value and no out-of-frame bbox can drive the head past it.
@@ -220,9 +368,24 @@ class FaceLockGaze:
     def __init__(self) -> None:
         self._yaw = 0.0
         self._pitch = 0.0
+        #: The body yaw this gaze HOLDS for the life of the lock (issue #183).
+        #: Set once, at lock time, from the pose the engine last streamed; 0.0
+        #: (the neutral body yaw) when nobody handed one over — a gaze built
+        #: directly in a test, or a lock taken before any tick composed a pose.
+        self._body_yaw = 0.0
         self._target_yaw = 0.0
         self._target_pitch = 0.0
         self._last_t: float | None = None
+        #: (t_local, commanded yaw, commanded pitch) for the recent past.
+        self._ring: deque[tuple[float, float, float]] = deque(maxlen=_RING_MAXLEN)
+        #: Capture time of the last observation actually APPLIED, and its bbox.
+        self._last_capture: float | None = None
+        self._last_bbox: tuple[float, float, float, float] | None = None
+        #: Normalised offset magnitude of the last accepted observation, and the
+        #: local time a fresh face was last SEEN — the anti-windup guard and the
+        #: recover-to-neutral timer, respectively.
+        self._last_offset: float | None = None
+        self._last_seen_t: float | None = None
 
     # -- introspection (tests, and any future status view) ------------------ #
 
@@ -237,6 +400,25 @@ class FaceLockGaze:
         return self._pitch
 
     @property
+    def body_yaw(self) -> float:
+        """The body yaw being held for the life of the lock, in degrees."""
+        return self._body_yaw
+
+    def hold_body_yaw(self, value: object) -> float:
+        """Hold *value* on the ``body_yaw`` channel for the life of this gaze.
+
+        Called ONCE by :meth:`FaceLockDriver.lock` with the body yaw the engine
+        streamed on the tick before the lock took the channel, so the lock
+        freezes the body where it already was instead of snapping it to
+        neutral. Never raises: a missing, non-numeric or non-finite reading
+        degrades to 0.0, the neutral body yaw — the same honest default
+        :meth:`reachy.behavior.pose_feed.LastPoseHolder.as_start_pose_provider`
+        falls back to when no pose has been stashed yet.
+        """
+        self._body_yaw = _finite(value, 0.0)
+        return self._body_yaw
+
+    @property
     def target_yaw(self) -> float:
         """The head yaw offset currently being eased toward, in degrees."""
         return self._target_yaw
@@ -249,33 +431,191 @@ class FaceLockGaze:
     # -- the contribution function ------------------------------------------ #
 
     def __call__(self, t_local: float, params: dict, sense) -> Contribution:
+        now = _finite(t_local, 0.0)
+        # First, because a rewinding clock invalidates the ring this tick reads.
+        dt = self._dt(now)
         max_yaw = abs(_finite((params or {}).get("max_yaw"), MAX_YAW_DEG))
         max_pitch = abs(_finite((params or {}).get("max_pitch"), MAX_PITCH_DEG))
-        centre = _bbox_centre(getattr(sense, "face_bbox", None))
+        bbox = _normalised_bbox(getattr(sense, "face_bbox", None))
+        centre = _bbox_centre(bbox)
         age = getattr(sense, "face_age_s", None)
         if centre is not None and not _is_stale(age, params):
-            gain_yaw = _finite((params or {}).get("yaw_gain"), YAW_GAIN_DEG)
-            gain_pitch = _finite((params or {}).get("pitch_gain"), PITCH_GAIN_DEG)
-            cx, cy = centre
-            self._target_yaw = _clamp(-(cx - 0.5) * 2.0 * gain_yaw, max_yaw)
-            self._target_pitch = _clamp(-(cy - 0.5) * 2.0 * gain_pitch, max_pitch)
-        # else: hold the last target — absence is not a release.
+            self._last_seen_t = now  # a fresh face resets the recover timer
+            capture = self._capture_time(now, age)
+            if self._is_new_observation(capture, bbox):
+                fov_h = abs(_finite((params or {}).get("fov_h"), HFOV_DEG))
+                fov_v = abs(_finite((params or {}).get("fov_v"), VFOV_DEG))
+                # Clamped into 0..1 here as well as declared on the Param: the
+                # library validator is the real gate, but this leaf takes its
+                # params from a dict and a NEGATIVE damping would steer AWAY
+                # from the face — the same belt-and-braces `abs()` the clamps
+                # and the slew already apply.
+                damping = min(1.0, max(0.0, _finite((params or {}).get("damping"), DAMPING)))
+                base_yaw, base_pitch = self._base_at(capture)
+                cx, cy = centre
+                new_yaw = _clamp(base_yaw - (cx - 0.5) * fov_h * damping, max_yaw)
+                # +pitch is CHIN-DOWN (the SDK builds head poses with
+                # scipy `from_euler("xyz")` in an x-forward, z-up frame, so a
+                # positive rotation about y tips the nose down; expressions.toml
+                # says the same). A face LOW in the frame (cy > 0.5) therefore
+                # needs a POSITIVE pitch. Shipped inverted until the 2026-09-06
+                # live retest (deviation d7): the head dipped away from every
+                # face above it.
+                new_pitch = _clamp(base_pitch + (cy - 0.5) * fov_v * damping, max_pitch)
+                admitted = self._admit_target(new_yaw, new_pitch, cx, cy)
+                if admitted:
+                    self._target_yaw = new_yaw
+                    self._target_pitch = new_pitch
+                logger.info(
+                    "[SENSE stage=intent source=lock_face event=aim] "
+                    "cx=%.3f cy=%.3f admitted=%s -> yaw=%.1f pitch=%.1f",
+                    cx,
+                    cy,
+                    admitted,
+                    self._target_yaw,
+                    self._target_pitch,
+                )
+                self._last_capture = capture
+                self._last_bbox = bbox
+        else:
+            # Absence breaks the convergence chain: the next real detection
+            # starts fresh, so a face that returns is never judged against the
+            # offset from before it vanished (which would reject the first
+            # re-aim as "not converging").
+            self._last_offset = None
+            if self._recovering(now):
+                # No fresh face for RECOVER_AFTER_S: ease the gaze back toward
+                # neutral so a lock that lost its face (or a guard-frozen
+                # runaway that then lost it) stops pointing at a wall. Still
+                # LOCKED — a returning face re-aims at once; only the head
+                # relaxes.
+                ease = RECOVER_RATE_DEG_S * dt
+                self._target_yaw = _approach(self._target_yaw, 0.0, ease)
+                self._target_pitch = _approach(self._target_pitch, 0.0, ease)
+            # else: a brief absence is HELD — absence is not a release.
 
         # Re-clamp the held target too: `params` may have tightened since.
         self._target_yaw = _clamp(self._target_yaw, max_yaw)
         self._target_pitch = _clamp(self._target_pitch, max_pitch)
 
-        step = abs(_finite((params or {}).get("slew"), SLEW_DEG_S)) * self._dt(t_local)
+        step = abs(_finite((params or {}).get("slew"), SLEW_DEG_S)) * dt
         self._yaw = _clamp(_approach(self._yaw, self._target_yaw, step), max_yaw)
         self._pitch = _clamp(_approach(self._pitch, self._target_pitch, step), max_pitch)
-        return Contribution(head=_head(yaw=self._yaw, pitch=self._pitch))
+        self._ring.append((now, self._yaw, self._pitch))
+        # `body_yaw` is HELD, never planned: the lock claims the channel only to
+        # keep `feel-alive`'s slow wander from rotating the camera off the face
+        # (#183). Contributing it every tick (rather than abstaining) is what
+        # makes the claim effective — an abstaining claimant falls through to
+        # the base layer in `arbitrate()`.
+        return Contribution(head=_head(yaw=self._yaw, pitch=self._pitch), body_yaw=self._body_yaw)
+
+    # -- the capture-time machinery ----------------------------------------- #
+
+    def _capture_time(self, now: float, age: object) -> float | None:
+        """When the frame behind this bbox was taken, on the LOCAL clock.
+
+        ``None`` when the snapshot carries no ``face_age_s`` at all — an older
+        or partial provider. The caller then falls back to "the bbox changed",
+        which is weaker but never wrong in the dangerous direction.
+        """
+        if age is None:
+            return None
+        return now - max(0.0, _finite(age, 0.0))
+
+    def _is_new_observation(
+        self, capture: float | None, bbox: tuple[float, float, float, float] | None
+    ) -> bool:
+        """Whether this reading is a DETECTION we have not already acted on.
+
+        The rule, and why it is this one:
+
+        * With a capture time, a reading is new when that time ADVANCED. A bbox
+          republished between detections carries a growing ``face_age_s``, so
+          its capture time stands still — the single robust signal, and it works
+          even for a motionless face whose two consecutive detections are
+          bit-identical. The advance must clear :data:`_NEW_OBSERVATION_EPS_S`
+          UNLESS the bbox itself changed, which absorbs the microsecond skew
+          between the provider's clock and ours without making a genuinely
+          fast detector (a new bbox every tick) wait for the epsilon.
+        * With no capture time, a changed bbox is the only evidence available.
+        """
+        if capture is None:
+            return bbox != self._last_bbox
+        if self._last_capture is None:
+            return True
+        advance = capture - self._last_capture
+        if advance <= 0.0:
+            return False
+        return advance > _NEW_OBSERVATION_EPS_S or bbox != self._last_bbox
+
+    def _admit_target(self, new_yaw: float, new_pitch: float, cx: float, cy: float) -> bool:
+        """Whether to accept this observation's target — the anti-windup guard.
+
+        The FIRST observation of a lock always wins (there is nothing yet to
+        converge from). After that, an OUTWARD push — one that would drive the
+        target further from neutral on the axis that dominates the offset — is
+        accepted only while the measured offset is still SHRINKING by at least
+        :data:`CONVERGE_EPS`. A push that moves the target TOWARD neutral is
+        always fine (the face crossed centre, or moved closer in). This is what
+        stops a fixed, unreachable offset from marching the head to its clamp
+        and pinning there (live, 2026-09-06). ``_last_offset`` is updated every
+        accepted OR rejected call, so convergence is always measured against the
+        most recent reading.
+        """
+        offset = math.hypot(cx - 0.5, cy - 0.5)
+        last = self._last_offset
+        self._last_offset = offset
+        if last is None or self._last_capture is None:
+            return True  # first real observation
+        toward_neutral = (
+            abs(new_yaw) < abs(self._target_yaw) - _RECOVER_ANGLE_EPS
+            or abs(new_pitch) < abs(self._target_pitch) - _RECOVER_ANGLE_EPS
+        )
+        if toward_neutral:
+            return True
+        return offset < last - CONVERGE_EPS
+
+    def _recovering(self, now: float) -> bool:
+        """Whether enough true absence has passed to ease back toward neutral."""
+        seen = self._last_seen_t
+        return seen is not None and (now - seen) > RECOVER_AFTER_S
+
+    def _base_at(self, capture: float | None) -> tuple[float, float]:
+        """The angle this gaze was COMMANDING at *capture*, from the ring.
+
+        The most recent sample at or before the capture time — the command
+        actually in force when the frame was taken. With nothing that old
+        (a ring shorter than the detection latency, or a fresh lock) the OLDEST
+        sample is used; with an empty ring, the current command. Using the
+        CURRENT command instead would double-count every degree slewed since
+        the frame was taken, which turns a converging loop into an overshooting
+        one exactly while the head is moving.
+        """
+        if capture is None or not self._ring:
+            return (self._yaw, self._pitch)
+        for sample_t, yaw, pitch in reversed(self._ring):
+            if sample_t <= capture:
+                return (yaw, pitch)
+        _oldest_t, yaw, pitch = self._ring[0]
+        return (yaw, pitch)
 
     def _dt(self, t_local: float) -> float:
-        """Seconds since the previous call, bounded and never negative."""
+        """Seconds since the previous call, bounded and never negative.
+
+        A REWINDING clock (a restarted timeline, a test driving the same gaze
+        twice from t=0) invalidates the ring and the last capture time: every
+        remembered timestamp now sits in the future. Both are dropped, so the
+        next reading is taken as new and measured against the current command.
+        """
         now = _finite(t_local, 0.0)
         previous = self._last_t
         self._last_t = now
         if previous is None:
+            return 0.0
+        if now < previous:
+            self._ring.clear()
+            self._last_capture = None
+            self._last_bbox = None
             return 0.0
         return max(0.0, min(_MAX_DT_S, now - previous))
 
@@ -294,8 +634,12 @@ def _approach(value: float, target: float, step: float) -> float:
     return value + math.copysign(step, delta)
 
 
-def _bbox_centre(bbox: object) -> tuple[float, float] | None:
-    """The ``(cx, cy)`` centre of a normalised ``(x, y, w, h)``, or ``None``."""
+def _normalised_bbox(bbox: object) -> tuple[float, float, float, float] | None:
+    """A hostile ``face_bbox`` as a finite 4-tuple of floats, or ``None``.
+
+    A tuple (never the caller's list) so it can be compared and remembered as
+    the "same detection" key without aliasing the snapshot.
+    """
     if not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
         return None
     try:
@@ -304,6 +648,15 @@ def _bbox_centre(bbox: object) -> tuple[float, float] | None:
         return None
     if not all(math.isfinite(v) for v in (x, y, w, h)):
         return None
+    return (x, y, w, h)
+
+
+def _bbox_centre(bbox: object) -> tuple[float, float] | None:
+    """The ``(cx, cy)`` centre of a normalised ``(x, y, w, h)``, or ``None``."""
+    box = _normalised_bbox(bbox)
+    if box is None:
+        return None
+    x, y, w, h = box
     return (x + w / 2.0, y + h / 2.0)
 
 
@@ -323,6 +676,21 @@ def make_face_lock() -> Callable[[float, dict, object], Contribution]:
     state. Construct :class:`FaceLockGaze` directly in a test.
     """
     return FaceLockGaze()
+
+
+def _lock_channels() -> list[str]:
+    """The ``face-lock`` library entry's claimed channels, sorted; ``["head"]`` if unknown.
+
+    Imported lazily (the library imports this module for the entry's
+    ``make_fn``), and fail-open to the head alone so a feed line is never lost
+    to an import-order accident.
+    """
+    try:
+        from reachy.behavior import library as lib
+
+        return sorted(lib.get(FACE_LOCK_BEHAVIOR).channels)
+    except Exception:  # pragma: no cover - defensive: the feed line still lands
+        return ["head"]
 
 
 # --------------------------------------------------------------------------- #
@@ -608,7 +976,7 @@ class FaceLockDriver:
             # record that undoes it is the lock itself, released by name.
             lifetime=Lifetime(looping=True, duration=None),
             params=dict(params),
-            fn=entry.build_fn(),
+            fn=self._build_gaze(entry, ctx),
             wants_sense=entry.wants_sense,
         )
         result = ctx.admit(beh)
@@ -667,6 +1035,31 @@ class FaceLockDriver:
         self._emit(ctx, EVENT_LOCK_RELEASED, {"id": behavior_id, "reason": reason})
         return behavior_id, restored
 
+    def _build_gaze(self, entry, ctx):
+        """One fresh gaze, holding the body yaw the engine streamed most recently.
+
+        ``ctx.pose`` is the complete pose the engine composed and sent THIS tick
+        — populated after streaming, before the seam runs (see
+        :class:`reachy.behavior.engine.TickContext`) — so at lock time it is the
+        body yaw commanded on the tick BEFORE the lock takes the channel. That
+        is the same live-pose seam :mod:`reachy.behavior.pose_feed` adapts for
+        ``GotoLane``'s start pose; reading it straight off ``ctx`` needs no
+        composition change and no second stash.
+
+        A ctx with no ``pose`` (the duck-typed ctx a test or a non-engine caller
+        passes, or a lock taken before any tick composed one) holds 0.0 — the
+        neutral body yaw, and the same fallback ``as_start_pose_provider``
+        makes. Never raises.
+        """
+        fn = entry.build_fn()
+        hold = getattr(fn, "hold_body_yaw", None)
+        if not callable(hold):  # a foreign/monkeypatched factory — nothing to hold
+            return fn
+        pose = getattr(ctx, "pose", None)
+        body_yaw = pose.get("body_yaw") if isinstance(pose, dict) else None
+        hold(body_yaw)
+        return fn
+
     def _face_is_lockable(self, ctx) -> bool:
         sense = getattr(ctx, "sense", None)
         if _bbox_centre(getattr(sense, "face_bbox", None)) is None:
@@ -710,7 +1103,10 @@ class FaceLockDriver:
                 "ts": getattr(ctx, "now", 0.0),
                 "tick": getattr(ctx, "tick", 0),
                 "behavior": FACE_LOCK_BEHAVIOR,
-                "channels": ["head"],
+                # The channels the lock CLAIMS (#183: head + body_yaw, so the
+                # base layer keeps the antennas) — read from the library entry,
+                # never restated, so the feed cannot under-report the claim.
+                "channels": _lock_channels(),
                 "detail": dict(detail),
             }
         )
@@ -727,11 +1123,13 @@ def _reject_unknown_fields(payload: dict, *, kind: str = LOCK_FACE) -> None:
 
 
 __all__ = [
+    "DAMPING",
     "EVENT_FACE_LOST",
     "EVENT_LOCK_RELEASED",
     "FACE_LOCK_BEHAVIOR",
     "FACE_LOST_ACTION",
     "FACE_LOST_AFTER_S",
+    "HFOV_DEG",
     "LOCK_FACE",
     "LOCK_INHIBITS",
     "LOCK_RELEASED_ACTION",
@@ -747,6 +1145,7 @@ __all__ = [
     "REASON_REQUESTED",
     "RELEASE_FACE",
     "SLEW_DEG_S",
+    "VFOV_DEG",
     "YAW_GAIN_DEG",
     "FaceLockDriver",
     "FaceLockGaze",

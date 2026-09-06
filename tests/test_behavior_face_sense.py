@@ -1225,3 +1225,435 @@ def test_behavior_command_construction_site_passes_both_knobs() -> None:
     source = inspect.getsource(behavior_module)
     assert "detect_interval=detect_interval_from_env()" in source
     assert "detect_max_width=detect_max_width_from_env()" in source
+
+
+# --------------------------------------------------------------------------- #
+# t4 #181: FaceObservation.captured_at — the age anchor is capture time,      #
+# not publish/drain time                                                      #
+# --------------------------------------------------------------------------- #
+
+
+class _DetectionWithBBox:
+    """A detection carrying a real bbox, so the position leg is exercised too."""
+
+    embedding = [0.1, 0.2]
+    bbox_norm = (0.1, 0.1, 0.3, 0.3)
+
+
+def test_captured_at_is_stamped_before_detection_and_ages_the_snapshot() -> None:
+    """t4 #181 acceptance (a): face_age_s == now - captured_at, not now - drain time.
+
+    The fake engine's ``detect`` advances a shared clock by 300 ms to simulate
+    a slow CM4 detection — the exact gap the honesty condition (h32) names.
+    ``_worker_tick`` is driven synchronously (``start_worker=False``), so there
+    is no thread race: the clock only moves where this test moves it.
+    """
+    clock_time = [0.0]
+
+    class _SlowEngine:
+        def detect(self, frame):
+            clock_time[0] += 0.3  # simulated 300 ms detection cost
+            return _DetectionWithBBox()
+
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_SlowEngine(),
+        store=_FakeStore(match=_FakeMatch("ada")),
+        detect_interval=0.0,
+        clock=lambda: clock_time[0],
+        start_worker=False,
+    )
+    # tick at t=0.0: the tick thread publishes the frame for the worker to take.
+    driver(_Ctx(0.0))
+    assert clock_time[0] == 0.0
+
+    driver._worker_tick()  # the heavy leg — clock advances mid-detection
+    assert clock_time[0] == pytest.approx(0.3)
+
+    # tick at t=0.3: the tick thread drains the worker's result and latches it.
+    driver(_Ctx(0.3))
+    # captured_at was stamped at 0.0 (before detection), so the anchor is 0.0
+    # and the age at this drain is 0.3 — never 0.0, which is what anchoring on
+    # the drain/publish time would have produced.
+    assert driver._face_bbox_at == pytest.approx(0.0)
+    assert driver.peek_face_age_s() == pytest.approx(0.3)
+
+    # a later tick with no new detection keeps ageing from the SAME anchor.
+    driver(_Ctx(0.5))
+    assert driver.peek_face_age_s() == pytest.approx(0.5)
+
+
+def test_face_observation_without_captured_at_falls_back_to_publish_time() -> None:
+    """t4 #181 acceptance (b): an older producer/test fake with no ``captured_at``
+    still works — the age anchors on the drain (publish) tick, exactly as before.
+    """
+    driver = FaceSenseDriver(media=_FakeMedia([_frame()]), start_worker=False)
+    driver(_Ctx(0.0))
+    driver._output.publish(FS.FaceObservation(name="ada", bbox=(0.1, 0.1, 0.2, 0.2)))
+
+    driver(_Ctx(1.0))  # drain tick — no captured_at on the observation
+    assert driver._face_bbox_at == pytest.approx(1.0)
+    assert driver.peek_face_age_s() == pytest.approx(0.0)
+
+    driver(_Ctx(1.2))
+    assert driver.peek_face_age_s() == pytest.approx(0.2)
+
+
+def test_bbox_ttl_expiry_anchors_on_captured_at_not_drain_time() -> None:
+    """t4 #181 acceptance (c): the bbox TTL expiry uses the captured_at anchor.
+
+    Without the fix, the anchor would be the 0.5 s drain tick and the position
+    would still be held at t=1.4 (only 0.9 s past that anchor); anchored on the
+    true capture time (0.0), it is 1.4 s old — past a 1.0 s TTL — and expires.
+    """
+    # The driver's clock and the engine's ``ctx.now`` are SEPARATE time bases
+    # by contract: the driver measures the detection's latency on its own clock
+    # (the one ``captured_at`` was read on) and applies it to ``ctx.now``. The
+    # test drives both from one variable so the latency is exactly what is set.
+    clock = [0.0]
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        face_bbox_ttl_s=1.0,
+        start_worker=False,
+        clock=lambda: clock[0],
+    )
+    driver(_Ctx(0.0))
+    driver._output.publish(
+        FS.FaceObservation(name="ada", bbox=(0.1, 0.1, 0.2, 0.2), captured_at=0.0)
+    )
+
+    clock[0] = 0.5
+    driver(_Ctx(0.5))  # drain tick, 0.5 s of latency after the real capture time
+    assert driver.peek_face_bbox() is not None
+    assert driver.peek_face_age_s() == pytest.approx(0.5)
+
+    clock[0] = 1.4
+    driver(_Ctx(1.4))  # now - anchor(0.0) = 1.4 > ttl(1.0): expired
+    assert driver.peek_face_bbox() is None
+    assert driver.peek_face_age_s() is None
+
+
+def test_face_observation_captured_at_defaults_to_none() -> None:
+    """The dataclass default keeps every existing bare construction working."""
+    assert FS.FaceObservation(name="ada").captured_at is None
+    assert FS.FaceObservation(name="ada", bbox=(0.0, 0.0, 0.1, 0.1)).captured_at is None
+
+
+def test_worker_tick_stamps_captured_at_on_the_published_observation() -> None:
+    """A direct check of the publish contract: captured_at is the pre-detect clock."""
+    clock_time = [5.0]
+
+    class _Engine:
+        def detect(self, frame):
+            clock_time[0] += 0.05
+            return _DetectionWithBBox()
+
+    published: list = []
+
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_Engine(),
+        store=_FakeStore(match=_FakeMatch("ada")),
+        detect_interval=0.0,
+        clock=lambda: clock_time[0],
+        start_worker=False,
+    )
+    driver._output.publish = lambda value: published.append(value) or None
+
+    driver(_Ctx(0.0))
+    driver._worker_tick()
+
+    assert len(published) == 1
+    observation = published[0]
+    assert isinstance(observation, FS.FaceObservation)
+    assert observation.captured_at == pytest.approx(5.0)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #179 — still-only detection: the self-motion gate on the worker        #
+# --------------------------------------------------------------------------- #
+#
+# On the CM4 a detection submitted mid-slew costs the tick rate (50 -> 7 Hz)
+# AND produces a blurred bbox in a head frame that has already moved on. The
+# gate is the same shape as ``rms_sense``'s moving floor: an injected
+# ``SelfMovingProvider`` peek, one senselog line per transition (never per
+# tick), and a raising/missing peek that degrades to "not moving".
+
+
+class _GateDriver:
+    """A recognizer-ready driver whose detections are counted, on a fake clock."""
+
+    def __init__(self, clock_box, **kwargs):
+        self.detections = 0
+        engine = _FakeEngine()
+        self.driver = FaceSenseDriver(
+            media=_FakeMedia([_frame()]),
+            engine=engine,
+            store=_FakeStore(match=_FakeMatch("ada")),
+            detect_interval=0.5,
+            frame_interval_s=0.0,
+            clock=lambda: clock_box[0],
+            start_worker=False,
+            **kwargs,
+        )
+        self._engine = engine
+
+    def worker_tick(self) -> None:
+        before = len(self._engine.frames)
+        self.driver._worker_tick()
+        if len(self._engine.frames) > before:
+            self.detections += 1
+
+
+def _gate_lines(caplog) -> list:
+    """Every senselog line this module's self-motion gate emitted."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "stage=gate source=face" in record.getMessage()
+    ]
+
+
+def _run_gate(gate, clock_box, *, seconds: float, step: float = 0.1, ctx_start: float = 0.0):
+    """Advance the fake clock, publishing a frame and running the worker each step."""
+    ticks = int(round(seconds / step))
+    for i in range(ticks):
+        clock_box[0] = round(clock_box[0] + step, 6)
+        gate.driver(_Ctx(round(ctx_start + (i + 1) * step, 6)))
+        gate.worker_tick()
+
+
+def test_a_moving_head_submits_zero_detections() -> None:
+    """Criterion (a), first half: 2 s of commanded motion -> nothing detected."""
+    clock = [0.0]
+    gate = _GateDriver(clock, moving=lambda: True)
+    _run_gate(gate, clock, seconds=2.0)
+    assert gate.detections == 0
+
+
+def test_detection_resumes_once_the_settle_has_elapsed_after_motion_stops() -> None:
+    """Criterion (a), second half: within ``still_settle_s`` of stillness it detects again."""
+    clock = [0.0]
+    moving = {"v": True}
+    gate = _GateDriver(clock, moving=lambda: moving["v"], still_settle_s=0.5)
+    _run_gate(gate, clock, seconds=2.0)
+    assert gate.detections == 0
+
+    moving["v"] = False
+    # Inside the settle: still nothing.
+    _run_gate(gate, clock, seconds=0.4, ctx_start=2.0)
+    assert gate.detections == 0
+    # Past the settle: a detection lands.
+    _run_gate(gate, clock, seconds=0.4, ctx_start=2.4)
+    assert gate.detections >= 1
+
+
+def test_a_held_lock_degrades_the_cadence_instead_of_silencing_it() -> None:
+    """Criterion (b): while a lock is held, motion slows detection — it never stops it."""
+    clock = [0.0]
+    gate = _GateDriver(
+        clock,
+        moving=lambda: True,
+        lock_held=lambda: True,
+        held_detect_interval=1.5,
+    )
+    _run_gate(gate, clock, seconds=6.0)
+    # 6 s at a 1.5 s held cadence: a handful, not zero and not the free-running rate.
+    assert 3 <= gate.detections <= 5
+
+
+def test_the_gate_emits_exactly_one_open_and_one_close_line_per_motion_episode(caplog) -> None:
+    """Criterion (e): transitions are observable; ticks are not."""
+    clock = [0.0]
+    moving = {"v": False}
+    gate = _GateDriver(clock, moving=lambda: moving["v"], still_settle_s=0.5)
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        _run_gate(gate, clock, seconds=0.5)
+        moving["v"] = True
+        _run_gate(gate, clock, seconds=2.0, ctx_start=0.5)
+        moving["v"] = False
+        _run_gate(gate, clock, seconds=1.5, ctx_start=2.5)
+
+    lines = _gate_lines(caplog)
+    assert len(lines) == 2, lines
+    assert "opened" in lines[0] and "self-moving" in lines[0]
+    assert "held=" in lines[0]
+    assert "closed" in lines[1]
+
+
+def test_a_raising_moving_peek_degrades_to_not_moving() -> None:
+    """Criterion (f): a broken peek is never a crash and never a silenced sense."""
+
+    def _boom() -> bool:
+        raise RuntimeError("no self-motion driver")
+
+    clock = [0.0]
+    gate = _GateDriver(clock, moving=_boom)
+    _run_gate(gate, clock, seconds=2.0)
+    assert gate.detections >= 1
+
+
+def test_without_a_moving_peek_the_cadence_is_exactly_todays() -> None:
+    """No injected provider means no gate at all — the pre-#179 behaviour."""
+    clock = [0.0]
+    gate = _GateDriver(clock)
+    _run_gate(gate, clock, seconds=2.0)
+    assert gate.detections >= 1
+
+
+# --------------------------------------------------------------------------- #
+# Issue #179 / #176 — the ``on_stale`` callback seam                          #
+# --------------------------------------------------------------------------- #
+#
+# ``_check_stream_staleness`` stays DETECT ONLY here: it calls an injected
+# callback and nothing else. Composition (a later task) binds it to
+# ``HeldMediaClient.drop``; this module imports neither.
+
+
+def test_on_stale_fires_once_per_silent_episode() -> None:
+    calls: list = []
+    media = _FakeMedia([_frame(), None, _frame(), None])
+    driver = FaceSenseDriver(
+        media=media,
+        start_worker=False,
+        frame_interval_s=0.0,
+        stream_stale_s=1.0,
+        on_stale=calls.append,
+    )
+    driver(_Ctx(0.0))  # a frame anchors `_last_frame_at`
+    driver(_Ctx(2.0))  # silent past the window -> episode 1
+    driver(_Ctx(2.5))  # still silent -> no second call
+    assert calls == [FS.REASON_STREAM_ENDED]
+
+    driver(_Ctx(2.6))  # frames resume: the latch re-arms
+    driver(_Ctx(5.0))  # silent again -> episode 2
+    assert calls == [FS.REASON_STREAM_ENDED, FS.REASON_STREAM_ENDED]
+
+
+def test_on_stale_never_fires_when_no_frame_ever_arrived() -> None:
+    calls: list = []
+    driver = FaceSenseDriver(
+        media=_FakeMedia([None]),
+        start_worker=False,
+        frame_interval_s=0.0,
+        stream_stale_s=1.0,
+        on_stale=calls.append,
+    )
+    for now in (0.0, 1.0, 5.0, 50.0):
+        driver(_Ctx(now))
+    assert calls == []
+
+
+def test_on_stale_never_fires_when_the_camera_reports_unavailable() -> None:
+    """A died pipeline still LOGS the drop; it must not ask for a re-acquire."""
+    calls: list = []
+    media = _FakeMedia([_frame()])
+    driver = FaceSenseDriver(
+        media=media,
+        start_worker=False,
+        frame_interval_s=0.0,
+        stream_stale_s=1.0,
+        on_stale=calls.append,
+    )
+    driver(_Ctx(0.0))
+    media.camera_available = False
+    for now in (2.0, 5.0, 20.0):
+        driver(_Ctx(now))
+    assert calls == []
+
+
+def test_a_raising_on_stale_is_contained_and_logged_once(caplog) -> None:
+    def _boom(reason: str) -> None:
+        raise RuntimeError("holder is gone")
+
+    media = _FakeMedia([_frame(), None, _frame(), None])
+    driver = FaceSenseDriver(
+        media=media,
+        start_worker=False,
+        frame_interval_s=0.0,
+        stream_stale_s=1.0,
+        on_stale=_boom,
+    )
+    with caplog.at_level(logging.WARNING, logger="reachy.behavior.face_sense"):
+        driver(_Ctx(0.0))
+        driver(_Ctx(2.0))
+        driver(_Ctx(2.6))
+        driver(_Ctx(5.0))
+
+    assert driver.peek_frame_available() is False  # no crash reached the tick body
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+
+def test_without_a_callback_the_staleness_path_is_exactly_todays(caplog) -> None:
+    media = _FakeMedia([_frame(), None])
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        driver(_Ctx(0.0))
+        for now in (2.0, 5.0):
+            driver(_Ctx(now))
+    assert len(_drop_messages(caplog, FS.REASON_STREAM_ENDED)) == 1
+
+
+def test_the_stale_latch_re_arms_when_the_media_client_is_a_new_generation() -> None:
+    """Live on the Wireless (2026-09-06): after a drop and a re-warm the NEW client
+    died before its first frame, and the once-per-episode latch never re-armed —
+    the runtime sat on a connected-but-dead client. A new generation is a new
+    episode: the same stale timestamp trips the latch again."""
+    media = _FakeMedia([_frame(), None, None, None, None, None])
+    media.generation = 1
+    fired: list[str] = []
+    driver = FaceSenseDriver(
+        media=media,
+        stream_stale_s=1.0,
+        frame_interval_s=0.0,
+        start_worker=False,
+        on_stale=fired.append,
+    )
+    driver(_Ctx(0.0))  # one usable frame, then the fake is empty
+    driver(_Ctx(1.5))
+    assert fired == [FS.REASON_STREAM_ENDED]
+    driver(_Ctx(3.0))
+    assert fired == [FS.REASON_STREAM_ENDED], "same generation: once per episode"
+    media.generation = 2  # the keeper re-warmed a fresh client; still no frame
+    driver(_Ctx(3.1))
+    driver(_Ctx(4.6))
+    assert fired == [FS.REASON_STREAM_ENDED, FS.REASON_STREAM_ENDED]
+
+
+def test_a_media_client_without_a_generation_keeps_the_once_per_episode_latch() -> None:
+    media = _FakeMedia([_frame(), None, None, None])
+    fired: list[str] = []
+    driver = FaceSenseDriver(
+        media=media,
+        stream_stale_s=1.0,
+        frame_interval_s=0.0,
+        start_worker=False,
+        on_stale=fired.append,
+    )
+    driver(_Ctx(0.0))
+    driver(_Ctx(1.5))
+    driver(_Ctx(3.0))
+    assert fired == [FS.REASON_STREAM_ENDED]
+
+
+# --------------------------------------------------------------------------- #
+# score_threshold_from_env (#181 live follow-up)                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_score_threshold_from_env_defaults_when_unset() -> None:
+    assert FS.score_threshold_from_env(None) == FS.DEFAULT_SCORE_THRESHOLD
+    assert FS.score_threshold_from_env("") == FS.DEFAULT_SCORE_THRESHOLD
+
+
+@pytest.mark.parametrize("raw,expected", [("0.4", 0.4), ("0.55", 0.55), ("1.0", 1.0)])
+def test_score_threshold_from_env_parses_a_valid_float(raw, expected) -> None:
+    assert FS.score_threshold_from_env(raw) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw", ["nope", "0", "-0.2", "1.5", "nan", "inf"])
+def test_score_threshold_from_env_falls_back_on_out_of_range_or_garbage(raw) -> None:
+    assert FS.score_threshold_from_env(raw) == FS.DEFAULT_SCORE_THRESHOLD
