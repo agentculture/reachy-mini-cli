@@ -1409,6 +1409,81 @@ throwaway per-frame path); a `frames_ok == 0` result prints a targeted
 hint (daemon running? SDK/daemon versions aligned? `connection_mode
 localhost_only`?).
 
+#### The WirePlumber boot race (Wireless, imx708)
+
+On the Wireless unit the camera path above can lose the race at boot: the
+user-session **PipeWire**/**WirePlumber** stack (WirePlumber 0.5.8 +
+`libspa-0.2-libcamera` 1.4.2, both from the OS image) also starts at boot and
+its `libcamera`/`v4l2` monitors enumerate the same `imx708` pipeline the
+daemon needs. Whichever side gets there first keeps it — this is a **boot
+race, not a regression**. When WirePlumber wins, `fuser /dev/video0` shows
+`pipewire`/`wireplumber` holding `/dev/media0`, `/dev/media1`,
+`/dev/video0`, `/dev/video1` and `/dev/video13`-`16`, and the daemon's
+libcamera source fails at acquisition with:
+
+```text
+GStreamer error: state change failed and some element failed to post a proper error
+```
+
+The runtime's receive side then simply has no video track — `frame_available`
+stays false with nothing louder in the daemon log.
+
+**The fix** is a WirePlumber drop-in that disables its camera monitors so it
+never contests the device:
+
+```text
+~/.config/wireplumber/wireplumber.conf.d/99-reachy-no-camera.conf
+```
+
+```conf
+wireplumber.profiles.main = {
+  monitor.libcamera = disabled
+  monitor.v4l2 = disabled
+}
+```
+
+Apply it, then restart in this order — WirePlumber first, then whichever
+process actually opens the camera:
+
+```bash
+systemctl --user restart wireplumber
+systemctl --user restart reachy-runtime   # re-acquire media
+# if the camera is opened once at daemon start, also:
+systemctl --user restart reachy-daemon
+```
+
+After the fix, the daemon's own log names the camera and its negotiated
+stream, e.g. `Adding camera '/base/soc/i2c0mux/i2c@0/imx708@1a'` and
+`configuring streams: (0) 1280x720-YUYV/Rec709`.
+
+**Side effect — this is session-wide, not device-scoped.** The drop-in
+disables the `libcamera` and `v4l2` monitors for the **whole user session**,
+so every camera disappears from that session's PipeWire graph, not only the
+one the daemon wants: a browser or any other PipeWire-based tool running on
+the same box loses camera access too. Treat this as a per-box operator
+change, not something to apply blindly on a shared or multi-purpose machine.
+**Reversal:** delete the drop-in file and `systemctl --user restart
+wireplumber`.
+
+A second, unrelated cause produces the same symptom: a **foreign SDK client**
+connecting to the daemon's `/ws/sdk` with a media profile releases the
+daemon's media hardware on every connection (the daemon logs `Releasing media
+hardware for direct access... Media hardware released`), which kills the
+runtime's receive pipeline with `Internal data stream error` / `End-of-stream`.
+If frames stop while `state.json` still reports availability, look for such a
+client first and stop it.
+
+**Recovery is usually just the runtime, not the daemon.** When frames go
+silent with no configuration change (the foreign-client case above, or a
+transient pipeline drop), `systemctl --user restart reachy-runtime` alone
+brought frames back within 35 s on the Wireless — a daemon restart was not
+needed.
+
+> A durable fix belongs upstream of this repo — in the OS image (ship the
+> drop-in, or a monitor priority that always favors the daemon), or in a
+> future `service` drop-in writer here. Neither exists today; this section
+> documents the manual operator repair.
+
 ### The forge loop — the robot writes its own reaction seams
 
 An attached `agent attach` client can hand a natural-language goal to a coder
