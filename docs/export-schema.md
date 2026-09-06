@@ -307,7 +307,9 @@ triggered it.
 
 Published whenever the engine's perception snapshot changes (always once, on
 the first tick, to establish a baseline) — not every tick, so a steady 50 Hz
-loop does not flood the feed with an identical reading every 20 ms.
+loop does not flood the feed with an identical reading every 20 ms. A `sense`
+line implies at least one emitted field changed since the previous `sense`
+line — a clock-only change never by itself produces a line.
 
 | Key                | Type            | Description                                        |
 |--------------------|-----------------|------------------------------------------------------|

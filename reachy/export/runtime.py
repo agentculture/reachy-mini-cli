@@ -570,43 +570,77 @@ class RuntimeConsumer:
 # TickBus driver — publishes a "sense" event when perception changes
 # ---------------------------------------------------------------------------
 
+#: pat_state keys that are pure clock readings — nulled in the COMPARISON
+#: view only, never in the emitted payload. See SenseSnapshotDriver's
+#: docstring: pat_sense.py rewrites both to "now" on several paths with no
+#: touch-phase transition, so an un-scrubbed compare floods the feed.
+_PAT_STATE_CLOCK_KEYS = ("phase_started_at", "last_press_at")
+
+
+def _scrub_sense_payload(payload: dict) -> dict:
+    """A comparison-only view of *payload* with clock-only fields nulled.
+
+    Never used for the emitted event itself — only to decide whether this
+    tick's reading differs from the last one actually published.
+    """
+    scrub = dict(payload)
+    pat_state = scrub.get("pat_state")
+    if isinstance(pat_state, dict):
+        scrub["pat_state"] = {
+            k: (None if k in _PAT_STATE_CLOCK_KEYS else v) for k, v in pat_state.items()
+        }
+    return scrub
+
 
 class SenseSnapshotDriver:
-    """Publish a ``"sense"`` runtime event whenever ``ctx.sense`` changes.
+    """Publish a ``"sense"`` runtime event whenever the emitted PAYLOAD changes.
 
     Usable directly as a :class:`reachy.behavior.rule_engine.TickBus` driver
-    (``driver(ctx) -> None``). Compares each tick's ``ctx.sense`` against the
-    last-published snapshot (frozen-dataclass equality) and emits only on a
-    change — always on the first tick, to establish a baseline — so a 50 Hz loop
-    does not flood the feed with an identical reading every 20 ms. Never raises:
-    ``ctx.sense`` is a plain dataclass read, and ``ctx.emit`` is the engine's own
-    fault-isolated fan-out.
+    (``driver(ctx) -> None``). Compares each tick's would-be payload (minus
+    ``ts``/``tick``) against the last EMITTED payload and emits only on a
+    genuine difference — always on the first tick, to establish a baseline —
+    so a 50 Hz loop does not flood the feed with an identical reading every
+    20 ms.
+
+    Comparing the raw ``Sense``/``PatState`` dataclasses (frozen-dataclass
+    equality) is deliberately NOT used any more: ``Sense.face_age_s`` and
+    ``doa_age_s`` advance every tick while a face or a DoA reading is held —
+    neither reaches the payload at all — and ``pat_sense.py`` rewrites
+    ``PatState.phase_started_at``/``last_press_at`` to ``now`` on several
+    paths with no touch-phase transition. Either alone defeats a raw-equality
+    compare and floods the feed at tick rate. The fix builds the payload
+    that would be emitted and compares a SCRUBBED view of it (``ts``/``tick``
+    excluded, and ``pat_state``'s own two clock anchors nulled) against the
+    same scrub of the last EMITTED payload — so a line is published only when
+    at least one field a consumer can see has genuinely changed. The emitted
+    payload itself is never scrubbed: ``pat_state.phase_started_at`` and
+    ``last_press_at`` still reach the wire on every emission, unchanged shape.
+    Never raises: ``ctx.sense`` is a plain dataclass read, and ``ctx.emit`` is
+    the engine's own fault-isolated fan-out.
     """
 
     def __init__(self) -> None:
-        self._last = None
+        self._last_scrub: dict | None = None
         self._started = False
 
     def __call__(self, ctx) -> None:
         sense = ctx.sense
-        if self._started and sense == self._last:
-            return
-        self._started = True
-        self._last = sense
         pat = getattr(sense, "pat_event", None)
         pat_state = _pat_state_payload(getattr(sense, "pat_state", None))
-        ctx.emit(
-            {
-                "type": _RAW_TYPE_SENSE,
-                "doa": getattr(sense, "doa_angle", None),
-                "speech": bool(getattr(sense, "speech_detected", False)),
-                "rms": getattr(sense, "rms", None),
-                "pat": list(pat) if pat is not None else None,
-                "pat_state": pat_state,
-                "face": getattr(sense, "face", None),
-                "frame_available": bool(getattr(sense, "frame_available", False)),
-                "name_mentioned": bool(getattr(sense, "name_mentioned", False)),
-                "ts": ctx.now,
-                "tick": ctx.tick,
-            }
-        )
+        payload = {
+            "type": _RAW_TYPE_SENSE,
+            "doa": getattr(sense, "doa_angle", None),
+            "speech": bool(getattr(sense, "speech_detected", False)),
+            "rms": getattr(sense, "rms", None),
+            "pat": list(pat) if pat is not None else None,
+            "pat_state": pat_state,
+            "face": getattr(sense, "face", None),
+            "frame_available": bool(getattr(sense, "frame_available", False)),
+            "name_mentioned": bool(getattr(sense, "name_mentioned", False)),
+        }
+        scrub = _scrub_sense_payload(payload)
+        if self._started and scrub == self._last_scrub:
+            return
+        self._started = True
+        self._last_scrub = scrub
+        ctx.emit({**payload, "ts": ctx.now, "tick": ctx.tick})
