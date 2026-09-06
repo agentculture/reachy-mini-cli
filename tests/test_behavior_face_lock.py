@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from reachy.behavior import face_lock as face_lock_mod
+from reachy.behavior import intents as intents_mod
 from reachy.behavior import library as behavior_library
 from reachy.behavior.control import KindRegistry
 from reachy.behavior.face_lock import (
@@ -50,6 +51,7 @@ from reachy.behavior.face_lock import (
 )
 from reachy.behavior.intents import SET_INHIBITION, IntentDriver
 from reachy.behavior.sense import EMPTY_SENSE, Sense
+from reachy.cli._errors import CliError
 
 # --------------------------------------------------------------------------- #
 # Fakes / harness                                                             #
@@ -171,8 +173,18 @@ def test_the_locked_behavior_maps_the_bbox_centre_to_yaw_and_pitch_every_tick() 
     assert fn.target_pitch > 0.0
     assert fn.pitch == pytest.approx(fn.target_pitch, abs=1e-6)
 
-    # A centred face commands neither.
-    heads = _run(fn, params, _face(cx=0.5, cy=0.5), 200)
+    # A CENTRED face asks for no correction, so the aim HOLDS where it is —
+    # incremental, not absolute: "the face is dead centre" is not a request to
+    # return to neutral, it is confirmation that the current angle is right.
+    before = (fn.target_yaw, fn.target_pitch)
+    heads = _run(fn, params, _face(cx=0.5, cy=0.5), 200, start=100.0)
+    assert (fn.target_yaw, fn.target_pitch) == pytest.approx(before, abs=1e-6)
+    assert heads[-1]["yaw"] == pytest.approx(before[0], abs=1e-6)
+    assert heads[-1]["pitch"] == pytest.approx(before[1], abs=1e-6)
+
+    # And from neutral, a centred face commands nothing at all.
+    fresh = make_face_lock()
+    heads = _run(fresh, params, _face(cx=0.5, cy=0.5), 200)
     assert heads[-1]["yaw"] == pytest.approx(0.0, abs=1e-6)
     assert heads[-1]["pitch"] == pytest.approx(0.0, abs=1e-6)
 
@@ -403,7 +415,7 @@ def test_release_then_lock_again_works() -> None:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("overrides", [{}, {"yaw_gain": 400.0, "pitch_gain": 400.0}])
+@pytest.mark.parametrize("overrides", [{}, {"fov_h": 360.0, "fov_v": 360.0, "damping": 1.0}])
 @pytest.mark.parametrize("corner", [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)])
 def test_a_face_at_the_frame_edge_never_commands_beyond_the_clamp(overrides, corner) -> None:
     fn = make_face_lock()
@@ -509,3 +521,337 @@ def test_the_runtime_seam_wires_both_kinds() -> None:
     source = inspect.getsource(behavior_cmd)
     assert "FaceLockDriver" in source
     assert "inhibition_observer" in source
+
+
+# --------------------------------------------------------------------------- #
+# 6. the INCREMENTAL aim (issue #181, spec c2/c3/c5, honesty h2/h3/h4)         #
+# --------------------------------------------------------------------------- #
+#
+# The old aim was ABSOLUTE — `-(cx-0.5)*2*gain` — i.e. a proportional loop of
+# gain `2*gain/FOV` (~0.31 on the Wireless camera), so the head settled a third
+# of the way to the face and stayed there. These tests drive the gaze against a
+# SIMULATED PINHOLE CAMERA that reacts to the commanded angle, which is the only
+# way an open-loop settle and a closed-loop convergence can be told apart.
+
+
+_HFOV = 87.0
+_VFOV = 57.0
+
+
+def _seen_bbox(
+    bearing_yaw: float,
+    bearing_pitch: float,
+    yaw: float,
+    pitch: float,
+    *,
+    size: float = 0.2,
+) -> tuple[float, float, float, float]:
+    """Where a face at ``bearing_*`` lands in a frame taken while commanding ``yaw``.
+
+    A pinhole camera bolted to the head, small-angle-linearised across the frame
+    (exact enough for a convergence property, and the same linearisation the
+    lock's own inverse makes). The repo's signs: ``+yaw`` is LEFT, so a face to
+    the left of the camera axis lands at a SMALLER x; ``+pitch`` is up, so a face
+    above the axis lands at a SMALLER y.
+    """
+    cx = 0.5 - (bearing_yaw - yaw) / _HFOV
+    cy = 0.5 - (bearing_pitch - pitch) / _VFOV
+    return (cx - size / 2.0, cy - size / 2.0, size, size)
+
+
+def _track(
+    fn,
+    params: dict,
+    *,
+    bearing_yaw: float,
+    bearing_pitch: float = 0.0,
+    detections: tuple[float, ...],
+    latency_s: float = 0.0,
+    duration_s: float,
+    dt: float = 0.02,
+) -> list[tuple[float, float, float]]:
+    """Run the gaze against the simulated camera; return ``(t, yaw, pitch)`` each tick.
+
+    A detection is PUBLISHED at each time in *detections* and republished (with a
+    growing ``face_age_s``, exactly as :mod:`reachy.behavior.face_sense` holds a
+    bbox for its TTL) on every tick until the next one. ``latency_s`` is the
+    detection latency: the frame behind a detection published at ``t`` was
+    captured at ``t - latency_s``, and ``face_age_s`` reports the age since
+    CAPTURE, which is what the ring lookup keys on.
+    """
+    out: list[tuple[float, float, float]] = []
+    published: tuple[float, tuple[float, float, float, float]] | None = None
+    pending = list(detections)
+    yaw, pitch = 0.0, 0.0
+    capture_pose: dict[float, tuple[float, float]] = {}
+    ticks = int(round(duration_s / dt)) + 1
+    for i in range(ticks):
+        t = i * dt
+        # Remember the pose at every instant, so a detection can be built from
+        # the pose that was actually commanded when its frame was captured.
+        capture_pose[round(t, 6)] = (yaw, pitch)
+        while pending and pending[0] <= t + 1e-9:
+            publish_at = pending.pop(0)
+            captured_at = publish_at - latency_s
+            base = capture_pose.get(round(max(0.0, captured_at), 6), (yaw, pitch))
+            published = (
+                captured_at,
+                _seen_bbox(bearing_yaw, bearing_pitch, base[0], base[1]),
+            )
+        if published is None:
+            sense = EMPTY_SENSE
+        else:
+            captured_at, bbox = published
+            sense = Sense(face_bbox=bbox, face_age_s=max(0.0, t - captured_at))
+        head = fn(t, params, sense).head
+        yaw, pitch = head["yaw"], head["pitch"]
+        out.append((t, yaw, pitch))
+    return out
+
+
+def _lock_params(**overrides) -> dict:
+    params = behavior_library.get(FACE_LOCK_BEHAVIOR).default_params()
+    params.update(overrides)
+    return params
+
+
+def test_the_defaults_are_the_wireless_cameras_fov_and_the_shipped_damping() -> None:
+    params = _lock_params()
+    assert params["fov_h"] == 87.0
+    assert params["fov_v"] == 57.0
+    assert params["damping"] == 0.7
+
+
+def test_the_aim_converges_on_a_face_30_deg_off_axis_without_overshooting() -> None:
+    """h2: within 2 deg of the bearing after two detection cycles, no overshoot.
+
+    Damping 0.7 leaves 30% of the error per detection, so a 30 deg bearing is
+    9.0 deg out after ONE application, 2.7 after two and 0.81 after three. Two
+    detection CYCLES of elapsed time (t=0, 1.0 and 2.0 s) is three applications
+    and lands at 0.81 deg — comfortably inside the 2 deg the honesty condition
+    names. The clamp is widened for the test: the shipped 20 deg envelope
+    physically cannot reach a 30 deg bearing, and the property under test is the
+    loop, not the envelope.
+    """
+    fn = make_face_lock()
+    params = _lock_params(max_yaw=45.0, max_pitch=45.0)
+    track = _track(fn, params, bearing_yaw=30.0, detections=(0.0, 1.0, 2.0), duration_s=2.5)
+
+    final_yaw = track[-1][1]
+    assert abs(30.0 - final_yaw) <= 2.0
+    # No overshoot: the error keeps its sign for the whole run, so the head
+    # never passes the face and comes back.
+    assert all(30.0 - yaw > 0.0 for _t, yaw, _p in track)
+    assert max(yaw for _t, yaw, _p in track) <= 30.0 + 1e-9
+    # And it is genuinely converging, not settling at a fraction: the old
+    # absolute map would have parked at 2*20/87 = 0.23 of the bearing.
+    assert final_yaw > 0.9 * 30.0
+
+
+def test_the_aim_converges_in_pitch_too() -> None:
+    fn = make_face_lock()
+    params = _lock_params(max_yaw=45.0, max_pitch=45.0)
+    track = _track(
+        fn,
+        params,
+        bearing_yaw=0.0,
+        bearing_pitch=15.0,
+        detections=(0.0, 1.0, 2.0),
+        duration_s=2.5,
+    )
+    final_pitch = track[-1][2]
+    assert abs(15.0 - final_pitch) <= 2.0
+    assert all(15.0 - pitch > 0.0 for _t, _y, pitch in track)
+
+
+def test_a_300_ms_detection_latency_still_converges_in_two_cycles() -> None:
+    """h3/c42: the ring is indexed by CAPTURE time, so a slewing head is not double-counted.
+
+    The slew is deliberately slow (20 deg/s) so the head is still MOVING when
+    the next frame is captured — the only regime in which basing the increment
+    on the current pose rather than the capture-time pose differs. It differs by
+    overshooting: at t=1.0 s the naive base (the pose now, 20 deg) plus 0.7 of an
+    error measured at 14 deg targets 31.2 deg, past a 30 deg face; the ring's
+    capture-time base targets 25.2 deg and keeps closing from below.
+    """
+    fn = make_face_lock()
+    params = _lock_params(max_yaw=45.0, max_pitch=45.0, slew=20.0)
+    track = _track(
+        fn,
+        params,
+        bearing_yaw=30.0,
+        detections=(0.0, 1.0, 2.0),
+        latency_s=0.3,
+        duration_s=2.5,
+    )
+
+    assert abs(30.0 - track[-1][1]) <= 2.0
+    assert all(30.0 - yaw > 0.0 for _t, yaw, _p in track)
+    assert fn.target_yaw <= 30.0 + 1e-9
+
+
+def test_a_republished_stale_reading_does_not_walk_the_target() -> None:
+    """c2: one detection moves the target ONCE, however many ticks republish it.
+
+    Between detections the producer holds the same bbox and its ``face_age_s``
+    grows, so the derived capture time stands still. Re-applying the increment
+    every tick would march the head off the face within a second.
+    """
+    fn = make_face_lock()
+    params = _lock_params()
+    bbox = _seen_bbox(15.0, 0.0, 0.0, 0.0)
+
+    first = fn(0.0, params, Sense(face_bbox=bbox, face_age_s=0.0))
+    target_after_one = fn.target_yaw
+    assert target_after_one == pytest.approx(15.0 * 0.7, abs=1e-6)
+
+    for i in range(1, 100):  # 2 s of republication at 50 Hz
+        t = i * 0.02
+        fn(t, params, Sense(face_bbox=bbox, face_age_s=t))
+    assert fn.target_yaw == pytest.approx(target_after_one, abs=1e-9)
+    assert first.head["yaw"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_ring_falls_back_to_the_oldest_sample_it_still_holds() -> None:
+    """An age older than the ring is answered honestly, never with the current pose."""
+    fn = make_face_lock()
+    params = _lock_params(max_yaw=45.0, max_age=60.0)
+    # Drive the head somewhere with one detection, then hand it a reading whose
+    # capture time predates every sample in the ring.
+    _track(fn, params, bearing_yaw=20.0, detections=(0.0,), duration_s=1.0)
+    moved = fn.yaw
+    assert moved > 1.0
+
+    oldest = fn._ring[0]
+    fn(1.02, params, Sense(face_bbox=_seen_bbox(20.0, 0.0, 0.0, 0.0), face_age_s=50.0))
+    # Based on the oldest remembered command (the start of the run), not on the
+    # pose it happens to hold now.
+    assert fn.target_yaw == pytest.approx(oldest[1] + 20.0 * 0.7, abs=1e-6)
+
+
+def test_a_snapshot_with_no_age_at_all_falls_back_to_a_changed_bbox() -> None:
+    """An older/partial provider still tracks — one application per new bbox."""
+
+    class _NoAge:
+        def __init__(self, bbox):
+            self.face_bbox = bbox
+
+    fn = make_face_lock()
+    params = _lock_params(max_yaw=45.0)
+    bbox = _seen_bbox(10.0, 0.0, 0.0, 0.0)
+    for i in range(50):
+        fn(i * 0.02, params, _NoAge(bbox))
+    once = fn.target_yaw
+    assert once == pytest.approx(10.0 * 0.7, abs=1e-6)
+
+    moved = _seen_bbox(10.0, 0.0, 5.0, 0.0)
+    fn(1.02, params, _NoAge(moved))
+    assert fn.target_yaw != once
+
+
+# --------------------------------------------------------------------------- #
+# 7. the params are a validated DOMAIN on both override paths                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_old_gain_params_are_gone_from_the_entry() -> None:
+    entry = behavior_library.get(FACE_LOCK_BEHAVIOR)
+    assert "yaw_gain" not in entry.params
+    assert "pitch_gain" not in entry.params
+    assert {"fov_h", "fov_v", "damping"} <= set(entry.params)
+
+
+@pytest.mark.parametrize("key", ["fov_h", "fov_v", "damping"])
+@pytest.mark.parametrize("bad", ["nan", "inf", "-1"])
+def test_the_cli_set_path_refuses_a_non_finite_or_negative_value(key, bad) -> None:
+    entry = behavior_library.get(FACE_LOCK_BEHAVIOR)
+    with pytest.raises(CliError) as excinfo:
+        behavior_library.resolve_params(entry, {key: bad})
+    assert key in str(excinfo.value.message)
+
+
+@pytest.mark.parametrize("key", ["fov_h", "fov_v", "damping"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
+def test_the_intent_params_path_refuses_a_non_finite_or_negative_value(key, bad) -> None:
+    entry = behavior_library.get(FACE_LOCK_BEHAVIOR)
+    with pytest.raises(CliError) as excinfo:
+        intents_mod._validated_params(entry, {key: bad})
+    assert key in str(excinfo.value.message)
+
+
+@pytest.mark.parametrize("key", ["fov_h", "fov_v"])
+def test_a_zero_field_of_view_is_refused_on_both_paths(key) -> None:
+    """A zero FOV reads EVERY face as dead centre — a lock that can never aim."""
+    entry = behavior_library.get(FACE_LOCK_BEHAVIOR)
+    with pytest.raises(CliError):
+        behavior_library.resolve_params(entry, {key: "0"})
+    with pytest.raises(CliError):
+        intents_mod._validated_params(entry, {key: 0.0})
+
+
+def test_damping_above_one_is_refused() -> None:
+    """Above 1.0 the loop over-corrects by construction: it would oscillate."""
+    entry = behavior_library.get(FACE_LOCK_BEHAVIOR)
+    with pytest.raises(CliError):
+        intents_mod._validated_params(entry, {"damping": 1.5})
+    # Zero damping is legal (a lock that holds still), and so is 1.0.
+    assert intents_mod._validated_params(entry, {"damping": 0.0})["damping"] == 0.0
+    assert intents_mod._validated_params(entry, {"damping": 1.0})["damping"] == 1.0
+
+
+def test_a_lock_face_payload_naming_the_new_params_reaches_the_gaze() -> None:
+    _driver, registry = _wire()
+    ctx = _RecordingCtx(sense=_face())
+    registry.dispatch(
+        {"op": LOCK_FACE, "params": {"fov_h": 120.0, "fov_v": 70.0, "damping": 1.0}}, ctx
+    )
+    beh = ctx.admits[0]
+    assert beh.params["fov_h"] == 120.0
+    assert beh.params["damping"] == 1.0
+
+    beh.fn(0.0, dict(beh.params), _face(cx=0.75, cy=0.5))
+    # damping 1.0 through a 120 deg FOV: a face a quarter-frame right of centre
+    # is 30 deg away, and the target aims all of it.
+    assert beh.fn.target_yaw == pytest.approx(-min(30.0, beh.params["max_yaw"]), abs=1e-6)
+
+
+def test_a_lock_face_payload_naming_a_dead_param_is_refused() -> None:
+    """The registry turns the CliError into a typed refusal; nothing is admitted."""
+    _driver, registry = _wire()
+    ctx = _RecordingCtx(sense=_face())
+    result = registry.dispatch({"op": LOCK_FACE, "params": {"yaw_gain": 30.0}}, ctx)
+    assert result["ok"] is False
+    assert "yaw_gain" in result["error"]
+    assert ctx.admits == []
+
+
+# --------------------------------------------------------------------------- #
+# 8. the leaf's import boundary (h4)                                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_face_lock_imports_no_transport_no_sdk_and_no_network() -> None:
+    """h4: ``face_lock.py`` imports no transport and no ``reachy_mini``.
+
+    The FOV defaults are CONSTANTS in this module precisely because reading them
+    from ``GET /api/camera/specs`` here would give a leaf behavior a transport;
+    composition is where a per-camera value would be resolved and injected.
+    """
+    tree = ast.parse(inspect.getsource(face_lock_mod))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+    forbidden = {"reachy_mini", "urllib", "urllib.request", "socket", "requests"}
+    assert not (modules & forbidden)
+    assert not any(m == "reachy.robot" or m.startswith("reachy.robot.") for m in modules)
+
+
+def test_a_negative_damping_in_a_raw_params_dict_never_steers_away() -> None:
+    """Validation is the gate; the leaf still refuses to invert its own loop."""
+    fn = make_face_lock()
+    params = _lock_params(damping=-1.0)
+    fn(0.0, params, Sense(face_bbox=_seen_bbox(15.0, 0.0, 0.0, 0.0), face_age_s=0.0))
+    assert fn.target_yaw == pytest.approx(0.0, abs=1e-9)

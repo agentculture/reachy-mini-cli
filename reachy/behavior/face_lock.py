@@ -86,6 +86,7 @@ boundary holds.
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Callable, Iterable
 
 from reachy.behavior.model import Behavior, Contribution, Lifetime, neutral_head
@@ -133,6 +134,16 @@ REASON_EVICTED = "evicted"
 #: How long the face must be absent/stale before the ONE ``face-lost`` report.
 #: Well above vision's own TTL (:data:`MAX_FACE_AGE_S`): a dropped frame is not
 #: a lost face, and this event is meant to be rare enough to mean something.
+#:
+#: Re-derived for #181/#179 against the LONGEST legitimate gap between two
+#: detections while a lock is actively re-aiming, and it still holds at 3.0 s:
+#: one detect interval (``face_sense.DEFAULT_DETECT_INTERVAL`` 0.5 s, 1.0 s as
+#: deployed on the Wireless) + the post-motion settle #179 adds to the face
+#: worker (<= 0.5 s) + the worst in-clamp slew the incremental aim can command
+#: (the full 40 deg yaw envelope at :data:`SLEW_DEG_S` = 0.33 s) = 1.83 s. One
+#: whole missed cycle on top of that is 2.83 s — inside 3.0, with ~0.2 s of
+#: margin in the worst case and ~1.3 s in the shipped 0.5 s-interval case. So
+#: the value is UNCHANGED; what changed is that it now has a derivation.
 FACE_LOST_AFTER_S = 3.0
 
 #: How long ``mind_online()`` must read ``False`` CONTINUOUSLY before the lock
@@ -161,11 +172,38 @@ MAX_YAW_DEG = 20.0
 MAX_PITCH_DEG = 12.0
 
 #: Degrees commanded for a face at the very edge of the frame, BEFORE the clamp.
-#: Equal to the clamps by default, so the mapping is linear across the frame and
-#: only saturates at the edge; raise it for a twitchier lock, and the clamp still
-#: binds.
+#: The OPEN-LOOP mapping the one-shot glance :mod:`reachy.behavior.gaze` still
+#: uses (``plan_look_at_face``): a single glance has no loop to close, so it maps
+#: the offset straight onto an absolute angle.
+#:
+#: The face LOCK no longer uses these (issue #181): an absolute map settles at
+#: ``2*gain/FOV`` of the true bearing — ~0.31 on the Wireless camera — because
+#: the offset shrinks as the head turns toward it. The lock's aim is now
+#: INCREMENTAL, off :data:`HFOV_DEG` / :data:`VFOV_DEG` / :data:`DAMPING`.
 YAW_GAIN_DEG = 20.0
 PITCH_GAIN_DEG = 12.0
+
+#: The camera's field of view in degrees, horizontal and vertical — what turns a
+#: normalised bbox offset into a real ANGLE, and the whole reason the lock can
+#: aim incrementally at all.
+#:
+#: Measured on the Reachy Mini Wireless from ``GET /api/camera/specs``'s
+#: intrinsics (fx ~2002, cx ~1906 at 3840 px wide): ``2*atan(cx/fx)`` ~ 87 deg
+#: horizontal, ~57 deg vertical. Overridable per lock as the ``fov_h`` / ``fov_v``
+#: params, because a different camera is a different number — this module is a
+#: leaf that imports no transport, so nothing reads ``/api/camera/specs`` HERE
+#: (composition may resolve it once and inject the default; see the spec's
+#: scope boundary for #181).
+HFOV_DEG = 87.0
+VFOV_DEG = 57.0
+
+#: How much of the measured angular error one detection closes, 0..1. At 0.7 a
+#: face 30 deg off-axis is within 2.7 deg after two detections and 0.8 deg after
+#: three, and the error NEVER changes sign — the loop cannot overshoot, because
+#: every step is a fraction of a measured error. 1.0 (aim exactly at the face) is
+#: reachable through the ``damping`` param and is the twitchy end; the shipped
+#: default keeps a margin for a stale or mis-centred bbox (decision c24, #181).
+DAMPING = 0.7
 
 #: How fast the commanded angle chases its target, in deg/s — specified in
 #: TIME, never per tick, so the lock behaves identically at any tick rate
@@ -175,6 +213,23 @@ SLEW_DEG_S = 120.0
 #: Longest gap between two calls the slew integrates over. A resumed/stalled
 #: process must not teleport the head.
 _MAX_DT_S = 0.25
+
+#: How many past ``(t, yaw, pitch)`` samples the base-pose ring keeps. The ring
+#: answers ONE question — "what was I commanding when this frame was taken?" —
+#: so it only has to reach back as far as a bbox may be old, i.e. the ``max_age``
+#: param (:data:`MAX_FACE_AGE_S`, 1.5 s) plus slack. 256 samples is ~5 s at the
+#: 50 Hz design cadence. A faster tick shortens the window rather than growing
+#: the ring; the lookup then degrades to the OLDEST sample, which is the honest
+#: answer ("this is as far back as I remember") and still much better than the
+#: current pose.
+_RING_MAXLEN = 256
+
+#: How far the capture time must advance before an unchanged bbox counts as a
+#: NEW observation. ``face_age_s`` is measured on the sense provider's clock and
+#: ``t_local`` on the engine's, so a republished (stale) reading's derived
+#: capture time jitters by microseconds between the two; 50 ms swallows that
+#: while staying far below any real detection interval (0.5-1.0 s).
+_NEW_OBSERVATION_EPS_S = 0.05
 
 
 def _clamp(value: float, limit: float) -> float:
@@ -197,13 +252,37 @@ class FaceLockGaze:
     entry (:class:`reachy.behavior.orient.OrientToSound` is the sibling, and the
     reference for a self-clamping continuous behavior).
 
-    Every tick it maps ``sense.face_bbox``'s centre — normalised ``0..1``,
-    origin top-left — onto a head yaw/pitch TARGET and eases the commanded angle
-    toward it at :data:`SLEW_DEG_S`. The sign convention is the repo's:
-    ``+yaw`` is LEFT (:func:`reachy.behavior.sense.doa_angle_to_yaw`), so a face
-    at large ``x`` (the robot's right) yields a negative yaw; ``+pitch`` is up
+    The aim is INCREMENTAL and closed-loop (issue #181). ``sense.face_bbox``'s
+    centre — normalised ``0..1``, origin top-left — is an ANGULAR ERROR once the
+    camera's field of view is known::
+
+        target_yaw   = base_yaw   - (cx - 0.5) * fov_h * damping
+        target_pitch = base_pitch - (cy - 0.5) * fov_v * damping
+
+    where ``base_*`` is the angle this gaze was COMMANDING WHEN THE FRAME WAS
+    TAKEN, not the one it commands now — see :meth:`_base_at`. The commanded
+    angle then eases toward the target at :data:`SLEW_DEG_S`. The sign
+    convention is the repo's and is unchanged: ``+yaw`` is LEFT
+    (:func:`reachy.behavior.sense.doa_angle_to_yaw`), so a face at large ``x``
+    (the robot's right) yields a negative yaw; ``+pitch`` is up
     (``thoughtful``'s "upward/forward tilt"), so a face at small ``y`` yields a
     positive pitch.
+
+    What this replaces, and why: the previous target was ABSOLUTE
+    (``-(cx-0.5) * 2 * gain``), which is a proportional loop with gain
+    ``2*gain/FOV`` — ~0.31 on the Wireless camera — so the head settled about a
+    third of the way to the face and never arrived. The incremental form closes
+    ``damping`` of the MEASURED error per detection instead, so it converges
+    regardless of the gain constants, and it cannot overshoot for
+    ``0 < damping <= 1`` because every step is a fraction of an error it just
+    measured.
+
+    Only a NEW observation moves the target. A bbox is republished on every tick
+    between detections (the producer holds it for its TTL), and re-applying an
+    increment from ONE reading 50 times would walk the head off the face. A
+    reading is new when its CAPTURE time — ``t_local - sense.face_age_s`` —
+    advances: a held reading's age grows exactly as fast as the clock, so its
+    capture time is constant. See :meth:`_is_new_observation`.
 
     The clamp is its OWN, applied to both the target and the command, so no
     ``params`` value and no out-of-frame bbox can drive the head past it.
@@ -223,6 +302,11 @@ class FaceLockGaze:
         self._target_yaw = 0.0
         self._target_pitch = 0.0
         self._last_t: float | None = None
+        #: (t_local, commanded yaw, commanded pitch) for the recent past.
+        self._ring: deque[tuple[float, float, float]] = deque(maxlen=_RING_MAXLEN)
+        #: Capture time of the last observation actually APPLIED, and its bbox.
+        self._last_capture: float | None = None
+        self._last_bbox: tuple[float, float, float, float] | None = None
 
     # -- introspection (tests, and any future status view) ------------------ #
 
@@ -249,33 +333,118 @@ class FaceLockGaze:
     # -- the contribution function ------------------------------------------ #
 
     def __call__(self, t_local: float, params: dict, sense) -> Contribution:
+        now = _finite(t_local, 0.0)
+        # First, because a rewinding clock invalidates the ring this tick reads.
+        dt = self._dt(now)
         max_yaw = abs(_finite((params or {}).get("max_yaw"), MAX_YAW_DEG))
         max_pitch = abs(_finite((params or {}).get("max_pitch"), MAX_PITCH_DEG))
-        centre = _bbox_centre(getattr(sense, "face_bbox", None))
+        bbox = _normalised_bbox(getattr(sense, "face_bbox", None))
+        centre = _bbox_centre(bbox)
         age = getattr(sense, "face_age_s", None)
         if centre is not None and not _is_stale(age, params):
-            gain_yaw = _finite((params or {}).get("yaw_gain"), YAW_GAIN_DEG)
-            gain_pitch = _finite((params or {}).get("pitch_gain"), PITCH_GAIN_DEG)
-            cx, cy = centre
-            self._target_yaw = _clamp(-(cx - 0.5) * 2.0 * gain_yaw, max_yaw)
-            self._target_pitch = _clamp(-(cy - 0.5) * 2.0 * gain_pitch, max_pitch)
+            capture = self._capture_time(now, age)
+            if self._is_new_observation(capture, bbox):
+                fov_h = abs(_finite((params or {}).get("fov_h"), HFOV_DEG))
+                fov_v = abs(_finite((params or {}).get("fov_v"), VFOV_DEG))
+                # Clamped into 0..1 here as well as declared on the Param: the
+                # library validator is the real gate, but this leaf takes its
+                # params from a dict and a NEGATIVE damping would steer AWAY
+                # from the face — the same belt-and-braces `abs()` the clamps
+                # and the slew already apply.
+                damping = min(1.0, max(0.0, _finite((params or {}).get("damping"), DAMPING)))
+                base_yaw, base_pitch = self._base_at(capture)
+                cx, cy = centre
+                self._target_yaw = _clamp(base_yaw - (cx - 0.5) * fov_h * damping, max_yaw)
+                self._target_pitch = _clamp(base_pitch - (cy - 0.5) * fov_v * damping, max_pitch)
+                self._last_capture = capture
+                self._last_bbox = bbox
         # else: hold the last target — absence is not a release.
 
         # Re-clamp the held target too: `params` may have tightened since.
         self._target_yaw = _clamp(self._target_yaw, max_yaw)
         self._target_pitch = _clamp(self._target_pitch, max_pitch)
 
-        step = abs(_finite((params or {}).get("slew"), SLEW_DEG_S)) * self._dt(t_local)
+        step = abs(_finite((params or {}).get("slew"), SLEW_DEG_S)) * dt
         self._yaw = _clamp(_approach(self._yaw, self._target_yaw, step), max_yaw)
         self._pitch = _clamp(_approach(self._pitch, self._target_pitch, step), max_pitch)
+        self._ring.append((now, self._yaw, self._pitch))
         return Contribution(head=_head(yaw=self._yaw, pitch=self._pitch))
 
+    # -- the capture-time machinery ----------------------------------------- #
+
+    def _capture_time(self, now: float, age: object) -> float | None:
+        """When the frame behind this bbox was taken, on the LOCAL clock.
+
+        ``None`` when the snapshot carries no ``face_age_s`` at all — an older
+        or partial provider. The caller then falls back to "the bbox changed",
+        which is weaker but never wrong in the dangerous direction.
+        """
+        if age is None:
+            return None
+        return now - max(0.0, _finite(age, 0.0))
+
+    def _is_new_observation(
+        self, capture: float | None, bbox: tuple[float, float, float, float] | None
+    ) -> bool:
+        """Whether this reading is a DETECTION we have not already acted on.
+
+        The rule, and why it is this one:
+
+        * With a capture time, a reading is new when that time ADVANCED. A bbox
+          republished between detections carries a growing ``face_age_s``, so
+          its capture time stands still — the single robust signal, and it works
+          even for a motionless face whose two consecutive detections are
+          bit-identical. The advance must clear :data:`_NEW_OBSERVATION_EPS_S`
+          UNLESS the bbox itself changed, which absorbs the microsecond skew
+          between the provider's clock and ours without making a genuinely
+          fast detector (a new bbox every tick) wait for the epsilon.
+        * With no capture time, a changed bbox is the only evidence available.
+        """
+        if capture is None:
+            return bbox != self._last_bbox
+        if self._last_capture is None:
+            return True
+        advance = capture - self._last_capture
+        if advance <= 0.0:
+            return False
+        return advance > _NEW_OBSERVATION_EPS_S or bbox != self._last_bbox
+
+    def _base_at(self, capture: float | None) -> tuple[float, float]:
+        """The angle this gaze was COMMANDING at *capture*, from the ring.
+
+        The most recent sample at or before the capture time — the command
+        actually in force when the frame was taken. With nothing that old
+        (a ring shorter than the detection latency, or a fresh lock) the OLDEST
+        sample is used; with an empty ring, the current command. Using the
+        CURRENT command instead would double-count every degree slewed since
+        the frame was taken, which turns a converging loop into an overshooting
+        one exactly while the head is moving.
+        """
+        if capture is None or not self._ring:
+            return (self._yaw, self._pitch)
+        for sample_t, yaw, pitch in reversed(self._ring):
+            if sample_t <= capture:
+                return (yaw, pitch)
+        _oldest_t, yaw, pitch = self._ring[0]
+        return (yaw, pitch)
+
     def _dt(self, t_local: float) -> float:
-        """Seconds since the previous call, bounded and never negative."""
+        """Seconds since the previous call, bounded and never negative.
+
+        A REWINDING clock (a restarted timeline, a test driving the same gaze
+        twice from t=0) invalidates the ring and the last capture time: every
+        remembered timestamp now sits in the future. Both are dropped, so the
+        next reading is taken as new and measured against the current command.
+        """
         now = _finite(t_local, 0.0)
         previous = self._last_t
         self._last_t = now
         if previous is None:
+            return 0.0
+        if now < previous:
+            self._ring.clear()
+            self._last_capture = None
+            self._last_bbox = None
             return 0.0
         return max(0.0, min(_MAX_DT_S, now - previous))
 
@@ -294,8 +463,12 @@ def _approach(value: float, target: float, step: float) -> float:
     return value + math.copysign(step, delta)
 
 
-def _bbox_centre(bbox: object) -> tuple[float, float] | None:
-    """The ``(cx, cy)`` centre of a normalised ``(x, y, w, h)``, or ``None``."""
+def _normalised_bbox(bbox: object) -> tuple[float, float, float, float] | None:
+    """A hostile ``face_bbox`` as a finite 4-tuple of floats, or ``None``.
+
+    A tuple (never the caller's list) so it can be compared and remembered as
+    the "same detection" key without aliasing the snapshot.
+    """
     if not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
         return None
     try:
@@ -304,6 +477,15 @@ def _bbox_centre(bbox: object) -> tuple[float, float] | None:
         return None
     if not all(math.isfinite(v) for v in (x, y, w, h)):
         return None
+    return (x, y, w, h)
+
+
+def _bbox_centre(bbox: object) -> tuple[float, float] | None:
+    """The ``(cx, cy)`` centre of a normalised ``(x, y, w, h)``, or ``None``."""
+    box = _normalised_bbox(bbox)
+    if box is None:
+        return None
+    x, y, w, h = box
     return (x + w / 2.0, y + h / 2.0)
 
 
@@ -727,11 +909,13 @@ def _reject_unknown_fields(payload: dict, *, kind: str = LOCK_FACE) -> None:
 
 
 __all__ = [
+    "DAMPING",
     "EVENT_FACE_LOST",
     "EVENT_LOCK_RELEASED",
     "FACE_LOCK_BEHAVIOR",
     "FACE_LOST_ACTION",
     "FACE_LOST_AFTER_S",
+    "HFOV_DEG",
     "LOCK_FACE",
     "LOCK_INHIBITS",
     "LOCK_RELEASED_ACTION",
@@ -747,6 +931,7 @@ __all__ = [
     "REASON_REQUESTED",
     "RELEASE_FACE",
     "SLEW_DEG_S",
+    "VFOV_DEG",
     "YAW_GAIN_DEG",
     "FaceLockDriver",
     "FaceLockGaze",
