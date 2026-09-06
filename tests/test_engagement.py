@@ -25,6 +25,7 @@ from collections.abc import Sequence
 import pytest
 
 from reachy.speech.engagement import (
+    DEFAULT_NAMES,
     ConversationGate,
     Decision,
     EngagementClassifier,
@@ -568,4 +569,24 @@ def test_short_utterances_are_gated_even_while_warm() -> None:
     verdict = gate.decide("Okay.", now=0.5)  # firmly inside the warm window
     assert verdict.decision is Decision.DROP
     assert verdict.label == "not-addressed-short"
+    assert classifier.calls == []
+
+
+# ---------------------------------------------------------------------------
+# "nova" as a canonical name (issue #25)
+# ---------------------------------------------------------------------------
+
+
+def test_default_names_include_nova() -> None:
+    """DEFAULT_NAMES gains "nova" alongside "reachy"/"robot" (issue #25)."""
+    assert DEFAULT_NAMES == ("reachy", "nova", "robot")
+
+
+def test_nova_engages_via_name_fast_path_no_classifier_call() -> None:
+    """ "nova" engages through the zero-classifier name fast-path, like "reachy"."""
+    classifier = _RecordingClassifier(verdict=True)
+    gate = _gate(classifier)
+    verdict = gate.decide("hey nova what time is it", now=0.0)
+    assert verdict.decision is Decision.ENGAGE
+    assert verdict.label == "name"
     assert classifier.calls == []

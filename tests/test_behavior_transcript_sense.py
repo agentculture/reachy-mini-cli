@@ -1065,3 +1065,22 @@ def test_the_transcript_rule_schema_is_untouched_by_the_realtime_arc() -> None:
     }, "the comparator set moved — the realtime arc must not touch the rule schema"
     # The documented gap, pinned so it cannot change unnoticed in either direction.
     assert _load({"field": "transcript", "op": "eq", "value": "hi"}).react[0].when.op == "eq"
+
+
+# ---------------------------------------------------------------------------
+# "nova" as a canonical name (issue #25)
+# ---------------------------------------------------------------------------
+
+
+def test_default_names_include_nova() -> None:
+    """DEFAULT_NAMES gains "nova" alongside "reachy"/"robot" (issue #25)."""
+    from reachy.behavior.transcript_sense import DEFAULT_NAMES
+
+    assert DEFAULT_NAMES == ("reachy", "nova", "robot")
+
+
+def test_should_engage_accepts_nova_by_default() -> None:
+    """The plain-word engagement check in ``_should_engage`` recognises "nova"."""
+    media = _Media()
+    driver = _driver(media)
+    assert driver._should_engage("hey nova what time is it", 0.0) is True
