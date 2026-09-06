@@ -1794,7 +1794,9 @@ gate's name fast-path, its fallback heuristic and the single-shot classifier's
 prompt all answer to the added name — no restart, exactly the path a rule edit
 takes. `behavior rules list` and `behavior rules check` print the merged
 names, and `behavior engine status` reports the names the running engine
-answers to, so a reload that did not take is visible rather than guessed.
+answers to (`names_source: engine`; before the first reload of an edited table
+it reports the file's names as `names_source: disk` with a note), so a reload
+that did not take is visible rather than guessed.
 
 The table is validated **fail-closed** with the rest of the file: every entry
 must be a single lower-case word of letters only, at least three characters,
