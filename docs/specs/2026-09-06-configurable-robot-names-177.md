@@ -36,6 +36,12 @@
   - honesty: A test builds the driver with a names provider, swaps the provider's return from ('reachy','robot') to ('reachy','robot','nova') between two utterances, and the second 'nova …' utterance is admitted by name with no driver rebuild; the rendered classifier prompt after the swap names nova.
 - The two other roots read the SAME file: agent embody builds its AttentionGate with names from `load_rules`(overlay).names at start (it already imports reachy.behavior.rules in embody/tools.py; hot reload there is a non-goal), and sleep's default wake phrases become one 'hey <name>' per configured name from the same load (an explicit --wake-phrase or `REACHY_STT_PHRASE` still selects exactly one).
   - honesty: agent embody composition passes `load_rules`(overlay).names into AttentionGate (a test injects a fake loader and asserts the gate's names); sleep's WakeDetector default phrases derive from the same load; neither root imports anything new from reachy.speech.engagement.
+- Fail-closed bounds on a configured name (challenge pass / security lens: `name_match.py`:276 exact whole-word match): each entry must be letters only after lower-casing, at least 3 characters (a one- or two-letter 'name' engages the robot on ordinary speech through the EXACT match that no fuzzy floor guards), and the table holds at most 8 entries; anything else refuses the file with a message naming the entry and the rule it broke.
+  - honesty: names = \["ab"\], \["no va"\], \["nova!"\], \["n0va"\], and a 9-entry list each refuse the whole file with a CliError naming the entry and the bound; names = \["nova"\] and \["Nova"\] both load as 'nova'.
+- The effective names are OBSERVABLE (challenge pass / observability lens: `cmd_rules_list`:510 and the engine status/check summaries at :339/:692 render modes but would not render names): behavior rules list prints the merged names, behavior rules check reports them in its summary, and behavior engine status shows the names the running engine currently answers to, so an operator can tell whether a reload took.
+  - honesty: behavior rules list --json carries a names key equal to the merged tuple; behavior rules check's summary line names them; behavior engine status --json on a live engine reports names, and the value changes after behavior reload of an edited table.
+- Test hygiene: tests/`test_transcript_engagement_heuristic.py`:65's own `_DEFAULT_NAMES` copy is replaced by an import of the shipped constant, so the drift guard covers tests as well as source.
+  - honesty: grep -rn '("reachy", "robot")' tests/ finds no tuple literal; the heuristic test imports the shipped constant.
 
 ## Honesty conditions
 
@@ -61,7 +67,7 @@
 - This repo's source and tests contain no peer name: 'nova' appears only as a CONFIGURED value inside test cases and docs examples, never in a default, a prompt or a tuple literal (a grep-based test pins it).
 - The three persona prompts that say 'You are Reachy Mini' (embody/engine.py:598, speech/`agent_turn.py`:98, `realtime_duplex.py`:752 — the last already overridable via `REACHY_EMBODY_VOICE_PROMPT`) are NOT rewritten: they describe the body, not the gate, and a peer that wants a persona name supplies its own prompt (`reachy_nova` already does: config/persona/nova.md).
 - engagement.py keeps its single LLM edge and `transcript_sense.py` stays its only importer: the resolver is a leaf with no LLM import, so tests/`test_zero_llm_boundary.py`'s equality pins are untouched; attention.py keeps importing `name_match`, never engagement.
-- `reachy_nova`'s harness/`rules_overlay.py` copies this repo's `_TOP_LEVEL_FIELDS` and refuses a rules file with an unknown top-level table, so a names table in the overlay makes ITS managed-block writes fail until that copy learns the key. That is a `reachy_nova` change (an issue on OriNachum/reachy-nova, filed from this plan), not something this repo can paper over; the docs name it as the peer's prerequisite.
+- `reachy_nova`'s harness/`rules_overlay.py` copies BOTH of this repo's schema sets — `_TOP_LEVEL_FIELDS` (:105) and `SENSE_FIELDS` (:74) — and its whole-file validator refuses an unknown top-level table, while its predicate validator (:150) refuses an unknown when.field. So a names table breaks ITS managed-block writes, and a rule keyed on `name_mentioned` written by an operator makes every later nova write fail too, until both copies learn the new key and field. That is a `reachy_nova` change (one issue on OriNachum/reachy-nova naming both copies, filed from this plan); the docs name it as the peer's prerequisite.
 
 ## Non-goals
 
@@ -98,11 +104,22 @@
   - seeds: `c14`, `c15`
 - `s12` — `reachy_nova/reachy_nova/harness/rules_overlay.py (validate_rules_document:284, _split_overlay:364, _atomic_write:428)`: The peer edits the overlay by managed block, preserving operator head/tail — so a names table survives its writes — but its whole-file validator copies `_TOP_LEVEL_FIELDS` and would refuse the file. Cross-repo prerequisite.
   - seeds: `c17`, `c12`
+- `s13` — `challenge pass / adjacent-systems lens: reachy/embody/tools.py create_rule writer (_split_overlay:401, MANAGED_BEGIN:212, _atomic_write:545)`: Writes only its managed block, preserves the operator head/tail, and validates the candidate through THIS repo's `load_rules` — so a names table in the head survives its writes and is accepted the moment the schema learns it. Clean; the peer's writer is the one that breaks (c17).
+  - seeds: `c17`
+- `s14` — `challenge pass / concurrency lens: RulesLoader.reload (whole-file read) vs the two managed-block writers (embody tools.py, nova rules_overlay.py), both temp-file + os.replace`: Reader sees a complete file or the previous one, never a torn write; a hand edit racing a managed write is the pre-existing overlay hazard and unchanged by names. Clean pass.
+- `s15` — `challenge pass / reversibility + failure-mode lens: rules.py RulesLoader.reload:1001 last-good, cmd_reload:368 result reporting`: A malformed names table is refused and the last-good names stay in force; behavior reload returns the rejection to the caller; removing the table and reloading restores the shipped pair. No new rollback path needed — recorded as examined.
+  - seeds: `c15`
+- `s16` — `challenge pass / hidden-dependency lens: reachy/sleep/wakeword.py .phrase readers (:184,:256,:260,:278,:320) and grep for classifier system_prompt overrides`: The phrase→phrases change is contained to wakeword.py (six readers, all internal; the openwakeword log line reads .phrase); no caller in reachy/ or tests overrides EngagementClassifier's `system_prompt`, so rendering it from names breaks no override.
+  - seeds: `c4`, `c5`
+- `s17` — `challenge pass / overlooked-actors lens: boot ordering (_boot_tick_seam:911 reloads before the first tick) and the two start-only readers (agent embody, sleep)`: The runtime has the overlay's names before its first tick; embody and sleep read at start only, so a names table written AFTER they start is stale until their restart — documented as the non-goal (c13/c16), not hidden.
+  - seeds: `c16`
 
 ## Decisions
 
 - Wake phrases derive 'hey <name>' for every configured name except the generic 'robot', so the shipped default remains exactly 'hey reachy'. (Ori, 2026-09-06, resolving q4.)
+- The shipped pair is spelled once as `SHIPPED_NAMES` in reachy/speech/`name_match.py`; rules.py imports it, the overlay's names table lists additions only, and RulesConfig.names always includes the shipped pair. (Ori, 2026-09-06, resolving q5.)
 
 ## Open parks
 
 - [unknown_nonblocking] Fuzzy-match quality for short configured names is bounded by Soundex: 'navy' ties 'nova' and no orthographic guard separates them. Acceptable residual for a name only a peer configures; a proper fix is a per-name explicit mishearing list, a separate change.
+- [unknown_nonblocking] A configured name that is also a common word in the room's language (validation cannot know 'nova' is safe and 'mark' is not) engages the robot on ambient speech through the exact whole-word match; the classifier still judges context-only admissions, but a NAME admission bypasses it by design. Residual, operator-owned; a warning list would be a separate change.
