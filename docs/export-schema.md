@@ -319,6 +319,7 @@ loop does not flood the feed with an identical reading every 20 ms.
 | `pat`              | array or `null` | `[kind, level]` from a head-pat detection, or `null`  |
 | `face`             | string or `null`| A recognised face's name, or `null`                   |
 | `frame_available`  | bool            | Whether a camera frame was available to peek           |
+| `name_mentioned`   | bool            | Whether the transcript engagement gate admitted an utterance BY NAME this tick (a one-tick event, `false` on a context-only admission) |
 | `pat_state`        | object          | The event-stable pat-interaction state (see below); additive and **may be absent** |
 
 `pat_state` is an additive parallel object carrying the pat interaction's
@@ -347,7 +348,7 @@ missing or malformed).
 Example line:
 
 ```json
-{"t":"sense","ts":1718362800.0,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false,"pat_state":{"availability":"unavailable","contact":false,"touch_type":null,"level":null,"yaw_deg":null,"phase":"idle","phase_started_at":null,"last_press_at":null}}
+{"t":"sense","ts":1718362800.0,"tick":1,"doa":null,"speech":false,"rms":null,"pat":null,"face":null,"frame_available":false,"name_mentioned":false,"pat_state":{"availability":"unavailable","contact":false,"touch_type":null,"level":null,"yaw_deg":null,"phase":"idle","phase_started_at":null,"last_press_at":null}}
 ```
 
 **Not every engine sense field reaches this block.** The engine's internal

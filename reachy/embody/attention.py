@@ -98,19 +98,26 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from reachy.speech.name_match import DEFAULT_THRESHOLD, is_name_match
+from reachy.speech.name_match import DEFAULT_THRESHOLD, SHIPPED_NAMES, is_name_match
 
 # --------------------------------------------------------------------------- #
 # Defaults                                                                    #
 # --------------------------------------------------------------------------- #
 
-#: Names the robot answers to. Duplicated from
-#: :data:`reachy.speech.engagement.DEFAULT_NAMES` rather than imported — that
-#: module carries the LLM classifier this gate deliberately does not reach —
-#: and ``tests/test_embody_attention.py`` pins the two tuples equal so the
-#: duplication cannot drift into a robot that answers to different names
-#: depending on which of its two ears heard you.
-DEFAULT_NAMES: tuple[str, ...] = ("reachy", "robot")
+#: Names the robot answers to when nothing is configured — an ALIAS of
+#: :data:`reachy.speech.name_match.SHIPPED_NAMES`, the ONE place the shipped
+#: pair is spelled (#177). It used to be a hand-copied tuple, kept honest by a
+#: drift guard, because reaching :mod:`reachy.speech.engagement` would put an
+#: LLM edge in the layer; the constant moved down into ``name_match`` — a pure
+#: ``difflib`` + ``re`` leaf this module already imports — so the copy, and the
+#: robot that could answer to different names depending on which of its two
+#: ears heard you, are gone rather than merely watched.
+#:
+#: The exported NAME is kept: ``tests/test_embody_attention.py`` pins it equal
+#: to :data:`reachy.speech.engagement.DEFAULT_NAMES`, and callers construct a
+#: gate against it. The operator's own additions arrive at composition through
+#: ``names=`` / :meth:`AttentionGate.set_names`, never by editing this line.
+DEFAULT_NAMES: tuple[str, ...] = SHIPPED_NAMES
 
 #: How long attention stays open after the last thing heard or said, in seconds.
 #:
@@ -222,6 +229,31 @@ class AttentionGate:
     def window_s(self) -> float:
         """The configured window, in seconds."""
         return self._window_s
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """The names this gate currently answers to."""
+        return self._names
+
+    def set_names(self, names: Sequence[str]) -> None:
+        """Replace the names, after construction (#177).
+
+        The gate is constructed by :class:`~reachy.embody.engine.EmbodyTurnEngine`,
+        which owns its clock; the operator's configured names are read from the
+        rules overlay by the COMPOSITION root, one layer further out. Rather
+        than thread a names field through the engine's frozen ``Limits`` — a
+        second place for the same fact to live, and one every other bound would
+        then have to explain itself against — composition resolves the names
+        once at start and hands them here.
+
+        Fail-closed in the one direction that matters: an empty or all-blank
+        sequence is IGNORED and the current names stand. A gate with no names
+        answers to nothing, which is a robot that has gone deaf for a reason no
+        operator would guess from a rules file that merely failed to parse.
+        """
+        cleaned = tuple(str(name).strip() for name in names if str(name).strip())
+        if cleaned:
+            self._names = cleaned
 
     def is_warm(self, now: float | None = None) -> bool:
         """Whether a conversation is currently live (a nameless utterance lands)."""

@@ -161,7 +161,18 @@ _VOLATILE_KEYS = ("ts", "phase_started_at", "last_press_at")
 
 
 def _stable(lines: list[str]) -> list[dict]:
-    """Decode JSONL, dropping every clock reading, at any depth."""
+    """Decode JSONL, dropping every clock reading, at any depth — and then
+    collapsing CONSECUTIVE ``sense`` events that are identical once scrubbed.
+
+    ``SenseSnapshotDriver`` emits on dataclass INequality, and ``Sense`` carries
+    ``pat_state`` whose ``phase_started_at`` is a clock reading the pat sense
+    rewrites on tick-timing-dependent paths. On a slow CI runner one of the two
+    four-tick runs can therefore emit a ``sense`` line that differs from its
+    predecessor in nothing but a timestamp (seen four heads in a row on PR
+    #182: tick 3, byte-identical to tick 2 but for ``tick`` itself). Such a line is not
+    information the bus could add, drop or reorder, so it is folded before the
+    two feeds are compared; every DISTINCT event still has to match, in order.
+    """
 
     def _scrub(value):
         if isinstance(value, dict):
@@ -170,7 +181,21 @@ def _stable(lines: list[str]) -> list[dict]:
             return [_scrub(v) for v in value]
         return value
 
-    return [_scrub(json.loads(line)) for line in lines]
+    def _sans_tick(event: dict) -> dict:
+        return {k: v for k, v in event.items() if k != "tick"}
+
+    scrubbed = [_scrub(json.loads(line)) for line in lines]
+    folded: list[dict] = []
+    for event in scrubbed:
+        if (
+            folded
+            and event.get("t") == "sense"
+            and folded[-1].get("t") == "sense"
+            and _sans_tick(folded[-1]) == _sans_tick(event)
+        ):
+            continue  # a later tick's re-emission of the same reading: timestamp-only
+        folded.append(event)
+    return folded
 
 
 def _retained_state_tree(client) -> dict:

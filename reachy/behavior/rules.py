@@ -25,6 +25,15 @@ A rules file — either layer — has three sections:
 * **modes** (``[modes.<name>]``) — named, purely declarative parameter sets, one
   of which may be selected as the file's ``active_mode``.
 
+A file may additionally carry a ``names`` array — the extra names this robot
+answers to, ON TOP of the shipped pair
+(:data:`reachy.speech.name_match.SHIPPED_NAMES`, spelled in code and never in a
+rules file). It is EXTEND-only by construction: :func:`_validate_names` always
+returns the shipped names first, so no rules file can take away the name the
+robot has always answered to. Bounds: at most
+:data:`MAX_CONFIGURED_NAMES` entries, each a letters-only word of at least
+:data:`MIN_NAME_LENGTH` characters after lower-casing, de-duplicated silently.
+
 A rule entry may carry ``enabled = false``, which makes it a **tombstone**: it
 contributes no rule of its own and DISABLES the rule of that id contributed by
 a lower layer. ``id`` is the only field a tombstone needs (the rest of a copied
@@ -82,7 +91,12 @@ worker, and this module knows nothing about voices, audio, or threads.
   ``duration_s`` of its own — refused FAIL-CLOSED so an admitted behavior can
   never hold a channel forever without an explicit, deliberate opt-in;
 * an ``active_mode`` that does not name a defined mode, or defined modes with
-  no ``active_mode`` selected.
+  no ``active_mode`` selected;
+* a ``names`` value that is not a list, an entry that is not a string, an entry
+  that is not letters-only after lower-casing (so ``"no va"``, ``"n0va"``,
+  ``"nope!"`` and ``""`` are all refused), an entry shorter than
+  :data:`MIN_NAME_LENGTH`, or more than :data:`MAX_CONFIGURED_NAMES` entries —
+  each naming the offending entry and the bound it broke.
 
 Every failure raises :class:`~reachy.cli._errors.CliError` (exit-code 1, user
 error) with a specific, actionable message — never a bare
@@ -112,6 +126,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -121,6 +136,7 @@ from pathlib import Path
 from reachy.behavior import library as behavior_library
 from reachy.cli._errors import EXIT_USER_ERROR, CliError
 from reachy.daemon import state_dir
+from reachy.speech.name_match import SHIPPED_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +172,10 @@ SENSE_FIELDS: frozenset[str] = frozenset(
         "frame_available",
         "transcript",
         "self_moving",
+        # Latched for ONE tick by the transcript sense when an utterance was
+        # admitted BY NAME (the engagement gate's ``name`` label) — never by a
+        # context-only admission.
+        "name_mentioned",
     }
 )
 
@@ -218,8 +238,22 @@ DEFAULT_HYSTERESIS = 0.0
 #: only caller.
 MAX_SAY_CHARS = 500
 
+#: The alphabet a configured name may use: the matcher tokenises ``[A-Za-z]``.
+_ASCII_NAME_RE = re.compile(r"[a-z]+")
+
+#: How many entries a rules file's ``names`` table may carry. Bounded rather
+#: than open-ended for the same fail-closed reason :data:`MAX_SAY_CHARS` is:
+#: every configured name is another word the fuzzy matcher tests every heard
+#: utterance against, so a pasted word list must not be able to make the robot
+#: answer to half the dictionary.
+MAX_CONFIGURED_NAMES = 8
+
+#: The shortest word that may be configured as a name. Below this there is not
+#: enough word left for a fuzzy match to separate a name from ordinary speech.
+MIN_NAME_LENGTH = 3
+
 _PREDICATE_FIELDS = frozenset({"field", "op", "value"})
-_TOP_LEVEL_FIELDS = frozenset({"active_mode", "react", "inhibit", "modes"})
+_TOP_LEVEL_FIELDS = frozenset({"active_mode", "react", "inhibit", "modes", "names"})
 _REACT_FIELDS = frozenset(
     {"id", "enabled", "when", "run", "params", "cooldown_s", "hysteresis", "duration_s", "say"}
 )
@@ -444,6 +478,7 @@ class RulesConfig:
     modes: dict[str, Mode] = field(default_factory=dict)
     active_mode: str | None = None
     disabled: frozenset[str] = frozenset()
+    names: tuple[str, ...] = SHIPPED_NAMES
 
     @classmethod
     def from_dict(cls, data: object) -> "RulesConfig":
@@ -494,6 +529,7 @@ class RulesConfig:
 
         modes = _validate_modes(data.get("modes"))
         active_mode = _validate_active_mode(data.get("active_mode"), modes)
+        names = _validate_names(data.get("names"))
 
         return cls(
             react=react_rules,
@@ -501,6 +537,7 @@ class RulesConfig:
             modes=modes,
             active_mode=active_mode,
             disabled=disabled,
+            names=names,
         )
 
 
@@ -803,6 +840,75 @@ def _validate_modes(raw: object) -> dict[str, Mode]:
     return modes
 
 
+def _dedupe(names: tuple[str, ...]) -> tuple[str, ...]:
+    """Order-preserving de-duplication — the first spelling of a name wins."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return tuple(ordered)
+
+
+def _validate_names(raw: object) -> tuple[str, ...]:
+    """Validate the optional ``names`` table: the SHIPPED pair plus additions.
+
+    The shipped names (:data:`reachy.speech.name_match.SHIPPED_NAMES`) are
+    spelled in CODE and always come first, in order. A rules file may only
+    EXTEND them: there is deliberately no way to remove one, because a robot
+    that stops answering to its own name after a typo in a TOML list is a robot
+    an operator cannot talk their way back to.
+
+    Everything here is fail-closed and refuses the WHOLE file, naming the
+    offending entry and the bound it broke — the same posture as ``say``'s
+    length cap and ``goto``'s axis bounds. An absent table means "no additions",
+    never "no names".
+    """
+    if raw is None:
+        return SHIPPED_NAMES
+    if not isinstance(raw, list):
+        raise _error(
+            f"'names' must be a list of strings (got {raw!r})",
+            remediation='write names = ["<name>"] — a TOML array, even for one name',
+        )
+    if len(raw) > MAX_CONFIGURED_NAMES:
+        raise _error(
+            f"'names' has {len(raw)} entries, over the {MAX_CONFIGURED_NAMES}-entry limit",
+            remediation=(
+                f"keep at most {MAX_CONFIGURED_NAMES} names — every one is a word every "
+                "heard utterance is matched against"
+            ),
+        )
+
+    extra: list[str] = []
+    for index, item in enumerate(raw):
+        path = f"names[{index}]"
+        if isinstance(item, bool) or not isinstance(item, str):
+            raise _error(
+                f"{path}: every name must be a string (got {item!r})",
+                remediation="quote each name in the array",
+            )
+        name = item.strip().lower()
+        # ASCII a-z ONLY — ``str.isalpha`` would admit an accented name the
+        # matcher's ``[A-Za-z]`` tokeniser can never extract, so it would be
+        # accepted here and unreachable everywhere else (#177 review).
+        if not _ASCII_NAME_RE.fullmatch(name):
+            raise _error(
+                f"{path}: name {item!r} must be letters only (a-z) after lower-casing",
+                remediation="a name is one word: no digits, spaces, punctuation, or blanks",
+            )
+        if len(name) < MIN_NAME_LENGTH:
+            raise _error(
+                f"{path}: name {item!r} is shorter than the {MIN_NAME_LENGTH}-character minimum",
+                remediation=f"configure a name of at least {MIN_NAME_LENGTH} letters",
+            )
+        extra.append(name)
+
+    return _dedupe((*SHIPPED_NAMES, *extra))
+
+
 def _validate_active_mode(raw: object, modes: dict[str, Mode]) -> str | None:
     if raw is None:
         if modes:
@@ -911,6 +1017,7 @@ def merge_rules(base: RulesConfig, overlay: RulesConfig) -> RulesConfig:
         modes=modes,
         active_mode=active_mode,
         disabled=frozenset(rule_id for rule_id in disabled if rule_id not in overlay_by_id),
+        names=_dedupe((*base.names, *overlay.names)),
     )
 
 

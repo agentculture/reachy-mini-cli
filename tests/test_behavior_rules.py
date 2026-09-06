@@ -603,6 +603,7 @@ def test_module_imports_stdlib_and_reachy_only():
         "__future__",
         "logging",
         "math",
+        "re",
         "tomllib",
         "collections",
         "dataclasses",

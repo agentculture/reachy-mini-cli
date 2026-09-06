@@ -114,11 +114,24 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
-from reachy.speech.name_match import DEFAULT_THRESHOLD, is_name_match
+from reachy.speech.name_match import DEFAULT_THRESHOLD, SHIPPED_NAMES, is_name_match
 
-#: Canonical names the robot answers to.  Mirrors the listen/transcribe default.
-DEFAULT_NAMES: tuple[str, ...] = ("reachy", "robot")
+#: Canonical names the robot answers to — an ALIAS of
+#: :data:`reachy.speech.name_match.SHIPPED_NAMES`, which is the ONE place the
+#: shipped pair is spelled.  The alias is kept (rather than the import being
+#: used directly at every site) because it is part of this module's public
+#: surface: ``reachy.embody.attention.DEFAULT_NAMES`` is pinned equal to it by
+#: test, and callers pass it explicitly.
+DEFAULT_NAMES: tuple[str, ...] = SHIPPED_NAMES
+
+#: What a ``names`` parameter accepts anywhere in this module: a plain sequence
+#: (the shipped pair, or an operator's configured list) OR a zero-arg callable
+#: returning one.  The callable form is what makes the names LIVE — the robot's
+#: names can change while the runtime is up, and the next utterance is judged
+#: against the new set with nothing rebuilt.
+NamesLike = Sequence[str] | Callable[[], Sequence[str]]
 
 #: Tight, bounded default timeout for a single classifier call (seconds).  A
 #: classifier sits in the perception hot-loop, so a slow/dead endpoint must fail
@@ -156,21 +169,72 @@ LABEL_SHORT = "not-addressed-short"
 LABEL_COLD = "not-addressed-cold"
 LABEL_DEGRADE = "degrade"
 
-#: System prompt for the engagement classifier.
+#: System prompt TEMPLATE for the engagement classifier — rendered against the
+#: names the robot currently answers to (``{names}``).
 #:
 #: Parked as a tunable follow-up (issue #55): the exact wording is a single
 #: module-level constant so it can be tuned in one place without touching the
 #: control flow.  The contract it must keep is the addressed-vs-helpable
 #: distinction and the strict ``YES``/``NO`` answer shape that
 #: :meth:`EngagementClassifier._parse` depends on.
-ENGAGEMENT_SYSTEM_PROMPT: str = (
+#:
+#: There is deliberately NO name literal in the template (issue #177).  A
+#: hardcoded "Reachy" was a second, silent copy of the robot's identity: an
+#: operator who renames the robot would still have had the classifier told the
+#: old name, so a configured name would engage on the fast path and then be
+#: judged by a classifier that had never heard of it.
+ENGAGEMENT_PROMPT_TEMPLATE: str = (
     "You decide whether a spoken utterance is addressed to a small desk robot "
-    "named Reachy, given the recent conversation. Engage only if the speaker is "
-    "talking TO the robot or clearly continuing a conversation with it — NOT if "
-    "two people are talking to each other, even about something the robot could "
-    "help with. Being helpable is not the same as being addressed: do not engage "
-    "just because the robot could assist. Answer with exactly YES or NO."
+    "that answers to the names: {names}, given the recent conversation. Engage "
+    "only if the speaker is talking TO the robot or clearly continuing a "
+    "conversation with it — NOT if two people are talking to each other, even "
+    "about something the robot could help with. Being helpable is not the same "
+    "as being addressed: do not engage just because the robot could assist. "
+    "Answer with exactly YES or NO."
 )
+
+
+def resolve_names(names: NamesLike) -> tuple[str, ...]:
+    """Resolve a :data:`NamesLike` into a concrete tuple of names, at USE time.
+
+    A callable is invoked here and now — that is the whole point of the
+    provider form: swapping what the provider returns takes effect on the very
+    next utterance, with no gate or classifier rebuilt.
+
+    Never raises.  A provider that raises, returns a non-sequence, or yields
+    nothing usable degrades to :data:`~reachy.speech.name_match.SHIPPED_NAMES`
+    rather than to the empty tuple: an empty name set would silently take away
+    the ONLY thing that can open a cold conversation (the name fast-path), so a
+    misconfigured provider would leave a robot that can never be addressed
+    again — indistinguishable, from the room, from a wedged runtime.
+    """
+    value: Any = names
+    if callable(value):
+        try:
+            value = value()
+        except Exception:  # a names provider must never break a decision
+            return SHIPPED_NAMES
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        return SHIPPED_NAMES
+    resolved = tuple(str(name) for name in value if isinstance(name, str) and name.strip())
+    return resolved or SHIPPED_NAMES
+
+
+def render_engagement_prompt(names: NamesLike) -> str:
+    """Render the classifier's system prompt naming EVERY configured name.
+
+    ``names`` may be a sequence or a provider (see :data:`NamesLike`); it is
+    resolved at call time, so rendering per call is what keeps the prompt in
+    step with a live rename.
+    """
+    return ENGAGEMENT_PROMPT_TEMPLATE.format(names=", ".join(resolve_names(names)))
+
+
+#: The classifier prompt as rendered for the SHIPPED names.  Kept as a
+#: module-level constant for backward compatibility (callers imported it, and
+#: it is the readable reference form); a classifier given other names renders
+#: its own.
+ENGAGEMENT_SYSTEM_PROMPT: str = render_engagement_prompt(SHIPPED_NAMES)
 
 
 class Decision(enum.Enum):
@@ -219,7 +283,8 @@ class EngagementClassifier:
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float = DEFAULT_CLASSIFIER_TIMEOUT,
-        system_prompt: str = ENGAGEMENT_SYSTEM_PROMPT,
+        names: NamesLike = SHIPPED_NAMES,
+        system_prompt: str | None = None,
     ) -> None:
         """Build a classifier.
 
@@ -237,9 +302,15 @@ class EngagementClassifier:
         timeout:
             Per-call timeout in seconds.  Defaults to a tight, bounded value so
             the perception loop degrades instead of hanging.
+        names:
+            The names the robot answers to — a sequence, or a zero-arg provider
+            (see :data:`NamesLike`).  Used ONLY to render the system prompt, and
+            resolved on every call, so a provider swap reaches the very next
+            judgement without this object being rebuilt.
         system_prompt:
-            The classifier instruction.  Defaults to
-            :data:`ENGAGEMENT_SYSTEM_PROMPT`; override to tune behaviour.
+            An explicit classifier instruction, which WINS over the rendered
+            one for the object's whole life.  ``None`` (the default) renders
+            :data:`ENGAGEMENT_PROMPT_TEMPLATE` against *names*.
         """
         if complete_fn is None:
             # Resolved HERE, not as a default argument, so importing this module
@@ -257,7 +328,20 @@ class EngagementClassifier:
         self._base_url = base_url
         self._api_key = api_key
         self._timeout = timeout
-        self._system_prompt = system_prompt
+        self._names = names
+        self._explicit_prompt = system_prompt
+
+    @property
+    def system_prompt(self) -> str:
+        """The instruction this call will use: the explicit one, else rendered.
+
+        Rendering per call is the cheapest way to keep the prompt honest about a
+        live rename — it is one ``str.format`` against a tuple, off the tick
+        thread, immediately before a network round-trip.
+        """
+        if self._explicit_prompt is not None:
+            return self._explicit_prompt
+        return render_engagement_prompt(self._names)
 
     def judge(self, text: str, context: Sequence[str]) -> bool:
         """Return ``True`` iff *text* is addressed to the robot.
@@ -303,7 +387,7 @@ class EngagementClassifier:
             "Is this new utterance addressed to the robot? Answer YES or NO."
         )
         return [
-            {"role": "system", "content": self._system_prompt},
+            {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user},
         ]
 
@@ -328,7 +412,7 @@ def decide_engagement(
     context: Sequence[str],
     *,
     classifier: EngagementClassifier,
-    names: Sequence[str] = DEFAULT_NAMES,
+    names: NamesLike = DEFAULT_NAMES,
     name_threshold: float = DEFAULT_THRESHOLD,
 ) -> Decision:
     """Decide whether *text* is addressed to the robot.
@@ -357,7 +441,8 @@ def decide_engagement(
         The (injectable) engagement classifier — only consulted off the name
         path.  Tests pass a fake to assert call counts.
     names:
-        Canonical names for the fast-path.  Defaults to :data:`DEFAULT_NAMES`.
+        Canonical names for the fast-path — a sequence or a zero-arg provider
+        (:data:`NamesLike`), resolved here.  Defaults to :data:`DEFAULT_NAMES`.
     name_threshold:
         Fuzzy-match threshold handed to :func:`is_name_match`.  Defaults to the
         name-matcher's own :data:`~reachy.speech.name_match.DEFAULT_THRESHOLD`.
@@ -368,7 +453,7 @@ def decide_engagement(
         ``ENGAGE`` / ``DROP`` / ``DEGRADE`` (see :class:`Decision`).
     """
     # 1. Name fast-path — short-circuit, no classifier call.
-    if is_name_match(text, names, name_threshold):
+    if is_name_match(text, resolve_names(names), name_threshold):
         return Decision.ENGAGE
 
     # 2. Single classifier call; 3. any failure degrades.
@@ -442,7 +527,11 @@ class ConversationGate:
         ``REACHY_ENGAGE_HEURISTIC`` escape hatch and an unconfigured endpoint
         both want.
     names, name_threshold:
-        Passed to :func:`~reachy.speech.name_match.is_name_match`.
+        Passed to :func:`~reachy.speech.name_match.is_name_match`.  ``names``
+        may be a plain sequence or a zero-arg provider (:data:`NamesLike`) and
+        is resolved on every :meth:`decide`, so an operator renaming the robot
+        while the runtime is up is obeyed by the very next utterance — no gate
+        is rebuilt and no conversation state is lost.
     warm_window_s:
         How long the conversation stays live after the last accepted turn, and
         the age past which a turn is dropped from the classifier context.
@@ -458,7 +547,7 @@ class ConversationGate:
         self,
         *,
         classifier: EngagementClassifier | None = None,
-        names: Sequence[str] = DEFAULT_NAMES,
+        names: NamesLike = DEFAULT_NAMES,
         name_threshold: float = DEFAULT_THRESHOLD,
         warm_window_s: float = DEFAULT_WARM_WINDOW_S,
         min_context_words: int = DEFAULT_MIN_CONTEXT_WORDS,
@@ -466,7 +555,8 @@ class ConversationGate:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._classifier = classifier
-        self._names = tuple(names)
+        #: The names SOURCE — held unresolved so a provider stays live.
+        self._names_source: NamesLike = names
         self._name_threshold = name_threshold
         self._warm_window_s = max(0.0, float(warm_window_s))
         self._min_context_words = max(0, int(min_context_words))
@@ -480,6 +570,10 @@ class ConversationGate:
     # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
+
+    def _names(self) -> tuple[str, ...]:
+        """The names to judge THIS utterance against, resolved now."""
+        return resolve_names(self._names_source)
 
     def is_warm(self, now: float | None = None) -> bool:
         """Whether a conversation is currently live (a context-only turn is admissible)."""
@@ -509,7 +603,7 @@ class ConversationGate:
         self._expire(moment)
 
         # 1. Name — outranks every other rule, costs nothing.
-        if is_name_match(text, self._names, self._name_threshold):
+        if is_name_match(text, self._names(), self._name_threshold):
             self.note_engaged(text, moment)
             return GateVerdict(Decision.ENGAGE, LABEL_NAME)
 

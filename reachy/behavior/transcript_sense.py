@@ -187,7 +187,14 @@ import numpy as np
 
 from reachy import senselog
 from reachy.robot.audio_shape import to_mono
-from reachy.speech.engagement import ConversationGate, Decision
+from reachy.speech.engagement import DEFAULT_NAMES as _SHIPPED_NAMES
+from reachy.speech.engagement import (
+    LABEL_NAME,
+    ConversationGate,
+    Decision,
+    NamesLike,
+    resolve_names,
+)
 from reachy.speech.realtime import Utterance
 
 logger = logging.getLogger(__name__)
@@ -222,8 +229,17 @@ _FALLBACK_RATE = 16000
 DEFAULT_MIN_WORDS = 3
 DEFAULT_ENGAGE_WINDOW_S = 20.0
 
-#: Canonical names the robot answers to (the donor's default).
-DEFAULT_NAMES: tuple[str, ...] = ("reachy", "robot")
+#: Canonical names the robot answers to — an ALIAS of the ONE place the shipped
+#: pair is spelled (:data:`reachy.speech.name_match.SHIPPED_NAMES`, re-exported
+#: as :data:`reachy.speech.engagement.DEFAULT_NAMES`). Reached through the
+#: engagement module on purpose: ``reachy.speech.engagement`` is already on the
+#: zero-LLM boundary's allow-list for this package, and a direct
+#: ``reachy.speech.name_match`` edge would be a NEW one for a constant.
+#:
+#: A runtime whose names are CONFIGURABLE injects ``names_provider=`` instead;
+#: this constant is only what a driver falls back to when nobody configured
+#: anything.
+DEFAULT_NAMES: tuple[str, ...] = _SHIPPED_NAMES
 
 #: Bound on utterances awaiting the engagement gate. Small on purpose: if the
 #: classifier is wedged, queueing more is pointless — the words are already
@@ -339,7 +355,15 @@ class TranscriptSenseDriver:
     tuning:
         A :class:`TranscriptTuning`; see its docstring.
     names:
-        Canonical names for the gate's fast path.
+        Canonical names for the gate's fast path — a FIXED tuple, for a driver
+        whose names never change. Defaults to :data:`DEFAULT_NAMES`.
+    names_provider:
+        A zero-arg callable returning the names the robot answers to RIGHT NOW.
+        It WINS over ``names`` when given, and is resolved per utterance (never
+        snapshotted at construction), so an operator renaming the robot while
+        the runtime is up is obeyed by the very next utterance with nothing
+        rebuilt — neither this driver nor the gate it owns. A driver built
+        without one behaves exactly as before.
     clock:
         Monotonic clock used only when ``ctx.now`` is unusable. Injectable.
     """
@@ -354,6 +378,7 @@ class TranscriptSenseDriver:
         mute_until: Callable[[], float] | None = None,
         tuning: TranscriptTuning = TranscriptTuning(),
         names: tuple[str, ...] = DEFAULT_NAMES,
+        names_provider: Callable[[], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
         pending_maxsize: int = DEFAULT_PENDING_MAXSIZE,
         ready_maxsize: int = DEFAULT_READY_MAXSIZE,
@@ -365,7 +390,11 @@ class TranscriptSenseDriver:
         self._on_engage = on_engage
         self._mute_until = mute_until if mute_until is not None else (lambda: 0.0)
         self._tuning = tuning
-        self._names = tuple(name.lower() for name in names)
+        #: The names SOURCE — a provider when one was injected, else the fixed
+        #: tuple. Held unresolved so a provider stays LIVE.
+        self._names_source: NamesLike = (
+            names_provider if names_provider is not None else tuple(names)
+        )
         self._clock = clock
         self._join_timeout_s = max(0.0, float(join_timeout_s))
         self._max_takes_per_tick = max(1, int(max_takes_per_tick))
@@ -382,6 +411,11 @@ class TranscriptSenseDriver:
         # --- the one-tick latch (written by the tick thread only) -------------
         self._latch: str | None = None
         self._latch_direction: str | None = None
+        #: Whether the transcript latched THIS tick was admitted BY NAME. A
+        #: separate one-tick latch on the same cadence, not a property of the
+        #: text: "reachy, stop" and a context-admitted follow-up both set
+        #: ``transcript``, and only the first is the robot being ADDRESSED.
+        self._name_mentioned = False
 
         # --- the handoff ------------------------------------------------------
         self._pending: queue.Queue = queue.Queue(maxsize=max(1, int(pending_maxsize)))
@@ -407,7 +441,8 @@ class TranscriptSenseDriver:
             if (self._force_heuristic or classifier is None)
             else ConversationGate(
                 classifier=classifier,
-                names=self._names,
+                # The SOURCE, not a snapshot: the gate resolves it per decision.
+                names=self._names_source,
                 warm_window_s=tuning.engage_window_s,
                 min_context_words=tuning.min_words,
             )
@@ -446,6 +481,7 @@ class TranscriptSenseDriver:
         # last tick has already been read by this tick's start-of-tick sense.
         self._latch = None
         self._latch_direction = None
+        self._name_mentioned = False
         self.ticks += 1
         if self._closed:
             return
@@ -638,11 +674,12 @@ class TranscriptSenseDriver:
     def _adopt_ready(self) -> None:
         """Latch at most one transcript the worker has finished. Never blocks."""
         try:
-            text, direction = self._ready.get_nowait()
+            text, direction, by_name = self._ready.get_nowait()
         except queue.Empty:
             return
         self._latch = text
         self._latch_direction = direction
+        self._name_mentioned = bool(by_name)
 
     def _ensure_worker(self) -> None:
         """Start the background worker on first use (tick thread only, no race)."""
@@ -674,7 +711,7 @@ class TranscriptSenseDriver:
 
     def _handle(self, job: _Heard) -> None:
         """Run the engagement gate over one utterance; publish it if admitted."""
-        engaged, label = self._decide(job.text, job.t)
+        engaged, label, by_name = self._decide(job.text, job.t)
         if not engaged:
             # Not addressed to the robot: ambient speech, a backchannel too short
             # to carry addressing signal, or no conversation open to continue.
@@ -683,14 +720,15 @@ class TranscriptSenseDriver:
             senselog.drop(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, label)
             return
         self._notify_engaged()
+        item = (job.text, job.direction, by_name)
         try:
-            self._ready.put_nowait((job.text, job.direction))
+            self._ready.put_nowait(item)
         except queue.Full:
             # The engine has stopped draining. Drop the OLDEST so the latch
             # always carries the freshest words rather than a stale backlog.
             self._drop_oldest_ready()
             try:
-                self._ready.put_nowait((job.text, job.direction))
+                self._ready.put_nowait(item)
             except queue.Full:
                 senselog.drop(_STAGE_TRANSCRIPT, _SOURCE, job.event_id, REASON_LATCH_BACKLOG)
                 return
@@ -717,7 +755,16 @@ class TranscriptSenseDriver:
     # The engagement gate (WORKER THREAD) — reused, not reimplemented
     # ------------------------------------------------------------------
 
-    def _decide(self, text: str, t: float) -> tuple[bool, str]:
+    def _names(self) -> tuple[str, ...]:
+        """The names to judge THIS utterance against, resolved now and lowered.
+
+        Lowered because :meth:`_should_engage` compares against lowercased
+        words; :func:`~reachy.speech.name_match.is_name_match` (the gate's path)
+        lowercases for itself.
+        """
+        return tuple(name.lower() for name in resolve_names(self._names_source))
+
+    def _decide(self, text: str, t: float) -> tuple[bool, str, bool]:
         """Layered engagement decision — the #54/#56 gate, now conversation-aware.
 
         Two paths, chosen once at construction:
@@ -734,38 +781,55 @@ class TranscriptSenseDriver:
           stalls on a dead endpoint — and a heuristic accept is reported back to
           the gate, so a run of degraded turns cannot strand it cold.
 
-        Returns the decision and its LABEL. The label is the caller's
-        ``senselog.drop`` reason, so a drop always says which rule dropped it.
+        Returns the decision, its LABEL, and whether the admission was BY NAME.
+        The label is the caller's ``senselog.drop`` reason, so a drop always
+        says which rule dropped it. The by-name flag is what the
+        ``name_mentioned`` latch carries: it is available on EVERY path,
+        including the two heuristic ones, because "the robot was addressed by
+        name" must not silently become false the moment the classifier is down.
         """
         gate = self._gate
         if gate is None:
-            engaged = self._should_engage(text, t)
+            engaged, by_name = self._should_engage(text, t)
             label = "engaged-heuristic" if engaged else "dropped-heuristic"
         else:
             verdict = gate.decide(text, t)
             if verdict.decision is Decision.DEGRADE:
-                engaged = self._should_engage(text, t)
+                engaged, by_name = self._should_engage(text, t)
                 label = "degrade->heuristic"
                 if engaged:
                     gate.note_engaged(text, t)
             else:
                 engaged = verdict.decision is Decision.ENGAGE
                 label = verdict.label
+                # The gate NAMES its own reason; ``name`` is the fast path.
+                by_name = engaged and label == LABEL_NAME
 
         logger.info('engagement: %s :: "%s"', label, text[:40])
-        return engaged, label
+        return engaged, label, bool(by_name)
 
-    def _should_engage(self, text: str, t: float) -> bool:
+    def _should_engage(self, text: str, t: float) -> tuple[bool, bool]:
         """The cheap fallback rule: named, or a clear sentence in an open window.
 
         The name match is WHOLE-WORD, not a substring, so "robotic"/"robots" do
         not falsely trigger on the name "robot".
+
+        Returns ``(engaged, by_name)``. The second value is the same
+        distinction the gate makes with its ``name`` label — WHY this engaged —
+        so the caller can latch ``name_mentioned`` without re-deriving it (and
+        without the two paths disagreeing about what a name is).
         """
         words = _WORD_RE.findall(text.lower())
-        if any(name in words for name in self._names):
-            return True
+        # EXACT whole-word, deliberately NOT the fuzzy matcher: this is the
+        # no-classifier fallback, and an STT mishearing engaging the robot with
+        # nothing to judge context is exactly what it must not do (pinned by
+        # test_misheard_name_does_not_engage_when_idle). The one concession is
+        # the clitic stem — "reachy's" names the robot as surely as "reachy".
+        stems = {word.split("'", 1)[0] for word in words}
+        if any(name in stems for name in self._names()):
+            return True, True
         coherent = len(words) >= self._tuning.min_words
-        return coherent and t < self._engaged_until
+        return (coherent and t < self._engaged_until), False
 
     # ------------------------------------------------------------------
     # Provider seam
@@ -797,6 +861,21 @@ class TranscriptSenseDriver:
         plain string field cannot carry.
         """
         return self._latch_direction
+
+    def peek_name_mentioned(self) -> bool:
+        """Whether the transcript latched this tick NAMED the robot.
+
+        A one-tick latch on exactly the cadence of :meth:`peek` — ``True`` for
+        the single tick that adopts a by-name admission, ``False`` on every
+        other tick, including the tick that adopts a CONTEXT admission (that
+        one still sets ``transcript``). Never raises, never blocks, and safe to
+        call repeatedly within a tick.
+        """
+        return self._name_mentioned
+
+    def as_name_mentioned_provider(self) -> Callable[[], bool]:
+        """The zero-arg ``name_mentioned`` provider (an alias for :meth:`peek_name_mentioned`)."""
+        return self.peek_name_mentioned
 
     # ------------------------------------------------------------------
     # Lifecycle
