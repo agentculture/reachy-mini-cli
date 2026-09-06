@@ -204,14 +204,19 @@ def test_the_locked_behavior_holds_its_last_target_when_the_bbox_vanishes() -> N
     assert held[0] != 0.0
     assert held[1] != 0.0
 
-    heads = _run(fn, params, EMPTY_SENSE, 200, start=4.0)
+    # A BRIEF absence (under RECOVER_AFTER_S) still holds the last target —
+    # vision drops frames, and one missed detection is not a lost face.
+    _run(fn, params, EMPTY_SENSE, 100, start=4.0)  # 2.0 s < RECOVER_AFTER_S (3.0)
     assert (fn.target_yaw, fn.target_pitch) == held
-    assert heads[-1]["yaw"] == pytest.approx(held[0], abs=1e-6)
-    assert heads[-1]["pitch"] == pytest.approx(held[1], abs=1e-6)
 
-    # A bbox that is merely STALE is held the same way — never released here.
-    heads = _run(fn, params, _face(cx=0.1, age=MAX_FACE_AGE_S + 1.0), 200, start=8.0)
-    assert (fn.target_yaw, fn.target_pitch) == held
+    # A PROLONGED absence eases the gaze back toward neutral (the lock stays
+    # locked; only the head relaxes) so a lock that lost its face — or a
+    # guard-frozen runaway that then lost it — stops pointing at a wall.
+    heads = _run(fn, params, EMPTY_SENSE, 400, start=6.0)  # well past RECOVER_AFTER_S
+    assert abs(fn.target_yaw) < abs(held[0])
+    assert abs(fn.target_pitch) < abs(held[1])
+    assert heads[-1]["yaw"] == pytest.approx(0.0, abs=0.5)
+    assert heads[-1]["pitch"] == pytest.approx(0.0, abs=0.5)
 
 
 def test_lock_adds_feel_alive_and_orient_to_sound_to_the_inhibited_set() -> None:
@@ -1035,3 +1040,38 @@ def test_a_reading_up_to_three_seconds_old_still_steers_the_lock():
     assert MAX_FACE_AGE_S == 3.0
     assert _is_stale(2.5, None) is False
     assert _is_stale(3.5, None) is True
+
+
+def test_a_fixed_unreachable_offset_does_not_march_the_gaze_to_the_clamp() -> None:
+    """Anti-windup (#181, live 2026-09-06): a face pinned off-centre and never
+    centring (beyond reach, or a false detection on a wall) must NOT accumulate
+    corrections up to the clamp. The un-guarded loop ran to the clamp and held
+    there staring at an empty room for 80 s.
+
+    A moving bbox (a new detection each step) at a CONSTANT modest offset — so
+    the first correction does not itself saturate — settles well short of the
+    clamp instead of marching to it.
+    """
+    fn = make_face_lock()
+    params = behavior_library.get(FACE_LOCK_BEHAVIOR).default_params()
+    max_yaw = params["max_yaw"]
+    # A constant offset that its FIRST correction does not clamp: cx=0.62 →
+    # (0.62-0.5)*87*0.7 ≈ 7.3° < 20°. A stalled loop would still crawl outward.
+    heads = []
+    for i in range(400):
+        # A fresh detection each step (age 0), same offset — the classic stall.
+        heads.append(fn(i * 0.5, params, _face(cx=0.62, cy=0.5, age=0.0)).head)
+    settled = abs(heads[-1]["yaw"])
+    assert settled < max_yaw - 1.0, f"gaze marched to the clamp: {settled} vs {max_yaw}"
+
+
+def test_a_returning_face_is_re_aimed_after_a_recover_to_neutral() -> None:
+    """Recover is not a release: once eased to neutral, a face that returns is
+    tracked again."""
+    fn = make_face_lock()
+    params = behavior_library.get(FACE_LOCK_BEHAVIOR).default_params()
+    _run(fn, params, _face(cx=0.9, cy=0.2), 100)
+    _run(fn, params, EMPTY_SENSE, 400, start=2.0)  # ease to neutral
+    assert fn.target_yaw == pytest.approx(0.0, abs=0.5)
+    _run(fn, params, _face(cx=0.1, cy=0.8), 100, start=12.0)  # a face returns
+    assert fn.target_yaw != pytest.approx(0.0, abs=0.5)

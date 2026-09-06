@@ -241,6 +241,32 @@ DAMPING = 0.7
 #: (the cadence-invariance lesson of issue #168).
 SLEW_DEG_S = 120.0
 
+#: Anti-windup for the incremental aim. Each new detection nudges the target by
+#: the FOV-scaled bbox offset; if that offset never SHRINKS — a face beyond the
+#: head's reach, or a false detection latched on a fixed edge (a printed face on
+#: a wall) — the nudges accumulate and march the target to the clamp, where it
+#: pins. So an OUTWARD push (one that moves the target further from neutral) is
+#: only accepted while the measured offset is still shrinking by at least this
+#: much (normalised frame units); a stalled offset freezes the target where it
+#: is rather than driving on to the corner. Live on the Wireless (2026-09-06)
+#: the un-guarded loop ran the head to its clamp and held there, staring at an
+#: empty kitchen, for 80 s. Convergence itself is unaffected: a working lock's
+#: offset shrinks ~(1-damping) each cycle, far above this floor.
+CONVERGE_EPS = 0.03
+
+#: How long the face may be genuinely ABSENT (no fresh bbox) before the lock
+#: eases the gaze back toward neutral instead of holding a possibly-runaway
+#: pose forever. A short absence is still HELD — vision drops frames, and a
+#: person who steps out for a moment has not asked to be un-looked-at — so this
+#: matches :data:`FACE_LOST_AFTER_S`. The lock is NOT released here: it stays
+#: locked and re-aims the instant a face returns; only the HEAD relaxes, so a
+#: lock that lost its face stops pointing at a wall.
+RECOVER_AFTER_S = 3.0
+
+#: How fast (deg/s) the gaze eases toward neutral once :data:`RECOVER_AFTER_S`
+#: of true absence has passed. Gentle — this is a graceful relax, not a snap.
+RECOVER_RATE_DEG_S = 30.0
+
 #: Longest gap between two calls the slew integrates over. A resumed/stalled
 #: process must not teleport the head.
 _MAX_DT_S = 0.25
@@ -261,6 +287,11 @@ _RING_MAXLEN = 256
 #: capture time jitters by microseconds between the two; 50 ms swallows that
 #: while staying far below any real detection interval (0.5-1.0 s).
 _NEW_OBSERVATION_EPS_S = 0.05
+
+#: Degrees below which a "toward neutral" move is not counted as one — keeps
+#: a re-application of the same clamped target from reading as progress and so
+#: keeping a pinned runaway alive.
+_RECOVER_ANGLE_EPS = 0.25
 
 
 def _clamp(value: float, limit: float) -> float:
@@ -343,6 +374,11 @@ class FaceLockGaze:
         #: Capture time of the last observation actually APPLIED, and its bbox.
         self._last_capture: float | None = None
         self._last_bbox: tuple[float, float, float, float] | None = None
+        #: Normalised offset magnitude of the last accepted observation, and the
+        #: local time a fresh face was last SEEN — the anti-windup guard and the
+        #: recover-to-neutral timer, respectively.
+        self._last_offset: float | None = None
+        self._last_seen_t: float | None = None
 
     # -- introspection (tests, and any future status view) ------------------ #
 
@@ -397,6 +433,7 @@ class FaceLockGaze:
         centre = _bbox_centre(bbox)
         age = getattr(sense, "face_age_s", None)
         if centre is not None and not _is_stale(age, params):
+            self._last_seen_t = now  # a fresh face resets the recover timer
             capture = self._capture_time(now, age)
             if self._is_new_observation(capture, bbox):
                 fov_h = abs(_finite((params or {}).get("fov_h"), HFOV_DEG))
@@ -409,11 +446,29 @@ class FaceLockGaze:
                 damping = min(1.0, max(0.0, _finite((params or {}).get("damping"), DAMPING)))
                 base_yaw, base_pitch = self._base_at(capture)
                 cx, cy = centre
-                self._target_yaw = _clamp(base_yaw - (cx - 0.5) * fov_h * damping, max_yaw)
-                self._target_pitch = _clamp(base_pitch - (cy - 0.5) * fov_v * damping, max_pitch)
+                new_yaw = _clamp(base_yaw - (cx - 0.5) * fov_h * damping, max_yaw)
+                new_pitch = _clamp(base_pitch - (cy - 0.5) * fov_v * damping, max_pitch)
+                if self._admit_target(new_yaw, new_pitch, cx, cy):
+                    self._target_yaw = new_yaw
+                    self._target_pitch = new_pitch
                 self._last_capture = capture
                 self._last_bbox = bbox
-        # else: hold the last target — absence is not a release.
+        else:
+            # Absence breaks the convergence chain: the next real detection
+            # starts fresh, so a face that returns is never judged against the
+            # offset from before it vanished (which would reject the first
+            # re-aim as "not converging").
+            self._last_offset = None
+            if self._recovering(now):
+                # No fresh face for RECOVER_AFTER_S: ease the gaze back toward
+                # neutral so a lock that lost its face (or a guard-frozen
+                # runaway that then lost it) stops pointing at a wall. Still
+                # LOCKED — a returning face re-aims at once; only the head
+                # relaxes.
+                ease = RECOVER_RATE_DEG_S * dt
+                self._target_yaw = _approach(self._target_yaw, 0.0, ease)
+                self._target_pitch = _approach(self._target_pitch, 0.0, ease)
+            # else: a brief absence is HELD — absence is not a release.
 
         # Re-clamp the held target too: `params` may have tightened since.
         self._target_yaw = _clamp(self._target_yaw, max_yaw)
@@ -468,6 +523,38 @@ class FaceLockGaze:
         if advance <= 0.0:
             return False
         return advance > _NEW_OBSERVATION_EPS_S or bbox != self._last_bbox
+
+    def _admit_target(self, new_yaw: float, new_pitch: float, cx: float, cy: float) -> bool:
+        """Whether to accept this observation's target — the anti-windup guard.
+
+        The FIRST observation of a lock always wins (there is nothing yet to
+        converge from). After that, an OUTWARD push — one that would drive the
+        target further from neutral on the axis that dominates the offset — is
+        accepted only while the measured offset is still SHRINKING by at least
+        :data:`CONVERGE_EPS`. A push that moves the target TOWARD neutral is
+        always fine (the face crossed centre, or moved closer in). This is what
+        stops a fixed, unreachable offset from marching the head to its clamp
+        and pinning there (live, 2026-09-06). ``_last_offset`` is updated every
+        accepted OR rejected call, so convergence is always measured against the
+        most recent reading.
+        """
+        offset = math.hypot(cx - 0.5, cy - 0.5)
+        last = self._last_offset
+        self._last_offset = offset
+        if last is None or self._last_capture is None:
+            return True  # first real observation
+        toward_neutral = (
+            abs(new_yaw) < abs(self._target_yaw) - _RECOVER_ANGLE_EPS
+            or abs(new_pitch) < abs(self._target_pitch) - _RECOVER_ANGLE_EPS
+        )
+        if toward_neutral:
+            return True
+        return offset < last - CONVERGE_EPS
+
+    def _recovering(self, now: float) -> bool:
+        """Whether enough true absence has passed to ease back toward neutral."""
+        seen = self._last_seen_t
+        return seen is not None and (now - seen) > RECOVER_AFTER_S
 
     def _base_at(self, capture: float | None) -> tuple[float, float]:
         """The angle this gaze was COMMANDING at *capture*, from the ring.
