@@ -1127,20 +1127,34 @@ def test_downscale_for_detection_is_identity_when_already_narrow_enough() -> Non
 
 
 def test_downscale_for_detection_without_cv2_passes_through_unscaled(monkeypatch) -> None:
-    """If cv2 is missing, the frame passes through unscaled — never a raise."""
-    import builtins
+    """If cv2 is missing, the frame passes through unscaled — never a raise.
 
-    real_import = builtins.__import__
+    The helper loads OpenCV through ``importlib.import_module`` (not a bare
+    ``import``), so THAT is the seam the simulated absence must hit — patching
+    ``builtins.__import__`` never applied, and with the ``[vision]`` extra
+    installed the frame was resized and this test failed (review finding).
+    """
+    import importlib
+
+    real_import_module = importlib.import_module
 
     def _no_cv2(name, *args, **kwargs):
         if name == "cv2":
             raise ImportError("no module named cv2")
-        return real_import(name, *args, **kwargs)
+        return real_import_module(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", _no_cv2)
+    monkeypatch.setattr(importlib, "import_module", _no_cv2)
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
     result = FS.downscale_for_detection(frame, 640)
     assert result is frame
+
+
+def test_the_no_cv2_test_seam_is_the_one_the_helper_uses() -> None:
+    """Vacuity guard: the helper must reach cv2 via importlib.import_module."""
+    import inspect
+
+    source = inspect.getsource(FS.downscale_for_detection)
+    assert 'importlib.import_module("cv2")' in source
 
 
 def test_driver_with_detect_max_width_hands_the_engine_a_downscaled_frame() -> None:

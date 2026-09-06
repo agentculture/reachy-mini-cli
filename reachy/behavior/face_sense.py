@@ -179,6 +179,7 @@ lazily only after confirming opencv is present.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -422,7 +423,7 @@ def detect_interval_from_env(
         parsed = float(text)
     except ValueError:
         return default
-    if parsed != parsed or abs(parsed) == float("inf") or parsed <= 0.0:
+    if math.isnan(parsed) or math.isinf(parsed) or parsed <= 0.0:
         return default
     return parsed
 
