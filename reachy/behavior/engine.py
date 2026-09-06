@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from reachy import senselog
 from reachy.behavior import control as control_mod
 from reachy.behavior import library
 from reachy.behavior.arbitration import admit, arbitrate
@@ -42,6 +43,16 @@ from reachy.robot.transport import TargetSink
 
 # Base-layer behavior name + the param the CLI/config exposes (its liveliness).
 BASE_LAYER_NAME = "feel-alive"
+
+# The senselog coordinates of a base-layer re-seed (#183): one line per real
+# re-seed, so an operator can tell "the base layer came back" from "the base
+# layer never left" in the journal alone.
+_BASE_STAGE = "engine"
+_BASE_SOURCE = "base-layer"
+
+#: The causes :meth:`Engine.state`'s ``base_layer.stopped_by`` reports.
+STOPPED_BY_STOP = "stop"
+STOPPED_BY_INHIBITION = "inhibition"
 
 
 @dataclass
@@ -64,6 +75,11 @@ class ActiveBehavior:
 
 def _noop_emit(_event: dict) -> None:
     """Default ``TickContext.emit`` when the seam registers no event consumers."""
+
+
+def _noop_ensure_base() -> str | None:
+    """Default ``TickContext.ensure_base`` for a context built without an engine."""
+    return None
 
 
 @dataclass
@@ -104,6 +120,11 @@ class TickContext:
       matching that library name or id (see :meth:`Engine.stop`).
     * ``active_names`` — ``active_names() -> set[str]``: the library names of the
       behaviors currently active.
+    * ``ensure_base`` — ``ensure_base() -> str | None``: re-seed the passive
+      ``feel-alive`` base layer if no base behavior is active, returning the new
+      id (``None`` when one already is — the call is idempotent). The seam a
+      rider uses on the edge where an inhibition naming the base layer CLEARS
+      (see :meth:`Engine.ensure_base`); the engine itself never calls it.
 
     The ``tick_seam`` is invoked directly and is responsible for its own error
     isolation (the engine adds none), so one rider raising never silently eats
@@ -120,6 +141,7 @@ class TickContext:
     admit: Callable[[Behavior], dict]
     evict: Callable[[str], dict]
     active_names: Callable[[], set[str]]
+    ensure_base: Callable[[], str | None] = _noop_ensure_base
 
 
 @dataclass
@@ -134,6 +156,16 @@ class Engine:
     # driving each channel (not just who nominally claims it) and the last DoA.
     _last_ownership: dict | None = None
     _last_sense: Sense = EMPTY_SENSE
+    # Base-layer lifecycle bookkeeping (#183). ``_base_seeded`` latches on the
+    # first seed (so "never seeded" and "seeded then stopped" are different
+    # states); ``_base_energy`` is the energy the FIRST seed used, so every
+    # re-seed restores the liveliness the run was configured with rather than
+    # the library default; ``_base_stopped_by`` records the CAUSE of the last
+    # removal — an operator (or the peer harness) must be able to tell
+    # intentional stillness from an inhibition-driven eviction.
+    _base_seeded: bool = False
+    _base_energy: float = 1.0
+    _base_stopped_by: str | None = None
 
     # --- mutation --------------------------------------------------------
     def _next_id(self, name: str) -> str:
@@ -149,16 +181,62 @@ class Engine:
         entry = library.get(BASE_LAYER_NAME)
         params = entry.default_params()
         params["energy"] = energy
+        return self._seed_base(now, params)
+
+    def _seed_base(self, now: float, params: dict[str, float]) -> str:
+        """Build + append an ``is_base`` ``feel-alive``; the ONE path that makes a base id.
+
+        Records the id in ``_base_ids`` (so ``stop all`` keeps it), latches
+        ``_base_seeded``, remembers the seeding energy for later re-seeds, and
+        clears the removal cause — a base layer that is back was not stopped.
+        """
         beh = library.build(
             BASE_LAYER_NAME,
-            params,
+            dict(params),
             StopClass.PASSIVE,
             Lifetime(looping=True, duration=None),
             self._next_id(BASE_LAYER_NAME),
         )
         self.active.append(ActiveBehavior(beh, now, is_base=True))
         self._base_ids.add(beh.id)
+        if not self._base_seeded:
+            self._base_energy = float(beh.params.get("energy", self._base_energy))
+        self._base_seeded = True
+        self._base_stopped_by = None
         return beh.id
+
+    def base_active(self) -> bool:
+        """Whether an ``is_base`` behavior is on the active set right now."""
+        return any(ab.is_base for ab in self.active)
+
+    def ensure_base(self, now: float) -> str | None:
+        """Re-seed the base layer unless one is already active. Returns the new id or ``None``.
+
+        The engine side of #183: ``seed_base_layer`` runs once at start, so a
+        behavior evicted by an inhibition naming ``feel-alive`` used to be gone
+        for the life of the process. A rider calls this (via
+        ``TickContext.ensure_base``) on the edge where such an inhibition
+        clears. Idempotent by construction — while a base id is active this is a
+        silent no-op, so it can never put a SECOND ``feel-alive`` on the active
+        set — and every real re-seed emits exactly one senselog line, since a
+        base layer that comes back without a trace is indistinguishable from one
+        that never left.
+        """
+        if self.base_active():
+            return None
+        entry = library.get(BASE_LAYER_NAME)
+        params = entry.default_params()
+        params["energy"] = self._base_energy
+        was = self._base_stopped_by
+        base_id = self._seed_base(now, params)
+        senselog.stage(
+            _BASE_STAGE,
+            _BASE_SOURCE,
+            "re-seed",
+            f"re-seeded {BASE_LAYER_NAME} id={base_id} energy={self._base_energy} "
+            f"after={was or 'never-active'}",
+        )
+        return base_id
 
     def add(
         self,
@@ -174,11 +252,68 @@ class Engine:
         ``channels`` overrides which channels the behavior claims (e.g. an
         ``antenna-sway`` set to also seize ``body_yaw``); ``None`` keeps the
         library entry's channels.
+
+        **The un-stop carve-out (#183).** An UNBOUNDED add of
+        :data:`BASE_LAYER_NAME` (``looping=True`` with no duration — what
+        ``behavior run feel-alive`` with no lifetime flag, and the equivalent
+        spool ``run_behavior``, produce) re-seeds the base layer PROPER rather
+        than admitting a plain copy beside it: ``is_base=True``, the id recorded
+        in ``_base_ids`` so ``stop all`` keeps it, and the removal cause
+        cleared. It is the only verb that can undo a by-name ``stop
+        feel-alive``. An add of the same name WITH a duration (or with
+        ``looping=False``) is an ordinary bounded behavior, unchanged.
         """
+        if self._is_base_re_seed(name, lifetime):
+            return self._add_base(params, now, channels)
         beh = library.build(name, params, stop_class, lifetime, self._next_id(name))
         if channels:
             beh = dataclasses.replace(beh, channels=frozenset(channels))
         return self.admit_behavior(beh, now)
+
+    @staticmethod
+    def _is_base_re_seed(name: str, lifetime: Lifetime) -> bool:
+        """Whether this add is the un-stop verb (an unbounded add of the base name)."""
+        return name == BASE_LAYER_NAME and lifetime.looping and lifetime.duration is None
+
+    def _add_base(self, params: dict[str, float], now: float, channels: list[str] | None) -> dict:
+        """Re-seed the base layer from an unbounded ``add``; a no-op while one is active.
+
+        ``channels`` is deliberately ignored: the base layer's claim is the
+        library entry's, and a re-seed that claimed something else would not be
+        the base layer any more.
+        """
+        for active in self.active:
+            if active.is_base:
+                outcome = self._outcome(active.behavior, [], {})
+                outcome["note"] = f"{BASE_LAYER_NAME} base layer already active"
+                return outcome
+        entry = library.get(BASE_LAYER_NAME)
+        merged = entry.default_params()
+        merged["energy"] = self._base_energy
+        merged.update(params or {})
+        base_id = self._seed_base(now, merged)
+        beh = self.active[-1].behavior
+        senselog.stage(
+            _BASE_STAGE,
+            _BASE_SOURCE,
+            "re-seed",
+            f"re-seeded {BASE_LAYER_NAME} id={base_id} via add",
+        )
+        return self._outcome(beh, [], {})
+
+    @staticmethod
+    def _outcome(beh: Behavior, evicted: list, blocked: dict) -> dict:
+        """The shared ``add``/``admit_behavior`` outcome shape."""
+        return {
+            "ok": True,
+            "op": "add",
+            "id": beh.id,
+            "name": beh.name,
+            "class": beh.stop_class.value,
+            "channels": sorted(beh.channels),
+            "evicted": [b.id for b in evicted],
+            "blocked": blocked,
+        }
 
     def admit_behavior(self, beh: Behavior, now: float) -> dict:
         """Admit an already-built :class:`Behavior` onto the active set.
@@ -194,19 +329,30 @@ class Engine:
         if evicted_ids:
             self.active = [ab for ab in self.active if ab.behavior.id not in evicted_ids]
         self.active.append(ActiveBehavior(beh, now))
-        return {
-            "ok": True,
-            "op": "add",
-            "id": beh.id,
-            "name": beh.name,
-            "class": beh.stop_class.value,
-            "channels": sorted(beh.channels),
-            "evicted": [b.id for b in result.evicted],
-            "blocked": result.blocked,
-        }
+        return self._outcome(beh, result.evicted, result.blocked)
 
     def stop(self, target: str) -> dict:
-        """Stop a behavior by id or name, or ``all`` (keeps the passive base layer)."""
+        """Stop a behavior by id or name, or ``all`` (keeps the passive base layer).
+
+        A stop that removes the base layer records ``"stop"`` as its cause —
+        intentional stillness, held until an unbounded ``add`` of
+        :data:`BASE_LAYER_NAME` or a restart. :meth:`evict` is the same removal
+        attributed to an inhibition instead.
+        """
+        return self._remove(target, STOPPED_BY_STOP)
+
+    def evict(self, target: str) -> dict:
+        """``stop`` attributed to an inhibition — the call ``TickContext.evict`` binds to.
+
+        Identical removal semantics and identical outcome dict; the only
+        difference is the cause recorded when the removed behavior was the base
+        layer, so ``state()`` can tell an inhibition-driven eviction (which a
+        rider un-does on the clearing edge via :meth:`ensure_base`) from an
+        operator's deliberate ``stop feel-alive``.
+        """
+        return self._remove(target, STOPPED_BY_INHIBITION)
+
+    def _remove(self, target: str, cause: str) -> dict:
         before = {ab.behavior.id for ab in self.active}
         if target == "all":
             keep = self._base_ids
@@ -219,6 +365,8 @@ class Engine:
             removed_ids = {ab.behavior.id for ab in removed}
             self.active = [ab for ab in self.active if ab.behavior.id not in removed_ids]
         stopped = [ab.behavior.id for ab in removed]
+        if any(ab.is_base for ab in removed):
+            self._base_stopped_by = cause
         return {
             "ok": True,
             "op": "stop",
@@ -343,6 +491,14 @@ class Engine:
                 "angle": self._last_sense.doa_angle,
                 "speech_detected": self._last_sense.speech_detected,
             },
+            # Additive (#183): an operator and the peer harness can tell a
+            # deliberately still robot from an inhibited one, and both from an
+            # engine that never seeded a base layer at all.
+            "base_layer": {
+                "seeded": self._base_seeded,
+                "active": self.base_active(),
+                "stopped_by": self._base_stopped_by,
+            },
         }
 
 
@@ -445,8 +601,9 @@ def _invoke_seam(tick_seam, seam_emit, engine: Engine, t: float, ticks: int, sna
             ownership=tick["ownership"],
             emit=seam_emit,
             admit=lambda beh, _t=t: engine.admit_behavior(beh, _t),
-            evict=engine.stop,
+            evict=engine.evict,
             active_names=lambda: {ab.behavior.name for ab in engine.active},
+            ensure_base=lambda _t=t: engine.ensure_base(_t),
         )
     )
 
