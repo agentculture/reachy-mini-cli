@@ -2465,7 +2465,7 @@ def _compose_run_seam(
     # that `Restart=on-failure` never restarts. So the whole construction is
     # guarded and releases what it opened before re-raising.
     reader = media = transcript_driver = face_driver = keeper = speech = pump = None
-    realtime = publisher = tee = clip_rider = mind_presence = None
+    realtime = publisher = tee = clip_rider = mind_presence = face_lock_driver = None
     try:
         # The voice, first: built and STARTED here on the setup thread so no tick
         # ever pays for thread creation, and so a malformed REACHY_VOICE_ENGINE /
@@ -2519,12 +2519,34 @@ def _compose_run_seam(
         # behaviour (0.5 s / no downscaling) so nothing changes for an operator
         # who never sets them — see REACHY_FACE_DETECT_INTERVAL /
         # REACHY_FACE_DETECT_MAX_WIDTH in ``face_sense.py``.
+        # The self-motion latch (#95): composed UNCONDITIONALLY (it reads only
+        # ctx.pose — no SDK, no extra). Built HERE, before the face driver,
+        # because two consumers peek it: the rms provider below (the moving
+        # floor) and, since #179, the face driver's still-only detection gate.
+        self_motion = _make_self_motion()
         face_driver = FaceSenseDriver(
             media=media,
             engine=recognition[0] if recognition is not None else None,
             store=recognition[1] if recognition is not None else None,
             detect_interval=detect_interval_from_env(),
             detect_max_width=detect_max_width_from_env(),
+            # #179: detect only while the head is still — the same latch the
+            # mic's moving floor consumes. A HELD face lock keeps a slow cadence
+            # through its own slew instead of none (`lock_held` is late-bound:
+            # the lock driver is constructed further down, and a peek before
+            # then reads "no lock", never raises — `_peek` degrades).
+            moving=self_motion.is_moving,
+            lock_held=lambda: bool(face_lock_driver is not None and face_lock_driver.locked),
+            # #176: a camera that goes SILENT (frames stop while the client still
+            # claims connected + camera-available) is handed back from the TICK
+            # thread — `_check_stream_staleness` runs inside `face_driver(ctx)` —
+            # through the held client's own explicit drop, so `_HolderKeeper`'s
+            # unchanged `connected == False` poll re-warms it off-thread. The
+            # keeper never touches a connected holder; the reader's thread is
+            # the only one that tears it down (see `HeldMediaClient.drop`). A
+            # client without the verb (an older stand-in) is "no route": the
+            # detector keeps its detect-only #138 behaviour rather than crash.
+            on_stale=getattr(media, "drop", None),
         )
         # The rolling clip rider (spec claim c18): fed by PUSH off the SAME
         # frame `face_driver` already reads — never a second `media.frame()`
@@ -2616,10 +2638,8 @@ def _compose_run_seam(
         )
 
         holder = LastPoseHolder()
-        # The self-motion latch (#95): composed UNCONDITIONALLY (it reads only
-        # ctx.pose — no SDK, no extra), consulted by the rms provider at read
-        # time so the robot's own actuator noise reads quiet while it moves.
-        self_motion = _make_self_motion()
+        # (`self_motion` — the #95 latch — is built above, beside the face driver
+        # that shares it; the rms provider below is its second consumer.)
         # ONE mic read per tick, two sense fields off it (#102): the raw
         # loudness (gated by the moving floor above) and its ratio over the
         # rolling background. The self-motion latch does double duty here — it
@@ -2756,6 +2776,11 @@ def _compose_run_seam(
                 face_recognizer_ready=recognition is not None,
             ),
             main_control=main_control,
+            # #176: liveness beside availability — the face driver's own
+            # last-usable-frame timestamp, read on the face driver's own clock
+            # (the two must share a time base, or "age" means nothing).
+            frame_liveness=face_driver.peek_last_frame_at,
+            clock=face_driver.clock,
         )
         # The names the RUNNING engine answers to, onto the SAME `state.json`
         # (#177) — the one live channel `behavior engine status` can ask, since

@@ -1461,6 +1461,24 @@ class FaceSenseDriver:
         """The current TTL-held ``frame_available`` condition. Never raises."""
         return self._frame_available
 
+    def peek_last_frame_at(self) -> float | None:
+        """When the last USABLE frame arrived, on this driver's own clock, or ``None``.
+
+        The liveness reading the availability rider publishes as
+        ``senses.<name>.last_frame_at`` (#176): a STABLE timestamp, never an
+        age, so a rider that writes on change is not made to write every tick.
+        ``None`` means no usable frame has EVER arrived — the same value the
+        staleness detector treats as "nothing to be stale about". Pair it with
+        :attr:`clock` on the consumer side: the timestamp is meaningful only on
+        the clock it was read from.
+        """
+        return self._last_frame_at
+
+    @property
+    def clock(self) -> Callable[[], float]:
+        """The clock :meth:`peek_last_frame_at`'s reading lives on. Never raises."""
+        return self._clock
+
     def as_frame_available_provider(self) -> Callable[[], bool]:
         """The zero-arg ``frame_available`` provider callable."""
         return self.peek_frame_available
