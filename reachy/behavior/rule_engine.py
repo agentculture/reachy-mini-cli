@@ -152,6 +152,11 @@ def _field_present(sense: Sense, field: str) -> bool:
         return sense.face is not None
     if field == "transcript":
         return sense.transcript is not None
+    if field == "name_mentioned":
+        # A one-tick EVENT flag (#177): present exactly on the tick the transcript
+        # sense latched an admission BY NAME — a CONDITION-style boolean like
+        # ``speech`` / ``self_moving``, never ``None``.
+        return bool(sense.name_mentioned)
     return False
 
 
@@ -167,6 +172,7 @@ def _field_value(sense: Sense, field: str):
         "frame_available": sense.frame_available,
         "transcript": sense.transcript,
         "self_moving": sense.self_moving,
+        "name_mentioned": sense.name_mentioned,
     }.get(field)
 
 

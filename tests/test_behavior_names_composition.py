@@ -293,12 +293,19 @@ def _tick_names_publisher(rules_driver):
     return rider
 
 
+def _engine_process_is_alive(monkeypatch) -> None:
+    """Make the supervisor report a LIVE engine process (no real process needed)."""
+    monkeypatch.setattr("reachy.behavior.supervisor.read_pid", lambda: 4242)
+    monkeypatch.setattr("reachy.behavior.supervisor.is_alive", lambda pid: True)
+
+
 def test_engine_status_json_reports_the_running_engines_names(monkeypatch, capsys) -> None:
     _write_overlay(CONFIGURED)
     rules_driver = behavior_mod._boot_tick_seam()
     rider = _tick_names_publisher(rules_driver)
 
     monkeypatch.setattr("reachy.behavior.supervisor.health_ok", lambda *a, **k: True)
+    _engine_process_is_alive(monkeypatch)
     assert main(["behavior", "engine", "status", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["names"] == [*rules_mod.SHIPPED_NAMES, CONFIGURED]
@@ -311,6 +318,32 @@ def test_engine_status_json_reports_the_running_engines_names(monkeypatch, capsy
     assert main(["behavior", "engine", "status", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["names"] == [*rules_mod.SHIPPED_NAMES, "mimi"]
+
+
+def test_a_stopped_engines_leftover_state_is_not_reported_as_live_names(monkeypatch, capsys) -> None:
+    """state.json outlives a stopped/crashed engine until the next run resets the
+    spool — a published list is proof of nothing unless the process is alive."""
+    _write_overlay(CONFIGURED)
+    rules_driver = behavior_mod._boot_tick_seam()
+    _tick_names_publisher(rules_driver)(None)  # publishes names into state.json
+    monkeypatch.setattr("reachy.behavior.supervisor.health_ok", lambda *a, **k: True)
+    # No pid file / dead pid: the supervisor says "stopped" — the default here.
+    assert main(["behavior", "engine", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["process"] != "running"
+    assert payload["names_source"] == behavior_mod.NAMES_FROM_DISK
+
+
+def test_the_engagement_classifier_is_built_on_the_live_names_provider(monkeypatch) -> None:
+    """Review finding: the fast-path used live names but the classifier's prompt
+    listed only the shipped pair, so nameless follow-ups were judged blind."""
+    monkeypatch.delenv("REACHY_ENGAGE_HEURISTIC", raising=False)
+    names = [*rules_mod.SHIPPED_NAMES]
+    classifier = behavior_mod._engagement_classifier(names=lambda: tuple(names))
+    assert classifier is not None
+    assert CONFIGURED not in classifier.system_prompt
+    names.append(CONFIGURED)
+    assert CONFIGURED in classifier.system_prompt  # re-rendered from the live provider
 
 
 def test_engine_status_falls_back_to_the_file_and_says_so(monkeypatch, capsys) -> None:

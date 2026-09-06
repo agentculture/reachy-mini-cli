@@ -204,3 +204,79 @@ def test_rules_does_not_respell_the_shipped_pair() -> None:
     source = Path(rules_mod.__file__).read_text(encoding="utf-8")
     assert '"reachy", "robot"' not in source
     assert "nova" not in source.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Review findings on PR #182 — the field must be READ, not only declared       #
+# --------------------------------------------------------------------------- #
+
+from dataclasses import dataclass, field as _field  # noqa: E402
+
+from reachy.behavior.rule_engine import RuleEngine, _field_present, _field_value  # noqa: E402
+from reachy.behavior.sense import Sense  # noqa: E402
+
+
+@dataclass
+class _RecordingCtx:
+    """Minimal duck-typed TickContext (mirrors test_behavior_self_motion.py)."""
+
+    now: float = 0.0
+    tick: int = 0
+    sense: object = None
+    ownership: dict = _field(default_factory=dict)
+    admits: list = _field(default_factory=list)
+    evicts: list = _field(default_factory=list)
+    events: list = _field(default_factory=list)
+
+    def emit(self, event: dict) -> None:
+        self.events.append(event)
+
+    def admit(self, behavior) -> dict:
+        self.admits.append(behavior)
+        return {"ok": True, "op": "add", "id": behavior.id, "name": behavior.name}
+
+    def evict(self, name: str) -> dict:
+        self.evicts.append(name)
+        return {"ok": True, "op": "stop", "target": name}
+
+    def active_names(self) -> set:
+        return set()
+
+
+def test_the_rule_engine_reads_name_mentioned_as_a_condition_flag() -> None:
+    assert _field_present(Sense(name_mentioned=True), "name_mentioned") is True
+    assert _field_present(Sense(name_mentioned=False), "name_mentioned") is False
+    assert _field_present(Sense(), "name_mentioned") is False
+    assert _field_value(Sense(name_mentioned=True), "name_mentioned") is True
+
+
+def test_a_rule_keyed_on_name_mentioned_fires_and_only_on_that_tick() -> None:
+    cfg = rules_mod.RulesConfig.from_dict(
+        {
+            "react": [
+                {
+                    "id": "look-up-when-named",
+                    "when": {"field": "name_mentioned", "op": "is_true"},
+                    "run": "thoughtful",
+                    "cooldown_s": 0.0,
+                }
+            ]
+        }
+    )
+    engine = RuleEngine(cfg)
+    named = _RecordingCtx(now=0.25, tick=1, sense=Sense(name_mentioned=True, transcript="reachy hi"))
+    engine.on_tick(named)
+    assert [b.name for b in named.admits] == ["thoughtful"]
+
+    context_only = _RecordingCtx(now=0.5, tick=2, sense=Sense(transcript="and then what"))
+    engine.on_tick(context_only)
+    assert context_only.admits == []
+
+
+def test_an_accented_name_is_refused_because_the_matcher_is_ascii(tmp_path) -> None:
+    """``str.isalpha`` would accept it; the ``[A-Za-z]`` tokeniser could never match it."""
+    path = tmp_path / "rules.toml"
+    path.write_text('names = ["\u00e9va"]\n', encoding="utf-8")
+    with pytest.raises(CliError) as err:
+        rules_mod.load_rules(path)
+    assert "letters only (a-z)" in err.value.message

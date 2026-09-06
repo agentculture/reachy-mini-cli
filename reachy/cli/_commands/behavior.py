@@ -1139,7 +1139,10 @@ def cmd_engine_status(args: argparse.Namespace) -> int:
     ``behavior reload`` would otherwise read the file's answer as the robot's.
     """
     data = supervisor.status(base_url=args.base_url, timeout=args.timeout)
-    published = _published_names()
+    # A stopped or crashed engine leaves ``state.json`` behind until the next run
+    # resets the spool, so a published list is proof of nothing unless the
+    # supervisor says the process is alive.
+    published = _published_names() if data.get("process") == "running" else None
     names = published if published is not None else _names_on_disk()
     data["names"] = names
     data["names_source"] = NAMES_FROM_ENGINE if published is not None else NAMES_FROM_DISK
@@ -2076,7 +2079,7 @@ class _RuntimeResources:
             logger.warning("behavior: closing the %s raised; continuing", what, exc_info=True)
 
 
-def _engagement_classifier():
+def _engagement_classifier(names=None):
     """The transcript gate's optional LLM classifier, or ``None``.
 
     Mirrors the retired ``listen --live --transcribe`` builder so the symbolic runtime
@@ -2098,7 +2101,13 @@ def _engagement_classifier():
 
         # No base_url/model/api_key overrides — llm.complete resolves the one
         # REACHY_OPENAI_* endpoint, the same backend any external cognition uses.
-        return EngagementClassifier()
+        # *names* is the SAME live provider the transcript driver gets (#177), so
+        # the classifier's rendered prompt lists the configured names too — a
+        # classifier built on the shipped default would judge every nameless
+        # follow-up against a prompt that never heard of the configured name.
+        if names is None:
+            return EngagementClassifier()
+        return EngagementClassifier(names=names)
     except Exception:  # a build fault must not disable hearing
         logger.warning(
             "behavior: engagement classifier unavailable; the transcript gate "
@@ -2584,7 +2593,7 @@ def _compose_run_seam(
             # this composition root owns its lifecycle (start above, close in
             # `_RuntimeResources`), exactly as it owns the two held SDK clients.
             realtime=realtime,
-            classifier=_engagement_classifier(),
+            classifier=_engagement_classifier(names=names_provider),
             # Self-mute: the mic and the speaker share a room, so without this the
             # runtime transcribes its OWN voice, the transcript fires a rule, the
             # rule speaks, and the robot talks to itself forever. The actuator

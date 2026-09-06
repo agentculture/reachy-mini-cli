@@ -820,7 +820,13 @@ class TranscriptSenseDriver:
         without the two paths disagreeing about what a name is).
         """
         words = _WORD_RE.findall(text.lower())
-        if any(name in words for name in self._names()):
+        # EXACT whole-word, deliberately NOT the fuzzy matcher: this is the
+        # no-classifier fallback, and an STT mishearing engaging the robot with
+        # nothing to judge context is exactly what it must not do (pinned by
+        # test_misheard_name_does_not_engage_when_idle). The one concession is
+        # the clitic stem — "reachy's" names the robot as surely as "reachy".
+        stems = {word.split("'", 1)[0] for word in words}
+        if any(name in stems for name in self._names()):
             return True, True
         coherent = len(words) >= self._tuning.min_words
         return (coherent and t < self._engaged_until), False

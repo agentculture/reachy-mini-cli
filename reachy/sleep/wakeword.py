@@ -375,7 +375,14 @@ class OpenWakeWordBackend:
             from openwakeword.model import Model  # type: ignore[import-untyped]
 
             engine = Model(wakeword_models=[], inference_framework="tflite")
-            logger.info("[wakeword] openwakeword engine loaded, phrase=%r", self.phrase)
+            # The on-box engine fires on its BUNDLED models; a configured phrase or
+            # name steers the ``http`` backend only. Said once, at load, so a box
+            # that added a name and picked this backend is not silently deaf to it.
+            logger.warning(
+                "[wakeword] openwakeword detects its bundled models only — configured "
+                "phrases %r do not steer it (use --wake-word-kind http for those)",
+                self.phrases,
+            )
             return engine
         except ImportError:
             logger.debug("[wakeword] openwakeword not installed; Tier-2 wake-word disabled")

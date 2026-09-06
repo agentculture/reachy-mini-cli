@@ -124,6 +124,7 @@ the (separate, dependent) rules evaluator.
 
 from __future__ import annotations
 
+import re
 import logging
 import math
 import tomllib
@@ -236,6 +237,9 @@ DEFAULT_HYSTERESIS = 0.0
 #: imports THIS constant, so there is one number), because a rule is not its
 #: only caller.
 MAX_SAY_CHARS = 500
+
+#: The alphabet a configured name may use: the matcher tokenises ``[A-Za-z]``.
+_ASCII_NAME_RE = re.compile(r"[a-z]+")
 
 #: How many entries a rules file's ``names`` table may carry. Bounded rather
 #: than open-ended for the same fail-closed reason :data:`MAX_SAY_CHARS` is:
@@ -887,7 +891,10 @@ def _validate_names(raw: object) -> tuple[str, ...]:
                 remediation="quote each name in the array",
             )
         name = item.strip().lower()
-        if not name.isalpha():
+        # ASCII a-z ONLY — ``str.isalpha`` would admit an accented name the
+        # matcher's ``[A-Za-z]`` tokeniser can never extract, so it would be
+        # accepted here and unreachable everywhere else (#177 review).
+        if not _ASCII_NAME_RE.fullmatch(name):
             raise _error(
                 f"{path}: name {item!r} must be letters only (a-z) after lower-casing",
                 remediation="a name is one word: no digits, spaces, punctuation, or blanks",
