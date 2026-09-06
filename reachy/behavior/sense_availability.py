@@ -203,11 +203,12 @@ def runtime_probes(
 
     * ``pat`` / ``pat_event`` — the proprioceptive pose read-back, so the
       ``[sdk]`` extra; and the stack must actually have been composed.
-    * ``rms`` / ``rms_ratio`` / ``transcript`` — all three ride the ONE mic tap,
-      so all three need the ``[sdk]`` extra. (Hearing additionally needs a
-      reachable lobes session, but a down session is transient and latched by
-      the transcriber itself — see the module docstring on why this block does
-      not report liveness.)
+    * ``rms`` / ``rms_ratio`` / ``transcript`` / ``name_mentioned`` — all four
+      ride the ONE mic tap (``name_mentioned`` is a further derivative of the
+      transcript engagement gate's own verdict), so all four need the
+      ``[sdk]`` extra. (Hearing additionally needs a reachable lobes session,
+      but a down session is transient and latched by the transcriber itself —
+      see the module docstring on why this block does not report liveness.)
     * ``frame_available`` — camera frames come through the held media client:
       the ``[sdk]`` extra, and NOT ``[vision]`` (the frame-validity leg is
       numpy-only).
@@ -255,6 +256,7 @@ def runtime_probes(
         "rms": _media,
         "rms_ratio": _media,
         "transcript": _media,
+        "name_mentioned": _media,
         "frame_available": _media,
         "face": _face,
         "self_moving": lambda: AVAILABLE,

@@ -122,11 +122,13 @@ class SenseEvent:
     """A perception snapshot published when it differs from the last one.
 
     Mirrors :class:`reachy.behavior.sense.Sense`'s fields (``doa``/``speech``/
-    ``rms``/``pat``/``pat_state``/``face``/``frame_available``); ``pat`` stays
-    the legacy 2-element list (``[kind, level]``) or ``null``. ``pat_state`` is
-    an additive parallel object and is omitted when parsing an older raw shape
-    that did not carry it. Unknown object keys are ignored for forward
-    compatibility.
+    ``rms``/``pat``/``pat_state``/``face``/``frame_available``/
+    ``name_mentioned``); ``pat`` stays the legacy 2-element list
+    (``[kind, level]``) or ``null``. ``pat_state`` is an additive parallel
+    object and is omitted when parsing an older raw shape that did not carry
+    it. ``name_mentioned`` (issue #177) defaults ``False`` so an older raw
+    shape with no such key parses cleanly. Unknown object keys are ignored for
+    forward compatibility.
     """
 
     t: ClassVar[str] = "sense"
@@ -140,6 +142,7 @@ class SenseEvent:
     ts: float = 0.0
     tick: int = 0
     pat_state: dict | None = None
+    name_mentioned: bool = False
 
 
 @dataclass(frozen=True)
@@ -235,6 +238,7 @@ def runtime_to_jsonl(event: RuntimeEvent) -> str:
             "pat": event.pat,
             "face": event.face,
             "frame_available": event.frame_available,
+            "name_mentioned": event.name_mentioned,
         }
         pat_state = _pat_state_payload(event.pat_state)
         if pat_state is not None:
@@ -424,6 +428,7 @@ def _sense_event(event: dict) -> SenseEvent:
         ts=_safe_float(event.get("ts")),
         tick=_safe_int(event.get("tick")),
         pat_state=_pat_state_payload(event.get("pat_state")),
+        name_mentioned=bool(event.get("name_mentioned", False)),
     )
 
 
@@ -600,6 +605,7 @@ class SenseSnapshotDriver:
                 "pat_state": pat_state,
                 "face": getattr(sense, "face", None),
                 "frame_available": bool(getattr(sense, "frame_available", False)),
+                "name_mentioned": bool(getattr(sense, "name_mentioned", False)),
                 "ts": ctx.now,
                 "tick": ctx.tick,
             }

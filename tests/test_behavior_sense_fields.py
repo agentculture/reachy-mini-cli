@@ -292,18 +292,52 @@ def test_every_sense_field_is_fed_by_the_current_composition() -> None:
     composition root now wires ``rms`` (the shared per-tick mic chunk),
     ``transcript``, ``face`` and ``frame_available``, so every predicate field
     ``rules.py`` accepts is genuinely fed and ``behavior rules check`` has
-    nothing left to warn about. The assertion stays in place inverted, so the
-    NEXT drift (a new predicate field added to ``SENSE_FIELDS`` with nothing
-    feeding it) is caught here rather than discovered as a silently dead rule.
-
-    ONE field is knowingly pending (#177): ``name_mentioned`` entered
-    ``SENSE_FIELDS`` with t2 (the rules schema learned the ``names`` table) and
-    gains its provider in t3. The canary stays sharp meanwhile — the gap is
-    pinned by EQUALITY to exactly that one name, so any OTHER unfed field still
-    fails here, and t3 restores the plain ``==`` by deleting the pending set.
+    nothing left to warn about. t3 (#177) closes the last knowingly-pending
+    gap — ``name_mentioned`` (which entered ``SENSE_FIELDS`` with t2) now has
+    its own ``_PROVIDER_PREDICATE_FIELDS`` / ``_COMPOSED_PROVIDER_FIELDS``
+    entries — so the assertion is restored to a plain equality: the NEXT
+    drift (a new predicate field added to ``SENSE_FIELDS`` with nothing
+    feeding it) is caught here rather than discovered as a silently dead
+    rule.
     """
     from reachy.behavior.rules import SENSE_FIELDS
 
-    pending = frozenset({"name_mentioned"})  # t3 wires the provider
-    assert SENSE_FIELDS - FED_SENSE_FIELDS == pending
-    assert FED_SENSE_FIELDS - SENSE_FIELDS == frozenset()
+    assert FED_SENSE_FIELDS == SENSE_FIELDS
+
+
+# --------------------------------------------------------------------------- #
+# 6. name_mentioned (#177) — Sense field, provider seam, registry pins       #
+# --------------------------------------------------------------------------- #
+
+
+def test_empty_sense_name_mentioned_defaults_false() -> None:
+    assert EMPTY_SENSE.name_mentioned is False
+    assert Sense().name_mentioned is False
+
+
+def test_read_perception_peeks_the_name_mentioned_provider() -> None:
+    snap = read_perception(SenseProviders(name_mentioned=lambda: True))
+    assert snap.name_mentioned is True
+
+
+def test_a_raising_name_mentioned_provider_degrades_to_false() -> None:
+    def _boom():
+        raise RuntimeError("gate unavailable")
+
+    assert read_perception(SenseProviders(name_mentioned=_boom)).name_mentioned is False
+
+
+def test_name_mentioned_provider_result_is_coerced_to_bool() -> None:
+    snap = read_perception(SenseProviders(name_mentioned=lambda: "truthy-but-not-bool"))
+    assert snap.name_mentioned is True
+    snap2 = read_perception(SenseProviders(name_mentioned=lambda: None))
+    assert snap2.name_mentioned is False
+
+
+def test_name_mentioned_is_declared_fed_in_the_same_change() -> None:
+    from reachy.behavior.rules import SENSE_FIELDS
+    from reachy.behavior.sense import _COMPOSED_PROVIDER_FIELDS
+
+    assert "name_mentioned" in _COMPOSED_PROVIDER_FIELDS
+    assert "name_mentioned" in FED_SENSE_FIELDS
+    assert "name_mentioned" in SENSE_FIELDS

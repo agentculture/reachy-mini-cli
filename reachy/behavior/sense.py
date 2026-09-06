@@ -124,7 +124,7 @@ class Sense:
     read.
 
     ``rms``, ``pat_event``, ``pat_state``, ``face``, ``frame_available``,
-    ``transcript``, and ``self_moving`` extend the snapshot with the cues the
+    ``transcript``, ``self_moving``, and ``name_mentioned`` extend the snapshot with the cues the
     retired ``listen`` loop carried on its folded hooks (``PatHook`` /
     ``VisionHook`` / ``FaceHook`` / ``TranscribeHook``), so a sensor-driven
     behavior reads them the same way it reads ``doa_angle``. Each has a "no reading"
@@ -181,6 +181,14 @@ class Sense:
       A CONDITION like ``frame_available`` (an always-populated boolean, never
       ``None``), defaulting ``False``. It is both a rule predicate in its own
       right and the latch behind the moving rms floor (#95).
+    - ``name_mentioned`` — a one-tick EVENT (issue #177): the transcript
+      engagement gate admitted an utterance THIS tick because it named the
+      robot, mirroring ``face``'s/``pat_event``'s one-tick-latch semantics
+      rather than a held condition like ``frame_available``. An utterance
+      admitted on CONTEXT alone (the warm-window path, no name in it) leaves
+      this ``False`` — the field answers "was I addressed by name just now",
+      never "is a conversation open". The robot must never learn a peer's
+      name from this field; it fires on ITS OWN name only. Defaults ``False``.
     """
 
     doa_angle: float | None = None
@@ -196,6 +204,7 @@ class Sense:
     transcript: str | None = None
     self_moving: bool = False
     rms_ratio: float | None = None
+    name_mentioned: bool = False
 
 
 # The "no reading" snapshot — what behaviors get when nothing senses, the poll
@@ -308,6 +317,7 @@ FaceAgeProvider = Callable[[], float | None]
 FrameAvailableProvider = Callable[[], bool]
 TranscriptProvider = Callable[[], str | None]
 SelfMovingProvider = Callable[[], bool]
+NameMentionedProvider = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -336,6 +346,7 @@ class SenseProviders:
     transcript: TranscriptProvider | None = None
     self_moving: SelfMovingProvider | None = None
     rms_ratio: RmsRatioProvider | None = None
+    name_mentioned: NameMentionedProvider | None = None
 
 
 #: Predicate-field names (the ``Predicate.field`` vocabulary validated against
@@ -364,6 +375,7 @@ _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
     "frame_available": "frame_available",
     "transcript": "transcript",
     "self_moving": "self_moving",
+    "name_mentioned": "name_mentioned",
 }
 
 #: Which of the optional :class:`SenseProviders` attributes the CURRENT engine
@@ -396,8 +408,26 @@ _PROVIDER_PREDICATE_FIELDS: dict[str, str] = {
 #: change that wires the provider — this is the only place that needs
 #: updating; nothing else duplicates this list, so the check can never drift
 #: from reality by forgetting a second copy.
+#:
+#: ``name_mentioned`` (issue #177) is declared here ahead of its composition
+#: wiring: t3 lands the field/provider/registry plumbing across every
+#: registry this module owns, and a LATER task wires the concrete provider
+#: (the transcript engagement gate's own name-match verdict) into
+#: ``_compose_run_seam``. That is the same "wiring, not hardware" reading
+#: this set's docstring already draws for a mic-less box's DoA leg, one step
+#: earlier: the predicate is genuinely live the moment the provider lands,
+#: with no further registry change needed here.
 _COMPOSED_PROVIDER_FIELDS: frozenset[str] = frozenset(
-    {"pat_event", "rms", "rms_ratio", "face", "frame_available", "transcript", "self_moving"}
+    {
+        "pat_event",
+        "rms",
+        "rms_ratio",
+        "face",
+        "frame_available",
+        "transcript",
+        "self_moving",
+        "name_mentioned",
+    }
 )
 
 #: The full set of predicate fields (``Predicate.field`` values) the current
@@ -494,6 +524,7 @@ def read_perception(
         pat_state=pat_state if isinstance(pat_state, PatState) else UNAVAILABLE_PAT_STATE,
         transcript=_peek(providers.transcript, None),
         self_moving=bool(_peek(providers.self_moving, False)),
+        name_mentioned=bool(_peek(providers.name_mentioned, False)),
     )
 
 

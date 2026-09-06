@@ -101,6 +101,12 @@ def test_sense_cues_never_produces_a_frame_available_cue():
     assert runtime_cues.sense_cues({"frame_available": True}) == []
 
 
+def test_sense_cues_name_mentioned():
+    assert runtime_cues.sense_cues({"name_mentioned": True}) == [runtime_cues.NAME_MENTIONED_CUE]
+    assert runtime_cues.sense_cues({"name_mentioned": False}) == []
+    assert runtime_cues.sense_cues({}) == []  # absent is the same as False
+
+
 def test_sense_cues_everything_at_once_in_order():
     event = {
         "doa": 1.5707963267948966,
