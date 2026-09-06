@@ -1367,3 +1367,231 @@ def test_worker_tick_stamps_captured_at_on_the_published_observation() -> None:
     observation = published[0]
     assert isinstance(observation, FS.FaceObservation)
     assert observation.captured_at == pytest.approx(5.0)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #179 — still-only detection: the self-motion gate on the worker        #
+# --------------------------------------------------------------------------- #
+#
+# On the CM4 a detection submitted mid-slew costs the tick rate (50 -> 7 Hz)
+# AND produces a blurred bbox in a head frame that has already moved on. The
+# gate is the same shape as ``rms_sense``'s moving floor: an injected
+# ``SelfMovingProvider`` peek, one senselog line per transition (never per
+# tick), and a raising/missing peek that degrades to "not moving".
+
+
+class _GateDriver:
+    """A recognizer-ready driver whose detections are counted, on a fake clock."""
+
+    def __init__(self, clock_box, **kwargs):
+        self.detections = 0
+        engine = _FakeEngine()
+        self.driver = FaceSenseDriver(
+            media=_FakeMedia([_frame()]),
+            engine=engine,
+            store=_FakeStore(match=_FakeMatch("ada")),
+            detect_interval=0.5,
+            frame_interval_s=0.0,
+            clock=lambda: clock_box[0],
+            start_worker=False,
+            **kwargs,
+        )
+        self._engine = engine
+
+    def worker_tick(self) -> None:
+        before = len(self._engine.frames)
+        self.driver._worker_tick()
+        if len(self._engine.frames) > before:
+            self.detections += 1
+
+
+def _gate_lines(caplog) -> list:
+    """Every senselog line this module's self-motion gate emitted."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "stage=gate source=face" in record.getMessage()
+    ]
+
+
+def _run_gate(gate, clock_box, *, seconds: float, step: float = 0.1, ctx_start: float = 0.0):
+    """Advance the fake clock, publishing a frame and running the worker each step."""
+    ticks = int(round(seconds / step))
+    for i in range(ticks):
+        clock_box[0] = round(clock_box[0] + step, 6)
+        gate.driver(_Ctx(round(ctx_start + (i + 1) * step, 6)))
+        gate.worker_tick()
+
+
+def test_a_moving_head_submits_zero_detections() -> None:
+    """Criterion (a), first half: 2 s of commanded motion -> nothing detected."""
+    clock = [0.0]
+    gate = _GateDriver(clock, moving=lambda: True)
+    _run_gate(gate, clock, seconds=2.0)
+    assert gate.detections == 0
+
+
+def test_detection_resumes_once_the_settle_has_elapsed_after_motion_stops() -> None:
+    """Criterion (a), second half: within ``still_settle_s`` of stillness it detects again."""
+    clock = [0.0]
+    moving = {"v": True}
+    gate = _GateDriver(clock, moving=lambda: moving["v"], still_settle_s=0.5)
+    _run_gate(gate, clock, seconds=2.0)
+    assert gate.detections == 0
+
+    moving["v"] = False
+    # Inside the settle: still nothing.
+    _run_gate(gate, clock, seconds=0.4, ctx_start=2.0)
+    assert gate.detections == 0
+    # Past the settle: a detection lands.
+    _run_gate(gate, clock, seconds=0.4, ctx_start=2.4)
+    assert gate.detections >= 1
+
+
+def test_a_held_lock_degrades_the_cadence_instead_of_silencing_it() -> None:
+    """Criterion (b): while a lock is held, motion slows detection — it never stops it."""
+    clock = [0.0]
+    gate = _GateDriver(
+        clock,
+        moving=lambda: True,
+        lock_held=lambda: True,
+        held_detect_interval=1.5,
+    )
+    _run_gate(gate, clock, seconds=6.0)
+    # 6 s at a 1.5 s held cadence: a handful, not zero and not the free-running rate.
+    assert 3 <= gate.detections <= 5
+
+
+def test_the_gate_emits_exactly_one_open_and_one_close_line_per_motion_episode(caplog) -> None:
+    """Criterion (e): transitions are observable; ticks are not."""
+    clock = [0.0]
+    moving = {"v": False}
+    gate = _GateDriver(clock, moving=lambda: moving["v"], still_settle_s=0.5)
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        _run_gate(gate, clock, seconds=0.5)
+        moving["v"] = True
+        _run_gate(gate, clock, seconds=2.0, ctx_start=0.5)
+        moving["v"] = False
+        _run_gate(gate, clock, seconds=1.5, ctx_start=2.5)
+
+    lines = _gate_lines(caplog)
+    assert len(lines) == 2, lines
+    assert "opened" in lines[0] and "self-moving" in lines[0]
+    assert "held=" in lines[0]
+    assert "closed" in lines[1]
+
+
+def test_a_raising_moving_peek_degrades_to_not_moving() -> None:
+    """Criterion (f): a broken peek is never a crash and never a silenced sense."""
+
+    def _boom() -> bool:
+        raise RuntimeError("no self-motion driver")
+
+    clock = [0.0]
+    gate = _GateDriver(clock, moving=_boom)
+    _run_gate(gate, clock, seconds=2.0)
+    assert gate.detections >= 1
+
+
+def test_without_a_moving_peek_the_cadence_is_exactly_todays() -> None:
+    """No injected provider means no gate at all — the pre-#179 behaviour."""
+    clock = [0.0]
+    gate = _GateDriver(clock)
+    _run_gate(gate, clock, seconds=2.0)
+    assert gate.detections >= 1
+
+
+# --------------------------------------------------------------------------- #
+# Issue #179 / #176 — the ``on_stale`` callback seam                          #
+# --------------------------------------------------------------------------- #
+#
+# ``_check_stream_staleness`` stays DETECT ONLY here: it calls an injected
+# callback and nothing else. Composition (a later task) binds it to
+# ``HeldMediaClient.drop``; this module imports neither.
+
+
+def test_on_stale_fires_once_per_silent_episode() -> None:
+    calls: list = []
+    media = _FakeMedia([_frame(), None, _frame(), None])
+    driver = FaceSenseDriver(
+        media=media,
+        start_worker=False,
+        frame_interval_s=0.0,
+        stream_stale_s=1.0,
+        on_stale=calls.append,
+    )
+    driver(_Ctx(0.0))  # a frame anchors `_last_frame_at`
+    driver(_Ctx(2.0))  # silent past the window -> episode 1
+    driver(_Ctx(2.5))  # still silent -> no second call
+    assert calls == [FS.REASON_STREAM_ENDED]
+
+    driver(_Ctx(2.6))  # frames resume: the latch re-arms
+    driver(_Ctx(5.0))  # silent again -> episode 2
+    assert calls == [FS.REASON_STREAM_ENDED, FS.REASON_STREAM_ENDED]
+
+
+def test_on_stale_never_fires_when_no_frame_ever_arrived() -> None:
+    calls: list = []
+    driver = FaceSenseDriver(
+        media=_FakeMedia([None]),
+        start_worker=False,
+        frame_interval_s=0.0,
+        stream_stale_s=1.0,
+        on_stale=calls.append,
+    )
+    for now in (0.0, 1.0, 5.0, 50.0):
+        driver(_Ctx(now))
+    assert calls == []
+
+
+def test_on_stale_never_fires_when_the_camera_reports_unavailable() -> None:
+    """A died pipeline still LOGS the drop; it must not ask for a re-acquire."""
+    calls: list = []
+    media = _FakeMedia([_frame()])
+    driver = FaceSenseDriver(
+        media=media,
+        start_worker=False,
+        frame_interval_s=0.0,
+        stream_stale_s=1.0,
+        on_stale=calls.append,
+    )
+    driver(_Ctx(0.0))
+    media.camera_available = False
+    for now in (2.0, 5.0, 20.0):
+        driver(_Ctx(now))
+    assert calls == []
+
+
+def test_a_raising_on_stale_is_contained_and_logged_once(caplog) -> None:
+    def _boom(reason: str) -> None:
+        raise RuntimeError("holder is gone")
+
+    media = _FakeMedia([_frame(), None, _frame(), None])
+    driver = FaceSenseDriver(
+        media=media,
+        start_worker=False,
+        frame_interval_s=0.0,
+        stream_stale_s=1.0,
+        on_stale=_boom,
+    )
+    with caplog.at_level(logging.WARNING, logger="reachy.behavior.face_sense"):
+        driver(_Ctx(0.0))
+        driver(_Ctx(2.0))
+        driver(_Ctx(2.6))
+        driver(_Ctx(5.0))
+
+    assert driver.peek_frame_available() is False  # no crash reached the tick body
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+
+def test_without_a_callback_the_staleness_path_is_exactly_todays(caplog) -> None:
+    media = _FakeMedia([_frame(), None])
+    driver = FaceSenseDriver(
+        media=media, start_worker=False, frame_interval_s=0.0, stream_stale_s=1.0
+    )
+    with caplog.at_level(logging.INFO, logger="reachy.sense"):
+        driver(_Ctx(0.0))
+        for now in (2.0, 5.0):
+            driver(_Ctx(now))
+    assert len(_drop_messages(caplog, FS.REASON_STREAM_ENDED)) == 1
