@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The robot's canonical names gain "nova" (`name_match`, `engagement`,
+  `transcript_sense`, `attention`, the sleep wake-word default) alongside
+  "reachy"/"robot", with n-family collision guards (a Soundex phonetic guard,
+  an apostrophe/clitic stem match, and a four-letter fuzzy-match floor) so
+  "now"/"no"/"know"/"nah"/"not"/"novel"/"november"/"nowhere"/"nothing"/"never"
+  do not false-trigger the name fast-path.
+
 ## [0.51.1] - 2026-08-26
 
 ### Fixed
