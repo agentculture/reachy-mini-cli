@@ -103,6 +103,7 @@ boundary holds.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 from typing import Callable, Iterable
@@ -114,6 +115,8 @@ from reachy.cli._errors import EXIT_USER_ERROR, CliError
 #: :mod:`reachy.behavior.intents`'s bare-verb naming (``run_behavior``, ...).
 LOCK_FACE = "lock_face"
 RELEASE_FACE = "release_face"
+
+logger = logging.getLogger(__name__)
 
 #: The library entry the lock admits.
 FACE_LOCK_BEHAVIOR = "face-lock"
@@ -448,9 +451,19 @@ class FaceLockGaze:
                 cx, cy = centre
                 new_yaw = _clamp(base_yaw - (cx - 0.5) * fov_h * damping, max_yaw)
                 new_pitch = _clamp(base_pitch - (cy - 0.5) * fov_v * damping, max_pitch)
-                if self._admit_target(new_yaw, new_pitch, cx, cy):
+                admitted = self._admit_target(new_yaw, new_pitch, cx, cy)
+                if admitted:
                     self._target_yaw = new_yaw
                     self._target_pitch = new_pitch
+                logger.info(
+                    "[SENSE stage=intent source=lock_face event=aim] "
+                    "cx=%.3f cy=%.3f admitted=%s -> yaw=%.1f pitch=%.1f",
+                    cx,
+                    cy,
+                    admitted,
+                    self._target_yaw,
+                    self._target_pitch,
+                )
                 self._last_capture = capture
                 self._last_bbox = bbox
         else:
