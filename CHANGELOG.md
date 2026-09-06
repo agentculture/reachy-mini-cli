@@ -49,10 +49,7 @@ The September-6 face/lock/camera arc — six issues, one PR
 - `face_age_s` measures detection latency on the driver's own clock, applied
   to the engine tick clock — the two time bases never couple.
 
-### Fixed
-
 ## [0.53.1] - 2026-09-06
-## [0.52.1] - 2026-09-06
 
 ### Added
 

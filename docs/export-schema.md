@@ -610,7 +610,13 @@ keys in the same snapshot.
 currently seeded and active, and, when it is not, why:
 
 ```json
-{"base_layer": {"seeded": true, "active": false, "stopped_by": "stop"}}
+{
+  "base_layer": {
+    "seeded": true,
+    "active": false,
+    "stopped_by": "stop"
+  }
+}
 ```
 
 `stopped_by` is `null` while `active` is `true`; `"stop"` after an explicit
@@ -628,7 +634,16 @@ for the full walkthrough.
 `last_frame_at` (float timestamp or `null`):
 
 ```json
-{"senses": {"face": {"available": true, "reason": null, "live": true, "last_frame_at": 1234.5}}}
+{
+  "senses": {
+    "face": {
+      "available": true,
+      "reason": null,
+      "live": true,
+      "last_frame_at": 1234.5
+    }
+  }
+}
 ```
 
 `available`/`reason` stay **structural** — composed once, at process start,
