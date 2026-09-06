@@ -183,7 +183,7 @@ import math
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.util import find_spec as _find_spec
 from typing import Any, Callable
 
@@ -558,10 +558,21 @@ class FaceObservation:
     pair is the whole point of t2: before it, an unmatched detection was
     discarded entirely and a stranger looking at the robot produced no reading
     at all.
+
+    ``captured_at`` (t4 #181) is the worker's own clock (``self._clock()``) read
+    at the moment the frame was TAKEN — before detection, which on the CM4
+    costs non-trivial time. It is what the tick-thread age/TTL logic anchors
+    on instead of the (later) drain/publish tick, so ``face_age_s`` reports how
+    old the detection actually is rather than under-reporting it by the
+    detection's own runtime. ``None`` (the default) is what an older producer
+    or a test fake constructing this dataclass bare still yields, and the
+    consumer falls back to the drain tick's own clock in that case — never a
+    crash, never a stale-looking reading with no anchor at all.
     """
 
     name: str | None = None
     bbox: tuple[float, float, float, float] | None = None
+    captured_at: float | None = None
 
 
 def bbox_area(bbox: tuple[float, float, float, float] | None) -> float:
@@ -1000,9 +1011,13 @@ class FaceSenseDriver:
         if observation is None:
             return
         if observation.bbox is not None:
+            # Anchor on the worker's own capture-time clock read (t4 #181) when
+            # the observation carries one; an older producer/test fake with no
+            # captured_at falls back to this drain tick, exactly as before.
+            anchor = observation.captured_at if observation.captured_at is not None else now
             self._face_bbox = observation.bbox
-            self._face_bbox_at = now
-            self._face_age_s = 0.0 if now is not None else None
+            self._face_bbox_at = anchor
+            self._face_age_s = (now - anchor) if (now is not None and anchor is not None) else None
         name = (observation.name or "").strip()
         if not name:
             return
@@ -1032,12 +1047,14 @@ class FaceSenseDriver:
     def _age_position(self, now: float | None) -> None:
         """Re-age the held position each tick and expire it past its TTL.
 
-        Age is measured on the ENGINE'S tick clock (``ctx.now``) at the moment
-        the observation was drained, never on the worker's own clock: mixing
-        two clocks in one reading is how a "seconds ago" ends up meaningless.
-        The drain happens on the tick after the detection completes, so the
-        reading is late by at most one tick — far inside anything a motion
-        behavior can act on.
+        Age is measured on the ENGINE'S tick clock (``ctx.now``) against the
+        anchor :meth:`_drain_match` set — the observation's ``captured_at``
+        (the worker's pre-detection clock read, t4 #181) when present, or the
+        drain tick itself as a fallback for an observation with none. Mixing
+        two clocks in one reading is how a "seconds ago" ends up meaningless,
+        so both anchor and ``now`` here are read on the SAME clock domain in
+        production (both default to ``time.monotonic``); a test that injects
+        one must inject the other identically.
         """
         anchor = self._face_bbox_at
         if self._face_bbox is None or anchor is None or now is None:
@@ -1097,9 +1114,10 @@ class FaceSenseDriver:
         if not usable_frame(frame):
             return
         self._last_detect = now
+        captured_at = now  # the clock read BEFORE detection, per t4 #181 / h32
         observation = self._detect_once(frame)
         if observation is not None:
-            self._output.publish(observation)
+            self._output.publish(replace(observation, captured_at=captured_at))
 
     def _detect_once(self, frame: object) -> "FaceObservation | None":
         """Detect + embed + match one frame -> the chosen face, or ``None``.
