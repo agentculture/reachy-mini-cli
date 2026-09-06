@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0] - 2026-09-06
+
+### Added
+
+- The robot's canonical names gain "nova" (`name_match`, `engagement`,
+  `transcript_sense`, `attention`, the sleep wake-word default) alongside
+  "reachy"/"robot", with n-family collision guards (a Soundex phonetic guard,
+  an apostrophe/clitic stem match, and a four-letter fuzzy-match floor) so
+  "now"/"no"/"know"/"nah"/"not"/"novel"/"november"/"nowhere"/"nothing"/"never"
+  do not false-trigger the name fast-path.
+- `select_face` prefers a recognised (enrolled) face when several faces are in
+  frame — biggest among equals — so a gaze lock taken for reachy-nova's
+  conversation hold goes to the person the robot knows (#175). No other
+  face-lock gain, cadence or TTL constant changes.
+
 ## [0.51.1] - 2026-08-26
 
 ### Fixed

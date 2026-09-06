@@ -450,6 +450,15 @@ def test_the_gate_reports_which_rule_admitted_an_utterance() -> None:
     assert (refused.admitted, refused.label) == (False, LABEL_COLD)
 
 
+def test_the_gate_admits_nova_via_the_name_rule() -> None:
+    """ "nova" opens the gate exactly like "reachy" (issue #25)."""
+    clock = _Clock()
+    gate = AttentionGate(window_s=20.0, clock=clock)
+
+    opened = gate.decide("hey nova, hello")
+    assert (opened.admitted, opened.label, opened.opened) == (True, LABEL_NAME, True)
+
+
 def test_the_gate_never_admits_an_empty_or_wordless_utterance() -> None:
     gate = AttentionGate(window_s=20.0, clock=_Clock())
     for junk in ("", "   ", "...", "?!"):

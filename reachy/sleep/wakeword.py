@@ -11,7 +11,7 @@ keeps Tier-1 (speech flag + snap) and obtains its Tier-2 backend from here via
   accumulates a rolling audio window (a single tick's mic chunk is far too short
   to transcribe a phrase), POSTs it as a WAV upload at most once per
   ``min_interval``, parses the JSON response, and fires when a configurable wake
-  phrase (default ``"hey reachy"``) is detected. A configured-but-unreachable /
+  phrase (default ``"hey reachy"`` OR ``"hey nova"``) is detected. A configured-but-unreachable /
   absent endpoint degrades cleanly to "no wake-word" (``update`` returns
   ``False``) and **never raises**. No on-box STT model is bundled.
 
@@ -66,6 +66,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_PHRASE = "hey reachy"
+#: Default wake phrases (issue #25: the robot also answers to "nova"). Only
+#: used when neither an explicit ``phrase`` arg nor ``REACHY_STT_PHRASE`` is
+#: set — either of those still selects exactly one phrase, preserving the
+#: existing override semantics.
+DEFAULT_PHRASES: tuple[str, ...] = ("hey reachy", "hey nova")
 #: Endpoint path + per-request timeout for the STT POST. The *transcription* leg
 #: (URL / language / sample-rate / window / throttle resolution) is now owned by
 #: :class:`reachy.speech.stt.Transcriber`; only the wake-word-specific defaults
@@ -89,6 +94,21 @@ DEFAULT_KIND = KIND_HTTP
 def _resolve_phrase(override: str | None) -> str:
     """Return the wake phrase: explicit arg > ``REACHY_STT_PHRASE`` > default."""
     return override or os.environ.get("REACHY_STT_PHRASE") or DEFAULT_PHRASE
+
+
+def _resolve_phrases(override: str | None) -> tuple[str, ...]:
+    """Return the wake phrases to match against.
+
+    An explicit ``phrase`` arg or ``REACHY_STT_PHRASE`` selects exactly one
+    phrase (unchanged override semantics); only the unconfigured default
+    expands to :data:`DEFAULT_PHRASES` (both "hey reachy" and "hey nova").
+    """
+    env = os.environ.get("REACHY_STT_PHRASE")
+    if override:
+        return (override,)
+    if env:
+        return (env,)
+    return DEFAULT_PHRASES
 
 
 def _resolve_stt_timeout(override: float | None) -> float:
@@ -143,7 +163,9 @@ class HttpSttBackend:
         (``http://localhost:9002`` — Parakeet on the same box).
     phrase:
         Wake phrase to match (case-insensitive substring). Explicit arg >
-        ``REACHY_STT_PHRASE`` > ``"hey reachy"``.
+        ``REACHY_STT_PHRASE`` > :data:`DEFAULT_PHRASES` (``"hey reachy"`` OR
+        ``"hey nova"`` — either fires; an explicit arg or the env override
+        still selects exactly one phrase).
     stt_path:
         Endpoint path appended to the base URL (default
         ``/v1/audio/transcriptions``).
@@ -181,7 +203,10 @@ class HttpSttBackend:
         min_interval: float = DEFAULT_MIN_INTERVAL,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.phrase = _resolve_phrase(phrase)
+        self.phrases = _resolve_phrases(phrase)
+        #: Primary phrase, kept for back-compat with callers/logging that read
+        #: a single ``.phrase`` — always the first of :attr:`phrases`.
+        self.phrase = self.phrases[0]
         # The transcription leg (WAV-multipart + urllib + rolling window +
         # throttle) is owned by the shared Transcriber; this backend keeps only
         # the wake-word-specific phrase matching on top of the raw JSON payload.
@@ -253,11 +278,14 @@ class HttpSttBackend:
         if bool(payload.get("detected")):
             return True
         phrase = payload.get("phrase")
-        if isinstance(phrase, str) and phrase.strip().lower() == self.phrase.lower():
-            return True
+        if isinstance(phrase, str):
+            candidate = phrase.strip().lower()
+            if any(candidate == p.lower() for p in self.phrases):
+                return True
         transcript = payload.get("text") or payload.get("transcript")
         if isinstance(transcript, str) and transcript:
-            return self.phrase.lower() in transcript.lower()
+            lowered = transcript.lower()
+            return any(p.lower() in lowered for p in self.phrases)
         return False
 
 
