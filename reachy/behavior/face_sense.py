@@ -479,14 +479,26 @@ def select_face(candidates) -> "FaceCandidate | None":
     A candidate with no box (no position to report) never outranks one with a
     box, named or not — see issue #127: an unnamed face still needs a
     position, so "any face qualifies" is preserved even for a single,
-    completely unknown face in frame.
+    completely unknown face in frame. Among BOXLESS candidates the same
+    recognised-first rule applies, so a name cue is never lost to an unnamed
+    detection that merely came first (before this ordering was explicit, two
+    boxless detections resolved to whichever the detector reported first).
+
+    The whole rule is ONE sort key — ``(has a box, is named, area)`` — so the
+    three tiers cannot drift apart as separate filters.
     """
-    scored = [(candidate, bbox_area(candidate.bbox)) for candidate in candidates]
-    if not scored:
+    ranked = [
+        (
+            candidate.bbox is not None,
+            bool((candidate.name or "").strip()),
+            bbox_area(candidate.bbox),
+        )
+        for candidate in candidates
+    ]
+    if not ranked:
         return None
-    named = [pair for pair in scored if pair[0].bbox is not None and (pair[0].name or "").strip()]
-    pool = named or scored
-    return max(pool, key=lambda pair: pair[1])[0]
+    best = max(range(len(ranked)), key=lambda index: ranked[index])
+    return list(candidates)[best]
 
 
 def to_xywh(bbox_norm) -> "tuple[float, float, float, float] | None":
