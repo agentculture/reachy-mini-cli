@@ -151,7 +151,7 @@ def plan_look_at_face(
     a missing DoA age) or older than ``max_age_s``. A fresh bbox maps through
     the SAME bbox-centre -> yaw/pitch convention as
     :class:`reachy.behavior.face_lock.FaceLockGaze` (``+yaw`` left, ``+pitch``
-    up; gain equal to the clamp, so the mapping is linear across the frame and
+    chin-down; gain equal to the clamp, so the mapping is linear across the frame and
     only saturates at the edge) and clamps to ``max_yaw``/``max_pitch``.
     """
     centre = _bbox_centre(sense.face_bbox)
@@ -161,7 +161,9 @@ def plan_look_at_face(
         return None
     cx, cy = centre
     yaw = _clamp(-(cx - 0.5) * 2.0 * face_lock_mod.YAW_GAIN_DEG, max_yaw)
-    pitch = _clamp(-(cy - 0.5) * 2.0 * face_lock_mod.PITCH_GAIN_DEG, max_pitch)
+    # +pitch is chin-DOWN (SDK `from_euler("xyz")`, x-forward z-up): a face low
+    # in the frame needs a positive pitch. Inverted until deviation d7.
+    pitch = _clamp((cy - 0.5) * 2.0 * face_lock_mod.PITCH_GAIN_DEG, max_pitch)
     return (yaw, pitch)
 
 

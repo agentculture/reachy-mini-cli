@@ -175,9 +175,12 @@ def test_the_locked_behavior_maps_the_bbox_centre_to_yaw_and_pitch_every_tick() 
     assert fn.target_yaw < 0.0
     assert fn.yaw == pytest.approx(fn.target_yaw, abs=1e-6)
 
-    # A face HIGH in the frame (small y) tilts the head up: +pitch is up.
+    # A face HIGH in the frame (small y) tilts the head UP, and +pitch is
+    # chin-DOWN (SDK `from_euler("xyz")`, x-forward z-up), so the target is
+    # NEGATIVE. Shipped with the sign inverted until the 2026-09-06 live
+    # retest (deviation d7): the head dipped away from every face above it.
     _run(fn, params, _face(cx=0.5, cy=0.1), 200)
-    assert fn.target_pitch > 0.0
+    assert fn.target_pitch < 0.0
     assert fn.pitch == pytest.approx(fn.target_pitch, abs=1e-6)
 
     # A CENTRED face asks for no correction, so the aim HOLDS where it is —
@@ -568,11 +571,12 @@ def _seen_bbox(
     A pinhole camera bolted to the head, small-angle-linearised across the frame
     (exact enough for a convergence property, and the same linearisation the
     lock's own inverse makes). The repo's signs: ``+yaw`` is LEFT, so a face to
-    the left of the camera axis lands at a SMALLER x; ``+pitch`` is up, so a face
-    above the axis lands at a SMALLER y.
+    the left of the camera axis lands at a SMALLER x; ``+pitch`` is CHIN-DOWN
+    (SDK ``from_euler("xyz")``, x-forward z-up — deviation d7), so a face BELOW
+    the axis (a positive ``bearing_pitch``) lands at a LARGER y.
     """
     cx = 0.5 - (bearing_yaw - yaw) / _HFOV
-    cy = 0.5 - (bearing_pitch - pitch) / _VFOV
+    cy = 0.5 + (bearing_pitch - pitch) / _VFOV
     return (cx - size / 2.0, cy - size / 2.0, size, size)
 
 
