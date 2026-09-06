@@ -82,6 +82,11 @@ def _noop_ensure_base() -> str | None:
     return None
 
 
+def _noop_add_base() -> dict:
+    """Default ``TickContext.add_base`` for a context built without an engine."""
+    return {"ok": False, "op": "add", "name": BASE_LAYER_NAME, "error": "no engine bound"}
+
+
 @dataclass
 class TickContext:
     """The per-tick seam contract handed to ``engine.run(tick_seam=...)``.
@@ -124,7 +129,17 @@ class TickContext:
       ``feel-alive`` base layer if no base behavior is active, returning the new
       id (``None`` when one already is — the call is idempotent). The seam a
       rider uses on the edge where an inhibition naming the base layer CLEARS
-      (see :meth:`Engine.ensure_base`); the engine itself never calls it.
+      (see :meth:`Engine.ensure_base`); the engine itself never calls it. It
+      REFUSES while the base layer was stopped BY NAME — that is intentional
+      stillness, and only ``add_base`` undoes it.
+    * ``add_base`` — ``add_base() -> dict``: the UN-STOP verb, an explicit
+      unbounded :meth:`Engine.add` of :data:`BASE_LAYER_NAME` (see that method's
+      carve-out), returning the ordinary add outcome. It is the seam the spool's
+      ``run_behavior feel-alive`` with no lifetime routes through
+      (:mod:`reachy.behavior.intents`), so the agent-facing surface and
+      ``behavior run feel-alive`` reach the SAME base re-seed path — and unlike
+      ``ensure_base`` it clears a by-name stop, because asking for the base layer
+      by name IS the operator changing their mind.
 
     The ``tick_seam`` is invoked directly and is responsible for its own error
     isolation (the engine adds none), so one rider raising never silently eats
@@ -142,6 +157,7 @@ class TickContext:
     evict: Callable[[str], dict]
     active_names: Callable[[], set[str]]
     ensure_base: Callable[[], str | None] = _noop_ensure_base
+    add_base: Callable[[], dict] = _noop_add_base
 
 
 @dataclass
@@ -166,6 +182,12 @@ class Engine:
     _base_seeded: bool = False
     _base_energy: float = 1.0
     _base_stopped_by: str | None = None
+    # Whether the current stop EPISODE has already reported a refused
+    # ``ensure_base``. The refusal is per-tick (the driver re-checks the edge on
+    # every set_inhibition cycle) but the journal line is per episode: a rider
+    # that keeps asking must not bury the log, and a silent refusal would be
+    # indistinguishable from a re-seed that never happened.
+    _base_stop_reported: bool = False
 
     # --- mutation --------------------------------------------------------
     def _next_id(self, name: str) -> str:
@@ -203,6 +225,7 @@ class Engine:
             self._base_energy = float(beh.params.get("energy", self._base_energy))
         self._base_seeded = True
         self._base_stopped_by = None
+        self._base_stop_reported = False
         return beh.id
 
     def base_active(self) -> bool:
@@ -221,7 +244,28 @@ class Engine:
         set — and every real re-seed emits exactly one senselog line, since a
         base layer that comes back without a trace is indistinguishable from one
         that never left.
+
+        **A by-name stop is never undone here** (the #183 decision). ``stop`` and
+        ``evict`` are the same removal with different CAUSES precisely so this
+        method can honour the difference: an inhibition-driven eviction is a
+        transient claim on the head that the clearing edge un-does, while
+        ``behavior stop feel-alive`` is intentional stillness — an operator (or a
+        rule) asking for a still robot — and it holds until the un-stop verb (an
+        unbounded ``add`` of :data:`BASE_LAYER_NAME`, see :meth:`add`) or a
+        restart. The refusal names itself once per stop episode rather than once
+        per call, since a rider may ask on every inhibition cycle.
         """
+        if self._base_stopped_by == STOPPED_BY_STOP:
+            if not self._base_stop_reported:
+                self._base_stop_reported = True
+                senselog.drop(
+                    _BASE_STAGE,
+                    _BASE_SOURCE,
+                    "re-seed",
+                    f"base-layer-stopped: {BASE_LAYER_NAME} was stopped by name; "
+                    f"re-seed refused until an unbounded add of {BASE_LAYER_NAME}",
+                )
+            return None
         if self.base_active():
             return None
         entry = library.get(BASE_LAYER_NAME)
@@ -370,6 +414,7 @@ class Engine:
         stopped = [ab.behavior.id for ab in removed]
         if any(ab.is_base for ab in removed):
             self._base_stopped_by = cause
+            self._base_stop_reported = False  # a new episode reports again
         return {
             "ok": True,
             "op": "stop",
@@ -607,6 +652,13 @@ def _invoke_seam(tick_seam, seam_emit, engine: Engine, t: float, ticks: int, sna
             evict=engine.evict,
             active_names=lambda: {ab.behavior.name for ab in engine.active},
             ensure_base=lambda _t=t: engine.ensure_base(_t),
+            add_base=lambda _t=t: engine.add(
+                BASE_LAYER_NAME,
+                {},
+                StopClass.PASSIVE,
+                Lifetime(looping=True, duration=None),
+                _t,
+            ),
         )
     )
 
