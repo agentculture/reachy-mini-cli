@@ -324,6 +324,23 @@ def test_a_single_unknown_candidate_still_yields_a_bbox() -> None:
     assert select_face([only_unknown]) is only_unknown
 
 
+def test_among_boxless_candidates_the_named_one_still_wins() -> None:
+    """Two detections with no box: the recognised one is chosen, so its name cue
+    is published rather than lost to whichever the detector listed first."""
+    boxless_unknown = FaceCandidate(bbox=None, name=None)
+    boxless_known = FaceCandidate(bbox=None, name="ada")
+    assert select_face([boxless_unknown, boxless_known]) is boxless_known
+    assert select_face([boxless_known, boxless_unknown]) is boxless_known
+
+
+def test_ties_resolve_to_the_first_candidate_reported() -> None:
+    """Equal status and equal area: the detector's order decides, deterministically."""
+    first = FaceCandidate(bbox=(0.0, 0.0, 0.3, 0.3), name=None)
+    second = FaceCandidate(bbox=(0.5, 0.5, 0.3, 0.3), name=None)
+    assert select_face([first, second]) is first
+    assert select_face([second, first]) is second
+
+
 def test_a_boxless_candidate_never_beats_one_with_a_box() -> None:
     boxless = FaceCandidate(bbox=None, name="ada")
     boxed = FaceCandidate(bbox=(0.0, 0.0, 0.3, 0.3), name=None)
