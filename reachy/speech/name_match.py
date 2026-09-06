@@ -101,6 +101,29 @@ the initial guard removes the same-length same-score collisions ("speech") that
 the threshold alone cannot separate from "richie"; the phonetic guard removes
 the common-word collisions ("really") that score *above* "richie" and which no
 orthographic guard can separate from it.
+
+**Two guards for SHORT configured names (issue #177)**
+
+Everything above was tuned against "reachy"/"robot", both 5+ letters. A robot
+whose name is CONFIGURED to something shorter (e.g. a four-letter, single-
+trailing-consonant name — "nova" is used only as an illustrative example
+below, never as a default) needs two additional guards the longer shipped
+names never exercised:
+
+1. *Clitic guard* — a tokenised word carrying an apostrophe suffix (STT often
+   renders a name+contraction as one token, e.g. ``"<name>'s"``) is matched on
+   its stem (the text before the apostrophe), so ``"reachy's"`` matches
+   "reachy" the same way "reachy" does, instead of being scored against the
+   literal longer string.
+2. *Four-letter fuzzy floor* — a short name with only one consonant after its
+   initial letter has a weak Soundex code (a word need only share that one
+   consonant to tie it, e.g. an illustrative "navy" would also code ``N100``
+   against an illustrative "nova"). A fuzzy (non-exact) match is required to be
+   at least :data:`_MIN_FUZZY_WORD_LEN` (4) letters long; this was already true
+   of every accepted "reachy" mishearing (5+ letters), so it changes nothing
+   for the shipped names. It is a floor, not a full fix — a same-length,
+   single-consonant collision is a known residual gap the phonetic guard alone
+   cannot close.
 """
 
 from __future__ import annotations
@@ -112,12 +135,23 @@ from collections.abc import Iterable
 # Same word-tokenisation pattern used by behavior/transcript_sense.py
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 
+#: The shipped canonical names — THE one place this pair is spelled (issue
+#: #177).  Every other module that needs "the robot's names" derives from this
+#: constant rather than re-spelling the tuple.
+SHIPPED_NAMES: tuple[str, ...] = ("reachy", "robot")
+
 #: Default similarity threshold for :func:`is_name_match`.
 #:
 #: Set to 0.50 — the tightest value that accepts "richie" (score 0.500) against
 #: "reachy" while rejecting "rich" (score 0.400).  Callers may lower this to be
 #: more permissive or raise it to be stricter.
 DEFAULT_THRESHOLD: float = 0.50
+
+#: Minimum word length for a *fuzzy* (non-exact) match.  Every accepted
+#: "reachy" mishearing is 5+ letters, so this only ever bites SHORT configured
+#: names (four letters or fewer) whose Soundex code is weak evidence — see the
+#: module docstring's "short configured names" section.
+_MIN_FUZZY_WORD_LEN: int = 4
 
 
 #: Soundex consonant classes.  Letters absent from this map (the vowels plus
@@ -210,31 +244,41 @@ def _word_matches_name(word: str, name: str, threshold: float) -> bool:
     score decides. Factored out of :func:`is_name_match` so the public function
     stays a flat ``any(...)`` over word/name pairs.
     """
-    if word == name:
+    # Clitic guard: an STT token can fuse a name with a trailing
+    # contraction/possessive ("reachy's"). Match on the stem — the tokeniser
+    # regex only ever admits an apostrophe followed by more letters, so the
+    # stem is never empty for a valid token.
+    stem = word.split("'", 1)[0]
+    if stem == name:
         return True  # exact whole-word match — always accept
-    if name.startswith(word):
+    if name.startswith(stem):
         return False  # prefix guard: "reach" is a strict prefix of "reachy" → truncation
-    if name in word:
+    if name in stem:
         return False  # superstring guard: "reachy" in "preachy" → morphological extension
     # Initial guard: a fuzzy match must share the name's first letter. STT mishearings
     # of "reachy" keep the leading phoneme ("richie", "reachie"); same-length score
     # collisions ("speech") do not. (``name[:1]`` is a safe single-char prefix — "" for
     # an empty name — so ``startswith`` never raises.)
-    if not word.startswith(name[:1]):
+    if not stem.startswith(name[:1]):
+        return False
+    # Four-letter fuzzy floor: below this, a short configured name has too
+    # little consonant material for the phonetic guard to discriminate
+    # reliably. See the module docstring's "short configured names" section.
+    if len(stem) < _MIN_FUZZY_WORD_LEN:
         return False
     # Phonetic guard (#104): a fuzzy match must SOUND like the name, not merely
     # look like it. "really"/"reality"/"root" all clear the guards above and the
     # score, but their consonant skeletons (R400/R430/R300) differ from the
     # name's — they are ordinary words, not mis-transcriptions. See the module
     # docstring for the measured collision table this closes.
-    if _phonetic_code(word) != _phonetic_code(name):
+    if _phonetic_code(stem) != _phonetic_code(name):
         return False
-    return _combined_score(word, name) >= threshold
+    return _combined_score(stem, name) >= threshold
 
 
 def is_name_match(
     text: str,
-    names: Iterable[str] = ("reachy", "robot"),
+    names: Iterable[str] = SHIPPED_NAMES,
     threshold: float = DEFAULT_THRESHOLD,
 ) -> bool:
     """Return ``True`` when *text* contains a word that plausibly names the robot.
@@ -261,7 +305,7 @@ def is_name_match(
     text:
         The utterance to check (may be a full sentence or a single word).
     names:
-        Canonical names to match against.  Defaults to ``("reachy", "robot")``.
+        Canonical names to match against.  Defaults to :data:`SHIPPED_NAMES`.
         All comparisons are case-insensitive.
     threshold:
         Minimum combined similarity score to accept a fuzzy match.
