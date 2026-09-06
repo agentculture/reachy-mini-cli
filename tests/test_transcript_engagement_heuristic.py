@@ -44,6 +44,7 @@ from dataclasses import fields as _dc_fields
 import pytest
 
 from reachy.behavior.transcript_sense import TranscriptSenseDriver, TranscriptTuning
+from reachy.speech.name_match import SHIPPED_NAMES
 from tests.fixtures.engagement_transcripts import (
     ADDRESSED_FOLLOWUP,
     AMBIENT,
@@ -62,7 +63,10 @@ from tests.fixtures.engagement_transcripts import (
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 
 #: Default constructor values (mirrors TranscriptSenseDriver.__init__ defaults).
-_DEFAULT_NAMES = ("reachy", "robot")
+#: The names are IMPORTED, never re-spelled: ``SHIPPED_NAMES`` is the one place
+#: the shipped pair is written down (issue #177), and a second copy here would
+#: keep passing while the product's names moved on.
+_DEFAULT_NAMES = SHIPPED_NAMES
 _DEFAULT_MIN_WORDS = 3
 _DEFAULT_ENGAGE_WINDOW = 20.0
 
@@ -111,6 +115,19 @@ def _stamp_window(hook: TranscriptSenseDriver, last_accepted_t: float) -> None:
     hook._engaged_until = last_accepted_t + hook._tuning.engage_window_s
 
 
+def _engages(hook: TranscriptSenseDriver, text: str, t: float) -> bool:
+    """The heuristic's ENGAGED half.
+
+    ``_should_engage`` returns ``(engaged, by_name)`` since issue #177 — the
+    caller needs to know WHY an utterance was admitted so the runtime can latch
+    ``name_mentioned``. Every assertion in this file is about the first half and
+    is unchanged; ``test_the_heuristic_reports_why_it_engaged`` below pins the
+    second.
+    """
+    engaged, _by_name = hook._should_engage(text, t)
+    return engaged
+
+
 # ---------------------------------------------------------------------------
 # 1. White-box: pin the exact rule as shipped
 # ---------------------------------------------------------------------------
@@ -122,10 +139,10 @@ def test_heuristic_logic_matches_source() -> None:
     The rule (from ``reachy/behavior/transcript_sense.py``'s ``_should_engage``):
 
         words = _WORD_RE.findall(text.lower())
-        if any(name in words for name in self._names):
-            return True
+        if any(name in words for name in self._names()):
+            return True, True
         coherent = len(words) >= self._tuning.min_words
-        return coherent and t < self._engaged_until
+        return (coherent and t < self._engaged_until), False
 
     We verify this *exactly* by probing four representative points:
     1. Named (regardless of window)   → True.
@@ -142,22 +159,22 @@ def test_heuristic_logic_matches_source() -> None:
 
     # 1. Named — always True.
     assert (
-        hook._should_engage("reachy what time is it", now_out_of_window) is True
+        _engages(hook, "reachy what time is it", now_out_of_window) is True
     ), "a named utterance must engage regardless of window state"
 
     # 2. Short fragment, no name, in-window.
     assert (
-        hook._should_engage("uh yeah", now_in_window) is False
+        _engages(hook, "uh yeah", now_in_window) is False
     ), "a short fragment (< min_words) must not engage even in-window"
 
     # 3. Coherent + in-window, no name → True today (this is the flaw).
     assert (
-        hook._should_engage("the weather looks nice today", now_in_window) is True
+        _engages(hook, "the weather looks nice today", now_in_window) is True
     ), "today's heuristic accepts any coherent in-window utterance — even ambient"
 
     # 4. Coherent + out-of-window → False.
     assert (
-        hook._should_engage("the weather looks nice today", now_out_of_window) is False
+        _engages(hook, "the weather looks nice today", now_out_of_window) is False
     ), "a coherent utterance outside the window is correctly rejected"
 
 
@@ -170,14 +187,51 @@ def test_name_match_is_whole_word() -> None:
     hook = _make_hook()
 
     assert (
-        hook._should_engage("the robotic arm is moving", 0.0) is False
+        _engages(hook, "the robotic arm is moving", 0.0) is False
     ), "'robotic' contains 'robot' as a substring — must not engage when idle"
     assert (
-        hook._should_engage("robots are fascinating machines", 0.0) is False
+        _engages(hook, "robots are fascinating machines", 0.0) is False
     ), "'robots' is not the canonical whole-word 'robot' — must not engage when idle"
     assert (
-        hook._should_engage("robot please turn around", 0.0) is True
+        _engages(hook, "robot please turn around", 0.0) is True
     ), "the whole word 'robot' must engage"
+
+
+def test_the_heuristic_reports_why_it_engaged() -> None:
+    """``_should_engage`` returns ``(engaged, by_name)`` — the WHY, not just the what.
+
+    The DEGRADE path must be able to latch ``name_mentioned`` exactly as the
+    gate's ``name`` label does. If the heuristic only returned a boolean, "the
+    robot was addressed by name" would silently become false whenever the
+    classifier is down — the one moment a robot most needs to know it was
+    called.
+    """
+    hook = _make_hook()
+    _stamp_window(hook, last_accepted_t=0.0)
+
+    assert hook._should_engage("reachy what time is it", 5.0) == (True, True)
+    # In-window, coherent, nameless: engaged, but NOT by name.
+    assert hook._should_engage("the weather looks nice today", 5.0) == (True, False)
+    # Dropped utterances are never "by name".
+    assert hook._should_engage("uh yeah", 5.0) == (False, False)
+
+
+def test_a_names_provider_reaches_the_heuristic_live() -> None:
+    """The heuristic resolves its names per utterance, so a swap takes effect at once.
+
+    "nova" is NOT a shipped name; it appears here only as a CONFIGURED value,
+    which is the whole point of issue #177 — the robot learns a name from
+    configuration, never from a literal in ``reachy/``.
+    """
+    configured: list[tuple[str, ...]] = [_DEFAULT_NAMES]
+    hook = _make_hook(names_provider=lambda: configured[0])
+
+    assert _engages(hook, "nova please turn around", 0.0) is False
+
+    configured[0] = _DEFAULT_NAMES + ("nova",)
+    assert hook._should_engage("nova please turn around", 0.0) == (True, True)
+    # ...and the shipped names still work alongside the configured one.
+    assert hook._should_engage("robot please turn around", 0.0) == (True, True)
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +244,7 @@ def test_named_utterances_always_engage(line: TranscriptLine) -> None:
     """Every NAMED fixture must engage, even with no prior conversation (t=0)."""
     hook = _make_hook()  # _engaged_until = 0.0 → window closed
     assert (
-        hook._should_engage(line.text, 0.0) is True
+        _engages(hook, line.text, 0.0) is True
     ), f"NAMED utterance should always engage; got False for: {line.text!r}"
 
 
@@ -208,7 +262,7 @@ def test_ambient_ignored_when_idle(line: TranscriptLine) -> None:
     """
     hook = _make_hook()  # _engaged_until = 0.0 → window closed
     assert (
-        hook._should_engage(line.text, 1.0) is False
+        _engages(hook, line.text, 1.0) is False
     ), f"ambient utterance outside window must be rejected; got True for: {line.text!r}"
 
 
@@ -242,7 +296,7 @@ def test_ambient_flaw_inside_window(line: TranscriptLine) -> None:
     _stamp_window(hook, last_accepted_t=0.0)  # simulate a prior exchange at t=0
     t_ambient = 5.0  # 5 s later, well inside the 20 s window
 
-    result = hook._should_engage(line.text, t_ambient)
+    result = _engages(hook, line.text, t_ambient)
     assert result is True, (
         f"BUG CONFIRMED: ambient line accepted in-window for: {line.text!r}\n"
         "This is the flaw the new gate must fix."
@@ -268,7 +322,7 @@ def test_misheard_name_does_not_engage_when_idle(line: TranscriptLine) -> None:
     """
     hook = _make_hook()  # _engaged_until = 0.0 → window closed
     assert (
-        hook._should_engage(line.text, 1.0) is False
+        _engages(hook, line.text, 1.0) is False
     ), f"misheard name must not engage when idle; got True for: {line.text!r}"
 
 
@@ -300,7 +354,7 @@ def test_addressed_followup_engages_in_window(line: TranscriptLine) -> None:
     t_followup = 8.0  # 8 s later, inside the window
 
     assert (
-        hook._should_engage(line.text, t_followup) is True
+        _engages(hook, line.text, t_followup) is True
     ), f"addressed follow-up in-window must engage; got False for: {line.text!r}"
 
 
