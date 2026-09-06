@@ -305,11 +305,17 @@ background worker streaming mic audio to the lobes `/v1/realtime` session
 gate) and `face` / `face_bbox` / `face_age_s` / `frame_available`
 (`behavior/face_sense.py`, a background YuNet/SFace worker). The bbox is
 captured BEFORE the store match, so a stranger still has a POSITION to look at;
-`select_face` is the pure policy that picks which one — biggest wins (box area
-is the only distance proxy the detector gives), with a recognised face breaking
-a NARROW near tie (`AREA_TIE_RATIO`), so two people side by side stop being a
-coin-flip the attention flicks between, while a far-larger unknown face still
-beats a small known one. `Sense.doa_age_s` is the sibling freshness field, the
+`select_face` is the pure policy that picks which one — ONE sort key, `(has a
+box, is named, area)`: a recognised face wins over any unrecognised face
+regardless of size, and among faces of equal status the biggest wins (box area
+is the only distance proxy the detector gives). That is issue #175's operator
+decision ("any face, prefer enrolled", for reachy-nova #25): `lock_face` reads
+only `Sense.face_bbox`, so the preference reaches the lock with no change on
+the lock side. The former `AREA_TIE_RATIO` near-tie band is gone — it only ever
+let a name win ACROSS statuses, which the first tier now does outright, and
+among equal-status faces it filtered nothing. The names the robot answers to
+are a separate concern (#177, a configurable override; this repo hardcodes no
+peer's name). `Sense.doa_age_s` is the sibling freshness field, the
 `DoaPoller`'s own last-good age carried onto the snapshot: a one-shot like
 `look-at-sound` samples it ONCE at admission and must see the same age a
 concurrent rule predicate would, not a second, later clock read.

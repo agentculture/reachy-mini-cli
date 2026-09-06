@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0] - 2026-09-06
+
+### Changed
+
+- **`select_face` prefers a recognised face** (#175, for reachy-nova #25 q2):
+  a recognised face wins over any unrecognised face regardless of size; among
+  faces of equal recognition status the biggest wins; among boxless
+  detections the named one is chosen so its name cue is not lost. The rule is
+  one sort key `(has a box, is named, area)`. `AREA_TIE_RATIO` and the near-tie
+  band are removed. No face-lock, gaze, TTL or cadence constant changes;
+  `lock_face` inherits the preference by reading `Sense.face_bbox` unchanged.
+  The robot's canonical names are untouched — see #177 for the configurable
+  override a peer harness can supply.
+
 ## [0.51.1] - 2026-08-26
 
 ### Fixed
