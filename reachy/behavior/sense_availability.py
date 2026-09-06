@@ -70,13 +70,50 @@ the whole life of this process, and here is why.*
 The probe map is injected, so a future task can add a genuinely standing
 dynamic verdict (a latched ``session-down``, say) without touching this module.
 
+--------------------------------------------------------------------------
+Liveness (issue #176, c37/h27) — a SEPARATE fact, standing beside available
+--------------------------------------------------------------------------
+The paragraph above is still true: ``available``/``reason`` never became a
+liveness readout. But the user decided liveness IS worth a standing fact of
+its own, for exactly the two senses derived from the camera stream
+(``frame_available`` / ``face``) — it is simply a DIFFERENT fact, published
+beside the structural one rather than folded into it:
+
+    "senses": {
+      "frame_available": {"available": true, "reason": null,
+                           "live": true, "last_frame_at": 1234.5},
+      "face":            {"available": true, "reason": null,
+                           "live": true, "last_frame_at": 1234.5},
+      "rms":             {"available": true, "reason": null,
+                           "live": null, "last_frame_at": null},
+      ...
+    }
+
+``live`` is computed from an injected ``frame_liveness`` provider (a zero-arg
+callable returning the last usable frame's timestamp, or ``None``) against the
+SAME staleness threshold :mod:`reachy.behavior.face_sense` already uses to
+latch ``REASON_STREAM_ENDED`` — :data:`~reachy.behavior.face_sense.
+DEFAULT_STREAM_STALE_S`, imported here rather than restated, so the two can
+never drift apart. A sense with no provider injected (today's composition —
+wiring one is task t12) always renders ``live: null``.
+
+``last_frame_at`` is a STABLE timestamp, not a per-tick age: an age computed
+against "now" would change every tick a frame arrives, which would make the
+change gate below (and its senselog report) fire every tick forever. So the
+write-and-report decision keys on ``(available, reason, live)`` only —
+``last_frame_at`` rides along in whatever block IS written, but never causes a
+write or a log line by itself.
+
 Stdlib only, plus in-package imports. No ``reachy_mini``, no ``cv2``, no
-network — the probes are import-spec checks and composition booleans.
+network — the probes are import-spec checks and composition booleans, and
+``frame_liveness`` is an injected callable, never a direct read of the media
+client.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from importlib.util import find_spec as _find_spec
 from pathlib import Path
@@ -85,6 +122,11 @@ from typing import Callable, Iterable, Mapping
 from reachy import senselog
 from reachy.behavior import control as control_mod
 from reachy.behavior import face_sense
+
+# The ONE threshold that says a camera stream has gone stale — imported rather
+# than restated, so the availability block's notion of "live" can never drift
+# from face_sense's own latched REASON_STREAM_ENDED.
+from reachy.behavior.face_sense import DEFAULT_STREAM_STALE_S
 
 # The ONE declared source of truth for which optional providers the current
 # composition wires (``behavior rules check`` lints against it through
@@ -127,6 +169,12 @@ PAT_SENSE_DISABLED = "pat-sense-disabled"
 #: assumed fine: an unanswerable question is not a yes.
 PROBE_ERROR = "probe-error"
 
+#: The two senses derived from the held media client's camera stream — the
+#: only ones a ``frame_liveness`` provider is ever consulted for. Every other
+#: sense's ``live``/``last_frame_at`` stay ``None`` regardless of what is
+#: injected.
+CAMERA_LIVENESS_SENSES: frozenset[str] = frozenset({"frame_available", "face"})
+
 
 @dataclass(frozen=True)
 class SenseAvailability:
@@ -136,10 +184,20 @@ class SenseAvailability:
     forgotten: an unavailable sense MUST carry a non-blank reason, and an
     available one must NOT carry a reason at all (a lingering reason on a
     recovered sense is the same lie in the other direction).
+
+    ``live`` / ``last_frame_at`` (issue #176) are a SEPARATE, orthogonal fact —
+    see the module docstring's "Liveness" section. The one invariant enforced
+    here: ``live=True`` without a ``last_frame_at`` is a contradiction (there is
+    no frame to be live ABOUT), so it is refused at construction the same way a
+    reasonless dead sense is. ``live=False`` or ``live=None`` never require one
+    — "not live" and "unknown" are both consistent with no frame having arrived
+    yet.
     """
 
     available: bool
     reason: str | None = None
+    live: bool | None = None
+    last_frame_at: float | None = None
 
     def __post_init__(self) -> None:
         if self.available and self.reason is not None:
@@ -152,10 +210,20 @@ class SenseAvailability:
                 "an unavailable sense must NAME its reason — a dead sense is "
                 "never a silent no-op (see reachy.senselog's drop discipline)"
             )
+        if self.live and self.last_frame_at is None:
+            raise ValueError(
+                "live=True requires a last_frame_at — there is no frame to be "
+                "live about; pass last_frame_at=<timestamp> or live=False/None"
+            )
 
     def as_dict(self) -> dict:
         """The wire shape published under :data:`STATE_KEY`."""
-        return {"available": self.available, "reason": self.reason}
+        return {
+            "available": self.available,
+            "reason": self.reason,
+            "live": self.live,
+            "last_frame_at": self.last_frame_at,
+        }
 
 
 #: The single available verdict — frozen, so one shared instance is safe.
@@ -287,6 +355,21 @@ class SenseAvailabilityDriver:
         :class:`~reachy.behavior.intents.IntentDriver` does.
     root:
         State-dir override for the default spool (tests).
+    frame_liveness:
+        Optional zero-arg callable returning the last usable camera frame's
+        timestamp (``last_frame_at``), or ``None`` when no frame has arrived
+        yet. Consulted ONLY for :data:`CAMERA_LIVENESS_SENSES`; every other
+        sense's ``live``/``last_frame_at`` render ``None`` regardless. ``None``
+        (the default — today's composition, task t12 wires the real one) means
+        "no provider at all", which is a DIFFERENT, permanent ``live: null``
+        from "a provider exists but has not seen a frame yet" (``live: false``,
+        ``last_frame_at: null``).
+    clock:
+        The rider's own clock, used only to judge a ``frame_liveness`` reading
+        against :data:`~reachy.behavior.face_sense.DEFAULT_STREAM_STALE_S`.
+        Injectable for determinism; defaults to :func:`time.monotonic`, the
+        same choice :mod:`reachy.behavior.face_sense` makes for its own worker
+        clock.
     """
 
     def __init__(
@@ -296,6 +379,8 @@ class SenseAvailabilityDriver:
         main_control: control_mod.CommandSpool | None = None,
         root: Path | None = None,
         senses: Iterable[str] = AVAILABILITY_SENSES,
+        frame_liveness: Callable[[], float | None] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         declared = frozenset(senses)
         missing = sorted(declared - set(probes))
@@ -313,17 +398,44 @@ class SenseAvailabilityDriver:
         self._probes = dict(probes)
         self._main = main_control or control_mod.CommandSpool(root=root)
         self._published: dict | None = None
+        self._frame_liveness = frame_liveness
+        self._clock = time.monotonic if clock is None else clock
+        # The comparison key used by the write gate and the report, keyed on
+        # (available, reason, live) — deliberately NOT last_frame_at, which
+        # would otherwise advance every tick a frame arrives and defeat the
+        # whole write-on-change discipline this module exists for.
+        self._last_key: dict[str, tuple] | None = None
 
     # -- the block ---------------------------------------------------------- #
 
     def block(self) -> dict:
-        """The current availability block: ``{sense: {available, reason}}``.
+        """The current availability block: ``{sense: {available, reason, live,
+        last_frame_at}}``.
 
         Public because it is also the natural source for any other standing
         mirror of runtime state (a retained broker topic, a status readout) —
         one builder, so two surfaces can never disagree.
         """
-        return {name: self._probe(name).as_dict() for name in sorted(self._probes)}
+        return {name: self._entry(name).as_dict() for name in sorted(self._probes)}
+
+    def _entry(self, name: str) -> SenseAvailability:
+        verdict = self._probe(name)
+        if name not in CAMERA_LIVENESS_SENSES or self._frame_liveness is None:
+            return verdict
+        if not verdict.available:
+            # Structural unavailability wins — liveness is meaningless with
+            # nothing behind it (no frame will ever reach a dead sense).
+            return verdict
+        last_frame_at = self._frame_liveness()
+        live = (
+            last_frame_at is not None and (self._clock() - last_frame_at) <= DEFAULT_STREAM_STALE_S
+        )
+        return SenseAvailability(
+            available=verdict.available,
+            reason=verdict.reason,
+            live=live,
+            last_frame_at=last_frame_at,
+        )
 
     def _probe(self, name: str) -> SenseAvailability:
         try:
@@ -345,41 +457,62 @@ class SenseAvailabilityDriver:
         except Exception:  # a sense tap must never crash the loop
             logger.warning("sense availability publish raised; skipping this tick", exc_info=True)
 
+    @staticmethod
+    def _key(block: dict) -> dict[str, tuple]:
+        """The (available, reason, live) triple per sense — see ``_last_key``."""
+        return {
+            name: (entry["available"], entry["reason"], entry["live"])
+            for name, entry in block.items()
+        }
+
     def _publish(self) -> None:
         block = self.block()
+        key = self._key(block)
         current = self._main.read_state()
         if not isinstance(current, dict):
             current = {}
-        if current.get(STATE_KEY) == block:
+        current_block = current.get(STATE_KEY)
+        if isinstance(current_block, dict) and self._key(current_block) == key:
+            # Structurally unchanged: last_frame_at may have advanced, but that
+            # alone is never a reason to write or log — see the module
+            # docstring's "Liveness" section.
+            self._last_key = key
             return
         merged = dict(current)
         merged[STATE_KEY] = block
         self._main.write_state(merged)
-        self._report(block)
+        self._report(block, key)
 
-    def _report(self, block: dict) -> None:
-        """One senselog line per CHANGED verdict — bounded, because changes are rare.
+    def _report(self, block: dict, key: dict[str, tuple]) -> None:
+        """One senselog line per CHANGED (available, reason, live) triple.
 
-        Skipped for a pure republish (the engine heartbeat clobbered the key and
-        the rider put it back): that is bookkeeping, not news.
+        Bounded, because changes are rare, and blind to ``last_frame_at``:
+        skipped entirely for a pure republish (the engine heartbeat clobbered
+        the key and the rider put it back, or only timestamps moved) — that is
+        bookkeeping, not news.
         """
-        previous = self._published
-        self._published = dict(block)
-        if previous == block:
+        previous = self._last_key
+        self._last_key = key
+        if previous == key:
             return
         for name in sorted(block):
-            entry = block[name]
-            if previous is not None and previous.get(name) == entry:
+            if previous is not None and previous.get(name) == key[name]:
                 continue
-            if entry["available"]:
-                senselog.stage(STAGE, name, STATE_KEY, "sense available")
+            available, reason, live = key[name]
+            if not available:
+                senselog.drop(STAGE, name, STATE_KEY, reason)
+            elif live is False:
+                senselog.drop(STAGE, name, STATE_KEY, "no-frames")
+            elif live is True:
+                senselog.stage(STAGE, name, STATE_KEY, "frames live")
             else:
-                senselog.drop(STAGE, name, STATE_KEY, entry["reason"])
+                senselog.stage(STAGE, name, STATE_KEY, "sense available")
 
 
 __all__ = [
     "AVAILABILITY_SENSES",
     "AVAILABLE",
+    "CAMERA_LIVENESS_SENSES",
     "PAT_SENSE_DISABLED",
     "PROBE_ERROR",
     "SDK_EXTRA_ABSENT",

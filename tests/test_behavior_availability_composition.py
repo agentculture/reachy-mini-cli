@@ -115,6 +115,8 @@ def test_state_json_reports_face_dead_with_vision_extra_absent(_isolated, monkey
     assert state[STATE_KEY]["face"] == {
         "available": False,
         "reason": "vision-extra-absent",
+        "live": None,
+        "last_frame_at": None,
     }
 
 
@@ -129,7 +131,12 @@ def test_state_json_reports_face_available_with_the_vision_extra(_isolated, monk
     )
 
     state = _run_engine()
-    assert state[STATE_KEY]["face"] == {"available": True, "reason": None}
+    assert state[STATE_KEY]["face"] == {
+        "available": True,
+        "reason": None,
+        "live": None,
+        "last_frame_at": None,
+    }
 
 
 def test_the_bare_ci_box_reports_every_sense_dead_with_a_named_reason(_isolated, monkeypatch):
@@ -151,7 +158,12 @@ def test_the_bare_ci_box_reports_every_sense_dead_with_a_named_reason(_isolated,
     assert set(dead) == set(AVAILABILITY_SENSES) - {"self_moving"}
     assert all(isinstance(reason, str) and reason.strip() for reason in dead.values())
     assert dead["face"] == "vision-extra-absent"
-    assert block["self_moving"] == {"available": True, "reason": None}
+    assert block["self_moving"] == {
+        "available": True,
+        "reason": None,
+        "live": None,
+        "last_frame_at": None,
+    }
 
 
 # --------------------------------------------------------------------------- #
