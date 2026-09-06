@@ -1225,3 +1225,136 @@ def test_behavior_command_construction_site_passes_both_knobs() -> None:
     source = inspect.getsource(behavior_module)
     assert "detect_interval=detect_interval_from_env()" in source
     assert "detect_max_width=detect_max_width_from_env()" in source
+
+
+# --------------------------------------------------------------------------- #
+# t4 #181: FaceObservation.captured_at — the age anchor is capture time,      #
+# not publish/drain time                                                      #
+# --------------------------------------------------------------------------- #
+
+
+class _DetectionWithBBox:
+    """A detection carrying a real bbox, so the position leg is exercised too."""
+
+    embedding = [0.1, 0.2]
+    bbox_norm = (0.1, 0.1, 0.3, 0.3)
+
+
+def test_captured_at_is_stamped_before_detection_and_ages_the_snapshot() -> None:
+    """t4 #181 acceptance (a): face_age_s == now - captured_at, not now - drain time.
+
+    The fake engine's ``detect`` advances a shared clock by 300 ms to simulate
+    a slow CM4 detection — the exact gap the honesty condition (h32) names.
+    ``_worker_tick`` is driven synchronously (``start_worker=False``), so there
+    is no thread race: the clock only moves where this test moves it.
+    """
+    clock_time = [0.0]
+
+    class _SlowEngine:
+        def detect(self, frame):
+            clock_time[0] += 0.3  # simulated 300 ms detection cost
+            return _DetectionWithBBox()
+
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_SlowEngine(),
+        store=_FakeStore(match=_FakeMatch("ada")),
+        detect_interval=0.0,
+        clock=lambda: clock_time[0],
+        start_worker=False,
+    )
+    # tick at t=0.0: the tick thread publishes the frame for the worker to take.
+    driver(_Ctx(0.0))
+    assert clock_time[0] == 0.0
+
+    driver._worker_tick()  # the heavy leg — clock advances mid-detection
+    assert clock_time[0] == pytest.approx(0.3)
+
+    # tick at t=0.3: the tick thread drains the worker's result and latches it.
+    driver(_Ctx(0.3))
+    # captured_at was stamped at 0.0 (before detection), so the anchor is 0.0
+    # and the age at this drain is 0.3 — never 0.0, which is what anchoring on
+    # the drain/publish time would have produced.
+    assert driver._face_bbox_at == pytest.approx(0.0)
+    assert driver.peek_face_age_s() == pytest.approx(0.3)
+
+    # a later tick with no new detection keeps ageing from the SAME anchor.
+    driver(_Ctx(0.5))
+    assert driver.peek_face_age_s() == pytest.approx(0.5)
+
+
+def test_face_observation_without_captured_at_falls_back_to_publish_time() -> None:
+    """t4 #181 acceptance (b): an older producer/test fake with no ``captured_at``
+    still works — the age anchors on the drain (publish) tick, exactly as before.
+    """
+    driver = FaceSenseDriver(media=_FakeMedia([_frame()]), start_worker=False)
+    driver(_Ctx(0.0))
+    driver._output.publish(FS.FaceObservation(name="ada", bbox=(0.1, 0.1, 0.2, 0.2)))
+
+    driver(_Ctx(1.0))  # drain tick — no captured_at on the observation
+    assert driver._face_bbox_at == pytest.approx(1.0)
+    assert driver.peek_face_age_s() == pytest.approx(0.0)
+
+    driver(_Ctx(1.2))
+    assert driver.peek_face_age_s() == pytest.approx(0.2)
+
+
+def test_bbox_ttl_expiry_anchors_on_captured_at_not_drain_time() -> None:
+    """t4 #181 acceptance (c): the bbox TTL expiry uses the captured_at anchor.
+
+    Without the fix, the anchor would be the 0.5 s drain tick and the position
+    would still be held at t=1.4 (only 0.9 s past that anchor); anchored on the
+    true capture time (0.0), it is 1.4 s old — past a 1.0 s TTL — and expires.
+    """
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        face_bbox_ttl_s=1.0,
+        start_worker=False,
+    )
+    driver(_Ctx(0.0))
+    driver._output.publish(
+        FS.FaceObservation(name="ada", bbox=(0.1, 0.1, 0.2, 0.2), captured_at=0.0)
+    )
+
+    driver(_Ctx(0.5))  # drain tick, well after the real capture time
+    assert driver.peek_face_bbox() is not None
+
+    driver(_Ctx(1.4))  # now - captured_at(0.0) = 1.4 > ttl(1.0): expired
+    assert driver.peek_face_bbox() is None
+    assert driver.peek_face_age_s() is None
+
+
+def test_face_observation_captured_at_defaults_to_none() -> None:
+    """The dataclass default keeps every existing bare construction working."""
+    assert FS.FaceObservation(name="ada").captured_at is None
+    assert FS.FaceObservation(name="ada", bbox=(0.0, 0.0, 0.1, 0.1)).captured_at is None
+
+
+def test_worker_tick_stamps_captured_at_on_the_published_observation() -> None:
+    """A direct check of the publish contract: captured_at is the pre-detect clock."""
+    clock_time = [5.0]
+
+    class _Engine:
+        def detect(self, frame):
+            clock_time[0] += 0.05
+            return _DetectionWithBBox()
+
+    published: list = []
+
+    driver = FaceSenseDriver(
+        media=_FakeMedia([_frame()]),
+        engine=_Engine(),
+        store=_FakeStore(match=_FakeMatch("ada")),
+        detect_interval=0.0,
+        clock=lambda: clock_time[0],
+        start_worker=False,
+    )
+    driver._output.publish = lambda value: published.append(value) or None
+
+    driver(_Ctx(0.0))
+    driver._worker_tick()
+
+    assert len(published) == 1
+    observation = published[0]
+    assert isinstance(observation, FS.FaceObservation)
+    assert observation.captured_at == pytest.approx(5.0)
