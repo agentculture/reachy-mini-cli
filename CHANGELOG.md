@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.54.0] - 2026-09-06
+
+The September-6 face/lock/camera arc — six issues, one PR
+(spec: `docs/specs/2026-09-06-september-6-face-lock-camera-fixes-181-179-176-183.md`).
+
+### Added
+
+- `state.json` `senses.<name>.live` / `last_frame_at` — camera liveness beside
+  structural availability (#176); `no-frames` / `frames live` senselog lines.
+- `state.json` `base_layer: {seeded, active, stopped_by}` and
+  `TickContext.ensure_base` / `add_base`: the base layer re-seeds when an
+  inhibition naming `feel-alive` clears; a by-name `behavior stop feel-alive`
+  is intentional stillness until an unbounded `run feel-alive` (#183).
+- `HeldMediaClient.drop(reason)` — a camera that goes silent for 10 s is
+  handed back from the tick thread and re-warmed by the keeper, no restart (#176).
+- `FaceSenseDriver` still-only detection: `moving` / `lock_held` / `on_stale`
+  seams, `DEFAULT_STILL_SETTLE_S`, `DEFAULT_HELD_DETECT_INTERVAL`,
+  `[SENSE stage=gate source=face]` lines (#179); `FaceObservation.captured_at`.
+- `face-lock` params `fov_h` / `fov_v` / `damping` (#181); follow-up #186 for
+  `look-at-face`.
+- Operating guide: the face lock, still-only detection, the eyes' liveness,
+  the base layer stopped vs. inhibited, the WirePlumber camera boot race.
+
+### Changed
+
+- `face-lock` aims incrementally through the camera FOV (centres in two
+  detection cycles at damping 0.7) instead of an absolute 20°/12° gain that
+  settled at ~0.31 of the face angle (#181). `yaw_gain` / `pitch_gain` removed.
+- `face-lock` claims head + body_yaw; `feel-alive` leaves `LOCK_INHIBITS`, so
+  the antennas keep swaying under a lock and the base layer is never evicted
+  by it (#183). Its `motion.*` events report `["body_yaw","head"]`.
+- `SenseSnapshotDriver` emits a `sense` line only when the EMITTED payload
+  changed — clock-only fields (pat timestamps, face/DoA ages) no longer
+  produce lines (#184).
+- `run_behavior feel-alive` with no lifetime is the base re-seed; every other
+  looping-default entry is still refused unbounded.
+
+### Fixed
+
+- `test_a_missing_vision_extra_reports_a_named_reason_never_a_crash` states
+  its cv2 premise through the `find_spec` seam (#185).
+- `face_age_s` measures detection latency on the driver's own clock, applied
+  to the engine tick clock — the two time bases never couple.
+
 ## [0.53.1] - 2026-09-06
 
 ### Added
