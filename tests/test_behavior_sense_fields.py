@@ -295,7 +295,15 @@ def test_every_sense_field_is_fed_by_the_current_composition() -> None:
     nothing left to warn about. The assertion stays in place inverted, so the
     NEXT drift (a new predicate field added to ``SENSE_FIELDS`` with nothing
     feeding it) is caught here rather than discovered as a silently dead rule.
+
+    ONE field is knowingly pending (#177): ``name_mentioned`` entered
+    ``SENSE_FIELDS`` with t2 (the rules schema learned the ``names`` table) and
+    gains its provider in t3. The canary stays sharp meanwhile — the gap is
+    pinned by EQUALITY to exactly that one name, so any OTHER unfed field still
+    fails here, and t3 restores the plain ``==`` by deleting the pending set.
     """
     from reachy.behavior.rules import SENSE_FIELDS
 
-    assert FED_SENSE_FIELDS == SENSE_FIELDS
+    pending = frozenset({"name_mentioned"})  # t3 wires the provider
+    assert SENSE_FIELDS - FED_SENSE_FIELDS == pending
+    assert FED_SENSE_FIELDS - SENSE_FIELDS == frozenset()

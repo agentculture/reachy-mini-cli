@@ -112,6 +112,13 @@ _ENGINE_CORE = (
 # What counts as "an LLM"                                                     #
 # --------------------------------------------------------------------------- #
 
+#: The ONE ``reachy.speech`` module the engine's decision core may reach
+#: transitively (#177 t2): ``reachy.behavior.rules`` imports ``SHIPPED_NAMES``
+#: from it so the names the robot answers to are spelled once, in code. A pure
+#: ``difflib`` + ``re`` leaf that decides nothing and — pinned separately —
+#: imports no first-party module of its own.
+_DECISION_CORE_SPEECH_LEAF = "reachy.speech.name_match"
+
 #: The repo's one LLM client: streaming + single-shot chat completions against
 #: an OpenAI-compatible endpoint.
 _LLM_CLIENT = "reachy.speech.llm"
@@ -185,6 +192,14 @@ _BEHAVIOR_SPEECH_ALLOW = {
     ),
     "reachy.speech.events": (
         "``_doa_direction`` only — a pure bearing-to-'from the left' formatter"
+    ),
+    # ---- the NAMES the robot answers to (#177 t2) ---------------------------
+    "reachy.speech.name_match": (
+        "pure difflib + re word matching, plus the SHIPPED_NAMES constant the "
+        "rules schema's ``names`` table extends. It reports whether a word "
+        "names the robot and decides nothing; its only imports are difflib and "
+        "re — no model, no network. reachy.behavior.rules imports the constant "
+        "so the shipped pair is spelled exactly once, in code"
     ),
     "reachy.speech.engagement": (
         "the #54/#56 layered addressed-vs-ambient admission gate, kept by plan "
@@ -435,11 +450,17 @@ def test_the_speech_allow_list_has_no_dead_entries() -> None:
 
 
 def test_only_the_voice_and_hearing_modules_touch_the_speech_package() -> None:
-    """Name the two doors, so a third one opening is visible in the diff.
+    """Name the doors, so a new one opening is visible in the diff.
 
-    28 of the 30 ``reachy/behavior/`` modules import nothing from
-    :mod:`reachy.speech` at all. Pinning the two that do keeps "the runtime has
+    Almost every ``reachy/behavior/`` module imports nothing from
+    :mod:`reachy.speech` at all. Pinning the ones that do keeps "the runtime has
     a voice and ears" a bounded claim rather than a spreading one.
+
+    The third door (#177 t2) is NOT a capability: ``rules.py`` imports the
+    ``SHIPPED_NAMES`` constant so the names the robot answers to are spelled
+    exactly once, in code, and :mod:`reachy.speech.name_match` is pure
+    ``difflib`` + ``re``. A door onto a word matcher is not a door onto
+    cognition — but it is still a door, so it is named here.
     """
     doors = {
         name
@@ -449,6 +470,7 @@ def test_only_the_voice_and_hearing_modules_touch_the_speech_package() -> None:
     assert doors == {
         "reachy.behavior.speech_act",  # the voice (t6)
         "reachy.behavior.transcript_sense",  # the ears (t11)
+        "reachy.behavior.rules",  # the NAMES (#177 t2) — a constant + a matcher
     }, f"unexpected reachy/behavior/ modules reaching into reachy.speech: {sorted(doors)}"
 
 
@@ -582,8 +604,16 @@ def test_the_engine_decision_core_reaches_no_speech_module_at_all() -> None:
     is tolerable: the engine, the rule engine, intents, arbitration, the goto
     lane, pat sense and the sense snapshot reach NOTHING in
     :mod:`reachy.speech`, :mod:`reachy.forge` or :mod:`reachy.vision`
-    transitively. Voice and ears hang off the composition root, not off the
-    decision loop.
+    transitively — with ONE named exception, below. Voice and ears hang off the
+    composition root, not off the decision loop.
+
+    The exception (#177 t2) is :data:`_DECISION_CORE_SPEECH_LEAF`: ``rules.py``
+    imports the ``SHIPPED_NAMES`` *constant* so the names the robot answers to
+    are spelled exactly once in the repo. It is a data edge onto a pure
+    ``difflib`` + ``re`` leaf, and the companion test below pins that the leaf
+    reaches no first-party module of its own — so this cannot become the crack
+    the speech stack walks back in through. Nothing is imported that could
+    *decide* anything; the leaf itself is never called from the decision loop.
     """
     for core in _ENGINE_CORE:
         parents = _reachable_from(core)
@@ -591,12 +621,29 @@ def test_the_engine_decision_core_reaches_no_speech_module_at_all() -> None:
             module
             for module in parents
             if module.startswith(("reachy.speech", "reachy.forge", "reachy.vision"))
+            and module != _DECISION_CORE_SPEECH_LEAF
         )
         assert not leaked, (
             f"{core} now reaches {leaked} — the engine's decision loop must be "
             f"free of the speech/vision/forge stacks.\n"
             + "\n".join(f"  {m}: {_chain(m, parents)}" for m in leaked)
         )
+
+
+def test_the_one_speech_leaf_the_decision_core_may_reach_is_a_dead_end() -> None:
+    """The exception above is only tolerable while the leaf stays a leaf.
+
+    :data:`_DECISION_CORE_SPEECH_LEAF` must reach NO first-party module at all
+    — if it ever grows an import of, say, ``reachy.speech.engagement``, the
+    decision core would inherit the whole stack through a door opened for a
+    tuple of strings. Pinned by emptiness, so widening it is a test failure and
+    not a review miss.
+    """
+    reached = sorted(_reachable_from(_DECISION_CORE_SPEECH_LEAF))
+    assert reached == [_DECISION_CORE_SPEECH_LEAF], (
+        f"{_DECISION_CORE_SPEECH_LEAF} is no longer a dead-end leaf — it now "
+        f"reaches {[m for m in reached if m != _DECISION_CORE_SPEECH_LEAF]}"
+    )
 
 
 def test_importing_the_engine_does_not_load_the_llm_client() -> None:
