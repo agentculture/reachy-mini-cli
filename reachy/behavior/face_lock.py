@@ -23,8 +23,26 @@ What ``lock_face`` does, in one atomic step
    detection. A face gone for :data:`FACE_LOST_AFTER_S` is REPORTED once, as
    ``motion.face-lost``, and the lock still persists (see below).
 3. SNAPSHOTS the currently inhibited set and adds its own
-   (:data:`LOCK_INHIBITS` — ``feel-alive`` and ``orient-to-sound``, the two
-   behaviors that would otherwise keep dragging the head off the face).
+   (:data:`LOCK_INHIBITS` — ``orient-to-sound``, the one behavior arbitration
+   alone cannot keep off the face).
+
+Why only ONE name, and why the lock claims the body too (issue #183)
+---------------------------------------------------------------------
+The lock used to inhibit ``feel-alive`` as well, which stilled the ANTENNAS for
+the whole hold — the base layer is ONE behavior, so inhibiting it to protect
+the head took the sway with it. Arbitration is per CHANNEL by (class priority,
+recency) with abstention, and ``face-lock`` is ``STOPPABLE`` above the
+``PASSIVE`` base layer, so the lock wins any channel it CLAIMS without evicting
+anything. It therefore claims ``head`` AND ``body_yaw`` (see the library entry)
+and contributes a constant, HELD ``body_yaw`` — the value the engine was
+already streaming when the lock was taken — because ``feel-alive``'s slow body
+wander (amplitude 6 deg at energy 1.0) rotates the whole head assembly, and the
+camera with it, off the face. ``antennas`` is left unclaimed, so the base layer
+keeps that channel and the antennas keep swaying under a lock.
+
+``orient-to-sound`` STAYS inhibited: it is ``STOPPABLE`` like the lock, so a
+later admission would win the head on the recency tie-break. Arbitration alone
+cannot keep a same-class behavior off the face — only the inhibition can.
 
 A lock cannot outlive its mind, nor be held forever
 ----------------------------------------------------
@@ -53,7 +71,7 @@ caller's back.
 
 Ownership is RECOMPUTED on every replacement, never frozen at acquisition. The
 live set is re-asserted as ``new_set | LOCK_INHIBITS``: while the lock is held,
-``feel-alive`` / ``orient-to-sound`` are inhibited no matter what the caller
+``orient-to-sound`` is inhibited no matter what the caller
 wrote — including a name that was ALREADY operator-inhibited when the lock was
 taken (so it was never "added") and that the replacement drops, which an
 acquisition-time ownership set would have let start dragging the head off the
@@ -100,9 +118,13 @@ RELEASE_FACE = "release_face"
 #: The library entry the lock admits.
 FACE_LOCK_BEHAVIOR = "face-lock"
 
-#: What the lock adds to the inhibited set: the two behaviors that would
-#: otherwise keep commanding the head (and so keep pulling it off the face).
-LOCK_INHIBITS = ("feel-alive", "orient-to-sound")
+#: What the lock adds to the inhibited set. ONE name since #183: the base layer
+#: is handled by arbitration instead (the lock claims ``head`` + ``body_yaw``
+#: and leaves ``antennas`` to ``feel-alive``), but ``orient-to-sound`` is the
+#: lock's own contention class, so a later admission of it would win the head
+#: on the recency tie-break. The tuple shape is kept for exactly that reason —
+#: the set is "whatever arbitration cannot handle", not "one behavior".
+LOCK_INHIBITS = ("orient-to-sound",)
 
 #: A ``face_bbox`` older than this is not a face to lock onto. Matches the
 #: producer's own TTL (``reachy.behavior.face_sense``), so the two agree.
@@ -299,6 +321,11 @@ class FaceLockGaze:
     def __init__(self) -> None:
         self._yaw = 0.0
         self._pitch = 0.0
+        #: The body yaw this gaze HOLDS for the life of the lock (issue #183).
+        #: Set once, at lock time, from the pose the engine last streamed; 0.0
+        #: (the neutral body yaw) when nobody handed one over — a gaze built
+        #: directly in a test, or a lock taken before any tick composed a pose.
+        self._body_yaw = 0.0
         self._target_yaw = 0.0
         self._target_pitch = 0.0
         self._last_t: float | None = None
@@ -319,6 +346,25 @@ class FaceLockGaze:
     def pitch(self) -> float:
         """The head pitch offset currently being commanded, in degrees."""
         return self._pitch
+
+    @property
+    def body_yaw(self) -> float:
+        """The body yaw being held for the life of the lock, in degrees."""
+        return self._body_yaw
+
+    def hold_body_yaw(self, value: object) -> float:
+        """Hold *value* on the ``body_yaw`` channel for the life of this gaze.
+
+        Called ONCE by :meth:`FaceLockDriver.lock` with the body yaw the engine
+        streamed on the tick before the lock took the channel, so the lock
+        freezes the body where it already was instead of snapping it to
+        neutral. Never raises: a missing, non-numeric or non-finite reading
+        degrades to 0.0, the neutral body yaw — the same honest default
+        :meth:`reachy.behavior.pose_feed.LastPoseHolder.as_start_pose_provider`
+        falls back to when no pose has been stashed yet.
+        """
+        self._body_yaw = _finite(value, 0.0)
+        return self._body_yaw
 
     @property
     def target_yaw(self) -> float:
@@ -368,7 +414,12 @@ class FaceLockGaze:
         self._yaw = _clamp(_approach(self._yaw, self._target_yaw, step), max_yaw)
         self._pitch = _clamp(_approach(self._pitch, self._target_pitch, step), max_pitch)
         self._ring.append((now, self._yaw, self._pitch))
-        return Contribution(head=_head(yaw=self._yaw, pitch=self._pitch))
+        # `body_yaw` is HELD, never planned: the lock claims the channel only to
+        # keep `feel-alive`'s slow wander from rotating the camera off the face
+        # (#183). Contributing it every tick (rather than abstaining) is what
+        # makes the claim effective — an abstaining claimant falls through to
+        # the base layer in `arbitrate()`.
+        return Contribution(head=_head(yaw=self._yaw, pitch=self._pitch), body_yaw=self._body_yaw)
 
     # -- the capture-time machinery ----------------------------------------- #
 
@@ -790,7 +841,7 @@ class FaceLockDriver:
             # record that undoes it is the lock itself, released by name.
             lifetime=Lifetime(looping=True, duration=None),
             params=dict(params),
-            fn=entry.build_fn(),
+            fn=self._build_gaze(entry, ctx),
             wants_sense=entry.wants_sense,
         )
         result = ctx.admit(beh)
@@ -848,6 +899,31 @@ class FaceLockDriver:
         restored = self._restore_inhibitions()
         self._emit(ctx, EVENT_LOCK_RELEASED, {"id": behavior_id, "reason": reason})
         return behavior_id, restored
+
+    def _build_gaze(self, entry, ctx):
+        """One fresh gaze, holding the body yaw the engine streamed most recently.
+
+        ``ctx.pose`` is the complete pose the engine composed and sent THIS tick
+        — populated after streaming, before the seam runs (see
+        :class:`reachy.behavior.engine.TickContext`) — so at lock time it is the
+        body yaw commanded on the tick BEFORE the lock takes the channel. That
+        is the same live-pose seam :mod:`reachy.behavior.pose_feed` adapts for
+        ``GotoLane``'s start pose; reading it straight off ``ctx`` needs no
+        composition change and no second stash.
+
+        A ctx with no ``pose`` (the duck-typed ctx a test or a non-engine caller
+        passes, or a lock taken before any tick composed one) holds 0.0 — the
+        neutral body yaw, and the same fallback ``as_start_pose_provider``
+        makes. Never raises.
+        """
+        fn = entry.build_fn()
+        hold = getattr(fn, "hold_body_yaw", None)
+        if not callable(hold):  # a foreign/monkeypatched factory — nothing to hold
+            return fn
+        pose = getattr(ctx, "pose", None)
+        body_yaw = pose.get("body_yaw") if isinstance(pose, dict) else None
+        hold(body_yaw)
+        return fn
 
     def _face_is_lockable(self, ctx) -> bool:
         sense = getattr(ctx, "sense", None)

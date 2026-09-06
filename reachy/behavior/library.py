@@ -329,7 +329,13 @@ LIBRARY: dict[str, LibraryEntry] = {
     "face-lock": LibraryEntry(
         name="face-lock",
         summary="hold the gaze on the seen face — the behavior the lock_face intent admits",
-        channels=_HEAD,
+        # Head AND body yaw (issue #183): the body rotates the whole head
+        # assembly, so `feel-alive`'s slow wander would carry the camera off
+        # the face. Claiming the channel and HOLDING it (see
+        # `reachy.behavior.face_lock.FaceLockGaze.hold_body_yaw`) is what lets
+        # the lock stop inhibiting the base layer — which keeps `antennas`, so
+        # the antennas go on swaying under a lock.
+        channels=_HEAD | _BODY,
         default_class=StopClass.STOPPABLE,
         # Looping with NO default duration: a face lock is a STANDING intent
         # ended by `release_face` (or, later, a face-lost event), so it is

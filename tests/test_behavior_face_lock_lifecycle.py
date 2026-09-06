@@ -379,7 +379,7 @@ def test_a_later_set_inhibition_still_wins_over_a_lifecycle_release() -> None:
     _lock(registry, ctx)
     registry.dispatch({"op": SET_INHIBITION, "behaviors": ["nod", "shake"]}, ctx)
     # The lock re-asserts its own additions on top of the caller's statement.
-    assert {"feel-alive", "orient-to-sound"} <= set(intents.inhibitions)
+    assert set(LOCK_INHIBITS) <= set(intents.inhibitions)
 
     _tick(driver, ctx, now=11.0, sense=_face())
     assert driver.locked is False
@@ -394,10 +394,8 @@ def test_a_lifecycle_release_also_strips_the_locks_own_additions_from_a_replacem
     ctx = _RecordingCtx(sense=_face())
     _lock(registry, ctx)
     # A mind echoing back what it read, plus one name of its own.
-    registry.dispatch(
-        {"op": SET_INHIBITION, "behaviors": ["feel-alive", "orient-to-sound", "speak"]}, ctx
-    )
-    assert {"feel-alive", "orient-to-sound"} <= set(intents.inhibitions)
+    registry.dispatch({"op": SET_INHIBITION, "behaviors": [*LOCK_INHIBITS, "speak"]}, ctx)
+    assert set(LOCK_INHIBITS) <= set(intents.inhibitions)
 
     _tick(driver, ctx, now=11.0, sense=_face())
     assert driver.locked is False
@@ -466,7 +464,7 @@ def test_an_external_stop_of_the_behavior_releases_the_lock_state() -> None:
     The driver watched face, mind and clock only, so an eviction it did not ask
     for left ``locked`` true and the inhibitions installed: the head was free
     again while ``lock_face`` still answered ``already locked`` and
-    ``feel-alive``/``orient-to-sound`` stayed inhibited until the 30-minute
+    every :data:`LOCK_INHIBITS` name stayed inhibited until the 30-minute
     watchdog. Eviction is a fourth ending, and it runs the SAME release path.
     """
     driver, registry, intents = _wire()
